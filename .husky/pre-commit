@@ -1,0 +1,43 @@
+# Commit-time half of the three-layer ban (D-13).
+#
+# This is the layer that matters. A large share of commits on this project are
+# authored by Claude sessions, and D-02 leaves no CI pipeline to hang a gate on,
+# so this hook is the only thing standing between a forbidden token and
+# permanent history. Version-controlled under .husky/ rather than hand-placed in
+# .git/hooks/, because the latter is not tracked and a fresh clone would
+# silently lose the protection -- which is the exact failure this exists to
+# prevent. `npm install` reinstalls it via the `prepare` script.
+#
+# Two checks only. It runs on every commit, and a slow hook is a hook someone
+# disables. No test suite, no typecheck -- those have their own gate.
+
+# Abort on the first failing command. NOT redundant, and not style: without it
+# this script exits with the status of its LAST command, which is the
+# conditional at the bottom -- and that succeeds whenever grep finds nothing. A
+# non-zero exit from the scan below would be printed and then discarded, and the
+# commit would proceed. The gate previously worked only because husky's
+# generated wrapper .husky/_/h invokes this file as `sh -e`: a line in a
+# gitignored file this hook does not mention, which vanishes the moment husky is
+# removed, downgraded, swapped for another runner, core.hooksPath is repointed,
+# or someone runs `sh .husky/pre-commit` by hand to test it.
+set -e
+
+# 1. The forbidden-token scan. Same module test/forbidden-tokens.test.ts
+#    imports, so the two layers cannot disagree about what is banned. It prints
+#    each violation as `file:line — why` and exits non-zero.
+node scripts/forbidden-tokens.mjs
+
+# 2. The local secrets file. .gitignore already covers it, but `git add -f`
+#    defeats that on its own, and this file carries a live Apple app-specific
+#    password that would be permanent the moment it lands in history.
+#    `.dev.vars.example` is deliberately not matched -- it holds no values.
+if git diff --cached --name-only --diff-filter=ACMR | grep -qE '(^|/)\.dev\.vars$'; then
+	echo "" >&2
+	echo "Refusing the commit: .dev.vars is staged." >&2
+	echo "" >&2
+	echo "  That file holds a live Apple app-specific password. Once committed it is" >&2
+	echo "  in history permanently, and rotating the credential is the only remedy." >&2
+	echo "  Unstage it with: git restore --staged .dev.vars" >&2
+	echo "" >&2
+	exit 1
+fi

@@ -1,0 +1,39 @@
+node_modules
+.wrangler
+dist
+.dev.vars
+.env
+.DS_Store
+
+# Your live Worker config, holding your Cloudflare account id, KV namespace
+# ids, and custom domain. Copied from wrangler.jsonc.example on `npm install`;
+# fill in your own values. The tracked template is wrangler.jsonc.example.
+wrangler.jsonc
+
+# Generated at build time from the wrangler config's routes[0].pattern — never
+# committed, so it cannot go stale. See scripts/write-hostname.mjs.
+src/deployed-hostname.generated.ts
+
+# GSD planning/state artifacts — internal process notes, not part of the
+# public project. Excluded from the open-source repo; kept locally for the
+# GSD workflow. Also carries personal data (calendar names/ids) that the
+# forbidden-tokens scan does not cover.
+.planning/
+.gsd/
+
+# Live-account observation logs, deliberately not tracked.
+#
+# An earlier copy of this path was deleted on 2026-08-16 and five findings were
+# salvaged into .planning/phases/02-imap-client-mail-read/02-UAT.md:823, on the
+# reasoning that "a second, diverging account of server behaviour is worse than
+# none" — roughly half of it described this client's own pre-fix behaviour as
+# though it described the iCloud server. The file reappeared untracked and was
+# re-examined under plan 03-10; its DAV-era section 10 was found to be already
+# recorded, more completely, in 03-01-SUMMARY.md, so there was nothing left to
+# salvage. Ignored rather than merely deleted so it cannot drift back in as an
+# untracked file and re-raise the same settled question.
+#
+# The authoritative account of observed server behaviour is the phase UAT
+# document (02-UAT.md for mail, 03-UAT.md for DAV) — not a file under
+# test/fixtures/, which is read by no test despite its location.
+test/fixtures/OBSERVED-BEHAVIOUR.md

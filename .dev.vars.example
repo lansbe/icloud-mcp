@@ -1,0 +1,35 @@
+# Local development secrets for `wrangler dev`.
+#
+# Copy this file to `.dev.vars` and fill in the values. `.dev.vars` is
+# git-ignored and must never be committed — the pre-commit hook refuses it.
+#
+# In PRODUCTION these are NOT read from a file. Set each one with
+#   npx wrangler secret put <NAME>
+# so it lives only in Cloudflare Secrets. See README.md → Deploy.
+#
+# Note: R2_ACCOUNT_ID is NOT here — it is a non-secret `var` in wrangler.jsonc,
+# not a secret.
+
+# Shared secret for the /authorize login form (D-01). This is the password you
+# type to authorize an MCP client. Use a long random string.
+AUTH_SECRET=
+
+# The iCloud account's Apple ID (its email address). Used for IMAP LOGIN,
+# CalDAV/CardDAV Basic auth, and as the From address on drafts.
+APPLE_ID=
+
+# An Apple APP-SPECIFIC password — NOT your Apple ID password. iCloud requires
+# one because the account has two-factor auth. Create it at
+# https://account.apple.com → Sign-In and Security → App-Specific Passwords.
+APPLE_APP_PASSWORD=
+
+# HMAC key for calendar confirmation tokens (CALW-04). Independent from
+# AUTH_SECRET on purpose. Generate a fresh random value, e.g.
+#   openssl rand -base64 32
+CONFIRM_SECRET=
+
+# R2 S3 API token for presigned attachment uploads. Create an R2 API token
+# scoped to the attachments bucket with Object Read & Write only
+# (Cloudflare dashboard → R2 → Manage API tokens). It yields these two halves.
+R2_ACCESS_KEY_ID=
+R2_SECRET_ACCESS_KEY=

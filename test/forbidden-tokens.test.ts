@@ -1,0 +1,1299 @@
+// The test-time half of the three-layer ban (FND-06, D-11, D-12, D-13).
+//
+// Every pattern is imported from scripts/forbidden-tokens.mjs and never
+// restated here, so this file and .husky/pre-commit cannot drift apart about
+// what is banned. The violating strings below exist only to prove the patterns
+// are not vacuous; that is exactly why this file's path is in the scanner's
+// EXCLUDED set, and the tests under "self-exclusion" prove that skip is real
+// rather than decorative.
+//
+// This file runs under Node rather than inside workerd (see vitest.config.ts):
+// it reads the repository off disk, and a Workers isolate has no filesystem to
+// read. Every filesystem access lives behind the scanner's own API, so nothing
+// here imports node:fs and the project needs no Node type package.
+
+import { describe, expect, it } from "vitest";
+import {
+  APPEND_COMMAND,
+  APPEND_OWNER,
+  APPEND_SCOPE,
+  DAV_FETCH_CALL,
+  DAV_FETCH_OWNER,
+  DAV_HOST_LITERAL,
+  DAV_HOST_OWNER,
+  EXCLUDED,
+  FORBIDDEN,
+  OWNERSHIP_VIOLATION_IDS,
+  SOCKET_IMPORT,
+  SOCKET_OWNER,
+  SUBSCRIPTION_FEED_FETCH_CALL,
+  SUBSCRIPTION_FEED_FETCH_OWNER,
+  checkAppendOwnership,
+  checkCommitHook,
+  checkDavFetchOwnership,
+  checkDavHostOwnership,
+  checkSocketOwnership,
+  checkSubscriptionFeedFetchOwnership,
+  formatViolation,
+  matchRule,
+  scan,
+  scanWranglerConfig,
+} from "../scripts/forbidden-tokens.mjs";
+
+const SCANNER_PATH = "scripts/forbidden-tokens.mjs";
+const THIS_TEST_PATH = "test/forbidden-tokens.test.ts";
+
+/** The rules this phase adds that are scoped to the DAV tree. Named once so a
+ *  rule added to the ban list without a scope test is a missing name rather
+ *  than a silent omission.
+ *
+ *  `dav-concurrent-request` is deliberately NOT here. It began on this list and
+ *  was widened to `src/` by 03-REVIEW.md WR-03, because its mail sibling
+ *  `concurrent-session` names the orchestrator rather than the primitive and
+ *  needs the whole source tree to reach it — a fan-out over `getEvent` is
+ *  written in `src/mcp/tools/`, where no tsdav name is even in scope. Its own
+ *  block below asserts both halves of that reach. */
+const DAV_RULE_IDS = ["dav-eager-load", "ical-jsdate"];
+
+/** The realistic fan-out shape, with one entry point substituted in.
+ *
+ *  The transport parameter is deliberately NOT spelled `davFetch`. That name is
+ *  itself on the alternation, so a template carrying it matches on every
+ *  iteration no matter what `entryPoint` is — the per-name loops below would
+ *  pass unchanged with the whole alternation deleted down to that single name,
+ *  which is a gate that cannot fail. It is spelled with a name the alternation
+ *  does not carry, and `refuses a name the alternation does not carry` proves
+ *  the substitution is what each loop is actually reading. */
+const fanOutOver = (entryPoint: string) =>
+  `await Promise.allSettled(items.map((i) => ${entryPoint}(env, transport, i)));`;
+
+/** The service-layer entry points a tool can fan out over: the only DAV names
+ *  visible from `src/mcp/`, because a tool never sees a tsdav call.
+ *
+ *  Eleven read entry points, plus the four CalDAV WRITE entry points phase 5
+ *  added — `createEvent`, `updateEvent`, `deleteEvent` and `getEventWithEtag`.
+ *  Hand-written on purpose, and never derived from the shipped pattern: a list
+ *  read out of the very regex it is checked against would agree with that regex
+ *  by construction, so dropping a name would drop it from both sides at once
+ *  and the loop would stay green. That is the shape of dead gate this project
+ *  has already shipped once and had to measure.
+ *
+ *  The `DAV_FAN_OUT_LIBRARY` half below carries the primitives. The two are
+ *  asserted separately, and their UNION is set-equality-checked against the
+ *  names actually present in the shipped alternation, so a name added to the
+ *  pattern without a matching assertion fails too. */
+const DAV_FAN_OUT_SERVICE = [
+  "listCalendars",
+  "listEvents",
+  "searchEvents",
+  "getEvent",
+  "listAddressBooks",
+  "searchContacts",
+  "getContact",
+  "runDavDiagnosticOutcome",
+  "withRediscovery",
+  "resolveDavAccount",
+  "pagedEvents",
+  // Not a write, and on this list for the same reason `withRediscovery` and
+  // `resolveDavAccount` are: it costs a real round trip (one PROPFIND at the
+  // principal) and it is reachable from `src/mcp/`. WINDOWS entry 60 filed it
+  // against this scanner as an open gap, noting it is PARTLY covered by
+  // construction -- it wraps `withRediscovery`, so a combinator around THAT
+  // still fires -- but that a combinator around this name itself was invisible
+  // to every assertion in this file. Naming it closes the entry outright rather
+  // than leaving it resting on an implementation detail of its own body.
+  //
+  // `planCreateTarget`, which entry 60 names alongside it, is deliberately NOT
+  // here: it is synchronous, mints a UID and a URL, and issues no request at
+  // all. This rule's subject is round trips against one account, so listing a
+  // pure function would misstate what it bans.
+  "resolveOrganizerAddress",
+  // Phase 5's CalDAV write path. Each one ends in one or more DAV round trips
+  // that CHANGE the account, so N of them concurrently is N irreversible
+  // conversations against one account rather than N reads of it.
+  "createEvent",
+  "updateEvent",
+  "deleteEvent",
+  // Held by the set-equality below, NOT by the per-name loop. `getEvent`
+  // precedes this in the alternation and is a prefix of it, so the fan-out
+  // template matches whether or not this name is in the pattern at all -- its
+  // loop assertion is redundant by construction and cannot fail. Written down
+  // rather than repaired: the repair is a trailing word boundary on the group,
+  // which would make the rule match strictly LESS than it does today, and the
+  // Conventions forbid narrowing a rule to tidy an assertion. The set-equality
+  // is a real gate on it, so removing the name from the pattern still fails.
+  "getEventWithEtag",
+  // The COMPOSITE tool-layer entry points phase 5 added (05-REVIEW.md WR-04).
+  // Every one of them ends in one or more of the names above, so every one was
+  // covered BY ACCIDENT — and this rule's own comment already says what that is
+  // worth: "covering a name by accident is how a guarantee quietly leaves when
+  // the body is refactored." Naming them is the same move
+  // `resolveOrganizerAddress` got one entry up.
+  //
+  // They are also the layer this rule's `why` says a fan-out is actually written
+  // at. `Promise.all(ids.map((id) => buildDeletePreview(...)))` — "preview
+  // deleting all of these" — is the shape, and until these were added it matched
+  // nothing.
+  //
+  // **Each of the three `Preview` names is here on its own account, and that is
+  // checkable rather than asserted:** `buildPreview` is NOT a prefix of the
+  // other two, so none of the three is covered by either of the others and each
+  // per-name loop below can genuinely fail. That is the property 05-13 found
+  // missing on `getEventWithEtag`, whose loop cannot fail because `getEvent`
+  // precedes it and is a prefix of it — do not let that shape back in without
+  // writing it down.
+  "applyCommit",
+  "buildPreview",
+  "buildDeletePreview",
+  "buildCreatePreview",
+  "occurrenceBody",
+  // Plan 05-14's third body shaper. It re-reads the resource, decides between
+  // the rebuild and the invited-event patch from those bytes, and hands back the
+  // one it built — so it ends in a round trip exactly as its two siblings do,
+  // and it is named here for the reason they are rather than left resting on
+  // `getEventWithEtag` inside its own body.
+  "scopelessBody",
+  "applyNarrowedDelete",
+  "observeDelivery",
+  // Phase 6 (SCHED-01). `findFreeSlots` is the new orchestrator: it sweeps EVERY
+  // calendar the account has for free/busy time, which is the exact account-wide
+  // shape D-84 reintroduces and the sharpest fan-out temptation this tool will
+  // face. It is reachable from `src/mcp/`, so it belongs on this list for the
+  // same reason `listEvents` does.
+  "findFreeSlots",
+  // `collectFrom` is now called in a LOOP over collections for the first time.
+  // Before phase 6 `pagedEvents` called it exactly once per request, so it
+  // carried no fan-out risk and was correctly absent from the alternation; the
+  // find-slots loop is what makes wrapping it in a combinator a live temptation
+  // (06-RESEARCH.md Pitfall 3, WINDOWS.md entry #60's precedent).
+  "collectFrom",
+];
+
+/** The request primitive and the tsdav standalone helpers: what a "just do them
+ *  all" edit inside `src/dav/` reaches for.
+ *
+ *  Read helpers, plus the three tsdav WRITE helpers phase 5's service layer
+ *  calls through. Before this list existed, only the two names appearing in the
+ *  rule's violating sample were asserted at all — the other ten were on the
+ *  alternation and covered by nothing, which is the same invisibility the write
+ *  extension exists to close, one layer down. */
+const DAV_FAN_OUT_LIBRARY = [
+  "davFetch",
+  "createAccount",
+  "propfind",
+  "fetchCalendars",
+  "fetchCalendarObjects",
+  "calendarQuery",
+  "calendarMultiGet",
+  "fetchAddressBooks",
+  "fetchVCards",
+  "addressBookQuery",
+  "addressBookMultiGet",
+  "supportedReportSet",
+  "createCalendarObject",
+  "updateCalendarObject",
+  "deleteCalendarObject",
+];
+
+/** The names actually present in the shipped rule's final alternation group.
+ *
+ *  Mechanical, and it fails loudly rather than quietly: an extraction that came
+ *  back empty or garbled produces a set that cannot equal the hand-written
+ *  union, so the assertion using it reports a mismatch instead of passing on a
+ *  vacuous comparison. */
+function alternationNamesOf(pattern: RegExp): string[] {
+  const source = pattern.source;
+  const open = source.lastIndexOf("(?:");
+  const close = source.lastIndexOf(")");
+  if (open < 0 || close < open) {
+    throw new Error("no trailing alternation group found in the rule's source");
+  }
+  return source.slice(open + "(?:".length, close).split("|");
+}
+
+/** Exclusion disabled, so a rule's reach over a real tree can be compared with
+ *  and without the skip-list. */
+const NO_EXCLUSIONS = { excluded: new Set<string>() };
+
+describe("the ban list itself", () => {
+  it("gives every rule a non-empty reason, because the hook prints it on rejection", () => {
+    expect(FORBIDDEN.length).toBeGreaterThan(0);
+    for (const rule of FORBIDDEN) {
+      expect(rule.why, `rule ${rule.id} has no reason`).toBeTruthy();
+      expect(rule.why.trim().length).toBeGreaterThan(20);
+    }
+  });
+
+  it("gives every rule a distinct id, so a violation names which rule fired", () => {
+    const ids = FORBIDDEN.map((rule) => rule.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
+describe("the patterns have teeth", () => {
+  // Matched against in-memory strings rather than fixture files. A fixture file
+  // carrying a banned token would itself need excluding from the scan, which is
+  // the self-exclusion problem all over again.
+  const violatingSamples: Record<string, string> = {
+    "tls-upgrade-call": "const upgraded = await socket.startTls();",
+    "tls-upgrade-mode": 'connect(addr, { secureTransport: "starttls" });',
+    "cleartext-imap-port": "connect({ hostname: host, port: 143 });",
+    "smtp-submission-port": "connect({ hostname: host, port: 587 });",
+    "host-with-banned-port": 'const relay = "smtp.mail.me.com:465";',
+    "mail-sending-library": 'import { createTransport } from "nodemailer";',
+    "secret-binding-in-log-call": "console.log(`sending`, env.APPLE_APP_PASSWORD);",
+    "logging-on-the-credential-path": "console.debug(commandLine);",
+    // A debug line in src/mcp/ or src/auth/ — outside src/mail/, so the rule
+    // above never sees it, and naming no secret, so the rule above that one
+    // never sees it either. That pair of blind spots is what this rule closes.
+    "logging-anywhere-under-src": 'console.log("handler reached", requestId);',
+    // The same call one step worse: the whole environment object, which carries
+    // all three secrets without any of them being written down.
+    "env-object-in-log-call": 'console.warn("diagnose env", env);',
+    // A fan-out around the choke-point. Written with an arrow function on
+    // purpose: the parenthesis pair in `()` is exactly what a naive
+    // "no closing paren between them" pattern would trip over.
+    "concurrent-connect": "await Promise.all(folders.map(() => runOver(connectImap())));",
+    // The same fan-out one layer up, and the shape a contributor would actually
+    // write: nobody wraps a combinator around the raw connect helper, because
+    // nothing but the orchestrator calls it. Arrow function again, for the same
+    // reason as the rule above — the `()` is what a naive span trips over.
+    "concurrent-session":
+      "await Promise.all(refs.map((ref) => withMailSession(env, gate, ref.mailbox, ref.uidValidity, one)));",
+    // A fetch item list hoisted into a constant, written without the peeking
+    // form. This is the shape with the worst blast radius: the page-listing
+    // path sends one of these per page.
+    "non-peeking-fetch-item":
+      'const ITEMS = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY[])";',
+    // The same fan-out shape as the two rules above, one protocol over. Arrow
+    // function again, for the same reason: the `()` is what a naive
+    // paren-bounded span trips over.
+    //
+    // WRITE-shaped, and deliberately so. The read half was never the dangerous
+    // one: an account-wide sweep over reads was withdrawn because it could not
+    // be repaired by making it concurrent, and a read that loses the race just
+    // returns a worse answer. A sweep over WRITES cannot be repaired at all —
+    // each request in it changes the user's calendar, so a half-completed
+    // fan-out leaves a state nobody chose and no retry can describe. Naming a
+    // service write entry point keeps the rule-level set-equality guard
+    // exercising the half phase 5 added rather than only the half it inherited.
+    //
+    // The transport is NOT spelled `davFetch` here, for the reason `fanOutOver`
+    // gives: that name is itself on the alternation, so a sample carrying it
+    // would match with every write name deleted again and would prove nothing
+    // about the extension. This sample matches through `deleteEvent` alone.
+    "dav-concurrent-request":
+      "await Promise.all(refs.map((r) => deleteEvent(env, transport, r.eventId, r.etag)));",
+    // One boolean that turns account discovery into a fan-out over every
+    // collection fetching every object inside it.
+    "dav-eager-load":
+      "const account = await createAccount({ account: base, loadCollections: true });",
+    // The host-timezone-dependent conversion. Silently wrong times, never an
+    // error, and the test pool's zone is not production's.
+    "ical-jsdate": "const start = event.startDate.toJSDate();",
+  };
+
+  it("covers every rule with a known-violating sample", () => {
+    // Guards the guard: a rule added without a sample would otherwise be
+    // untested, and an untested pattern that matches nothing looks identical to
+    // a tree with nothing to find.
+    expect(Object.keys(violatingSamples).sort()).toEqual(
+      FORBIDDEN.map((rule) => rule.id).sort(),
+    );
+  });
+
+  for (const rule of FORBIDDEN) {
+    it(`rule "${rule.id}" matches a known violation`, () => {
+      const sample = violatingSamples[rule.id];
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(fresh.test(sample), `pattern for ${rule.id} matched nothing`).toBe(true);
+    });
+  }
+
+  it("does not fire on the port and transport mode this project actually uses", () => {
+    const permitted = 'connect({ hostname: h, port: 993 }, { secureTransport: "on" });';
+    for (const rule of FORBIDDEN) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(fresh.test(permitted), `rule ${rule.id} false-positived`).toBe(false);
+    }
+  });
+
+  it("catches a bare fetch item written inline in the command, not only hoisted", () => {
+    // The item list is written both ways in this codebase — hoisted into a
+    // constant, and interpolated into the command. The rule carries one anchor
+    // for each, and the sample above only exercises the first. Without this,
+    // dropping the command-shaped anchor would leave the suite green.
+    const inline = "await send(channel, tag, `UID FETCH ${uid} (UID FLAGS BODY[])`);";
+    const rule = FORBIDDEN.find((r) => r.id === "non-peeking-fetch-item")!;
+    const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+    expect(fresh.test(inline)).toBe(true);
+  });
+
+  it("keeps looking past an interpolated call in the command", () => {
+    // The span is bounded by the statement and the line, not by the next
+    // closing parenthesis — the same choice the socket-level concurrency rule
+    // makes and for the same reason. An interpolation that calls anything at
+    // all puts a `)` between the anchor and the item, and a paren-bounded span
+    // would stop there and report nothing. Found by mutation: swapping the
+    // bound for `[^)]` left every other assertion in this file green.
+    const interpolated = "const cmd = `UID FETCH ${ref.at(0)} (UID FLAGS BODY[])`;";
+    const rule = FORBIDDEN.find((r) => r.id === "non-peeking-fetch-item")!;
+    const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+    expect(fresh.test(interpolated)).toBe(true);
+  });
+
+  it("catches a lowercase fetch item, because the protocol is case-insensitive", () => {
+    // A server treats a lowercase item name as the same item, so a lowercase
+    // spelling marks the same page read. Without this the `i` flag could be
+    // dropped and the suite would stay green.
+    const lower = 'const items = "(uid flags body[])";';
+    const rule = FORBIDDEN.find((r) => r.id === "non-peeking-fetch-item")!;
+    const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+    expect(fresh.test(lower)).toBe(true);
+  });
+
+  it("catches the RFC822 spelling of the same seen-flag side effect", () => {
+    // RFC 3501 makes RFC822 and RFC822.TEXT functionally equivalent to the bare
+    // body item, side effect included. A rule that caught one spelling and not
+    // its synonym would give false assurance, which is worse than no rule.
+    const rule = FORBIDDEN.find((r) => r.id === "non-peeking-fetch-item")!;
+    for (const sample of [
+      'const items = "(UID FLAGS RFC822)";',
+      'const items = "(UID RFC822.TEXT)";',
+    ]) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(fresh.test(sample), `missed ${sample}`).toBe(true);
+    }
+  });
+
+  it("excuses the RFC822 sub-items that fetch no body and set no flag", () => {
+    // RFC822.SIZE is in this project's own permitted item list and RFC822.HEADER
+    // is the peeking-equivalent header fetch. Banning either would ban the
+    // command the rule is protecting.
+    const rule = FORBIDDEN.find((r) => r.id === "non-peeking-fetch-item")!;
+    for (const sample of [
+      'const items = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])";',
+      'const items = "(RFC822.HEADER)";',
+    ]) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(fresh.test(sample), `false-positived on ${sample}`).toBe(false);
+    }
+  });
+
+  it("keeps the negative lookahead load-bearing, not decorative", () => {
+    // Measured, not assumed: with the item spelled `BODY[` and nothing else
+    // permitted between the name and the bracket, a lookahead against a
+    // dot-prefixed suffix can never fire, and deleting it leaves every other
+    // assertion green. The qualifier group is what gives the lookahead
+    // something to refuse — this asserts the pair works together.
+    const rule = FORBIDDEN.find((r) => r.id === "non-peeking-fetch-item")!;
+    const withoutLookahead = new RegExp(
+      rule.pattern.source.replace("(?!\\.PEEK)", ""),
+      rule.pattern.flags,
+    );
+    const peeking = 'const items = "(UID FLAGS BODY.PEEK[])";';
+    expect(new RegExp(rule.pattern.source, rule.pattern.flags).test(peeking)).toBe(
+      false,
+    );
+    expect(
+      withoutLookahead.test(peeking),
+      "the lookahead removes no match, so it is dead code",
+    ).toBe(true);
+  });
+
+  it("catches a fan-out around the over-a-stream session variant too", () => {
+    // `withMailSessionOver` opens a session over an already-open stream, and N
+    // of those is still N conversations against one connection budget. The
+    // sample above exercises only the socket-opening variant, so without this a
+    // rule narrowed to the exact name would leave the suite green.
+    const fanOut =
+      "await Promise.any(names.map((n) => withMailSessionOver(sock, env, gate, n, null, one)));";
+    const rule = FORBIDDEN.find((r) => r.id === "concurrent-session")!;
+    const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+    expect(fresh.test(fanOut)).toBe(true);
+  });
+
+  it("does not fire on a single session call with no combinator around it", () => {
+    // The permitted form, and the one every mail tool in this phase writes. A
+    // rule that could not tell this from a fan-out would ban the orchestrator
+    // it exists to protect.
+    const permitted = "return withMailSession(env, gate, mailbox, uidValidity, fn);";
+    for (const rule of FORBIDDEN) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(fresh.test(permitted), `rule ${rule.id} false-positived`).toBe(false);
+    }
+  });
+
+  it("does not fire on a fetch item list that uses the peeking form", () => {
+    // The permitted form, byte-for-byte what FETCH_ITEMS holds in
+    // src/mail/service.ts.
+    const permitted =
+      'const ITEMS = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])";';
+    for (const rule of FORBIDDEN) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(fresh.test(permitted), `rule ${rule.id} false-positived`).toBe(false);
+    }
+  });
+
+  it("does not fire on reading the server's own reply key", () => {
+    // The discriminator that makes the rule above anchored rather than
+    // spelling-based: a peeking fetch comes BACK from the server under a key
+    // spelled without the peek, so src/mail/service.ts must look that key up.
+    // A rule keyed on the spelling alone would ban reading the reply to the
+    // very command it protects.
+    const permitted = 'const body = items.get("BODY[]");';
+    const rule = FORBIDDEN.find((r) => r.id === "non-peeking-fetch-item")!;
+    const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+    expect(fresh.test(permitted)).toBe(false);
+  });
+
+  it("does not mistake a clock-shaped string for a banned port", () => {
+    const innocent = 'const label = "12:25"; const other = "07:465";';
+    const rule = FORBIDDEN.find((r) => r.id === "host-with-banned-port")!;
+    const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+    expect(fresh.test(innocent)).toBe(false);
+  });
+
+  it("scopes each DAV rule to the DAV tree, driven through the scanner's own matcher", () => {
+    // Not `rule.scope === "src/dav/"`: that would restate the scanner's
+    // prefix logic here and pass even if `matchRule` stopped honouring scope
+    // at all. Driving the real matcher is what makes the directory prefix
+    // proven load-bearing rather than merely declared.
+    for (const id of DAV_RULE_IDS) {
+      const rule = FORBIDDEN.find((r) => r.id === id)!;
+      const index = FORBIDDEN.indexOf(rule);
+      const sample = violatingSamples[id]!;
+      expect(
+        matchRule(rule, index, "src/dav/calendar.ts", sample).length,
+        `${id} did not fire inside its own tree`,
+      ).toBeGreaterThan(0);
+      expect(
+        matchRule(rule, index, "src/mail/service.ts", sample),
+        `${id} escaped its scope`,
+      ).toEqual([]);
+    }
+  });
+
+  it("does not fire on the seconds-since-epoch accessor, which is the permitted form", () => {
+    // The rule bans the conversion whose result depends on the host zone. The
+    // epoch accessor is what src/dav/icalendar.ts uses once a zone has been
+    // resolved, so banning both would ban the fix along with the bug.
+    const permitted = "const seconds = resolved.toUnixTime();";
+    const rule = FORBIDDEN.find((r) => r.id === "ical-jsdate")!;
+    const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+    expect(fresh.test(permitted)).toBe(false);
+  });
+
+  it("catches an orchestrator-level fan-out written outside the DAV tree", () => {
+    // 03-REVIEW.md WR-03. It is the shape a contributor would actually write: a
+    // tool has an array of identifiers and reaches for the entry point it
+    // imported, because a tsdav call is not in scope there and never will be —
+    // and with the rule scoped to src/dav/ over library names, this exact line
+    // matched nothing at all.
+    //
+    // Driven through the scanner's own matcher rather than a bare regex test,
+    // so the scope widening is proven load-bearing rather than merely declared
+    // — a rule reverted to `src/dav/` fails here rather than passing quietly.
+    const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
+    const index = FORBIDDEN.indexOf(rule);
+    const fanOut =
+      "const events = await Promise.all(ids.map((id) => getEvent(env, davFetch, id)));";
+    expect(
+      matchRule(rule, index, "src/mcp/tools/calendar.ts", fanOut).length,
+      "the DAV fan-out rule does not reach src/mcp/tools/, which is the layer a fan-out is written at",
+    ).toBeGreaterThan(0);
+    // The library half, in its own tree, spelled out here rather than reusing
+    // the rule's violating sample. The sample is now service-shaped, so reusing
+    // it would leave the tsdav shape with no matcher-driven assertion anywhere
+    // and the loss would be invisible: this test would keep passing, on the
+    // wrong evidence.
+    expect(
+      matchRule(
+        rule,
+        index,
+        "src/dav/calendar.ts",
+        "await Promise.all(calendars.map((c) => fetchCalendarObjects({ calendar: c, fetch: davFetch })));",
+      ).length,
+      "widening the scope lost the rule's reach over its own tree",
+    ).toBeGreaterThan(0);
+
+    // And the COMPOSITE half (05-REVIEW.md WR-04). "Preview deleting all of
+    // these" is one sentence, and this is the line it turns into — written in
+    // the very file the seven names live in. It names no service entry point
+    // and no tsdav call, so before those names were added it matched nothing:
+    // the previous two assertions here would both stay green with the whole
+    // composite half absent, which is why this one is spelled out separately.
+    expect(
+      matchRule(
+        rule,
+        index,
+        "src/mcp/tools/calendar.ts",
+        "const previews = await Promise.all(ids.map((id) => buildDeletePreview(transport, refOf(id), id, scope)));",
+      ).length,
+      "the rule does not reach the composite tool-layer entry points, which is the layer its own reason says a fan-out is written at",
+    ).toBeGreaterThan(0);
+
+    // Phase 6's own orchestrator. `findFreeSlots` sweeps every calendar the
+    // account has, so a "check them all at once" edit is the exact fan-out D-84
+    // reintroduces the temptation for — exercised here through the same matcher
+    // so the extension is proven load-bearing rather than only declared.
+    expect(
+      matchRule(rule, index, "src/mcp/tools/calendar.ts", fanOutOver("findFreeSlots"))
+        .length,
+      "the rule does not reach findFreeSlots, phase 6's account-wide free/busy orchestrator",
+    ).toBeGreaterThan(0);
+  });
+
+  it("names every DAV service entry point a tool can fan out over, read and write alike", () => {
+    // The alternation's outermost layer, asserted name by name. Without this,
+    // dropping any single entry point from the pattern leaves every other
+    // assertion in this file green — the rule-level set-equality guard
+    // included, because that guard operates at the RULE level and cannot see
+    // inside one. This is the same both-directions discipline the count
+    // constraints below already use, applied to the inside of one pattern.
+    //
+    // Phase 5's four write entry points are on this list for a sharper reason
+    // than the reads. `Promise.all(ids.map(deleteEvent))` is the single most
+    // tempting fan-out this project will ever be offered — "clear my calendar
+    // for August" is one sentence — and until those names were added it passed
+    // the scan outright.
+    //
+    // The eight COMPOSITE names are on it for the reason the rule's own comment
+    // gives about `resolveOrganizerAddress`: each was covered only because its
+    // body happens to call a guarded name, and a body is a refactor away from
+    // not doing that.
+    const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
+    expect(
+      DAV_FAN_OUT_SERVICE.length,
+      "eleven read entry points, phase 5's four writes, the organiser resolution WINDOWS 60 filed, the eight composite tool-layer entry points 05-REVIEW.md WR-04 filed plus 05-14's scopelessBody, and phase 6's findFreeSlots orchestrator and its looped collectFrom",
+    ).toBe(26);
+    for (const entryPoint of DAV_FAN_OUT_SERVICE) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(
+        fresh.test(fanOutOver(entryPoint)),
+        `${entryPoint} is not named in the alternation`,
+      ).toBe(true);
+    }
+  });
+
+  it("names every DAV library primitive a src/dav/ edit can fan out over, read and write alike", () => {
+    // The alternation's innermost layers, asserted name by name for the same
+    // reason as the loop above. Twelve of these were on the alternation and
+    // covered by nothing at all before this loop existed — the rule's single
+    // violating sample named two of them, and a sample proves the RULE is not
+    // vacuous, never that any particular name inside it is live.
+    const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
+    expect(
+      DAV_FAN_OUT_LIBRARY.length,
+      "the request primitive and the tsdav helpers, plus phase 5's three writes",
+    ).toBe(15);
+    for (const entryPoint of DAV_FAN_OUT_LIBRARY) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(
+        fresh.test(fanOutOver(entryPoint)),
+        `${entryPoint} is not named in the alternation`,
+      ).toBe(true);
+    }
+  });
+
+  it("refuses a name the alternation does not carry, so the two loops above have teeth", () => {
+    // Guards the guards. Both loops substitute one name into a fixed template,
+    // so if any OTHER token in that template were itself on the alternation,
+    // every iteration would match for the wrong reason and both loops would
+    // pass with the alternation gutted down to that one token. The template
+    // used to spell the transport `davFetch`, which is exactly that token —
+    // this control is what stops it coming back.
+    const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
+    const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+    expect(
+      fresh.test(fanOutOver("notADavEntryPoint")),
+      "the fan-out template matches regardless of the name substituted into it — the per-name loops prove nothing",
+    ).toBe(false);
+  });
+
+  it("keeps every per-name assertion CAPABLE of failing, with one recorded exception", () => {
+    // The other way a per-name loop dies, and the one 05-13 found the hard way.
+    // The alternation carries no leading word boundary, so a name that CONTAINS
+    // another entry matches through that other entry — and its own loop
+    // iteration passes whether or not the name is in the pattern at all.
+    // `getEventWithEtag` is exactly that: `getEvent` precedes it and is a prefix
+    // of it, so removing `getEventWithEtag` from the pattern breaks nothing in
+    // the loop above and only the set-equality holds it there.
+    //
+    // Recorded as an EXACT LIST rather than tolerated, so a name added later
+    // with the same defect fails here and has to be argued for. The three
+    // `Preview` names WR-04 added are the case this was written against:
+    // `buildPreview` is not a prefix of `buildCreatePreview` or
+    // `buildDeletePreview`, so all three loops can genuinely fail — and this
+    // proves that rather than asserting it in a comment.
+    //
+    // The repair for the exception is a trailing word boundary on the group,
+    // which would make the rule match strictly LESS than it does today.
+    // Narrowing a safety rule to tidy an assertion is what the Conventions
+    // forbid outright, so the exception stays and is named here instead.
+    const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
+    const names = alternationNamesOf(rule.pattern);
+    expect(names.length, "the alternation extraction came back empty").toBeGreaterThan(
+      10,
+    );
+
+    const covered = names.filter((name) =>
+      names.some((other) => other !== name && name.includes(other)),
+    );
+    expect(
+      covered,
+      "a name in the alternation is matched through another entry, so its per-name loop cannot fail",
+    ).toEqual(["getEventWithEtag"]);
+  });
+
+  it("asserts every name in the shipped alternation, with nothing left over", () => {
+    // The other direction, and the one neither loop above can supply. A loop
+    // catches a name REMOVED from the pattern; only this catches a name ADDED
+    // to it without an assertion — which is how the write half came to be
+    // missing in the first place, one layer up.
+    //
+    // The union is hand-written; only the comparand is read from the shipped
+    // rule. Deriving both sides from the pattern would make this agree with
+    // itself by construction.
+    const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
+    const asserted = [...DAV_FAN_OUT_SERVICE, ...DAV_FAN_OUT_LIBRARY].sort();
+    expect(new Set(asserted).size, "a name is listed twice").toBe(asserted.length);
+    expect(alternationNamesOf(rule.pattern).sort()).toEqual(asserted);
+  });
+
+  it("does not fire on a single service entry point call with no combinator", () => {
+    // The permitted form, and the one every DAV tool in src/mcp/tools/ writes.
+    // Widening the scope to src/ put those files inside this rule's reach for
+    // the first time, so the false-positive direction has to be asserted there
+    // too — a rule that could not tell an awaited call from a fan-out would be
+    // switched off within a week.
+    //
+    // The write entry points are here for a second reason on top of that one.
+    // Widening the alternation could be "fixed" by a pattern that matches
+    // everything, and every positive assertion above would stay green while the
+    // rule stopped discriminating. These are the exact lines src/mcp/tools/ and
+    // src/dav/calendar.ts write on the permitted path — including the TWO-request
+    // serial commit that plans 05-10 through 05-12 deliberately pay, because a
+    // patch needs the whole resource and rebuilding drops every component it did
+    // not rebuild. Multiple awaited requests are not what this rule bans.
+    for (const permitted of [
+      "const event = await getEvent(env, davFetch, params.eventId);",
+      "return searchContacts(env, davFetch, { term, pageSize });",
+      "const page = await listEvents(env, davFetch, options);",
+      "const created = await createEvent(env, davFetch, input);",
+      "const current = await getEventWithEtag(env, davFetch, ref);",
+      "await updateEvent(env, davFetch, ref, body, current.etag);",
+      "await deleteEvent(env, davFetch, ref, current.etag);",
+    ]) {
+      for (const rule of FORBIDDEN) {
+        const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+        expect(fresh.test(permitted), `rule ${rule.id} false-positived`).toBe(false);
+      }
+    }
+  });
+
+  it("does not fire on a single DAV request with no combinator around it", () => {
+    // The permitted form, and the one every DAV tool in this phase writes. A
+    // rule that could not tell this from a fan-out would ban the transport it
+    // exists to protect. The three write helpers are here for the same reason
+    // their service callers are in the loop above: an awaited write is what
+    // src/dav/calendar.ts does on every legitimate commit.
+    for (const permitted of [
+      "const books = await fetchAddressBooks({ account, headers: {}, fetch: davFetch });",
+      "await createCalendarObject({ calendar, filename, iCalString, fetch: davFetch });",
+      "await updateCalendarObject({ calendarObject, headers, fetch: davFetch });",
+      "await deleteCalendarObject({ calendarObject, headers, fetch: davFetch });",
+    ]) {
+      for (const rule of FORBIDDEN) {
+        const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+        expect(fresh.test(permitted), `rule ${rule.id} false-positived`).toBe(false);
+      }
+    }
+  });
+});
+
+describe("the scanned surface", () => {
+  // `scan()` with no argument is the multi-root scan, and it is the exact call
+  // the CLI entry point makes. Asserting on it is therefore asserting on the
+  // commit gate rather than on a narrower cousin of it.
+
+  it("runs the socket-ownership check once across all roots, not once per root", () => {
+    // Each root on its own reports the choke-point missing, because only one of
+    // them contains socket code. A per-root check would therefore fail the scan
+    // the moment scripts/ and test/ were added to the surface.
+    expect(scan("scripts").map((v) => v.pattern)).toContain("socket-choke-point-missing");
+    expect(scan("test").map((v) => v.pattern)).toContain("socket-choke-point-missing");
+    expect(scan().map((v) => v.pattern)).not.toContain("socket-choke-point-missing");
+  });
+
+  it("walks test/, proven by the violating samples in this very file", () => {
+    // With the skip disabled this file's samples are findable, which is only
+    // possible if test/ is inside the default surface at all. Behavioural
+    // rather than an assertion about a root list, so it keeps holding for
+    // whatever files later phases add to the directory.
+    const files = scan(undefined, NO_EXCLUSIONS).map((v) => v.file);
+    expect(files).toContain(THIS_TEST_PATH);
+  });
+
+  it("finds everything a single-root scan finds, for each root separately", () => {
+    // The superset property, stated per-directory rather than per-file: no
+    // matter what a later phase adds under src/, scripts/, or test/, anything a
+    // scan of that one directory would catch is caught by the scan the hook
+    // runs. The ownership check is excluded because it is deliberately a
+    // whole-surface property, and is asserted above.
+    const key = (v: { file: string; line: number; column: number; pattern: string }) =>
+      `${v.file}:${v.line}:${v.column}:${v.pattern}`;
+    const wholeSurface = scan(undefined, NO_EXCLUSIONS).map(key);
+    for (const root of ["src", "scripts", "test"]) {
+      for (const violation of scan(root, NO_EXCLUSIONS)) {
+        // Every COUNT constraint is excluded here, not only the socket one, and
+        // the carve-out is named by the exported list rather than by a string
+        // prefix so a constraint added later cannot fall outside it silently. A
+        // count is deliberately a whole-surface property: scanning one root in
+        // isolation reports the owners living in the other roots as missing,
+        // which is correct for that narrower question and wrong for this one.
+        // Each direction of each count is asserted on its own below.
+        if (OWNERSHIP_VIOLATION_IDS.includes(violation.pattern)) continue;
+        expect(wholeSurface, `${root} contributed a violation the gate misses`).toContain(
+          key(violation),
+        );
+      }
+    }
+  });
+});
+
+describe("the current tree", () => {
+  it("is clean", () => {
+    // Mapped through formatViolation so a failure reads as the reason the rule
+    // exists, not as a dump of objects.
+    expect(scan().map(formatViolation)).toEqual([]);
+  });
+
+  it("carries no nonexistent limits key, and hardcodes no deployed hostname", () => {
+    // Wave 1 established that `wrangler deploy --dry-run` accepts the limits key
+    // silently, so the tooling will never report that it does nothing. The
+    // hostname half asserts src/ re-exports the generated value rather than
+    // hardcoding a literal that nothing forces to match the wrangler route.
+    expect(scanWranglerConfig().map(formatViolation)).toEqual([]);
+  });
+
+  it("fires hostname-hardcoded when src hardcodes a deployed hostname literal", () => {
+    // A guard that can never fail is indistinguishable from one that was never
+    // added. Point the check at a sample that hardcodes the literal and confirm
+    // it rejects it.
+    const violations = scanWranglerConfig(
+      "wrangler.jsonc",
+      "test/fixtures/hostname-hardcoded-sample.ts",
+    );
+    expect(violations.map((v) => v.pattern)).toEqual(["hostname-hardcoded"]);
+  });
+});
+
+describe("determinism", () => {
+  it("produces identical results on two runs over the same tree", () => {
+    expect(scan()).toEqual(scan());
+  });
+
+  it("stays identical across repeated runs, so no rule carries state between files", () => {
+    // A shared global regex carries `lastIndex` from one file to the next. If
+    // the scanner reused one, a later pass would skip matches an earlier pass
+    // found, and the lists would diverge.
+    const first = scan("scripts");
+    expect(scan("scripts")).toEqual(first);
+    expect(scan("scripts")).toEqual(first);
+  });
+});
+
+describe("self-exclusion", () => {
+  it("names both self-referential files in EXCLUDED", () => {
+    expect(EXCLUDED.has(SCANNER_PATH)).toBe(true);
+    expect(EXCLUDED.has(THIS_TEST_PATH)).toBe(true);
+  });
+
+  it("actually skips the scanner when its own directory is the root", () => {
+    const violations = scan("scripts");
+    expect(violations.filter((v) => v.file === SCANNER_PATH)).toEqual([]);
+  });
+
+  it("actually skips this test file when its own directory is the root", () => {
+    const violations = scan("test");
+    expect(violations.filter((v) => v.file === THIS_TEST_PATH)).toEqual([]);
+  });
+
+  it("would flag this file without the skip, so the exclusion is load-bearing", () => {
+    // The same scan over the same tree with exclusion disabled. Without this,
+    // the assertion above would be proving only that this file happens to be
+    // clean — a scanner that passes because it cannot see itself is worthless,
+    // and so is a self-exclusion that is never exercised.
+    const withSkip = scan("test").filter((v) => v.file === THIS_TEST_PATH);
+    const withoutSkip = scan("test", NO_EXCLUSIONS).filter(
+      (v) => v.file === THIS_TEST_PATH,
+    );
+    expect(withoutSkip.length).toBeGreaterThan(0);
+    expect(withSkip).toEqual([]);
+  });
+
+  it("still skips both files under the multi-root scan the hook actually runs", () => {
+    // The single-root cases above prove the skip works when the file's own
+    // directory is the root. This proves it survives the widening — scripts/
+    // and test/ are now inside the scanner's own search space, so the skip is
+    // load-bearing on every commit rather than only in these two tests.
+    const violations = scan();
+    expect(violations.filter((v) => v.file === SCANNER_PATH)).toEqual([]);
+    expect(violations.filter((v) => v.file === THIS_TEST_PATH)).toEqual([]);
+  });
+
+  it("would flag this file under the multi-root scan too, without the skip", () => {
+    expect(
+      scan(undefined, NO_EXCLUSIONS).filter((v) => v.file === THIS_TEST_PATH).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("does not rely on the scanner's pattern spellings failing to self-match", () => {
+    // As written, the scanner's own regex literals do not match themselves: a
+    // word-boundary escape puts a word character immediately before the banned
+    // identifier, and the quoted-string patterns put a bracket where a quote
+    // would have to be. That is a coincidence of spelling, not a property, and
+    // one reworded `why` string would end it. The path exclusion is what
+    // actually holds — this asserts the set contains the path, so a future
+    // reader who notices the coincidence does not conclude the skip is dead
+    // weight and delete it.
+    expect(EXCLUDED.has(SCANNER_PATH)).toBe(true);
+    expect(scan("scripts", NO_EXCLUSIONS).filter((v) => v.file === SCANNER_PATH)).toEqual(
+      scan("scripts").filter((v) => v.file === SCANNER_PATH),
+    );
+  });
+});
+
+describe("the socket choke-point is a count constraint, not a pure negative", () => {
+  // Referred to only through the imported SOCKET_IMPORT and SOCKET_OWNER
+  // identifiers. The module specifier itself is never written into this file —
+  // not in a fixture string, not in a title, not in a comment.
+  const owner = { file: SOCKET_OWNER, line: 1, column: 1 };
+  const elsewhere = { file: "src/mail/imap-session.ts", line: 4, column: 1 };
+
+  it("passes when exactly one file reaches it and that file is SOCKET_OWNER", () => {
+    expect(checkSocketOwnership([owner])).toEqual([]);
+  });
+
+  it("reports a violation when a second file reaches it", () => {
+    const violations = checkSocketOwnership([owner, elsewhere]);
+    expect(violations.map((v) => v.pattern)).toEqual(["socket-choke-point-duplicated"]);
+    expect(violations[0]!.file).toBe(elsewhere.file);
+  });
+
+  it("reports a violation when no file reaches it", () => {
+    // A silently-deleted choke-point guards nothing, which is exactly as bad as
+    // a duplicated one and much easier to miss.
+    const violations = checkSocketOwnership([]);
+    expect(violations.map((v) => v.pattern)).toEqual(["socket-choke-point-missing"]);
+  });
+
+  it("is wired into scan(): a tree with no such file fails", () => {
+    // scripts/ contains no file matching SOCKET_IMPORT, so scanning it exercises
+    // the deleted direction against a real tree rather than a synthetic list.
+    expect(scan("scripts").map((v) => v.pattern)).toContain("socket-choke-point-missing");
+  });
+
+  it("still matches the file the ban names", () => {
+    // scan() over src/ is clean, which given the two directions above can only
+    // be true if SOCKET_OWNER is the single match. Asserting SOCKET_IMPORT is a
+    // real pattern rather than an empty one closes the last vacuous reading.
+    expect(SOCKET_IMPORT.source.length).toBeGreaterThan(0);
+    expect(scan().map((v) => v.pattern)).not.toContain("socket-choke-point-missing");
+    expect(scan().map((v) => v.pattern)).not.toContain("socket-choke-point-duplicated");
+  });
+});
+
+describe("host resolution is a count constraint, not a pure negative", () => {
+  // Unlike the socket block above, the hostnames ARE written literally here.
+  // The socket ban is unscoped, so naming the module specifier in this file
+  // would be a violation the path exclusion happens to hide. The host count is
+  // collected from src/ only, so a literal in a test is not a violation at all
+  // — which is deliberate, and is what lets test/dav-discovery.test.ts build
+  // fixture URLs against both hosts. A test that could not name the thing it is
+  // testing would have to assert the pattern is non-empty and stop there.
+  const owner = { file: DAV_HOST_OWNER, line: 30, column: 1 };
+  const elsewhere = { file: "src/dav/calendar.ts", line: 7, column: 1 };
+
+  it("passes when only the discovery module names a host", () => {
+    expect(checkDavHostOwnership([owner])).toEqual([]);
+  });
+
+  it("reports a violation naming the offending file when anything else does", () => {
+    const violations = checkDavHostOwnership([owner, elsewhere]);
+    expect(violations.map((v) => v.pattern)).toEqual(["dav-host-outside-discovery"]);
+    expect(violations[0]!.file).toBe(elsewhere.file);
+  });
+
+  it("reports a violation when nothing resolves a host at all", () => {
+    // The direction a scoped negative cannot see: a discovery module quietly
+    // deleted or renamed satisfies "no hardcoded host" trivially, by way of a
+    // codebase that no longer works.
+    expect(checkDavHostOwnership([]).map((v) => v.pattern)).toEqual([
+      "dav-host-resolution-missing",
+    ]);
+  });
+
+  it("matches both service hosts, and a sharded spelling of either", () => {
+    // A shard constant is the realistic hardcoding — nobody copies the
+    // unsharded root, they copy the home URL out of a diagnostic. Substring
+    // matching is what makes the sharded form a violation too.
+    for (const sample of [
+      'const CALDAV = "https://caldav.icloud.com";',
+      'const CARDDAV = "https://contacts.icloud.com";',
+      'const HOME = "https://p120-caldav.icloud.com/00000000/calendars/";',
+      'const BOOK = "https://p120-contacts.icloud.com/00000000/carddavhome/";',
+    ]) {
+      expect(
+        new RegExp(DAV_HOST_LITERAL.source, DAV_HOST_LITERAL.flags).test(sample),
+        `missed ${sample}`,
+      ).toBe(true);
+    }
+  });
+
+  it("does not match the mail host, which is a different ban on a different tree", () => {
+    expect(
+      new RegExp(DAV_HOST_LITERAL.source, DAV_HOST_LITERAL.flags).test(
+        'connect({ hostname: "imap.mail.me.com", port: 993 });',
+      ),
+    ).toBe(false);
+  });
+
+  it("is wired into scan(): a tree with no such file fails", () => {
+    // scripts/ contains no module naming a host, so scanning it exercises the
+    // deleted direction against a real tree rather than a synthetic list.
+    expect(scan("scripts").map((v) => v.pattern)).toContain("dav-host-resolution-missing");
+    expect(scan().map((v) => v.pattern)).not.toContain("dav-host-resolution-missing");
+    expect(scan().map((v) => v.pattern)).not.toContain("dav-host-outside-discovery");
+  });
+});
+
+describe("the DAV transport choke point is a count constraint too", () => {
+  const owner = { file: DAV_FETCH_OWNER, line: 235, column: 20 };
+  const elsewhere = { file: "src/dav/calendar.ts", line: 12, column: 5 };
+
+  it("passes when only the transport module reaches the network", () => {
+    expect(checkDavFetchOwnership([owner])).toEqual([]);
+  });
+
+  it("reports a violation naming the offending file when a second module does", () => {
+    const violations = checkDavFetchOwnership([owner, elsewhere]);
+    expect(violations.map((v) => v.pattern)).toEqual(["dav-fetch-outside-transport"]);
+    expect(violations[0]!.file).toBe(elsewhere.file);
+  });
+
+  it("reports a violation when no module reaches the network", () => {
+    expect(checkDavFetchOwnership([]).map((v) => v.pattern)).toEqual([
+      "dav-fetch-choke-point-missing",
+    ]);
+  });
+
+  it("matches a bare call and a call through the global object", () => {
+    for (const sample of [
+      "response = await fetch(input, { ...init, headers, redirect: 'manual' });",
+      "const r = await globalThis.fetch(url);",
+    ]) {
+      expect(
+        new RegExp(DAV_FETCH_CALL.source, DAV_FETCH_CALL.flags).test(sample),
+        `missed ${sample}`,
+      ).toBe(true);
+    }
+  });
+
+  it("does not match the injected transport, which differs only in case", () => {
+    // Every DAV caller reaches the network THROUGH the injected function, and
+    // that is the permitted form. A pattern that could not tell the two apart
+    // would report every call site and be switched off within a week.
+    for (const sample of [
+      "const response = await davFetch(url, init);",
+      "const books = await fetchAddressBooks({ account, headers: {}, fetch: davFetch });",
+      "const responses = await propfind({ url, depth: '1', fetch: davFetch });",
+      "export type DavFetch = typeof globalThis.fetch;",
+    ]) {
+      expect(
+        new RegExp(DAV_FETCH_CALL.source, DAV_FETCH_CALL.flags).test(sample),
+        `false-positived on ${sample}`,
+      ).toBe(false);
+    }
+  });
+
+  it("is wired into scan(): a tree with no such file fails", () => {
+    expect(scan("scripts").map((v) => v.pattern)).toContain(
+      "dav-fetch-choke-point-missing",
+    );
+    expect(scan().map((v) => v.pattern)).not.toContain("dav-fetch-choke-point-missing");
+    expect(scan().map((v) => v.pattern)).not.toContain("dav-fetch-outside-transport");
+  });
+});
+
+describe("the write choke point is a count constraint too", () => {
+  // The write is the one thing this project does to the user's account, and
+  // Convention 2 makes it deliberately singular: Claude drafts, the human
+  // reviews and sends. A second module issuing the command is a second write
+  // path arriving without a decision.
+  const owner = { file: APPEND_OWNER, line: 2737, column: 7 };
+  // The realistic second site, and it is realistic rather than hypothetical:
+  // the tool layer is where "just write it from here" gets written, because
+  // that is the layer holding the user's request.
+  const elsewhere = { file: "src/mcp/tools/mail.ts", line: 41, column: 5 };
+
+  it("passes when only the service module constructs the write command", () => {
+    expect(checkAppendOwnership([owner])).toEqual([]);
+  });
+
+  it("reports a violation naming the offending file when a second module does", () => {
+    const violations = checkAppendOwnership([owner, elsewhere]);
+    expect(violations.map((v) => v.pattern)).toEqual(["append-outside-drafts"]);
+    expect(violations[0]!.file).toBe(elsewhere.file);
+  });
+
+  it("reports a violation when no module constructs it at all", () => {
+    // The direction a scoped negative cannot see: "no second write path" is
+    // trivially true of a codebase with no write path, and losing the whole
+    // capability is quieter than gaining a duplicate of it.
+    expect(checkAppendOwnership([]).map((v) => v.pattern)).toEqual([
+      "append-choke-point-missing",
+    ]);
+  });
+
+  it("is wired into scan(): a tree with no write path fails", () => {
+    // scripts/ constructs no command, so scanning it in isolation exercises the
+    // deleted direction against a real tree rather than a synthetic list.
+    expect(scan("scripts").map((v) => v.pattern)).toContain("append-choke-point-missing");
+    expect(scan().map((v) => v.pattern)).not.toContain("append-choke-point-missing");
+    expect(scan().map((v) => v.pattern)).not.toContain("append-outside-drafts");
+  });
+
+  it("matches the two shapes a command line is built in here", () => {
+    // The known-violating samples for this constraint. A count constraint has
+    // no entry on the pattern list, so the set-equality that guards the guard
+    // for every other rule does not reach it — these stand in its place, for
+    // the same stated reason: a pattern that silently matches nothing is
+    // indistinguishable from a rule that was never added.
+    for (const sample of [
+      // The current construction site: after an interpolated tag.
+      "`${tag} APPEND ${quotedMailbox} ${flags} {${message.byteLength}}`,",
+      // The evasion a second writer would actually reach for, because it is
+      // the shortest route: hand the whole line to the generic sender, which
+      // supplies the tag itself.
+      "await send(channel, `APPEND ${mailbox} (\\\\Draft) {${n}}`);",
+      'const line = "APPEND INBOX {12}";',
+    ]) {
+      expect(
+        new RegExp(APPEND_COMMAND.source, APPEND_COMMAND.flags).test(sample),
+        `missed ${sample}`,
+      ).toBe(true);
+    }
+  });
+
+  it("does not fire on the reply, the identifiers, or the prose", () => {
+    // Anchored on the construction rather than on the word, for the reason
+    // DAV_FETCH_CALL is anchored on the call syntax. The success response code
+    // carries the same six letters as a prefix, two constants contain them, and
+    // three modules already discuss the command in prose. A rule that reported
+    // any of those would be switched off within a week — and one that banned
+    // reading the server's own reply would ban the answer to the very command
+    // it protects.
+    for (const sample of [
+      'completion = "a5 OK [APPENDUID 1237268096 92] APPEND completed";',
+      'expect(parseAppendUid("a5 OK APPEND completed")).toBeNull();',
+      "if (bytes.byteLength > MAX_APPEND_LITERAL_BYTES) return null;",
+      'export const DRAFT_APPEND_FLAGS = "(\\\\Draft \\\\Seen)";',
+      " * decide which literal form `APPEND` may use. A tidied copy would be a",
+    ]) {
+      expect(
+        new RegExp(APPEND_COMMAND.source, APPEND_COMMAND.flags).test(sample),
+        `false-positived on ${sample}`,
+      ).toBe(false);
+    }
+  });
+
+  it("does fire on prose that spells the command out with an argument", () => {
+    // Executable form of the discipline the rule's docstring states, and the
+    // reason it is stated there rather than left to luck: the pattern being
+    // case-sensitive and a comment happening to be lowercase is a coincidence,
+    // not a property. Waves 5 through 8 add four more modules under src/, and
+    // their plans ask them to discuss the write path in prose. Describe the
+    // command by role, never by name — this is what it costs not to.
+    expect(
+      new RegExp(APPEND_COMMAND.source, APPEND_COMMAND.flags).test(
+        " * an `APPEND that failed` must not delete the staged object.",
+      ),
+    ).toBe(true);
+  });
+
+  it("does not fire on the test that asserts the command line byte for byte", () => {
+    // test/append.test.ts names the command in order to prove the exchange is
+    // correct, and a fixture is not a code path. The scope is what holds that
+    // apart, so this scans the REAL tree with exclusion disabled — if the scope
+    // were widened to the full surface, the fixture would start failing commits
+    // for asserting the very behaviour the rule protects.
+    const withoutSkip = scan(undefined, NO_EXCLUSIONS);
+    expect(withoutSkip.filter((v) => v.pattern === "append-outside-drafts")).toEqual([]);
+    // Non-vacuous: with the skip disabled, test/ really was read.
+    expect(withoutSkip.map((v) => v.file)).toContain(THIS_TEST_PATH);
+    expect(APPEND_SCOPE).toBe("src/");
+  });
+});
+
+describe("the subscription-feed fetch choke point is a count constraint too", () => {
+  const owner = { file: SUBSCRIPTION_FEED_FETCH_OWNER, line: 90, column: 14 };
+  const elsewhere = { file: "src/dav/calendar.ts", line: 12, column: 5 };
+
+  it("passes when only the subscription-feed module reaches the network", () => {
+    expect(checkSubscriptionFeedFetchOwnership([owner])).toEqual([]);
+  });
+
+  it("reports a violation naming the offending file when a second module does", () => {
+    const violations = checkSubscriptionFeedFetchOwnership([owner, elsewhere]);
+    expect(violations.map((v) => v.pattern)).toEqual([
+      "subscription-feed-fetch-outside-owner",
+    ]);
+    expect(violations[0]!.file).toBe(elsewhere.file);
+  });
+
+  it("reports a violation when no module reaches the network", () => {
+    expect(checkSubscriptionFeedFetchOwnership([]).map((v) => v.pattern)).toEqual([
+      "subscription-feed-fetch-choke-point-missing",
+    ]);
+  });
+
+  it("matches a bare call and a call through the global object", () => {
+    for (const sample of [
+      "response = await fetch(url);",
+      "const r = await globalThis.fetch(url);",
+    ]) {
+      expect(
+        new RegExp(
+          SUBSCRIPTION_FEED_FETCH_CALL.source,
+          SUBSCRIPTION_FEED_FETCH_CALL.flags,
+        ).test(sample),
+        `missed ${sample}`,
+      ).toBe(true);
+    }
+  });
+
+  it("does not match the injected fetcher, which differs only in case", () => {
+    for (const sample of [
+      "const text = await fetchSubscriptionFeed(collection.source);",
+      "export type FetchSubscriptionFeed = typeof fetchSubscriptionFeed;",
+    ]) {
+      expect(
+        new RegExp(
+          SUBSCRIPTION_FEED_FETCH_CALL.source,
+          SUBSCRIPTION_FEED_FETCH_CALL.flags,
+        ).test(sample),
+        `false-positived on ${sample}`,
+      ).toBe(false);
+    }
+  });
+
+  it("is wired into scan(): a tree with no such file fails", () => {
+    expect(scan("scripts").map((v) => v.pattern)).toContain(
+      "subscription-feed-fetch-choke-point-missing",
+    );
+    expect(scan().map((v) => v.pattern)).not.toContain(
+      "subscription-feed-fetch-choke-point-missing",
+    );
+    expect(scan().map((v) => v.pattern)).not.toContain(
+      "subscription-feed-fetch-outside-owner",
+    );
+  });
+});
+
+describe("the count constraints as a set", () => {
+  it("covers every ownership violation id with an exercised sample, in both directions", () => {
+    // The parallel of the rule-id set-equality assertion above, and it exists
+    // for the same reason: a count constraint that can never emit one of its
+    // two ids is indistinguishable from one that was never added. Every id is
+    // produced by actually running a checker, never restated as a literal.
+    const nonOwner = { file: "src/dav/calendar.ts", line: 1, column: 1 };
+    const observed = new Set<string>([
+      ...checkSocketOwnership([
+        { file: SOCKET_OWNER, line: 1, column: 1 },
+        { file: "src/mail/imap-session.ts", line: 1, column: 1 },
+      ]).map((v) => v.pattern),
+      ...checkSocketOwnership([]).map((v) => v.pattern),
+      ...checkDavHostOwnership([nonOwner]).map((v) => v.pattern),
+      ...checkDavHostOwnership([]).map((v) => v.pattern),
+      ...checkDavFetchOwnership([nonOwner]).map((v) => v.pattern),
+      ...checkDavFetchOwnership([]).map((v) => v.pattern),
+      ...checkAppendOwnership([nonOwner]).map((v) => v.pattern),
+      ...checkAppendOwnership([]).map((v) => v.pattern),
+      ...checkSubscriptionFeedFetchOwnership([nonOwner]).map((v) => v.pattern),
+      ...checkSubscriptionFeedFetchOwnership([]).map((v) => v.pattern),
+    ]);
+    expect([...observed].sort()).toEqual([...OWNERSHIP_VIOLATION_IDS].sort());
+  });
+
+  it("gives every count constraint a reason a rejected commit can act on", () => {
+    const nonOwner = { file: "src/dav/calendar.ts", line: 1, column: 1 };
+    const violations = [
+      ...checkSocketOwnership([nonOwner]),
+      ...checkSocketOwnership([]),
+      ...checkDavHostOwnership([nonOwner]),
+      ...checkDavHostOwnership([]),
+      ...checkDavFetchOwnership([nonOwner]),
+      ...checkDavFetchOwnership([]),
+      ...checkAppendOwnership([nonOwner]),
+      ...checkAppendOwnership([]),
+      ...checkSubscriptionFeedFetchOwnership([nonOwner]),
+      ...checkSubscriptionFeedFetchOwnership([]),
+    ];
+    expect(violations.length).toBe(OWNERSHIP_VIOLATION_IDS.length);
+    for (const violation of violations) {
+      expect(violation.why.length, `${violation.pattern} has a label, not a reason`)
+        .toBeGreaterThan(80);
+    }
+  });
+
+  it("keeps the discovery module inside every pattern rule's reach", () => {
+    // The whole point of expressing the hostname rule as a count: EXCLUDED
+    // skips a file for EVERY rule, so buying the hostname exemption with a path
+    // exclusion would have dropped the logging, fan-out and date rules on the
+    // one module that most needs them.
+    expect(EXCLUDED.has(DAV_HOST_OWNER)).toBe(false);
+    expect(EXCLUDED.has(DAV_FETCH_OWNER)).toBe(false);
+    // The same argument for the write, where it bites hardest: the module
+    // holding the write is the module that most needs the logging ban, the
+    // session fan-out ban and the peeking-fetch ban.
+    expect(EXCLUDED.has(APPEND_OWNER)).toBe(false);
+    // And for the subscription-feed fetcher: it is the one module in the
+    // repository handed a stranger-supplied third-party URL, so it is also the
+    // one that most needs the logging ban applying to it in full.
+    expect(EXCLUDED.has(SUBSCRIPTION_FEED_FETCH_OWNER)).toBe(false);
+    const logging = FORBIDDEN.find((r) => r.id === "logging-anywhere-under-src")!;
+    expect(
+      matchRule(logging, 0, DAV_HOST_OWNER, 'console.log("resolved", homeUrl);').length,
+    ).toBeGreaterThan(0);
+  });
+});
+
+describe("the commit-time gate", () => {
+  it("exists, is executable, and still runs both of its checks", () => {
+    // That it *blocks* a commit cannot be asserted from inside the repository
+    // without side effects; that was verified once by hand and recorded in
+    // 01-04-SUMMARY.md.
+    expect(checkCommitHook().map(formatViolation)).toEqual([]);
+  });
+
+  it("reports the gate as missing when it is not there", () => {
+    const violations = checkCommitHook(".husky/pre-commit-that-does-not-exist");
+    expect(violations.map((v) => v.pattern)).toEqual(["commit-gate-missing"]);
+  });
+
+  it("reports a hook body that does not abort on error", () => {
+    // Pointed at a real file that exists, is readable, and is definitively not
+    // a shell script, so the check is exercised against contents rather than
+    // against an absence. A fixture with every other property satisfied would
+    // have to be a file carrying a deliberately-broken copy of the gate, which
+    // is not worth committing to the repository to sharpen one assertion.
+    //
+    // The abort line is the one thing standing between a printed violation and
+    // a successful commit; without it the scan is advisory.
+    const patterns = checkCommitHook("package.json").map((v) => v.pattern);
+    expect(patterns).toContain("commit-gate-no-set-e");
+    expect(patterns).not.toContain("commit-gate-missing");
+  });
+});

@@ -1,0 +1,74 @@
+// Test wiring (D-03, D-09): tests execute inside the real workerd runtime,
+// not a Node mock, so D-03's in-process ordering proof runs the actual Worker.
+//
+// The pool is registered as a Vite *plugin*. The rationale for this import
+// shape — and for the earlier API it replaces — is recorded in
+// .planning/phases/01-foundation-imap-connectivity-proof/01-01-SUMMARY.md
+// rather than here, because this file is grepped for the superseded name.
+//
+// Two projects, because this suite has two genuinely different needs and
+// Vitest 4 does not inherit root plugins into inline projects (that changes in
+// 5, so the plugin is declared inside the project that needs it rather than at
+// the root where it would silently apply to neither):
+//
+//   workers — everything that exercises Worker behaviour. Real workerd.
+//   static  — the forbidden-token scan, which reads the repository off disk.
+//             A Workers isolate has no filesystem, so this cannot run in the
+//             pool: `readFileSync` there resolves against a virtual filesystem
+//             holding only the bundle, and every repo path is a miss.
+//
+// The split is deliberately narrow. Anything that is not filesystem-bound
+// belongs in the workers project, where the runtime is the real one.
+import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
+import { defineConfig } from "vitest/config";
+
+/** The only tests that read the repository tree, and so the only ones that
+ *  must run under Node. Named once and referenced by both projects, so a file
+ *  cannot end up in both or in neither. */
+const FILESYSTEM_TESTS = ["test/forbidden-tokens.test.ts"];
+
+const IGNORED = ["**/node_modules/**", "**/dist/**", "**/.wrangler/**"];
+
+export default defineConfig({
+  test: {
+    projects: [
+      {
+        test: {
+          name: "static",
+          environment: "node",
+          include: FILESYSTEM_TESTS,
+          exclude: IGNORED,
+        },
+      },
+      {
+        plugins: [
+          cloudflareTest({
+            // The pool reads the real Worker config, so tests see the same
+            // compatibility flags, bindings, and entry point that deploys do.
+            wrangler: { configPath: "wrangler.jsonc" },
+            miniflare: {
+              // Fake secrets for tests. Real Secrets live only in Cloudflare and
+              // are never present locally, and D-09 forbids any automated login
+              // to the real Apple ID — no CI, pre-commit, or post-deploy job
+              // ever authenticates against it.
+              bindings: {
+                AUTH_SECRET: "test-secret-not-real",
+                APPLE_ID: "test@example.invalid",
+                APPLE_APP_PASSWORD: "test-password-not-real",
+                R2_ACCOUNT_ID: "test-account-id-not-real",
+                R2_ACCESS_KEY_ID: "test-access-key-not-real",
+                R2_SECRET_ACCESS_KEY: "test-secret-key-not-real",
+                CONFIRM_SECRET: "test-confirm-secret-not-real",
+              },
+            },
+          }),
+        ],
+        test: {
+          name: "workers",
+          include: ["test/**/*.test.ts"],
+          exclude: [...IGNORED, ...FILESYSTEM_TESTS],
+        },
+      },
+    ],
+  },
+});

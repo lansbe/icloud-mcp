@@ -1,0 +1,219 @@
+// Worker configuration (D-04: jsonc, so the rationale can live inline).
+// Every key below exists in wrangler@4.122.0's config-schema.json.
+//
+// ── TEMPLATE ──────────────────────────────────────────────────────────────
+// The tracked copy of this file is `wrangler.jsonc.example`, and the values
+// marked YOUR_* below are placeholders. `npm install` copies this template to
+// `wrangler.jsonc` (git-ignored) if you don't have one yet; edit THAT file and
+// fill in your own Cloudflare account id, KV namespace ids, and custom-domain
+// hostname before deploying. The real secrets (AUTH_SECRET, APPLE_ID, the
+// app-specific password, and the R2 S3 key pair) are Workers Secrets set with
+// `wrangler secret put` and never live in this file at all.
+//
+// The KV namespaces and R2 bucket are account state you create out of band —
+// `wrangler kv namespace create` and `wrangler r2 bucket create` print the ids
+// and confirm the bucket; paste those in. See the per-binding notes below.
+// ──────────────────────────────────────────────────────────────────────────
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "icloud-mcp",
+  "main": "src/index.ts",
+
+  // Pin rationale (D-15): `wrangler` is exact-pinned in package.json and
+  // matched to `@cloudflare/vitest-pool-workers`, which itself depends on
+  // wrangler at an exact version — any other top-level pin installs two
+  // copies and tests then run against a different runtime than deploys.
+  // workers-sdk#9238 broke raw TCP sockets (`cloudflare:sockets`) entirely in
+  // wrangler 4.15.0. Treat every wrangler bump as a SOCKET-affecting change,
+  // not a build-affecting one: a green build proves nothing about a socket.
+  // Re-verify any bump with a live `mail_imap_diagnose` call, never with a
+  // successful `deploy --dry-run` alone.
+  "compatibility_date": "2026-08-01",
+
+  // `agents/mcp/server` imports node:async_hooks at module top level,
+  // unconditionally, before any project code runs. The narrower `nodejs_als`
+  // flag does not mark that module external (workers-sdk#6011) and produces
+  // bundle errors, so the broader flag is required.
+  "compatibility_flags": ["nodejs_compat"],
+
+  // D-02: production only. No *.workers.dev URL and no version preview URLs,
+  // so no second reachable deployment with weaker auth can exist. Criterion
+  // 1's "on every reachable deployment, previews included" clause is
+  // satisfied by there being no previews to gate. `preview_urls` already
+  // defaults to false; it is stated explicitly so a future edit that
+  // re-enables it is a visible change in a diff rather than a silent one.
+  "workers_dev": false,
+  "preview_urls": false,
+
+  // The single production hostname, and the ONE place it is configured. Set it
+  // to your own custom domain before deploying — nothing else in the repo needs
+  // editing. `scripts/hostname.mjs` reads it from here and
+  // `scripts/write-hostname.mjs` bakes it into src/deployed-hostname.generated.ts,
+  // from which createMcpHandler's `allowedHostnames`/`allowedOriginHostnames`
+  // (host/origin validation is silently skipped on a custom domain without them)
+  // and the OAuth provider's `resourceMetadata.resource` URL both derive. That
+  // URL becomes the RFC 8707 token audience, so changing the hostname after
+  // authorization invalidates every issued token.
+  //
+  // Placeholder — set this to your own custom domain in your git-ignored
+  // wrangler.jsonc before deploying.
+  "routes": [
+    { "pattern": "icloud-mcp.example.com", "custom_domain": true }
+  ],
+
+  // The Cloudflare account id. Not a secret — it is an opaque account handle,
+  // not a credential, and the two values that ARE credentials for the same
+  // bucket (the R2 S3 API key pair) are Workers Secrets and appear nowhere in
+  // this repository. It is needed to build the presigned-upload URL host, and
+  // it lives in config for the same reason the route hostname above does: one
+  // declared place, so a change is visible in a diff rather than buried as a
+  // literal under src/.
+  "vars": {
+    "R2_ACCOUNT_ID": "YOUR_CLOUDFLARE_ACCOUNT_ID"
+  },
+
+  // Required by @cloudflare/workers-oauth-provider for token storage. The
+  // BINDING name OAUTH_KV is NOT configurable — the library reads
+  // env.OAUTH_KV directly in its shipped JavaScript. No Durable Object is
+  // involved, so this config carries no `migrations` block.
+  //
+  // The namespace TITLE, however, is free, and it is deliberately NOT
+  // "OAUTH_KV": a namespace by that bare name already exists on this
+  // Cloudflare account, belonging to a sibling MCP Worker that uses the same
+  // library. Pointing this binding at it would put two different servers'
+  // OAuth grants, clients, and token records in one keyspace — two providers
+  // on different library versions sharing a store, where one of them reaches
+  // real personal mail. Isolation here is structural rather than something
+  // the audience check has to be trusted to enforce after the fact.
+  //
+  // DAV_CACHE (D-58) is a SECOND namespace rather than a key prefix inside the
+  // one above. OAUTH_KV holds the OAuth provider library's own grants, clients
+  // and token records, and the library owns its key prefixes in shipped
+  // JavaScript this project does not control — so "just prefix the keys" is a
+  // convention only one of the two writers has agreed to. This namespace holds
+  // discovery metadata only: three resolved URLs per service, 24-hour TTL
+  // (D-59), never message or contact content. Its title carries the project
+  // prefix for the same reason the one above does — a bare name is exactly the
+  // sort of title a sibling MCP Worker on this account also reaches for.
+  //
+  // ONE BINDING NAME IS PROHIBITED PROJECT-WIDE, and this is the only place it
+  // is written down: a Worker var or Secret named DEBUG must never be created.
+  // tsdav inlines a logging library whose activation check reads
+  // `process.env.DEBUG`; this Worker sets `nodejs_compat` with a
+  // `compatibility_date` past the date the populate-process-env flag defaults
+  // on, so a binding by that name lands in `process.env` — and `observability`
+  // below has logs enabled, so what it turns on is retained Cloudflare storage,
+  // not a terminal. What would then be logged is the Apple ID by name
+  // (tsdav's own Basic-auth helper names it; this project does not call that
+  // helper) and raw DAV response bodies. Stated honestly rather than
+  // overstated: the app-specific password is base64'd inside a header string
+  // and is never separately named, the zero-logging rule in ./.claude/CLAUDE.md
+  // §4 governs src/ while the library lives in node_modules/, and
+  // scripts/forbidden-tokens.mjs cannot see inside node_modules/ at all. The
+  // only reachable activation path is a binding this project controls and will
+  // not create, which is why a comment is the whole mitigation.
+  // CONFIRM_KV (D5-3 option A) is a THIRD namespace on the same reasoning that
+  // made DAV_CACHE a second one, and it matters more here than it did there.
+  // DAV_CACHE holds a cache whose corruption costs two extra PROPFINDs;
+  // CONFIRM_KV holds the only record of which calendar-write capability tokens
+  // have already been spent, so a key that collides with a discovery entry is a
+  // confirmation that can be replayed. One key per spent token,
+  // `confirm:v1:<jti>`, value "1", expiring with the token itself.
+  //
+  // Its TITLE carries the project prefix for the same reason both titles above
+  // do — a bare `confirm` or `confirmations` is precisely the sort of name a
+  // sibling Worker on this account also reaches for, and this account already
+  // demonstrated that hazard concretely when a namespace named plainly
+  // `OAUTH_KV` turned out to belong to a different MCP Worker.
+  //
+  // THE NAMESPACE IS ACCOUNT STATE AND IS NOT IN GIT. Nothing in this file
+  // creates it: `wrangler kv namespace create` does, out of band, and this
+  // config only points at the id that command printed. The id below is
+  // therefore a claim about the account that this repository cannot check.
+  // It is recorded verbatim in
+  // .planning/phases/05-calendar-write-preview-then-commit-safety/05-UAT.md,
+  // which is the only place a reader can confirm the namespace exists at all —
+  // the same arrangement the R2 lifecycle rule below uses, and for the same
+  // reason.
+  //
+  // `wrangler deploy --dry-run` is NOT evidence that this entry is right. It
+  // does not resolve namespace ids against the account, and it does not
+  // validate inside a `limits` block at all — a bad config there produces no
+  // output and exit 0. `wrangler kv namespace list` naming the id is the check.
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "YOUR_OAUTH_KV_NAMESPACE_ID" },
+    { "binding": "DAV_CACHE", "id": "YOUR_DAV_CACHE_NAMESPACE_ID" },
+    { "binding": "CONFIRM_KV", "id": "YOUR_CONFIRM_KV_NAMESPACE_ID" }
+  ],
+
+  // Attachment staging (D-83, ATT-03). A bucket of its own rather than a prefix
+  // inside an existing one, for exactly the reason DAV_CACHE above is a second
+  // namespace rather than a key prefix in the first: "just prefix the keys" is
+  // a convention only one of the writers ever agreed to.
+  //
+  // The bucket NAME carries the project prefix for the same reason both
+  // namespace titles above do — a bare `attachments` is precisely the sort of
+  // name a sibling Worker on this account also reaches for, and twelve other
+  // buckets already share this account (D-58).
+  //
+  // The name deliberately carries no environment suffix. The `staging/` prefix
+  // INSIDE the bucket already carries that meaning, and four sibling buckets on
+  // this account use a suffix to denote environment instead, so a `-staging`
+  // suffix here would be the odd one out meaning something different from every
+  // neighbour.
+  //
+  // That `staging/` prefix carries a lifecycle rule named
+  // `expire-staged-attachments` which expires objects after one day (D-82).
+  // THE RULE IS NOT IN GIT AND NOTHING HERE RECREATES IT: R2 lifecycle rules
+  // are account state, created out of band via the wrangler R2 CLI, and this
+  // config has no key that expresses one. Its listing is recorded verbatim in
+  // .planning/phases/04-mail-write-attachments/04-UAT.md, which is the only
+  // place a reader can confirm the sweep exists at all.
+  //
+  // The ordering of the two 24-hour numbers is what makes one day the right
+  // figure, and it only works in this direction: R2 executes expiry WITHIN 24
+  // hours of the deadline, so staged bytes live 24-48 hours while a staged id
+  // token dies at exactly 24. The token therefore always expires BEFORE the
+  // bytes, never after, and a still-valid staged id can never name an object
+  // that expiry has already removed. Reversing them produces exactly that.
+  //
+  // No `remote` key here, deliberately. `wrangler r2 bucket create` offers to
+  // add one, and accepting it points local dev and the vitest pool at the real
+  // bucket. This phase's tests do put/get/delete round-trips; they must hit
+  // Miniflare's local R2, which is what the pool supplies from this block
+  // alone. The fake credentials in vitest.config.ts exist for the same reason.
+  "r2_buckets": [
+    { "binding": "ATTACHMENT_STAGING", "bucket_name": "icloud-mcp-attachments" }
+  ],
+
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "invocation_logs": true }
+  }
+
+  // NOTE: the "limits" block accepts ONLY `cpu_ms` and `subrequests`.
+  // UserLimits declares "additionalProperties": false, but that lives in
+  // config-schema.json — it is honoured by schema-aware editors, NOT by the
+  // deploy path. Wave 1 put an invalid connection-cap key in this block and
+  // ran `wrangler deploy --dry-run`: no output, exit 0. So an unknown key here
+  // is silently accepted and silently does nothing, and this note is the only
+  // place a reader learns that. `scanWranglerConfig()` in
+  // scripts/forbidden-tokens.mjs fails the scan on that key for the same
+  // reason — and it matches this file's raw text, comments included, which is
+  // why the key is described here rather than spelled out. The one place it is
+  // written down is that scanner.
+  //
+  // There is no key for capping simultaneous connections — workers-sdk#13609
+  // requested one and it did not ship. The six-connection cap is therefore not
+  // configurable at all (D-10). Two things hold the shape instead, and neither
+  // is a constant:
+  //
+  //   1. connectImap() in src/mail/socket.ts takes no parameters, so one live
+  //      socket per request is the only shape a caller can express.
+  //   2. The `concurrent-connect` rule in scripts/forbidden-tokens.mjs fails
+  //      the scan, and the commit, on a concurrent combinator wrapped around
+  //      that helper.
+  //
+  // MAX_CONCURRENT_CONNECTIONS in src/mail/socket.ts documents the ceiling and
+  // why it is three rather than six; it does not enforce it. No code reads it.
+}
