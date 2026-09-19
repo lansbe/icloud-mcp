@@ -52,16 +52,16 @@ function row(name: string): UserIdVector {
 }
 
 describe("the walk sees rows at all, so an empty filter cannot pass", () => {
-  it("holds at least 11 accepted rows and at least 17 refused rows", () => {
+  it("holds at least 12 accepted rows and at least 18 refused rows", () => {
     // THE discriminating case for every walk in this file. Asserted first.
     expect(
       HEX_ROWS.length,
       "too few accepted rows: the filter matched nothing, or rows were removed",
-    ).toBeGreaterThanOrEqual(11);
+    ).toBeGreaterThanOrEqual(12);
     expect(
       REFUSED_ROWS.length,
       "too few refused rows: the filter matched nothing, or rows were removed",
-    ).toBeGreaterThanOrEqual(17);
+    ).toBeGreaterThanOrEqual(18);
   });
 
   it("sorts every row into exactly one of the two groups", () => {
@@ -106,7 +106,12 @@ describe("every row is well formed", () => {
 });
 
 describe("values that mean the same thing meet", () => {
-  it.each(["a-padded-mixed-case", "a-nbsp-padded", "a-bom-prefixed"])(
+  it.each([
+    "a-padded-mixed-case",
+    "a-nbsp-padded",
+    "a-bom-prefixed",
+    "a-trailing-newline",
+  ])(
     "%s is user A",
     (name) => {
       expect(
@@ -116,7 +121,12 @@ describe("values that mean the same thing meet", () => {
     },
   );
 
-  it.each(["a-padded-mixed-case", "a-nbsp-padded", "a-bom-prefixed"])(
+  it.each([
+    "a-padded-mixed-case",
+    "a-nbsp-padded",
+    "a-bom-prefixed",
+    "a-trailing-newline",
+  ])(
     "%s is a different input from the plain address",
     (name) => {
       // Otherwise the row above would be comparing A with A.
@@ -162,11 +172,12 @@ describe("values that only just differ stay apart", () => {
   });
 
   it("gives every distinct accepted person a distinct user id", () => {
-    // The three spellings of A are the only rows allowed to repeat a value.
+    // The four spellings of A are the only rows allowed to repeat a value.
     const meeting = new Set([
       "a-padded-mixed-case",
       "a-nbsp-padded",
       "a-bom-prefixed",
+      "a-trailing-newline",
     ]);
     const people = HEX_ROWS.filter((one) => !meeting.has(one.name));
     expect(
@@ -245,6 +256,52 @@ describe("every decision has a row holding it in place", () => {
       "the row no longer lowercases to plain ASCII, so either order refuses it",
     ).toBe(true);
     expect(kelvin.expected, "a non-ASCII input must be refused").toBe(REFUSED);
+  });
+
+  it("holds the two rows Phase 8 added, with their code points intact", () => {
+    // Both rows hold a code point nobody can see in a diff. A tool that carried
+    // the file could have turned the escape into the raw character, or dropped
+    // it, and the row would then pin something other than what its name says.
+    //
+    // Every code point is named by its number here, never typed, so nothing
+    // that rewrites this file can change what is being compared.
+    const plain = row("user-a").input;
+
+    // The zero-width space: the trim does NOT remove it, so the input is not
+    // ASCII, and it is refused.
+    const zeroWidth = row("zero-width-space-prefixed");
+    expect(
+      zeroWidth.input.charCodeAt(0),
+      "the row does not start with the zero-width space: the escape was lost",
+    ).toBe(0x200b);
+    expect(
+      zeroWidth.input.length,
+      "the row must be one code unit longer than the plain address",
+    ).toBe(23);
+    expect(
+      zeroWidth.input.trim().charCodeAt(0),
+      "the trim removed the zero-width space, so the row pins nothing",
+    ).toBe(0x200b);
+    expect(zeroWidth.expected, "a non-ASCII input must be refused").toBe(REFUSED);
+
+    // The trailing newline: the trim DOES remove it, so this is A.
+    const newline = row("a-trailing-newline");
+    expect(
+      newline.input.charCodeAt(newline.input.length - 1),
+      "the row does not end with a line feed: the escape was lost",
+    ).toBe(0x0a);
+    expect(
+      newline.input.length,
+      "the row must be one code unit longer than the plain address",
+    ).toBe(23);
+    expect(
+      newline.input.trim(),
+      "the row must trim to exactly the plain address",
+    ).toBe(plain);
+    expect(
+      newline.expected,
+      "a spelling of A must get A's user id",
+    ).toBe(row("user-a").expected);
   });
 
   it("refuses the empty and the spaces-only input", () => {

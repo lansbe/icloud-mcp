@@ -79,7 +79,8 @@ const LOCAL_PART_239 = "a".repeat(239);
  * Every row, in the order the spec was written.
  *
  * Read the accepted rows in two groups. Some must MEET: the padded, the
- * NBSP-padded and the BOM-prefixed spellings of A are all A. Others must STAY
+ * NBSP-padded, the BOM-prefixed and the newline-ended spellings of A are all
+ * A. Others must STAY
  * APART: a `+tag` address and the three Apple domains are each their own
  * person. Folding any of those together would make two people one user.
  */
@@ -135,6 +136,12 @@ export const USER_ID_VECTORS: readonly UserIdVector[] = [
     pins: "D-18 BOM removed by trim",
   },
   {
+    name: "a-trailing-newline",
+    input: "user-a@example.invalid\n",
+    expected: USER_A_VECTOR.expected,
+    pins: "D-10 trailing newline removed by trim",
+  },
+  {
     name: "max-length-254",
     input: `${LOCAL_PART_238}@example.invalid`,
     expected: "68c1388e82a845c684acbd4e4fa2ea8b60c419782e138437866f291d357361ab",
@@ -187,6 +194,12 @@ export const USER_ID_VECTORS: readonly UserIdVector[] = [
     input: "\u0000user-a@example.invalid",
     expected: REFUSED,
     pins: "D-09, D-10 trim does not remove NUL",
+  },
+  {
+    name: "zero-width-space-prefixed",
+    input: "\u200buser-a@example.invalid",
+    expected: REFUSED,
+    pins: "D-09, D-19 trim does not remove U+200B",
   },
   {
     name: "double-at",
