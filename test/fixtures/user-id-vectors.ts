@@ -172,6 +172,12 @@ export const USER_ID_VECTORS: readonly UserIdVector[] = [
     pins: "D-09 lowercases to i plus U+0307",
   },
   {
+    name: "kelvin-sign",
+    input: "\u212aelvin@example.invalid",
+    expected: REFUSED,
+    pins: "D-09, D-19 checked before lowercase, U+212A lowercases to ASCII k",
+  },
+  {
     name: "nul-prefixed",
     input: "\u0000user-a@example.invalid",
     expected: REFUSED,

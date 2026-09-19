@@ -52,7 +52,7 @@ function row(name: string): UserIdVector {
 }
 
 describe("the walk sees rows at all, so an empty filter cannot pass", () => {
-  it("holds at least 11 accepted rows and at least 16 refused rows", () => {
+  it("holds at least 11 accepted rows and at least 17 refused rows", () => {
     // THE discriminating case for every walk in this file. Asserted first.
     expect(
       HEX_ROWS.length,
@@ -61,7 +61,7 @@ describe("the walk sees rows at all, so an empty filter cannot pass", () => {
     expect(
       REFUSED_ROWS.length,
       "too few refused rows: the filter matched nothing, or rows were removed",
-    ).toBeGreaterThanOrEqual(16);
+    ).toBeGreaterThanOrEqual(17);
   });
 
   it("sorts every row into exactly one of the two groups", () => {
@@ -206,7 +206,7 @@ describe("the length cap is pinned where it is measured", () => {
 });
 
 describe("every decision has a row holding it in place", () => {
-  it.each(["D-09", "D-10", "D-11", "D-17", "D-18"])(
+  it.each(["D-09", "D-10", "D-11", "D-17", "D-18", "D-19"])(
     "%s is pinned by at least one row",
     (decision) => {
       expect(
@@ -215,6 +215,37 @@ describe("every decision has a row holding it in place", () => {
       ).toBeGreaterThanOrEqual(1);
     },
   );
+
+  it("holds the one row where the order of the ASCII check changes the answer", () => {
+    // D-19, settled by the owner: the ASCII check runs on the trimmed input,
+    // BEFORE lowercasing. The Kelvin sign is the code point that tells the two
+    // orders apart. It is not ASCII as typed, and it lowercases to a plain k. A
+    // function that checked after lowercasing would accept this row, and hand
+    // it the same user id as the plain address.
+    //
+    // The code point is named by its number here, never typed, so nothing that
+    // rewrites this file can change what is being compared.
+    const kelvin = row("kelvin-sign");
+    const isPrintableAscii = (text: string): boolean =>
+      [...text].every((one) => {
+        const code = one.charCodeAt(0);
+        return code >= 0x21 && code <= 0x7e;
+      });
+
+    expect(
+      kelvin.input.charCodeAt(0),
+      "the row does not start with the Kelvin sign: the escape was lost",
+    ).toBe(0x212a);
+    expect(
+      isPrintableAscii(kelvin.input.trim()),
+      "the row is ASCII as typed, so it pins nothing",
+    ).toBe(false);
+    expect(
+      isPrintableAscii(kelvin.input.trim().toLowerCase()),
+      "the row no longer lowercases to plain ASCII, so either order refuses it",
+    ).toBe(true);
+    expect(kelvin.expected, "a non-ASCII input must be refused").toBe(REFUSED);
+  });
 
   it("refuses the empty and the spaces-only input", () => {
     expect(row("empty").input, "the empty row must be empty").toBe("");
