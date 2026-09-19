@@ -65,6 +65,7 @@ import {
   resolveStagedAttachments,
   stageInlineBytes,
 } from "../src/mcp/tools/mail";
+import { TOKEN_DECODER, fromBase64Url } from "../src/tokens";
 import {
   CANARY_SUMMARY_A,
   EVENT_A_ID,
@@ -80,6 +81,7 @@ import {
   readToolResult,
   toolsFor,
 } from "./fixtures/two-users";
+import type { TwoUserDavStub } from "./fixtures/two-user-dav";
 import type { RecordedToolResult } from "./fixtures/two-users";
 
 const DECODER = new TextDecoder();
@@ -764,4 +766,197 @@ describe("home-set check: an event id only works under the caller's own home", (
   it.todo(
     "home-set check through the registered callbacks: cannot run until Phase 9 threads the principal into the tool callbacks",
   );
+});
+
+// ---------------------------------------------------------------------------
+// The calendar confirm flow, with two users
+//
+// A previews a change and is handed a one-time token. B gets hold of the token
+// and the change, and tries to commit them.
+//
+// **Every turn change forgets the cached DAV home first.** Today the calendar
+// callbacks key that cache by the pool's own identity, not by the user. Left
+// alone, B's commit would find the home A's preview just cached, the home-set
+// check would pass for B, and the test would be measuring this fixture instead
+// of the code. The warning sign is "B's commit is not refused".
+// ---------------------------------------------------------------------------
+
+/** What A's preview handed back: the one-time token and the change it covers. */
+interface PreviewOfA {
+  readonly confirmToken: string;
+  readonly change: Record<string, unknown>;
+}
+
+/**
+ * A previews a move of A's event by one hour, against the two-home stub.
+ *
+ * It installs the stub, so every later call in the same test goes to it too.
+ * Gives null when the call gave null or the preview carried no token.
+ *
+ * It holds no assertion and it never throws, so it is safe inside an
+ * expected-fail body.
+ */
+async function previewAsA(stub: TwoUserDavStub): Promise<PreviewOfA | null> {
+  try {
+    await clearDavCache(env, "caldav");
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await toolsFor(USER_A).call("calendar_update_event", {
+      id: EVENT_A_ID,
+      startLocal: "2026-02-10T16:00:00",
+      endLocal: "2026-02-10T17:00:00",
+    });
+    if (result === null) return null;
+
+    const parsed = readToolResult(result);
+    const confirmToken = parsed.trusted?.confirmToken;
+    const change = parsed.untrusted?.change;
+    if (typeof confirmToken !== "string") return null;
+    if (typeof change !== "object" || change === null) return null;
+    return { confirmToken, change: change as Record<string, unknown> };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The jti inside a confirm token, or null.
+ *
+ * The token's first part is plain base64url JSON, so reading it needs no key.
+ * Field `j` is the jti. It holds no assertion and it never throws.
+ */
+function jtiOf(token: string): string | null {
+  try {
+    const first = token.split(".")[0];
+    if (first === undefined) return null;
+    const parsed: unknown = JSON.parse(
+      TOKEN_DECODER.decode(fromBase64Url(first)),
+    );
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const jti = (parsed as Record<string, unknown>).j;
+    return typeof jti === "string" && jti.length > 0 ? jti : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Every confirm key that holds `jti`, or null if the store could not be listed.
+ *
+ * It matches on the jti and not on today's exact key. Phase 10 changes the key
+ * shape, and a check tied to today's shape would go quiet that day and start
+ * reporting "nothing written" for ever. It holds no assertion and never throws.
+ */
+async function confirmKeysHolding(jti: string): Promise<string[] | null> {
+  try {
+    const listed = await env.CONFIRM_KV.list({ prefix: "confirm:" });
+    return listed.keys
+      .map((one) => one.name)
+      .filter((name) => name.includes(jti))
+      .sort();
+  } catch {
+    return null;
+  }
+}
+
+describe("confirm token: a one-time confirmation belongs to the user who previewed", () => {
+  // This is the proof that the slot leak assertion further down CAN pass. It
+  // is the same predicate, on the same tool, for a commit nobody interfered
+  // with. If this goes red because the flag did not read as false, the fault
+  // is in `readToolResult`, which must give a strict boolean. Fix it there.
+  it("control: A's own commit succeeds", async () => {
+    const stub = twoUserDavStub();
+
+    const preview = await previewAsA(stub);
+    expect(preview, "the fixture failed to preview").not.toBeNull();
+    if (preview === null) throw new Error("unreachable");
+
+    const jti = jtiOf(preview.confirmToken);
+    expect(jti, "the token's jti could not be read").not.toBeNull();
+    if (jti === null) throw new Error("unreachable");
+
+    // A preview alone writes nothing. So the store check below CAN come back
+    // empty, which is what the CONFIRM_KV leak assertion needs to be able to do.
+    expect(
+      await confirmKeysHolding(jti),
+      "a preview alone wrote the jti into the store",
+    ).toEqual([]);
+
+    const resultA = await toolsFor(USER_A).call("calendar_commit", {
+      confirmToken: preview.confirmToken,
+      change: preview.change,
+    });
+    expect(resultA, "the tool is missing or its callback threw").not.toBeNull();
+    if (resultA === null) throw new Error("unreachable");
+
+    expect(
+      readToolResult(resultA).isError,
+      "A's own commit was refused",
+    ).toBe(false);
+
+    const writes = stub.observed.filter((one) => one.method === "PUT");
+    expect(writes.length, "A's commit did not issue exactly one write").toBe(1);
+    expect(writes[0]!.user, "A's write did not carry A's credentials").toBe("A");
+    expect(
+      writes[0]!.url.startsWith(HOME_A),
+      "A's write did not go to a URL under A's home",
+    ).toBe(true);
+
+    // And the store check can see a jti that IS there.
+    expect(
+      (await confirmKeysHolding(jti))?.length,
+      "A's own commit did not record A's jti",
+    ).toBe(1);
+  });
+
+  it("control: B's commit with A's token is refused and writes nothing under A's home", async () => {
+    const stub = twoUserDavStub();
+
+    const preview = await previewAsA(stub);
+    expect(preview, "the fixture failed to preview").not.toBeNull();
+    if (preview === null) throw new Error("unreachable");
+
+    await clearDavCache(env, "caldav");
+    const resultB = await toolsFor(USER_B).call("calendar_commit", {
+      confirmToken: preview.confirmToken,
+      change: preview.change,
+    });
+    expect(resultB, "the tool is missing or its callback threw").not.toBeNull();
+    if (resultB === null) throw new Error("unreachable");
+
+    expect(
+      readToolResult(resultB).isError,
+      "B's commit with A's token was not refused",
+    ).toBe(true);
+
+    expect(
+      stub.observed.filter(
+        (one) =>
+          (one.method === "PUT" || one.method === "DELETE") &&
+          one.user === "B" &&
+          one.url.startsWith(HOME_A),
+      ),
+      "a write carrying B's credentials reached a URL under A's home",
+    ).toEqual([]);
+    expect(
+      stub.observed.filter(
+        (one) => one.method === "PUT" || one.method === "DELETE",
+      ),
+      "B's refused commit still issued a write somewhere",
+    ).toEqual([]);
+
+    // B was refused for the expected reason. A token that failed to verify is
+    // refused before any request is made. B's requests are on the list, so the
+    // token verified, B's own home was resolved, and the home-set check is what
+    // turned B away.
+    expect(
+      stub.observed.filter((one) => one.user === "B").length,
+      "B was refused before B's home was ever resolved",
+    ).toBeGreaterThan(0);
+
+    expect(
+      JSON.stringify(resultB),
+      "B received text from A's event",
+    ).not.toContain(CANARY_SUMMARY_A);
+  });
 });
