@@ -85,8 +85,9 @@ import {
   readToolResult,
   toolsFor,
 } from "./fixtures/two-users";
+import type { StagedAttachments } from "../src/mcp/tools/mail";
 import type { TwoUserDavStub } from "./fixtures/two-user-dav";
-import type { RecordedToolResult } from "./fixtures/two-users";
+import type { Attempt, RecordedToolResult } from "./fixtures/two-users";
 
 const DECODER = new TextDecoder();
 const ENCODER = new TextEncoder();
@@ -124,6 +125,35 @@ async function stageAsA(
     return { id: staged.id, key: decodeStagedId(staged.id, now).key };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Did B end up holding A's canary? This is what decides the two staged-read
+ * leaks.
+ *
+ * It looks for A's bytes in what B got, and not at whether B's call threw. A
+ * fix is free to refuse B by throwing, or by handing back a result with no
+ * files in it, or a filtered one. All three read as "no leak" here. A check
+ * on the throw alone would stay failing for ever under the second and third,
+ * while its message went on saying B had received A's bytes.
+ *
+ * The two controls beside the leak tests decode the same field and find the
+ * canary there, so this is known to be able to say yes.
+ *
+ * It holds no assertion and it never throws.
+ */
+function holdsCanary(
+  outcome: Attempt<StagedAttachments>,
+  canary: string,
+): boolean {
+  try {
+    if (outcome.refused) return false;
+    return outcome.value.attachments.some((one) =>
+      DECODER.decode(one.content).includes(canary),
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -304,7 +334,13 @@ describe("R2 staging, read: a staged file belongs to the user who staged it", ()
     ).toBe(MARKER_A);
   });
 
-  // RECORDED 2026-09-19, run as a plain test before this mark was added:
+  // RECORDED 2026-09-19, run as a plain test, after the check was moved from
+  // "B's call threw" to "B holds A's canary":
+  //
+  //   AssertionError: LEAK: B received A's file bytes: expected true to be false // Object.is equality
+  //
+  // SUPERSEDED, recorded 2026-09-19 before the mark was first added, when the
+  // check was on the throw alone. Kept so the history stays honest:
   //
   //   AssertionError: LEAK: B received A's file bytes: expected false to be true // Object.is equality
   //
@@ -324,7 +360,10 @@ describe("R2 staging, read: a staged file belongs to the user who staged it", ()
       resolveStagedAttachments(envFor(USER_B), [idFromA], now),
     );
 
-    expect(outcome.refused, "LEAK: B received A's file bytes").toBe(true);
+    expect(
+      holdsCanary(outcome, MARKER_A),
+      "LEAK: B received A's file bytes",
+    ).toBe(false);
   });
 });
 
@@ -424,7 +463,13 @@ describe("staged id, built by hand: the id proves nothing about who holds it", (
     ).toBe(MARKER_A);
   });
 
-  // RECORDED 2026-09-19, run as a plain test before this mark was added:
+  // RECORDED 2026-09-19, run as a plain test, after the check was moved from
+  // "B's call threw" to "B holds A's canary":
+  //
+  //   AssertionError: LEAK: B read A's file bytes with a staged id B built by hand: expected true to be false // Object.is equality
+  //
+  // SUPERSEDED, recorded 2026-09-19 before the mark was first added, when the
+  // check was on the throw alone. Kept so the history stays honest:
   //
   //   AssertionError: LEAK: B read A's file bytes with a staged id B built by hand: expected false to be true // Object.is equality
   //
@@ -454,9 +499,9 @@ describe("staged id, built by hand: the id proves nothing about who holds it", (
     );
 
     expect(
-      outcome.refused,
+      holdsCanary(outcome, MARKER_A),
       "LEAK: B read A's file bytes with a staged id B built by hand",
-    ).toBe(true);
+    ).toBe(false);
   });
 });
 
