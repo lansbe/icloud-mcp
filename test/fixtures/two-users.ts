@@ -210,15 +210,26 @@ export function toolsFor(user: TestUser, extra?: ExtraTools): UserTools {
     },
   } as unknown as McpServer;
 
-  registerMailTools(server, createSessionGate());
-  registerCalendarTools(server, createDavFetch(envFor(user)));
+  // **Building the tools must not throw either**, for the same reason `call`
+  // must not. A leak test writes `toolsFor(USER_B).call(...)` inside its
+  // expected-fail body, so a throw from a registrar would land in that body and
+  // count as the expected failure. A registrar that throws leaves whatever was
+  // recorded before it. `call` then gives null for a tool that never made it
+  // onto the list, the leak test returns early, and the controls and the
+  // fixture pins, which assert on `names` and on a real result, go red.
+  try {
+    registerMailTools(server, createSessionGate());
+    registerCalendarTools(server, createDavFetch(envFor(user)));
 
-  // After the real registrations, onto the same list, so an extra tool is
-  // reached through the very same `call` path as a real one.
-  if (extra !== undefined) {
-    extra((name, callback) => {
-      recorded.push({ name, callback });
-    });
+    // After the real registrations, onto the same list, so an extra tool is
+    // reached through the very same `call` path as a real one.
+    if (extra !== undefined) {
+      extra((name, callback) => {
+        recorded.push({ name, callback });
+      });
+    }
+  } catch {
+    // Deliberately empty. See the comment above.
   }
 
   return {
