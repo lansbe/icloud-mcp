@@ -22,8 +22,8 @@
 // turns ANY failure inside such a body into a pass and throws the error away.
 // It cannot tell "B got A's bytes" from a typo. So a body that blew up in setup
 // would sit there looking like recorded evidence of a leak while proving
-// nothing. Three rules close that, and every expected-fail body in this file
-// follows all three:
+// nothing. Four rules close that, and every expected-fail body in this file
+// follows all four:
 //
 //   1. Only the leak assertion may throw. It is the one `expect` in the body,
 //      and its message starts `LEAK:` and says what leaked in plain words.
@@ -33,6 +33,10 @@
 //   3. B's action goes through `attempt()`, which turns a throw into a value.
 //      After the fix B's call will throw, and a throw that escaped would keep
 //      the expected fail "failing" for ever.
+//   4. The hooks cannot throw. The runner flips a throw from a hook the same
+//      way it flips one from the body. So the setup hook records how it went in
+//      `storesClean`, a plain test asserts that flag, and every expected-fail
+//      body returns early when it is false.
 //
 // Before any test here was marked, it was run once as a plain test and its
 // failure line was captured. That line is copied in a comment above the test,
@@ -225,25 +229,55 @@ async function forgetEveryDavHome(): Promise<void> {
  * Nothing left over, before every case: an empty bucket, no confirm keys and no
  * cached DAV home. This is what makes the file give the same result in any
  * order.
+ *
+ * **This hook cannot throw, and that is the point.** The runner runs a hook
+ * inside the same place it runs the test body, so a throw from here would be
+ * flipped into a pass for every expected fail in the file at once, and the
+ * error would be thrown away. So the hook holds no assertion and goes through
+ * `attempt()`. It records how it went in `storesClean` instead:
+ *
+ *   - "fixture: every store starts empty" is a plain test that asserts the
+ *     flag, so a broken cleanup goes red there, with a message.
+ *   - Every expected-fail body returns early when the flag is false. The body
+ *     then passes, so its mark goes red too. Nothing is recorded as a leak on
+ *     a run where the stores were never cleaned.
  */
+let storesClean = false;
+
+/** False once a teardown did not finish, so the next setup knows about it. */
+let mocksCleared = true;
+
 beforeEach(async () => {
-  for (const key of await everyStagedKey()) {
-    await env.ATTACHMENT_STAGING.delete(key);
-  }
-  expect(await everyStagedKey()).toEqual([]);
-
-  for (const key of await everyConfirmKey()) {
-    await env.CONFIRM_KV.delete(key);
-  }
-  expect(await everyConfirmKey()).toEqual([]);
-
-  await forgetEveryDavHome();
+  storesClean = false;
+  const cleaned = await attempt(async () => {
+    for (const key of await everyStagedKey()) {
+      await env.ATTACHMENT_STAGING.delete(key);
+    }
+    for (const key of await everyConfirmKey()) {
+      await env.CONFIRM_KV.delete(key);
+    }
+    await forgetEveryDavHome();
+    return (
+      (await everyStagedKey()).length === 0 &&
+      (await everyConfirmKey()).length === 0
+    );
+  });
+  storesClean = !cleaned.refused && cleaned.value && mocksCleared;
 });
 
-/** No stubbed `fetch` and no mock outlives the test that installed it. */
+/**
+ * No stubbed `fetch` and no mock outlives the test that installed it.
+ *
+ * It cannot throw either, for the same reason. A teardown that did not finish
+ * is carried into `storesClean` by the next setup.
+ */
 afterEach(() => {
-  vi.unstubAllGlobals();
-  vi.restoreAllMocks();
+  try {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  } catch {
+    mocksCleared = false;
+  }
 });
 
 describe("R2 staging, read: a staged file belongs to the user who staged it", () => {
@@ -279,6 +313,7 @@ describe("R2 staging, read: a staged file belongs to the user who staged it", ()
   // red with "Expect test to fail": remove the mark then, on purpose, and leave
   // the body exactly as it is.
   it.fails("B cannot attach a file A staged", async () => {
+    if (!storesClean) return;
     const now = Date.now();
 
     const staged = await stageInlineBytes(
@@ -328,6 +363,7 @@ describe("R2 staging, delete: only the user who staged a file can remove it", ()
   // this test goes red with "Expect test to fail": remove the mark then, on
   // purpose, and leave the body exactly as it is.
   it.fails("B cannot delete a file A staged", async () => {
+    if (!storesClean) return;
     const now = Date.now();
 
     const staged = await stageAsA(now);
@@ -381,6 +417,7 @@ describe("staged id, built by hand: the id proves nothing about who holds it", (
   // lands, this test goes red with "Expect test to fail": remove the mark then,
   // on purpose, and leave the body exactly as it is.
   it.fails("B cannot read A's file with an id B built by hand", async () => {
+    if (!storesClean) return;
     const now = Date.now();
 
     const staged = await stageAsA(now);
@@ -408,6 +445,15 @@ describe("staged id, built by hand: the id proves nothing about who holds it", (
 // These two are what prove the catch paths work. No other green test reaches
 // them today, because nothing B does is refused yet, so nothing B does throws.
 describe("fixture", () => {
+  // Plain, so it goes red. The setup hook cannot throw, so this is where a
+  // cleanup that did not finish gets seen. Every expected-fail body returns
+  // early on the same flag.
+  it("fixture: every store starts empty", () => {
+    expect(storesClean, "the cleanup before this test did not finish").toBe(
+      true,
+    );
+  });
+
   it("fixture: a callback that throws gives null", async () => {
     const tools = toolsFor(USER_A, (register) => {
       register("test_throws", () => {
@@ -572,6 +618,7 @@ describe("upload ticket: an upload belongs to the user who asked for the grant",
   // this test goes red with "Expect test to fail": remove the mark then, on
   // purpose, and leave the body exactly as it is.
   it.fails("B cannot confirm A's upload", async () => {
+    if (!storesClean) return;
     const now = Date.now();
 
     const upload = await grantAndUploadAsA(now);
@@ -599,6 +646,7 @@ describe("upload ticket: an upload belongs to the user who asked for the grant",
   // place, this test goes red with "Expect test to fail": remove the mark then,
   // on purpose, and leave the body exactly as it is.
   it.fails("B's wrong-size confirm cannot delete A's upload", async () => {
+    if (!storesClean) return;
     const now = Date.now();
 
     const upload = await grantAndUploadAsA(now);
@@ -630,6 +678,7 @@ describe("upload ticket: an upload belongs to the user who asked for the grant",
   // B's confirm refuse, this test goes red with "Expect test to fail": remove
   // the mark then, on purpose, and leave the body exactly as it is.
   it.fails("B cannot confirm a ticket B built by hand", async () => {
+    if (!storesClean) return;
     const now = Date.now();
 
     const upload = await grantAndUploadAsA(now);
@@ -974,6 +1023,7 @@ describe("confirm token: a one-time confirmation belongs to the user who preview
   // a fix leaves A's slot alone, this test goes red with "Expect test to fail":
   // remove the mark then, on purpose, and leave the body exactly as it is.
   it.fails("B's refused commit cannot spend A's confirm slot", async () => {
+    if (!storesClean) return;
     const stub = twoUserDavStub();
 
     const preview = await previewAsA(stub);
@@ -1014,6 +1064,7 @@ describe("confirm token: a one-time confirmation belongs to the user who preview
   // fix stops B's call reaching the store, this test goes red with "Expect test
   // to fail": remove the mark then, on purpose, and leave the body as it is.
   it.fails("B's refused commit cannot write A's jti into CONFIRM_KV", async () => {
+    if (!storesClean) return;
     const stub = twoUserDavStub();
 
     const preview = await previewAsA(stub);
