@@ -31,7 +31,12 @@
 // Changing a row that is already ACCEPTED is costly: the user id is the key of
 // every per-user store, so a changed rule re-keys every store for every user
 // the old rule accepted. Refusing more is the safe direction; accepting more,
-// or accepting differently, is not (D-09, D-17, D-18).
+// or accepting differently, is not (D-09, D-17, D-18, D-19).
+//
+// The order of the steps is part of the spec. The length cap is measured on
+// the input as typed (D-18). Then trim, then refuse anything that is not
+// printable ASCII, and only then lowercase (D-19). The kelvin-sign row is the
+// one row that tells that last order from the other one.
 
 /** What `expected` holds when the input must be turned away. */
 export const REFUSED = "refused";
