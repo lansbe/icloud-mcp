@@ -1,6 +1,7 @@
-// The one function that turns an Apple ID into a user id, run over the spec.
+// The principal module: the one user id function run over the spec, the
+// password holder, and the two constructors that build a principal.
 //
-// **What this file proves.** Three things.
+// **What this file proves.** Six things.
 //
 // 1. `test/fixtures/user-id-vectors.ts` is the user id spec, written as rows.
 //    This file runs the one function over every row. An accepted row must come
@@ -16,6 +17,20 @@
 // 3. Nothing under `src/` imports the principal module yet. Phase 8 is
 //    groundwork, and "nothing that ships today calls it" is how the phase
 //    shows it changed no behaviour.
+// 4. The password does not travel with the principal. A built principal is a
+//    frozen object with two fields, and neither is a secret. Turning it into
+//    JSON, spreading it, cloning it or turning it into a string gives no
+//    password. The one password reader answers only the very object that was
+//    built. A copy with the same two fields gets the auth error.
+// 5. The props constructor fails closed. It accepts exactly one shape: `v` as
+//    the number 1, an Apple ID and an app password, and no other key. Every
+//    other shape in the table below is refused with the existing auth error,
+//    the old owner grant included. The refusal carries nothing from the input:
+//    not in the message, not in the stack, not in a property. It takes one
+//    argument, so there is no second place for a credential to come from.
+// 6. The env constructor gives user A and user B the ids the vectors file
+//    gives them, and refuses a missing or empty secret. For both users the two
+//    constructors and the one function agree on the id.
 //
 // **What this file cannot prove, and why.** It cannot show that a hex value in
 // the vectors file is right. It only shows that the function and the file
@@ -39,6 +54,19 @@
 // glob's size and two named members are asserted before the offender list,
 // and the matcher is shown to match a real import line.
 //
+// Four more for the holder and the constructors. A props constructor that
+// refused everything would pass the whole bad-props table: the good shape is
+// shown to resolve, for A and for B, before the table runs. A leak check on an
+// input that held no values would find none: each leak check first asserts
+// that the input it sends really holds the address and the password. A copy
+// that differed from the original would be refused for the wrong reason: each
+// copy is first shown to be equal to the original, field for field, so only
+// its identity is different. And two test users with the same password would
+// make "A never answers B's password" empty: the two are shown to differ.
+//
+// Refusals are checked by error TYPE and by category. The one message compared
+// is the fixed label, and only to show that nothing was added to it.
+//
 // **The no-importer test goes red on purpose in Phase 9.** Phase 9 adds the
 // first real importer. When it does, this test fails, and that is the signal
 // it was built to give. Phase 9 replaces it with a count rule in the scan,
@@ -49,7 +77,17 @@
 // real Apple ID. Every address sits under `example.invalid`.
 
 import { describe, expect, it } from "vitest";
-import { userIdOf } from "../src/principal";
+import type { Env } from "../src/env";
+import { ImapAuthError, toErrorCategory } from "../src/errors";
+import * as principalModule from "../src/principal";
+import {
+  passwordOf,
+  principalFromEnv,
+  principalFromProps,
+  userIdOf,
+} from "../src/principal";
+import { USER_A, USER_B, envFor } from "./fixtures/two-users";
+import type { TestUser } from "./fixtures/two-users";
 import { REFUSED, USER_ID_VECTORS } from "./fixtures/user-id-vectors";
 
 /** What a user id must look like. */
@@ -112,6 +150,96 @@ const SOURCES: Record<string, string> = Object.fromEntries(
  */
 const IMPORTS_THE_PRINCIPAL =
   /\b(?:from|import)\s*\(?\s*["'][^"'\n]*\/principal(?:\.[cm]?[jt]s)?["']/;
+
+/**
+ * A minimal environment carrying only the two account bindings.
+ *
+ * Built in one expression, and nothing is written onto it afterwards. Both
+ * parameters admit `undefined` because a Workers Secret binding does: an unset
+ * or deleted Secret arrives absent, and the refusal cases have to be able to
+ * say so.
+ */
+function fakeEnv(
+  appleId: string | undefined,
+  password: string | undefined,
+): Env {
+  return {
+    APPLE_ID: appleId,
+    APPLE_APP_PASSWORD: password,
+  } as unknown as Env;
+}
+
+/** The one props shape that is accepted, for `user`. A fresh object each call. */
+function goodPropsFor(user: TestUser): {
+  v: number;
+  appleId: string;
+  appPassword: string;
+} {
+  return { v: 1, appleId: user.appleId, appPassword: user.appPassword };
+}
+
+/** A made-up password for the rows that need one. Not a real credential. */
+const ROW_PASSWORD = "cccc-cccc-cccc-cccc";
+
+/** An address with one letter outside ASCII, built by number and never typed. */
+const NON_ASCII_ADDRESS = `us${String.fromCharCode(0xe9)}r@example.invalid`;
+
+/** An address one character over the cap: 239 letters and the 16 of the domain. */
+const TOO_LONG_ADDRESS = `${"a".repeat(239)}@example.invalid`;
+
+/**
+ * Every shape the props constructor must refuse, by name.
+ *
+ * One row per refusal in the plan's behaviour list. The old owner grant and
+ * the extra-key shape are the two that matter most: the first is what every
+ * grant stored before this milestone looks like, and the second is how a user
+ * id supplied from outside would arrive.
+ */
+const BAD_PROPS: ReadonlyArray<readonly [string, unknown]> = [
+  ["null", null],
+  ["undefined", undefined],
+  ["a string", "user-a@example.invalid"],
+  ["a number", 1],
+  ["an array", [1, USER_A.appleId, USER_A.appPassword]],
+  ["an empty object", {}],
+  ["the old owner grant", { userId: "owner" }],
+  ["v 1 alone", { v: 1 }],
+  ["v 2 with both fields", { ...goodPropsFor(USER_A), v: 2 }],
+  ["v as the string 1 with both fields", { ...goodPropsFor(USER_A), v: "1" }],
+  ["appleId empty", { v: 1, appleId: "", appPassword: ROW_PASSWORD }],
+  ["appleId a number", { v: 1, appleId: 42, appPassword: ROW_PASSWORD }],
+  ["appleId missing", { v: 1, appPassword: ROW_PASSWORD }],
+  ["appPassword empty", { v: 1, appleId: USER_A.appleId, appPassword: "" }],
+  ["appPassword a number", { v: 1, appleId: USER_A.appleId, appPassword: 42 }],
+  ["appPassword missing", { v: 1, appleId: USER_A.appleId }],
+  [
+    "an appleId with no at sign",
+    { v: 1, appleId: "user-a.example.invalid", appPassword: ROW_PASSWORD },
+  ],
+  [
+    "an appleId holding a non-ASCII letter",
+    { v: 1, appleId: NON_ASCII_ADDRESS, appPassword: ROW_PASSWORD },
+  ],
+  [
+    "an appleId of 255 characters",
+    { v: 1, appleId: TOO_LONG_ADDRESS, appPassword: ROW_PASSWORD },
+  ],
+  [
+    "a good shape with one extra key, a user id supplied from outside",
+    { ...goodPropsFor(USER_A), userId: USER_B.userId },
+  ],
+];
+
+/** What a refusal is allowed to show: its message, its stack, its property names and values. */
+function everythingOn(raised: unknown): string {
+  const own = Object.getOwnPropertyNames(raised as object);
+  return JSON.stringify({
+    message: (raised as Error).message,
+    stack: (raised as Error).stack,
+    own,
+    values: own.map((name) => String((raised as Record<string, unknown>)[name])),
+  });
+}
 
 describe("the walk sees rows at all, so an empty filter cannot pass", () => {
   it("holds at least 12 accepted rows and at least 18 refused rows", () => {
@@ -307,4 +435,326 @@ describe("nothing that ships today imports the principal module", () => {
       "a file under src/ imports the principal module. Phase 8 lands it with no caller. If this is Phase 9 adding the first one, replace this test with the count rule in the scan.",
     ).toEqual([]);
   });
+});
+
+describe("module shape", () => {
+  it("exports the one id function, the one password reader and the two constructors, nothing else", () => {
+    // The design made checkable. There is no export that hands out the holder
+    // itself, and no form constructor yet: that one waits for the login page.
+    expect(Object.keys(principalModule).sort()).toEqual([
+      "passwordOf",
+      "principalFromEnv",
+      "principalFromProps",
+      "userIdOf",
+    ]);
+  });
+
+  it("exports only functions", () => {
+    for (const value of Object.values(principalModule)) {
+      expect(typeof value).toBe("function");
+    }
+  });
+});
+
+describe("the holder: the principal travels and the password does not (D-01, D-16)", () => {
+  it("has two test users whose passwords differ, so the checks below mean something", () => {
+    expect(USER_A.appPassword.length).toBeGreaterThan(0);
+    expect(USER_B.appPassword.length).toBeGreaterThan(0);
+    expect(USER_A.appPassword).not.toBe(USER_B.appPassword);
+    expect(USER_A.userId).not.toBe(USER_B.userId);
+  });
+
+  it("builds a frozen object with exactly two fields, and neither is a secret", async () => {
+    const principal = await principalFromProps(goodPropsFor(USER_A));
+
+    expect(Object.keys(principal).sort()).toEqual(["appleId", "userId"]);
+    expect(Reflect.ownKeys(principal).length, "a hidden or symbol key").toBe(2);
+    expect(principal.userId).toBe(USER_A.userId);
+    expect(principal.appleId).toBe(USER_A.appleId);
+    expect(Object.isFrozen(principal)).toBe(true);
+  });
+
+  it("answers each user's password for that user's own principal, and only that", async () => {
+    const a = await principalFromProps(goodPropsFor(USER_A));
+    const b = await principalFromProps(goodPropsFor(USER_B));
+
+    expect(passwordOf(a)).toBe(USER_A.appPassword);
+    expect(passwordOf(b)).toBe(USER_B.appPassword);
+    expect(passwordOf(a)).not.toBe(USER_B.appPassword);
+    expect(passwordOf(b)).not.toBe(USER_A.appPassword);
+  });
+
+  it("reads the password without a promise", async () => {
+    // The two constructors are async because the id function is. The reader
+    // is not, and the callers in Phase 9 write it straight into a command.
+    const principal = await principalFromProps(goodPropsFor(USER_A));
+    expect(typeof passwordOf(principal)).toBe("string");
+  });
+
+  it("holds no password in any form a copy or a string could carry", async () => {
+    const principal = await principalFromProps(goodPropsFor(USER_A));
+    const password = USER_A.appPassword;
+
+    const forms = [
+      JSON.stringify(principal),
+      JSON.stringify({ ...principal }),
+      JSON.stringify(structuredClone(principal)),
+      String(principal),
+      `${principal as unknown as string}`,
+      JSON.stringify(Object.getOwnPropertyNames(principal)),
+      JSON.stringify(Object.values(principal)),
+      JSON.stringify(Object.getOwnPropertyDescriptors(principal)),
+    ];
+    for (const form of forms) {
+      expect(form.includes(password), `a form held the password: ${form}`).toBe(
+        false,
+      );
+    }
+    // The control. The same walk DOES find a value the object really holds, so
+    // "not found" above is not the walk being blind.
+    expect(forms.some((form) => form.includes(USER_A.appleId))).toBe(true);
+    expect(Object.getOwnPropertySymbols(principal)).toEqual([]);
+  });
+
+  it("refuses a spread copy, which is equal in every field", async () => {
+    const principal = await principalFromProps(goodPropsFor(USER_A));
+    const copy = { ...principal };
+
+    expect(copy, "the copy must equal the original").toEqual(principal);
+    expect(copy === principal, "the copy must be another object").toBe(false);
+    expect(() => passwordOf(copy)).toThrow(ImapAuthError);
+    // And the original still answers, so the refusal is about identity.
+    expect(passwordOf(principal)).toBe(USER_A.appPassword);
+  });
+
+  it("refuses a structured clone, which is equal in every field", async () => {
+    const principal = await principalFromProps(goodPropsFor(USER_A));
+    const copy = structuredClone(principal);
+
+    expect(copy, "the clone must equal the original").toEqual(principal);
+    expect(copy === principal, "the clone must be another object").toBe(false);
+    expect(() => passwordOf(copy)).toThrow(ImapAuthError);
+  });
+
+  it("refuses an object made by hand with the right two fields", () => {
+    const forged = Object.freeze({
+      userId: USER_A.userId,
+      appleId: USER_A.appleId,
+    });
+    expect(() => passwordOf(forged)).toThrow(ImapAuthError);
+  });
+
+  it("gives the auth category for a refused copy, and the fixed label", async () => {
+    const principal = await principalFromProps(goodPropsFor(USER_A));
+    let raised: unknown = null;
+    try {
+      passwordOf({ ...principal });
+    } catch (err: unknown) {
+      raised = err;
+    }
+
+    expect(raised).toBeInstanceOf(ImapAuthError);
+    expect(toErrorCategory(raised).category).toBe("auth_failed");
+    expect(everythingOn(raised)).not.toContain(USER_A.appPassword);
+    expect(everythingOn(raised)).not.toContain(USER_A.appleId);
+    expect((raised as Error).message).toBe("imap-credentials-rejected");
+  });
+
+  it("builds a new principal each time, so nothing is shared between two sign-ins", async () => {
+    // Two grants for the same person are two objects. A table keyed by the
+    // address would hand back the first one, and with it the first password.
+    const first = await principalFromProps(goodPropsFor(USER_A));
+    const second = await principalFromProps({
+      ...goodPropsFor(USER_A),
+      appPassword: ROW_PASSWORD,
+    });
+
+    expect(first === second).toBe(false);
+    expect(first.userId).toBe(second.userId);
+    expect(passwordOf(first)).toBe(USER_A.appPassword);
+    expect(passwordOf(second)).toBe(ROW_PASSWORD);
+  });
+
+  it("keeps the password it was given, whatever happens to the props afterwards", async () => {
+    const props = goodPropsFor(USER_A);
+    const principal = await principalFromProps(props);
+    props.appPassword = ROW_PASSWORD;
+    props.appleId = USER_B.appleId;
+
+    expect(passwordOf(principal)).toBe(USER_A.appPassword);
+    expect(principal.appleId).toBe(USER_A.appleId);
+    expect(principal.userId).toBe(USER_A.userId);
+  });
+
+  it("carries the Apple ID exactly as given, and still gives the same user id", async () => {
+    // Asserted first, so the padded spelling below really is a different
+    // string for the same person.
+    expect(USER_A.appleId).toBe(USER_A.appleId.trim().toLowerCase());
+    const typed = `  ${USER_A.appleId.toUpperCase()} `;
+    expect(typed).not.toBe(USER_A.appleId);
+
+    const principal = await principalFromProps({
+      ...goodPropsFor(USER_A),
+      appleId: typed,
+    });
+
+    expect(principal.appleId, "no trim and no lowercasing").toBe(typed);
+    expect(principal.userId).toBe(USER_A.userId);
+  });
+});
+
+describe("the props constructor fails closed (D-02, D-04)", () => {
+  it("accepts the one good shape, for A and for B, so the table below is not a function that refuses everything", async () => {
+    await expect(
+      principalFromProps(goodPropsFor(USER_A)),
+    ).resolves.toMatchObject({ userId: USER_A.userId });
+    await expect(
+      principalFromProps(goodPropsFor(USER_B)),
+    ).resolves.toMatchObject({ userId: USER_B.userId });
+  });
+
+  it("holds every refusal the plan lists, each under its own name", () => {
+    expect(BAD_PROPS.length).toBeGreaterThanOrEqual(20);
+    const names = BAD_PROPS.map(([name]) => name);
+    expect(new Set(names).size, "two rows share a name").toBe(names.length);
+    expect(names).toContain("the old owner grant");
+    expect(
+      names.some((name) => name.includes("one extra key")),
+      "the extra-key row is missing",
+    ).toBe(true);
+  });
+
+  it("builds the two awkward addresses the way the rows say", () => {
+    expect(TOO_LONG_ADDRESS.length).toBe(255);
+    expect(NON_ASCII_ADDRESS.charCodeAt(2)).toBe(0xe9);
+  });
+
+  it.each(BAD_PROPS)("refuses %s with the auth error", async (_name, value) => {
+    await expect(principalFromProps(value)).rejects.toBeInstanceOf(
+      ImapAuthError,
+    );
+  });
+
+  it("takes exactly one argument, so there is no second place for a credential to come from", () => {
+    expect(principalFromProps.length).toBe(1);
+  });
+
+  const LEAKY_PASSWORD = "leaky-password-value";
+  const LEAKY_SHAPES: ReadonlyArray<readonly [string, string, unknown]> = [
+    [
+      "a wrong v",
+      "leaky-wrong-v@example.invalid",
+      { v: 2, appleId: "leaky-wrong-v@example.invalid", appPassword: LEAKY_PASSWORD },
+    ],
+    [
+      "an extra key",
+      "leaky-extra-key@example.invalid",
+      {
+        v: 1,
+        appleId: "leaky-extra-key@example.invalid",
+        appPassword: LEAKY_PASSWORD,
+        note: "anything",
+      },
+    ],
+    [
+      "an address the id function turns away",
+      "leaky-no-at-sign.example.invalid",
+      { v: 1, appleId: "leaky-no-at-sign.example.invalid", appPassword: LEAKY_PASSWORD },
+    ],
+  ];
+
+  it.each(LEAKY_SHAPES)(
+    "carries no fragment of the address or the password when it refuses %s",
+    async (_name, address, shape) => {
+      // The input really holds both values. Without this the check below
+      // could pass on an input that had nothing to leak.
+      expect(JSON.stringify(shape)).toContain(address);
+      expect(JSON.stringify(shape)).toContain(LEAKY_PASSWORD);
+
+      const raised = await principalFromProps(shape).then(
+        () => null,
+        (err: unknown) => err,
+      );
+
+      expect(raised).toBeInstanceOf(ImapAuthError);
+      expect(toErrorCategory(raised).category).toBe("auth_failed");
+      const shown = everythingOn(raised);
+      expect(shown).not.toContain(address);
+      expect(shown).not.toContain(LEAKY_PASSWORD);
+      // Nor a length or a field name, which would be an oracle of its own.
+      expect((raised as Error).message).toBe("imap-credentials-rejected");
+    },
+  );
+});
+
+describe("the env constructor, temporary until the secrets are removed (D-03)", () => {
+  it.each([USER_A, USER_B].map((user) => [user.label, user] as const))(
+    "gives user %s the id the vectors file gives them, and their own password",
+    async (_label, user) => {
+      const principal = await principalFromEnv(envFor(user));
+
+      expect(principal.userId).toBe(user.userId);
+      expect(principal.appleId).toBe(user.appleId);
+      expect(passwordOf(principal)).toBe(user.appPassword);
+      expect(Object.isFrozen(principal)).toBe(true);
+      expect(Object.keys(principal).sort()).toEqual(["appleId", "userId"]);
+    },
+  );
+
+  it("carries the Apple ID binding untouched, so no byte changes on the wire", async () => {
+    const typed = ` ${USER_A.appleId.toUpperCase()}  `;
+    const principal = await principalFromEnv(fakeEnv(typed, ROW_PASSWORD));
+
+    expect(principal.appleId).toBe(typed);
+    expect(principal.userId).toBe(USER_A.userId);
+  });
+
+  it.each([
+    ["the Apple ID is not set", undefined, ROW_PASSWORD],
+    ["the password is not set", USER_A.appleId, undefined],
+    ["neither is set", undefined, undefined],
+    ["the Apple ID is empty", "", ROW_PASSWORD],
+    ["the password is empty", USER_A.appleId, ""],
+    ["the Apple ID has no at sign", "user-a.example.invalid", ROW_PASSWORD],
+    ["the Apple ID holds a non-ASCII letter", NON_ASCII_ADDRESS, ROW_PASSWORD],
+  ] as const)("refuses with the auth error when %s", async (_name, appleId, password) => {
+    await expect(
+      principalFromEnv(fakeEnv(appleId, password)),
+    ).rejects.toBeInstanceOf(ImapAuthError);
+  });
+
+  it("carries no fragment of either binding when it refuses", async () => {
+    const address = "leaky-binding.example.invalid";
+    const password = "leaky-binding-password";
+
+    const raised = await principalFromEnv(fakeEnv(address, password)).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    expect(raised).toBeInstanceOf(ImapAuthError);
+    expect(toErrorCategory(raised).category).toBe("auth_failed");
+    expect(everythingOn(raised)).not.toContain(address);
+    expect(everythingOn(raised)).not.toContain(password);
+    expect((raised as Error).message).toBe("imap-credentials-rejected");
+  });
+});
+
+describe("the invariant: three ways to an id, one answer", () => {
+  it.each([USER_A, USER_B].map((user) => [user.label, user] as const))(
+    "user %s gets the id from the vectors file, whichever way it is asked for",
+    async (_label, user) => {
+      // Every value compared here is a result of the one function, reached by
+      // three roads, held against a literal from the vectors file. There is no
+      // second fingerprint anywhere in this test.
+      const fromEnv = await principalFromEnv(envFor(user));
+      const fromProps = await principalFromProps(goodPropsFor(user));
+      const direct = await userIdOf(user.appleId);
+
+      expect(FULL_HEX.test(user.userId), "the vectors id is not 64 hex").toBe(true);
+      expect(fromEnv.userId).toBe(user.userId);
+      expect(fromProps.userId).toBe(user.userId);
+      expect(direct).toBe(user.userId);
+    },
+  );
 });
