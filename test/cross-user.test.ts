@@ -399,6 +399,24 @@ describe("fixture", () => {
     expect(resolved).toEqual({ refused: false, value: "the value" });
   });
 
+  it("fixture: a registration that throws does not escape toolsFor", async () => {
+    const built = await attempt(async () =>
+      toolsFor(USER_B, () => {
+        throw new Error("a registration that throws");
+      }),
+    );
+
+    expect(built.refused, "toolsFor let a registration throw escape").toBe(false);
+    if (built.refused) throw new Error("unreachable");
+
+    // What was recorded before the throw is still there and still callable.
+    expect(built.value.names).toContain("mail_confirm_upload");
+    expect(
+      await built.value.call("test_nobody_registered_this", {}),
+      "a missing tool did not give null",
+    ).toBeNull();
+  });
+
   it("fixture: both users reach the mail and calendar tools", () => {
     const names = toolsFor(USER_B).names;
     expect(names).toContain("mail_confirm_upload");
@@ -483,5 +501,95 @@ describe("upload ticket: an upload belongs to the user who asked for the grant",
     });
 
     expect(result, "the tool is missing or its callback threw").not.toBeNull();
+  });
+
+  // RECORDED 2026-09-19, run as a plain test before this mark was added:
+  //
+  //   AssertionError: LEAK: B confirmed A's upload and was handed a staged id for A's file: expected false to be true // Object.is equality
+  //
+  // B presented the uploadId A was given. The tool confirmed it and handed B a
+  // staged id for A's file. A null from B's call returns early, which makes this
+  // body pass and the mark go red. "control: B's confirm call gives a real
+  // result" makes the same call and is red whenever it gives null, so a null
+  // here can never be read as "no leak". When a fix makes B's confirm refuse,
+  // this test goes red with "Expect test to fail": remove the mark then, on
+  // purpose, and leave the body exactly as it is.
+  it.fails("B cannot confirm A's upload", async () => {
+    const now = Date.now();
+
+    const upload = await grantAndUploadAsA(now);
+    if (upload === null) return;
+
+    const result = await toolsFor(USER_B).call("mail_confirm_upload", {
+      uploadId: upload.uploadId,
+      sizeBytes: UPLOAD_BYTES_A.length,
+    });
+    if (result === null) return;
+
+    expect(
+      refusedByTool(result),
+      "LEAK: B confirmed A's upload and was handed a staged id for A's file",
+    ).toBe(true);
+  });
+
+  // RECORDED 2026-09-19, run as a plain test before this mark was added:
+  //
+  //   AssertionError: LEAK: B's wrong-size confirm deleted A's uploaded object: expected null not to be null
+  //
+  // B confirmed A's uploadId with a size one byte too big. The size check
+  // failed and deleted A's object. On this path the uploaded bytes are the only
+  // copy, so A has to upload the file again. When a fix leaves A's object in
+  // place, this test goes red with "Expect test to fail": remove the mark then,
+  // on purpose, and leave the body exactly as it is.
+  it.fails("B's wrong-size confirm cannot delete A's upload", async () => {
+    const now = Date.now();
+
+    const upload = await grantAndUploadAsA(now);
+    if (upload === null) return;
+    const keyOfA = upload.key;
+
+    // B's result is not read, so a null needs no early return here. Whether
+    // A's object is still there is true evidence either way.
+    await toolsFor(USER_B).call("mail_confirm_upload", {
+      uploadId: upload.uploadId,
+      sizeBytes: UPLOAD_BYTES_A.length + 1,
+    });
+
+    expect(
+      await env.ATTACHMENT_STAGING.head(keyOfA),
+      "LEAK: B's wrong-size confirm deleted A's uploaded object",
+    ).not.toBeNull();
+  });
+
+  // RECORDED 2026-09-19, run as a plain test before this mark was added:
+  //
+  //   AssertionError: LEAK: B confirmed A's upload with an upload ticket B built by hand: expected false to be true // Object.is equality
+  //
+  // **This is the guard against a wrong fix**, like the hand-built staged id
+  // above. The ticket is not signed, so a fix that read the user out of the
+  // ticket would be reading a value B chose. "control: B's hand-built ticket
+  // confirm gives a real result" builds its ticket with the same helper, makes
+  // the same call, and is red whenever that call gives null. When a fix makes
+  // B's confirm refuse, this test goes red with "Expect test to fail": remove
+  // the mark then, on purpose, and leave the body exactly as it is.
+  it.fails("B cannot confirm a ticket B built by hand", async () => {
+    const now = Date.now();
+
+    const upload = await grantAndUploadAsA(now);
+    if (upload === null) return;
+
+    const ticket = handBuiltTicketFor(upload.key, now);
+    if (ticket === null) return;
+
+    const result = await toolsFor(USER_B).call("mail_confirm_upload", {
+      uploadId: ticket,
+      sizeBytes: UPLOAD_BYTES_A.length,
+    });
+    if (result === null) return;
+
+    expect(
+      refusedByTool(result),
+      "LEAK: B confirmed A's upload with an upload ticket B built by hand",
+    ).toBe(true);
   });
 });
