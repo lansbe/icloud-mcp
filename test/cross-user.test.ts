@@ -959,4 +959,85 @@ describe("confirm token: a one-time confirmation belongs to the user who preview
       "B received text from A's event",
     ).not.toContain(CANARY_SUMMARY_A);
   });
+
+  // RECORDED 2026-09-19, run as a plain test before this mark was added:
+  //
+  //   AssertionError: LEAK: B's refused commit spent A's one-time confirm slot, so A's own commit was refused: expected true to be false // Object.is equality
+  //
+  // B is refused today, by the home-set check. But the one-time slot is taken
+  // BEFORE that check runs, so B's refused call still uses it up, and A has to
+  // preview again. Nothing on this path asks who the token was minted for. A
+  // null from either commit returns early, which makes this body pass and the
+  // mark go red; both controls above make the same calls and are red whenever
+  // one gives null. "control: A's own commit succeeds" uses this very predicate
+  // on a commit nobody interfered with, so it is known to be able to pass. When
+  // a fix leaves A's slot alone, this test goes red with "Expect test to fail":
+  // remove the mark then, on purpose, and leave the body exactly as it is.
+  it.fails("B's refused commit cannot spend A's confirm slot", async () => {
+    const stub = twoUserDavStub();
+
+    const preview = await previewAsA(stub);
+    if (preview === null) return;
+
+    // B's turn. Forget the home A's preview cached, or B would be handed it.
+    const beforeB = await attempt(() => clearDavCache(env, "caldav"));
+    if (beforeB.refused) return;
+    const resultB = await toolsFor(USER_B).call("calendar_commit", {
+      confirmToken: preview.confirmToken,
+      change: preview.change,
+    });
+
+    // A's turn again. Forget B's home the same way.
+    const beforeA = await attempt(() => clearDavCache(env, "caldav"));
+    if (beforeA.refused) return;
+    const resultA = await toolsFor(USER_A).call("calendar_commit", {
+      confirmToken: preview.confirmToken,
+      change: preview.change,
+    });
+    if (resultB === null || resultA === null) return;
+
+    expect(
+      readToolResult(resultA).isError,
+      "LEAK: B's refused commit spent A's one-time confirm slot, so A's own commit was refused",
+    ).toBe(false);
+  });
+
+  // RECORDED 2026-09-19, run as a plain test before this mark was added:
+  //
+  //   AssertionError: LEAK: B's refused commit wrote A's jti into CONFIRM_KV: expected [ Array(1) ] to deeply equal []
+  //
+  // The same flaw, seen from the store. After B's refused commit one key held
+  // A's jti, and A had taken no second turn, so only B can have written it. The
+  // check matches on the jti and not on today's key shape, so it still means
+  // something after that shape changes. "control: A's own commit succeeds"
+  // shows the same store check comes back empty after a preview alone. When a
+  // fix stops B's call reaching the store, this test goes red with "Expect test
+  // to fail": remove the mark then, on purpose, and leave the body as it is.
+  it.fails("B's refused commit cannot write A's jti into CONFIRM_KV", async () => {
+    const stub = twoUserDavStub();
+
+    const preview = await previewAsA(stub);
+    if (preview === null) return;
+    const jti = jtiOf(preview.confirmToken);
+    if (jti === null) return;
+
+    // B's turn. Forget the home A's preview cached, or B would be handed it.
+    const beforeB = await attempt(() => clearDavCache(env, "caldav"));
+    if (beforeB.refused) return;
+    const resultB = await toolsFor(USER_B).call("calendar_commit", {
+      confirmToken: preview.confirmToken,
+      change: preview.change,
+    });
+    if (resultB === null) return;
+
+    // A takes no second turn here. The store is read straight away, so the
+    // only caller that can have written A's jti is B.
+    const held = await confirmKeysHolding(jti);
+    if (held === null) return;
+
+    expect(
+      held,
+      "LEAK: B's refused commit wrote A's jti into CONFIRM_KV",
+    ).toEqual([]);
+  });
 });
