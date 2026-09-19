@@ -12,8 +12,11 @@
 // here is written against a signature that does not exist yet. A later phase
 // changes how the fixture says "this is B", and nothing about what is asserted.
 //
-// **Nothing here is faked.** `env.ATTACHMENT_STAGING` is the pool's real local
-// bucket, the same one `test/staging.test.ts` uses.
+// **The stores are real.** `env.ATTACHMENT_STAGING` is the pool's real local
+// bucket, the same one `test/staging.test.ts` uses, and `env.CONFIRM_KV` and
+// `env.DAV_CACHE` are the pool's real namespaces. The one thing that is faked is
+// iCloud itself: the DAV tests install the two-home stub from
+// `./fixtures/two-user-dav`, which answers every request and forwards none.
 //
 // **What would make an expected fail pass for the wrong reason.** The runner
 // turns ANY failure inside such a body into a pass and throws the error away.
@@ -43,7 +46,12 @@
 // real Apple ID (D-09).
 
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getEvent } from "../src/dav/calendar";
+import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
+import { DavNotFoundError } from "../src/dav/errors";
+import { decodeEventId } from "../src/dav/ids";
+import { createDavFetch } from "../src/dav/transport";
 import {
   STAGED_ID_TTL_MS,
   decodeStagedId,
@@ -57,6 +65,13 @@ import {
   resolveStagedAttachments,
   stageInlineBytes,
 } from "../src/mcp/tools/mail";
+import {
+  CANARY_SUMMARY_A,
+  EVENT_A_ID,
+  HOME_A,
+  HOME_B,
+  twoUserDavStub,
+} from "./fixtures/two-user-dav";
 import {
   USER_A,
   USER_B,
@@ -181,12 +196,52 @@ function refusedByTool(result: RecordedToolResult): boolean {
   return readToolResult(result).trusted?.staged === false;
 }
 
-/** A bucket with nothing in it, before every case. */
+/** Every confirm key currently in the store. */
+async function everyConfirmKey(): Promise<string[]> {
+  const listed = await env.CONFIRM_KV.list({ prefix: "confirm:" });
+  return listed.keys.map((one) => one.name).sort();
+}
+
+/**
+ * Forget every cached DAV home: the pool's own, A's and B's.
+ *
+ * All three, because today the calendar callbacks key the cache by the pool's
+ * own identity while the functions under them key it by whoever's environment
+ * they were handed. A home left behind under any of the three would let one
+ * test's discovery answer another test's question.
+ *
+ * One at a time, never together. Each is a store operation, and this project
+ * does not fan those out.
+ */
+async function forgetEveryDavHome(): Promise<void> {
+  await clearDavCache(env, "caldav");
+  await clearDavCache(envFor(USER_A), "caldav");
+  await clearDavCache(envFor(USER_B), "caldav");
+}
+
+/**
+ * Nothing left over, before every case: an empty bucket, no confirm keys and no
+ * cached DAV home. This is what makes the file give the same result in any
+ * order.
+ */
 beforeEach(async () => {
   for (const key of await everyStagedKey()) {
     await env.ATTACHMENT_STAGING.delete(key);
   }
   expect(await everyStagedKey()).toEqual([]);
+
+  for (const key of await everyConfirmKey()) {
+    await env.CONFIRM_KV.delete(key);
+  }
+  expect(await everyConfirmKey()).toEqual([]);
+
+  await forgetEveryDavHome();
+});
+
+/** No stubbed `fetch` and no mock outlives the test that installed it. */
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("R2 staging, read: a staged file belongs to the user who staged it", () => {
@@ -592,4 +647,121 @@ describe("upload ticket: an upload belongs to the user who asked for the grant",
       "LEAK: B confirmed A's upload with an upload ticket B built by hand",
     ).toBe(true);
   });
+});
+
+describe("DAV_CACHE: a cached home belongs to the account it was resolved for", () => {
+  it("DAV_CACHE: A and B resolve to their own homes under their own keys", async () => {
+    const stub = twoUserDavStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const firstA = await resolveDavAccount(
+      envFor(USER_A),
+      createDavFetch(envFor(USER_A)),
+      "caldav",
+    );
+    expect(firstA.cacheHit, "A's first resolve was not a cold one").toBe(false);
+    expect(firstA.homeUrl, "A did not resolve to A's home").toBe(HOME_A);
+
+    const firstB = await resolveDavAccount(
+      envFor(USER_B),
+      createDavFetch(envFor(USER_B)),
+      "caldav",
+    );
+    expect(firstB.cacheHit, "B's first resolve was answered from A's entry").toBe(
+      false,
+    );
+    expect(firstB.homeUrl, "B did not resolve to B's home").toBe(HOME_B);
+
+    // Two keys, one per user. The user ids are the literal rows from the
+    // vectors file. Nothing is hashed here (D-12): this works because an
+    // address that is already trimmed and lowercase hashes today to exactly the
+    // user id the spec gives it.
+    const listed = await env.DAV_CACHE.list({ prefix: "dav:" });
+    const names = listed.keys.map((one) => one.name);
+    const keyOfA = `dav:v1:${USER_A.userId}:caldav`;
+    const keyOfB = `dav:v1:${USER_B.userId}:caldav`;
+    expect(names, "A's home is not stored under A's own key").toContain(keyOfA);
+    expect(names, "B's home is not stored under B's own key").toContain(keyOfB);
+    expect(keyOfA, "A and B share one cache key").not.toBe(keyOfB);
+
+    // B resolving did not move A's entry.
+    const secondA = await resolveDavAccount(
+      envFor(USER_A),
+      createDavFetch(envFor(USER_A)),
+      "caldav",
+    );
+    expect(secondA.cacheHit, "A's second resolve missed the cache").toBe(true);
+    expect(secondA.homeUrl, "A's cached home changed after B resolved").toBe(
+      HOME_A,
+    );
+  });
+
+  it.todo(
+    "DAV_CACHE through the registered callbacks: cannot run until Phase 9 threads the principal into the tool callbacks",
+  );
+});
+
+describe("home-set check: an event id only works under the caller's own home", () => {
+  // Without this the zero-request assertion in the next test would pass just as
+  // happily on a harness that never sends anything at all.
+  it("negative control: A can fetch A's own event", async () => {
+    const stub = twoUserDavStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const detail = await getEvent(
+      envFor(USER_A),
+      createDavFetch(envFor(USER_A)),
+      decodeEventId(EVENT_A_ID),
+    );
+
+    expect(
+      JSON.stringify(detail),
+      "A did not get A's own event back",
+    ).toContain(CANARY_SUMMARY_A);
+    expect(
+      stub.observed.filter(
+        (one) => one.user === "A" && one.url.startsWith(HOME_A),
+      ).length,
+      "A's own fetch never reached the stub",
+    ).toBeGreaterThan(0);
+  });
+
+  it("home-set check: B cannot fetch an event under A's home", async () => {
+    const stub = twoUserDavStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    // Whatever B got back: a value, or what the call threw.
+    let received: unknown = null;
+    let thrown: unknown = null;
+    try {
+      received = await getEvent(
+        envFor(USER_B),
+        createDavFetch(envFor(USER_B)),
+        decodeEventId(EVENT_A_ID),
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown, "B was not refused").toBeInstanceOf(DavNotFoundError);
+    expect(
+      stub.observed.filter((one) => one.url.startsWith(HOME_A)),
+      "a request carrying B's credentials reached a URL under A's home",
+    ).toEqual([]);
+    expect(
+      JSON.stringify(received),
+      "B received text from A's event",
+    ).not.toContain(CANARY_SUMMARY_A);
+
+    // B did reach the stub, as B. So the empty list above is a real refusal and
+    // not a harness that sent nothing.
+    expect(
+      stub.observed.filter((one) => one.user === "B").length,
+      "B's call never reached the stub at all",
+    ).toBeGreaterThan(0);
+  });
+
+  it.todo(
+    "home-set check through the registered callbacks: cannot run until Phase 9 threads the principal into the tool callbacks",
+  );
 });
