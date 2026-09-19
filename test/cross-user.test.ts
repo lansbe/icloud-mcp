@@ -95,4 +95,30 @@ describe("R2 staging, read: a staged file belongs to the user who staged it", ()
       "A did not get back the bytes A staged",
     ).toBe(MARKER_A);
   });
+
+  // RECORDED 2026-09-19, run as a plain test before this mark was added:
+  //
+  //   AssertionError: LEAK: B received A's file bytes: expected false to be true // Object.is equality
+  //
+  // B presented the id A was given and was handed A's file. Nothing on this
+  // path asks who is calling. When a fix makes B's call refuse, this test goes
+  // red with "Expect test to fail": remove the mark then, on purpose, and leave
+  // the body exactly as it is.
+  it.fails("B cannot attach a file A staged", async () => {
+    const now = Date.now();
+
+    const staged = await stageInlineBytes(
+      envFor(USER_A),
+      { base64: btoa(MARKER_A), filename: "a.txt", mimeType: "text/plain" },
+      now,
+    );
+    if (!staged.staged) return;
+    const idFromA = staged.id;
+
+    const outcome = await attempt(() =>
+      resolveStagedAttachments(envFor(USER_B), [idFromA], now),
+    );
+
+    expect(outcome.refused, "LEAK: B received A's file bytes").toBe(true);
+  });
 });
