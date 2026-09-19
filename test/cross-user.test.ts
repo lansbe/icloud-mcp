@@ -138,22 +138,34 @@ async function stageAsA(
  * on the throw alone would stay failing for ever under the second and third,
  * while its message went on saying B had received A's bytes.
  *
- * The two controls beside the leak tests decode the same field and find the
- * canary there, so this is known to be able to say yes.
+ * **Three answers, not two.** True: B holds the canary. False: B was refused,
+ * or what B got does not hold it. Null: the check itself broke, so nothing is
+ * known. A broken check must never read as false, because false is the answer
+ * that lets the leak assertion pass. That matters most on the day the mark is
+ * removed: from then on the body is a plain test, and a check that broke
+ * toward false would keep it green for ever. So each leak body returns early
+ * on null, like every other setup step that could not finish.
+ *
+ * **What proves it can say yes.** The two A-side controls, "control: A can
+ * attach a file A staged" and "control: A can resolve an id A rebuilt for A's
+ * own key", call this very function on A's own result and expect true. They
+ * are plain tests, so they go red whenever the check gives null or false for
+ * a file that does hold the canary. That is the test that goes red for the
+ * early return on null, and it stays after the marks are gone.
  *
  * It holds no assertion and it never throws.
  */
 function holdsCanary(
   outcome: Attempt<StagedAttachments>,
   canary: string,
-): boolean {
+): boolean | null {
   try {
     if (outcome.refused) return false;
     return outcome.value.attachments.some((one) =>
       DECODER.decode(one.content).includes(canary),
     );
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -332,6 +344,14 @@ describe("R2 staging, read: a staged file belongs to the user who staged it", ()
       DECODER.decode(resolved.attachments[0]!.content),
       "A did not get back the bytes A staged",
     ).toBe(MARKER_A);
+
+    // The very check the leak test beside this one decides on, run on a file
+    // that does hold the canary. It must say yes. A null or a false here means
+    // the check is broken, and the leak test would be measuring nothing.
+    expect(
+      holdsCanary({ refused: false, value: resolved }, MARKER_A),
+      "the canary check cannot see the canary in A's own file",
+    ).toBe(true);
   });
 
   // RECORDED 2026-09-19, run as a plain test, after the check was moved from
@@ -360,10 +380,12 @@ describe("R2 staging, read: a staged file belongs to the user who staged it", ()
       resolveStagedAttachments(envFor(USER_B), [idFromA], now),
     );
 
-    expect(
-      holdsCanary(outcome, MARKER_A),
-      "LEAK: B received A's file bytes",
-    ).toBe(false);
+    // Null means the check itself broke. "control: A can attach a file A
+    // staged" runs the same check on A's own file and is red whenever it does.
+    const held = holdsCanary(outcome, MARKER_A);
+    if (held === null) return;
+
+    expect(held, "LEAK: B received A's file bytes").toBe(false);
   });
 });
 
@@ -461,6 +483,14 @@ describe("staged id, built by hand: the id proves nothing about who holds it", (
       DECODER.decode(resolved.attachments[0]!.content),
       "A did not get back the bytes A staged",
     ).toBe(MARKER_A);
+
+    // The very check the leak test beside this one decides on, run on a file
+    // that does hold the canary. It must say yes. A null or a false here means
+    // the check is broken, and the leak test would be measuring nothing.
+    expect(
+      holdsCanary({ refused: false, value: resolved }, MARKER_A),
+      "the canary check cannot see the canary in A's own file",
+    ).toBe(true);
   });
 
   // RECORDED 2026-09-19, run as a plain test, after the check was moved from
@@ -498,8 +528,13 @@ describe("staged id, built by hand: the id proves nothing about who holds it", (
       resolveStagedAttachments(envFor(USER_B), [idFromB], now),
     );
 
+    // Null means the check itself broke. "control: A can resolve an id A
+    // rebuilt for A's own key" runs the same check and is red whenever it does.
+    const held = holdsCanary(outcome, MARKER_A);
+    if (held === null) return;
+
     expect(
-      holdsCanary(outcome, MARKER_A),
+      held,
       "LEAK: B read A's file bytes with a staged id B built by hand",
     ).toBe(false);
   });
