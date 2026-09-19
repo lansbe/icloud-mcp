@@ -29,8 +29,13 @@
 // The user ids are COPIED from the vectors file and never computed. No
 // fingerprinting code may exist in a test helper (D-12).
 
+import type { McpServer } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
+import { createDavFetch } from "../../src/dav/transport";
 import type { Env } from "../../src/env";
+import { createSessionGate } from "../../src/mail/service";
+import { registerCalendarTools } from "../../src/mcp/tools/calendar";
+import { registerMailTools } from "../../src/mcp/tools/mail";
 import { USER_A_VECTOR, USER_B_VECTOR } from "./user-id-vectors";
 
 /** One test user: who they are, and the user id the spec gives them. */
@@ -96,4 +101,186 @@ export async function attempt<T>(run: () => Promise<T>): Promise<Attempt<T>> {
   } catch {
     return { refused: true };
   }
+}
+
+/**
+ * A tool result exactly as a callback in `src/` hands it back.
+ *
+ * `isError` is optional here because it is optional there. An error result sets
+ * it to true. No tool ever sets it to false, so a success result does not carry
+ * the field at all. Read it through `readToolResult`, never off this shape.
+ */
+export interface RecordedToolResult {
+  readonly isError?: boolean;
+  readonly content: readonly { readonly text: string }[];
+}
+
+/** A tool result with both halves parsed, and a yes-or-no answer for failure. */
+export interface ParsedToolResult {
+  /** Always a boolean, never missing. See `readToolResult` for why. */
+  readonly isError: boolean;
+  /** The first block, parsed. Null when it would not parse. */
+  readonly trusted: Record<string, unknown> | null;
+  /** The JSON object inside the fenced second block. Null when it would not parse. */
+  readonly untrusted: Record<string, unknown> | null;
+}
+
+/** One recorded tool callback. It may return, throw, or reject. */
+type RecordedCallback = (
+  args: Record<string, unknown>,
+) => RecordedToolResult | Promise<RecordedToolResult>;
+
+/**
+ * Extra tools for one `toolsFor` call, for tests only.
+ *
+ * The function is handed a small `register(name, callback)`. It mirrors the
+ * extra-tools parameter `createServerFactory` already has in
+ * `src/mcp/server.ts`. It exists so a test can register a callback that throws
+ * and show that `call` gives null for it. No production tool is registered this
+ * way.
+ */
+export type ExtraTools = (
+  register: (name: string, callback: RecordedCallback) => void,
+) => void;
+
+/** The registered tools, as one named user would reach them. */
+export interface UserTools {
+  /** Every recorded tool name, in registration order. */
+  readonly names: readonly string[];
+  /**
+   * Call one tool. Resolves to its result, or to null. Never throws and never
+   * rejects.
+   */
+  call(
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<RecordedToolResult | null>;
+}
+
+/**
+ * The registered mail and calendar tool callbacks, for `user`.
+ *
+ * The repo never builds a real MCP server to call a tool. It hands the
+ * registrars a small object that records what they register, in the same
+ * three-argument shape `test/dav-tools.test.ts` uses, and then calls the
+ * recorded callback. Registration opens no socket and sends no request.
+ *
+ * **What "for `user`" honestly means today, which is not much (D-05).**
+ *
+ * - The MAIL callbacks ignore the user completely. `registerMailTools` takes a
+ *   server and a gate, and its callbacks read the ambient environment that
+ *   `src/mcp/tools/mail.ts` imports for itself. So `toolsFor(USER_A)` and
+ *   `toolsFor(USER_B)` make the very same mail call. That is not a flaw in this
+ *   fixture. It is the thing the cross-user tests record: the tool layer has no
+ *   idea who is calling.
+ * - The CALENDAR callbacks carry the user's Basic header, because they send
+ *   through the `davFetch` built here from `envFor(user)`. But they still key
+ *   the DAV cache by the ambient identity, not by this user.
+ *
+ * **Phase 9 changes only this function.** When the registrars start taking a
+ * signed-in user, this is where that user's principal gets passed in. What the
+ * tests ASSERT does not change.
+ *
+ * **Why `call` never throws.** Inside an expected-fail body the runner counts a
+ * throw from ANYWHERE as the expected failure and throws the error away. It is
+ * true that today's callbacks catch their own errors and return a result. Do
+ * not lean on that. Phase 9 rewires this function, and a callback that started
+ * throwing would keep a leak test "failing as expected" for the wrong reason,
+ * so the real fix in Phase 10 would go unnoticed. With null instead, the leak
+ * test returns early, its body passes, the expected fail turns red, and someone
+ * looks.
+ *
+ * `call` gives null in two cases: no tool has that name, or the callback threw
+ * or rejected. `names` tells them apart. A name that is listed and still gives
+ * null means the callback threw.
+ *
+ * The caught value is never bound and never read, for the same reason as in
+ * `attempt`: nothing about an error object belongs in a test report.
+ */
+export function toolsFor(user: TestUser, extra?: ExtraTools): UserTools {
+  const recorded: { name: string; callback: RecordedCallback }[] = [];
+
+  const server = {
+    registerTool(
+      name: string,
+      _options: Record<string, unknown>,
+      callback: RecordedCallback,
+    ): void {
+      recorded.push({ name, callback });
+    },
+  } as unknown as McpServer;
+
+  registerMailTools(server, createSessionGate());
+  registerCalendarTools(server, createDavFetch(envFor(user)));
+
+  // After the real registrations, onto the same list, so an extra tool is
+  // reached through the very same `call` path as a real one.
+  if (extra !== undefined) {
+    extra((name, callback) => {
+      recorded.push({ name, callback });
+    });
+  }
+
+  return {
+    names: recorded.map((one) => one.name),
+    async call(name, args) {
+      const tool = recorded.find((one) => one.name === name);
+      if (tool === undefined) return null;
+      try {
+        return await tool.callback(args);
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
+/** The JSON object in `text`, from its first brace to its last. Null if none. */
+function parseObject(text: unknown): Record<string, unknown> | null {
+  try {
+    if (typeof text !== "string") return null;
+    const from = text.indexOf("{");
+    const to = text.lastIndexOf("}");
+    if (from < 0 || to < from) return null;
+    const parsed: unknown = JSON.parse(text.slice(from, to + 1));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read a tool result into its two parsed halves. Never throws.
+ *
+ * The first block is the server's own JSON. The second is a fenced block with a
+ * notice around a JSON object, so it is read from its outermost brace to its
+ * outermost brace. A block that is missing or will not parse comes back as null.
+ *
+ * **`isError` is compared with true, never passed through.** The field is
+ * optional in `src/mcp/untrusted.ts`. Error results set it to true, and no tool
+ * ever sets it to false, so a success result has no such field. Passing the raw
+ * field through would hand back `undefined` for every success, and then every
+ * check that it is false would fail, leak or no leak. Comparing with true makes
+ * the answer a real boolean: true only when the raw field is exactly true, and
+ * false in every other case, a missing field included.
+ */
+export function readToolResult(result: RecordedToolResult): ParsedToolResult {
+  let trustedText: unknown = null;
+  let untrustedText: unknown = null;
+  let isError = false;
+  try {
+    isError = result.isError === true;
+    trustedText = result.content[0]?.text;
+    untrustedText = result.content[1]?.text;
+  } catch {
+    // A result with no readable content. Both halves stay null.
+  }
+  return {
+    isError,
+    trusted: parseObject(trustedText),
+    untrusted: parseObject(untrustedText),
+  };
 }

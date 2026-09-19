@@ -47,16 +47,28 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   STAGED_ID_TTL_MS,
   decodeStagedId,
+  decodeUploadId,
   encodeStagedId,
+  encodeUploadId,
 } from "../src/mail/ids";
 import {
+  mintUploadGrant,
   releaseStagedAttachments,
   resolveStagedAttachments,
   stageInlineBytes,
 } from "../src/mcp/tools/mail";
-import { USER_A, USER_B, attempt, envFor } from "./fixtures/two-users";
+import {
+  USER_A,
+  USER_B,
+  attempt,
+  envFor,
+  readToolResult,
+  toolsFor,
+} from "./fixtures/two-users";
+import type { RecordedToolResult } from "./fixtures/two-users";
 
 const DECODER = new TextDecoder();
+const ENCODER = new TextEncoder();
 
 /**
  * A's file, as a string nothing else in the suite could produce by accident.
@@ -92,6 +104,81 @@ async function stageAsA(
   } catch {
     return null;
   }
+}
+
+/** The file A uploads through a presigned grant. A second canary, like MARKER_A. */
+const UPLOAD_MARKER_A = "CANARY-A-uploaded-file-51d2b8";
+const UPLOAD_BYTES_A = ENCODER.encode(UPLOAD_MARKER_A);
+
+/**
+ * A asks for an upload grant, and the bytes land at the key it names.
+ *
+ * The `put` stands in for the presigned PUT, so no network is used. It writes
+ * the same content type and the same filename metadata the real upload would.
+ * Gives null when the grant was not granted or the write did not happen.
+ *
+ * It holds no assertion and it never throws, so it is safe inside an
+ * expected-fail body.
+ *
+ * `now` must be the wall clock. The confirm callback reads the wall clock for
+ * itself, so a ticket minted at a fixed instant in the past would look expired
+ * to it, and an expiry would stand in for a refusal and hide the leak.
+ */
+async function grantAndUploadAsA(
+  now: number,
+): Promise<{ uploadId: string; key: string } | null> {
+  try {
+    const grant = await mintUploadGrant(
+      envFor(USER_A),
+      {
+        filename: "a.pdf",
+        mimeType: "application/pdf",
+        sizeBytes: UPLOAD_BYTES_A.length,
+      },
+      now,
+    );
+    if (!grant.granted || grant.uploadId === null) return null;
+
+    const key = decodeUploadId(grant.uploadId, now).key;
+    await env.ATTACHMENT_STAGING.put(key, UPLOAD_BYTES_A, {
+      httpMetadata: { contentType: "application/pdf" },
+      customMetadata: { filename: "a.pdf" },
+    });
+    return { uploadId: grant.uploadId, key };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * An upload ticket for `key` that B wrote by hand, or null if it cannot be built.
+ *
+ * B never saw the ticket A was given. The ticket is not signed, so B can write
+ * one from the key alone. The leak test and its control BOTH build their ticket
+ * here, and that is what makes the control's call the same call as the leak
+ * test's.
+ *
+ * It holds no assertion and it never throws.
+ */
+function handBuiltTicketFor(key: string, now: number): string | null {
+  try {
+    return encodeUploadId({ key, expiresAt: now + STAGED_ID_TTL_MS }, now);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Did the tool turn B away? True when the result is an error result, or when
+ * the server's own half says nothing was staged.
+ *
+ * It takes a result that is not null, holds no assertion and never throws. The
+ * error flag is always read inline through `readToolResult`, because a raw
+ * success result has no such field.
+ */
+function refusedByTool(result: RecordedToolResult): boolean {
+  if (readToolResult(result).isError) return true;
+  return readToolResult(result).trusted?.staged === false;
 }
 
 /** A bucket with nothing in it, before every case. */
@@ -258,5 +345,143 @@ describe("staged id, built by hand: the id proves nothing about who holds it", (
       outcome.refused,
       "LEAK: B read A's file bytes with a staged id B built by hand",
     ).toBe(true);
+  });
+});
+
+// These two are what prove the catch paths work. No other green test reaches
+// them today, because nothing B does is refused yet, so nothing B does throws.
+describe("fixture", () => {
+  it("fixture: a callback that throws gives null", async () => {
+    const tools = toolsFor(USER_A, (register) => {
+      register("test_throws", () => {
+        throw new Error("a callback that throws");
+      });
+      register("test_rejects", () =>
+        Promise.reject(new Error("a callback that rejects")),
+      );
+    });
+
+    expect(
+      await tools.call("test_throws", {}),
+      "a callback that threw did not give null",
+    ).toBeNull();
+    expect(
+      await tools.call("test_rejects", {}),
+      "a callback that rejected did not give null",
+    ).toBeNull();
+    expect(
+      await tools.call("test_nobody_registered_this", {}),
+      "a missing tool did not give null",
+    ).toBeNull();
+
+    // The extra tools went onto the same list as the real ones, not in place
+    // of them.
+    expect(tools.names).toContain("mail_confirm_upload");
+    expect(tools.names).toContain("test_throws");
+    expect(tools.names).toContain("test_rejects");
+  });
+
+  it("fixture: attempt turns a throw into refused", async () => {
+    const threw = await attempt(async () => {
+      throw new Error("a plain throw");
+    });
+    expect(threw.refused, "a plain throw was not turned into refused").toBe(true);
+
+    const rejected = await attempt(() =>
+      Promise.reject(new Error("a rejected promise")),
+    );
+    expect(
+      rejected.refused,
+      "a rejected promise was not turned into refused",
+    ).toBe(true);
+
+    const resolved = await attempt(() => Promise.resolve("the value"));
+    expect(resolved).toEqual({ refused: false, value: "the value" });
+  });
+
+  it("fixture: both users reach the mail and calendar tools", () => {
+    const names = toolsFor(USER_B).names;
+    expect(names).toContain("mail_confirm_upload");
+    expect(names).toContain("calendar_update_event");
+    expect(names).toContain("calendar_commit");
+  });
+});
+
+describe("upload ticket: an upload belongs to the user who asked for the grant", () => {
+  it("control: A confirms A's own upload", async () => {
+    const now = Date.now();
+
+    const upload = await grantAndUploadAsA(now);
+    expect(upload, "the fixture failed to grant and upload").not.toBeNull();
+    if (upload === null) throw new Error("unreachable");
+
+    const result = await toolsFor(USER_A).call("mail_confirm_upload", {
+      uploadId: upload.uploadId,
+      sizeBytes: UPLOAD_BYTES_A.length,
+    });
+    expect(result, "the tool is missing or its callback threw").not.toBeNull();
+    if (result === null) throw new Error("unreachable");
+
+    expect(
+      readToolResult(result).isError,
+      "a success result must read as isError false",
+    ).toBe(false);
+
+    const trusted = readToolResult(result).trusted;
+    expect(trusted?.staged, "A's own confirm was not staged").toBe(true);
+    expect(typeof trusted?.id, "A's own confirm gave no staged id").toBe("string");
+
+    // The id is real: it resolves, as A, to the bytes A uploaded.
+    const resolved = await resolveStagedAttachments(
+      envFor(USER_A),
+      [String(trusted?.id)],
+      now,
+    );
+    expect(
+      DECODER.decode(resolved.attachments[0]!.content),
+      "A's confirmed id did not resolve to the bytes A uploaded",
+    ).toBe(UPLOAD_MARKER_A);
+  });
+
+  // This says nothing about what the result holds, on purpose. It is green
+  // today, when B is handed a staged id, and green after the fix, when B is
+  // refused. It goes red only when B's call gives null, which is the one case
+  // the leak test beside it passes over by returning early.
+  it("control: B's confirm call gives a real result", async () => {
+    const now = Date.now();
+
+    const upload = await grantAndUploadAsA(now);
+    expect(upload, "the fixture failed to grant and upload").not.toBeNull();
+    if (upload === null) throw new Error("unreachable");
+
+    const result = await toolsFor(USER_B).call("mail_confirm_upload", {
+      uploadId: upload.uploadId,
+      sizeBytes: UPLOAD_BYTES_A.length,
+    });
+
+    expect(result, "the tool is missing or its callback threw").not.toBeNull();
+  });
+
+  // The same job, for the call the hand-built ticket test makes. The control
+  // above cannot cover it: that one sends A's real uploadId, so a callback that
+  // threw only on a hand-built ticket would leave it green while the leak test
+  // returned early and passed.
+  it("control: B's hand-built ticket confirm gives a real result", async () => {
+    const now = Date.now();
+
+    const upload = await grantAndUploadAsA(now);
+    expect(upload, "the fixture failed to grant and upload").not.toBeNull();
+    if (upload === null) throw new Error("unreachable");
+
+    const ticket = handBuiltTicketFor(upload.key, now);
+    expect(ticket, "the hand-built ticket could not be built").not.toBeNull();
+    if (ticket === null) throw new Error("unreachable");
+
+    const result = await toolsFor(USER_B).call("mail_confirm_upload", {
+      uploadId: ticket,
+      sizeBytes: UPLOAD_BYTES_A.length,
+    });
+
+    expect(result, "the tool is missing or its callback threw").not.toBeNull();
   });
 });
