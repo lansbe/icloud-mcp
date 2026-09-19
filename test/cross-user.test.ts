@@ -316,12 +316,8 @@ describe("R2 staging, read: a staged file belongs to the user who staged it", ()
     if (!storesClean) return;
     const now = Date.now();
 
-    const staged = await stageInlineBytes(
-      envFor(USER_A),
-      { base64: btoa(MARKER_A), filename: "a.txt", mimeType: "text/plain" },
-      now,
-    );
-    if (!staged.staged) return;
+    const staged = await stageAsA(now);
+    if (staged === null) return;
     const idFromA = staged.id;
 
     const outcome = await attempt(() =>
@@ -352,6 +348,21 @@ describe("R2 staging, delete: only the user who staged a file can remove it", ()
     ).toBeNull();
   });
 
+  // The leak test below returns early when its bucket read is refused. This
+  // makes the same read, through the same `attempt`, and goes red for it.
+  it("control: the bucket can be read after staging", async () => {
+    const now = Date.now();
+
+    const staged = await stageAsA(now);
+    expect(staged, "the fixture failed to stage").not.toBeNull();
+    if (staged === null) throw new Error("unreachable");
+
+    const read = await attempt(() => env.ATTACHMENT_STAGING.head(staged.key));
+    expect(read.refused, "the bucket read was refused").toBe(false);
+    if (read.refused) throw new Error("unreachable");
+    expect(read.value, "A's object was not in the bucket").not.toBeNull();
+  });
+
   // RECORDED 2026-09-19, run as a plain test before this mark was added:
   //
   //   AssertionError: LEAK: B's release deleted A's staged object: expected null not to be null
@@ -374,8 +385,15 @@ describe("R2 staging, delete: only the user who staged a file can remove it", ()
       releaseStagedAttachments(envFor(USER_B), [keyOfA], true),
     );
 
+    // The bucket is read OUTSIDE the assertion. A read that rejected inside it
+    // would throw before the matcher ran, and the runner would record that as
+    // the leak. "control: the bucket can be read after staging" is red whenever
+    // this read is refused.
+    const after = await attempt(() => env.ATTACHMENT_STAGING.head(keyOfA));
+    if (after.refused) return;
+
     expect(
-      await env.ATTACHMENT_STAGING.head(keyOfA),
+      after.value,
       "LEAK: B's release deleted A's staged object",
     ).not.toBeNull();
   });
@@ -606,6 +624,21 @@ describe("upload ticket: an upload belongs to the user who asked for the grant",
     expect(result, "the tool is missing or its callback threw").not.toBeNull();
   });
 
+  // The wrong-size leak test returns early when its bucket read is refused.
+  // This makes the same read, through the same `attempt`, and goes red for it.
+  it("control: the bucket can be read after an upload", async () => {
+    const now = Date.now();
+
+    const upload = await grantAndUploadAsA(now);
+    expect(upload, "the fixture failed to grant and upload").not.toBeNull();
+    if (upload === null) throw new Error("unreachable");
+
+    const read = await attempt(() => env.ATTACHMENT_STAGING.head(upload.key));
+    expect(read.refused, "the bucket read was refused").toBe(false);
+    if (read.refused) throw new Error("unreachable");
+    expect(read.value, "A's upload was not in the bucket").not.toBeNull();
+  });
+
   // RECORDED 2026-09-19, run as a plain test before this mark was added:
   //
   //   AssertionError: LEAK: B confirmed A's upload and was handed a staged id for A's file: expected false to be true // Object.is equality
@@ -660,8 +693,14 @@ describe("upload ticket: an upload belongs to the user who asked for the grant",
       sizeBytes: UPLOAD_BYTES_A.length + 1,
     });
 
+    // Read outside the assertion, for the same reason as the staged delete
+    // above. "control: the bucket can be read after an upload" is red whenever
+    // this read is refused.
+    const after = await attempt(() => env.ATTACHMENT_STAGING.head(keyOfA));
+    if (after.refused) return;
+
     expect(
-      await env.ATTACHMENT_STAGING.head(keyOfA),
+      after.value,
       "LEAK: B's wrong-size confirm deleted A's uploaded object",
     ).not.toBeNull();
   });
