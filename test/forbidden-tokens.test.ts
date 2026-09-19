@@ -710,6 +710,77 @@ describe("the patterns have teeth", () => {
       }
     }
   });
+
+  // ------------------------------------------------ credential names in a log
+  // Phase 8, CRED-05 (D-08). The rule-level guard above sees RULES, never the
+  // names inside one: the rule's single sample names one binding, so a name
+  // dropped from the alternation would leave every assertion above green. These
+  // blocks are the per-name layer, copied from the DAV fan-out blocks.
+
+  /** Every name the secret-in-log rule must carry. Hand-written on purpose, and
+   *  never derived from the shipped pattern: a list read off the rule would
+   *  agree with the rule by construction.
+   *
+   *  The first three are the Worker's secret bindings. The last two are the
+   *  field names the grant's props use for the same two values. */
+  const SECRET_LOG_NAMES = [
+    "APPLE_APP_PASSWORD",
+    "APPLE_ID",
+    "AUTH_SECRET",
+    "appPassword",
+    "appleId",
+  ];
+
+  /** A logging call that reads one named field, with the name substituted in.
+   *
+   *  The object is deliberately spelled `holder`. It is NOT the environment
+   *  object and it carries no name from the list, for the reason `fanOutOver`
+   *  gives: a template that already holds a listed name matches on every pass
+   *  no matter what is substituted, and the loop below would prove nothing. */
+  const logCallNaming = (name: string) => `console.log("sending", holder.${name});`;
+
+  it("names every credential field a log line could pass, binding and grant alike", () => {
+    // One line per name. A sample proves the RULE is not vacuous, never that any
+    // particular name inside it is live.
+    const rule = FORBIDDEN.find((r) => r.id === "secret-binding-in-log-call")!;
+    expect(SECRET_LOG_NAMES.length, "three bindings and the grant's two fields").toBe(5);
+    for (const name of SECRET_LOG_NAMES) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(
+        fresh.test(logCallNaming(name)),
+        `${name} is not named in the alternation`,
+      ).toBe(true);
+    }
+  });
+
+  it("refuses a credential name the alternation does not carry, so the loop above has teeth", () => {
+    // Guards the guard. If the template matched on its own, the loop above
+    // would pass with the alternation gutted. The near-miss is here for a
+    // second reason: the names match as whole identifiers with exact letter
+    // case, so a longer identifier that merely STARTS with a listed name is
+    // not seen. That is a known limit of the rule, and this pins it rather
+    // than leaving it to be discovered.
+    const rule = FORBIDDEN.find((r) => r.id === "secret-binding-in-log-call")!;
+    for (const notListed of ["notASecretName", "appleIdentity"]) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(
+        fresh.test(logCallNaming(notListed)),
+        `the template matched for ${notListed}, which is not on the list — the per-name loop proves nothing`,
+      ).toBe(false);
+    }
+  });
+
+  it("asserts every name in the shipped secret alternation, with nothing left over", () => {
+    // The other direction. The loop catches a name REMOVED from the pattern;
+    // only this catches a name ADDED to it without a sample line. The list is
+    // hand-written and only the comparand is read from the shipped rule.
+    // `alternationNamesOf` throws when it finds no group, so an empty or garbled
+    // alternation cannot pass here.
+    const rule = FORBIDDEN.find((r) => r.id === "secret-binding-in-log-call")!;
+    const asserted = [...SECRET_LOG_NAMES].sort();
+    expect(new Set(asserted).size, "a name is listed twice").toBe(asserted.length);
+    expect(alternationNamesOf(rule.pattern).sort()).toEqual(asserted);
+  });
 });
 
 describe("the scanned surface", () => {

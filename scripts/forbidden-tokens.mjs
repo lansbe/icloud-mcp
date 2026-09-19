@@ -77,11 +77,22 @@ export const FORBIDDEN = [
   // FND-03, Pitfall 6. IMAP's LOGIN command carries the password inline in the
   // command stream, so there is no separately-named field a redactor could
   // target. The only reliable defence is that the credential path does not log.
+  // Phase 8, CRED-05 (D-08). The last two names are not bindings. They are the
+  // field names the grant's props use for the same two values, and they sit
+  // beside the binding names because the leak is the same leak: a per-user
+  // credential reaches a retained log through a line that names it. The three
+  // binding names stay on the list even after the bindings themselves are
+  // retired, because a rule that only refuses more costs nothing to keep.
+  //
+  // What it does not see: a different spelling or letter case of a name. The
+  // names match as whole identifiers, with a word boundary on each side and no
+  // case-insensitive flag, so a longer identifier that merely starts with one
+  // is not caught. The rule below it for the props object is the wider net.
   {
     id: "secret-binding-in-log-call",
     pattern:
-      /\b(?:console|logger)\.[a-z]+\([^)]*\b(?:APPLE_APP_PASSWORD|APPLE_ID|AUTH_SECRET)\b/g,
-    why: "A logging call whose arguments mention a secret binding name. Credentials must never reach a log, an error, or a tool response.",
+      /\b(?:console|logger)\.[a-z]+\([^)]*\b(?:APPLE_APP_PASSWORD|APPLE_ID|AUTH_SECRET|appPassword|appleId)\b/g,
+    why: "A logging call whose arguments mention a secret binding name, or one of the two credential field names the grant's props carry. A log line naming either field leaks the Apple ID or the app-specific password. Credentials must never reach a log, an error, or a tool response.",
   },
   {
     id: "logging-on-the-credential-path",
