@@ -2480,13 +2480,31 @@ interface RowStructure {
   hasAttachments: boolean;
 }
 
-/** The empty answer, spelled once so every early return agrees on it. */
+/**
+ * The empty answer, spelled once so every early return agrees on it.
+ *
+ * This one object is handed to every caller by reference. Inside one isolate
+ * that makes it shared between users (audit row N2), so it is frozen: a caller
+ * that tries to write to it gets a `TypeError`, and the next caller still gets
+ * an empty page.
+ *
+ * The inner array is frozen too. The unsupported-charset return spreads this
+ * object, and a spread copy is a new outer object that still shares the same
+ * inner array. The inner freeze is the one that protects that path.
+ *
+ * Frozen by the two statements below and not inside the declaring expression,
+ * because the expression form does not type-check here: `messages` is declared
+ * as a mutable array, and a frozen literal is a read-only one. The statement
+ * form changes no type.
+ */
 const EMPTY_PAGE: SearchPage = {
   messages: [],
   hasMore: false,
   nextCursor: null,
   unsupportedCharset: false,
 };
+Object.freeze(EMPTY_PAGE.messages);
+Object.freeze(EMPTY_PAGE);
 
 /**
  * Fetch one page inside an open session.
