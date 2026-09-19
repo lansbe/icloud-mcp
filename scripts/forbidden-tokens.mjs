@@ -121,6 +121,79 @@ export const FORBIDDEN = [
     pattern: /\b(?:console|logger)\.[a-z]+\([^)]*\benv\b/g,
     why: "A logging call whose arguments mention the bare environment object. It carries APPLE_ID and APPLE_APP_PASSWORD, so nothing needs to name a secret for the credentials to reach the log -- which is exactly the shape the secret-binding rule cannot see.",
   },
+  // Phase 8, CRED-05 (D-07). The rule above, moved to where the credentials
+  // live next. Once each user signs in with their own account, the Apple ID and
+  // the app-specific password travel in the grant's props, and the principal
+  // built from them is the handle on the password. A log line that passes any
+  // of those names no secret, so the two rules above cannot see it.
+  //
+  // THE SPAN IS BOUNDED BY THE STATEMENT, and the two older logging rules above
+  // keep the paren-bounded span. The difference is deliberate. A span that
+  // stops at the first closing parenthesis ends at an INNER call's parenthesis,
+  // so a log call whose first argument is itself a call hides the props behind
+  // it. The concurrency rules below made the same choice for the same reason.
+  // The older rules are left exactly as they are: changing a shipped span is a
+  // change to a shipped rule, and this phase adds rules without touching one.
+  //
+  // FIVE NAMES, where D-07 lists four. The fifth is the one password reader. A
+  // log call that passes what it returns is the most direct leak there is, and
+  // a principal held in a variable with another name would hide it from the
+  // other four. It only refuses more. To drop it, delete that one name here and
+  // in PROPS_LOG_NAMES in test/forbidden-tokens.test.ts.
+  //
+  // WHAT IT DOES NOT AND CANNOT SEE. A variable with another name. A field
+  // pulled out first and logged under a new name. A logger that is not called
+  // by either of the two names the pattern opens with. A direct write to an
+  // output stream. An argument list that runs past 400 characters, or one with
+  // a semicolon before the name. A different spelling or letter case of a
+  // listed name: the names match as whole identifiers, with a word boundary on
+  // each side and no case-insensitive flag. All of these are evasions rather
+  // than accidents, and this rule is aimed at the accident. Under src/ the
+  // blanket logging rule above still refuses every one of them that is a
+  // logging call. Naming the gaps here is what stops a later reader believing
+  // the rule proves more than it does.
+  {
+    // No `scope`, on purpose: this one holds in every scanned directory. A
+    // throwaway script or a test helper that prints the grant's props leaks the
+    // same two values as a Worker that does.
+    id: "props-object-in-log-call",
+    pattern:
+      /\b(?:console|logger)\.[a-z]+\s*\([^;]{0,400}?\b(?:props|principal|authInfo|getMcpAuthContext|passwordOf)\b/g,
+    why: "A logging call whose arguments mention the grant's props, the principal, the auth info, the auth context reader or the password reader. The grant's props carry the Apple ID and the app-specific password, so a log line that passes them names no secret and leaks both -- and observability logging is enabled, so 'a log' means retained Cloudflare storage, not a terminal.",
+  },
+
+  // ---------------------------------------------------- writes onto the env object
+  // Phase 8, CRED-05 (D-09). The environment object is shared: by every test in
+  // a file, and by every request an isolate serves. A write onto it changes who
+  // the NEXT caller runs as, and nothing at the write site says so. It matches
+  // nothing on the real tree today, and it is here before the per-user code is
+  // written so that code is bound by it from its first commit.
+  //
+  // Three forms, the ones D-09 names: a member assignment, an index assignment,
+  // and the object-merge call with the environment object as its TARGET. An
+  // accessor chain is required before the operator, so declaring or rebinding a
+  // local with this name is not a hit. The operator may be plain or compound,
+  // and must not be the start of a comparison or an arrow. A spread copy with
+  // fields overridden is a new object and is left alone: that is the permitted
+  // form, and it is what the two-user test fixture does.
+  //
+  // WHAT IT DOES NOT AND CANNOT SEE. The delete form. The property-definition
+  // call and the reflective set call. An alias of the object, written through
+  // under another name. A destructuring assignment. A bare rebinding of a local
+  // with this name, which changes no shared object and is not a leak. A
+  // different spelling or letter case of the object's name. All have zero hits
+  // today. These are evasions rather than accidents, and this rule is aimed at
+  // the accident. Naming the gaps here is what stops a later reader believing
+  // the rule proves more than it does.
+  {
+    // No `scope`, on purpose: a test that writes an identity onto the shared
+    // object is the realistic case, so the rule has to reach test/ and scripts/
+    // as well as src/.
+    id: "env-assignment",
+    pattern:
+      /\benv\s*(?:\.\s*[A-Za-z_$][\w$]*|\[[^\]\n]*\])+\s*(?:\*\*|<<|>>>?|&&|\|\||\?\?|[-+*\/%&|^])?=(?![=>])|\bObject\.assign\s*\(\s*(?:[\w$]+\.)*env\b/g,
+    why: "A write onto the environment object: a member assignment, an index assignment, or an object merge with it as the target. That object is shared by every test in a file and every request in an isolate, so a write onto it is how one user's identity leaks into another test or another request. Build a fresh copy with the two account fields overridden instead.",
+  },
 
   // -------------------------------------------------------------- concurrency
   // D-10. The detective half of the one-socket-per-request limit; the structural

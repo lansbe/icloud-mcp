@@ -250,6 +250,13 @@ describe("the patterns have teeth", () => {
     // The same call one step worse: the whole environment object, which carries
     // all three secrets without any of them being written down.
     "env-object-in-log-call": 'console.warn("diagnose env", env);',
+    // The same leak after the credentials move into the grant. The props read
+    // off the execution context hold the Apple ID and the app-specific
+    // password, and this line names neither. It is the debug line a
+    // contributor would really write while wiring the handler, which is why it
+    // is the sample: no binding name, no environment object, so neither rule
+    // above sees it.
+    "props-object-in-log-call": 'console.log("grant reached the handler", ctx.props);',
     // A fan-out around the choke-point. Written with an arrow function on
     // purpose: the parenthesis pair in `()` is exactly what a naive
     // "no closing paren between them" pattern would trip over.
@@ -291,6 +298,13 @@ describe("the patterns have teeth", () => {
     // The host-timezone-dependent conversion. Silently wrong times, never an
     // error, and the test pool's zone is not production's.
     "ical-jsdate": "const start = event.startDate.toJSDate();",
+    // A test that wants to run as user B and reaches for the shortest way to do
+    // it: writing B's address onto the shared environment object. Member
+    // assignment, because that is the form a contributor types first. The
+    // object is shared by every test in the file, so the next test runs as B
+    // without saying so. The right way is a fresh copy with both account
+    // fields overridden, which is what the two-user fixture does.
+    "env-assignment": 'env.APPLE_ID = "user-b@example.invalid";',
   };
 
   it("covers every rule with a known-violating sample", () => {
@@ -780,6 +794,217 @@ describe("the patterns have teeth", () => {
     const asserted = [...SECRET_LOG_NAMES].sort();
     expect(new Set(asserted).size, "a name is listed twice").toBe(asserted.length);
     expect(alternationNamesOf(rule.pattern).sort()).toEqual(asserted);
+  });
+
+  // ---------------------------------------------- the grant's props in a log
+  // Phase 8, CRED-05 (D-07). Same four-part shape as the block above: a
+  // hand-written list, a per-name loop, a control, and a set-equality.
+
+  /** Every name the props-in-log rule must carry. Hand-written, never derived.
+   *
+   *  The first four are D-07's. The fifth is the one password reader, added
+   *  under the regex discretion. To drop it, delete it here and in the shipped
+   *  alternation, and nothing else changes. */
+  const PROPS_LOG_NAMES = [
+    "props",
+    "principal",
+    "authInfo",
+    "getMcpAuthContext",
+    "passwordOf",
+  ];
+
+  /** A logging call that passes one named value, with the name substituted in.
+   *
+   *  The template carries no name from the list and does not mention the
+   *  environment object, for the reason `fanOutOver` gives. The logger is
+   *  spelled the second way the pattern allows, so both spellings are exercised
+   *  across this file rather than one. */
+  const propsLogCallNaming = (name: string) =>
+    `logger.info("handler reached", requestId, ${name});`;
+
+  it("names every handle on the grant's credentials a log line could pass", () => {
+    const rule = FORBIDDEN.find((r) => r.id === "props-object-in-log-call")!;
+    expect(PROPS_LOG_NAMES.length, "D-07's four names and the password reader").toBe(5);
+    for (const name of PROPS_LOG_NAMES) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(
+        fresh.test(propsLogCallNaming(name)),
+        `${name} is not named in the alternation`,
+      ).toBe(true);
+    }
+  });
+
+  it("refuses a props name the alternation does not carry, so the loop above has teeth", () => {
+    // Guards the guard, and pins the rule's known limit at the same time. The
+    // two near-misses are the realistic ones: a variable that merely ENDS with
+    // a listed name in another letter case, and a plural. Neither is seen,
+    // because the names match as whole identifiers with exact case. The rule's
+    // own comment says so; this proves it rather than asserting it.
+    const rule = FORBIDDEN.find((r) => r.id === "props-object-in-log-call")!;
+    for (const notListed of ["notOnTheList", "grantProps", "principals"]) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(
+        fresh.test(propsLogCallNaming(notListed)),
+        `the template matched for ${notListed}, which is not on the list — the per-name loop proves nothing`,
+      ).toBe(false);
+    }
+  });
+
+  it("asserts every name in the shipped props alternation, with nothing left over", () => {
+    // Hand-written on one side, read from the shipped rule on the other.
+    // `alternationNamesOf` reads the LAST non-capturing group, which for this
+    // pattern is the name list. A later edit that adds a group after the names
+    // makes it read the wrong group, and this goes red rather than quiet.
+    const rule = FORBIDDEN.find((r) => r.id === "props-object-in-log-call")!;
+    const asserted = [...PROPS_LOG_NAMES].sort();
+    expect(new Set(asserted).size, "a name is listed twice").toBe(asserted.length);
+    expect(alternationNamesOf(rule.pattern).sort()).toEqual(asserted);
+  });
+
+  it("sees the props behind an inner call's closing parenthesis", () => {
+    // Why this rule's span is bounded by the statement and not by the next
+    // closing parenthesis. The first argument here is itself a call, and its
+    // `)` would end a paren-bounded span before the props were reached. The
+    // second assertion shows that with a paren-bounded copy of the same rule,
+    // so the claim in the rule's comment is measured rather than stated.
+    const line = "console.log(describe(requestId), ctx.props);";
+    const rule = FORBIDDEN.find((r) => r.id === "props-object-in-log-call")!;
+    const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+    expect(fresh.test(line)).toBe(true);
+
+    const parenBounded = /\b(?:console|logger)\.[a-z]+\s*\([^)]*\bprops\b/;
+    expect(
+      parenBounded.test(line),
+      "a paren-bounded span was expected to miss this line; if it does not, the line no longer discriminates",
+    ).toBe(false);
+  });
+
+  it("does not reach past the end of the statement for a props name", () => {
+    // The other side of the statement bound. A log call that passes nothing
+    // sensitive, followed by an ordinary statement that reads the props, is two
+    // statements and not a leak. Both orders are here.
+    const rule = FORBIDDEN.find((r) => r.id === "props-object-in-log-call")!;
+    for (const permitted of [
+      'console.log("handler reached"); const grant = ctx.props;',
+      'const grant = ctx.props; console.log("handler reached");',
+    ]) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(fresh.test(permitted), `fired across a semicolon: ${permitted}`).toBe(false);
+    }
+  });
+
+  it("does not fire a name rule on a logging call that names nothing, and the blanket rule still does", () => {
+    // Both halves, because either alone misleads. A logging call with an empty
+    // argument list names nothing, so neither name rule can see it — an empty
+    // match is not a match. Under src/ it is still refused, by the blanket
+    // rule, which is the rule that does not depend on names at all.
+    const empty = "console.log();";
+    for (const id of ["secret-binding-in-log-call", "props-object-in-log-call"]) {
+      const rule = FORBIDDEN.find((r) => r.id === id)!;
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(fresh.test(empty), `${id} fired on an empty argument list`).toBe(false);
+    }
+    const blanket = FORBIDDEN.find((r) => r.id === "logging-anywhere-under-src")!;
+    expect(
+      matchRule(blanket, FORBIDDEN.indexOf(blanket), "src/mcp/api-handler.ts", empty).length,
+      "the blanket logging rule did not fire on an empty logging call under src/",
+    ).toBeGreaterThan(0);
+  });
+
+  // -------------------------------------------- writes onto the env object
+  // Phase 8, CRED-05 (D-09). This rule has no name list: the last non-capturing
+  // group in its source is the dotted prefix inside the merge arm, so
+  // `alternationNamesOf` would read the wrong group. One line per FORM instead.
+
+  /** Every form of write the rule must refuse, one line each. */
+  const ENV_WRITE_FORMS: ReadonlyArray<readonly [string, string]> = [
+    ["member assignment", "env.APPLE_ID = userB.appleId;"],
+    ["index assignment", 'env["APPLE_ID"] = userB.appleId;'],
+    ["compound addition", "env.RETRY_BUDGET += 1;"],
+    ["compound nullish assignment", "env.APPLE_ID ??= userB.appleId;"],
+    ["nested member", "env.DAV_CACHE.put = stubPut;"],
+    ["member on this", "this.env.APPLE_ID = userB.appleId;"],
+    ["member on the next line", "env\n  .APPLE_ID = userB.appleId;"],
+    ["object merge onto it", "Object.assign(env, { APPLE_ID: userB.appleId });"],
+    [
+      "object merge onto a dotted path ending in it",
+      "Object.assign(ctx.env, { APPLE_ID: userB.appleId });",
+    ],
+  ];
+
+  /** Reads, comparisons, declarations and copies. None is a write onto the
+   *  shared object, so NO rule on the list may fire on any of them. */
+  const ENV_READS_AND_COPIES: ReadonlyArray<readonly [string, string]> = [
+    ["strict equality", "if (env.APPLE_ID === expected) return;"],
+    ["loose equality", "if (env.MODE == expected) return;"],
+    ["inequality", "if (env.APPLE_ID !== expected) return;"],
+    [
+      "less-or-equal and greater-or-equal",
+      "const inRange = env.LIMIT <= ceiling && env.LIMIT >= floor;",
+    ],
+    ["a declaration of a local with this name", "const env = makeEnv();"],
+    ["a typed let declaration", "let env: Env = makeEnv();"],
+    ["an arrow parameter", "const run = (env: Env) => handle(env);"],
+    // What `envFor` in test/fixtures/two-users.ts does. A new object, with both
+    // account fields overridden. The rule must leave the permitted form alone,
+    // or it bans the fix it points people to.
+    [
+      "a spread copy with fields overridden",
+      "return { ...(env as Env), APPLE_ID: user.appleId, APPLE_APP_PASSWORD: user.appPassword };",
+    ],
+    ["an assignment on a differently named object", "testEnv.APPLE_ID = userB.appleId;"],
+    ["a ternary that reads it", "const id = env.APPLE_ID ? env.APPLE_ID : fallback;"],
+    [
+      "an object merge INTO an empty object",
+      "const copy = Object.assign({}, env, { APPLE_ID: userB.appleId });",
+    ],
+  ];
+
+  it("refuses every form of write onto the env object", () => {
+    const rule = FORBIDDEN.find((r) => r.id === "env-assignment")!;
+    expect(ENV_WRITE_FORMS.length, "the forms D-09 names, and their variants").toBe(9);
+    for (const [form, line] of ENV_WRITE_FORMS) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(fresh.test(line), `the ${form} form was not seen`).toBe(true);
+    }
+  });
+
+  it("does not fire on a read, a comparison, a declaration or a copy of the env object", () => {
+    // Every rule, not only the new one, in the style of the permitted-line
+    // loops above: a false positive in ANY rule shows here. A rule that banned
+    // the spread copy would ban the right way to be another user.
+    expect(ENV_READS_AND_COPIES.length).toBeGreaterThan(0);
+    for (const [shape, permitted] of ENV_READS_AND_COPIES) {
+      for (const rule of FORBIDDEN) {
+        const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+        expect(
+          fresh.test(permitted),
+          `rule ${rule.id} false-positived on ${shape}`,
+        ).toBe(false);
+      }
+    }
+  });
+
+  it("holds both new rules in every scanned directory, driven through the scanner's own matcher", () => {
+    // Not `rule.scope === undefined`: that would restate the scanner's prefix
+    // logic here and pass even if `matchRule` grew a default scope. Driving the
+    // real matcher over one path per scanned root is what proves "no scope"
+    // rather than declaring it.
+    for (const id of ["props-object-in-log-call", "env-assignment"]) {
+      const rule = FORBIDDEN.find((r) => r.id === id)!;
+      const index = FORBIDDEN.indexOf(rule);
+      const sample = violatingSamples[id]!;
+      for (const path of [
+        "src/mcp/api-handler.ts",
+        "scripts/probe.mjs",
+        "test/some.test.ts",
+      ]) {
+        expect(
+          matchRule(rule, index, path, sample).length,
+          `${id} did not fire under ${path}`,
+        ).toBeGreaterThan(0);
+      }
+    }
   });
 });
 
