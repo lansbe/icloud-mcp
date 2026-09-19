@@ -172,6 +172,33 @@ describe("R2 staging, delete: only the user who staged a file can remove it", ()
       "A's own release left A's object behind",
     ).toBeNull();
   });
+
+  // RECORDED 2026-09-19, run as a plain test before this mark was added:
+  //
+  //   AssertionError: LEAK: B's release deleted A's staged object: expected null not to be null
+  //
+  // B named A's key and asked for it to be released, as if an attach of B's had
+  // just consumed it. A's file was gone afterwards. Nothing on this path asks
+  // whose key it is. The check reads the bucket, not B's result, so it holds
+  // whether B's call returns or throws. When a fix leaves A's object in place,
+  // this test goes red with "Expect test to fail": remove the mark then, on
+  // purpose, and leave the body exactly as it is.
+  it.fails("B cannot delete a file A staged", async () => {
+    const now = Date.now();
+
+    const staged = await stageAsA(now);
+    if (staged === null) return;
+    const keyOfA = staged.key;
+
+    await attempt(() =>
+      releaseStagedAttachments(envFor(USER_B), [keyOfA], true),
+    );
+
+    expect(
+      await env.ATTACHMENT_STAGING.head(keyOfA),
+      "LEAK: B's release deleted A's staged object",
+    ).not.toBeNull();
+  });
 });
 
 describe("staged id, built by hand: the id proves nothing about who holds it", () => {
@@ -197,5 +224,39 @@ describe("staged id, built by hand: the id proves nothing about who holds it", (
       DECODER.decode(resolved.attachments[0]!.content),
       "A did not get back the bytes A staged",
     ).toBe(MARKER_A);
+  });
+
+  // RECORDED 2026-09-19, run as a plain test before this mark was added:
+  //
+  //   AssertionError: LEAK: B read A's file bytes with a staged id B built by hand: expected false to be true // Object.is equality
+  //
+  // **This is the guard against a wrong fix.** The id is not signed, so B can
+  // write anything into one. A fix that read the user out of the id being
+  // checked would be reading a value B chose, and B would still get A's file.
+  // Only a check against the signed-in user refuses this. When such a fix
+  // lands, this test goes red with "Expect test to fail": remove the mark then,
+  // on purpose, and leave the body exactly as it is.
+  it.fails("B cannot read A's file with an id B built by hand", async () => {
+    const now = Date.now();
+
+    const staged = await stageAsA(now);
+    if (staged === null) return;
+    const keyOfA = staged.key;
+
+    // B never saw the id A was given. B writes one from nothing but the key.
+    const forged = await attempt(async () =>
+      encodeStagedId({ key: keyOfA, expiresAt: now + STAGED_ID_TTL_MS }, now),
+    );
+    if (forged.refused) return;
+    const idFromB = forged.value;
+
+    const outcome = await attempt(() =>
+      resolveStagedAttachments(envFor(USER_B), [idFromB], now),
+    );
+
+    expect(
+      outcome.refused,
+      "LEAK: B read A's file bytes with a staged id B built by hand",
+    ).toBe(true);
   });
 });
