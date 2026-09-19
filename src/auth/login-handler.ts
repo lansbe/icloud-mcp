@@ -56,6 +56,7 @@
 
 import { AuthorizationError } from "@cloudflare/workers-oauth-provider";
 import type { ClientInfo } from "@cloudflare/workers-oauth-provider";
+import { isConfiguredSecret } from "../configured-secret";
 import type { Env } from "../env";
 
 /** The only scope this server issues. */
@@ -191,22 +192,19 @@ Point your MCP client at that full URL, including the /mcp path. Authorization i
 }
 
 /**
- * True only for a non-empty string — the shape a usable configured secret has.
+ * The configured-secret predicate, re-exported unchanged from where it now
+ * lives.
  *
- * This exists because the absent case is silently indistinguishable from the
- * empty one at the comparison. `TextEncoder.prototype.encode` is declared
- * `encode(optional USVString input = "")`, so `encode(undefined)` resolves to
- * the WebIDL default `""` — it does not throw and does not stringify to
- * `"undefined"`. An unset Workers Secret binding is `undefined` at runtime, so
- * both sides of the comparison become the SHA-256 digest of the empty string,
- * `timingSafeEqual` returns true, and an empty submitted value authorizes.
- * `src/env.ts` types the binding `string`, so nothing catches this statically.
- *
- * Closes CR-01.
+ * This is a compatibility surface and nothing else — no wrapper, no second
+ * implementation. The definition now lives in the root module
+ * `src/configured-secret.ts`. The five source importers (`src/confirm.ts`,
+ * `src/staging/presign.ts`, `src/mail/credentials.ts`, `src/dav/transport.ts`
+ * and `src/dav/discovery.ts`) and `test/authorize-secret.test.ts` resolve the
+ * name from this module, and keeping them unedited is the evidence that the
+ * move was mechanical. This handler also calls the function itself, which is
+ * why it holds an import above as well as this statement.
  */
-export function isConfiguredSecret(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
-}
+export { isConfiguredSecret };
 
 /**
  * The counter's key: the time bucket AND the connecting client's address.
