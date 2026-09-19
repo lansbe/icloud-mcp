@@ -45,6 +45,12 @@
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  STAGED_ID_TTL_MS,
+  decodeStagedId,
+  encodeStagedId,
+} from "../src/mail/ids";
+import {
+  releaseStagedAttachments,
   resolveStagedAttachments,
   stageInlineBytes,
 } from "../src/mcp/tools/mail";
@@ -62,6 +68,30 @@ const MARKER_A = "CANARY-A-staged-file-7f3c9e";
 async function everyStagedKey(): Promise<string[]> {
   const listed = await env.ATTACHMENT_STAGING.list();
   return listed.objects.map((one) => one.key).sort();
+}
+
+/**
+ * Stage A's file as A, and hand back the id A was given and the bucket key it
+ * names. Gives null when staging did not succeed.
+ *
+ * It holds no assertion and it never throws, so it is safe inside an
+ * expected-fail body: a control asserts on its result with a message, and a
+ * leak test returns early on null.
+ */
+async function stageAsA(
+  now: number,
+): Promise<{ id: string; key: string } | null> {
+  try {
+    const staged = await stageInlineBytes(
+      envFor(USER_A),
+      { base64: btoa(MARKER_A), filename: "a.txt", mimeType: "text/plain" },
+      now,
+    );
+    if (!staged.staged) return null;
+    return { id: staged.id, key: decodeStagedId(staged.id, now).key };
+  } catch {
+    return null;
+  }
 }
 
 /** A bucket with nothing in it, before every case. */
@@ -120,5 +150,52 @@ describe("R2 staging, read: a staged file belongs to the user who staged it", ()
     );
 
     expect(outcome.refused, "LEAK: B received A's file bytes").toBe(true);
+  });
+});
+
+describe("R2 staging, delete: only the user who staged a file can remove it", () => {
+  it("control: A's own release removes A's object", async () => {
+    const now = Date.now();
+
+    const staged = await stageAsA(now);
+    expect(staged, "the fixture failed to stage").not.toBeNull();
+    if (staged === null) throw new Error("unreachable");
+    expect(
+      await env.ATTACHMENT_STAGING.head(staged.key),
+      "A's object was not in the bucket after staging",
+    ).not.toBeNull();
+
+    await releaseStagedAttachments(envFor(USER_A), [staged.key], true);
+
+    expect(
+      await env.ATTACHMENT_STAGING.head(staged.key),
+      "A's own release left A's object behind",
+    ).toBeNull();
+  });
+});
+
+describe("staged id, built by hand: the id proves nothing about who holds it", () => {
+  it("control: A can resolve an id A rebuilt for A's own key", async () => {
+    const now = Date.now();
+
+    const staged = await stageAsA(now);
+    expect(staged, "the fixture failed to stage").not.toBeNull();
+    if (staged === null) throw new Error("unreachable");
+
+    const rebuilt = encodeStagedId(
+      { key: staged.key, expiresAt: now + STAGED_ID_TTL_MS },
+      now,
+    );
+
+    const resolved = await resolveStagedAttachments(
+      envFor(USER_A),
+      [rebuilt],
+      now,
+    );
+
+    expect(
+      DECODER.decode(resolved.attachments[0]!.content),
+      "A did not get back the bytes A staged",
+    ).toBe(MARKER_A);
   });
 });
