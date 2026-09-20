@@ -199,6 +199,34 @@ const NON_ASCII_ADDRESS = `us${String.fromCharCode(0xe9)}r@example.invalid`;
 /** An address one character over the cap: 239 letters and the 16 of the domain. */
 const TOO_LONG_ADDRESS = `${"a".repeat(239)}@example.invalid`;
 
+// White space for the untrimmed-address rows (D-18). Each is built from its
+// number and never typed, so nothing that rewrites this file can change it.
+const SPACE = String.fromCharCode(0x20);
+const LINE_FEED = String.fromCharCode(0x0a);
+const CARRIAGE_RETURN = String.fromCharCode(0x0d);
+const NO_BREAK_SPACE = String.fromCharCode(0xa0);
+
+/**
+ * User A's address with white space at an end, by name (D-18, code review WR-06).
+ *
+ * The id function trims its own copy and ACCEPTS every one of these, as user A.
+ * So each is refused by the props constructor's own trim check and by nothing
+ * else, and a test below shows that before the table runs.
+ */
+const UNTRIMMED_ADDRESSES: ReadonlyArray<readonly [string, string]> = [
+  ["an appleId with a leading space", SPACE + USER_A.appleId],
+  ["an appleId with a trailing space", USER_A.appleId + SPACE],
+  ["an appleId with a trailing line feed", USER_A.appleId + LINE_FEED],
+  [
+    "an appleId with a trailing carriage return and line feed",
+    USER_A.appleId + CARRIAGE_RETURN + LINE_FEED,
+  ],
+  [
+    "an appleId padded with no-break spaces",
+    NO_BREAK_SPACE + USER_A.appleId + NO_BREAK_SPACE,
+  ],
+];
+
 /**
  * Every shape the props constructor must refuse, by name.
  *
@@ -262,6 +290,11 @@ const BAD_PROPS: ReadonlyArray<readonly [string, unknown]> = [
       appleId: USER_A.appleId,
     }),
   ],
+  // D-18, code review WR-06. A good shape whose address the trim would change.
+  ...UNTRIMMED_ADDRESSES.map(
+    ([name, appleId]) =>
+      [name, { v: 1, appleId, appPassword: USER_A.appPassword }] as const,
+  ),
 ];
 
 /** What a refusal is allowed to show: its message, its stack, its property names and values. */
@@ -621,18 +654,21 @@ describe("the holder: the principal travels and the password does not (D-01, D-1
   });
 
   it("carries the Apple ID exactly as given, and still gives the same user id", async () => {
-    // Asserted first, so the padded spelling below really is a different
-    // string for the same person.
+    // Asserted first, so the capital spelling below really is a different
+    // string for the same person. No padding here: since D-18 the props
+    // constructor refuses an address the trim would change, and the bad-props
+    // table holds that. Letter case is still carried as given.
     expect(USER_A.appleId).toBe(USER_A.appleId.trim().toLowerCase());
-    const typed = `  ${USER_A.appleId.toUpperCase()} `;
+    const typed = USER_A.appleId.toUpperCase();
     expect(typed).not.toBe(USER_A.appleId);
+    expect(typed).toBe(typed.trim());
 
     const principal = await principalFromProps({
       ...goodPropsFor(USER_A),
       appleId: typed,
     });
 
-    expect(principal.appleId, "no trim and no lowercasing").toBe(typed);
+    expect(principal.appleId, "no lowercasing").toBe(typed);
     expect(principal.userId).toBe(USER_A.userId);
   });
 });
@@ -705,6 +741,41 @@ describe("the props constructor fails closed (D-02, D-04)", () => {
       ).toBe(false);
     }
   });
+
+  it("builds the untrimmed addresses so that only the trim check can refuse them (D-18)", async () => {
+    // Code review WR-06. If the id function turned one of these away, its row
+    // in the table would pass with the trim check deleted, and hold nothing.
+    // So each is shown to differ from its trimmed form, to trim back to user
+    // A's clean address, and to be ACCEPTED by the id function as user A.
+    expect(UNTRIMMED_ADDRESSES.length).toBe(5);
+    for (const [name, address] of UNTRIMMED_ADDRESSES) {
+      expect(address, `${name}: must differ from its trimmed form`).not.toBe(address.trim());
+      expect(address.trim(), `${name}: must trim to the clean address`).toBe(USER_A.appleId);
+      expect(await userIdOf(address), `${name}: the id function must accept it`).toBe(
+        USER_A.userId,
+      );
+      expect(
+        BAD_PROPS.some(([rowName]) => rowName === name),
+        `${name}: missing from the bad-props table`,
+      ).toBe(true);
+    }
+    // Built from numbers, so check the numbers.
+    expect(UNTRIMMED_ADDRESSES[0]![1].charCodeAt(0)).toBe(0x20);
+    expect(UNTRIMMED_ADDRESSES[2]![1].endsWith(String.fromCharCode(0x0a))).toBe(true);
+    expect(UNTRIMMED_ADDRESSES[3]![1].endsWith(String.fromCharCode(0x0d, 0x0a))).toBe(true);
+    expect(UNTRIMMED_ADDRESSES[4]![1].charCodeAt(0)).toBe(0xa0);
+  });
+
+  it.each(UNTRIMMED_ADDRESSES)(
+    "leaves the env constructor alone: it still accepts %s, untouched (D-18)",
+    async (_name, address) => {
+      // D-18 changes the props path only. The env constructor must carry the
+      // binding exactly as before, so today's wire bytes do not change.
+      const principal = await principalFromEnv(fakeEnv(address, ROW_PASSWORD));
+      expect(principal.appleId).toBe(address);
+      expect(principal.userId).toBe(USER_A.userId);
+    },
+  );
 
   it.each(BAD_PROPS)("refuses %s with the auth error", async (_name, value) => {
     const raised = await principalFromProps(value).then(

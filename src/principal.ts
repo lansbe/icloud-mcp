@@ -157,6 +157,12 @@ export async function userIdOf(appleId: string): Promise<string | null> {
  * it would change bytes on the wire. `userIdOf` trims and lowercases its own
  * copy, so the id comes out the same either way.
  *
+ * The two constructors differ on padding, on purpose (D-18). The env
+ * constructor carries the binding untouched, padding included, so today's wire
+ * bytes do not change. The props constructor REFUSES an address the trim would
+ * change, so a principal built from props never carries padding. Neither one
+ * ever changes the address it was given.
+ *
  * The object is frozen, so `readonly` holds at run time too. The password is
  * not here. See `passwordOf`.
  */
@@ -178,8 +184,10 @@ const PASSWORDS = new WeakMap<Principal, string>();
 /**
  * Build one principal and put its password in the holder.
  *
- * The one place a principal is made, so both constructors refuse the same
- * addresses for the same reason. A new object every call, never a shared one.
+ * The one place a principal is made, so both constructors refuse every address
+ * the id function refuses, for the same reason. The props constructor refuses
+ * an untrimmed address on top of that, before it gets here (D-18). A new object
+ * every call, never a shared one.
  */
 async function build(appleId: string, appPassword: string): Promise<Principal> {
   const userId = await userIdOf(appleId);
@@ -235,6 +243,12 @@ export async function principalFromEnv(env: Env): Promise<Principal> {
  * before this milestone, which holds a fixed owner id and none of these
  * fields. Such a grant must never become a session.
  *
+ * **The Apple ID must already be trimmed (D-18).** An address with a space, a
+ * line ending or any other white space at either end is refused, even though
+ * the id function would accept it. The login page stores the trimmed address,
+ * so nothing this server wrote looks like that. The env constructor does not
+ * share this check: see `Principal`.
+ *
  * **One argument, and no environment.** There is no fallback to the Worker
  * secrets for a grant that does not check out. A fallback would turn a broken
  * grant from anyone into the owner's session.
@@ -274,6 +288,13 @@ export async function principalFromProps(props: unknown): Promise<Principal> {
   if (version !== 1) throw new ImapAuthError();
   if (!isConfiguredSecret(appleId)) throw new ImapAuthError();
   if (!isConfiguredSecret(appPassword)) throw new ImapAuthError();
+
+  // D-18. Props are written only by this server's own login page, and it
+  // stores the trimmed address. So an address the trim would change means a bug
+  // or tampering, and it is refused. Without this the id function would trim
+  // its own copy and say yes, and the principal would then carry padding or a
+  // line ending that the wire layer, or Apple, turns down on every call.
+  if (appleId !== appleId.trim()) throw new ImapAuthError();
 
   return build(appleId, appPassword);
 }
