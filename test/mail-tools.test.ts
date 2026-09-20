@@ -61,6 +61,7 @@ import {
 } from "../src/mcp/tools/mail";
 import {
   assertMailSecretsBound,
+  entryEnv,
   ownerPrincipal,
   type BoundMailSecrets,
 } from "./fixtures/bound-secrets";
@@ -1851,8 +1852,9 @@ describe("no mail response carries a credential", () => {
   // Narrowed by assertion, never by a coalesce: `?? ""` would typecheck and
   // keep every case below green while making `not.toContain("")` trivially
   // true, which is exactly what the non-zero-length guards prevent.
-  assertMailSecretsBound(env);
-  const bound: BoundMailSecrets = env;
+  const entry = entryEnv();
+  assertMailSecretsBound(entry);
+  const bound: BoundMailSecrets = entry;
 
   const responses: [string, () => { content: { text: string }[] }][] = [
     ["a shaped message", () => shaped()],

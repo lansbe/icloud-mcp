@@ -51,6 +51,7 @@ import { principalFromEnv } from "../src/principal";
 import {
   assertMailSecretsBound,
   type BoundMailSecrets,
+  entryEnv,
   ownerPrincipal,
 } from "./fixtures/bound-secrets";
 import type { Principal } from "../src/principal";
@@ -386,7 +387,7 @@ describe("the discovery chain (DAV-02)", () => {
   it("refuses before any request when a secret is absent", async () => {
     const stub = davStub();
     vi.stubGlobal("fetch", stub.fetch);
-    const scoped = { ...env, APPLE_APP_PASSWORD: undefined };
+    const scoped = { ...entryEnv(), APPLE_APP_PASSWORD: undefined };
     // The promise the door would hand over with that secret unset. An absent
     // secret can no longer be expressed below the door: discovery takes a
     // principal, and none can be built from this environment. So the claim is
@@ -478,8 +479,9 @@ describe("the discovery cache (DAV-03)", () => {
   });
 
   it("never puts the Apple ID in the key in cleartext (T-03-07)", async () => {
-    assertMailSecretsBound(env);
-    const bound: BoundMailSecrets = env;
+    const entry = entryEnv();
+  assertMailSecretsBound(entry);
+    const bound: BoundMailSecrets = entry;
     expect(bound.APPLE_ID.length).toBeGreaterThan(0);
 
     const kv = fakeKv();

@@ -57,7 +57,7 @@
 // This module contains no logging calls of any kind and must never acquire any.
 
 import { isConfiguredSecret } from "./configured-secret";
-import type { Env } from "./env";
+import type { OwnerMailSecrets } from "./env";
 import { ImapAuthError } from "./errors";
 
 const ENCODER = new TextEncoder();
@@ -258,7 +258,9 @@ export function passwordOf(principal: Principal): string {
  * space or holds a control character (D-19). The check is also what narrows
  * each binding from "string or undefined" to a string.
  */
-export async function principalFromEnv(env: Env): Promise<Principal> {
+export async function principalFromEnv(
+  env: OwnerMailSecrets,
+): Promise<Principal> {
   const appleId = env.APPLE_ID;
   const appPassword = env.APPLE_APP_PASSWORD;
   if (!isConfiguredSecret(appleId)) throw new ImapAuthError();

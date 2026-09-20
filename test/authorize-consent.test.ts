@@ -41,7 +41,8 @@ import { env } from "cloudflare:workers";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { loginHandler } from "../src/auth/login-handler";
-import type { Env } from "../src/env";
+import type { Env, LoginGateSecret } from "../src/env";
+import { entryEnv } from "./fixtures/bound-secrets";
 import worker from "../src/index";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 
@@ -56,7 +57,7 @@ const SECRET_FIELD = 'name="secret"';
 /** Drive the production entry — the real provider — through its real fetch. */
 async function call(request: Request): Promise<Response> {
   const ctx = createExecutionContext();
-  const response = await worker.fetch(request, env as Env, ctx);
+  const response = await worker.fetch(request, entryEnv(), ctx);
   await waitOnExecutionContext(ctx);
   return response;
 }
@@ -158,7 +159,7 @@ function stubEnv(options: {
   client?: { clientId: string; clientName?: string } | null;
   kv?: unknown;
   calls?: string[];
-}): Env {
+}): Env & LoginGateSecret {
   const calls = options.calls ?? [];
   return {
     OAUTH_KV: options.kv ?? recordingKv().kv,
@@ -185,7 +186,7 @@ function stubEnv(options: {
           : options.client;
       },
     },
-  } as unknown as Env;
+  } as unknown as Env & LoginGateSecret;
 }
 
 function post(secret: string, query: string, headers: Record<string, string> = {}): Request {

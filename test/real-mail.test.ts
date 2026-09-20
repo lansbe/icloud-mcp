@@ -50,6 +50,7 @@ import { createSessionGate, getMessageOver } from "../src/mail/service";
 import { messageToolResult } from "../src/mcp/tools/mail";
 import {
   assertMailSecretsBound,
+  entryEnv,
   ownerPrincipal,
   type BoundMailSecrets,
 } from "./fixtures/bound-secrets";
@@ -340,8 +341,9 @@ describe("neither shaped result carries a credential", () => {
   // Narrowed by assertion, never by a coalesce: `?? ""` would typecheck and
   // keep both cases below green while making `not.toContain("")` trivially
   // true, which is exactly what the non-zero-length guards prevent.
-  assertMailSecretsBound(env);
-  const bound: BoundMailSecrets = env;
+  const entry = entryEnv();
+  assertMailSecretsBound(entry);
+  const bound: BoundMailSecrets = entry;
 
   const cases: [string, string, Uint8Array, number][] = [
     ["the HTML message", HTML_MESSAGE_STRUCTURE, HTML_MESSAGE_BYTES, HTML_UID],

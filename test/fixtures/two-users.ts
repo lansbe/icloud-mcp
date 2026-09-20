@@ -33,7 +33,7 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
 import { createDavFetch } from "../../src/dav/transport";
-import type { Env } from "../../src/env";
+import type { Env, OwnerMailSecrets } from "../../src/env";
 import { createSessionGate } from "../../src/mail/service";
 import { registerCalendarTools } from "../../src/mcp/tools/calendar";
 import { registerMailTools } from "../../src/mcp/tools/mail";
@@ -72,7 +72,7 @@ export const USER_B: TestUser = {
  * Both values are overridden, never one. A copy carrying B's address and the
  * ambient password would be a third identity nobody meant to test.
  */
-export function envFor(user: TestUser): Env {
+export function envFor(user: TestUser): Env & OwnerMailSecrets {
   return {
     ...(env as Env),
     APPLE_ID: user.appleId,

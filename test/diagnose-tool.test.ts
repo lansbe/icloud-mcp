@@ -25,6 +25,7 @@ import { diagnosticResult } from "../src/mcp/tools/diagnose";
 import {
   type BoundMailSecrets,
   assertMailSecretsBound,
+  entryEnv,
 } from "./fixtures/bound-secrets";
 
 /** Apple's own wording on a refusal, in the shape the session layer records. */
@@ -291,8 +292,9 @@ describe("no response carries a credential", () => {
   // Narrowed by assertion, never by a coalesce: `?? ""` would typecheck and
   // keep every case below green while making `not.toContain("")` trivially
   // true, which is exactly what the non-zero-length guards prevent.
-  assertMailSecretsBound(env);
-  const bound: BoundMailSecrets = env;
+  const entry = entryEnv();
+  assertMailSecretsBound(entry);
+  const bound: BoundMailSecrets = entry;
 
   const outcomes: [string, DiagnosticOutcome][] = [
     [

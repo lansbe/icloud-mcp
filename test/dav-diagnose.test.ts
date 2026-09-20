@@ -37,6 +37,7 @@ import { principalFromEnv } from "../src/principal";
 import {
   type BoundMailSecrets,
   assertMailSecretsBound,
+  entryEnv,
   ownerPrincipal,
 } from "./fixtures/bound-secrets";
 import type { Principal } from "../src/principal";
@@ -404,8 +405,9 @@ describe("dav_diagnose, end to end", () => {
   });
 
   it("never lets a credential reach the response", async () => {
-    assertMailSecretsBound(env);
-    const bound: BoundMailSecrets = env;
+    const entry = entryEnv();
+  assertMailSecretsBound(entry);
+    const bound: BoundMailSecrets = entry;
     expect(bound.APPLE_ID.length).toBeGreaterThan(0);
     expect(bound.APPLE_APP_PASSWORD.length).toBeGreaterThan(0);
 
@@ -428,7 +430,7 @@ describe("dav_diagnose, end to end", () => {
     // over. It rejects, the callback's first await throws, and the callback's
     // own catch shapes the refusal. Same two assertions as before, on the same
     // two fields.
-    const refused = principalFromEnv({ ...env, APPLE_ID: undefined });
+    const refused = principalFromEnv({ ...entryEnv(), APPLE_ID: undefined });
     refused.catch(() => {});
 
     const shaped = await diagnoseHandler(createDavFetch(refused), refused)({});

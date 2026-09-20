@@ -28,7 +28,7 @@ import {
   SAFE_MESSAGES,
   toErrorCategory,
 } from "../src/errors";
-import { assertMailSecretsBound } from "./fixtures/bound-secrets";
+import { assertMailSecretsBound, entryEnv } from "./fixtures/bound-secrets";
 
 /**
  * The seven values the vocabulary now holds, listed exhaustively.
@@ -297,9 +297,10 @@ describe("credential containment at the error boundary", () => {
   // Narrowed by assertion, never by a coalesce: `?? ""` would typecheck and
   // keep every case below green while making `not.toContain("")` trivially
   // true, which is exactly what the non-zero-length case guards against.
-  assertMailSecretsBound(env);
-  const fakeAppleId = env.APPLE_ID;
-  const fakePassword = env.APPLE_APP_PASSWORD;
+  const entry = entryEnv();
+  assertMailSecretsBound(entry);
+  const fakeAppleId = entry.APPLE_ID;
+  const fakePassword = entry.APPLE_APP_PASSWORD;
 
   it("has fake credentials to test against", () => {
     expect(fakeAppleId.length).toBeGreaterThan(0);

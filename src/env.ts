@@ -43,7 +43,8 @@ declare global {
        * lives, never *what* is in it.
        *
        * Typed `KVNamespace`, NOT `KVNamespace | undefined`. The widening on
-       * the three Secret bindings below is a statement about what a Workers
+       * the Secret bindings — those further down, and the three in the narrow
+       * interfaces at the end of this file — is a statement about what a Workers
        * Secret is at runtime — unset, deleted, and never-provisioned all
        * arrive absent — and it does not transfer to a namespace binding,
        * which either resolves at deploy time or fails the deploy.
@@ -93,8 +94,9 @@ declare global {
        * under a race.
        *
        * Typed `KVNamespace`, NOT `KVNamespace | undefined`, for the reason
-       * spelled out on `DAV_CACHE` above: the widening on the Secret bindings
-       * below is a statement about what a Workers Secret is at runtime, and it
+       * spelled out on `DAV_CACHE` above: the widening on the Secret bindings,
+       * here and in the narrow interfaces at the end of this file, is a
+       * statement about what a Workers Secret is at runtime, and it
        * does not transfer to a namespace binding, which either resolves at
        * deploy time or fails the deploy.
        */
@@ -118,7 +120,8 @@ declare global {
        * for `DAV_CACHE`.
        *
        * Typed `R2Bucket`, NOT `R2Bucket | undefined`, for the reason spelled
-       * out on `DAV_CACHE` above: the widening on the Secret bindings below is
+       * out on `DAV_CACHE` above: the widening on the Secret bindings, here and
+       * in the narrow interfaces at the end of this file, is
        * a statement about what a Workers Secret is at runtime, and it does not
        * transfer to a bucket binding, which either resolves at deploy time or
        * fails the deploy.
@@ -148,45 +151,9 @@ declare global {
        */
       OAUTH_PROVIDER: OAuthHelpers;
 
-      /**
-       * Shared secret for the /authorize form (D-01). Workers Secret.
-       *
-       * Admits `undefined` because that is what a Workers Secret binding is at
-       * runtime: unset, deleted, or failed-to-provision all arrive absent. The
-       * previous `string` was a claim the platform does not make, and typing it
-       * honestly is what lets the compiler — rather than a reviewer — find the
-       * next consumer that assumes presence.
-       *
-       * The absent case does not announce itself. `TextEncoder.prototype.encode`
-       * is declared `encode(optional USVString input = "")`, so `encode(undefined)`
-       * resolves to the empty string rather than throwing, and a comparison
-       * against an unset secret quietly succeeds against an empty submission
-       * (CR-01).
-       */
-      AUTH_SECRET: string | undefined;
-
-      /**
-       * Apple ID used for IMAP authentication. Workers Secret.
-       *
-       * Admits `undefined` for the same reason as `AUTH_SECRET`: an unset,
-       * deleted, or failed-to-provision Secret arrives absent, and nothing at
-       * runtime distinguishes that from a configured value until something reads
-       * it. On the mail path the absent value previously produced a `TypeError`
-       * that surfaced as `connection_failed` — a permanently missing secret
-       * described to the caller as a transient fault worth retrying (CR-01).
-       */
-      APPLE_ID: string | undefined;
-
-      /**
-       * Apple app-specific password. Workers Secret.
-       *
-       * Admits `undefined` for the same reason as the two above. All three are
-       * widened together deliberately: the runtime fact is identical for every
-       * Secret binding, and typing one honestly while leaving the others
-       * claiming more than the platform guarantees would read as an oversight
-       * rather than a decision (CR-01).
-       */
-      APPLE_APP_PASSWORD: string | undefined;
+      // The login gate's secret and the two mail secrets are NOT declared
+      // here. They live in the narrow interfaces at the end of this file, so
+      // code that holds the shared type cannot read them (Phase 9 D-14).
 
       /**
        * Access key id of the R2 S3 API token. Workers Secret.
@@ -196,7 +163,8 @@ declare global {
        * not the account-wide token the dashboard offers by default, which would
        * be a privilege escalation buying this phase nothing.
        *
-       * Admits `undefined` for the same reason the three above do, and the
+       * Admits `undefined` for the same reason the three secrets in the narrow
+       * interfaces at the end of this file do, and the
        * absent case is worth naming here because it does not announce itself:
        * a signer handed an absent key produces a syntactically well-formed
        * signature over an empty credential, and the failure surfaces as a
@@ -268,3 +236,77 @@ declare global {
 }
 
 export type Env = Cloudflare.Env;
+
+// The three narrow secret types (Phase 9 D-14).
+//
+// These three names used to sit on the shared type above. They were moved out
+// so the compiler refuses a new reader: code that holds the shared type cannot
+// spell them. They are declared OUTSIDE the global block on purpose. Inside it
+// they would be back on the ambient environment object, on every explicit
+// parameter of the shared type, and on the test environment, all at once.
+//
+// Every field is REQUIRED and admits `undefined`. It is not optional. A type
+// whose fields are all optional is a weak type, and handing it the shared type
+// then fails with an unhelpful "no properties in common" error. With required
+// fields the error is the clear "missing the following properties".
+//
+// The runtime bindings did not change. This is a type change only.
+
+/**
+ * The login gate's secret. Seen only by the login gate and the entry point.
+ */
+export interface LoginGateSecret {
+  /**
+   * Shared secret for the /authorize form (D-01). Workers Secret.
+   *
+   * Admits `undefined` because that is what a Workers Secret binding is at
+   * runtime: unset, deleted, or failed-to-provision all arrive absent. The
+   * previous `string` was a claim the platform does not make, and typing it
+   * honestly is what lets the compiler — rather than a reviewer — find the
+   * next consumer that assumes presence.
+   *
+   * The absent case does not announce itself. `TextEncoder.prototype.encode`
+   * is declared `encode(optional USVString input = "")`, so `encode(undefined)`
+   * resolves to the empty string rather than throwing, and a comparison
+   * against an unset secret quietly succeeds against an empty submission
+   * (CR-01).
+   */
+  AUTH_SECRET: string | undefined;
+}
+
+/**
+ * The two mail secrets. Seen only by the owner's constructor in
+ * `src/principal.ts`, by the door that hands it the environment, and by the
+ * entry point. Phase 13 removes them and this interface.
+ */
+export interface OwnerMailSecrets {
+  /**
+   * Apple ID used for IMAP authentication. Workers Secret.
+   *
+   * Admits `undefined` for the same reason as `AUTH_SECRET`: an unset,
+   * deleted, or failed-to-provision Secret arrives absent, and nothing at
+   * runtime distinguishes that from a configured value until something reads
+   * it. On the mail path the absent value previously produced a `TypeError`
+   * that surfaced as `connection_failed` — a permanently missing secret
+   * described to the caller as a transient fault worth retrying (CR-01).
+   */
+  APPLE_ID: string | undefined;
+
+  /**
+   * Apple app-specific password. Workers Secret.
+   *
+   * Admits `undefined` for the same reason as the two above. All three are
+   * widened together deliberately: the runtime fact is identical for every
+   * Secret binding, and typing one honestly while leaving the others
+   * claiming more than the platform guarantees would read as an oversight
+   * rather than a decision (CR-01).
+   */
+  APPLE_APP_PASSWORD: string | undefined;
+}
+
+/**
+ * What the runtime really hands the entry point: the shared type plus all
+ * three secrets. Only the entry point, the OAuth provider's options and the
+ * door are typed with it. Everything past them sees the shared type.
+ */
+export type EntryEnv = Env & OwnerMailSecrets & LoginGateSecret;

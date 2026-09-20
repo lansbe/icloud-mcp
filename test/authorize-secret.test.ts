@@ -29,7 +29,7 @@ import {
   isConfiguredSecret,
   loginHandler,
 } from "../src/auth/login-handler";
-import type { Env } from "../src/env";
+import type { Env, LoginGateSecret } from "../src/env";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 
 const ORIGIN = `https://${DEPLOYED_HOSTNAME}`;
@@ -47,12 +47,12 @@ const BOUND_SECRET = "test-secret-not-real";
 function envWithSecret(
   secret: string | undefined,
   provider?: unknown,
-): Env {
+): Env & LoginGateSecret {
   return {
     OAUTH_KV: env.OAUTH_KV,
     OAUTH_PROVIDER: provider,
     AUTH_SECRET: secret,
-  } as unknown as Env;
+  } as unknown as Env & LoginGateSecret;
 }
 
 /**

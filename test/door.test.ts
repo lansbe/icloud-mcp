@@ -41,7 +41,8 @@
 import { env } from "cloudflare:workers";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import type { Env } from "../src/env";
+import type { EntryEnv } from "../src/env";
+import { entryEnv } from "./fixtures/bound-secrets";
 import { DEPLOYED_HOSTNAME, createMcpApiHandler } from "../src/mcp/api-handler";
 import { USER_A } from "./fixtures/two-users";
 import worker, {
@@ -78,7 +79,7 @@ const OWNER: CaseProps = { absent: false, props: { userId: "owner" } };
 async function callDoor(
   request: Request,
   caseProps: CaseProps,
-  withEnv: Env = env as Env,
+  withEnv: EntryEnv = entryEnv(),
 ): Promise<Response> {
   const ctx = createExecutionContext();
   if (!caseProps.absent) {
@@ -95,7 +96,7 @@ async function callDoor(
 /** Drive the fixture Worker, for the recording tool's reset and read routes. */
 async function callWorker(request: Request): Promise<Response> {
   const ctx = createExecutionContext();
-  const response = await worker.fetch(request, env as Env, ctx);
+  const response = await worker.fetch(request, entryEnv(), ctx);
   await waitOnExecutionContext(ctx);
   return response;
 }
@@ -363,9 +364,9 @@ describe.each(LANES)("every other grant is refused at the door, %s", (_lane, bui
 
 describe("a missing Worker secret is not a 401 (D-09)", () => {
   /** A fresh copy of the environment with both mail secrets unset. */
-  function envWithoutMailSecrets(): Env {
+  function envWithoutMailSecrets(): EntryEnv {
     return {
-      ...(env as Env),
+      ...entryEnv(),
       APPLE_ID: undefined,
       APPLE_APP_PASSWORD: undefined,
     };

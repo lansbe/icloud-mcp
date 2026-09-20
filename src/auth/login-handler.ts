@@ -57,7 +57,7 @@
 import { AuthorizationError } from "@cloudflare/workers-oauth-provider";
 import type { ClientInfo } from "@cloudflare/workers-oauth-provider";
 import { isConfiguredSecret } from "../configured-secret";
-import type { Env } from "../env";
+import type { Env, LoginGateSecret } from "../env";
 
 /** The only scope this server issues. */
 const SUPPORTED_SCOPES = ["mcp"];
@@ -521,7 +521,10 @@ function authorizationErrorResponse(error: AuthorizationError): Response {
  * are implemented by the provider itself and never reach this handler.
  */
 export const loginHandler = {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env & LoginGateSecret,
+  ): Promise<Response> {
     const url = new URL(request.url);
 
     // Still a 404 — the path genuinely does not exist — but one that says where

@@ -4,7 +4,7 @@
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
-import type { Env } from "../env";
+import type { EntryEnv } from "../env";
 import { DEPLOYED_HOSTNAME } from "../deployed-hostname.generated";
 import type { Principal } from "../principal";
 import { principalFromEnv } from "../principal";
@@ -285,10 +285,18 @@ export function buildRequestHandler(
  *   own `try`, and its own `catch` maps a refusal to the category.
  */
 export function createMcpApiHandler(extraTools: ExtraTool[] = []): {
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response>;
+  fetch(
+    request: Request,
+    env: EntryEnv,
+    ctx: ExecutionContext,
+  ): Promise<Response>;
 } {
   return {
-    fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    fetch(
+      request: Request,
+      env: EntryEnv,
+      ctx: ExecutionContext,
+    ): Promise<Response> {
       // The one read of the grant's props in this codebase (D-08).
       if (!isOwnerGrant(ctx.props)) {
         return Promise.resolve(unauthorized(request));

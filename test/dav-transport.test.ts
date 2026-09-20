@@ -31,6 +31,7 @@ import { principalFromEnv, principalFromProps } from "../src/principal";
 import {
   assertMailSecretsBound,
   type BoundMailSecrets,
+  entryEnv,
   ownerPrincipal,
 } from "./fixtures/bound-secrets";
 
@@ -161,8 +162,9 @@ describe("davAuthHeader", () => {
   });
 
   it("builds a Basic header from the two bound secrets", async () => {
-    assertMailSecretsBound(env);
-    const bound: BoundMailSecrets = env;
+    const entry = entryEnv();
+  assertMailSecretsBound(entry);
+    const bound: BoundMailSecrets = entry;
 
     // The owner's principal, from the real env constructor. The two assertions
     // below still compare against the BOUND values, untouched: they are the
@@ -222,7 +224,7 @@ describe("davAuthHeader", () => {
     const stub = statusStub(207);
     vi.stubGlobal("fetch", stub.fetch);
 
-    const refused = principalFromEnv({ ...env, ...patch });
+    const refused = principalFromEnv({ ...entryEnv(), ...patch });
     refused.catch(() => {});
 
     expect(await raise(createDavFetch(refused))).toBeInstanceOf(DavAuthError);
@@ -244,7 +246,7 @@ describe("davAuthHeader", () => {
     const stub = statusStub(207);
     vi.stubGlobal("fetch", stub.fetch);
 
-    const refused = principalFromEnv({ ...env, APPLE_APP_PASSWORD: password });
+    const refused = principalFromEnv({ ...entryEnv(), APPLE_APP_PASSWORD: password });
     refused.catch(() => {});
 
     expect(await raise(createDavFetch(refused))).toBeInstanceOf(DavAuthError);
@@ -255,7 +257,10 @@ describe("davAuthHeader", () => {
     const stub = statusStub(207);
     vi.stubGlobal("fetch", stub.fetch);
 
-    const refused = principalFromEnv({ ...env, APPLE_ID: "a\nb@example.invalid" });
+    const refused = principalFromEnv({
+      ...entryEnv(),
+      APPLE_ID: "a\nb@example.invalid",
+    });
     refused.catch(() => {});
 
     expect(await raise(createDavFetch(refused))).toBeInstanceOf(DavAuthError);
@@ -269,7 +274,7 @@ describe("davAuthHeader", () => {
     const stub = statusStub(207);
     vi.stubGlobal("fetch", stub.fetch);
 
-    const refused = principalFromEnv({ ...env, APPLE_ID: undefined });
+    const refused = principalFromEnv({ ...entryEnv(), APPLE_ID: undefined });
     refused.catch(() => {});
 
     const raised = await raise(createDavFetch(refused));
@@ -365,7 +370,7 @@ describe("createDavFetch — the credential", () => {
 
     // The promise the door would hand over with that secret unset. It rejects,
     // and the DAV fetch turns the rejection into its own auth error.
-    const refused = principalFromEnv({ ...env, APPLE_ID: undefined });
+    const refused = principalFromEnv({ ...entryEnv(), APPLE_ID: undefined });
     refused.catch(() => {});
     await expect(createDavFetch(refused)(TARGET)).rejects.toBeInstanceOf(
       DavAuthError,
@@ -704,8 +709,9 @@ describe("no Dav* error carries anything a server said (T-03-03, T-03-04)", () =
   );
 
   it("never lets a credential reach a thrown error", async () => {
-    assertMailSecretsBound(env);
-    const bound: BoundMailSecrets = env;
+    const entry = entryEnv();
+  assertMailSecretsBound(entry);
+    const bound: BoundMailSecrets = entry;
     expect(bound.APPLE_ID.length).toBeGreaterThan(0);
     expect(bound.APPLE_APP_PASSWORD.length).toBeGreaterThan(0);
 

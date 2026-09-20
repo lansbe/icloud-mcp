@@ -70,7 +70,7 @@ import type { CommitOutcome, EventPreview } from "../src/mcp/tools/calendar";
 import { registerContactsTools } from "../src/mcp/tools/contacts";
 import { registerDavDiagnoseTool } from "../src/mcp/tools/dav-diagnose";
 import { UNTRUSTED_PREAMBLE } from "../src/mcp/untrusted";
-import { ownerPrincipal } from "./fixtures/bound-secrets";
+import { entryEnv, ownerPrincipal } from "./fixtures/bound-secrets";
 import type { Principal } from "../src/principal";
 import { principalFromEnv } from "../src/principal";
 
@@ -6955,7 +6955,7 @@ describe("a principal that was refused reaches no DAV tool", () => {
 
   /** The promise the door hands over when the Apple ID secret is unset. */
   function refusedPrincipal(): Promise<Principal> {
-    const refused = principalFromEnv({ ...env, APPLE_ID: undefined });
+    const refused = principalFromEnv({ ...entryEnv(), APPLE_ID: undefined });
     refused.catch(() => {});
     return refused;
   }

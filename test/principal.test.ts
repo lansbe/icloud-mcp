@@ -64,7 +64,7 @@
 // real Apple ID. Every address sits under `example.invalid`.
 
 import { describe, expect, it } from "vitest";
-import type { Env } from "../src/env";
+import type { OwnerMailSecrets } from "../src/env";
 import { ImapAuthError, toErrorCategory } from "../src/errors";
 import * as principalModule from "../src/principal";
 import {
@@ -97,11 +97,11 @@ const REFUSED_ROWS = USER_ID_VECTORS.filter((row) => row.expected === REFUSED);
 function fakeEnv(
   appleId: string | undefined,
   password: string | undefined,
-): Env {
+): OwnerMailSecrets {
   return {
     APPLE_ID: appleId,
     APPLE_APP_PASSWORD: password,
-  } as unknown as Env;
+  };
 }
 
 /** The one props shape that is accepted, for `user`. A fresh object each call. */

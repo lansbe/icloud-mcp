@@ -43,7 +43,8 @@ import {
   loginHandler,
   refusedRedirectBody,
 } from "../src/auth/login-handler";
-import type { Env } from "../src/env";
+import type { Env, LoginGateSecret } from "../src/env";
+import { entryEnv } from "./fixtures/bound-secrets";
 import worker from "../src/index";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 
@@ -70,7 +71,7 @@ const OTHER_PORT_LOOPBACK_CALLBACK = "http://localhost:51877/callback";
 /** Drive the production entry — the real provider — through its real fetch. */
 async function call(request: Request): Promise<Response> {
   const ctx = createExecutionContext();
-  const response = await worker.fetch(request, env as Env, ctx);
+  const response = await worker.fetch(request, entryEnv(), ctx);
   await waitOnExecutionContext(ctx);
   return response;
 }
@@ -158,7 +159,7 @@ function stubEnv(options: {
   redirectUri?: string;
   parseAuthRequest?: () => Promise<unknown>;
   calls?: string[];
-}): Env {
+}): Env & LoginGateSecret {
   const calls = options.calls ?? [];
   return {
     OAUTH_KV: quietKv(),
@@ -185,7 +186,7 @@ function stubEnv(options: {
         return { redirectTo: "https://attacker.example/cb?code=leaked" };
       },
     },
-  } as unknown as Env;
+  } as unknown as Env & LoginGateSecret;
 }
 
 function get(query: string): Request {

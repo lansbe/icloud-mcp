@@ -52,6 +52,7 @@ import {
 } from "./fixtures/fake-duplex";
 import {
   assertMailSecretsBound,
+  entryEnv,
   ownerPrincipal,
 } from "./fixtures/bound-secrets";
 import type { Principal } from "../src/principal";
@@ -922,9 +923,11 @@ describe("the authentication fallback", () => {
     expect(report.authFailureDetail).toContain(AUTH_REJECTED_LEGACY_TEXT);
     expect(report.authFailureDetail).toContain(AUTH_REJECTED_TEXT);
 
+    const bound = entryEnv();
+    assertMailSecretsBound(bound);
     const serialized = JSON.stringify(report);
-    expect(serialized).not.toContain(env.APPLE_APP_PASSWORD);
-    expect(serialized).not.toContain(env.APPLE_ID);
+    expect(serialized).not.toContain(bound.APPLE_APP_PASSWORD);
+    expect(serialized).not.toContain(bound.APPLE_ID);
   });
 
   it("bounds the assembled detail, not merely each part of it", async () => {
@@ -1083,16 +1086,17 @@ describe("failure categories, proven by injection", () => {
 
     const outcome = await runDiagnosticOver(duplex, principal, 1);
 
-    assertMailSecretsBound(env);
-    expect(env.APPLE_ID.length).toBeGreaterThan(0);
-    expect(env.APPLE_APP_PASSWORD.length).toBeGreaterThan(0);
+    const bound = entryEnv();
+    assertMailSecretsBound(bound);
+    expect(bound.APPLE_ID.length).toBeGreaterThan(0);
+    expect(bound.APPLE_APP_PASSWORD.length).toBeGreaterThan(0);
 
     for (const serialized of [
       JSON.stringify(diagnosticResult(outcome)),
       JSON.stringify(outcome.report),
     ]) {
-      expect(serialized).not.toContain(env.APPLE_APP_PASSWORD);
-      expect(serialized).not.toContain(env.APPLE_ID);
+      expect(serialized).not.toContain(bound.APPLE_APP_PASSWORD);
+      expect(serialized).not.toContain(bound.APPLE_ID);
     }
   });
 
@@ -1152,16 +1156,17 @@ describe("failure categories, proven by injection", () => {
     // A case that would pass just as happily against empty bindings is not a
     // proof of containment; `not.toContain("")` is true of every string.
     // Narrowed by assertion rather than a coalesce for that exact reason.
-    assertMailSecretsBound(env);
-    expect(env.APPLE_ID.length).toBeGreaterThan(0);
-    expect(env.APPLE_APP_PASSWORD.length).toBeGreaterThan(0);
+    const bound = entryEnv();
+    assertMailSecretsBound(bound);
+    expect(bound.APPLE_ID.length).toBeGreaterThan(0);
+    expect(bound.APPLE_APP_PASSWORD.length).toBeGreaterThan(0);
 
     for (const serialized of [
       JSON.stringify(diagnosticResult(outcome)),
       JSON.stringify(outcome.report),
     ]) {
-      expect(serialized).not.toContain(env.APPLE_APP_PASSWORD);
-      expect(serialized).not.toContain(env.APPLE_ID);
+      expect(serialized).not.toContain(bound.APPLE_APP_PASSWORD);
+      expect(serialized).not.toContain(bound.APPLE_ID);
     }
   });
 });

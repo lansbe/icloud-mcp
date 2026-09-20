@@ -23,7 +23,7 @@
 import { env } from "cloudflare:workers";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import type { Env } from "../src/env";
+import { entryEnv } from "./fixtures/bound-secrets";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 import worker, { CANARY_TOOL_NAME } from "./fixtures/worker-with-canary";
 
@@ -33,7 +33,7 @@ const ORIGIN = `https://${HOSTNAME}`;
 /** Drive the test-only Worker through its real fetch handler. */
 async function call(request: Request): Promise<Response> {
   const ctx = createExecutionContext();
-  const response = await worker.fetch(request, env as Env, ctx);
+  const response = await worker.fetch(request, entryEnv(), ctx);
   await waitOnExecutionContext(ctx);
   return response;
 }
