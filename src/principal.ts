@@ -182,14 +182,46 @@ export interface Principal {
 const PASSWORDS = new WeakMap<Principal, string>();
 
 /**
+ * Whether a password may be stored at all (D-19).
+ *
+ * Two refusals. A password that is only white space is no password: another
+ * module already treats such a secret as unset, and this one now gives the same
+ * answer. And a password holding any control character, which is any code unit
+ * below 0x20, or 0x7F. That covers CR, LF and NUL.
+ *
+ * CR and LF are the ones that matter. A login is one command line, and a line
+ * ending inside the password would end that line early and start a second
+ * command. The mail tree's quoting helper already refuses them before a
+ * password reaches a command line, and it stays as the second layer. Refusing
+ * here means no later call site has to remember to go through it.
+ *
+ * The test is on code units and uses no pattern, so this file needs no escape
+ * sequence for a control character. It answers yes or no and builds nothing
+ * from the password. The full four-groups-of-four shape check is NOT here: it
+ * belongs to the login page in Phase 11. A real app password holds no control
+ * character, so for valid credentials nothing changes.
+ */
+function isUsablePassword(appPassword: string): boolean {
+  if (appPassword.trim().length === 0) return false;
+  for (let index = 0; index < appPassword.length; index += 1) {
+    const code = appPassword.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) return false;
+  }
+  return true;
+}
+
+/**
  * Build one principal and put its password in the holder.
  *
  * The one place a principal is made, so both constructors refuse every address
  * the id function refuses, for the same reason. The props constructor refuses
- * an untrimmed address on top of that, before it gets here (D-18). A new object
+ * an untrimmed address on top of that, before it gets here (D-18). Both refuse
+ * the same passwords too, because that check is here (D-19). A new object
  * every call, never a shared one.
  */
 async function build(appleId: string, appPassword: string): Promise<Principal> {
+  if (!isUsablePassword(appPassword)) throw new ImapAuthError();
+
   const userId = await userIdOf(appleId);
   if (userId === null) throw new ImapAuthError();
 
@@ -222,8 +254,9 @@ export function passwordOf(principal: Principal): string {
  * is how code that still runs as the owner gets a principal.
  *
  * A secret that is unset or empty is refused with the auth error, and so is an
- * Apple ID the id function turns away. The check is also what narrows each
- * binding from "string or undefined" to a string.
+ * Apple ID the id function turns away. So is a password that is only white
+ * space or holds a control character (D-19). The check is also what narrows
+ * each binding from "string or undefined" to a string.
  */
 export async function principalFromEnv(env: Env): Promise<Principal> {
   const appleId = env.APPLE_ID;
@@ -248,6 +281,9 @@ export async function principalFromEnv(env: Env): Promise<Principal> {
  * the id function would accept it. The login page stores the trimmed address,
  * so nothing this server wrote looks like that. The env constructor does not
  * share this check: see `Principal`.
+ *
+ * **The password must be usable (D-19).** One that is only white space, or that
+ * holds a control character, is refused. Both constructors share that check.
  *
  * **One argument, and no environment.** There is no fallback to the Worker
  * secrets for a grant that does not check out. A fallback would turn a broken

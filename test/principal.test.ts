@@ -227,6 +227,52 @@ const UNTRIMMED_ADDRESSES: ReadonlyArray<readonly [string, string]> = [
   ],
 ];
 
+// Control characters for the unusable-password rows (D-19). Built from their
+// numbers and never typed, for the same reason as the white space above.
+const NUL = String.fromCharCode(0x00);
+const TAB = String.fromCharCode(0x09);
+const UNIT_SEPARATOR = String.fromCharCode(0x1f);
+const DELETE = String.fromCharCode(0x7f);
+
+/**
+ * Every password both constructors must refuse, by name (D-19, code review WR-07).
+ *
+ * Each one is a non-empty string, so the older "is it set" check lets every one
+ * of them through, and a test below shows that before the tables run. The line
+ * endings are the rows that matter: a login is one command line, and a line
+ * ending inside the password would end it early.
+ */
+const UNUSABLE_PASSWORDS: ReadonlyArray<readonly [string, string]> = [
+  ["a password that is only spaces", SPACE + SPACE + SPACE],
+  ["a password that is only no-break spaces", NO_BREAK_SPACE + NO_BREAK_SPACE],
+  ["a password with an embedded carriage return", `cccc-cccc${CARRIAGE_RETURN}cccc-cccc`],
+  ["a password with an embedded line feed", `cccc-cccc${LINE_FEED}cccc-cccc`],
+  [
+    "a password with a trailing carriage return and line feed",
+    ROW_PASSWORD + CARRIAGE_RETURN + LINE_FEED,
+  ],
+  ["a password with an embedded NUL", `cccc-cccc${NUL}cccc-cccc`],
+  ["a password with an embedded tab", `cccc-cccc${TAB}cccc-cccc`],
+  ["a password with the last control character below the space", `cccc-cccc${UNIT_SEPARATOR}cccc-cccc`],
+  ["a password with an embedded delete character", `cccc-cccc${DELETE}cccc-cccc`],
+];
+
+/**
+ * Passwords that hold no control character and must still be accepted (D-19).
+ *
+ * The check is NOT a shape check: the four-groups-of-four rule belongs to the
+ * login page in Phase 11. So anything that is not white-space-only and holds no
+ * control character passes, a space in the middle and the two printable ends of
+ * ASCII included. These are the near side of each boundary the rows above pin.
+ */
+const USABLE_PASSWORDS: ReadonlyArray<readonly [string, string]> = [
+  ["the usual four groups of four", "cccc-cccc-cccc-cccc"],
+  ["one with a space in the middle, the first code unit that is allowed", `cccc${SPACE}cccc`],
+  ["one with spaces at the ends around real text", `${SPACE}cccc-cccc${SPACE}`],
+  ["one holding the last printable ASCII character", `cccc${String.fromCharCode(0x7e)}cccc`],
+  ["one that fits no app-password shape at all", "not the four-by-four shape!"],
+];
+
 /**
  * Every shape the props constructor must refuse, by name.
  *
@@ -294,6 +340,11 @@ const BAD_PROPS: ReadonlyArray<readonly [string, unknown]> = [
   ...UNTRIMMED_ADDRESSES.map(
     ([name, appleId]) =>
       [name, { v: 1, appleId, appPassword: USER_A.appPassword }] as const,
+  ),
+  // D-19, code review WR-07. A good shape whose password may not be stored.
+  ...UNUSABLE_PASSWORDS.map(
+    ([name, appPassword]) =>
+      [name, { v: 1, appleId: USER_A.appleId, appPassword }] as const,
   ),
 ];
 
@@ -777,6 +828,88 @@ describe("the props constructor fails closed (D-02, D-04)", () => {
     },
   );
 
+  it("builds the unusable passwords so that only the password check can refuse them (D-19)", () => {
+    // Code review WR-07. Each is a non-empty string, which is all the older
+    // "is it set" check asks for. So a row here passes that check, and is
+    // refused by the new one or by nothing.
+    expect(UNUSABLE_PASSWORDS.length).toBe(9);
+    const names = UNUSABLE_PASSWORDS.map(([name]) => name);
+    expect(new Set(names).size, "two rows share a name").toBe(names.length);
+    for (const [name, password] of UNUSABLE_PASSWORDS) {
+      expect(typeof password, name).toBe("string");
+      expect(password.length, `${name}: must not be empty`).toBeGreaterThan(0);
+      expect(
+        BAD_PROPS.some(([rowName]) => rowName === name),
+        `${name}: missing from the bad-props table`,
+      ).toBe(true);
+    }
+
+    // Built from numbers, so check the numbers. One control character each,
+    // at the place the row's name says.
+    const controlsIn = (text: string): number[] =>
+      Array.from(text, (ch) => ch.charCodeAt(0)).filter((code) => code < 0x20 || code === 0x7f);
+    const byName = new Map(UNUSABLE_PASSWORDS);
+    expect(controlsIn(byName.get("a password with an embedded carriage return")!)).toEqual([0x0d]);
+    expect(controlsIn(byName.get("a password with an embedded line feed")!)).toEqual([0x0a]);
+    expect(
+      controlsIn(byName.get("a password with a trailing carriage return and line feed")!),
+    ).toEqual([0x0d, 0x0a]);
+    expect(controlsIn(byName.get("a password with an embedded NUL")!)).toEqual([0x00]);
+    expect(controlsIn(byName.get("a password with an embedded tab")!)).toEqual([0x09]);
+    expect(
+      controlsIn(byName.get("a password with the last control character below the space")!),
+    ).toEqual([0x1f]);
+    expect(controlsIn(byName.get("a password with an embedded delete character")!)).toEqual([0x7f]);
+    // The two white-space-only rows hold no control character at all, so they
+    // are refused by the white-space half of the check and not the other half.
+    expect(controlsIn(byName.get("a password that is only spaces")!)).toEqual([]);
+    expect(controlsIn(byName.get("a password that is only no-break spaces")!)).toEqual([]);
+
+    // And the accepted passwords hold none either.
+    for (const [name, password] of USABLE_PASSWORDS) {
+      expect(controlsIn(password), `${name}: holds a control character`).toEqual([]);
+      expect(password.trim().length, `${name}: is only white space`).toBeGreaterThan(0);
+    }
+  });
+
+  it.each(USABLE_PASSWORDS)(
+    "still accepts %s, and hands it back unchanged (D-19)",
+    async (_name, password) => {
+      // The other side of the check. A rule that refused every password would
+      // pass the whole table above. It is not a shape check either: that one
+      // belongs to the login page.
+      const principal = await principalFromProps({
+        v: 1,
+        appleId: USER_A.appleId,
+        appPassword: password,
+      });
+      expect(principal.userId).toBe(USER_A.userId);
+      expect(passwordOf(principal)).toBe(password);
+    },
+  );
+
+  it("carries no fragment of a refused password that held a line ending", async () => {
+    const head = "leaky-control-head";
+    const tail = "leaky-control-tail";
+    const address = "leaky-control@example.invalid";
+    const password = head + CARRIAGE_RETURN + LINE_FEED + tail;
+    // The address is a good one, so the password is the only reason to refuse.
+    expect(await userIdOf(address)).not.toBeNull();
+
+    const raised = await principalFromProps({ v: 1, appleId: address, appPassword: password }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    expect(raised).toBeInstanceOf(ImapAuthError);
+    expect(toErrorCategory(raised).category).toBe("auth_failed");
+    const shown = everythingOn(raised);
+    expect(shown).not.toContain(head);
+    expect(shown).not.toContain(tail);
+    expect(shown).not.toContain(address);
+    expect((raised as Error).message).toBe("imap-credentials-rejected");
+  });
+
   it.each(BAD_PROPS)("refuses %s with the auth error", async (_name, value) => {
     const raised = await principalFromProps(value).then(
       () => null,
@@ -920,6 +1053,28 @@ describe("the env constructor, temporary until the secrets are removed (D-03)", 
       principalFromEnv(fakeEnv(appleId, password)),
     ).rejects.toBeInstanceOf(ImapAuthError);
   });
+
+  it.each(UNUSABLE_PASSWORDS)(
+    "refuses %s with the auth error, the same as the props constructor (D-19)",
+    async (_name, password) => {
+      // The Apple ID is user A's good one, so the password is the only reason.
+      const raised = await principalFromEnv(fakeEnv(USER_A.appleId, password)).then(
+        () => null,
+        (err: unknown) => err,
+      );
+      expect(raised).toBeInstanceOf(ImapAuthError);
+      expect(toErrorCategory(raised).category).toBe("auth_failed");
+    },
+  );
+
+  it.each(USABLE_PASSWORDS)(
+    "still accepts %s, and hands it back unchanged (D-19)",
+    async (_name, password) => {
+      const principal = await principalFromEnv(fakeEnv(USER_A.appleId, password));
+      expect(principal.userId).toBe(USER_A.userId);
+      expect(passwordOf(principal)).toBe(password);
+    },
+  );
 
   it("carries no fragment of either binding when it refuses", async () => {
     const address = "leaky-binding.example.invalid";
