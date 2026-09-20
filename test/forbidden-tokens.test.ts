@@ -989,6 +989,12 @@ describe("the patterns have teeth", () => {
     // The first version already saw this one. It is here so a later rewrite of
     // the index arm into a balanced-brackets-only form goes red.
     ["index key holding an unclosed bracket", 'env["a[b"] = userB.appleId;'],
+    // Second code review, WR-01. The timing repair moved the white space in
+    // front of the non-null mark into the mark's own group. These two hold the
+    // white space on BOTH sides of the mark, so a repair that dropped either
+    // side to get its speed would go red here.
+    ["non-null mark with a space on each side", "env.DAV_CACHE ! .put = stubPut;"],
+    ["non-null mark on its own line", "env.DAV_CACHE\n  !\n  .put = stubPut;"],
   ];
 
   /** Reads, comparisons, declarations and copies. None is a write onto the
@@ -1041,8 +1047,8 @@ describe("the patterns have teeth", () => {
     const rule = FORBIDDEN.find((r) => r.id === "env-assignment")!;
     expect(
       ENV_WRITE_FORMS.length,
-      "9 forms from D-09 and their variants, and 13 from code review WR-01",
-    ).toBe(22);
+      "9 forms from D-09 and their variants, 13 from code review WR-01, 2 from the second review",
+    ).toBe(24);
     for (const [form, line] of ENV_WRITE_FORMS) {
       const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
       expect(fresh.test(line), `the ${form} form was not seen`).toBe(true);
@@ -1107,6 +1113,65 @@ describe("the patterns have teeth", () => {
         fresh.test(compoundWriteWith(comparison)),
         `the template matched for ${comparison}=, which is a comparison`,
       ).toBe(false);
+    }
+  });
+
+  it("runs in linear time on a long spaced chain that does not end in a write", () => {
+    // Second code review, WR-01. The first widened version of this rule had an
+    // optional mark with a white-space run on each side, inside the chain loop.
+    // With no mark present, a space before a dot could be taken by either run,
+    // so a chain that did NOT end in a write cost double for every link: about
+    // 25 links took seconds and 2,000 never finished. A new line is white
+    // space, so an ordinary multi-line chain has that shape. The rule has no
+    // scope and runs in both gates, so one such line hung the hook silently.
+    //
+    // A pattern match cannot be interrupted, so a test timeout would not save
+    // this test from a regression: it would hang, which is the very failure it
+    // is here to report. So it CLIMBS. Each short chain must finish inside the
+    // bound before the next, longer one is tried. With the doubling defect the
+    // climb fails in about a second at two dozen links, with a message, and
+    // the long chains are never reached.
+    const rule = FORBIDDEN.find((r) => r.id === "env-assignment")!;
+    const BOUND_MS = 500;
+    const spaced = (links: number) => `env${" . a".repeat(links)} ;`;
+    const multiLine = (links: number) => `env${"\n  .a".repeat(links)}\n;`;
+    const marked = (links: number) => `env${" ! . a".repeat(links)} ;`;
+
+    const timed = (text: string): { ms: number; hit: boolean } => {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      const started = performance.now();
+      const hit = fresh.test(text);
+      return { ms: performance.now() - started, hit };
+    };
+
+    for (const shape of [spaced, multiLine, marked]) {
+      for (const links of [8, 12, 16, 20, 24, 28]) {
+        const { ms, hit } = timed(shape(links));
+        expect(hit, `fired on a ${links}-link chain with no write`).toBe(false);
+        expect(
+          ms,
+          `${links} links took ${ms.toFixed(0)} ms: the cost is doubling per link, so the chain loop has two ways to match one space`,
+        ).toBeLessThan(BOUND_MS);
+      }
+    }
+
+    // Only now the long ones. Several thousand links, far past anything real.
+    for (const [name, text] of [
+      ["spaced", spaced(5000)],
+      ["multi-line", multiLine(5000)],
+      ["spaced with a mark on every link", marked(5000)],
+    ] as const) {
+      const { ms, hit } = timed(text);
+      expect(hit, `fired on the long ${name} chain, which holds no write`).toBe(false);
+      expect(ms, `the long ${name} chain took ${ms.toFixed(0)} ms`).toBeLessThan(BOUND_MS);
+    }
+
+    // The control. The same long chains DO fire once a write ends them, so
+    // "did not match" above is the missing write and not a blind pattern.
+    for (const text of [`env${" . a".repeat(5000)} = 1;`, `env${"\n  .a".repeat(5000)}\n  = 1;`]) {
+      const { ms, hit } = timed(text);
+      expect(hit, "a long chain that ends in a write was not seen").toBe(true);
+      expect(ms).toBeLessThan(BOUND_MS);
     }
   });
 

@@ -213,6 +213,20 @@ export const FORBIDDEN = [
   // Every one of these refuses more and none refuses less. Each has its own
   // sample row in ENV_WRITE_FORMS in test/forbidden-tokens.test.ts.
   //
+  // THE NON-NULL MARK OWNS THE WHITE SPACE IN FRONT OF IT, AND ONLY THAT (second
+  // code review, WR-01). Inside the chain loop the mark and its leading white
+  // space are optional TOGETHER, as one group, and one white-space run follows.
+  // The first widened version had a white-space run on EACH side of an optional
+  // mark. With no mark present, one space before a dot could be taken by either
+  // run, which is two ways to match every link. On a chain that does not end in
+  // a write the engine tried every combination, so the cost doubled per link:
+  // about 25 spaced links took seconds, and a new line counts as white space,
+  // so an ordinary multi-line chain has that shape. This rule has no scope and
+  // runs in both gates, so one such line would hang the hook with no message.
+  // The two forms match exactly the same strings. Do not split that group back
+  // into two optional pieces. A timing test in test/forbidden-tokens.test.ts
+  // holds it, over several thousand spaced links and a multi-line variant.
+  //
   // EVERY ARM OF THE COMPOUND-OPERATOR GROUP HAS ITS OWN SAMPLE ROW TOO (code
   // review WR-04), in ENV_COMPOUND_OPERATORS in the same test file. An arm with
   // no sample can be deleted with the whole suite still green, because the
@@ -262,7 +276,7 @@ export const FORBIDDEN = [
     // as well as src/.
     id: "env-assignment",
     pattern:
-      /\benv\b(?:\s+as\s+[^)\n]{1,80}\))?(?:\s*!?\s*(?:\.\s*[A-Za-z_$][\w$]*|\[[^\]\n]*\]|\[[^\[\]\n]*(?:\[[^\[\]\n]*\][^\[\]\n]*)+\]))+\s*(?:(?:\*\*|<<|>>>?|&&|\|\||\?\?|[-+*\/%&|^])?=(?![=>])|\+\+|--)|(?<![\w$)\]+\-])(?:\+\+|--)[ \t]*\(?[ \t]*(?:[\w$]+\.)*env\b(?:\s+as\s+[^)\n]{1,80}\))?!?(?:\.[A-Za-z_$]|\[)|\bObject\.assign\s*\(\s*(?:[\w$]+\.)*env\b/g,
+      /\benv\b(?:\s+as\s+[^)\n]{1,80}\))?(?:(?:\s*!)?\s*(?:\.\s*[A-Za-z_$][\w$]*|\[[^\]\n]*\]|\[[^\[\]\n]*(?:\[[^\[\]\n]*\][^\[\]\n]*)+\]))+\s*(?:(?:\*\*|<<|>>>?|&&|\|\||\?\?|[-+*\/%&|^])?=(?![=>])|\+\+|--)|(?<![\w$)\]+\-])(?:\+\+|--)[ \t]*\(?[ \t]*(?:[\w$]+\.)*env\b(?:\s+as\s+[^)\n]{1,80}\))?!?(?:\.[A-Za-z_$]|\[)|\bObject\.assign\s*\(\s*(?:[\w$]+\.)*env\b/g,
     why: "A write onto the environment object: a member assignment, an index assignment, an increment or decrement, or an object merge with it as the target, with or without a type cast or a non-null mark in front of the accessor. That object is shared by every test in a file and every request in an isolate, so a write onto it is how one user's identity leaks into another test or another request. Build a fresh copy with the two account fields overridden instead. The rule matches the word and reads text, so it also fires on a write onto the Node process's environment table or the build tool's, and on a comment or string that spells the write out. If that is what happened, set the variable from outside the script or pass a fresh copy, or describe the form by role in the comment. Do not loosen this rule.",
   },
 
