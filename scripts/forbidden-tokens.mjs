@@ -605,6 +605,87 @@ export const FORBIDDEN = [
       /(?:\bFETCH|["'`]\()[^;\n]{0,120}?\b(?:BODY(?!\.PEEK)(?:\.\w+)?\[|RFC822(?!\.(?:SIZE|HEADER))\b)/gi,
     why: "A body fetch item written without the peeking form (or its RFC822 synonym, which RFC 3501 makes functionally equivalent). Fetching this way sets the seen flag as a side effect, and the page-listing path touches every message on a page -- so one slip marks a whole page read in a single call, and read status is a field the user relies on. The structural half of the guarantee is that every mailbox is opened read-only, so the server refuses the mutation for the whole session; this rule is the convention half, and it catches the slip before it reaches a server that might not refuse it. Reading the server's reply is unaffected: the response key is spelled without the peek, which is why this rule is anchored on the fetch item list rather than on the spelling alone.",
   },
+
+  // ------------------------------------------------------------- store scoping
+  // ISO-06, D-13, D-21. Phase 10.
+  //
+  // THE RULE. Every KV and R2 key this project writes belongs to exactly one
+  // person. The staging bucket holds that person's attachments, the confirm
+  // namespace holds their pending writes, and the DAV cache holds their
+  // account's home URLs. So a key expression built under `src/` from a key
+  // prefix constant must put the user id straight after that constant, and
+  // nothing else may sit between the two.
+  //
+  // WHY THIS SHAPE, AND NOT THE LITERAL READING OF D-13. D-13 says "a key
+  // prefix constant declared under src/ that carries no user segment". Read as
+  // "the constant's own value must contain a user id" that is unsatisfiable: a
+  // module-scope constant is evaluated once when the isolate boots and there is
+  // no user then. ISO-06's own wording says a key **built** under `src/`, and
+  // that is the readable version: a USE of a prefix constant in a key
+  // expression that does not put a user id straight after it. Anchoring on the
+  // prefix constants is also how the rule finds a key expression at all. A rule
+  // over every string that merely looks like a key would fire on test data, on
+  // comments, and on the OAuth library's own documented key shapes, so it does
+  // not exist.
+  //
+  // WHY A KEY WITHOUT A USER SEGMENT IS THE FAILURE. It is a key any signed-in
+  // caller can name. One person's object becomes reachable through another
+  // person's request, and nothing fails on the way in -- the store returns the
+  // object it was asked for, which is exactly what it is built to do.
+  //
+  // WHAT IT DOES NOT SEE. Every one of these builds a key with no user id and
+  // fires nothing:
+  //
+  //   1. concatenation instead of a template: `CONFIRM_KEY_PREFIX + jti`;
+  //   2. a key built from a bare literal at the call site, with no prefix
+  //      constant at all;
+  //   3. a prefix constant renamed so it no longer ends in `PREFIX`, or no
+  //      longer contains one of the eight store words;
+  //   4. the user id interpolated under another name -- `${who}`, `${uid}`.
+  //      The rule keys on the spelling `userId`, optionally behind one member
+  //      access, so `${userId}`, `${actor.userId}` and `${principal.userId}`
+  //      are the three live spellings and all three pass;
+  //   5. the prefix constant copied into a variable first: `const p =
+  //      CONFIRM_KEY_PREFIX;` and then `` `${p}${jti}` ``;
+  //   6. the source-IP-keyed counter at `src/auth/login-handler.ts` -- it is
+  //      not a constant and not a per-user store. It is audit row S5 and it
+  //      belongs to Phase 11, which must not assume this rule covers it;
+  //   7. the OAuth library's own keys (`grant:`, `token:`, `client:`), which
+  //      live in `node_modules`, outside every entry in `SCAN_ROOTS`.
+  //
+  // A rule believed to prove more than it does is worse than one whose limits
+  // are written down.
+  //
+  // THE SHAPE. An interpolation whose whole content is an upper-case identifier
+  // containing one of eight store words and ending in `PREFIX`, NOT followed by
+  // an interpolation of `userId` with at most one member access in front of it.
+  // Both upper-case runs are bounded at 40 rather than left unbounded: that is
+  // what makes a 200,000-character adversarial input return in 0 ms, and it is
+  // not a tidiness knob. The MIME boundary constant in the message-assembly
+  // module is the near-miss, and the store-word filter is what keeps it clean
+  // WITHOUT a path exclusion -- an exclusion there would drop the logging,
+  // fan-out and write rules on that module too.
+  //
+  // ARMED LAST, ON PHASE 9'S PRECEDENT. It fired on four real lines when Phase
+  // 10 opened. `.husky/pre-commit` runs under `set -e`, so arming it before all
+  // four key expressions were reshaped would have refused every commit in the
+  // repository, including commits on unrelated work. It landed on a tree where
+  // it refuses nothing.
+  //
+  // ONE CONSEQUENCE WORTH KNOWING. The DAV cache key was reshaped by moving a
+  // colon out of the key expression and into the prefix constant (D-20). That
+  // change alters no byte of the key, so NO TEST IN THIS REPOSITORY CAN SEE IT
+  // -- measured, with all 2838 tests green either way. This rule is the only
+  // thing holding it. If somebody moves the colon back, the suite stays fully
+  // green and this rule starts refusing every commit, and the two events will
+  // look unrelated.
+  {
+    id: "store-key-without-a-user",
+    scope: "src/",
+    pattern:
+      /\$\{\s*[A-Z0-9_]{0,40}(?:KEY|KV|CACHE|STAGING|CONFIRM|BUCKET|R2|STORE)[A-Z0-9_]{0,40}PREFIX\s*\}(?!\s*\$\{\s*(?:[A-Za-z_][A-Za-z0-9_]{0,40}\s*\.\s*)?userId\s*\})/g,
+    why: "A store key built under src/ from a key-prefix constant with no user id straight after it. Every KV and R2 key this project writes belongs to exactly one person -- the staging bucket holds their attachments, the confirm namespace holds their pending writes, the DAV cache holds their account's home URLs. A key with no user segment is a key any signed-in caller can name, so one person's object becomes reachable through another person's request, and nothing fails on the way in: the store returns the object it was asked for. Interpolate the user id straight after the prefix constant, and take it from the signed-in principal -- never from the key, the token or the id being checked, because those are caller-supplied and a caller who chooses the segment chooses whose data to read. If this fired on something that is not a store key, rename the constant so it no longer reads as one. Do not buy it off with a path exclusion: this scanner's skip list is per file and not per rule, so excluding one file here would silently drop the logging, fan-out and write rules on it as well.",
+  },
 ];
 
 /**

@@ -317,6 +317,15 @@ describe("the patterns have teeth", () => {
     // without saying so. The right way is a fresh copy with both account
     // fields overridden, which is what the two-user fixture does.
     "env-assignment": 'env.APPLE_ID = "user-b@example.invalid";',
+    // A store key built from a prefix constant with the token id straight
+    // after it and no user segment in between. This is the contributor mistake
+    // the rule is aimed at, and it is an honest one: the jti is unique, so the
+    // key looks unique, and the code works perfectly for one user. It is only
+    // wrong once a second person exists — at which point any signed-in caller
+    // who knows a jti can name the key holding somebody else's pending write.
+    // Every one of the four key expressions in this project was written this
+    // way before Phase 10 reshaped them.
+    "store-key-without-a-user": "const key = `${CONFIRM_KEY_PREFIX}${jti}`;",
   };
 
   it("covers every rule with a known-violating sample", () => {
@@ -335,6 +344,41 @@ describe("the patterns have teeth", () => {
       expect(fresh.test(sample), `pattern for ${rule.id} matched nothing`).toBe(true);
     });
   }
+
+  it("does not fire the store-key rule on any shape Phase 10 actually shipped", () => {
+    // The five shapes that exist under src/ today. Four are the key
+    // expressions ISO-06 reshaped; the fifth is the MIME boundary constant in
+    // the message-assembly module, which is the near-miss this rule has to
+    // stay off. The store-word filter is what keeps that one clean, and it
+    // matters that it is the filter doing the work and not a path exclusion:
+    // EXCLUDED skips a file for EVERY rule, so excluding the module that
+    // assembles a message would silently drop its logging, fan-out and write
+    // rules too. The assertion below pins that it is NOT excluded.
+    const rule = FORBIDDEN.find((r) => r.id === "store-key-without-a-user")!;
+    const fires = (sample: string): boolean =>
+      new RegExp(rule.pattern.source, rule.pattern.flags).test(sample);
+
+    for (const sample of [
+      // src/staging/r2.ts — the binding side
+      "  const key = `${STAGING_PREFIX}${userId}/${segment}-${safe}-${nowMs}`;",
+      // src/staging/presign.ts — the presigned side
+      "  return `${STAGING_PREFIX}${userId}/${PRESIGNED_KEY_STEM}-${segment}-${nowMs}`;",
+      // src/confirm.ts
+      "  const key = `${CONFIRM_KEY_PREFIX}${userId}:${jti}`;",
+      // src/dav/discovery.ts
+      "  return `${DAV_CACHE_KEY_PREFIX}${userId}:${service}`;",
+      // src/mail/compose.ts — a MIME boundary, not a store key at all
+      "    const candidate = `${BOUNDARY_PREFIX}${crypto.randomUUID()}`;",
+      // The two member-access spellings of the same id, both permitted.
+      "  const key = `${STAGING_PREFIX}${principal.userId}/x`;",
+      "  const key = `${STAGING_PREFIX}${actor.userId}/x`;",
+    ]) {
+      expect(fires(sample), `false-positived on ${sample}`).toBe(false);
+    }
+
+    // The near-miss stays inside every other rule's reach.
+    expect(EXCLUDED.has("src/mail/compose.ts")).toBe(false);
+  });
 
   it("does not fire on the port and transport mode this project actually uses", () => {
     const permitted = 'connect({ hostname: h, port: 993 }, { secureTransport: "on" });';
