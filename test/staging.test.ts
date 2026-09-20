@@ -20,7 +20,7 @@
 
 import { AwsClient } from "aws4fetch";
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Env } from "../src/env";
 import { ImapNotFoundError } from "../src/errors";
 import type { DraftInput } from "../src/mail/compose";
@@ -76,6 +76,17 @@ import {
   taggedOk,
   wire,
 } from "./fixtures/icloud-bytes";
+import type { Principal } from "../src/principal";
+import { ownerPrincipal } from "./fixtures/bound-secrets";
+
+// The owner's principal, from the real env constructor over the pool's
+// ambient environment. Resolved once, and the very same object is handed to
+// every call: the password reader answers only the object a constructor
+// built, so it is never spread and never cloned.
+let principal: Principal;
+beforeAll(async () => {
+  principal = await ownerPrincipal();
+});
 
 const ENCODER = new TextEncoder();
 const DECODER = new TextDecoder();
@@ -754,7 +765,7 @@ describe("staging from a message: the copy that never reaches the transcript", (
 
     const content = await getAttachmentContentOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       FAST_BOUNDS,
@@ -779,7 +790,7 @@ describe("staging from a message: the copy that never reaches the transcript", (
 
     const content = await getAttachmentContentOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       FAST_BOUNDS,
@@ -804,7 +815,7 @@ describe("staging from a message: the copy that never reaches the transcript", (
 
     await getAttachmentContentOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       FAST_BOUNDS,
@@ -820,7 +831,7 @@ describe("staging from a message: the copy that never reaches the transcript", (
     const duplex = acceptingDuplex();
     const content = await getAttachmentContentOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       FAST_BOUNDS,
@@ -840,7 +851,7 @@ describe("staging from a message: the copy that never reaches the transcript", (
     const duplex = acceptingDuplex();
     const content = await getAttachmentContentOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       FAST_BOUNDS,
@@ -873,7 +884,7 @@ describe("staging from a message: the copy that never reaches the transcript", (
 
     const content = await getAttachmentContentOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       FAST_BOUNDS,
@@ -1517,7 +1528,7 @@ describe("composing with an attachment: every read before the socket", () => {
       (message) =>
         appendDraftOver(
           duplex,
-          env,
+          principal,
           createSessionGate(),
           null,
           message,
@@ -1546,7 +1557,7 @@ describe("composing with an attachment: every read before the socket", () => {
         written = message;
         return appendDraftOver(
           duplex,
-          env,
+          principal,
           createSessionGate(),
           null,
           message,
@@ -1596,7 +1607,7 @@ describe("composing with an attachment: every read before the socket", () => {
         appendCalls += 1;
         return appendDraftOver(
           duplex,
-          env,
+          principal,
           createSessionGate(),
           null,
           message,
@@ -1636,7 +1647,9 @@ describe("D-81's delete-on-attach layer", () => {
       (message) =>
         appendDraftOver(
           duplex,
-          over,
+          // `over` is the storage environment and nothing else now. The write
+          // acts for the owner's principal, whichever storage is swapped in.
+          principal,
           createSessionGate(),
           null,
           message,
@@ -2415,7 +2428,7 @@ describe("the third ingress, end to end", () => {
         written = message;
         return appendDraftOver(
           duplex,
-          env,
+          principal,
           createSessionGate(),
           null,
           message,

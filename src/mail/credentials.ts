@@ -25,8 +25,9 @@
 // any.
 
 import { isConfiguredSecret } from "../auth/login-handler";
-import type { Env } from "../env";
 import { ImapAuthError } from "../errors";
+import { passwordOf } from "../principal";
+import type { Principal } from "../principal";
 
 const ENCODER = new TextEncoder();
 
@@ -70,14 +71,16 @@ function assertNoIllegalCharacters(value: string): void {
 }
 
 /**
- * Refuse a binding that was never provisioned.
+ * Refuse a value that was never provisioned.
+ *
+ * This is the SECOND layer now. The principal's constructors already refuse an
+ * unset or empty address and password, so a real principal never trips this.
+ * It stays because the type of a principal is only a claim at runtime: an
+ * object made by hand can carry an absent address, and the values below land in
+ * a template literal, which would accept it silently.
  *
  * Declared as an assertion signature rather than a boolean predicate on
- * purpose: `src/env.ts` types the three secret bindings as absent-or-string,
- * which is what they are at runtime, so the write helpers below need the value
- * narrowed before it reaches `quoted`. A predicate returning plain `boolean`
- * would not narrow at the call site and would leave the choice between a
- * failing typecheck and a forbidden cast. This narrows and needs neither.
+ * purpose: it narrows at the call site, so nothing below needs a cast.
  *
  * Wraps `isConfiguredSecret` rather than restating it — one definition of what
  * a usable configured secret looks like, shared with the `/authorize` path that
@@ -139,28 +142,30 @@ function base64(bytes: Uint8Array): string {
  *
  * **Fixed, and never a parameter.** A caller-supplied `From` is a
  * caller-supplied identity, on a message that will go out under the user's own
- * name — so the identity is resolved here, from the binding, and the compose
- * tool exposes no way to name one.
+ * name — so the identity is resolved here, from the principal the call acts
+ * for, and the compose tool exposes no way to name one.
  *
  * Three things this function does and one it must never do:
  *
  * - It returns the Apple ID and nothing else. No object, no pair, no record —
  *   there is nothing here to spread into a response or attach to an error.
- * - `assertProvisioned` runs first, so an unset binding REFUSES rather than
+ * - `assertProvisioned` runs first, so an absent address REFUSES rather than
  *   stringifying. That check is behavioural rather than compiler-driven and
  *   must not be removed on the grounds that the typecheck passes without it:
  *   the value lands in a template literal one module over, and a template
- *   literal accepts an absent binding silently, stringifying it to the nine
+ *   literal accepts an absent value silently, stringifying it to the nine
  *   characters that spell the absent value. A draft authored by that
  *   placeholder is a message with a fabricated sender.
  * - `assertNoIllegalCharacters` runs next, because the value reaches a header
  *   line: a secret provisioned from a file carries the file's trailing newline,
  *   and a newline in a `From` header injects a second header.
- * - **It must never be handed the app-specific password.** Nothing here reads
- *   it, and nothing that calls this may pass it in.
+ * - **It must never ask for the app-specific password.** Nothing here calls
+ *   the password reader, and it stays synchronous. A principal holds the
+ *   address and the user id and no secret, so handing one over hands over no
+ *   password.
  */
-export function draftFromAddress(env: Env): string {
-  const appleId = env.APPLE_ID;
+export function draftFromAddress(principal: Principal): string {
+  const appleId = principal.appleId;
   assertProvisioned(appleId);
   assertNoIllegalCharacters(appleId);
   return appleId;
@@ -169,21 +174,23 @@ export function draftFromAddress(env: Env): string {
 /**
  * Write a tagged `LOGIN` command directly into the socket writer.
  *
- * Returns `undefined`. The credential enters this function through `env` and
- * leaves it only as bytes on the writer.
+ * Returns `undefined`. The Apple ID comes from the principal. The password
+ * comes from the password reader, which answers only the very object a
+ * constructor built, and it leaves this function only as bytes on the writer.
  */
 export async function writeLoginCommand(
   writer: WritableStreamDefaultWriter<Uint8Array>,
   tag: string,
-  env: Env,
+  principal: Principal,
 ): Promise<void> {
-  // Both checks run as statements before the write, not inside its argument.
-  // That ordering is the fix: a refusal raised while building the argument
-  // would already be too late if any byte had gone out, and a rejected value
-  // must leave no partial line on the wire for the server to read as the start
-  // of a command.
-  const appleId = env.APPLE_ID;
-  const password = env.APPLE_APP_PASSWORD;
+  // Both reads and both checks run as statements before the write, not inside
+  // its argument. That ordering is the fix: a refusal raised while building the
+  // argument would already be too late if any byte had gone out, and a rejected
+  // value must leave no partial line on the wire for the server to read as the
+  // start of a command. The password reader refuses a copied or hand-made
+  // principal right here, so such an object leaves zero bytes on the wire.
+  const appleId = principal.appleId;
+  const password = passwordOf(principal);
   assertProvisioned(appleId);
   assertProvisioned(password);
 
@@ -206,9 +213,9 @@ export async function writeLoginCommand(
  * The presence check in particular is BEHAVIOURAL, not compiler-driven, and
  * must not be removed on the grounds that the typecheck passes without it. The
  * values land in a template literal, and a template literal accepts an absent
- * binding silently: it stringifies to the nine characters spelling "undefined".
- * So the compiler raises nothing here, and without this check an unprovisioned
- * binding is base64-encoded and sent to iCloud as a literal placeholder
+ * value silently: it stringifies to the nine characters spelling "undefined".
+ * So the compiler raises nothing here, and without this check an absent
+ * value is base64-encoded and sent to iCloud as a literal placeholder
  * username and password. A green typecheck is not evidence the check is
  * redundant.
  *
@@ -219,10 +226,10 @@ export async function writeLoginCommand(
 export async function writeAuthenticatePlainCommand(
   writer: WritableStreamDefaultWriter<Uint8Array>,
   tag: string,
-  env: Env,
+  principal: Principal,
 ): Promise<void> {
-  const appleId = env.APPLE_ID;
-  const password = env.APPLE_APP_PASSWORD;
+  const appleId = principal.appleId;
+  const password = passwordOf(principal);
   assertProvisioned(appleId);
   assertProvisioned(password);
   assertNoIllegalCharacters(appleId);

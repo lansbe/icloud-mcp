@@ -13,7 +13,7 @@
 // have produced.
 
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { ImapConnectError, ImapNotFoundError, ImapThrottleError } from "../src/errors";
 import {
   decodeCursor,
@@ -62,6 +62,17 @@ import {
   createStallingDuplex,
 } from "./fixtures/fake-duplex";
 import type { FakeDuplex } from "./fixtures/fake-duplex";
+import type { Principal } from "../src/principal";
+import { ownerPrincipal } from "./fixtures/bound-secrets";
+
+// The owner's principal, from the real env constructor over the pool's
+// ambient environment. Resolved once, and the very same object is handed to
+// every call: the password reader answers only the object a constructor
+// built, so it is never spread and never cloned.
+let principal: Principal;
+beforeAll(async () => {
+  principal = await ownerPrincipal();
+});
 
 const ENCODER = new TextEncoder();
 
@@ -438,7 +449,7 @@ describe("mail_get_message, end to end over a full conversation", () => {
 
     const detail = await getMessageOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -470,7 +481,7 @@ describe("mail_get_message, end to end over a full conversation", () => {
 
     const detail = await getMessageOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -499,7 +510,7 @@ describe("mail_get_message, end to end over a full conversation", () => {
 
     const detail = await getMessageOver(
       happyPathDuplex({ raw: plain, structure: PLAIN_STRUCTURE }),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -511,14 +522,14 @@ describe("mail_get_message, end to end over a full conversation", () => {
   it("derives the unread flag from the flag list", async () => {
     const unread = await getMessageOver(
       happyPathDuplex(),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
     );
     const read = await getMessageOver(
       happyPathDuplex({ flags: "\\Seen" }),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -533,7 +544,7 @@ describe("mail_get_message, end to end over a full conversation", () => {
     // they travel in different halves of the tool response.
     const detail = await getMessageOver(
       happyPathDuplex(),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -548,7 +559,7 @@ describe("the commands actually written to the wire", () => {
   it("issues them in order, with distinct tags", async () => {
     const duplex = happyPathDuplex();
 
-    await getMessageOver(duplex, env, createSessionGate(), REF, FAST_BOUNDS);
+    await getMessageOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS);
 
     const lines = duplex.writtenLines();
     // An ordered comparison, not a set of `toContain` calls: a reader that
@@ -573,7 +584,7 @@ describe("the commands actually written to the wire", () => {
     // the call-site half. Losing either should fail here.
     const duplex = happyPathDuplex();
 
-    await getMessageOver(duplex, env, createSessionGate(), REF, FAST_BOUNDS);
+    await getMessageOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS);
 
     const lines = duplex.writtenLines();
     expect(lines.some((line) => line.includes("EXAMINE"))).toBe(true);
@@ -597,7 +608,7 @@ describe("the commands actually written to the wire", () => {
     // how much to pull before it knew how much there was.
     const duplex = happyPathDuplex();
 
-    await getMessageOver(duplex, env, createSessionGate(), REF, FAST_BOUNDS);
+    await getMessageOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS);
 
     const fetches = duplex.writtenLines().filter((line) => line.includes("FETCH"));
     expect(fetches).toEqual([
@@ -613,8 +624,8 @@ describe("the commands actually written to the wire", () => {
     const under = happyPathDuplex();
     const over = overCeilingDuplex();
 
-    await getMessageOver(under, env, createSessionGate(), REF, FAST_BOUNDS);
-    await getMessageOver(over, env, createSessionGate(), REF, FAST_BOUNDS);
+    await getMessageOver(under, principal, createSessionGate(), REF, FAST_BOUNDS);
+    await getMessageOver(over, principal, createSessionGate(), REF, FAST_BOUNDS);
 
     expect(under.writtenLines()[5]).toBe(`a6 UID FETCH ${UID} BODY.PEEK[]`);
     expect(over.writtenLines()[5]).toBe(
@@ -626,7 +637,7 @@ describe("the commands actually written to the wire", () => {
   it("quotes the mailbox name it opens", async () => {
     const duplex = happyPathDuplex();
 
-    await getMessageOver(duplex, env, createSessionGate(), REF, FAST_BOUNDS);
+    await getMessageOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS);
 
     expect(duplex.writtenLines()[3]).toBe(`a4 EXAMINE "${MAILBOX}"`);
   });
@@ -643,7 +654,7 @@ describe("the commands actually written to the wire", () => {
     ]);
 
     await expect(
-      getMessageOver(duplex, env, createSessionGate(), REF, FAST_BOUNDS),
+      getMessageOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS),
     ).rejects.toBeInstanceOf(ImapNotFoundError);
 
     expect(duplex.writtenLines()).toContain("a6 LOGOUT");
@@ -660,7 +671,7 @@ describe("the wire-size ceiling truncates, and never raises (D-35, T-02-06)", ()
     // closed deliberately and phases 3 through 6 all inherit it.
     const detail = await getMessageOver(
       overCeilingDuplex(),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -676,7 +687,7 @@ describe("the wire-size ceiling truncates, and never raises (D-35, T-02-06)", ()
     // so it survives a branch that deliberately fetches no attachment content.
     const detail = await getMessageOver(
       overCeilingDuplex(),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -693,7 +704,7 @@ describe("the wire-size ceiling truncates, and never raises (D-35, T-02-06)", ()
     // by `toContain`, so a rule that dropped only the deepest layer fails.
     const detail = await getMessageOver(
       overCeilingDuplex(),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -712,7 +723,7 @@ describe("the wire-size ceiling truncates, and never raises (D-35, T-02-06)", ()
 
     const detail = await getMessageOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -739,7 +750,7 @@ describe("the wire-size ceiling truncates, and never raises (D-35, T-02-06)", ()
     const duplex = overCeilingDuplex({ refuseMessage: true });
 
     await expect(
-      getMessageOver(duplex, env, createSessionGate(), REF, FAST_BOUNDS),
+      getMessageOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS),
     ).rejects.toBeInstanceOf(ImapNotFoundError);
 
     expect(
@@ -765,7 +776,7 @@ describe("the wire-size ceiling truncates, and never raises (D-35, T-02-06)", ()
 
     const detail = await getMessageOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -781,7 +792,7 @@ describe("the wire-size ceiling truncates, and never raises (D-35, T-02-06)", ()
   it("does not fire on an ordinary message, which is what makes D-34 true in practice", async () => {
     const detail = await getMessageOver(
       happyPathDuplex(),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -811,7 +822,7 @@ describe("a message with neither a text part nor an HTML part", () => {
 
     const detail = await getMessageOver(
       happyPathDuplex({ raw: attachmentOnly, structure: NO_TEXT_STRUCTURE }),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -914,7 +925,7 @@ describe("the raw-HTML option (D-33)", () => {
         raw: BLANK_PLAIN_ALTERNATIVE,
         structure: BLANK_PLAIN_STRUCTURE,
       }),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -932,7 +943,7 @@ describe("the raw-HTML option (D-33)", () => {
   it("returns a NULL raw-HTML field without the flag", async () => {
     const detail = await getMessageOver(
       happyPathDuplex({ raw: HTML_ONLY, structure: HTML_ONLY_STRUCTURE }),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -947,7 +958,7 @@ describe("the raw-HTML option (D-33)", () => {
   it("returns the raw HTML part WITH the flag", async () => {
     const detail = await getMessageOver(
       happyPathDuplex({ raw: HTML_ONLY, structure: HTML_ONLY_STRUCTURE }),
-      env,
+      principal,
       createSessionGate(),
       REF,
       { ...FAST_BOUNDS, includeHtml: true },
@@ -959,7 +970,7 @@ describe("the raw-HTML option (D-33)", () => {
   it("converts an HTML-only message to readable text, recording where it came from", async () => {
     const detail = await getMessageOver(
       happyPathDuplex({ raw: HTML_ONLY, structure: HTML_ONLY_STRUCTURE }),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -975,7 +986,7 @@ describe("the raw-HTML option (D-33)", () => {
   it("prefers the PLAIN part when a message carries both", async () => {
     const detail = await getMessageOver(
       happyPathDuplex({ raw: BOTH_PARTS, structure: ALTERNATIVE_STRUCTURE }),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -993,8 +1004,8 @@ describe("the raw-HTML option (D-33)", () => {
     const without = happyPathDuplex({ raw: HTML_ONLY, structure: HTML_ONLY_STRUCTURE });
     const with_ = happyPathDuplex({ raw: HTML_ONLY, structure: HTML_ONLY_STRUCTURE });
 
-    await getMessageOver(without, env, createSessionGate(), REF, FAST_BOUNDS);
-    await getMessageOver(with_, env, createSessionGate(), REF, {
+    await getMessageOver(without, principal, createSessionGate(), REF, FAST_BOUNDS);
+    await getMessageOver(with_, principal, createSessionGate(), REF, {
       ...FAST_BOUNDS,
       includeHtml: true,
     });
@@ -1009,7 +1020,7 @@ describe("the attachment cross-check (T-02-22)", () => {
   it("agrees when the structure and the parse describe the same file", async () => {
     const detail = await getMessageOver(
       happyPathDuplex(),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -1026,7 +1037,7 @@ describe("the attachment cross-check (T-02-22)", () => {
     // would throw that signal away.
     const detail = await getMessageOver(
       happyPathDuplex({ structure: DISAGREEING_STRUCTURE }),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -1045,7 +1056,7 @@ describe("the attachment cross-check (T-02-22)", () => {
     // rounding question — it is one of the two derivations being wrong.
     const detail = await getMessageOver(
       happyPathDuplex({ structure: UNDERSIZED_STRUCTURE }),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -1059,7 +1070,7 @@ describe("the attachment cross-check (T-02-22)", () => {
     // Reporting `true` there would flag every oversized message as suspicious.
     const detail = await getMessageOver(
       overCeilingDuplex(),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -1075,7 +1086,7 @@ describe("the attachment cross-check (T-02-22)", () => {
     // every real attachment and the flag would become noise.
     const detail = await getMessageOver(
       happyPathDuplex(),
-      env,
+      principal,
       createSessionGate(),
       REF,
       FAST_BOUNDS,
@@ -1106,7 +1117,7 @@ describe("the UIDVALIDITY gate (MAIL-06, T-02-12)", () => {
     ]);
 
     await expect(
-      getMessageOver(duplex, env, createSessionGate(), REF, FAST_BOUNDS),
+      getMessageOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS),
     ).rejects.toBeInstanceOf(ImapNotFoundError);
 
     expect(
@@ -1128,7 +1139,7 @@ describe("the UIDVALIDITY gate (MAIL-06, T-02-12)", () => {
     ]);
 
     await expect(
-      getMessageOver(duplex, env, createSessionGate(), REF, FAST_BOUNDS),
+      getMessageOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS),
     ).rejects.toBeInstanceOf(ImapNotFoundError);
     expect(
       duplex.writtenLines().some((line) => line.includes("FETCH")),
@@ -1147,7 +1158,7 @@ describe("the UIDVALIDITY gate (MAIL-06, T-02-12)", () => {
         examineReply("a4", { uidValidity: 4294967295, exists: 9 }),
         logoutExchange("a5"),
       ]),
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       null,
@@ -1174,7 +1185,7 @@ describe("the UIDVALIDITY gate (MAIL-06, T-02-12)", () => {
     await expect(
       withMailSessionOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         "INBOX\r\na9 LOGOUT",
         null,
@@ -1207,7 +1218,7 @@ describe("the session gate is request-scoped (D-46)", () => {
     // await, so it is already held by the time the next line runs.
     const first = withMailSessionOver(
       happyPathDuplex(),
-      env,
+      principal,
       gate,
       MAILBOX,
       null,
@@ -1222,7 +1233,7 @@ describe("the session gate is request-scoped (D-46)", () => {
     await expect(
       withMailSessionOver(
         secondDuplex,
-        env,
+        principal,
         gate,
         MAILBOX,
         null,
@@ -1247,7 +1258,7 @@ describe("the session gate is request-scoped (D-46)", () => {
     // than the fan-out it was trying to prevent.
     const first = withMailSessionOver(
       happyPathDuplex(),
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       null,
@@ -1256,7 +1267,7 @@ describe("the session gate is request-scoped (D-46)", () => {
     );
     const second = withMailSessionOver(
       happyPathDuplex(),
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       null,
@@ -1278,7 +1289,7 @@ describe("the session gate is request-scoped (D-46)", () => {
     await expect(
       withMailSessionOver(
         happyPathDuplex(),
-        env,
+        principal,
         gate,
         MAILBOX,
         null,
@@ -1294,7 +1305,7 @@ describe("the session gate is request-scoped (D-46)", () => {
     await expect(
       withMailSessionOver(
         happyPathDuplex(),
-        env,
+        principal,
         gate,
         MAILBOX,
         null,
@@ -1309,7 +1320,7 @@ describe("the session gate is request-scoped (D-46)", () => {
 
     await withMailSessionOver(
       happyPathDuplex(),
-      env,
+      principal,
       gate,
       MAILBOX,
       null,
@@ -1342,7 +1353,7 @@ describe("the per-call deadline races the work, not the session (D-45)", () => {
 
     const startedAt = Date.now();
     await expect(
-      getMessageOver(duplex, env, gate, REF, {
+      getMessageOver(duplex, principal, gate, REF, {
         readTimeoutMs: 300,
         drainTimeoutMs: 20,
         closeTimeoutMs: 20,
@@ -1361,7 +1372,7 @@ describe("the per-call deadline races the work, not the session (D-45)", () => {
     // worse bug than no deadline, and a test asserting only the timeout case
     // would not notice.
     await expect(
-      getMessageOver(happyPathDuplex(), env, createSessionGate(), REF, {
+      getMessageOver(happyPathDuplex(), principal, createSessionGate(), REF, {
         ...FAST_BOUNDS,
         callDeadlineMs: 2000,
       }),
@@ -1474,7 +1485,7 @@ describe("mail_list_folders, over a full conversation", () => {
   it("returns every folder with inline counts when the extended form is accepted", async () => {
     const listing = await listFoldersOver(
       extendedListingDuplex(SCRIPTED_FOLDERS),
-      env,
+      principal,
       createSessionGate(),
       FAST_BOUNDS,
     );
@@ -1490,7 +1501,7 @@ describe("mail_list_folders, over a full conversation", () => {
   it("takes the hierarchy separator from the reply's own field", async () => {
     const listing = await listFoldersOver(
       extendedListingDuplex(SCRIPTED_FOLDERS),
-      env,
+      principal,
       createSessionGate(),
       FAST_BOUNDS,
     );
@@ -1505,7 +1516,7 @@ describe("mail_list_folders, over a full conversation", () => {
       extendedListingDuplex([
         { name: "INBOX", delimiter: "NIL", counts: { messages: 1, unseen: 0 } },
       ]),
-      env,
+      principal,
       createSessionGate(),
       FAST_BOUNDS,
     );
@@ -1520,7 +1531,7 @@ describe("mail_list_folders, over a full conversation", () => {
     // `INBOX` third, discarding that while adding nothing.
     const listing = await listFoldersOver(
       extendedListingDuplex(SCRIPTED_FOLDERS),
-      env,
+      principal,
       createSessionGate(),
       FAST_BOUNDS,
     );
@@ -1539,7 +1550,7 @@ describe("mail_list_folders, over a full conversation", () => {
     // would make "no folders" indistinguishable from a failed command.
     const listing = await listFoldersOver(
       extendedListingDuplex([]),
-      env,
+      principal,
       createSessionGate(),
       FAST_BOUNDS,
     );
@@ -1559,7 +1570,7 @@ describe("mail_list_folders, over a full conversation", () => {
         { name: "Containers", attributes: "\\Noselect", counts: null },
         { name: "Notes", counts: { messages: 8, unseen: 1 } },
       ]),
-      env,
+      principal,
       createSessionGate(),
       FAST_BOUNDS,
     );
@@ -1591,7 +1602,7 @@ describe("mail_list_folders, over a full conversation", () => {
 
     const listing = await listFoldersOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       FAST_BOUNDS,
     );
@@ -1607,7 +1618,7 @@ describe("mail_list_folders, over a full conversation", () => {
     // deliberately does not have.
     const listing = await listFoldersOver(
       extendedListingDuplex([{ name: MUTF7_WIRE_NAME, counts: null }]),
-      env,
+      principal,
       createSessionGate(),
       FAST_BOUNDS,
     );
@@ -1628,7 +1639,7 @@ describe("mail_list_folders, over a full conversation", () => {
         { name: "Sent Messages", counts: null },
         { name: "Archive/2024", counts: null },
       ]),
-      env,
+      principal,
       createSessionGate(),
       FAST_BOUNDS,
     );
@@ -1653,7 +1664,7 @@ describe("mail_list_folders, over a full conversation", () => {
       extendedListingDuplex([
         { name: "Drafts", attributes: "\\Drafts \\HasNoChildren", counts: null },
       ]),
-      env,
+      principal,
       createSessionGate(),
       FAST_BOUNDS,
     );
@@ -1669,7 +1680,7 @@ describe("the commands a folder listing actually writes", () => {
   it("opens NO mailbox at all — the listing runs from the authenticated state", async () => {
     const duplex = extendedListingDuplex(SCRIPTED_FOLDERS);
 
-    await listFoldersOver(duplex, env, createSessionGate(), FAST_BOUNDS);
+    await listFoldersOver(duplex, principal, createSessionGate(), FAST_BOUNDS);
 
     const lines = duplex.writtenLines();
     expect(commandVerbs(lines)).toEqual([
@@ -1686,7 +1697,7 @@ describe("the commands a folder listing actually writes", () => {
   it("asks for the counts inline, recursively, from the namespace root", async () => {
     const duplex = extendedListingDuplex(SCRIPTED_FOLDERS);
 
-    await listFoldersOver(duplex, env, createSessionGate(), FAST_BOUNDS);
+    await listFoldersOver(duplex, principal, createSessionGate(), FAST_BOUNDS);
 
     expect(duplex.writtenLines()[3]).toBe(
       'a4 LIST "" "*" RETURN (STATUS (MESSAGES UNSEEN))',
@@ -1701,7 +1712,7 @@ describe("the commands a folder listing actually writes", () => {
 
     const listing = await listFoldersOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       FAST_BOUNDS,
     );
@@ -1737,7 +1748,7 @@ describe("the commands a folder listing actually writes", () => {
     ]);
 
     await expect(
-      listFoldersOver(duplex, env, createSessionGate(), FAST_BOUNDS),
+      listFoldersOver(duplex, principal, createSessionGate(), FAST_BOUNDS),
     ).rejects.toBeInstanceOf(ImapNotFoundError);
 
     expect(commandVerbs(duplex.writtenLines())).toEqual([
@@ -1757,7 +1768,7 @@ describe("the commands a folder listing actually writes", () => {
     ]);
 
     await expect(
-      listFoldersOver(duplex, env, createSessionGate(), FAST_BOUNDS),
+      listFoldersOver(duplex, principal, createSessionGate(), FAST_BOUNDS),
     ).rejects.toBeInstanceOf(ImapNotFoundError);
 
     expect(duplex.writtenLines()).toContain("a5 LOGOUT");
@@ -2137,7 +2148,7 @@ describe("the batched page fetch (MAIL-02, T-02-07)", () => {
     // says WHICH command was extra rather than only that one was.
     const duplex = fullPageDuplex();
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       pageSize: PAGE_SIZE_DEFAULT,
     });
@@ -2161,7 +2172,7 @@ describe("the batched page fetch (MAIL-02, T-02-07)", () => {
     // command with the wrong item list through.
     const duplex = fullPageDuplex();
 
-    await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       pageSize: PAGE_SIZE_DEFAULT,
     });
@@ -2174,7 +2185,7 @@ describe("the batched page fetch (MAIL-02, T-02-07)", () => {
   it("fetches one snippet command for a page resolving to a single path", async () => {
     const duplex = fullPageDuplex();
 
-    await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       pageSize: PAGE_SIZE_DEFAULT,
     });
@@ -2190,7 +2201,7 @@ describe("the batched page fetch (MAIL-02, T-02-07)", () => {
     // slip on a single-message fetch.
     const duplex = fullPageDuplex();
 
-    await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       pageSize: PAGE_SIZE_DEFAULT,
     });
@@ -2205,7 +2216,7 @@ describe("the batched page fetch (MAIL-02, T-02-07)", () => {
   it("returns every field criterion 2 names, and no body", async () => {
     const duplex = fullPageDuplex();
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       pageSize: PAGE_SIZE_DEFAULT,
     });
@@ -2230,7 +2241,7 @@ describe("the batched page fetch (MAIL-02, T-02-07)", () => {
   it("reports the SERVER's internal date, never the sender's own header", async () => {
     const duplex = fullPageDuplex();
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       pageSize: PAGE_SIZE_DEFAULT,
     });
@@ -2254,7 +2265,7 @@ describe("the batched page fetch (MAIL-02, T-02-07)", () => {
       "a8",
     );
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2266,7 +2277,7 @@ describe("the batched page fetch (MAIL-02, T-02-07)", () => {
     // phase where a sequence number is handed to the client unasked.
     const duplex = fullPageDuplex();
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       pageSize: PAGE_SIZE_DEFAULT,
     });
@@ -2285,7 +2296,7 @@ describe("the batched page fetch (MAIL-02, T-02-07)", () => {
   it("returns an empty page for an empty folder, not an error", async () => {
     const duplex = listingDuplex([searchReply("a5", [])], "a6");
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2328,7 +2339,7 @@ describe("the grouped snippet fetches (D-20, T-02-09)", () => {
   it("issues exactly one command per DISTINCT resolved part path", async () => {
     const duplex = twoPathDuplex();
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2352,7 +2363,7 @@ describe("the grouped snippet fetches (D-20, T-02-09)", () => {
     // order from the metadata reply, so a positional client mixes them up.
     const duplex = twoPathDuplex();
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2381,7 +2392,7 @@ describe("the grouped snippet fetches (D-20, T-02-09)", () => {
       "a8",
     );
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2430,7 +2441,7 @@ describe("the grouped snippet fetches (D-20, T-02-09)", () => {
     // and correctly got nothing out of it.
     const duplex = deepPreambleDuplex();
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2479,7 +2490,7 @@ describe("the grouped snippet fetches (D-20, T-02-09)", () => {
     // someone re-implementing it as the option that was declined.
     const duplex = deepPreambleDuplex();
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2538,7 +2549,7 @@ describe("the grouped snippet fetches (D-20, T-02-09)", () => {
       "a9",
     );
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2586,7 +2597,7 @@ describe("the grouped snippet fetches (D-20, T-02-09)", () => {
       "a9",
     );
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2638,7 +2649,7 @@ describe("the grouped snippet fetches (D-20, T-02-09)", () => {
       "a9",
     );
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2683,7 +2694,7 @@ describe("the grouped snippet fetches (D-20, T-02-09)", () => {
       "a8",
     );
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2737,7 +2748,7 @@ describe("the grouped snippet fetches (D-20, T-02-09)", () => {
       "a8",
     );
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2763,7 +2774,7 @@ describe("the grouped snippet fetches (D-20, T-02-09)", () => {
     // because D-20's grouped-fetch cost model was decided rather than inherited.
     const duplex = twoPathDuplex();
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2795,14 +2806,14 @@ describe("the grouped snippet fetches (D-20, T-02-09)", () => {
 
     const withMarker = await listMessagesOver(
       build(true),
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       FAST_BOUNDS,
     );
     const without = await listMessagesOver(
       build(false),
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       FAST_BOUNDS,
@@ -2822,7 +2833,7 @@ describe("the grouped snippet fetches (D-20, T-02-09)", () => {
       "a7",
     );
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2856,7 +2867,7 @@ describe("the grouped snippet fetches (D-20, T-02-09)", () => {
       "a9",
     );
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2913,7 +2924,7 @@ describe("the cursor contract (D-21, D-24, D-25)", () => {
   it("returns the NEWEST page first when given no cursor", async () => {
     const duplex = pageConversation([4801, 4802, 4803, 4804], 2);
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       pageSize: 2,
     });
@@ -2925,7 +2936,7 @@ describe("the cursor contract (D-21, D-24, D-25)", () => {
   it("signals more results with a cursor, as two separately named fields", async () => {
     const duplex = pageConversation([4801, 4802, 4803, 4804], 2);
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       pageSize: 2,
     });
@@ -2946,7 +2957,7 @@ describe("the cursor contract (D-21, D-24, D-25)", () => {
     // to reason about what a null cursor means.
     const duplex = pageConversation([4801, 4802], 25);
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
     });
 
@@ -2963,7 +2974,7 @@ describe("the cursor contract (D-21, D-24, D-25)", () => {
     });
     const duplex = pageConversation([4801, 4802, 4803, 4804], 25);
 
-    await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       cursor,
     });
@@ -2985,7 +2996,7 @@ describe("the cursor contract (D-21, D-24, D-25)", () => {
       const below = cursor === undefined ? null : decodeCursor(cursor).lastUid;
       const duplex = pageConversation(matching(folder, below), 3);
 
-      const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+      const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
         ...FAST_BOUNDS,
         pageSize: 3,
         cursor,
@@ -3032,7 +3043,7 @@ describe("the cursor contract (D-21, D-24, D-25)", () => {
       "a8",
     );
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       pageSize: 3,
     });
@@ -3053,7 +3064,7 @@ describe("the cursor contract (D-21, D-24, D-25)", () => {
     });
     const duplex = createFakeDuplex([...listingPrefix(), logoutExchange("a5")]);
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       cursor,
     });
@@ -3072,7 +3083,7 @@ describe("the cursor contract (D-21, D-24, D-25)", () => {
     const folder = Array.from({ length: 150 }, (_value, index) => 5000 + index);
     const duplex = pageConversation(folder, PAGE_SIZE_MAX);
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       pageSize: 500,
     });
@@ -3085,7 +3096,7 @@ describe("the cursor contract (D-21, D-24, D-25)", () => {
     const folder = Array.from({ length: 40 }, (_value, index) => 5000 + index);
     const duplex = pageConversation(folder, PAGE_SIZE_DEFAULT);
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       pageSize: 0,
     });
@@ -3102,7 +3113,7 @@ describe("the cursor contract (D-21, D-24, D-25)", () => {
     const duplex = createFakeDuplex([]);
 
     await expect(
-      listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+      listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
         ...FAST_BOUNDS,
         cursor,
       }),
@@ -3118,7 +3129,7 @@ describe("the cursor contract (D-21, D-24, D-25)", () => {
     const duplex = createFakeDuplex([]);
 
     await expect(
-      listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+      listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
         ...FAST_BOUNDS,
         cursor: encodeMessageId(REF),
       }),
@@ -3144,7 +3155,7 @@ describe("the listing's UIDVALIDITY gate (D-23, MAIL-06, T-02-12)", () => {
     ]);
 
     await expect(
-      listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+      listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
         ...FAST_BOUNDS,
         cursor: STALE_CURSOR,
       }),
@@ -3170,7 +3181,7 @@ describe("the listing's UIDVALIDITY gate (D-23, MAIL-06, T-02-12)", () => {
     ]);
 
     await expect(
-      listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+      listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
         ...FAST_BOUNDS,
         cursor: STALE_CURSOR,
       }),
@@ -3187,7 +3198,7 @@ describe("the listing's UIDVALIDITY gate (D-23, MAIL-06, T-02-12)", () => {
     // next page's gate would compare against a number nobody stated.
     const duplex = pageConversation([4801, 4802, 4803], 2);
 
-    const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+    const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       pageSize: 2,
     });
@@ -3248,7 +3259,7 @@ async function searchCommandFor(
   options: { cursor?: string } = {},
 ): Promise<string> {
   const duplex = listingDuplex([searchReply("a5", [])], "a6");
-  await searchMessagesOver(duplex, env, createSessionGate(), MAILBOX, criteria, {
+  await searchMessagesOver(duplex, principal, createSessionGate(), MAILBOX, criteria, {
     ...FAST_BOUNDS,
     ...options,
   });
@@ -3338,7 +3349,7 @@ async function datedSearch(
 
   const page = await searchMessagesOver(
     duplex,
-    env,
+    principal,
     createSessionGate(),
     MAILBOX,
     criteria,
@@ -3366,7 +3377,7 @@ describe("the search command this client writes", () => {
 
     const page = await searchMessagesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       { keyword: "recruiter" },
@@ -3453,7 +3464,7 @@ describe("the search command this client writes", () => {
     await expect(
       searchMessagesOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         MAILBOX,
         { startDate: "2026-02-01", endDate: "2026-02-31" },
@@ -3539,7 +3550,7 @@ describe("a non-ASCII search term takes the literal path", () => {
 
     await searchMessagesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       { keyword: ACCENTED_TERM },
@@ -3557,7 +3568,7 @@ describe("a non-ASCII search term takes the literal path", () => {
 
     await searchMessagesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       { keyword: ACCENTED_TERM },
@@ -3577,7 +3588,7 @@ describe("a non-ASCII search term takes the literal path", () => {
 
     await searchMessagesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       { keyword: ACCENTED_TERM, unreadOnly: true },
@@ -3594,7 +3605,7 @@ describe("a non-ASCII search term takes the literal path", () => {
 
     const page = await searchMessagesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       { keyword: ACCENTED_TERM },
@@ -3613,7 +3624,7 @@ describe("a non-ASCII search term takes the literal path", () => {
 
     await searchMessagesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       { keyword: 'the "offer" letter' },
@@ -3637,7 +3648,7 @@ describe("a null byte in a search term", () => {
     await expect(
       searchMessagesOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         MAILBOX,
         { keyword: "offer\u0000letter" },
@@ -3654,7 +3665,7 @@ describe("a null byte in a search term", () => {
     await expect(
       searchMessagesOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         MAILBOX,
         { sender: "jane\u0000@example.invalid" },
@@ -3672,7 +3683,7 @@ describe("a search that matched nothing", () => {
 
     const page = await searchMessagesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       { keyword: "nothing matches this" },
@@ -3704,7 +3715,7 @@ describe("a charset rejection (T-02-37)", () => {
     // retry something that will fail identically every time.
     const page = await searchMessagesOver(
       badCharsetConversation(),
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       { keyword: ACCENTED_TERM },
@@ -3722,7 +3733,7 @@ describe("a charset rejection (T-02-37)", () => {
 
     await searchMessagesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       { keyword: ACCENTED_TERM },
@@ -3753,7 +3764,7 @@ describe("a charset rejection (T-02-37)", () => {
     await expect(
       searchMessagesOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         MAILBOX,
         { keyword: ACCENTED_TERM },
@@ -3776,7 +3787,7 @@ describe("a charset rejection (T-02-37)", () => {
     await expect(
       searchMessagesOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         MAILBOX,
         { keyword: ACCENTED_TERM },
@@ -3795,7 +3806,7 @@ describe("search pagination re-runs the search per page (D-25)", () => {
 
     const page = await searchMessagesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       { keyword: "offer" },
@@ -3827,7 +3838,7 @@ describe("search pagination re-runs the search per page (D-25)", () => {
 
     const page = await searchMessagesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       { keyword: "offer" },
@@ -3847,7 +3858,7 @@ describe("search pagination re-runs the search per page (D-25)", () => {
     await expect(
       searchMessagesOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         MAILBOX,
         { keyword: "offer" },
@@ -3882,10 +3893,10 @@ describe("the unread listing shares the listing implementation", () => {
     // count: a failure names WHICH command differs, and a reimplementation that
     // happened to issue the same number of commands still fails.
     const listed = pageConversation([4801, 4802], PAGE_SIZE_DEFAULT);
-    await listMessagesOver(listed, env, createSessionGate(), MAILBOX, FAST_BOUNDS);
+    await listMessagesOver(listed, principal, createSessionGate(), MAILBOX, FAST_BOUNDS);
 
     const unread = pageConversation([4801, 4802], PAGE_SIZE_DEFAULT);
-    await listUnreadOver(unread, env, createSessionGate(), MAILBOX, FAST_BOUNDS);
+    await listUnreadOver(unread, principal, createSessionGate(), MAILBOX, FAST_BOUNDS);
 
     const listedCommands = sessionCommands(listed);
     const unreadCommands = sessionCommands(unread);
@@ -3903,7 +3914,7 @@ describe("the unread listing shares the listing implementation", () => {
     // connection, against a twenty-second call deadline.
     const duplex = pageConversation([4801, 4802], PAGE_SIZE_DEFAULT);
 
-    await listUnreadOver(duplex, env, createSessionGate(), MAILBOX, FAST_BOUNDS);
+    await listUnreadOver(duplex, principal, createSessionGate(), MAILBOX, FAST_BOUNDS);
 
     const lines = duplex.writtenLines();
     expect(lines.filter((line) => line.includes("EXAMINE"))).toHaveLength(1);
@@ -3920,7 +3931,7 @@ describe("the unread listing shares the listing implementation", () => {
   it("defaults to the inbox when no folder is named", async () => {
     const duplex = pageConversation([], PAGE_SIZE_DEFAULT);
 
-    await listUnreadOver(duplex, env, createSessionGate(), undefined, FAST_BOUNDS);
+    await listUnreadOver(duplex, principal, createSessionGate(), undefined, FAST_BOUNDS);
 
     expect(sessionCommands(duplex)[0]).toBe('a4 EXAMINE "INBOX"');
   });
@@ -3928,7 +3939,7 @@ describe("the unread listing shares the listing implementation", () => {
   it("takes an explicit folder when one is named", async () => {
     const duplex = pageConversation([], PAGE_SIZE_DEFAULT);
 
-    await listUnreadOver(duplex, env, createSessionGate(), "Archive", FAST_BOUNDS);
+    await listUnreadOver(duplex, principal, createSessionGate(), "Archive", FAST_BOUNDS);
 
     expect(sessionCommands(duplex)[0]).toBe('a4 EXAMINE "Archive"');
   });
@@ -3938,7 +3949,7 @@ describe("the unread listing shares the listing implementation", () => {
 
     const page = await listUnreadOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       FAST_BOUNDS,
@@ -3956,7 +3967,7 @@ describe("the unread listing shares the listing implementation", () => {
 
     const page = await listUnreadOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       FAST_BOUNDS,
@@ -3975,7 +3986,7 @@ describe("paging unread across a message that becomes read", () => {
     const firstPage = pageConversation([4805, 4804, 4803, 4802, 4801], 2);
     const one = await listUnreadOver(
       firstPage,
-      env,
+      principal,
       createSessionGate(),
       MAILBOX,
       { ...FAST_BOUNDS, pageSize: 2 },
@@ -3988,7 +3999,7 @@ describe("paging unread across a message that becomes read", () => {
     // Between the pages 4803 is read in Mail.app, so the server's second answer
     // no longer carries it. Nothing else changed.
     const secondPage = pageConversation([4802, 4801], 2);
-    const two = await listUnreadOver(secondPage, env, createSessionGate(), MAILBOX, {
+    const two = await listUnreadOver(secondPage, principal, createSessionGate(), MAILBOX, {
       ...FAST_BOUNDS,
       pageSize: 2,
       cursor: one.nextCursor!,
@@ -4022,7 +4033,7 @@ describe("a NO to the mailbox open", () => {
     ]);
 
     await expect(
-      getMessageOver(duplex, env, createSessionGate(), REF, FAST_BOUNDS),
+      getMessageOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS),
     ).rejects.toBeInstanceOf(ImapNotFoundError);
   });
 });

@@ -196,12 +196,11 @@ export interface UserTools {
  *
  * **What "for `user`" honestly means today, which is not much (D-05).**
  *
- * - The MAIL callbacks ignore the user completely. `registerMailTools` takes a
- *   server and a gate, and its callbacks read the ambient environment that
- *   `src/mcp/tools/mail.ts` imports for itself. So `toolsFor(USER_A)` and
- *   `toolsFor(USER_B)` make the very same mail call. That is not a flaw in this
- *   fixture. It is the thing the cross-user tests record: the tool layer has no
- *   idea who is calling.
+ * - The MAIL callbacks act for this user's principal (Phase 9, plan 09-04).
+ *   `registerMailTools` takes the promise from `testPrincipal(user)` as its
+ *   third parameter, and each callback awaits it and logs in as that user. The
+ *   staging helpers still read the ambient environment for R2, which holds no
+ *   credential.
  * - The CALENDAR callbacks carry the user's Basic header, because they send
  *   through the `davFetch` built here from `envFor(user)`. But they still key
  *   the DAV cache by the ambient identity, not by this user.
@@ -246,8 +245,16 @@ export function toolsFor(user: TestUser, extra?: ExtraTools): UserTools {
   // recorded before it. `call` then gives null for a tool that never made it
   // onto the list, the leak test returns early, and the controls and the
   // fixture pins, which assert on `names` and on a real result, go red.
+  // One principal for this user, made by the real props constructor. The no-op
+  // handler is attached straight away: a test that builds the tools and calls
+  // none of them would otherwise leave a rejected promise with nobody
+  // listening. Each callback still awaits `principal` itself and still sees
+  // the refusal.
+  const principal = testPrincipal(user);
+  principal.catch(() => {});
+
   try {
-    registerMailTools(server, createSessionGate());
+    registerMailTools(server, createSessionGate(), principal);
     registerCalendarTools(server, createDavFetch(envFor(user)));
 
     // After the real registrations, onto the same list, so an extra tool is

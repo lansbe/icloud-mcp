@@ -59,10 +59,10 @@ export function createServerFactory(
     // at module scope.
     const gate = createSessionGate();
     const davFetch = createDavFetch(env);
-    // The mail diagnostic is the first tool to act for the principal. The other
-    // registrars get the same promise as the mail chain and the DAV chain land.
+    // The mail diagnostic and the mail tools act for the principal. The DAV
+    // registrars get the same promise when the DAV chain lands.
     registerDiagnoseTool(server, principal);
-    registerMailTools(server, gate);
+    registerMailTools(server, gate, principal);
     registerDavDiagnoseTool(server, davFetch);
     // The same `davFetch` the diagnostic takes, deliberately: one queue per
     // request means a calendar call and a diagnosis issued in the same request

@@ -6,7 +6,7 @@
 // MAX_CONCURRENT_CONNECTIONS in ./socket.ts for why; the rationale for not
 // naming the specific combinators here is recorded in 01-02-SUMMARY.md.
 
-import type { Env } from "../env";
+import type { Principal } from "../principal";
 import {
   ImapAuthError,
   ImapConnectError,
@@ -243,7 +243,7 @@ export interface DiagnosticOutcome {
  */
 export async function runDiagnosticOver(
   duplex: DuplexLike,
-  env: Env,
+  principal: Principal,
   connectMs: number,
 ): Promise<DiagnosticOutcome> {
   const report = emptyReport();
@@ -267,7 +267,7 @@ export async function runDiagnosticOver(
     report.greetingCapability = firstCapability(greetingCapability.untagged);
 
     const loginStart = Date.now();
-    const auth = await authenticate(channel, env);
+    const auth = await authenticate(channel, principal);
     report.timings.loginMs = Date.now() - loginStart;
     report.authenticated = auth.authenticated;
     report.authMechanism = auth.mechanism;
@@ -404,7 +404,7 @@ export async function runDiagnosticOver(
  * the person taking it instead of inherited from a function name.
  */
 export async function runDiagnosticOutcome(
-  env: Env,
+  principal: Principal,
 ): Promise<DiagnosticOutcome> {
   const connectStart = Date.now();
   let sock: DuplexLike;
@@ -417,5 +417,5 @@ export async function runDiagnosticOutcome(
   }
   const connectMs = Date.now() - connectStart;
 
-  return runDiagnosticOver(sock, env, connectMs);
+  return runDiagnosticOver(sock, principal, connectMs);
 }

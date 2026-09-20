@@ -26,7 +26,7 @@
 // real Apple ID (D-09).
 
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { ImapConnectError, ImapNotFoundError } from "../src/errors";
 import {
   MAX_APPEND_LITERAL_BYTES,
@@ -57,6 +57,17 @@ import {
   createFakeDuplex,
   createStallingDuplex,
 } from "./fixtures/fake-duplex";
+import type { Principal } from "../src/principal";
+import { ownerPrincipal } from "./fixtures/bound-secrets";
+
+// The owner's principal, from the real env constructor over the pool's
+// ambient environment. Resolved once, and the very same object is handed to
+// every call: the password reader answers only the object a constructor
+// built, so it is never spread and never cloned.
+let principal: Principal;
+beforeAll(async () => {
+  principal = await ownerPrincipal();
+});
 
 const ENCODER = new TextEncoder();
 const DECODER = new TextDecoder();
@@ -162,7 +173,7 @@ describe("the command line", () => {
 
     await appendDraftOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       null,
       message,
@@ -205,7 +216,7 @@ describe("the command line", () => {
 
     await appendDraftOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       null,
       draftBytes(),
@@ -235,7 +246,7 @@ describe("the declared count", () => {
     const duplex = acceptingDuplex();
     await appendDraftOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       null,
       message,
@@ -257,7 +268,7 @@ describe("the declared count", () => {
 
     await appendDraftOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       null,
       message,
@@ -285,7 +296,7 @@ describe("the handshake ordering", () => {
 
     await appendDraftOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       null,
       message,
@@ -314,7 +325,7 @@ describe("the handshake ordering", () => {
 
     await appendDraftOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       null,
       draftBytes(),
@@ -380,7 +391,7 @@ describe("the outcome", () => {
   it("reports both numbers when the server sends the response code", async () => {
     const outcome = await appendDraftOver(
       acceptingDuplex(),
-      env,
+      principal,
       createSessionGate(),
       null,
       draftBytes(),
@@ -402,7 +413,7 @@ describe("the outcome", () => {
     // ladder rather than on a server statement, and the caller is told so.
     const outcome = await appendDraftOver(
       acceptingDuplex(),
-      env,
+      principal,
       createSessionGate(),
       null,
       draftBytes(),
@@ -415,7 +426,7 @@ describe("the outcome", () => {
   it("SUCCEEDS with null identifiers when the completion carries no response code", async () => {
     const outcome = await appendDraftOver(
       acceptingDuplex("a5 OK APPEND completed"),
-      env,
+      principal,
       createSessionGate(),
       null,
       draftBytes(),
@@ -436,7 +447,7 @@ describe("the outcome", () => {
     // call.
     const outcome = await appendDraftOver(
       acceptingDuplex(),
-      env,
+      principal,
       createSessionGate(),
       null,
       draftBytes(),
@@ -467,7 +478,7 @@ describe("the outcome", () => {
 
     const outcome = await appendDraftOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       null,
       oversize,
@@ -503,7 +514,7 @@ describe("a server that refuses", () => {
     await expect(
       appendDraftOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         null,
         draftBytes(),
@@ -531,7 +542,7 @@ describe("a server that refuses", () => {
     await expect(
       appendDraftOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         null,
         draftBytes(),
@@ -558,7 +569,7 @@ describe("a server that refuses", () => {
     await expect(
       appendDraftOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         null,
         draftBytes(),
@@ -580,7 +591,7 @@ describe("a server that refuses", () => {
     await expect(
       appendDraftOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         null,
         draftBytes(),
@@ -611,7 +622,7 @@ describe("the target folder", () => {
 
     const outcome = await appendDraftOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       "Work Drafts",
       draftBytes(),
@@ -628,7 +639,7 @@ describe("the target folder", () => {
     await expect(
       appendDraftOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         "Nowhere",
         draftBytes(),
@@ -651,7 +662,7 @@ describe("the target folder", () => {
     await expect(
       appendDraftOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         "Drafts\r\na9 DELETE INBOX",
         draftBytes(),
@@ -670,7 +681,7 @@ describe("the target folder", () => {
 
     await appendDraftOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       null,
       draftBytes(),
@@ -713,7 +724,7 @@ describe("a real built draft, driven through the write conversation", () => {
     const duplex = acceptingDuplex();
     const outcome = await appendDraftOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       null,
       result.bytes,
@@ -900,7 +911,7 @@ describe("the parent-header fetch", () => {
 
     await getReplyParentOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       PARENT_REF,
       FAST_BOUNDS,
@@ -932,7 +943,7 @@ describe("the parent-header fetch", () => {
 
     await getReplyParentOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       PARENT_REF,
       FAST_BOUNDS,
@@ -946,7 +957,7 @@ describe("the parent-header fetch", () => {
   it("lands every one of the six on ParentHeaders, with the right nullability", async () => {
     const parent = await getReplyParentOver(
       parentDuplex(),
-      env,
+      principal,
       createSessionGate(),
       PARENT_REF,
       FAST_BOUNDS,
@@ -968,7 +979,7 @@ describe("the parent-header fetch", () => {
     const duplex = parentDuplex();
     const parent = await getReplyParentOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       PARENT_REF,
       FAST_BOUNDS,
@@ -990,7 +1001,7 @@ describe("the parent-header fetch", () => {
     await expect(
       getReplyParentOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         PARENT_REF,
         FAST_BOUNDS,
@@ -1013,7 +1024,7 @@ describe("the parent-header fetch", () => {
     await expect(
       getReplyParentOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         PARENT_REF,
         FAST_BOUNDS,
@@ -1032,7 +1043,7 @@ describe("the parent-header fetch", () => {
     await expect(
       getReplyParentOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         PARENT_REF,
         FAST_BOUNDS,

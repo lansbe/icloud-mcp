@@ -7,7 +7,6 @@
 // would NOT be equivalent — is recorded in 01-02-SUMMARY.md rather than here.
 
 import type { McpServer } from "@modelcontextprotocol/server";
-import { env } from "cloudflare:workers";
 import {
   ImapAuthError,
   ImapThrottleError,
@@ -140,8 +139,8 @@ export function registerDiagnoseTool(
     },
     async () => {
       try {
-        await principal;
-        return diagnosticResult(await runDiagnosticOutcome(env));
+        const actor = await principal;
+        return diagnosticResult(await runDiagnosticOutcome(actor));
       } catch (err) {
         // A backstop for anything the diagnostic did not already fold into an
         // outcome. Same boundary, same fixed vocabulary.

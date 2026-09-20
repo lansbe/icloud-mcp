@@ -60,8 +60,9 @@ import {
   uploadUrlToolResult,
 } from "../src/mcp/tools/mail";
 import {
-  type BoundMailSecrets,
   assertMailSecretsBound,
+  ownerPrincipal,
+  type BoundMailSecrets,
 } from "./fixtures/bound-secrets";
 
 /** Every stranger-authored value the fixture carries, named once. */
@@ -1017,7 +1018,7 @@ describe("the registrations themselves", () => {
     };
     // The callbacks are recorded and never invoked, so nothing here opens a
     // socket or reads a credential.
-    registerMailTools(server as unknown as McpServer, createSessionGate());
+    registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
     return recorded;
   }
 
@@ -1618,7 +1619,7 @@ describe("the search and unread registrations", () => {
         recorded.push({ name, options });
       },
     };
-    registerMailTools(server as unknown as McpServer, createSessionGate());
+    registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
     return recorded;
   }
 
@@ -2027,7 +2028,7 @@ describe("the compose registration", () => {
         recorded.push({ name, options });
       },
     };
-    registerMailTools(server as unknown as McpServer, createSessionGate());
+    registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
     return recorded;
   }
 
@@ -2260,7 +2261,7 @@ describe("the reply registration", () => {
         recorded.push({ name, options });
       },
     };
-    registerMailTools(server as unknown as McpServer, createSessionGate());
+    registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
     return recorded;
   }
 
@@ -2900,7 +2901,7 @@ describe("the mail_get_attachment registration", () => {
         recorded.push({ name, options });
       },
     };
-    registerMailTools(server as unknown as McpServer, createSessionGate());
+    registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
     return recorded;
   }
 
@@ -3055,7 +3056,7 @@ describe("the mail_stage_attachment registration", () => {
         recorded.push({ name, options });
       },
     };
-    registerMailTools(server as unknown as McpServer, createSessionGate());
+    registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
     return recorded;
   }
 
@@ -3331,7 +3332,7 @@ describe("the mail_confirm_upload registration", () => {
         recorded.push({ name, options });
       },
     };
-    registerMailTools(server as unknown as McpServer, createSessionGate());
+    registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
     return recorded;
   }
 

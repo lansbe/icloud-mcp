@@ -10,7 +10,7 @@
 // single "log what I am about to write" line here would put the credential
 // into retained observability storage.
 
-import type { Env } from "../env";
+import type { Principal } from "../principal";
 import {
   ImapAuthError,
   ImapConnectError,
@@ -806,10 +806,12 @@ function replyText(result: CommandResult): string {
  */
 export async function authenticate(
   channel: ImapChannel,
-  env: Env,
+  principal: Principal,
 ): Promise<AuthOutcome> {
   const loginTag = channel.nextTag();
-  await channel.withWriter((writer) => writeLoginCommand(writer, loginTag, env));
+  await channel.withWriter((writer) =>
+    writeLoginCommand(writer, loginTag, principal),
+  );
   const login = await readUntilTag(channel, loginTag);
 
   if (login.status === "OK") {
@@ -823,7 +825,7 @@ export async function authenticate(
 
   const saslTag = channel.nextTag();
   await channel.withWriter((writer) =>
-    writeAuthenticatePlainCommand(writer, saslTag, env),
+    writeAuthenticatePlainCommand(writer, saslTag, principal),
   );
   const sasl = await readUntilTag(channel, saslTag);
 

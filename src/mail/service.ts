@@ -13,7 +13,7 @@
 
 import PostalMime from "postal-mime";
 import type { Address } from "postal-mime";
-import type { Env } from "../env";
+import type { Principal } from "../principal";
 import {
   ImapAuthError,
   ImapConnectError,
@@ -327,7 +327,7 @@ function firstCapability(untagged: ResponseLine[]): string | null {
  */
 export async function withMailSessionOver<T>(
   duplex: DuplexLike,
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   mailbox: string | null,
   expectedUidValidity: number | null,
@@ -350,7 +350,7 @@ export async function withMailSessionOver<T>(
     await readGreeting(channel);
     await sendCommand(channel, channel.nextTag(), "CAPABILITY");
 
-    const auth = await authenticate(channel, env);
+    const auth = await authenticate(channel, principal);
     if (!auth.authenticated) throw new ImapAuthError();
 
     const postLogin = await sendCommand(channel, channel.nextTag(), "CAPABILITY");
@@ -457,9 +457,16 @@ export async function withMailSessionOver<T>(
  * and that acquire — `connectImap()` is synchronous and an async function's
  * body runs synchronously until its first `await` — so the pair is atomic with
  * respect to the event loop rather than merely likely to be.
+ *
+ * That is also why this takes a principal and never the promise of one. The
+ * tool callback awaits the promise, as the first line of its try, and hands the
+ * resolved object down. An await here, ahead of the socket open, would put a
+ * gap between the check and the acquire, and two tool calls in one legacy batch
+ * share one gate: both could pass the check and both could open a socket. A
+ * test reads this function as text and fails if an await appears in that span.
  */
 export async function withMailSession<T>(
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   mailbox: string | null,
   expectedUidValidity: number | null,
@@ -477,7 +484,7 @@ export async function withMailSession<T>(
 
   return withMailSessionOver(
     sock,
-    env,
+    principal,
     gate,
     mailbox,
     expectedUidValidity,
@@ -1229,14 +1236,14 @@ async function readReplyParent(
 /** Read one reply's parent over an already-open stream pair. */
 export async function getReplyParentOver(
   duplex: DuplexLike,
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   ref: MessageRef,
   options: MailSessionOptions = {},
 ): Promise<ReplyParent> {
   return withMailSessionOver(
     duplex,
-    env,
+    principal,
     gate,
     ref.mailbox,
     ref.uidValidity,
@@ -1254,13 +1261,13 @@ export async function getReplyParentOver(
  * is written rather than answered from whatever now occupies that UID.
  */
 export async function getReplyParent(
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   ref: MessageRef,
   options: MailSessionOptions = {},
 ): Promise<ReplyParent> {
   return withMailSession(
-    env,
+    principal,
     gate,
     ref.mailbox,
     ref.uidValidity,
@@ -1387,7 +1394,7 @@ async function readAttachmentPart(
 /** Fetch one attachment part over an already-open stream pair. */
 export async function getAttachmentBytesOver(
   duplex: DuplexLike,
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   ref: AttachmentRef,
   encodedOctets: number,
@@ -1395,7 +1402,7 @@ export async function getAttachmentBytesOver(
 ): Promise<AttachmentFetch> {
   return withMailSessionOver(
     duplex,
-    env,
+    principal,
     gate,
     ref.mailbox,
     ref.uidValidity,
@@ -1439,14 +1446,14 @@ function attachmentSessionOptions(
  * reader moving it back inside would reintroduce exactly that, silently.
  */
 export async function getAttachmentBytes(
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   ref: AttachmentRef,
   encodedOctets: number,
   options: MailSessionOptions = {},
 ): Promise<AttachmentFetch> {
   return withMailSession(
-    env,
+    principal,
     gate,
     ref.mailbox,
     ref.uidValidity,
@@ -1548,14 +1555,14 @@ async function readAttachmentContent(
 /** Describe and fetch one attachment over an already-open stream pair. */
 export async function getAttachmentContentOver(
   duplex: DuplexLike,
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   ref: AttachmentRef,
   options: MailSessionOptions = {},
 ): Promise<AttachmentContent> {
   return withMailSessionOver(
     duplex,
-    env,
+    principal,
     gate,
     ref.mailbox,
     ref.uidValidity,
@@ -1579,13 +1586,13 @@ export async function getAttachmentContentOver(
  * project that decides whether a part is too large to ask for.
  */
 export async function getAttachmentContent(
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   ref: AttachmentRef,
   options: MailSessionOptions = {},
 ): Promise<AttachmentContent> {
   return withMailSession(
-    env,
+    principal,
     gate,
     ref.mailbox,
     ref.uidValidity,
@@ -1597,14 +1604,14 @@ export async function getAttachmentContent(
 /** Fetch one message over an already-open stream pair. */
 export async function getMessageOver(
   duplex: DuplexLike,
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   ref: MessageRef,
   options: GetMessageOptions = {},
 ): Promise<MessageDetail> {
   return withMailSessionOver(
     duplex,
-    env,
+    principal,
     gate,
     ref.mailbox,
     ref.uidValidity,
@@ -1621,13 +1628,13 @@ export async function getMessageOver(
  * answered with whatever now occupies that UID.
  */
 export async function getMessage(
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   ref: MessageRef,
   options: GetMessageOptions = {},
 ): Promise<MessageDetail> {
   return withMailSession(
-    env,
+    principal,
     gate,
     ref.mailbox,
     ref.uidValidity,
@@ -1839,13 +1846,13 @@ async function listAllFolders(session: MailSession): Promise<FolderListing> {
 /** List every folder over an already-open stream pair. */
 export async function listFoldersOver(
   duplex: DuplexLike,
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   options: MailSessionOptions = {},
 ): Promise<FolderListing> {
   return withMailSessionOver(
     duplex,
-    env,
+    principal,
     gate,
     // No mailbox: the listing command runs from the authenticated state, so no
     // mailbox is opened and no validity gate runs.
@@ -1864,11 +1871,11 @@ export async function listFoldersOver(
  * than merely enforced at the boundary.
  */
 export async function listFolders(
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   options: MailSessionOptions = {},
 ): Promise<FolderListing> {
-  return withMailSession(env, gate, null, null, listAllFolders, options);
+  return withMailSession(principal, gate, null, null, listAllFolders, options);
 }
 
 // ---------------------------------------------------------------------------
@@ -2906,7 +2913,7 @@ function assertSearchable(criteria: SearchCriteria): void {
 /** List one page of a folder over an already-open stream pair. */
 export async function listMessagesOver(
   duplex: DuplexLike,
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   mailbox: string,
   options: ListMessagesOptions = {},
@@ -2916,7 +2923,7 @@ export async function listMessagesOver(
 
   return withMailSessionOver(
     duplex,
-    env,
+    principal,
     gate,
     mailbox,
     cursor?.uidValidity ?? null,
@@ -2936,7 +2943,7 @@ export async function listMessagesOver(
  * the change would believe it was still paging.
  */
 export async function listMessages(
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   mailbox: string,
   options: ListMessagesOptions = {},
@@ -2945,7 +2952,7 @@ export async function listMessages(
   const pageSize = clampPageSize(options.pageSize);
 
   return withMailSession(
-    env,
+    principal,
     gate,
     mailbox,
     cursor?.uidValidity ?? null,
@@ -2957,7 +2964,7 @@ export async function listMessages(
 /** Search one page of a folder over an already-open stream pair. */
 export async function searchMessagesOver(
   duplex: DuplexLike,
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   mailbox: string,
   criteria: SearchCriteria,
@@ -2969,7 +2976,7 @@ export async function searchMessagesOver(
 
   return withMailSessionOver(
     duplex,
-    env,
+    principal,
     gate,
     mailbox,
     cursor?.uidValidity ?? null,
@@ -2997,7 +3004,7 @@ export async function searchMessagesOver(
  * with filters, and the two must not be able to drift apart.
  */
 export async function searchMessages(
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   mailbox: string,
   criteria: SearchCriteria,
@@ -3008,7 +3015,7 @@ export async function searchMessages(
   const pageSize = clampPageSize(options.pageSize);
 
   return withMailSession(
-    env,
+    principal,
     gate,
     mailbox,
     cursor?.uidValidity ?? null,
@@ -3020,12 +3027,12 @@ export async function searchMessages(
 /** List one page of a folder's unread mail over an already-open stream pair. */
 export async function listUnreadOver(
   duplex: DuplexLike,
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   mailbox: string = DEFAULT_MAILBOX,
   options: ListMessagesOptions = {},
 ): Promise<MessagePage> {
-  return searchMessagesOver(duplex, env, gate, mailbox, UNREAD_ONLY, options);
+  return searchMessagesOver(duplex, principal, gate, mailbox, UNREAD_ONLY, options);
 }
 
 /**
@@ -3057,12 +3064,12 @@ export async function listUnreadOver(
  * with the folder count bounded — not a fan-out, and not a silent default.
  */
 export async function listUnread(
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   mailbox: string = DEFAULT_MAILBOX,
   options: ListMessagesOptions = {},
 ): Promise<MessagePage> {
-  return searchMessages(env, gate, mailbox, UNREAD_ONLY, options);
+  return searchMessages(principal, gate, mailbox, UNREAD_ONLY, options);
 }
 
 // ---------------------------------------------------------------------------
@@ -3364,7 +3371,7 @@ async function writeDraft(
 /** Write one draft over an already-open stream pair. */
 export async function appendDraftOver(
   duplex: DuplexLike,
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   mailbox: string | null,
   message: Uint8Array,
@@ -3376,7 +3383,7 @@ export async function appendDraftOver(
 
   return withMailSessionOver(
     duplex,
-    env,
+    principal,
     gate,
     // No mailbox: both the listing and the write run from the authenticated
     // state, so nothing is opened and no validity gate runs. This is already
@@ -3402,7 +3409,7 @@ export async function appendDraftOver(
  * server's own listing rather than from a name anyone constructed.
  */
 export async function appendDraft(
-  env: Env,
+  principal: Principal,
   gate: SessionGate,
   mailbox: string | null,
   message: Uint8Array,
@@ -3413,7 +3420,7 @@ export async function appendDraft(
   assertQuotableMailbox(mailbox);
 
   return withMailSession(
-    env,
+    principal,
     gate,
     null,
     null,

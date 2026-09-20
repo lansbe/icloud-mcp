@@ -7,7 +7,7 @@
 // automated "integration test" anything other than a real login.
 
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
   ImapAuthError,
   ImapConnectError,
@@ -50,7 +50,20 @@ import {
   createRejectingCloseDuplex,
   createSilentPeerDuplex,
 } from "./fixtures/fake-duplex";
-import { assertMailSecretsBound } from "./fixtures/bound-secrets";
+import {
+  assertMailSecretsBound,
+  ownerPrincipal,
+} from "./fixtures/bound-secrets";
+import type { Principal } from "../src/principal";
+
+// The owner's principal, from the real env constructor over the pool's
+// ambient environment. Resolved once, and the very same object is handed to
+// every call: the password reader answers only the object a constructor
+// built, so it is never spread and never cloned.
+let principal: Principal;
+beforeAll(async () => {
+  principal = await ownerPrincipal();
+});
 
 /**
  * The injected bounds (D-51, WINDOWS.md ledger entry 9).
@@ -590,7 +603,7 @@ describe("the authenticated conversation", () => {
       logoutExchange("a5"),
     ]);
 
-    const { report, failed } = await runDiagnosticOver(duplex, env, 1);
+    const { report, failed } = await runDiagnosticOver(duplex, principal, 1);
 
     const lines = duplex.writtenLines();
     expect(commandWords(lines)).toEqual([
@@ -624,7 +637,7 @@ describe("the authenticated conversation", () => {
       logoutExchange("a5"),
     ]);
 
-    const { report } = await runDiagnosticOver(duplex, env, 1);
+    const { report } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(report.greetingCapability).toBe(PRE_AUTH_CAPABILITY);
     expect(report.postLoginCapability).toBe(POST_AUTH_CAPABILITY);
@@ -641,7 +654,7 @@ describe("the authenticated conversation", () => {
       logoutExchange("a5"),
     ]);
 
-    const { report } = await runDiagnosticOver(duplex, env, 1);
+    const { report } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(report.literalPlus).toBe(true);
   });
@@ -658,7 +671,7 @@ describe("the authenticated conversation", () => {
       logoutExchange("a5"),
     ]);
 
-    const { report } = await runDiagnosticOver(duplex, env, 1);
+    const { report } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(report.greetingCapability).toContain("LITERAL+");
     expect(report.postLoginCapability).not.toContain("LITERAL+");
@@ -675,7 +688,7 @@ describe("the authenticated conversation", () => {
       logoutExchange("a5"),
     ]);
 
-    const { report } = await runDiagnosticOver(duplex, env, 42);
+    const { report } = await runDiagnosticOver(duplex, principal, 42);
 
     expect(Object.keys(report.timings).sort()).toEqual([
       "closeMs",
@@ -714,7 +727,7 @@ describe("the read-only inbox stage (D-52)", () => {
       logoutExchange("a5"),
     ]);
 
-    await runDiagnosticOver(duplex, env, 1);
+    await runDiagnosticOver(duplex, principal, 1);
 
     const lines = duplex.writtenLines();
     expect(lines).toContain('a4 EXAMINE "INBOX"');
@@ -732,7 +745,7 @@ describe("the read-only inbox stage (D-52)", () => {
       logoutExchange("a5"),
     ]);
 
-    const { report, failed } = await runDiagnosticOver(duplex, env, 1);
+    const { report, failed } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(failed).toBe(false);
     expect(report.inboxUidValidity).toBe(INBOX_UIDVALIDITY);
@@ -755,7 +768,7 @@ describe("the read-only inbox stage (D-52)", () => {
       logoutExchange("a5"),
     ]);
 
-    const { report } = await runDiagnosticOver(duplex, env, 1);
+    const { report } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(report.inboxUidValidity).toBeGreaterThan(2 ** 31);
     expect(report.inboxUidValidity).toBe(INBOX_UIDVALIDITY);
@@ -775,7 +788,7 @@ describe("the read-only inbox stage (D-52)", () => {
       logoutExchange("a5"),
     ]);
 
-    const { report, failed, error } = await runDiagnosticOver(duplex, env, 1);
+    const { report, failed, error } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(failed).toBe(true);
     expect(toErrorCategory(error).category).toBe("not_found");
@@ -805,7 +818,7 @@ describe("the read-only inbox stage (D-52)", () => {
       logoutExchange("a4"),
     ]);
 
-    const { report } = await runDiagnosticOver(duplex, env, 1);
+    const { report } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(report.inboxUidValidity).toBeNull();
     expect(report.inboxMessageCount).toBeNull();
@@ -825,7 +838,7 @@ describe("the read-only inbox stage (D-52)", () => {
       logoutExchange("a5"),
     ]);
 
-    const { report, failed } = await runDiagnosticOver(duplex, env, 1);
+    const { report, failed } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(failed).toBe(false);
     expect(report.inboxUidValidity).toBeNull();
@@ -845,7 +858,7 @@ describe("the authentication fallback", () => {
       logoutExchange("a6"),
     ]);
 
-    const { report, failed } = await runDiagnosticOver(duplex, env, 1);
+    const { report, failed } = await runDiagnosticOver(duplex, principal, 1);
 
     const words = commandWords(duplex.writtenLines());
     expect(words.filter((word) => word === "LOGIN")).toHaveLength(1);
@@ -864,7 +877,7 @@ describe("the authentication fallback", () => {
       logoutExchange("a4"),
     ]);
 
-    const { error } = await runDiagnosticOver(duplex, env, 1);
+    const { error } = await runDiagnosticOver(duplex, principal, 1);
 
     const words = commandWords(duplex.writtenLines());
     expect(words).toEqual(["CAPABILITY", "LOGIN", "AUTHENTICATE", "LOGOUT"]);
@@ -880,7 +893,7 @@ describe("the authentication fallback", () => {
       logoutExchange("a4"),
     ]);
 
-    const { report, failed, error } = await runDiagnosticOver(duplex, env, 1);
+    const { report, failed, error } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(failed).toBe(true);
     expect(toErrorCategory(error).category).toBe("auth_failed");
@@ -903,7 +916,7 @@ describe("the authentication fallback", () => {
       logoutExchange("a4"),
     ]);
 
-    const { report } = await runDiagnosticOver(duplex, env, 1);
+    const { report } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(report.authFailureDetail).toBeTypeOf("string");
     expect(report.authFailureDetail).toContain(AUTH_REJECTED_LEGACY_TEXT);
@@ -930,7 +943,7 @@ describe("the authentication fallback", () => {
       logoutExchange("a4"),
     ]);
 
-    const { report } = await runDiagnosticOver(duplex, env, 1);
+    const { report } = await runDiagnosticOver(duplex, principal, 1);
 
     // Truncating per part left the real ceiling at roughly twice the constant
     // plus label text, so a per-part bound would sail past this.
@@ -951,7 +964,7 @@ describe("the authentication fallback", () => {
       logoutExchange("a5"),
     ]);
 
-    const { report } = await runDiagnosticOver(duplex, env, 1);
+    const { report } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(report.authFailureDetail).toBeNull();
   });
@@ -969,7 +982,7 @@ describe("failure categories, proven by injection", () => {
       logoutExchange("a3"),
     ]);
 
-    const { failed, error } = await runDiagnosticOver(duplex, env, 1);
+    const { failed, error } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(failed).toBe(true);
     expect(error).toBeInstanceOf(ImapThrottleError);
@@ -989,7 +1002,7 @@ describe("failure categories, proven by injection", () => {
       logoutExchange("a3"),
     ]);
 
-    const outcome = await runDiagnosticOver(duplex, env, 1);
+    const outcome = await runDiagnosticOver(duplex, principal, 1);
 
     // It reached the report from the parsed reply...
     expect(outcome.report.throttleFailureDetail).toBe(CONNECTION_LIMIT_TEXT);
@@ -1012,7 +1025,7 @@ describe("failure categories, proven by injection", () => {
     // yet to parse.
     const duplex = createFakeDuplex([GREETING_AT_CONNECTION_LIMIT]);
 
-    const outcome = await runDiagnosticOver(duplex, env, 1);
+    const outcome = await runDiagnosticOver(duplex, principal, 1);
 
     expect(outcome.error).toBeInstanceOf(ImapThrottleError);
     expect(outcome.report.throttleFailureDetail).toContain("Too many");
@@ -1034,7 +1047,7 @@ describe("failure categories, proven by injection", () => {
       logoutExchange("a3"),
     ]);
 
-    const { report } = await runDiagnosticOver(duplex, env, 1);
+    const { report } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(report.throttleFailureDetail?.length).toBe(MAX_FAILURE_DETAIL);
     // And it truncated rather than being handed something already short.
@@ -1055,7 +1068,7 @@ describe("failure categories, proven by injection", () => {
       logoutExchange("a5"),
     ]);
 
-    const { report } = await runDiagnosticOver(duplex, env, 1);
+    const { report } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(report.throttleFailureDetail).toBeNull();
   });
@@ -1068,7 +1081,7 @@ describe("failure categories, proven by injection", () => {
       logoutExchange("a3"),
     ]);
 
-    const outcome = await runDiagnosticOver(duplex, env, 1);
+    const outcome = await runDiagnosticOver(duplex, principal, 1);
 
     assertMailSecretsBound(env);
     expect(env.APPLE_ID.length).toBeGreaterThan(0);
@@ -1086,7 +1099,7 @@ describe("failure categories, proven by injection", () => {
   it("maps a duplex that rejects on open to connection_failed", async () => {
     const duplex = createFailingDuplex();
 
-    const { report, failed, error } = await runDiagnosticOver(duplex, env, 1);
+    const { report, failed, error } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(failed).toBe(true);
     expect(error).toBeInstanceOf(ImapConnectError);
@@ -1106,7 +1119,7 @@ describe("failure categories, proven by injection", () => {
       logoutExchange("a4"),
     ]);
 
-    const { report } = await runDiagnosticOver(duplex, env, 1);
+    const { report } = await runDiagnosticOver(duplex, principal, 1);
 
     expect(duplex.firstIndexOf("close")).toBeGreaterThan(
       duplex.firstIndexOf("readable-done"),
@@ -1134,7 +1147,7 @@ describe("failure categories, proven by injection", () => {
       logoutExchange("a4"),
     ]);
 
-    const outcome = await runDiagnosticOver(duplex, env, 1);
+    const outcome = await runDiagnosticOver(duplex, principal, 1);
 
     // A case that would pass just as happily against empty bindings is not a
     // proof of containment; `not.toContain("")` is true of every string.

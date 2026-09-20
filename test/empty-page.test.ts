@@ -34,7 +34,7 @@
 // This file contains no logging calls of any kind and must never acquire any.
 
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { encodeCursor } from "../src/mail/ids";
 import { createSessionGate, listMessagesOver } from "../src/mail/service";
 import { createFakeDuplex } from "./fixtures/fake-duplex";
@@ -48,6 +48,17 @@ import {
   logoutExchange,
   taggedOk,
 } from "./fixtures/icloud-bytes";
+import type { Principal } from "../src/principal";
+import { ownerPrincipal } from "./fixtures/bound-secrets";
+
+// The owner's principal, from the real env constructor over the pool's
+// ambient environment. Resolved once, and the very same object is handed to
+// every call: the password reader answers only the object a constructor
+// built, so it is never spread and never cloned.
+let principal: Principal;
+beforeAll(async () => {
+  principal = await ownerPrincipal();
+});
 
 /** The mailbox every call here opens. A copy of the service test's constant. */
 const MAILBOX = "INBOX";
@@ -107,7 +118,7 @@ function lowestCursor(): string {
  */
 async function emptyPageCall() {
   const duplex = createFakeDuplex([...listingPrefix(), logoutExchange("a5")]);
-  const page = await listMessagesOver(duplex, env, createSessionGate(), MAILBOX, {
+  const page = await listMessagesOver(duplex, principal, createSessionGate(), MAILBOX, {
     ...FAST_BOUNDS,
     cursor: lowestCursor(),
   });

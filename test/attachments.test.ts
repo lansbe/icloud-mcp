@@ -29,7 +29,7 @@
 // real Apple ID (D-09).
 
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { ImapNotFoundError } from "../src/errors";
 import { decodeAttachmentId, encodeAttachmentId } from "../src/mail/ids";
 import {
@@ -175,7 +175,7 @@ describe("the size pre-check, BEFORE the fetch command is written", () => {
 
     const result = await getAttachmentBytesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       MAX_ATTACHMENT_PART_OCTETS + 1,
@@ -199,7 +199,7 @@ describe("the size pre-check, BEFORE the fetch command is written", () => {
 
     const result = await getAttachmentBytesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       9_000_000,
@@ -223,7 +223,7 @@ describe("the size pre-check, BEFORE the fetch command is written", () => {
 
     const result = await getAttachmentBytesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       MAX_ATTACHMENT_PART_OCTETS,
@@ -243,7 +243,7 @@ describe("the size pre-check, BEFORE the fetch command is written", () => {
     await expect(
       getAttachmentBytesOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         ATTACHMENT_REF,
         1024,
@@ -265,7 +265,7 @@ describe("the part fetch itself", () => {
 
     await getAttachmentBytesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       1024,
@@ -282,7 +282,7 @@ describe("the part fetch itself", () => {
 
     await getAttachmentBytesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       1024,
@@ -304,7 +304,7 @@ describe("the part fetch itself", () => {
 
     const result = await getAttachmentBytesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       payload.byteLength,
@@ -336,7 +336,7 @@ describe("the part fetch itself", () => {
     await expect(
       getAttachmentBytesOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         ATTACHMENT_REF,
         1024,
@@ -356,7 +356,7 @@ describe("the part fetch itself", () => {
     const duplex = partDuplex(base64Part(600));
     await getAttachmentBytesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       1024,
@@ -432,7 +432,7 @@ describe("the injectable literal ceiling (D-51's seam, used a second time)", () 
 
     const result = await getAttachmentBytesOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       payload.byteLength,
@@ -488,6 +488,17 @@ import {
   extractAttachmentText,
 } from "../src/mail/extract";
 import { MAX_EXTRACTED_TEXT_BYTES, transferDecode } from "../src/mail/mime";
+import type { Principal } from "../src/principal";
+import { ownerPrincipal } from "./fixtures/bound-secrets";
+
+// The owner's principal, from the real env constructor over the pool's
+// ambient environment. Resolved once, and the very same object is handed to
+// every call: the password reader answers only the object a constructor
+// built, so it is never spread and never cloned.
+let principal: Principal;
+beforeAll(async () => {
+  principal = await ownerPrincipal();
+});
 
 const UTF8 = new TextEncoder();
 
@@ -1050,7 +1061,7 @@ describe("getAttachmentContentOver: the structure walk that supplies the numbers
 
     const content = await getAttachmentContentOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       FAST_BOUNDS,
@@ -1078,7 +1089,7 @@ describe("getAttachmentContentOver: the structure walk that supplies the numbers
 
     const content = await getAttachmentContentOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       FAST_BOUNDS,
@@ -1106,7 +1117,7 @@ describe("getAttachmentContentOver: the structure walk that supplies the numbers
 
     await getAttachmentContentOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       FAST_BOUNDS,
@@ -1129,7 +1140,7 @@ describe("getAttachmentContentOver: the structure walk that supplies the numbers
 
     const content = await getAttachmentContentOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ATTACHMENT_REF,
       FAST_BOUNDS,
@@ -1160,7 +1171,7 @@ describe("getAttachmentContentOver: the structure walk that supplies the numbers
     await expect(
       getAttachmentContentOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         { ...ATTACHMENT_REF, path: "1" },
         FAST_BOUNDS,
@@ -1178,7 +1189,7 @@ describe("getAttachmentContentOver: the structure walk that supplies the numbers
     await expect(
       getAttachmentContentOver(
         duplex,
-        env,
+        principal,
         createSessionGate(),
         { ...ATTACHMENT_REF, path: "9" },
         FAST_BOUNDS,
@@ -1199,7 +1210,7 @@ describe("getAttachmentContentOver: the structure walk that supplies the numbers
     const ref = decodeAttachmentId(encodeAttachmentId(ATTACHMENT_REF));
     const content = await getAttachmentContentOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       ref,
       FAST_BOUNDS,

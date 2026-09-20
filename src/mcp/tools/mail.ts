@@ -73,6 +73,7 @@ import {
   listUnread,
   searchMessages,
 } from "../../mail/service";
+import type { Principal } from "../../principal";
 import type { ConfirmRefusal } from "../../staging/presign";
 import {
   UPLOAD_URL_TTL_SECONDS,
@@ -1511,8 +1512,23 @@ function resolveMailbox(folderId: string | undefined): string {
  * `gate` is built per request in `createServerFactory` and threaded in, rather
  * than reached for from module scope. See `createSessionGate` for why an
  * isolate-wide counter would refuse legitimate concurrent requests.
+ *
+ * `principal` is a promise of who the request acts for, made once per request
+ * at the door. Every callback awaits it as the first line of its `try`, and
+ * hands the resolved object to each mail function it calls. A refusal is
+ * already the auth error, and each `catch` already maps that to
+ * `auth_failed`, so an unset secret answers before the gate is touched and
+ * before a socket opens. The await lives HERE and nowhere below: the session
+ * orchestrator must not await ahead of its gate (see `withMailSession`).
+ *
+ * The staging helpers still take the ambient `env`. They reach R2, not mail,
+ * and hold no credential.
  */
-export function registerMailTools(server: McpServer, gate: SessionGate): void {
+export function registerMailTools(
+  server: McpServer,
+  gate: SessionGate,
+  principal: Promise<Principal>,
+): void {
   server.registerTool(
     "mail_get_message",
     {
@@ -1530,11 +1546,12 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
     },
     async ({ id, includeHtml }) => {
       try {
+        const actor = await principal;
         // Decoding first means a malformed or stale token is refused before a
         // socket is opened, which is the cheapest possible refusal and the one
         // that spends none of the connection budget.
         const ref = decodeMessageId(id);
-        const detail = await getMessage(env, gate, ref, { includeHtml });
+        const detail = await getMessage(actor, gate, ref, { includeHtml });
         return messageToolResult(detail);
       } catch (err) {
         // The same backstop shape `registerDiagnoseTool` uses: one boundary,
@@ -1556,7 +1573,8 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
     },
     async () => {
       try {
-        return folderToolResult(await listFolders(env, gate));
+        const actor = await principal;
+        return folderToolResult(await listFolders(actor, gate));
       } catch (err) {
         return mailErrorResult(err);
       }
@@ -1586,11 +1604,12 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
     },
     async ({ folderId, pageSize, cursor }) => {
       try {
+        const actor = await principal;
         // Decoded before a socket is opened, so a malformed or foreign token is
         // refused without spending any of the connection budget.
         const folder = decodeFolderId(folderId);
         return messagePageToolResult(
-          await listMessages(env, gate, folder.mailbox, { pageSize, cursor }),
+          await listMessages(actor, gate, folder.mailbox, { pageSize, cursor }),
         );
       } catch (err) {
         return mailErrorResult(err);
@@ -1650,9 +1669,10 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
     },
     async ({ folderId, keyword, sender, startDate, endDate, pageSize, cursor }) => {
       try {
+        const actor = await principal;
         return searchPageToolResult(
           await searchMessages(
-            env,
+            actor,
             gate,
             resolveMailbox(folderId),
             { keyword, sender, startDate, endDate },
@@ -1691,8 +1711,9 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
     },
     async ({ folderId, pageSize, cursor }) => {
       try {
+        const actor = await principal;
         return messagePageToolResult(
-          await listUnread(env, gate, resolveMailbox(folderId), {
+          await listUnread(actor, gate, resolveMailbox(folderId), {
             pageSize,
             cursor,
           }),
@@ -1766,6 +1787,7 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
     },
     async ({ to, cc, subject, text, html, attachmentIds, folderId }) => {
       try {
+        const actor = await principal;
         // Decoded before a socket is opened, exactly as the fetch tool decodes
         // a message id first: a malformed or stale token is refused at zero
         // connection cost.
@@ -1790,8 +1812,8 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
           attachmentIds ?? [],
           (attachments) =>
             buildDraft({
-              // Fixed, from the binding. See `draftFromAddress`.
-              from: draftFromAddress(env),
+              // Fixed, from the principal. See `draftFromAddress`.
+              from: draftFromAddress(actor),
               to,
               cc: cc ?? [],
               subject,
@@ -1808,7 +1830,7 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
               quoted: null,
               now: new Date(),
             }),
-          (message) => appendDraft(env, gate, mailbox, message),
+          (message) => appendDraft(actor, gate, mailbox, message),
           Date.now(),
         );
 
@@ -1986,19 +2008,20 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
       folderId,
     }) => {
       try {
+        const actor = await principal;
         // Both tokens decoded before a socket is opened, exactly as every other
         // tool in this module does it: a malformed, stale or foreign token is
         // refused at zero connection cost and cannot address another message.
         const ref = decodeMessageId(parentId);
         const mailbox =
           folderId === undefined ? null : decodeFolderId(folderId).mailbox;
-        const self = draftFromAddress(env);
+        const self = draftFromAddress(actor);
 
         // D-69. `fetchParentHeaders` inside this call is not an optimisation:
         // the opaque id encodes the mailbox, the validity and the UID and NOT
         // the parent's Message-ID, so the threading headers cannot be built
         // from anything the caller holds. One session, serial, peeking.
-        const parent = await getReplyParent(env, gate, ref);
+        const parent = await getReplyParent(actor, gate, ref);
 
         const recipients = replyRecipients(parent.headers, {
           self,
@@ -2036,7 +2059,7 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
               quoted,
               now: new Date(),
             }),
-          (message) => appendDraft(env, gate, mailbox, message),
+          (message) => appendDraft(actor, gate, mailbox, message),
           Date.now(),
         );
 
@@ -2172,6 +2195,7 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
     },
     async ({ id }) => {
       try {
+        const actor = await principal;
         // Decoded BEFORE the socket opens, so a malformed, foreign or expired
         // token is refused without spending any of the connection budget — the
         // same ordering `resolveMailbox` keeps for a folder token.
@@ -2182,7 +2206,7 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
         // undocumented per-account ceiling; the transfer decode and the
         // extraction are pure CPU over megabytes and race nothing. Moving
         // either inside would spend a connection on arithmetic.
-        const content = await getAttachmentContent(env, gate, ref);
+        const content = await getAttachmentContent(actor, gate, ref);
 
         if (!content.fetch.fetched) {
           // A part this server declined to ask for. A SUCCESSFUL call carrying
@@ -2373,6 +2397,7 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
     },
     async ({ source, attachmentId, base64, filename, mimeType, sizeBytes }) => {
       try {
+        const actor = await principal;
         if (source === "presigned") {
           // Unreachable through MCP — the refinement above rejects it before
           // this handler runs. Present because a narrowing that lives only in a
@@ -2442,7 +2467,7 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
         // One session, and it is CLOSED before the next line runs. Every storage
         // operation is outside it — see `stageAttachmentContent`, whose
         // signature is what makes that structural rather than remembered.
-        const content = await getAttachmentContent(env, gate, ref);
+        const content = await getAttachmentContent(actor, gate, ref);
         const outcome = await stageAttachmentContent(
           env,
           content,
@@ -2513,6 +2538,10 @@ export function registerMailTools(server: McpServer, gate: SessionGate): void {
     },
     async ({ uploadId, sizeBytes }) => {
       try {
+        // This tool opens no session, so the resolved value goes unused. The
+        // await stays so every mail tool answers a refused principal the same
+        // way, and none works for a caller the others turn away.
+        await principal;
         const nowMs = Date.now();
 
         // Decoded before anything is read, exactly as every other tool in this

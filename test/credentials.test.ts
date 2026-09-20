@@ -7,7 +7,6 @@
 // error, or spread into a response.
 
 import { describe, expect, it } from "vitest";
-import type { Env } from "../src/env";
 import { ImapAuthError } from "../src/errors";
 import * as credentials from "../src/mail/credentials";
 import {
@@ -15,26 +14,33 @@ import {
   writeAuthenticatePlainCommand,
   writeLoginCommand,
 } from "../src/mail/credentials";
+import type { Principal } from "../src/principal";
+import { principalFromProps } from "../src/principal";
 import { createFakeDuplex } from "./fixtures/fake-duplex";
 
 const ENCODER = new TextEncoder();
 const DECODER = new TextDecoder();
 
 /**
- * A binding surface carrying only what the helper reads.
+ * A principal for the two values, from the REAL props constructor.
+ *
+ * It hands back the constructor's promise and nothing else. There is no
+ * test-only way into the password store, so this is the only honest way a test
+ * gets a principal whose password can be read (D-17).
  *
  * Both parameters admit `undefined` because a Workers Secret binding does: an
  * unset, deleted, or failed-to-provision Secret arrives absent, and the
- * unprovisioned case is one this file has to be able to express.
+ * unprovisioned case is one this file has to be able to express. The
+ * constructor refuses such a value, and a value carrying a control character,
+ * with the auth error. So every refusal case awaits this INSIDE the function
+ * the refusal helper awaits: a refusal at build time is then caught the same
+ * way as one at write time, and still with zero bytes written.
  */
-function fakeEnv(
+function principalOf(
   appleId: string | undefined,
   password: string | undefined,
-): Env {
-  return {
-    APPLE_ID: appleId,
-    APPLE_APP_PASSWORD: password,
-  } as unknown as Env;
+): Promise<Principal> {
+  return principalFromProps({ v: 1, appleId, appPassword: password });
 }
 
 /** Run one helper against a recording writer and hand back what it wrote. */
@@ -109,8 +115,8 @@ describe("module shape", () => {
 
 describe("writeLoginCommand", () => {
   it("writes a tagged LOGIN with both arguments as IMAP quoted strings", async () => {
-    const { text } = await capture((writer) =>
-      writeLoginCommand(writer, "a2", fakeEnv("someone@icloud.com", "abcd-efgh")),
+    const { text } = await capture(async (writer) =>
+      writeLoginCommand(writer, "a2", await principalOf("someone@icloud.com", "abcd-efgh")),
     );
 
     expect(text).toBe('a2 LOGIN "someone@icloud.com" "abcd-efgh"\r\n');
@@ -119,20 +125,22 @@ describe("writeLoginCommand", () => {
   it("escapes an embedded quote and an embedded backslash", async () => {
     // Unescaped, either character desynchronises the server's parser and the
     // failure looks exactly like a rejected credential.
-    const { text } = await capture((writer) =>
+    const { text } = await capture(async (writer) =>
       writeLoginCommand(
         writer,
         "a2",
-        fakeEnv('who"ami', 'pa"ss\\word'),
+        await principalOf('who"ami@example.com', 'pa"ss\\word'),
       ),
     );
 
-    expect(text).toBe('a2 LOGIN "who\\"ami" "pa\\"ss\\\\word"\r\n');
+    expect(text).toBe(
+      'a2 LOGIN "who\\"ami@example.com" "pa\\"ss\\\\word"\r\n',
+    );
   });
 
   it("terminates the line with CRLF, not a bare newline", async () => {
-    const { text } = await capture((writer) =>
-      writeLoginCommand(writer, "a2", fakeEnv("a@b.c", "pw")),
+    const { text } = await capture(async (writer) =>
+      writeLoginCommand(writer, "a2", await principalOf("a@b.c", "pw")),
     );
 
     expect(text.endsWith("\r\n")).toBe(true);
@@ -140,8 +148,8 @@ describe("writeLoginCommand", () => {
   });
 
   it("returns undefined — nothing credential-bearing comes back", async () => {
-    const { returned } = await capture((writer) =>
-      writeLoginCommand(writer, "a2", fakeEnv("a@b.c", "sekrit")),
+    const { returned } = await capture(async (writer) =>
+      writeLoginCommand(writer, "a2", await principalOf("a@b.c", "sekrit")),
     );
 
     expect(returned).toBeUndefined();
@@ -153,8 +161,8 @@ describe("writeLoginCommand", () => {
     // inherit, and getting it wrong there fails silently on exactly the
     // messages a user cares about.
     const password = "pässwörd–🔑";
-    const { bytes, text } = await capture((writer) =>
-      writeLoginCommand(writer, "a2", fakeEnv("a@b.c", password)),
+    const { bytes, text } = await capture(async (writer) =>
+      writeLoginCommand(writer, "a2", await principalOf("a@b.c", password)),
     );
 
     expect(bytes.byteLength).toBe(ENCODER.encode(text).byteLength);
@@ -165,11 +173,11 @@ describe("writeLoginCommand", () => {
 
 describe("writeAuthenticatePlainCommand", () => {
   it("writes a tagged AUTHENTICATE PLAIN carrying the initial response inline", async () => {
-    const { text } = await capture((writer) =>
+    const { text } = await capture(async (writer) =>
       writeAuthenticatePlainCommand(
         writer,
         "a3",
-        fakeEnv("someone@icloud.com", "abcd-efgh"),
+        await principalOf("someone@icloud.com", "abcd-efgh"),
       ),
     );
 
@@ -180,8 +188,8 @@ describe("writeAuthenticatePlainCommand", () => {
   it("builds the blob as base64 over the NUL-delimited UTF-8 bytes", async () => {
     const appleId = "someone@icloud.com";
     const password = "abcd-efgh";
-    const { text } = await capture((writer) =>
-      writeAuthenticatePlainCommand(writer, "a3", fakeEnv(appleId, password)),
+    const { text } = await capture(async (writer) =>
+      writeAuthenticatePlainCommand(writer, "a3", await principalOf(appleId, password)),
     );
 
     const blob = text.slice("a3 AUTHENTICATE PLAIN ".length, -2);
@@ -196,10 +204,10 @@ describe("writeAuthenticatePlainCommand", () => {
     // Encoding to bytes first and base64-ing those is the only correct order.
     // Handing a JavaScript string straight to the base64 primitive is the same
     // class of bug as measuring a literal length in code units.
-    const appleId = "sömeone@icloud.com";
+    const appleId = "someone@icloud.com";
     const password = "pässwörd–🔑";
-    const { text } = await capture((writer) =>
-      writeAuthenticatePlainCommand(writer, "a3", fakeEnv(appleId, password)),
+    const { text } = await capture(async (writer) =>
+      writeAuthenticatePlainCommand(writer, "a3", await principalOf(appleId, password)),
     );
 
     const blob = text.slice("a3 AUTHENTICATE PLAIN ".length, -2);
@@ -218,8 +226,8 @@ describe("writeAuthenticatePlainCommand", () => {
 
   it("emits only base64 alphabet characters, so the credential is not readable inline", async () => {
     const password = "abcd-efgh";
-    const { text } = await capture((writer) =>
-      writeAuthenticatePlainCommand(writer, "a3", fakeEnv("a@b.c", password)),
+    const { text } = await capture(async (writer) =>
+      writeAuthenticatePlainCommand(writer, "a3", await principalOf("a@b.c", password)),
     );
 
     const blob = text.slice("a3 AUTHENTICATE PLAIN ".length, -2);
@@ -228,19 +236,19 @@ describe("writeAuthenticatePlainCommand", () => {
   });
 
   it("returns undefined — nothing credential-bearing comes back", async () => {
-    const { returned } = await capture((writer) =>
-      writeAuthenticatePlainCommand(writer, "a3", fakeEnv("a@b.c", "sekrit")),
+    const { returned } = await capture(async (writer) =>
+      writeAuthenticatePlainCommand(writer, "a3", await principalOf("a@b.c", "sekrit")),
     );
 
     expect(returned).toBeUndefined();
   });
 
   it("measures the wire in UTF-8 bytes, not JavaScript code units", async () => {
-    const { bytes, text } = await capture((writer) =>
+    const { bytes, text } = await capture(async (writer) =>
       writeAuthenticatePlainCommand(
         writer,
         "a3",
-        fakeEnv("a@b.c", "pässwörd–🔑"),
+        await principalOf("a@b.c", "pässwörd–🔑"),
       ),
     );
 
@@ -248,22 +256,28 @@ describe("writeAuthenticatePlainCommand", () => {
   });
 });
 
-/** Both write helpers, each reduced to "here is an env, write the command". */
+/** Both write helpers, each reduced to "here is a principal, write the command". */
 const HELPERS: [
   string,
-  (writer: WritableStreamDefaultWriter<Uint8Array>, env: Env) => Promise<void>,
+  (
+    writer: WritableStreamDefaultWriter<Uint8Array>,
+    principal: Principal,
+  ) => Promise<void>,
 ][] = [
-  ["writeLoginCommand", (writer, env) => writeLoginCommand(writer, "a2", env)],
+  [
+    "writeLoginCommand",
+    (writer, principal) => writeLoginCommand(writer, "a2", principal),
+  ],
   [
     "writeAuthenticatePlainCommand",
-    (writer, env) => writeAuthenticatePlainCommand(writer, "a3", env),
+    (writer, principal) => writeAuthenticatePlainCommand(writer, "a3", principal),
   ],
 ];
 
-/** Which of the two bindings carries the bad value in a given case. */
-const FIELDS: [string, (bad: string | undefined) => Env][] = [
-  ["APPLE_ID", (bad) => fakeEnv(bad, "abcd-efgh")],
-  ["APPLE_APP_PASSWORD", (bad) => fakeEnv("someone@icloud.com", bad)],
+/** Which of the two values carries the bad one in a given case. */
+const FIELDS: [string, (bad: string | undefined) => Promise<Principal>][] = [
+  ["APPLE_ID", (bad) => principalOf(bad, "abcd-efgh")],
+  ["APPLE_APP_PASSWORD", (bad) => principalOf("someone@icloud.com", bad)],
 ];
 
 /**
@@ -293,10 +307,10 @@ const UNPROVISIONED_VALUES: [string, string | undefined][] = [
 
 describe("refuses illegal credential bytes before writing anything", () => {
   for (const [helperName, invoke] of HELPERS) {
-    for (const [fieldName, buildEnv] of FIELDS) {
+    for (const [fieldName, buildPrincipal] of FIELDS) {
       for (const [label, value] of ILLEGAL_VALUES) {
         it(`${helperName}: ${fieldName} with ${label}`, async () => {
-          await expectRefusal((writer) => invoke(writer, buildEnv(value)));
+          await expectRefusal(async (writer) => invoke(writer, await buildPrincipal(value)));
         });
       }
     }
@@ -306,8 +320,8 @@ describe("refuses illegal credential bytes before writing anything", () => {
     // The distinction matters: an escape would be silently wrong, because the
     // RFC gives these characters no escaped form. Whatever a caller meant by a
     // value containing one, it is not something this module can send.
-    await expectRefusal((writer) =>
-      writeLoginCommand(writer, "a2", fakeEnv("a@b.c", 'pass\\"\r\nword')),
+    await expectRefusal(async (writer) =>
+      writeLoginCommand(writer, "a2", await principalOf("a@b.c", 'pass\\"\r\nword')),
     );
   });
 
@@ -317,14 +331,14 @@ describe("refuses illegal credential bytes before writing anything", () => {
     const duplex = createFakeDuplex([]);
     const writer = duplex.writable.getWriter();
 
-    const raised = await writeLoginCommand(
-      writer,
-      "a2",
-      fakeEnv(appleId, `${password}\n`),
-    ).then(
-      () => null,
-      (err: unknown) => err,
-    );
+    // Built inside the chain, so a refusal at build time lands in the same
+    // place as one at write time.
+    const raised = await principalOf(appleId, `${password}\n`)
+      .then((principal) => writeLoginCommand(writer, "a2", principal))
+      .then(
+        () => null,
+        (err: unknown) => err,
+      );
     writer.releaseLock();
 
     expect(raised).toBeInstanceOf(ImapAuthError);
@@ -347,18 +361,18 @@ describe("refuses an unprovisioned binding before writing anything", () => {
   // set is not something a retry fixes, and retrying in a loop is the fastest
   // way to reach iCloud's connection ceiling.
   for (const [helperName, invoke] of HELPERS) {
-    for (const [fieldName, buildEnv] of FIELDS) {
+    for (const [fieldName, buildPrincipal] of FIELDS) {
       for (const [label, value] of UNPROVISIONED_VALUES) {
         it(`${helperName}: ${fieldName} ${label}`, async () => {
-          await expectRefusal((writer) => invoke(writer, buildEnv(value)));
+          await expectRefusal(async (writer) => invoke(writer, await buildPrincipal(value)));
         });
       }
     }
   }
 
   it("refuses when both bindings are absent", async () => {
-    await expectRefusal((writer) =>
-      writeLoginCommand(writer, "a2", fakeEnv(undefined, undefined)),
+    await expectRefusal(async (writer) =>
+      writeLoginCommand(writer, "a2", await principalOf(undefined, undefined)),
     );
   });
 
@@ -368,11 +382,11 @@ describe("refuses an unprovisioned binding before writing anything", () => {
   // evidence the check is redundant — without it, this helper base64s a literal
   // placeholder username and password and sends them to iCloud.
   it("writeAuthenticatePlainCommand does not base64 a stringified absent binding", async () => {
-    await expectRefusal((writer) =>
+    await expectRefusal(async (writer) =>
       writeAuthenticatePlainCommand(
         writer,
         "a3",
-        fakeEnv(undefined, undefined),
+        await principalOf(undefined, undefined),
       ),
     );
   });
@@ -404,8 +418,8 @@ describe("a written command is exactly one line", () => {
 
   for (const [label, password] of ACCEPTED_VALUES) {
     it(`writeLoginCommand writes one terminated line: ${label}`, async () => {
-      const { bytes } = await capture((writer) =>
-        writeLoginCommand(writer, "a2", fakeEnv("someone@icloud.com", password)),
+      const { bytes } = await capture(async (writer) =>
+        writeLoginCommand(writer, "a2", await principalOf("someone@icloud.com", password)),
       );
 
       const lineFeeds = [...bytes].filter((byte) => byte === 0x0a);
@@ -417,11 +431,11 @@ describe("a written command is exactly one line", () => {
     });
 
     it(`writeAuthenticatePlainCommand writes one terminated line: ${label}`, async () => {
-      const { bytes } = await capture((writer) =>
+      const { bytes } = await capture(async (writer) =>
         writeAuthenticatePlainCommand(
           writer,
           "a3",
-          fakeEnv("someone@icloud.com", password),
+          await principalOf("someone@icloud.com", password),
         ),
       );
 
@@ -432,8 +446,8 @@ describe("a written command is exactly one line", () => {
   }
 
   it("holds when the Apple ID carries the awkward characters too", async () => {
-    const { bytes } = await capture((writer) =>
-      writeLoginCommand(writer, "a2", fakeEnv('who"a\\mi', "abcd-efgh")),
+    const { bytes } = await capture(async (writer) =>
+      writeLoginCommand(writer, "a2", await principalOf('who"a\\mi@example.com', "abcd-efgh")),
     );
 
     expect([...bytes].filter((byte) => byte === 0x0a)).toHaveLength(1);
@@ -445,12 +459,25 @@ describe("a written command is exactly one line", () => {
 // The authoring identity (DRAFT-02)
 // ---------------------------------------------------------------------------
 
+/**
+ * An object with a principal's two fields that no constructor built.
+ *
+ * It has no entry in the password store, so it can never reach a password
+ * (D-17): the password reader refuses it. It is only ever handed to
+ * `draftFromAddress`, which must not ask for one. It is also the only way to
+ * put an absent or a broken address in front of that function's own checks,
+ * because the real constructors refuse such an address before it gets there.
+ */
+function lookAlike(appleId: string | undefined): Principal {
+  return { userId: "0".repeat(64), appleId } as unknown as Principal;
+}
+
 describe("draftFromAddress", () => {
-  it("returns the Apple ID and nothing else", () => {
+  it("returns the Apple ID and nothing else", async () => {
     // A bare string, not an object holding one: there is nothing here to spread
     // into a response, attach to an error, or serialize by accident.
     const returned = draftFromAddress(
-      fakeEnv("someone@icloud.com", "abcd-efgh"),
+      await await principalOf("someone@icloud.com", "abcd-efgh"),
     );
 
     expect(returned).toBe("someone@icloud.com");
@@ -458,42 +485,59 @@ describe("draftFromAddress", () => {
   });
 
   it("never reads the app-specific password", () => {
-    // The password is absent from the binding surface entirely and the call
-    // still succeeds, which is the discriminating form: an implementation that
-    // touched it would refuse here.
-    expect(
-      draftFromAddress({ APPLE_ID: "someone@icloud.com" } as unknown as Env),
-    ).toBe("someone@icloud.com");
+    // A hand-made object with the right two fields and NO entry in the
+    // password store. The call still succeeds, which is the discriminating
+    // form: an implementation that asked for the password would be refused
+    // here, because the password reader answers only an object a constructor
+    // built.
+    expect(draftFromAddress(lookAlike("someone@icloud.com"))).toBe(
+      "someone@icloud.com",
+    );
   });
 
   for (const [label, value] of UNPROVISIONED_VALUES) {
-    it(`refuses an unprovisioned binding rather than authoring as a placeholder: ${label}`, () => {
+    it(`refuses an unprovisioned binding rather than authoring as a placeholder: ${label}`, async () => {
       // BEHAVIOURAL, not compiler-driven. The value lands in a template literal
       // one module over, and a template literal accepts an absent binding
       // silently — stringifying it to the nine characters that spell the absent
       // value. Without this check a draft goes out with a fabricated sender and
       // the typecheck says nothing.
-      expect(() =>
-        draftFromAddress(fakeEnv(value, "abcd-efgh")),
-      ).toThrow(ImapAuthError);
+      //
+      // Two layers, and both are checked. The real constructor refuses such an
+      // address, so no real principal ever carries one here. The look-alike is
+      // what reaches this function's OWN check, the second layer.
+      await expect(
+        (async () => draftFromAddress(await principalOf(value, "abcd-efgh")))(),
+      ).rejects.toBeInstanceOf(ImapAuthError);
+      expect(() => draftFromAddress(lookAlike(value))).toThrow(ImapAuthError);
     });
   }
 
-  it("does not return a string containing the placeholder spelling", () => {
+  it("does not return a string containing the placeholder spelling", async () => {
     // Stated as a containment assertion as well as a refusal, because the
     // failure this guards is not "an exception was not thrown" — it is a value
     // that looks like an address and is not one.
     let returned: string | null = null;
     try {
-      returned = draftFromAddress(fakeEnv(undefined, "abcd-efgh"));
+      returned = draftFromAddress(await principalOf(undefined, "abcd-efgh"));
     } catch {
       returned = null;
     }
 
     expect(returned).toBeNull();
+
+    // And the function's own check, reached by an object no constructor built.
+    let fromLookAlike: string | null = null;
+    try {
+      fromLookAlike = draftFromAddress(lookAlike(undefined));
+    } catch {
+      fromLookAlike = null;
+    }
+
+    expect(fromLookAlike).toBeNull();
   });
 
-  it("refuses an Apple ID carrying CR or LF rather than repairing it", () => {
+  it("refuses an Apple ID carrying CR or LF rather than repairing it", async () => {
     // The value reaches a header line. The ordinary way a secret acquires one
     // of these is mundane and is why this is not theoretical: a secret
     // provisioned from a file carries the file's trailing newline, and a
@@ -502,9 +546,10 @@ describe("draftFromAddress", () => {
       "someone@icloud.com\r\n",
       "someone@icloud.com\nBcc: attacker@evil.invalid",
     ]) {
-      expect(() => draftFromAddress(fakeEnv(bad, "abcd-efgh"))).toThrow(
-        ImapAuthError,
-      );
+      await expect(
+        (async () => draftFromAddress(await principalOf(bad, "abcd-efgh")))(),
+      ).rejects.toBeInstanceOf(ImapAuthError);
+      expect(() => draftFromAddress(lookAlike(bad))).toThrow(ImapAuthError);
     }
   });
 });

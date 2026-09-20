@@ -45,12 +45,13 @@
 // green and silent, with nothing to gate.
 
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { createSessionGate, getMessageOver } from "../src/mail/service";
 import { messageToolResult } from "../src/mcp/tools/mail";
 import {
-  type BoundMailSecrets,
   assertMailSecretsBound,
+  ownerPrincipal,
+  type BoundMailSecrets,
 } from "./fixtures/bound-secrets";
 import { createFakeDuplex } from "./fixtures/fake-duplex";
 import {
@@ -77,6 +78,16 @@ import {
   structureFetchReply,
   taggedOk,
 } from "./fixtures/icloud-bytes";
+import type { Principal } from "../src/principal";
+
+// The owner's principal, from the real env constructor over the pool's
+// ambient environment. Resolved once, and the very same object is handed to
+// every call: the password reader answers only the object a constructor
+// built, so it is never spread and never cloned.
+let principal: Principal;
+beforeAll(async () => {
+  principal = await ownerPrincipal();
+});
 
 /** Bounds a few milliseconds wide, so no case here waits out a real timeout. */
 const FAST_BOUNDS = {
@@ -139,7 +150,7 @@ describe("a multi-paragraph HTML message, driven through the real reader", () =>
     );
     const detail = await getMessageOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       refFor(HTML_UID),
       { ...FAST_BOUNDS, includeHtml },
@@ -251,7 +262,7 @@ describe("a message carrying an attachment, driven through the real reader", () 
     );
     const detail = await getMessageOver(
       duplex,
-      env,
+      principal,
       createSessionGate(),
       refFor(ATTACHMENT_UID),
       FAST_BOUNDS,
@@ -349,7 +360,7 @@ describe("neither shaped result carries a credential", () => {
 
       const detail = await getMessageOver(
         conversation(structure, message, uid),
-        env,
+        principal,
         createSessionGate(),
         refFor(uid),
         { ...FAST_BOUNDS, includeHtml: true },
