@@ -893,6 +893,44 @@ describe("the patterns have teeth", () => {
     }
   });
 
+  it("fires on a listed name that is only a word in the message, and that is a recorded choice", () => {
+    // Code review WR-02. Every line here is INNOCENT: none passes a credential.
+    // The rule fires on all of them anyway, because it reads text and not
+    // syntax. That over-match is kept on purpose, and this test is what makes
+    // it a known limit rather than a surprise. One of the names is everyday
+    // DAV vocabulary, so the first row is the one a real author will meet.
+    //
+    // If this goes red, someone narrowed the rule. The fix for an innocent hit
+    // is to reword the message or add the semicolon, never to make the rule
+    // see less. The rule's own comment and its reason text both say so.
+    const rule = FORBIDDEN.find((r) => r.id === "props-object-in-log-call")!;
+    const innocentButRefused: ReadonlyArray<readonly [string, string]> = [
+      ["a DAV word inside a string", 'console.log("principal-URL discovery failed");'],
+      ["a listed name as a plain word in a string", 'console.log("checking the props rule");'],
+      ["a listed name inside a trailing comment", 'console.log("ok", requestId) // props are not passed'],
+      [
+        "a listed name in the next statement, with no semicolon between",
+        'console.log("ok")\nconst principal = await build()',
+      ],
+    ];
+    expect(innocentButRefused.length).toBe(4);
+    for (const [shape, line] of innocentButRefused) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(fresh.test(line), `the rule no longer fires on ${shape}: it was narrowed`).toBe(true);
+    }
+
+    // Why strings are not skipped. This one IS a leak, and it sits inside a
+    // string: a template literal that interpolates the real object. A rule
+    // that ignored string contents would miss it.
+    const leakInsideAString = "console.log(`grant: ${JSON.stringify(ctx.props)}`);";
+    const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+    expect(fresh.test(leakInsideAString)).toBe(true);
+
+    // The hook prints the reason text, so it has to tell the author what to do.
+    expect(rule.why).toContain("reword the message");
+    expect(rule.why).toContain("Do not loosen this rule");
+  });
+
   it("does not fire a name rule on a logging call that names nothing, and the blanket rule still does", () => {
     // Both halves, because either alone misleads. A logging call with an empty
     // argument list names nothing, so neither name rule can see it — an empty

@@ -152,6 +152,24 @@ export const FORBIDDEN = [
   // blanket logging rule above still refuses every one of them that is a
   // logging call. Naming the gaps here is what stops a later reader believing
   // the rule proves more than it does.
+  //
+  // WHAT IT SEES BY MISTAKE, AND WHY THAT STAYS (code review WR-02). The rule
+  // reads text, not syntax, so a listed name counts wherever it sits in the
+  // span: inside a string literal, inside a comment, or in the NEXT statement
+  // when the logging call has no semicolon after it. One of the five names is
+  // also everyday DAV vocabulary. The discovery code under src/dav/ is built
+  // around the current-user resource that the DAV specs call by that same
+  // word, so a script or a test helper that logs a plain message about DAV
+  // discovery is refused, and nothing in it touches a credential.
+  //
+  // That is a recorded choice and not a bug to fix. A pattern that skipped
+  // strings would also skip a template literal that interpolates the real
+  // object, which is a leak. WHEN THIS FIRES ON AN INNOCENT LINE: reword the
+  // message so it does not hold a listed name as a whole word, or end the
+  // logging call with a semicolon. Never loosen the name list or the span.
+  // Under src/ the question does not come up, because every logging call there
+  // is refused anyway. The over-match is pinned by test rows that assert the
+  // rule DOES fire on those lines, so a later "fix" that narrows it goes red.
   {
     // No `scope`, on purpose: this one holds in every scanned directory. A
     // throwaway script or a test helper that prints the grant's props leaks the
@@ -159,7 +177,7 @@ export const FORBIDDEN = [
     id: "props-object-in-log-call",
     pattern:
       /\b(?:console|logger)\.[a-z]+\s*\([^;]{0,400}?\b(?:props|principal|authInfo|getMcpAuthContext|passwordOf)\b/g,
-    why: "A logging call whose arguments mention the grant's props, the principal, the auth info, the auth context reader or the password reader. The grant's props carry the Apple ID and the app-specific password, so a log line that passes them names no secret and leaks both -- and observability logging is enabled, so 'a log' means retained Cloudflare storage, not a terminal.",
+    why: "A logging call whose arguments mention the grant's props, the principal, the auth info, the auth context reader or the password reader. The grant's props carry the Apple ID and the app-specific password, so a log line that passes them names no secret and leaks both -- and observability logging is enabled, so 'a log' means retained Cloudflare storage, not a terminal. The rule reads text, so it also fires when one of those names is only a word inside the message string or a comment, or sits in the next statement after a logging call with no semicolon. If that is what happened, reword the message or add the semicolon. Do not loosen this rule.",
   },
 
   // ---------------------------------------------------- writes onto the env object
