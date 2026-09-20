@@ -75,48 +75,36 @@ type CachedDiscovery = Pick<
 export const DISCOVERY_TTL_SECONDS = 86400;
 
 /**
- * The key namespace, versioned.
+ * The key namespace, versioned, separator included.
  *
  * The `v1` buys the same hedge `TOKEN_VERSION` buys in `src/mail/ids.ts`: a
  * future change to the stored shape becomes detectable rather than silently
  * misread as the current one.
+ *
+ * **The trailing colon is part of the value, and that is a decision (D-20).**
+ * The key expression below interpolates the user id straight after this
+ * constant, with nothing at all between them. Written the other way — a bare
+ * `dav:v1` here and the colon in the expression — the key comes out
+ * byte-identical, so nothing about the stored shape turns on which spelling is
+ * used. What turns on it is the ISO-06 scan rule, which reads a key prefix
+ * constant followed by anything other than a user id as a key with no user in
+ * it. Moving the colon back out would fire that rule on a correct key.
  */
-const DAV_CACHE_KEY_PREFIX = "dav:v1";
-
-const ENCODER = new TextEncoder();
-
-function hex(buffer: ArrayBuffer): string {
-  return Array.from(new Uint8Array(buffer))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-}
+const DAV_CACHE_KEY_PREFIX = "dav:v1:";
 
 /**
- * The Apple ID this request acts for, off the signed-in principal.
+ * The KV key for one `{user, service}` pair (DAV-03).
  *
- * The address is returned exactly as the principal carries it, with no trim and
- * no case change, because the key below hashes it as given.
- *
- * Until Phase 9 this function read the two mail secrets and refused when either
- * was absent. That check is not gone, it moved: a principal cannot be built
- * without both, so by the time one exists both are known good. The rest of that
- * argument now sits on `davCacheKey` below, where the identity it is about is
- * actually used (code review IN-02).
- */
-function requireAppleId(principal: Principal): string {
-  return principal.appleId;
-}
-
-/**
- * The KV key for one `{appleId, service}` pair (DAV-03).
- *
- * `dav:v1:<sha256hex(appleId)>:<service>`. The Apple ID is hashed, and the
- * reason is NOT secrecy — KV is not world-readable, and anything that can read
- * this namespace can already read its values. It is that a key NAME is exactly
- * the sort of value that ends up somewhere nobody audited: a metrics label, an
- * error string, a `wrangler kv key list` transcript pasted into a conversation.
- * ./.claude/CLAUDE.md §4's discipline is that the Apple ID does not travel, and a
- * hash travels harmlessly.
+ * `dav:v1:<user id>:<service>`. The user id is the 64-hex value `userIdOf`
+ * produces, taken off the signed-in principal — **nothing in this module hashes
+ * anything** (D-14). What the key carries is therefore a digest of the address
+ * and never the address, and the reason for that is NOT secrecy — KV is not
+ * world-readable, and anything that can read this namespace can already read
+ * its values. It is that a key NAME is exactly the sort of value that ends up
+ * somewhere nobody audited: a metrics label, an error string, a `wrangler kv
+ * key list` transcript pasted into a conversation. ./.claude/CLAUDE.md §4's
+ * discipline is that the Apple ID does not travel, and a digest travels
+ * harmlessly.
  *
  * **Two keys, one per service — not one object holding both.** D-61 deletes
  * both entries on `refresh: true` regardless, so the "atomic pair" argument for
@@ -128,9 +116,15 @@ function requireAppleId(principal: Principal): string {
  * The cache key and the DAV login moved to the principal together, in one plan,
  * and that is why. A key read from one identity and a login from another would
  * let the home-set check compare a caller's target against somebody else's
- * home. The hash is over the Apple ID exactly as the principal carries it, so
- * the owner's key did not move when this changed. Nothing in this module
- * retains the address.
+ * home. They are now literally the same value rather than two hashes of one
+ * input: the id comes off the principal, produced by `userIdOf` in
+ * `src/principal.ts`, which is the one function in this repository that turns
+ * an address into a user id. Nothing in this module retains the address.
+ *
+ * The owner's stored key did not move when this changed. `userIdOf` hashes the
+ * trimmed, lowercased address and the site deleted here hashed the address as
+ * the principal carried it, and for an address that is already trimmed and
+ * lowercase those are the same bytes.
  *
  * **An unset secret answers before any request is built.** It shows up as a
  * promise of the principal that rejects. Each DAV tool callback awaits that
@@ -138,9 +132,12 @@ function requireAppleId(principal: Principal): string {
  * top of every request, so `auth_failed` arrives ahead of the network on both
  * paths — the cache-hit path, where no request is ever built, included.
  */
-async function davCacheKey(appleId: string, service: DavService): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", ENCODER.encode(appleId));
-  return `${DAV_CACHE_KEY_PREFIX}:${hex(digest)}:${service}`;
+// `async` with nothing to await, ON PURPOSE (D-19). There is no digest left in
+// here, so the Promise is vestigial — and dropping it would take three `await`
+// sites with it, on a call graph this phase is already changing, for a purely
+// cosmetic gain. Do not tidy it away.
+async function davCacheKey(userId: string, service: DavService): Promise<string> {
+  return `${DAV_CACHE_KEY_PREFIX}${userId}:${service}`;
 }
 
 /**
@@ -249,7 +246,7 @@ export async function resolveDavAccount(
   davFetch: DavFetch,
   service: DavService,
 ): Promise<ResolvedDavAccount> {
-  const key = await davCacheKey(requireAppleId(principal), service);
+  const key = await davCacheKey(principal.userId, service);
 
   const cached = await env.DAV_CACHE.get<CachedDiscovery>(key, "json");
   if (
@@ -302,13 +299,12 @@ export async function clearDavCache(
   principal: Principal,
   service?: DavService,
 ): Promise<void> {
-  const appleId = requireAppleId(principal);
   const services = service ? [service] : DAV_SERVICES;
   // Sequential. Every KV operation counts against the same per-invocation
   // budget as an outbound request (./.claude/CLAUDE.md §3), and two deletes are
   // not worth a combinator.
   for (const one of services) {
-    await env.DAV_CACHE.delete(await davCacheKey(appleId, one));
+    await env.DAV_CACHE.delete(await davCacheKey(principal.userId, one));
   }
 }
 

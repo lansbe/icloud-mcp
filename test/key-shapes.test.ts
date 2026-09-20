@@ -7,14 +7,22 @@
 // open. A key shape that moved without a pin moving would be a change nobody
 // decided.
 //
-// **Three of the four have moved. One has not yet.**
+// **Three of the four have moved. The fourth did not, and could not.**
 //
 // | Pin | State |
 // |-----|-------|
 // | R2, binding side | moved — a user segment sits between the prefix and the name |
 // | R2, presigned ingress | moved — the same segment, same place |
 // | `CONFIRM_KV` | moved — the version went to 2 and the user id sits between the prefix and the jti |
-// | `DAV_CACHE` | not yet. It holds a hash of the Apple ID, and the cache-key change takes that hash from the signed-in user instead |
+// | `DAV_CACHE` | unmoved, by design. The key already held a hash of the Apple ID; the change takes that value off the signed-in principal instead of hashing for itself, and the bytes are the same |
+//
+// The `DAV_CACHE` row is the odd one and it is worth being clear about why an
+// unmoved pin is the right outcome there. A pin goes red when a shape changes.
+// This change was made specifically so the shape would NOT change — the
+// deployed cache holds live entries under those keys, and a key that moved
+// would cost the owner a cold cache nobody had predicted. So the evidence the
+// pin gives is the evidence that was wanted: it passed before the change and it
+// passes after, byte for byte.
 //
 // The two R2 pins gained `/[0-9a-f]{64}/` in the pattern and went from two
 // asserted segments to three. Neither reads the user id back out of the value
@@ -44,11 +52,14 @@
 //
 // **The DAV pin also checks the user id vectors against production code, with
 // no hashing in the test (D-12).** It compares the key the production code
-// writes against the literal user id from the vectors file. That works because
-// an address that is already trimmed and lowercase hashes today to exactly the
-// ISO-05 user id. Today `src/dav/discovery.ts` hashes the raw Apple ID, not a
-// normalised one, so this holds only for an address that needs no
-// normalising. Both test users have one.
+// writes against the literal user id from the vectors file. That comparison now
+// holds for ANY address, and the caveat that used to sit here is gone.
+// `src/dav/discovery.ts` no longer hashes anything: it takes the id off the
+// signed-in principal, and that id is `userIdOf`'s output — the one function in
+// the repository that turns an address into a user id (D-14). So the pin is
+// comparing the vectors file against the very rule the vectors file specifies,
+// rather than against a second hash that happened to agree for an address
+// needing no normalising.
 //
 // The recording store is used for the two KV pins ONLY, because the real
 // binding cannot show which key a call wrote first. The cross-user tests use
