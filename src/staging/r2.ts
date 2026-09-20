@@ -469,8 +469,26 @@ export function stagingKeyFor(
  * It is deliberately NOT "any depth beneath the user segment". Nothing this
  * project builds produces a deeper key, so the only producer of one is a
  * forgery.
+ *
+ * **Exported, and the export is the point.** Four call sites depend on this
+ * rule: the read, head and delete paths here, `stagingKeyFor`'s own
+ * post-condition, and the write grant in `./presign.ts`. The grant used to
+ * restate all seven conditions by hand, sharing only `USER_SEGMENT` while its
+ * docstring claimed the two could not drift — true of the constant, false of
+ * the logic. One rule now governs every one of them, so a drift of one
+ * condition is not detected, it is unwriteable. That is the same argument
+ * `stagingKeyFor` makes three hundred lines up, applied to the one caller that
+ * had ignored it.
+ *
+ * The two answers a caller can want are NOT unified, and that difference is
+ * deliberate. This returns, because the read paths have a "there is nothing
+ * there" answer that says exactly the right thing. The grant throws, because
+ * there is no capability to hand back and a silent failure there would be
+ * indistinguishable from success — and because a returned `false` on a
+ * grant path is an existence oracle. Keep the refusal at the call site; the
+ * RULE is what is shared.
  */
-function underStagingPrefix(userId: string, key: string): boolean {
+export function underStagingPrefix(userId: string, key: string): boolean {
   if (typeof key !== "string") return false;
   if (!key.startsWith(STAGING_PREFIX)) return false;
 

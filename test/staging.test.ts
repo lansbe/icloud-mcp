@@ -63,6 +63,7 @@ import {
   putStaged,
   sanitiseFilename,
   stagingKeyFor,
+  underStagingPrefix,
 } from "../src/staging/r2";
 import { createFakeDuplex } from "./fixtures/fake-duplex";
 import {
@@ -1921,6 +1922,61 @@ async function mintOne(over: Partial<Parameters<typeof mintUploadUrl>[2]> = {}) 
     ...over,
   });
 }
+
+describe("the write grant and the read path answer one adversarial key table", () => {
+  // WR-04. These two used to be copies. `assertGrantableKey` in presign.ts
+  // restated all seven of `underStagingPrefix`'s conditions by hand, sharing
+  // only the shape constant, while its docstring claimed the two could not
+  // drift — true of the constant, false of the logic. They agreed, but nothing
+  // held them together, and a one-condition drift would have opened the write
+  // grant or the read path without opening the other with every test green.
+  //
+  // The grant now calls the read side's predicate, so there is no second copy
+  // left to drift. This table is what catches somebody putting one back: every
+  // row is asserted against BOTH the exported predicate and the public mint,
+  // so a re-inlined copy that differs by one condition goes red here rather
+  // than in production. The refusals stay different on purpose — the read side
+  // returns false, the grant throws, because a returned false on a grant path
+  // is an existence oracle — so the table asserts the ANSWER and not the shape
+  // of the answer.
+  const OTHER_USER = "f".repeat(64);
+
+  // The rows are built from the id rather than closed over it: `principal` is
+  // assigned in a `beforeAll`, so a table evaluated while the suite is being
+  // collected reads `undefined`.
+  const refused: ReadonlyArray<readonly [string, (u: string) => string]> = [
+    ["no user segment at all — the shape staged before Phase 10", () => `${STAGING_PREFIX}upload-a1b2c3d4e5f60718-${NOW}`],
+    ["another person's segment, forged", () => `${STAGING_PREFIX}${OTHER_USER}/upload-a1b2c3d4e5f60718-${NOW}`],
+    ["deeper than anything this project builds", (u) => `${STAGING_PREFIX}${u}/sub/upload-1`],
+    ["a leading separator, so the segment is empty", () => `${STAGING_PREFIX}/upload-1`],
+    ["a trailing separator, so the name is empty", (u) => `${STAGING_PREFIX}${u}/`],
+    ["a segment that is not 64 hex", () => `${STAGING_PREFIX}abc/upload-1`],
+    ["the right id in the wrong case", (u) => `${STAGING_PREFIX}${u.toUpperCase()}/upload-1`],
+    ["a dot-dot in the name segment", (u) => `${STAGING_PREFIX}${u}/a..b`],
+    ["outside the staging prefix entirely", (u) => `other/${u}/upload-1`],
+    ["empty", () => ""],
+  ];
+
+  for (const [why, build] of refused) {
+    it(`refuses on both sides: ${why}`, async () => {
+      const key = build(principal.userId);
+
+      expect(underStagingPrefix(principal.userId, key), "the read side admitted it").toBe(
+        false,
+      );
+      await expect(mintOne({ key }), "the write grant admitted it").rejects.toBeInstanceOf(
+        ImapNotFoundError,
+      );
+    });
+  }
+
+  it("admits on both sides: the key this project actually builds", async () => {
+    const key = `${STAGING_PREFIX}${principal.userId}/upload-a1b2c3d4e5f60718-${NOW}`;
+
+    expect(underStagingPrefix(principal.userId, key)).toBe(true);
+    await expect(mintOne({ key })).resolves.toBeTypeOf("string");
+  });
+});
 
 describe("the minted upload URL", () => {
   it("signs BOTH the declared type and the declared length", async () => {

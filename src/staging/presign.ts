@@ -29,9 +29,9 @@ import type { StageResult } from "./r2";
 import {
   MAX_STAGED_FILE_BYTES,
   STAGING_PREFIX,
-  USER_SEGMENT,
   deleteStaged,
   headStaged,
+  underStagingPrefix,
 } from "./r2";
 
 /**
@@ -199,34 +199,38 @@ function assertNoIllegalCharacters(value: string): void {
  * of the value it was handed would be comparing a caller's choice against
  * itself.
  *
- * The rule is the same one the read side applies, condition for condition, and
- * the shape constant is imported rather than copied so the two cannot drift.
- * Only the refusal differs, for the reason three paragraphs up.
+ * **The rule is not restated here, it is CALLED.** This function used to
+ * hand-copy all seven of the read side's conditions, importing only the shape
+ * constant, and its docstring said "the shape constant is imported rather than
+ * copied so the two cannot drift". That was true of the constant and false of
+ * the logic, which is the worse half: a reader took the sentence to cover both,
+ * and a one-condition drift would have opened the write grant or the read path
+ * without opening the other, with no test in the repository able to see it.
+ * `stagingKeyFor` had already made this exact argument for its own
+ * post-condition — "the failure mode a second copy produces the moment the two
+ * copies drift by one condition" — three hundred lines from the copy. One rule
+ * now governs all four call sites and the docstring's claim is true rather than
+ * asserted.
+ *
+ * **Only the refusal stays here, and it stays here on purpose.** The read side
+ * returns a boolean because "there is nothing there" is both true and the right
+ * answer for it; this guards the construction of a capability, where a returned
+ * `false` is an existence oracle and silence is indistinguishable from success.
+ * Sharing the rule is not the same as sharing the answer. Do not collapse the
+ * two by making the shared predicate throw.
+ *
+ * The dot-dot condition that used to sit at the bottom of this function came
+ * with it and left its reasoning behind: it can never fire, because the line
+ * above already required 64 characters of lowercase hex. The read side carries
+ * the same line WITH four lines of comment saying the redundancy is deliberate.
+ * The copy read as a live check a reader would either trust or delete. It is
+ * now stated once, in the one place that explains it.
  */
 function assertGrantableKey(
   userId: string,
   key: string,
 ): asserts key is string {
-  if (typeof key !== "string" || !key.startsWith(STAGING_PREFIX)) {
-    throw new ImapNotFoundError();
-  }
-
-  const rest = key.slice(STAGING_PREFIX.length);
-  const slash = rest.indexOf("/");
-  // No user segment, or a second separator: too shallow, or deeper than
-  // anything this project builds.
-  if (slash <= 0 || rest.indexOf("/", slash + 1) !== -1) {
-    throw new ImapNotFoundError();
-  }
-
-  const segment = rest.slice(0, slash);
-  const named = rest.slice(slash + 1);
-  if (!USER_SEGMENT.test(segment) || segment !== userId) {
-    throw new ImapNotFoundError();
-  }
-  if (named.length === 0 || segment.includes("..") || named.includes("..")) {
-    throw new ImapNotFoundError();
-  }
+  if (!underStagingPrefix(userId, key)) throw new ImapNotFoundError();
 }
 
 /**
