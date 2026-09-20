@@ -9,6 +9,7 @@ import type { McpServerFactory } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
 import { createDavFetch } from "../dav/transport";
 import { createSessionGate } from "../mail/service";
+import type { Principal } from "../principal";
 import { registerCalendarTools } from "./tools/calendar";
 import { registerContactsTools } from "./tools/contacts";
 import { registerDavDiagnoseTool } from "./tools/dav-diagnose";
@@ -28,8 +29,16 @@ import { registerMailTools } from "./tools/mail";
  * this parameter, from a test-only Worker entry, against this same real
  * factory. 01-02-SUMMARY.md records why that test's own name is kept out of
  * this file entirely.
+ *
+ * `principal` is a PROMISE of who this request acts for, and it comes first
+ * because every caller must supply it. The API handler makes it and hands it in
+ * by closure, so this file never reads the grant's props. The body below stays
+ * synchronous and never awaits it: a rejection here would become a 500 with no
+ * challenge. Each tool callback awaits it instead, as the first line of its own
+ * `try`, where its own `catch` turns a refusal into `auth_failed`.
  */
 export function createServerFactory(
+  principal: Promise<Principal>,
   extraTools: Array<(server: McpServer) => void> = [],
 ): McpServerFactory {
   return () => {
@@ -50,7 +59,9 @@ export function createServerFactory(
     // at module scope.
     const gate = createSessionGate();
     const davFetch = createDavFetch(env);
-    registerDiagnoseTool(server);
+    // The mail diagnostic is the first tool to act for the principal. The other
+    // registrars get the same promise as the mail chain and the DAV chain land.
+    registerDiagnoseTool(server, principal);
     registerMailTools(server, gate);
     registerDavDiagnoseTool(server, davFetch);
     // The same `davFetch` the diagnostic takes, deliberately: one queue per

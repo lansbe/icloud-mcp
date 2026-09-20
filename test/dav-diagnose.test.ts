@@ -28,6 +28,7 @@ import {
 import {
   type BoundMailSecrets,
   assertMailSecretsBound,
+  ownerPrincipal,
 } from "./fixtures/bound-secrets";
 
 // ---------------------------------------------------------------------------
@@ -415,7 +416,7 @@ describe("dav_diagnose, end to end", () => {
     // The wiring half: `createServerFactory` builds a DAV fetch and registers
     // this tool per request, beside the session gate. If that edit regressed,
     // this throws rather than silently shipping a server with no DAV surface.
-    const factory = createServerFactory();
+    const factory = createServerFactory(ownerPrincipal());
     expect(() => factory({ era: "modern" })).not.toThrow();
   });
 });

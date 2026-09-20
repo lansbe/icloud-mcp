@@ -18,7 +18,27 @@
 // nor reports any of them: the thrown message names the BINDING, never its
 // contents.
 
+import { env as ambientEnv } from "cloudflare:workers";
 import type { Env } from "../../src/env";
+import type { Principal } from "../../src/principal";
+import { principalFromEnv } from "../../src/principal";
+
+/**
+ * The owner's principal, for a test that acts as the pool's ambient identity.
+ *
+ * It returns the promise from the REAL env constructor, given the pool's
+ * ambient environment, and nothing else. There is no test-only way into the
+ * password store and no hand-built principal (D-17). Pass the promise on as it
+ * is, or await it. Never spread or clone what it resolves to: the password
+ * reader answers only the very object the constructor built (D-16).
+ *
+ * The same three rules as the rest of this file: it stores nothing, prints
+ * nothing and reports nothing. No test may read, print or assert on a value it
+ * carries, because a local override file may hold a live one there.
+ */
+export function ownerPrincipal(): Promise<Principal> {
+  return principalFromEnv(ambientEnv as Env);
+}
 
 /** An `Env` whose two mail secrets are known present. */
 export type BoundMailSecrets = Env & {

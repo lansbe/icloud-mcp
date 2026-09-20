@@ -14,9 +14,10 @@
 //    never holds the address. And the length cap counts UTF-16 code units, not
 //    bytes: the rows pin 254 and 255 with ASCII only, where the two units
 //    agree, so one case here uses a two-byte character to tell them apart.
-// 3. Nothing under `src/` imports the principal module yet. Phase 8 is
-//    groundwork, and "nothing that ships today calls it" is how the phase
-//    shows it changed no behaviour.
+// 3. (Retired in Phase 9.) This used to show that nothing under `src/` imports
+//    the principal module. The door in `src/mcp/api-handler.ts` is now the
+//    first importer, so that test is gone (Phase 9 D-03). Who may read a
+//    password and who may read the grant's props are count rules in the scan.
 // 4. The password does not travel with the principal. A built principal is a
 //    frozen object with two fields, and neither is a secret. Turning it into
 //    JSON, spreading it, cloning it or turning it into a string gives no
@@ -39,20 +40,12 @@
 // every comparison is between a result of the one function and a literal from
 // the vectors file, or between two results of the one function.
 //
-// The no-importer test reads source text. It sees a `from` clause, a dynamic
-// import and a bare side-effect import whose quoted path ends in the module's
-// name. It cannot see a path built at runtime, and it does not look outside
-// `src/`. Tests may import the module. That is how it gets tested.
-//
-// **What would make it pass for the wrong reason.** Three things. A filter
+// **What would make it pass for the wrong reason.** Two things. A filter
 // that matched no rows, so a walk ran zero cases and reported green: the first
 // test asserts a floor on both groups before anything walks them. A missing
 // `await`: the function returns a Promise, so a call that is not awaited
 // compares a Promise with a string, and a not-equal check then passes for
-// ever. Every call below is awaited inside an async body. And a source glob
-// that loaded nothing, so "no file imports it" was true of an empty set: the
-// glob's size and two named members are asserted before the offender list,
-// and the matcher is shown to match a real import line.
+// ever. Every call below is awaited inside an async body.
 //
 // Four more for the holder and the constructors. A props constructor that
 // refused everything would pass the whole bad-props table: the good shape is
@@ -66,12 +59,6 @@
 //
 // Refusals are checked by error TYPE and by category. The one message compared
 // is the fixed label, and only to show that nothing was added to it.
-//
-// **The no-importer test goes red on purpose in Phase 9.** Phase 9 adds the
-// first real importer. When it does, this test fails, and that is the signal
-// it was built to give. Phase 9 replaces it with a count rule in the scan,
-// which says exactly which files may import the module. Do not loosen the
-// matcher to get past it.
 //
 // Nothing here opens a network connection and nothing authenticates against a
 // real Apple ID. Every address sits under `example.invalid`.
@@ -98,58 +85,6 @@ const HEX_ROWS = USER_ID_VECTORS.filter((row) => row.expected !== REFUSED);
 
 /** The rows the spec turns away. */
 const REFUSED_ROWS = USER_ID_VECTORS.filter((row) => row.expected === REFUSED);
-
-/** The directory the no-importer test owns. Every key in `SOURCES` begins with it. */
-const SRC_DIR = "src/";
-
-/** The module nobody may import yet. It is the one file the test skips. */
-const PRINCIPAL = "src/principal.ts";
-
-// This project carries no Node type package and a Workers isolate has no
-// filesystem, so the sources are read with Vite's build-time glob, as
-// `test/dav-home-containment.test.ts` does. The one suppression is proven
-// non-vacuous by `tsc` itself, which errors on one that suppresses nothing.
-// @ts-expect-error — Vite's `import.meta.glob` has no ambient declaration here; see above.
-const GLOBBED: Record<string, string> = import.meta.glob("../src/**/*.ts", {
-  query: "?raw",
-  import: "default",
-  eager: true,
-});
-
-/**
- * A glob key as a repository-relative path.
- *
- * Sliced from `src/` rather than stripped of a leading `../`, because the exact
- * prefix of a glob key belongs to the bundler. A key that does not contain the
- * directory at all is returned unchanged, and the non-vacuity test then reports
- * it rather than this function hiding it behind a silent rename.
- */
-function repoPathOf(globKey: string): string {
-  const index = globKey.indexOf(SRC_DIR);
-  return index === -1 ? globKey : globKey.slice(index);
-}
-
-/** The whole source tree as text, typed on the way in so nothing is `any`. */
-const SOURCES: Record<string, string> = Object.fromEntries(
-  Object.entries(GLOBBED).map(([key, text]) => [repoPathOf(key), text]),
-);
-
-/**
- * Matches an import of the principal module, and never the bare word.
- *
- * The word `from` or the word `import`, optional white space, an optional
- * opening parenthesis, a quote, any path text, then a slash, the module's name
- * and the closing quote. That covers a `from` clause (a type-only one
- * included), a dynamic import and a bare side-effect import. A file extension
- * before the closing quote is allowed for, so spelling the path with one is not
- * a way past.
- *
- * It must match the import specifier and not the word: several files under
- * `src/` already hold that word inside DAV names, and none of them imports
- * this module.
- */
-const IMPORTS_THE_PRINCIPAL =
-  /\b(?:from|import)\s*\(?\s*["'][^"'\n]*\/principal(?:\.[cm]?[jt]s)?["']/;
 
 /**
  * A minimal environment carrying only the two account bindings.
@@ -483,75 +418,6 @@ describe("the length cap counts UTF-16 code units, not bytes", () => {
     expect(padded.length, "the padded input must be 255 code units").toBe(255);
     expect(padded.trim(), "the input must trim to the clean address").toBe(ADDRESS);
     expect(await userIdOf(padded)).toBeNull();
-  });
-});
-
-describe("nothing that ships today imports the principal module", () => {
-  it("loaded the whole src/ tree as text", () => {
-    // Non-vacuity before anything else. A glob that matched nothing, a glob
-    // that did not recurse, and a raw import that came back empty would each
-    // leave the offender list below empty for the wrong reason.
-    expect(
-      Object.keys(SOURCES).length,
-      "the src/ glob loaded too few files: it matched nothing, or it did not recurse into the subdirectories",
-    ).toBeGreaterThan(30);
-
-    for (const [file, source] of Object.entries(SOURCES)) {
-      expect(
-        file.startsWith(SRC_DIR) && file.endsWith(".ts"),
-        `${file} is not a src/ TypeScript path`,
-      ).toBe(true);
-      expect(typeof source, `${file} did not load as text`).toBe("string");
-      expect(source.length, `${file} loaded empty`).toBeGreaterThan(0);
-    }
-
-    // One file at the root and proof the module itself was read. The second
-    // also shows the skip below is skipping something real.
-    expect(Object.keys(SOURCES), "the glob missed the module itself").toContain(
-      PRINCIPAL,
-    );
-    expect(Object.keys(SOURCES), "the glob missed the root of src/").toContain(
-      "src/index.ts",
-    );
-    // And one file two directories down, so a glob that stopped at the first
-    // level cannot pass for a recursive one.
-    expect(
-      Object.keys(SOURCES).some((file) => file.startsWith("src/mcp/tools/")),
-      "the glob did not reach src/mcp/tools/",
-    ).toBe(true);
-  });
-
-  it("matches an import of the module, in each of its three forms", () => {
-    // The matcher's own control. If it cannot match these, an empty offender
-    // list below means nothing.
-    const fromClause = 'import { userIdOf } from "./principal";';
-    const typeOnly = "import type { Principal } from '../principal';";
-    const dynamic = 'const loaded = await import("../principal");';
-    const sideEffect = 'import "./principal";';
-    for (const line of [fromClause, typeOnly, dynamic, sideEffect]) {
-      expect(IMPORTS_THE_PRINCIPAL.test(line), `did not match: ${line}`).toBe(true);
-    }
-  });
-
-  it("does not match the bare word inside a DAV name", () => {
-    expect(IMPORTS_THE_PRINCIPAL.test("principalUrl")).toBe(false);
-    expect(
-      IMPORTS_THE_PRINCIPAL.test('import { principalUrl } from "./discovery";'),
-    ).toBe(false);
-    expect(IMPORTS_THE_PRINCIPAL.test('from "./principal-url"')).toBe(false);
-  });
-
-  it("finds no file under src/ that imports it", () => {
-    const importers = Object.entries(SOURCES)
-      .filter(([file]) => file !== PRINCIPAL)
-      .filter(([, source]) => IMPORTS_THE_PRINCIPAL.test(source))
-      .map(([file]) => file)
-      .sort();
-
-    expect(
-      importers,
-      "a file under src/ imports the principal module. Phase 8 lands it with no caller. If this is Phase 9 adding the first one, replace this test with the count rule in the scan.",
-    ).toEqual([]);
   });
 });
 

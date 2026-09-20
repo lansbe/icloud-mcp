@@ -19,11 +19,13 @@
 
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import type { McpServer } from "@modelcontextprotocol/server";
-import { createMcpHandler } from "agents/mcp/server";
 import { oauthProviderOptions } from "../../src/auth/oauth";
 import type { Env } from "../../src/env";
-import { DEPLOYED_HOSTNAME } from "../../src/mcp/api-handler";
-import { createServerFactory } from "../../src/mcp/server";
+import {
+  buildRequestHandler,
+  createMcpApiHandler,
+} from "../../src/mcp/api-handler";
+import { principalFromEnv } from "../../src/principal";
 
 /** The name the ordering test calls. Deliberately not a production tool. */
 export const CANARY_TOOL_NAME = "canary";
@@ -34,7 +36,8 @@ let invoked = false;
 /**
  * Registers the recording tool into a server built by the real factory.
  *
- * Passed to `createServerFactory` exactly as production passes nothing.
+ * Handed to the API handler's builders, which pass it on to
+ * `createServerFactory`, exactly as production passes nothing.
  */
 export function registerCanary(server: McpServer): void {
   server.registerTool(
@@ -47,30 +50,14 @@ export function registerCanary(server: McpServer): void {
   );
 }
 
-// Same handler options as production, so the composition under test is the one
-// that ships rather than a convenient simplification of it.
-const handler = createMcpHandler(createServerFactory([registerCanary]), {
-  route: "/mcp",
-  allowedHostnames: [DEPLOYED_HOSTNAME],
-  // Mirrors production deliberately, and must move whenever production's does.
-  // This option selects which serving lane answers a request, so a stale value
-  // here does not merely diverge — it narrows the ordering proof to the lane
-  // Claude Desktop does NOT use, leaving the lane it does use as the single
-  // lane whose gate is unproven. The reasoning for the value itself lives at
-  // the production call site; do not duplicate it here, where it would drift.
-  legacy: "stateless",
-});
-
-// The same explicit adapter production uses. Assigning the handler directly
-// would drop the ExecutionContext, which is a different bug from the one this
-// fixture exists to catch — but it would change the composition under test.
+// The same API handler production uses, door included, with the recording tool
+// registered beside the real ones. It is built by production's own function
+// from production's own options, so the composition under test is the one that
+// ships rather than a convenient copy of it, and there is no option here to
+// drift out of step.
 const provider = new OAuthProvider<Env>({
   ...oauthProviderOptions,
-  apiHandler: {
-    fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-      return handler(request, env, ctx);
-    },
-  },
+  apiHandler: createMcpApiHandler([registerCanary]),
 });
 
 /** The observation routes. Kept off any production path by living here. */
@@ -78,7 +65,10 @@ const CANARY_ROUTE = "/__canary";
 const CANARY_RESET_ROUTE = "/__canary/reset";
 
 /**
- * Reaches the MCP handler with the gate deliberately stepped around.
+ * Reaches the MCP handler with the gate AND the door deliberately stepped
+ * around. The door serves only the owner's grant, and a bare test context
+ * carries no grant at all, so a request sent through the door would get a 401
+ * and the control below could never fire.
  *
  * This is the positive control, and without it the whole file proves nothing: a
  * canary that can never fire reports "never invoked" whatever the gate does, so
@@ -105,7 +95,16 @@ export default {
     if (pathname === CANARY_DISPATCH_ROUTE) {
       const url = new URL(request.url);
       url.pathname = "/mcp";
-      return handler(new Request(url, request), env, ctx);
+      // The per-request handler production builds, from production's options,
+      // given the owner's principal the way the door would give it. The no-op
+      // handler is the door's too: the recording tool never awaits the promise.
+      const principal = principalFromEnv(env);
+      principal.catch(() => {});
+      return buildRequestHandler(principal, [registerCanary])(
+        new Request(url, request),
+        env,
+        ctx,
+      );
     }
 
     return provider.fetch(request, env, ctx);

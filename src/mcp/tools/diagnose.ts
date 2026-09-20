@@ -15,6 +15,7 @@ import {
 } from "../../errors";
 import type { DiagnosticOutcome } from "../../mail/diagnose";
 import { runDiagnosticOutcome } from "../../mail/diagnose";
+import type { Principal } from "../../principal";
 
 /**
  * The MCP content result this tool produces, success or failure.
@@ -120,8 +121,16 @@ export function diagnosticResult(outcome: DiagnosticOutcome): ToolResult {
  * This is a permanent health check, not phase scaffolding (D-08). When a mail
  * tool fails in a later phase, "is it iCloud, my credentials, or our code?"
  * is answerable in one call with no deploy and no log dive.
+ *
+ * `principal` is a promise of who the request acts for. The callback awaits it
+ * as the first line of its `try` (D-27). A refusal is already the auth error,
+ * and the `catch` below already maps that to `auth_failed`, so an unset secret
+ * reads the same as it always has.
  */
-export function registerDiagnoseTool(server: McpServer): void {
+export function registerDiagnoseTool(
+  server: McpServer,
+  principal: Promise<Principal>,
+): void {
   server.registerTool(
     "mail_imap_diagnose",
     {
@@ -131,6 +140,7 @@ export function registerDiagnoseTool(server: McpServer): void {
     },
     async () => {
       try {
+        await principal;
         return diagnosticResult(await runDiagnosticOutcome(env));
       } catch (err) {
         // A backstop for anything the diagnostic did not already fold into an

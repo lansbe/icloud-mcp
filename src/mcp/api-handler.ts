@@ -1,9 +1,13 @@
-// MCP protocol termination, and the adapter that gets the request there with
-// its ExecutionContext intact.
+// MCP protocol termination, the adapter that gets the request there with its
+// ExecutionContext intact, and the door in front of both: only the owner's
+// grant is served, and every other grant gets a real 401.
 
+import type { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import type { Env } from "../env";
 import { DEPLOYED_HOSTNAME } from "../deployed-hostname.generated";
+import type { Principal } from "../principal";
+import { principalFromEnv } from "../principal";
 import { createServerFactory } from "./server";
 
 /**
@@ -25,7 +29,21 @@ import { createServerFactory } from "./server";
  */
 export { DEPLOYED_HOSTNAME };
 
-const handler = createMcpHandler(createServerFactory(), {
+/** The options object `createMcpHandler` takes, named by where it goes. */
+type HandlerOptions = NonNullable<Parameters<typeof createMcpHandler>[1]>;
+
+/** A tool registrar the test fixture hands in. Production hands in none. */
+type ExtraTool = (server: McpServer) => void;
+
+/**
+ * The options every per-request MCP handler is built with.
+ *
+ * One module-scope constant, so the door, the production handler and the test
+ * fixture's handler cannot drift apart: all three are built from this object.
+ * The handler itself is built per request (see `buildRequestHandler`). These
+ * options are not.
+ */
+const HANDLER_OPTIONS: HandlerOptions = {
   route: "/mcp",
 
   // Neither of the next two is optional here, and for one reason. The handler
@@ -119,7 +137,11 @@ const handler = createMcpHandler(createServerFactory(), {
   //     `withMailSessionOver` chain has no `await` ahead of that acquire, so
   //     there is no suspension point for a second entrant to interleave into.
   //     Anyone editing either of those is editing this guarantee, from a file
-  //     that does not mention it.
+  //     that does not mention it. The promise of the principal the door makes
+  //     below is awaited at the top of each tool callback, which is outside
+  //     the check-and-acquire pair, so that pair is still atomic: two batch
+  //     entries may both suspend on that await, and each then runs from the
+  //     held check to the acquire with no suspension point in between.
   //
   //     One consequence is recorded rather than fixed. The second mail call in
   //     a batch is refused with `ImapThrottleError`, whose prose names iCloud
@@ -145,8 +167,8 @@ const handler = createMcpHandler(createServerFactory(), {
   //
   // (d) When to re-tighten. When Claude Desktop sends the 2026-07-28 envelope,
   //     this goes back to the modern-clients-only value and the compatibility
-  //     lane is retired. That is a one-word edit here plus the matching one in
-  //     `test/fixtures/worker-with-canary.ts`, which pins this same option.
+  //     lane is retired. That is a one-word edit here and nowhere else: the
+  //     test fixture's handler is built from these same options.
   //
   // The value below is the library default and the option's documented
   // stateless-serving mode; the superseded value is the other of the two the
@@ -155,7 +177,134 @@ const handler = createMcpHandler(createServerFactory(), {
   // hash that changes on every release, so such a reference is stale by the
   // next install.
   legacy: "stateless",
-});
+};
+
+/**
+ * Is this the owner's grant (D-07)?
+ *
+ * Yes only for a plain object whose own keys, symbol keys included, are exactly
+ * `userId`, with the string value `owner`. That is the one grant the login gate
+ * mints today. Everything else is a no: the newer versioned shape (Phase 11
+ * owns it), another user id, the owner's id beside an extra key, a different
+ * letter case, null, an array, and no props at all. The handler library only
+ * builds an auth context when the props hold a key, so "nothing there" has to
+ * read as a bad grant and not as a crash.
+ *
+ * It returns a boolean and never throws. A throw on this path becomes a 500
+ * with no challenge (spike S1), and a client that gets a 500 has no way to know
+ * it should sign in again. The narrowing is the cast-free idiom the principal
+ * module uses.
+ *
+ * The guard stays until Phase 13. While credentials still come from the Worker
+ * secrets, whoever gets past it is served as the owner.
+ */
+function isOwnerGrant(props: unknown): boolean {
+  if (typeof props !== "object" || props === null || Array.isArray(props)) {
+    return false;
+  }
+  if (!("userId" in props)) return false;
+  if (Reflect.ownKeys(props).length !== 1) return false;
+  if (!Object.hasOwn(props, "userId")) return false;
+  return props.userId === "owner";
+}
+
+/**
+ * The door's own 401, for a grant that is not the owner's.
+ *
+ * Built from the same parts the OAuth library uses for its own 401, in the
+ * same order: the realm, the protected-resource metadata document for the
+ * requested path, the error code, and the one scope this server has. The
+ * metadata URL comes from the request URL, never from a hostname literal.
+ *
+ * **Fixed strings and the request URL only.** Nothing from the props, the
+ * environment or a caught value is ever put in the body or in a header.
+ *
+ * It skips the CORS headers the MCP handler adds to its own answers. The
+ * library's own 401 skips them too, and this endpoint is bearer-only: no cookie
+ * and no credentialed browser request is involved, so there is nothing for
+ * those headers to allow.
+ */
+function unauthorized(request: Request): Response {
+  const url = new URL(request.url);
+  const metadataUrl = `${url.origin}/.well-known/oauth-protected-resource${url.pathname}`;
+  return new Response(
+    JSON.stringify({
+      error: "invalid_token",
+      error_description: "Stored login is out of date. Sign in again.",
+    }),
+    {
+      status: 401,
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        Pragma: "no-cache",
+        "WWW-Authenticate": `Bearer realm="OAuth", resource_metadata="${metadataUrl}", error="invalid_token", scope="mcp"`,
+      },
+    },
+  );
+}
+
+/**
+ * Build the MCP handler for ONE request.
+ *
+ * The factory closes over the promise of the principal, so the tool layer gets
+ * the principal without ever reading the grant's props itself. The options are
+ * the production ones, always. The test fixture's route that steps around the
+ * gate and the door calls this too, so the composition under test is the one
+ * that ships.
+ *
+ * Built per request rather than once at module scope because the principal
+ * belongs to the request. Spike S1 ran this shape on both lanes and saw no
+ * problem from it.
+ */
+export function buildRequestHandler(
+  principal: Promise<Principal>,
+  extraTools: ExtraTool[] = [],
+): ReturnType<typeof createMcpHandler> {
+  return createMcpHandler(
+    createServerFactory(principal, extraTools),
+    HANDLER_OPTIONS,
+  );
+}
+
+/**
+ * Build the API handler: the door, and behind it the per-request MCP handler.
+ *
+ * `extraTools` is the same test-injection seam the server factory has.
+ * Production passes nothing.
+ *
+ * **Nothing in `fetch` throws and nothing in it awaits.**
+ *
+ * - A throw here becomes a 500 with no challenge (spike S1). So the guard
+ *   returns a boolean and the 401 is built right here.
+ * - The principal is handed on as a PROMISE (D-09, D-27). An unset or bad
+ *   Worker secret must read `auth_failed` from the tool, exactly as it does
+ *   today, and never a 401: a 401 tells the client to sign in again, and
+ *   signing in cannot fix a missing secret. So this function does not wait to
+ *   find out. Each tool callback awaits the promise as the first line of its
+ *   own `try`, and its own `catch` maps a refusal to the category.
+ */
+export function createMcpApiHandler(extraTools: ExtraTool[] = []): {
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response>;
+} {
+  return {
+    fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+      // The one read of the grant's props in this codebase (D-08).
+      if (!isOwnerGrant(ctx.props)) {
+        return Promise.resolve(unauthorized(request));
+      }
+
+      const principal = principalFromEnv(env);
+      // A request that calls no tool never awaits this promise. If a secret is
+      // unset it rejects, and a rejection nobody handles is an unhandled
+      // rejection. This one no-op handler prevents that. Everyone who awaits
+      // `principal` itself still sees the rejection.
+      principal.catch(() => {});
+
+      return buildRequestHandler(principal, extraTools)(request, env, ctx);
+    },
+  };
+}
 
 /**
  * The API handler the OAuth provider dispatches to. **An explicit adapter,
@@ -175,9 +324,9 @@ const handler = createMcpHandler(createServerFactory(), {
  * entirely correct in this phase because nothing consumes `props` yet. It
  * would surface much later as an unexplained `undefined` in whichever phase
  * first reads the authenticated principal.
+ *
+ * Phase 9 is the phase that paragraph predicted. The `fetch` built by
+ * `createMcpApiHandler` is the one reader of the grant's props in this
+ * codebase, and nothing else under `src/` may read them.
  */
-export const mcpApiHandler = {
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return handler(request, env, ctx);
-  },
-};
+export const mcpApiHandler = createMcpApiHandler();
