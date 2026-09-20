@@ -62,7 +62,7 @@ import {
 import { getEvent } from "../src/dav/calendar";
 import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
 import { DavNotFoundError } from "../src/dav/errors";
-import { decodeEventId } from "../src/dav/ids";
+import { decodeCalendarId, decodeEventId } from "../src/dav/ids";
 import { createDavFetch } from "../src/dav/transport";
 import {
   STAGED_ID_TTL_MS,
@@ -79,6 +79,9 @@ import {
 } from "../src/mcp/tools/mail";
 import { TOKEN_DECODER, fromBase64Url } from "../src/tokens";
 import {
+  CALDAV_ENTRY,
+  CALENDAR_A,
+  CALENDAR_B,
   CANARY_SUMMARY_A,
   EVENT_A_ID,
   HOME_A,
@@ -269,6 +272,46 @@ function handBuiltTicketFor(key: string, now: number): string | null {
 function refusedByTool(result: RecordedToolResult): boolean {
   if (readToolResult(result).isError) return true;
   return readToolResult(result).trusted?.staged === false;
+}
+
+/** What a calendar list result said, read without throwing. */
+interface CalendarListRead {
+  /** The server's own flag. Null when the result did not carry one. */
+  readonly cacheHit: boolean | null;
+  /** The collection URL inside each calendar id, in order. */
+  readonly collectionUrls: readonly string[];
+}
+
+/**
+ * Read a `calendar_list_calendars` result: was it a cache hit, and which
+ * collection does each calendar id point at.
+ *
+ * The id is opaque to the model and not to this server, so it is decoded with
+ * the server's own codec. It takes a result that is not null, holds no
+ * assertion and never throws: a result it cannot read comes back as a null flag
+ * and an empty list, and the caller's assertion says what was wrong.
+ */
+function calendarListOf(result: RecordedToolResult): CalendarListRead {
+  try {
+    const trusted = readToolResult(result).trusted;
+    const rows: unknown = trusted?.calendars;
+    const collectionUrls: string[] = [];
+    if (Array.isArray(rows)) {
+      for (const row of rows) {
+        const id: unknown = (row as Record<string, unknown> | null)?.id;
+        if (typeof id === "string") {
+          collectionUrls.push(decodeCalendarId(id).collectionUrl);
+        }
+      }
+    }
+    const cacheHit = trusted?.cacheHit;
+    return {
+      cacheHit: typeof cacheHit === "boolean" ? cacheHit : null,
+      collectionUrls,
+    };
+  } catch {
+    return { cacheHit: null, collectionUrls: [] };
+  }
 }
 
 /** Every confirm key currently in the store. */
@@ -900,9 +943,103 @@ describe("DAV_CACHE: a cached home belongs to the account it was resolved for", 
     );
   });
 
-  it.todo(
-    "DAV_CACHE through the registered callbacks: cannot run until Phase 9 threads the principal into the tool callbacks",
-  );
+  // This was a todo until Phase 9 threaded the principal into the tool
+  // callbacks (plans 09-04 and 09-05). It is the same claim as the test above,
+  // made through the REGISTERED callbacks: the login and the cache key moved
+  // together, so each user's callback reads and writes that user's own entry.
+  //
+  // Each call builds its tools afresh, because in production each request
+  // builds its own server. The cache is NOT cleared between the turns. That is
+  // the point: the two users' keys no longer collide, so there is nothing to
+  // clear.
+  it("DAV_CACHE through the registered callbacks: A and B each keep their own home under their own key", async () => {
+    const stub = twoUserDavStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const firstA = await toolsFor(USER_A).call("calendar_list_calendars", {});
+    expect(firstA, "A's list call threw, or the tool is not registered").not.toBeNull();
+    if (firstA === null) return;
+    expect(
+      readToolResult(firstA).isError,
+      "A's first list came back as an error result",
+    ).toBe(false);
+    expect(
+      calendarListOf(firstA).cacheHit,
+      "A's first list was not a cold one",
+    ).toBe(false);
+    expect(
+      calendarListOf(firstA).collectionUrls,
+      "A's first list did not name the calendar under A's home",
+    ).toEqual([CALENDAR_A]);
+
+    const firstB = await toolsFor(USER_B).call("calendar_list_calendars", {});
+    expect(firstB, "B's list call threw, or the tool is not registered").not.toBeNull();
+    if (firstB === null) return;
+    expect(
+      readToolResult(firstB).isError,
+      "B's first list came back as an error result",
+    ).toBe(false);
+    expect(
+      calendarListOf(firstB).cacheHit,
+      "B's first list was answered from A's cached entry",
+    ).toBe(false);
+    expect(
+      calendarListOf(firstB).collectionUrls,
+      "B's list did not name the calendar under B's home",
+    ).toEqual([CALENDAR_B]);
+
+    // Exactly two keys, one per user, and nothing under any third identity.
+    // The user ids are the literal rows from the vectors file. Nothing is
+    // hashed here (D-12).
+    const listed = await env.DAV_CACHE.list({ prefix: "dav:" });
+    const names = listed.keys.map((one) => one.name).sort();
+    const keyOfA = `dav:v1:${USER_A.userId}:caldav`;
+    const keyOfB = `dav:v1:${USER_B.userId}:caldav`;
+    expect(keyOfA, "A and B share one cache key").not.toBe(keyOfB);
+    expect(
+      names,
+      "the callbacks did not store exactly one home per user, each under that user's own key",
+    ).toEqual([keyOfA, keyOfB].sort());
+
+    // A again, after B, with nothing cleared. Still served from A's own entry,
+    // and still A's home.
+    const discoveryBefore = stub.observed.filter((one) =>
+      one.url.startsWith(CALDAV_ENTRY),
+    ).length;
+    const secondA = await toolsFor(USER_A).call("calendar_list_calendars", {});
+    expect(secondA, "A's second list call threw").not.toBeNull();
+    if (secondA === null) return;
+    expect(
+      readToolResult(secondA).isError,
+      "A's second list came back as an error result",
+    ).toBe(false);
+    expect(
+      calendarListOf(secondA).cacheHit,
+      "A's second list missed the cache",
+    ).toBe(true);
+    expect(
+      calendarListOf(secondA).collectionUrls,
+      "A's cached home changed after B listed",
+    ).toEqual([CALENDAR_A]);
+    expect(
+      stub.observed.filter((one) => one.url.startsWith(CALDAV_ENTRY)).length,
+      "A's second list ran discovery again, so it was not served from A's entry",
+    ).toBe(discoveryBefore);
+
+    // Labels only. Nobody's request reached the other user's home.
+    expect(
+      stub.observed.filter(
+        (one) =>
+          (one.user === "A" && one.url.startsWith(HOME_B)) ||
+          (one.user === "B" && one.url.startsWith(HOME_A)),
+      ),
+      "a request carrying one user's credentials reached the other user's home",
+    ).toEqual([]);
+    expect(
+      stub.observed.filter((one) => one.user === "unknown"),
+      "a request carried credentials that are neither A's nor B's",
+    ).toEqual([]);
+  });
 });
 
 describe("home-set check: an event id only works under the caller's own home", () => {
@@ -967,9 +1104,70 @@ describe("home-set check: an event id only works under the caller's own home", (
     ).toBeGreaterThan(0);
   });
 
-  it.todo(
-    "home-set check through the registered callbacks: cannot run until Phase 9 threads the principal into the tool callbacks",
-  );
+  // These two were one todo until Phase 9 threaded the principal into the tool
+  // callbacks. They are the two tests above, made through the REGISTERED
+  // get-event callback.
+  it("negative control through the registered callbacks: A can fetch A's own event", async () => {
+    const stub = twoUserDavStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await toolsFor(USER_A).call("calendar_get_event", {
+      id: EVENT_A_ID,
+    });
+    expect(result, "A's call threw, or the tool is not registered").not.toBeNull();
+    if (result === null) return;
+
+    expect(
+      readToolResult(result).isError,
+      "A was refused A's own event",
+    ).toBe(false);
+    expect(
+      JSON.stringify(result),
+      "A did not get A's own event back",
+    ).toContain(CANARY_SUMMARY_A);
+    expect(
+      stub.observed.filter(
+        (one) => one.user === "A" && one.url.startsWith(HOME_A),
+      ).length,
+      "A's own fetch never reached the stub",
+    ).toBeGreaterThan(0);
+  });
+
+  it("home-set check through the registered callbacks: B cannot fetch an event under A's home", async () => {
+    const stub = twoUserDavStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await toolsFor(USER_B).call("calendar_get_event", {
+      id: EVENT_A_ID,
+    });
+    expect(result, "B's call threw, or the tool is not registered").not.toBeNull();
+    if (result === null) return;
+
+    expect(readToolResult(result).isError, "B was not refused").toBe(true);
+    expect(
+      readToolResult(result).trusted?.category,
+      "B was refused, but not because the event is outside B's home",
+    ).toBe("not_found");
+    expect(
+      stub.observed.filter((one) => one.url.startsWith(HOME_A)),
+      "a request carrying B's credentials reached a URL under A's home",
+    ).toEqual([]);
+    expect(
+      JSON.stringify(result),
+      "B received text from A's event",
+    ).not.toContain(CANARY_SUMMARY_A);
+
+    // B did reach the stub, as B. So the empty list above is a real refusal and
+    // not a harness that sent nothing.
+    expect(
+      stub.observed.filter((one) => one.user === "B").length,
+      "B's call never reached the stub at all",
+    ).toBeGreaterThan(0);
+    expect(
+      stub.observed.filter((one) => one.user !== "B"),
+      "a request from B's tools carried credentials that are not B's",
+    ).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------
