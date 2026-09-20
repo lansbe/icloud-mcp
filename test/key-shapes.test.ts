@@ -113,11 +113,14 @@ async function davKeyWrittenFor(
 ): Promise<string> {
   const kv = fakeKv();
   const scoped: Env = { ...envFor(user), DAV_CACHE: kv.binding };
+  // One principal for this user, for the cache key and for the login alike.
+  const who = testPrincipal(user);
 
   vi.stubGlobal("fetch", twoUserDavStub().fetch);
   const resolved = await resolveDavAccount(
     scoped,
-    createDavFetch(testPrincipal(user)),
+    await who,
+    createDavFetch(who),
     "caldav",
   );
 

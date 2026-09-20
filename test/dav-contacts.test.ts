@@ -28,7 +28,15 @@
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { z } from "zod";
 import {
   CONTACT_TERM_MAX_LENGTH,
@@ -72,6 +80,7 @@ import {
   SINGLE_TYPE_PARAMETER_VCF,
 } from "./fixtures/dav-bytes";
 import { ownerPrincipal } from "./fixtures/bound-secrets";
+import type { Principal } from "../src/principal";
 
 // The owner's principal, as the PROMISE the real env constructor returns over
 // the pool's ambient environment. The DAV fetch builder and the registrars take
@@ -80,6 +89,14 @@ import { ownerPrincipal } from "./fixtures/bound-secrets";
 // the refusal.
 const owner = ownerPrincipal();
 owner.catch(() => {});
+
+// What that promise resolves to. Resolved once, and the very same object is
+// handed to every call: the password reader answers only the object a
+// constructor built, so it is never spread and never cloned.
+let principal: Principal;
+beforeAll(async () => {
+  principal = await owner;
+});
 
 // ---------------------------------------------------------------------------
 // The account this fixture describes
@@ -479,8 +496,8 @@ function davStub(options: StubOptions = {}): Stub {
  */
 async function warm(stub: Stub): Promise<void> {
   vi.stubGlobal("fetch", stub.fetch);
-  await clearDavCache(env, "carddav");
-  const resolved = await resolveDavAccount(env, createDavFetch(owner), "carddav");
+  await clearDavCache(env, principal, "carddav");
+  const resolved = await resolveDavAccount(env, principal, createDavFetch(owner), "carddav");
   expect(resolved.cacheHit).toBe(false);
   stub.observed.length = 0;
 }
@@ -524,7 +541,7 @@ afterEach(() => {
 
 describe("listAddressBooks", () => {
   it("returns one row per address book with its advertised reports", async () => {
-    const listing = await listAddressBooks(env, createDavFetch(owner));
+    const listing = await listAddressBooks(env, principal, createDavFetch(owner));
 
     expect(listing.addressBooks.map((one) => one.displayName)).toEqual([
       "Contacts",
@@ -539,7 +556,7 @@ describe("listAddressBooks", () => {
   it("does NOT advertise the query report, which is what decides the path", async () => {
     // The measured shape of the real account. If this ever changes, the
     // server-side path becomes live and this case is where that is noticed.
-    const listing = await listAddressBooks(env, createDavFetch(owner));
+    const listing = await listAddressBooks(env, principal, createDavFetch(owner));
 
     for (const book of listing.addressBooks) {
       expect(book.reports).not.toContain("addressbookQuery");
@@ -547,20 +564,20 @@ describe("listAddressBooks", () => {
   });
 
   it("mints an opaque id that resolves to the SHARD host, not the root", async () => {
-    const listing = await listAddressBooks(env, createDavFetch(owner));
+    const listing = await listAddressBooks(env, principal, createDavFetch(owner));
 
     const ref = decodeAddressBookId(listing.addressBooks[0].id);
     expect(ref.collectionUrl).toBe(BOOK_A_URL);
   });
 
   it("carries the discovery cache state", async () => {
-    const listing = await listAddressBooks(env, createDavFetch(owner));
+    const listing = await listAddressBooks(env, principal, createDavFetch(owner));
 
     expect(listing.cacheHit).toBe(true);
   });
 
   it("issues its requests strictly one at a time", async () => {
-    await listAddressBooks(env, createDavFetch(owner));
+    await listAddressBooks(env, principal, createDavFetch(owner));
 
     expect(stub.overlapped).toBe(false);
   });
@@ -620,7 +637,7 @@ describe("matchesContact", () => {
 describe("searchContacts refuses before spending the connection budget", () => {
   it("refuses an empty term with the stub never called", async () => {
     const err = await capture(() =>
-      searchContacts(env, createDavFetch(owner), { term: "" }),
+      searchContacts(env, principal, createDavFetch(owner), { term: "" }),
     );
 
     expect(err).toBeInstanceOf(DavNotFoundError);
@@ -629,7 +646,7 @@ describe("searchContacts refuses before spending the connection budget", () => {
 
   it("refuses a whitespace-only term with the stub never called", async () => {
     const err = await capture(() =>
-      searchContacts(env, createDavFetch(owner), { term: "   \t \n " }),
+      searchContacts(env, principal, createDavFetch(owner), { term: "   \t \n " }),
     );
 
     expect(err).toBeInstanceOf(DavNotFoundError);
@@ -638,7 +655,7 @@ describe("searchContacts refuses before spending the connection budget", () => {
 
   it("refuses a term longer than the maximum with the stub never called", async () => {
     const err = await capture(() =>
-      searchContacts(env, createDavFetch(owner), {
+      searchContacts(env, principal, createDavFetch(owner), {
         term: "a".repeat(CONTACT_TERM_MAX_LENGTH + 1),
       }),
     );
@@ -648,7 +665,7 @@ describe("searchContacts refuses before spending the connection budget", () => {
   });
 
   it("admits a term exactly at the maximum", async () => {
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "a".repeat(CONTACT_TERM_MAX_LENGTH),
     });
 
@@ -657,7 +674,7 @@ describe("searchContacts refuses before spending the connection budget", () => {
   });
 
   it("refuses a cursor minted for a different term", async () => {
-    const first = await searchContacts(env, createDavFetch(owner), {
+    const first = await searchContacts(env, principal, createDavFetch(owner), {
       term: "example.invalid",
       pageSize: 1,
     });
@@ -665,7 +682,7 @@ describe("searchContacts refuses before spending the connection budget", () => {
     stub.observed.length = 0;
 
     const err = await capture(() =>
-      searchContacts(env, createDavFetch(owner), {
+      searchContacts(env, principal, createDavFetch(owner), {
         term: "solano",
         cursor: first.nextCursor!,
       }),
@@ -682,7 +699,7 @@ describe("searchContacts refuses before spending the connection budget", () => {
 
 describe("the match path", () => {
   it("takes the local path with ZERO query requests when the report is not advertised", async () => {
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "solano",
     });
 
@@ -705,7 +722,7 @@ describe("the match path", () => {
       ],
     });
 
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "solano",
     });
 
@@ -727,7 +744,7 @@ describe("the match path", () => {
       ],
     });
 
-    await searchContacts(env, createDavFetch(owner), { term: "sol<ano&\"'" });
+    await searchContacts(env, principal, createDavFetch(owner), { term: "sol<ano&\"'" });
 
     const body = queries(next)[0].body;
     // Escaped on serialisation by the library's element builder. The raw
@@ -747,7 +764,7 @@ describe("the match path", () => {
       ],
     });
 
-    await searchContacts(env, createDavFetch(owner), { term: "solano" });
+    await searchContacts(env, principal, createDavFetch(owner), { term: "solano" });
 
     const body = queries(next)[0].body;
     // A default that is correct today is a default that changes silently, and
@@ -772,7 +789,7 @@ describe("the match path", () => {
       ],
     });
 
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "solano",
     });
 
@@ -799,7 +816,7 @@ describe("the match path", () => {
       ],
     });
 
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "example.invalid",
     });
 
@@ -823,7 +840,7 @@ describe("the match path", () => {
     });
 
     const err = await capture(() =>
-      searchContacts(env, createDavFetch(owner), { term: "solano" }),
+      searchContacts(env, principal, createDavFetch(owner), { term: "solano" }),
     );
 
     expect(err).toBeInstanceOf(DavAuthError);
@@ -845,7 +862,7 @@ describe("the match path", () => {
     });
 
     const err = await capture(() =>
-      searchContacts(env, createDavFetch(owner), { term: "solano" }),
+      searchContacts(env, principal, createDavFetch(owner), { term: "solano" }),
     );
 
     expect(err).toBeInstanceOf(DavThrottleError);
@@ -870,7 +887,7 @@ describe("the two match paths agree", () => {
 
   async function idsFor(reports: string[], term: string): Promise<string[]> {
     restub(bothWays(reports));
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term,
       pageSize: 100,
     });
@@ -921,11 +938,11 @@ describe("the two match paths agree", () => {
     // Without this the case above would pass on an implementation that
     // ignored the advertised reports entirely and always ran locally.
     restub(bothWays(LIVE_REPORTS));
-    const localRun = await searchContacts(env, createDavFetch(owner), {
+    const localRun = await searchContacts(env, principal, createDavFetch(owner), {
       term: "solano",
     });
     restub(bothWays(REPORTS_WITH_QUERY));
-    const serverRun = await searchContacts(env, createDavFetch(owner), {
+    const serverRun = await searchContacts(env, principal, createDavFetch(owner), {
       term: "solano",
     });
 
@@ -940,7 +957,7 @@ describe("the two match paths agree", () => {
 
 describe("searchContacts", () => {
   it("finds a card whose formatted name is empty, and names it", async () => {
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "okonkwo",
     });
 
@@ -952,7 +969,7 @@ describe("searchContacts", () => {
   });
 
   it("returns an empty page rather than an error when nothing matches", async () => {
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "no-such-person-anywhere",
     });
 
@@ -962,7 +979,7 @@ describe("searchContacts", () => {
   });
 
   it("carries the email addresses on the row, so an address lookup is one call", async () => {
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "solano",
     });
 
@@ -973,7 +990,7 @@ describe("searchContacts", () => {
   });
 
   it("carries NOTHING else a stranger wrote on the row (D-65)", async () => {
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "solano",
     });
 
@@ -993,7 +1010,7 @@ describe("searchContacts", () => {
   });
 
   it("orders by lower-cased display name, then by object URL", async () => {
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "example.invalid",
       pageSize: 100,
     });
@@ -1007,7 +1024,7 @@ describe("searchContacts", () => {
   });
 
   it("carries the discovery cache state onto the page", async () => {
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "solano",
     });
 
@@ -1015,7 +1032,7 @@ describe("searchContacts", () => {
   });
 
   it("clamps a page size above the maximum rather than refusing it", async () => {
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "example.invalid",
       pageSize: 5000,
     });
@@ -1024,7 +1041,7 @@ describe("searchContacts", () => {
   });
 
   it("pins the term into the cursor it mints", async () => {
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "  example.invalid  ",
       pageSize: 1,
     });
@@ -1044,7 +1061,7 @@ describe("searchContacts", () => {
         contacts: ContactSummary[];
         hasMore: boolean;
         nextCursor: string | null;
-      } = await searchContacts(env, createDavFetch(owner), {
+      } = await searchContacts(env, principal, createDavFetch(owner), {
         term: "example.invalid",
         pageSize: 2,
         cursor,
@@ -1073,7 +1090,7 @@ describe("searchContacts", () => {
   it("pages a card whose display-name key is the EMPTY string", async () => {
     // The empty key is a legitimate cursor value — refusing it would make
     // exactly the cards Apple returns with an empty formatted name unpageable.
-    const first = await searchContacts(env, createDavFetch(owner), {
+    const first = await searchContacts(env, principal, createDavFetch(owner), {
       term: "example.invalid",
       pageSize: 1,
     });
@@ -1082,7 +1099,7 @@ describe("searchContacts", () => {
     const cursor = decodeContactsCursor(first.nextCursor!, "example.invalid");
     expect(cursor.lastDisplayNameKey).toBe("");
 
-    const second = await searchContacts(env, createDavFetch(owner), {
+    const second = await searchContacts(env, principal, createDavFetch(owner), {
       term: "example.invalid",
       pageSize: 1,
       cursor: first.nextCursor!,
@@ -1091,7 +1108,7 @@ describe("searchContacts", () => {
   });
 
   it("issues its requests strictly one at a time across several address books", async () => {
-    await searchContacts(env, createDavFetch(owner), {
+    await searchContacts(env, principal, createDavFetch(owner), {
       term: "example.invalid",
     });
 
@@ -1104,7 +1121,7 @@ describe("searchContacts", () => {
   });
 
   it("mints ids that address the SHARD host", async () => {
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "solano",
     });
 
@@ -1129,7 +1146,7 @@ describe("getContact", () => {
   }
 
   it("fetches exactly ONE resource, by its own object URL", async () => {
-    await getContact(env, createDavFetch(owner), fullRef());
+    await getContact(env, principal, createDavFetch(owner), fullRef());
 
     expect(stub.observed.length).toBe(1);
     expect(stub.observed[0].method).toBe("REPORT");
@@ -1138,7 +1155,7 @@ describe("getContact", () => {
   });
 
   it("returns every field CONT-02 names", async () => {
-    const detail = await getContact(env, createDavFetch(owner), fullRef());
+    const detail = await getContact(env, principal, createDavFetch(owner), fullRef());
 
     expect(detail.displayName).toBe("Dr. Marisol Q Solano PhD");
     expect(detail.formattedName).toBe("Dr. Marisol Q Solano PhD");
@@ -1162,7 +1179,7 @@ describe("getContact", () => {
   });
 
   it("keeps Apple's item-group prefix on a labelled property", async () => {
-    const detail = await getContact(env, createDavFetch(owner), {
+    const detail = await getContact(env, principal, createDavFetch(owner), {
       addressBookUrl: BOOK_A_URL,
       objectUrl: `https://p42-contacts.icloud.com${GROUPED_HREF}`,
     });
@@ -1172,20 +1189,20 @@ describe("getContact", () => {
   });
 
   it("carries the same opaque id a search row would carry", async () => {
-    const detail = await getContact(env, createDavFetch(owner), fullRef());
+    const detail = await getContact(env, principal, createDavFetch(owner), fullRef());
 
     expect(detail.id).toBe(encodeContactId(fullRef()));
   });
 
   it("carries the discovery cache state", async () => {
-    const detail = await getContact(env, createDavFetch(owner), fullRef());
+    const detail = await getContact(env, principal, createDavFetch(owner), fullRef());
 
     expect(detail.cacheHit).toBe(true);
   });
 
   it("refuses a resource the server did not return", async () => {
     const err = await capture(() =>
-      getContact(env, createDavFetch(owner), {
+      getContact(env, principal, createDavFetch(owner), {
         addressBookUrl: BOOK_A_URL,
         objectUrl: `https://p42-contacts.icloud.com${BOOK_A_PATH}gone.vcf`,
       }),
@@ -1215,7 +1232,7 @@ describe("getContact", () => {
     });
 
     const err = await capture(() =>
-      getContact(env, createDavFetch(owner), decodeContactId(forged)),
+      getContact(env, principal, createDavFetch(owner), decodeContactId(forged)),
     );
 
     expect(err).toBeInstanceOf(DavNotFoundError);
@@ -1233,7 +1250,7 @@ describe("getContact", () => {
     });
 
     const err = await capture(() =>
-      getContact(env, createDavFetch(owner), decodeContactId(forged)),
+      getContact(env, principal, createDavFetch(owner), decodeContactId(forged)),
     );
 
     expect(err).toBeInstanceOf(DavNotFoundError);
@@ -1246,7 +1263,7 @@ describe("getContact", () => {
     // would close CR-01 by breaking the tool, and `cardsFrom` resolves every
     // href against the book URL — so a real card is genuinely under the home
     // set and must pass.
-    const page = await searchContacts(env, createDavFetch(owner), {
+    const page = await searchContacts(env, principal, createDavFetch(owner), {
       term: "solano",
     });
     const row = page.contacts.find((one) =>
@@ -1256,7 +1273,7 @@ describe("getContact", () => {
     stub.observed.length = 0;
 
     const detail = await getContact(
-      env,
+      env, principal,
       createDavFetch(owner),
       decodeContactId(row!.id),
     );
@@ -1543,7 +1560,7 @@ function registeredContacts(): Registration[] {
       recorded.push({ name, options, callback });
     },
   };
-  registerContactsTools(server as unknown as McpServer, createDavFetch(owner));
+  registerContactsTools(server as unknown as McpServer, createDavFetch(owner), owner);
   return recorded;
 }
 

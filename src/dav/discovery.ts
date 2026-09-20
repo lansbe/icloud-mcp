@@ -16,8 +16,8 @@
 
 import { createAccount } from "tsdav";
 import type { DAVAccount } from "tsdav";
-import { isConfiguredSecret } from "../auth/login-handler";
 import type { Env } from "../env";
+import type { Principal } from "../principal";
 import {
   DavAuthError,
   DavConnectError,
@@ -92,25 +92,31 @@ function hex(buffer: ArrayBuffer): string {
 }
 
 /**
- * Refuse before any request when either mail secret is absent.
+ * The Apple ID this request acts for, off the signed-in principal.
  *
- * **Both secrets are checked here even though this module only uses one of
- * them, and that is deliberate.** The password is never read in this file — the
- * transport builds the header. But on a cache HIT no request is made at all, so
- * `davAuthHeader` is never reached, and without this check an account with no
- * app-specific password would report a perfectly healthy cached discovery and
- * only fail later, on the first call that actually needed to talk to Apple.
- * "auth_failed before any request is made" has to hold on both paths or it is
- * not a property.
+ * **Until Phase 9 this function read the two mail secrets off the environment
+ * and refused when either was absent. That check is gone from here, and it did
+ * not get weaker: it moved.** A principal cannot be built without both values.
+ * The principal module's constructors refuse an absent, empty or unusable Apple
+ * ID or app password, so by the time a principal exists both are known good.
+ * An unset secret now shows up as a promise of the principal that rejects. Each
+ * DAV tool callback awaits that promise as the first line of its `try`, and the
+ * DAV fetch awaits it at the top of every request, so "auth_failed before any
+ * request is made" still holds on both paths: the cache-hit path, where no
+ * request is ever built, included.
  *
- * The Apple ID is returned rather than merely asserted because the key below
- * needs it. Nothing else in this module retains it.
+ * **This is the identity the cache is keyed by, and it is the same object the
+ * DAV fetch logs in with (D-13).** The two moved to the principal together, in
+ * one plan. A key read from one identity and a login from another would let the
+ * home-set check compare a caller's target against somebody else's home.
+ *
+ * The Apple ID is returned exactly as the principal carries it, with no trim
+ * and no case change, because the key below hashes it as given. The owner's
+ * principal carries the binding untouched, so the owner's key did not move.
+ * Nothing else in this module retains it.
  */
-function requireAppleId(env: Env): string {
-  const appleId = env.APPLE_ID;
-  if (!isConfiguredSecret(appleId)) throw new DavAuthError();
-  if (!isConfiguredSecret(env.APPLE_APP_PASSWORD)) throw new DavAuthError();
-  return appleId;
+function requireAppleId(principal: Principal): string {
+  return principal.appleId;
 }
 
 /**
@@ -237,10 +243,11 @@ async function discoverAccount(
  */
 export async function resolveDavAccount(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   service: DavService,
 ): Promise<ResolvedDavAccount> {
-  const key = await davCacheKey(requireAppleId(env), service);
+  const key = await davCacheKey(requireAppleId(principal), service);
 
   const cached = await env.DAV_CACHE.get<CachedDiscovery>(key, "json");
   if (
@@ -290,9 +297,10 @@ export async function resolveDavAccount(
  */
 export async function clearDavCache(
   env: Env,
+  principal: Principal,
   service?: DavService,
 ): Promise<void> {
-  const appleId = requireAppleId(env);
+  const appleId = requireAppleId(principal);
   const services = service ? [service] : DAV_SERVICES;
   // Sequential. Every KV operation counts against the same per-invocation
   // budget as an outbound request (./.claude/CLAUDE.md §3), and two deletes are
@@ -374,12 +382,13 @@ function isRediscoverable(err: unknown): boolean {
  */
 export async function withRediscovery<T>(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   service: DavService,
   operation: (resolved: ResolvedDavAccount) => Promise<T>,
   allowRediscovery = true,
 ): Promise<T> {
-  const resolved = await resolveDavAccount(env, davFetch, service);
+  const resolved = await resolveDavAccount(env, principal, davFetch, service);
 
   try {
     return await operation(resolved);
@@ -391,8 +400,8 @@ export async function withRediscovery<T>(
     if (!resolved.cacheHit) throw err;
     if (!isRediscoverable(err)) throw err;
 
-    await clearDavCache(env, service);
-    return withRediscovery(env, davFetch, service, operation, false);
+    await clearDavCache(env, principal, service);
+    return withRediscovery(env, principal, davFetch, service, operation, false);
   }
 }
 

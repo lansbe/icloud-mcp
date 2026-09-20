@@ -21,7 +21,7 @@
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type {
   CalendarListing,
@@ -71,6 +71,8 @@ import { registerContactsTools } from "../src/mcp/tools/contacts";
 import { registerDavDiagnoseTool } from "../src/mcp/tools/dav-diagnose";
 import { UNTRUSTED_PREAMBLE } from "../src/mcp/untrusted";
 import { ownerPrincipal } from "./fixtures/bound-secrets";
+import type { Principal } from "../src/principal";
+import { principalFromEnv } from "../src/principal";
 
 // The owner's principal, as the PROMISE the real env constructor returns over
 // the pool's ambient environment. The DAV fetch builder and the registrars take
@@ -79,6 +81,14 @@ import { ownerPrincipal } from "./fixtures/bound-secrets";
 // the refusal.
 const owner = ownerPrincipal();
 owner.catch(() => {});
+
+// What that promise resolves to. Resolved once, and the very same object is
+// handed to every call: the password reader answers only the object a
+// constructor built, so it is never spread and never cloned.
+let principal: Principal;
+beforeAll(async () => {
+  principal = await owner;
+});
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -579,7 +589,7 @@ interface Registration {
  * invoked, so nothing opens a socket or reads a credential. The cases that DO
  * invoke one install a counting stub first and assert it was never called.
  */
-function registeredDav(): Registration[] {
+function registeredDav(who: Promise<Principal> = owner): Registration[] {
   const recorded: Registration[] = [];
   const server = {
     registerTool(
@@ -590,15 +600,17 @@ function registeredDav(): Registration[] {
       recorded.push({ name, options, callback });
     },
   };
-  const davFetch = createDavFetch(owner);
-  registerDavDiagnoseTool(server as unknown as McpServer, davFetch);
-  registerCalendarTools(server as unknown as McpServer, davFetch);
+  // One promise, to the DAV fetch and to every registrar, as the server factory
+  // does it. The owner's, unless a case hands in its own.
+  const davFetch = createDavFetch(who);
+  registerDavDiagnoseTool(server as unknown as McpServer, davFetch, who);
+  registerCalendarTools(server as unknown as McpServer, davFetch, who);
   // The last registrar the phase adds. After this line the ceiling loop below
   // covers the phase's ENTIRE tool surface — one diagnostic, four calendar
   // tools and two contacts tools — rather than two thirds of it, and the mail
   // suite's own loop keeps covering the mail tools, which is all it was ever
   // able to see.
-  registerContactsTools(server as unknown as McpServer, davFetch);
+  registerContactsTools(server as unknown as McpServer, davFetch, who);
   return recorded;
 }
 
@@ -1559,8 +1571,8 @@ function writeDavStub(options: WriteStubOptions = {}): WriteStub {
  */
 async function warmWrite(stub: WriteStub): Promise<void> {
   vi.stubGlobal("fetch", stub.fetch);
-  await clearDavCache(env, "caldav");
-  const resolved = await resolveDavAccount(env, createDavFetch(owner), "caldav");
+  await clearDavCache(env, principal, "caldav");
+  const resolved = await resolveDavAccount(env, principal, createDavFetch(owner), "caldav");
   expect(resolved.cacheHit).toBe(false);
   stub.observed.length = 0;
 }
@@ -6852,8 +6864,8 @@ describe("calendar_find_free_slots returns an unfenced, trusted-only response", 
 
   async function warmSlots(fetchStub: typeof globalThis.fetch): Promise<void> {
     vi.stubGlobal("fetch", fetchStub);
-    await clearDavCache(env, "caldav");
-    await resolveDavAccount(env, createDavFetch(owner), "caldav");
+    await clearDavCache(env, principal, "caldav");
+    await resolveDavAccount(env, principal, createDavFetch(owner), "caldav");
   }
 
   const ARGS = {
@@ -6924,5 +6936,63 @@ describe("calendar_find_free_slots returns an unfenced, trusted-only response", 
     expect(description).toContain("calendar_create_event");
     expect(description).toContain("not idempotent");
     expect(description).toContain("not reserved");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A principal that was refused (Phase 9, D-09, D-27)
+//
+// With a mail secret unset, the promise of the principal rejects. Every DAV
+// callback awaits that promise as the FIRST line of its `try`, so every one of
+// them answers `auth_failed` before it looks at an argument, reads the cache or
+// sends a request.
+// ---------------------------------------------------------------------------
+
+describe("a principal that was refused reaches no DAV tool", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** The promise the door hands over when the Apple ID secret is unset. */
+  function refusedPrincipal(): Promise<Principal> {
+    const refused = principalFromEnv({ ...env, APPLE_ID: undefined });
+    refused.catch(() => {});
+    return refused;
+  }
+
+  it("covers every DAV registration, and the count is pinned", () => {
+    // One diagnostic, nine calendar tools, two contacts tools. A tool added
+    // later lands in the loop below by itself. This pin is what makes a tool
+    // REMOVED from the loop show up.
+    expect(registeredDav(refusedPrincipal()).length).toBe(12);
+  });
+
+  it("answers auth_failed from EVERY tool, with the unchanged message and zero requests", async () => {
+    let requests = 0;
+    vi.stubGlobal("fetch", async () => {
+      requests += 1;
+      return new Response(null, { status: 500 });
+    });
+
+    // EMPTY arguments, on purpose. A callback that looked at its arguments
+    // first would throw on a missing field or answer `not_found` for a bad id.
+    // `auth_failed` from all of them proves the await is ahead of everything.
+    // One at a time: this project does not fan tool calls out.
+    for (const tool of registeredDav(refusedPrincipal())) {
+      const result = await tool.callback({});
+      expect(result.isError, `${tool.name} did not fail`).toBe(true);
+      const body = JSON.parse(result.content[0].text) as {
+        category: string;
+        message: string;
+      };
+      expect(body.category, `${tool.name} read a refusal as something else`).toBe(
+        "auth_failed",
+      );
+      expect(body.message, `${tool.name} changed the auth_failed text`).toBe(
+        SAFE_MESSAGES.auth_failed,
+      );
+    }
+
+    expect(requests, "a refused principal still sent a request").toBe(0);
   });
 });

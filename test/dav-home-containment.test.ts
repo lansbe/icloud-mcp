@@ -135,7 +135,15 @@
 // This module contains no logging calls of any kind and must never acquire any.
 
 import { env } from "cloudflare:workers";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import {
   createEvent,
   deleteEvent,
@@ -147,6 +155,7 @@ import { encodeCalendarId } from "../src/dav/ids";
 import type { EventRef } from "../src/dav/ids";
 import { createDavFetch } from "../src/dav/transport";
 import { ownerPrincipal } from "./fixtures/bound-secrets";
+import type { Principal } from "../src/principal";
 
 // The owner's principal, as the PROMISE the real env constructor returns over
 // the pool's ambient environment. The DAV fetch builder and the registrars take
@@ -155,6 +164,14 @@ import { ownerPrincipal } from "./fixtures/bound-secrets";
 // the refusal.
 const owner = ownerPrincipal();
 owner.catch(() => {});
+
+// What that promise resolves to. Resolved once, and the very same object is
+// handed to every call: the password reader answers only the object a
+// constructor built, so it is never spread and never cloned.
+let principal: Principal;
+beforeAll(async () => {
+  principal = await owner;
+});
 
 /** The directory this gate owns. Every key in `SOURCES` begins with it. */
 const DAV_DIR = "src/dav/";
@@ -963,8 +980,8 @@ beforeEach(async () => {
   vi.stubGlobal("fetch", live.fetch);
   // Cleared first, so the warm-up is a real miss rather than a hit left behind
   // by another file in the pool.
-  await clearDavCache(env, "caldav");
-  const resolved = await resolveDavAccount(env, createDavFetch(owner), "caldav");
+  await clearDavCache(env, principal, "caldav");
+  const resolved = await resolveDavAccount(env, principal, createDavFetch(owner), "caldav");
   expect(resolved.cacheHit).toBe(false);
   live.observed.length = 0;
 });
@@ -990,8 +1007,8 @@ function refOf(calendarUrl: string, objectUrl: string): EventRef {
 /** The two writers that take an `EventRef`, driven with whatever ref is given. */
 const REF_WRITERS: Record<string, (ref: EventRef) => Promise<unknown>> = {
   updateEvent: (ref) =>
-    updateEvent(env, createDavFetch(owner), ref, CONTAINMENT_ICS, '"etag-1"'),
-  deleteEvent: (ref) => deleteEvent(env, createDavFetch(owner), ref, '"etag-1"'),
+    updateEvent(env, principal, createDavFetch(owner), ref, CONTAINMENT_ICS, '"etag-1"'),
+  deleteEvent: (ref) => deleteEvent(env, principal, createDavFetch(owner), ref, '"etag-1"'),
 };
 
 describe("a forged reference is refused before the credential leaves", () => {
@@ -1006,7 +1023,7 @@ describe("a forged reference is refused before the credential leaves", () => {
     }
 
     live.observed.length = 0;
-    await createEvent(env, createDavFetch(owner), {
+    await createEvent(env, principal, createDavFetch(owner), {
       calendarId: encodeCalendarId({ collectionUrl: WORK_URL }),
       summary: "Interview",
       startLocal: "2026-09-03T14:00:00",
@@ -1078,7 +1095,7 @@ describe("a forged reference is refused before the credential leaves", () => {
     ] as const) {
       live.observed.length = 0;
       const err = await refusal(() =>
-        createEvent(env, createDavFetch(owner), {
+        createEvent(env, principal, createDavFetch(owner), {
           calendarId: encodeCalendarId({ collectionUrl: collection }),
           summary: "Interview",
           startLocal: "2026-09-03T14:00:00",
@@ -1115,9 +1132,9 @@ describe("a forged reference is refused before the credential leaves", () => {
       "https://p42-caldav.icloud.com/1234567890/calendars",
     );
     vi.stubGlobal("fetch", slashless.fetch);
-    await clearDavCache(env, "caldav");
+    await clearDavCache(env, principal, "caldav");
     const resolved = await resolveDavAccount(
-      env,
+      env, principal,
       createDavFetch(owner),
       "caldav",
     );

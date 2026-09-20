@@ -10,6 +10,7 @@ import type { DavDiagnosticOutcome } from "../../dav/diagnose";
 import { runDavDiagnosticOutcome } from "../../dav/diagnose";
 import { davToErrorCategory } from "../../dav/errors";
 import type { DavFetch } from "../../dav/transport";
+import type { Principal } from "../../principal";
 
 /**
  * The MCP content result every DAV tool produces, success or failure.
@@ -118,6 +119,7 @@ export function davDiagnosticResult(outcome: DavDiagnosticOutcome): ToolResult {
 export function registerDavDiagnoseTool(
   server: McpServer,
   davFetch: DavFetch,
+  principal: Promise<Principal>,
 ): void {
   server.registerTool(
     "dav_diagnose",
@@ -136,8 +138,11 @@ export function registerDavDiagnoseTool(
     },
     async ({ refresh }) => {
       try {
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
         return davDiagnosticResult(
-          await runDavDiagnosticOutcome(env, davFetch, {
+          await runDavDiagnosticOutcome(env, actor, davFetch, {
             refresh: refresh ?? false,
           }),
         );

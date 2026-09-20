@@ -61,20 +61,22 @@ export function createServerFactory(
     // sends, so this body stays synchronous. It was this file's only use of the
     // ambient environment, which is why that import is gone.
     const davFetch = createDavFetch(principal);
-    // The mail diagnostic and the mail tools act for the principal. The DAV
-    // registrars get the same promise when the DAV chain lands.
+    // Every registrar below gets the SAME promise of the principal. Each tool
+    // callback awaits it as the first line of its own `try`. The DAV fetch
+    // above awaits it too, at the top of every request it sends, so the login
+    // and the cache key always belong to one identity (D-13).
     registerDiagnoseTool(server, principal);
     registerMailTools(server, gate, principal);
-    registerDavDiagnoseTool(server, davFetch);
+    registerDavDiagnoseTool(server, davFetch, principal);
     // The same `davFetch` the diagnostic takes, deliberately: one queue per
     // request means a calendar call and a diagnosis issued in the same request
     // serialise against each other rather than racing for the connection
     // budget §3 describes.
-    registerCalendarTools(server, davFetch);
+    registerCalendarTools(server, davFetch, principal);
     // The same `davFetch` again, for the same reason, and this line completes
     // Phase 3's tool surface: one diagnostic, four calendar tools and two
     // contacts tools, alongside Phase 2's mail tools.
-    registerContactsTools(server, davFetch);
+    registerContactsTools(server, davFetch, principal);
     for (const register of extraTools) register(server);
     return server;
   };

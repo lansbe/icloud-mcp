@@ -95,8 +95,9 @@ export function envFor(user: TestUser): Env {
  * two fields and gets the auth error. Pass the promise on as it is, or await it
  * and pass that one object on.
  *
- * `envFor` is still the carrier of "which user" for the DAV side. It stays
- * until plan 09-05 moves the DAV fetch onto the principal.
+ * Since plan 09-05 this is the carrier of "which user" on the DAV side as well
+ * as the mail side. `envFor` is still exported for the tests that need an
+ * environment with a user's values in it. Plan 09-08 decides what is left of it.
  */
 export function testPrincipal(user: TestUser): Promise<Principal> {
   return principalFromProps({
@@ -201,13 +202,15 @@ export interface UserTools {
  *   third parameter, and each callback awaits it and logs in as that user. The
  *   staging helpers still read the ambient environment for R2, which holds no
  *   credential.
- * - The CALENDAR callbacks carry the user's Basic header, because they send
- *   through the `davFetch` built here from `envFor(user)`. But they still key
- *   the DAV cache by the ambient identity, not by this user.
+ * - The CALENDAR callbacks act for this user's principal too (Phase 9, plan
+ *   09-05). The same promise goes to `createDavFetch`, which logs in with it,
+ *   and to `registerCalendarTools`, whose callbacks key the DAV cache by it.
+ *   The login and the cache key moved together, so they always name one user.
+ *   The confirm secret and the confirm store are still read off the ambient
+ *   environment, which is shared by both users. That is Phase 10's subject.
  *
- * **Phase 9 changes only this function.** When the registrars start taking a
- * signed-in user, this is where that user's principal gets passed in. What the
- * tests ASSERT does not change.
+ * **Phase 9 changed only this function, and it is done.** Both registrars take
+ * the user's principal here. What the tests ASSERT did not change.
  *
  * **Why `call` never throws.** Inside an expected-fail body the runner counts a
  * throw from ANYWHERE as the expected failure and throws the error away. It is
@@ -255,7 +258,7 @@ export function toolsFor(user: TestUser, extra?: ExtraTools): UserTools {
 
   try {
     registerMailTools(server, createSessionGate(), principal);
-    registerCalendarTools(server, createDavFetch(principal));
+    registerCalendarTools(server, createDavFetch(principal), principal);
 
     // After the real registrations, onto the same list, so an extra tool is
     // reached through the very same `call` path as a real one.

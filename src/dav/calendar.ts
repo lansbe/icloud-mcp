@@ -103,6 +103,7 @@ import type {
   SlotCursor,
 } from "./ids";
 import type { DavFetch } from "./transport";
+import type { Principal } from "../principal";
 
 const SECONDS_PER_DAY = 86400;
 
@@ -561,6 +562,7 @@ function collectionsFrom(
  */
 async function fetchCollections(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   resolved: ResolvedDavAccount,
 ): Promise<Collection[]> {
@@ -592,10 +594,11 @@ async function fetchCollections(
  */
 export async function listCalendars(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
 ): Promise<CalendarListing> {
-  return withRediscovery(env, davFetch, "caldav", async (resolved) => {
-    const collections = await fetchCollections(env, davFetch, resolved);
+  return withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
+    const collections = await fetchCollections(env, principal, davFetch, resolved);
 
     return {
       calendars: collections.map((one) => ({
@@ -915,6 +918,7 @@ async function collectFrom(
  */
 export async function listEvents(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   options: EventListOptions,
 ): Promise<EventPage> {
@@ -922,7 +926,7 @@ export async function listEvents(
   // and that is the whole reason they share a body: a second implementation
   // here would agree with this one today and drift the first time either
   // changed, silently, and only in the rows where the two disagree.
-  return pagedEvents(env, davFetch, options, null, LISTING_TERMS);
+  return pagedEvents(env, principal, davFetch, options, null, LISTING_TERMS);
 }
 
 /**
@@ -974,6 +978,7 @@ const LISTING_TERMS: CursorTerms = {
  */
 async function pagedEvents(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   options: EventListOptions,
   matches: OccurrenceFilter | null,
@@ -1031,8 +1036,8 @@ async function pagedEvents(
 
   const pageSize = clampPageSize(options.pageSize);
 
-  return withRediscovery(env, davFetch, "caldav", async (resolved) => {
-    const collections = await fetchCollections(env, davFetch, resolved);
+  return withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
+    const collections = await fetchCollections(env, principal, davFetch, resolved);
 
     // The INTERSECTION of the decoded id with the account's own enumeration,
     // and it is the reason `collectFrom`'s request needs no separate containment
@@ -1440,6 +1445,7 @@ function freeGaps(
  */
 export async function findFreeSlots(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   options: FindSlotsOptions,
 ): Promise<SlotPage> {
@@ -1485,8 +1491,8 @@ export async function findFreeSlots(
   const durationSeconds = options.durationMinutes * 60;
   const stepSeconds = SLOT_GRANULARITY_MINUTES * 60;
 
-  return withRediscovery(env, davFetch, "caldav", async (resolved) => {
-    const collections = await fetchCollections(env, davFetch, resolved);
+  return withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
+    const collections = await fetchCollections(env, principal, davFetch, resolved);
 
     // ONE allowance for the WHOLE multi-calendar sweep (WR-01, widened from "one
     // per page" to "one per sweep"): the cost the caller pays is the sweep, and a
@@ -1770,10 +1776,11 @@ function etagFor(
  */
 export async function getEvent(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   ref: EventRef,
 ): Promise<EventDetail> {
-  return (await readEvent(env, davFetch, ref)).detail;
+  return (await readEvent(env, principal, davFetch, ref)).detail;
 }
 
 /**
@@ -2298,10 +2305,11 @@ interface ReadEvent {
  */
 async function readEvent(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   ref: EventRef,
 ): Promise<ReadEvent> {
-  return withRediscovery(env, davFetch, "caldav", async (resolved) => {
+  return withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
     // BEFORE the multi-get, because everything after this line reaches the
     // network and `./transport.ts` attaches the credential to whatever URL it is
     // handed. Inside the callback rather than above it, because `resolved.homeUrl`
@@ -2440,10 +2448,11 @@ async function readEvent(
  */
 export async function getEventWithEtag(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   ref: EventRef,
 ): Promise<EventWithEtag> {
-  const read = await readEvent(env, davFetch, ref);
+  const read = await readEvent(env, principal, davFetch, ref);
   assertEtag(read.etag);
 
   return {
@@ -2951,12 +2960,14 @@ export interface UpdatedEvent {
  */
 async function withContainedTarget<T>(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   ref: EventRef,
   write: (resolved: ResolvedDavAccount) => Promise<T>,
 ): Promise<T> {
   return withRediscovery(
     env,
+    principal,
     davFetch,
     "caldav",
     async (resolved) => {
@@ -2970,6 +2981,7 @@ async function withContainedTarget<T>(
 
 export async function updateEvent(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   ref: EventRef,
   icsBody: string,
@@ -2978,7 +2990,7 @@ export async function updateEvent(
   // FIRST. See the docstring — everything below this line can reach the wire.
   assertEtag(etag);
 
-  return withContainedTarget(env, davFetch, ref, async () => {
+  return withContainedTarget(env, principal, davFetch, ref, async () => {
     await updateCalendarObject({
       calendarObject: { url: ref.objectUrl, data: icsBody, etag },
       // Never a credential from here. `./transport.ts` attaches it per call
@@ -3093,6 +3105,7 @@ export interface DeletedEvent {
  */
 export async function deleteEvent(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   ref: EventRef,
   etag: string | null | undefined,
@@ -3100,7 +3113,7 @@ export async function deleteEvent(
   // FIRST. See the docstring — everything below this line can reach the wire.
   assertEtag(etag);
 
-  return withContainedTarget(env, davFetch, ref, async () => {
+  return withContainedTarget(env, principal, davFetch, ref, async () => {
     await deleteCalendarObject({
       calendarObject: { url: ref.objectUrl, etag },
       // Never a credential from here. `./transport.ts` attaches it per call
@@ -3316,7 +3329,7 @@ const MAILTO_SCHEME = "mailto:";
  *
  * ## Why the refusal, rather than a fallback to the login
  *
- * Falling back to `APPLE_ID` when the set advertises no usable entry would
+ * Falling back to the login address when the set advertises no usable entry would
  * produce a resource that looks correct, writes successfully and returns 2xx —
  * and that iCloud silently declines to send from, for exactly the reason above.
  * A refusal costs the user a puzzled error; the fallback costs them a meeting
@@ -3347,9 +3360,10 @@ const MAILTO_SCHEME = "mailto:";
  */
 export async function resolveOrganizerAddress(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
 ): Promise<string> {
-  return withRediscovery(env, davFetch, "caldav", async (resolved) => {
+  return withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
     let advertised: string[];
     try {
       advertised = await fetchCalendarUserAddresses({
@@ -3388,12 +3402,14 @@ export async function resolveOrganizerAddress(
 
     // The login FIRST, by a fold rather than by identity: an address set is
     // returned by a server and its case is not the user's to control.
-    const login = env.APPLE_ID;
-    if (login !== undefined) {
-      const folded = fold(login);
-      const own = addresses.find((one) => fold(one) === folded);
-      if (own !== undefined) return own;
-    }
+    //
+    // The login is the signed-in principal's Apple ID (Phase 9, D-13). It is
+    // the same identity the DAV fetch logs in as and the cache is keyed by. It
+    // is always a string: a principal cannot be built without one, so the old
+    // branch for an unset login is gone.
+    const folded = fold(principal.appleId);
+    const own = addresses.find((one) => fold(one) === folded);
+    if (own !== undefined) return own;
 
     // Then the first advertised address, and a refusal if there is none. Never
     // the login itself: an address the principal does not advertise is one
@@ -3562,6 +3578,7 @@ export interface CreatedEvent {
  */
 export async function createEvent(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   input: CreateEventInput,
 ): Promise<CreatedEvent> {
@@ -3623,6 +3640,7 @@ export async function createEvent(
 
   return withRediscovery(
     env,
+    principal,
     davFetch,
     "caldav",
     async (resolved) => {
@@ -3830,6 +3848,7 @@ function usableTerm(term: string | undefined): string | null {
  */
 export async function searchEvents(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   options: EventSearchOptions,
 ): Promise<EventPage> {
@@ -3860,7 +3879,7 @@ export async function searchEvents(
   // "Interview" and "interview" return the identical ordered set, so refusing
   // between them would be a false refusal; "interview" and "offer" do not, and
   // that is the refusal.
-  return pagedEvents(env, davFetch, options, filter, {
+  return pagedEvents(env, principal, davFetch, options, filter, {
     keywordTerm: keyword === null ? null : fold(keyword),
     attendeeTerm: attendee === null ? null : fold(attendee),
   });

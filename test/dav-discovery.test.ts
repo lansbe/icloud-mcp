@@ -20,7 +20,15 @@
 // override.
 
 import { env } from "cloudflare:workers";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import type { Env } from "../src/env";
 import {
   DavAuthError,
@@ -45,6 +53,7 @@ import {
   type BoundMailSecrets,
   ownerPrincipal,
 } from "./fixtures/bound-secrets";
+import type { Principal } from "../src/principal";
 
 // The owner's principal, as the PROMISE the real env constructor returns over
 // the pool's ambient environment. The DAV fetch builder and the registrars take
@@ -53,6 +62,14 @@ import {
 // the refusal.
 const owner = ownerPrincipal();
 owner.catch(() => {});
+
+// What that promise resolves to. Resolved once, and the very same object is
+// handed to every call: the password reader answers only the object a
+// constructor built, so it is never spread and never cloned.
+let principal: Principal;
+beforeAll(async () => {
+  principal = await owner;
+});
 
 // ---------------------------------------------------------------------------
 // The account this fixture describes
@@ -209,7 +226,7 @@ async function capture(run: () => Promise<unknown>): Promise<unknown> {
 async function warmCache(service: "caldav" | "carddav"): Promise<Stub> {
   const stub = davStub();
   vi.stubGlobal("fetch", stub.fetch);
-  const resolved = await resolveDavAccount(env, createDavFetch(owner), service);
+  const resolved = await resolveDavAccount(env, principal, createDavFetch(owner), service);
   expect(resolved.cacheHit).toBe(false);
   return stub;
 }
@@ -284,7 +301,7 @@ function envWith(kv: FakeKv): Env {
 
 describe("the discovery chain (DAV-02)", () => {
   beforeEach(async () => {
-    await clearDavCache(env);
+    await clearDavCache(env, principal);
   });
 
   afterEach(() => {
@@ -300,7 +317,7 @@ describe("the discovery chain (DAV-02)", () => {
       const stub = davStub();
       vi.stubGlobal("fetch", stub.fetch);
 
-      const resolved = await resolveDavAccount(env, createDavFetch(owner), service);
+      const resolved = await resolveDavAccount(env, principal, createDavFetch(owner), service);
 
       expect(resolved.rootUrl.startsWith(server)).toBe(true);
       expect(resolved.principalUrl).toBe(`${server}${PRINCIPAL_PATH}`);
@@ -327,7 +344,7 @@ describe("the discovery chain (DAV-02)", () => {
     });
     vi.stubGlobal("fetch", stub.fetch);
 
-    const resolved = await resolveDavAccount(env, createDavFetch(owner), "caldav");
+    const resolved = await resolveDavAccount(env, principal, createDavFetch(owner), "caldav");
 
     expect(refused.size).toBeGreaterThan(0);
     expect(resolved.homeUrl).toBe(CALDAV_HOME);
@@ -348,7 +365,7 @@ describe("the discovery chain (DAV-02)", () => {
     vi.stubGlobal("fetch", davStub({ principalHref: false }).fetch);
 
     const raised = await capture(() =>
-      resolveDavAccount(env, createDavFetch(owner), "caldav"),
+      resolveDavAccount(env, principal, createDavFetch(owner), "caldav"),
     );
 
     expect(raised).toBeInstanceOf(DavNotFoundError);
@@ -359,7 +376,7 @@ describe("the discovery chain (DAV-02)", () => {
     vi.stubGlobal("fetch", davStub({ homeHref: false }).fetch);
 
     const raised = await capture(() =>
-      resolveDavAccount(env, createDavFetch(owner), "carddav"),
+      resolveDavAccount(env, principal, createDavFetch(owner), "carddav"),
     );
 
     expect(raised).toBeInstanceOf(DavNotFoundError);
@@ -370,22 +387,35 @@ describe("the discovery chain (DAV-02)", () => {
     const stub = davStub();
     vi.stubGlobal("fetch", stub.fetch);
     const scoped = { ...env, APPLE_APP_PASSWORD: undefined };
-    // The promise the door would hand over with that secret unset.
+    // The promise the door would hand over with that secret unset. An absent
+    // secret can no longer be expressed below the door: discovery takes a
+    // principal, and none can be built from this environment. So the claim is
+    // made one level up, the way a tool callback meets it. The callback awaits
+    // the promise as the first line of its `try`, and that await is what throws.
     const refused = principalFromEnv(scoped);
     refused.catch(() => {});
 
-    const raised = await capture(() =>
-      resolveDavAccount(scoped, createDavFetch(refused), "caldav"),
+    const raised = await capture(async () =>
+      resolveDavAccount(scoped, await refused, createDavFetch(refused), "caldav"),
     );
 
-    expect(raised).toBeInstanceOf(DavAuthError);
+    // The raised value is the principal module's refusal, and the DAV
+    // categoriser reads it as an auth failure (D-10), never a connection fault.
+    expect(davToErrorCategory(raised).category).toBe("auth_failed");
+    expect(stub.observed.length).toBe(0);
+
+    // The second path to the same answer: a DAV fetch built over that promise
+    // refuses with the DAV auth error, and still sends nothing.
+    const viaFetch = await capture(() => createDavFetch(refused)(CALDAV_HOME));
+    expect(viaFetch).toBeInstanceOf(DavAuthError);
+    expect(davToErrorCategory(viaFetch).category).toBe("auth_failed");
     expect(stub.observed.length).toBe(0);
   });
 });
 
 describe("the discovery cache (DAV-03)", () => {
   beforeEach(async () => {
-    await clearDavCache(env);
+    await clearDavCache(env, principal);
   });
 
   afterEach(() => {
@@ -402,7 +432,7 @@ describe("the discovery cache (DAV-03)", () => {
 
     const warm = davStub();
     vi.stubGlobal("fetch", warm.fetch);
-    const second = await resolveDavAccount(env, createDavFetch(owner), "caldav");
+    const second = await resolveDavAccount(env, principal, createDavFetch(owner), "caldav");
 
     expect(second.cacheHit).toBe(true);
     expect(warm.observed.length).toBe(0);
@@ -417,7 +447,7 @@ describe("the discovery cache (DAV-03)", () => {
     const scoped = envWith(kv);
     vi.stubGlobal("fetch", davStub().fetch);
 
-    await resolveDavAccount(scoped, createDavFetch(owner), "caldav");
+    await resolveDavAccount(scoped, principal, createDavFetch(owner), "caldav");
 
     expect(kv.puts.length).toBe(1);
     expect(kv.puts[0].options?.expirationTtl).toBe(DISCOVERY_TTL_SECONDS);
@@ -436,8 +466,8 @@ describe("the discovery cache (DAV-03)", () => {
     const scoped = envWith(kv);
     vi.stubGlobal("fetch", davStub().fetch);
 
-    await resolveDavAccount(scoped, createDavFetch(owner), "caldav");
-    await resolveDavAccount(scoped, createDavFetch(owner), "carddav");
+    await resolveDavAccount(scoped, principal, createDavFetch(owner), "caldav");
+    await resolveDavAccount(scoped, principal, createDavFetch(owner), "carddav");
 
     // A key mismatch between the read and the write is the other way the cache
     // silently never hits: the write succeeds, and the read never finds it.
@@ -455,7 +485,7 @@ describe("the discovery cache (DAV-03)", () => {
     const kv = fakeKv();
     const scoped = envWith(kv);
     vi.stubGlobal("fetch", davStub().fetch);
-    await resolveDavAccount(scoped, createDavFetch(owner), "caldav");
+    await resolveDavAccount(scoped, principal, createDavFetch(owner), "caldav");
 
     const key = kv.puts[0].key;
     expect(key).not.toContain(bound.APPLE_ID);
@@ -472,6 +502,7 @@ describe("the discovery cache (DAV-03)", () => {
 
     const resolved = await resolveDavAccount(
       scoped,
+      principal,
       createDavFetch(owner),
       "caldav",
     );
@@ -484,11 +515,11 @@ describe("the discovery cache (DAV-03)", () => {
   it("clears one service without disturbing the other", async () => {
     await warmCache("caldav");
     await warmCache("carddav");
-    await clearDavCache(env, "carddav");
+    await clearDavCache(env, principal, "carddav");
 
     const stub = davStub();
     vi.stubGlobal("fetch", stub.fetch);
-    const caldav = await resolveDavAccount(env, createDavFetch(owner), "caldav");
+    const caldav = await resolveDavAccount(env, principal, createDavFetch(owner), "caldav");
 
     expect(caldav.cacheHit).toBe(true);
     expect(stub.observed.length).toBe(0);
@@ -497,7 +528,7 @@ describe("the discovery cache (DAV-03)", () => {
 
 describe("D-60: the failure matrix", () => {
   beforeEach(async () => {
-    await clearDavCache(env);
+    await clearDavCache(env, principal);
   });
 
   afterEach(() => {
@@ -520,7 +551,7 @@ describe("D-60: the failure matrix", () => {
     let attempts = 0;
 
     try {
-      await withRediscovery(env, davFetch, "caldav", async (resolved) => {
+      await withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
         attempts += 1;
         return davFetch(target(resolved.homeUrl), { method: "REPORT" });
       });
@@ -571,7 +602,7 @@ describe("D-60: the failure matrix", () => {
 
       const after = davStub();
       vi.stubGlobal("fetch", after.fetch);
-      const resolved = await resolveDavAccount(env, createDavFetch(owner), "caldav");
+      const resolved = await resolveDavAccount(env, principal, createDavFetch(owner), "caldav");
 
       expect(resolved.cacheHit).toBe(true);
       expect(after.observed.length).toBe(0);
@@ -674,7 +705,7 @@ describe("D-60: the failure matrix", () => {
 
     const raised = await capture(() =>
       withRediscovery(
-        env,
+        env, principal,
         davFetch,
         "caldav",
         async (resolved) => {
@@ -693,7 +724,7 @@ describe("D-60: the failure matrix", () => {
     // And the entry survives, because nothing deleted it.
     const after = davStub();
     vi.stubGlobal("fetch", after.fetch);
-    expect((await resolveDavAccount(env, createDavFetch(owner), "caldav")).cacheHit).toBe(
+    expect((await resolveDavAccount(env, principal, createDavFetch(owner), "caldav")).cacheHit).toBe(
       true,
     );
   });
@@ -711,7 +742,7 @@ describe("D-60: the failure matrix", () => {
     let attempts = 0;
 
     const raised = await capture(() =>
-      withRediscovery(env, davFetch, "caldav", async (resolved) => {
+      withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
         attempts += 1;
         return davFetch(`${resolved.homeUrl}query/`, { method: "REPORT" });
       }),
@@ -805,7 +836,7 @@ describe("D-60: the failure matrix", () => {
     vi.stubGlobal("fetch", davStub().fetch);
 
     const value = await withRediscovery(
-      env,
+      env, principal,
       createDavFetch(owner),
       "caldav",
       async (resolved) => resolved.homeUrl,

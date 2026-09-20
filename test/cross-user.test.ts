@@ -50,7 +50,15 @@
 // real Apple ID (D-09).
 
 import { env } from "cloudflare:workers";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { getEvent } from "../src/dav/calendar";
 import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
 import { DavNotFoundError } from "../src/dav/errors";
@@ -89,6 +97,24 @@ import {
 import type { StagedAttachments } from "../src/mcp/tools/mail";
 import type { TwoUserDavStub } from "./fixtures/two-user-dav";
 import type { Attempt, RecordedToolResult } from "./fixtures/two-users";
+import type { Principal } from "../src/principal";
+import { ownerPrincipal } from "./fixtures/bound-secrets";
+
+// The owner's principal, as the PROMISE the real env constructor returns over
+// the pool's ambient environment. The DAV fetch builder and the registrars take
+// the promise. The no-op handler means a file that builds it and awaits it
+// nowhere leaves no rejection unheard. Everyone who does await it still sees
+// the refusal.
+const owner = ownerPrincipal();
+owner.catch(() => {});
+
+// What that promise resolves to. Resolved once, and the very same object is
+// handed to every call: the password reader answers only the object a
+// constructor built, so it is never spread and never cloned.
+let principal: Principal;
+beforeAll(async () => {
+  principal = await owner;
+});
 
 const DECODER = new TextDecoder();
 const ENCODER = new TextEncoder();
@@ -259,13 +285,17 @@ async function everyConfirmKey(): Promise<string[]> {
  * they were handed. A home left behind under any of the three would let one
  * test's discovery answer another test's question.
  *
+ * Since Phase 9 plan 09-05 that first sentence is history: the callbacks and
+ * the functions under them both key the cache by the signed-in principal. All
+ * three are still cleared, because a case may act as any of the three.
+ *
  * One at a time, never together. Each is a store operation, and this project
  * does not fan those out.
  */
 async function forgetEveryDavHome(): Promise<void> {
-  await clearDavCache(env, "caldav");
-  await clearDavCache(envFor(USER_A), "caldav");
-  await clearDavCache(envFor(USER_B), "caldav");
+  await clearDavCache(env, principal, "caldav");
+  await clearDavCache(env, await testPrincipal(USER_A), "caldav");
+  await clearDavCache(env, await testPrincipal(USER_B), "caldav");
 }
 
 /**
@@ -826,7 +856,8 @@ describe("DAV_CACHE: a cached home belongs to the account it was resolved for", 
     vi.stubGlobal("fetch", stub.fetch);
 
     const firstA = await resolveDavAccount(
-      envFor(USER_A),
+      env,
+      await testPrincipal(USER_A),
       createDavFetch(testPrincipal(USER_A)),
       "caldav",
     );
@@ -834,7 +865,8 @@ describe("DAV_CACHE: a cached home belongs to the account it was resolved for", 
     expect(firstA.homeUrl, "A did not resolve to A's home").toBe(HOME_A);
 
     const firstB = await resolveDavAccount(
-      envFor(USER_B),
+      env,
+      await testPrincipal(USER_B),
       createDavFetch(testPrincipal(USER_B)),
       "caldav",
     );
@@ -857,7 +889,8 @@ describe("DAV_CACHE: a cached home belongs to the account it was resolved for", 
 
     // B resolving did not move A's entry.
     const secondA = await resolveDavAccount(
-      envFor(USER_A),
+      env,
+      await testPrincipal(USER_A),
       createDavFetch(testPrincipal(USER_A)),
       "caldav",
     );
@@ -880,7 +913,8 @@ describe("home-set check: an event id only works under the caller's own home", (
     vi.stubGlobal("fetch", stub.fetch);
 
     const detail = await getEvent(
-      envFor(USER_A),
+      env,
+      await testPrincipal(USER_A),
       createDavFetch(testPrincipal(USER_A)),
       decodeEventId(EVENT_A_ID),
     );
@@ -906,7 +940,8 @@ describe("home-set check: an event id only works under the caller's own home", (
     let thrown: unknown = null;
     try {
       received = await getEvent(
-        envFor(USER_B),
+        env,
+        await testPrincipal(USER_B),
         createDavFetch(testPrincipal(USER_B)),
         decodeEventId(EVENT_A_ID),
       );
@@ -948,6 +983,10 @@ describe("home-set check: an event id only works under the caller's own home", (
 // alone, B's commit would find the home A's preview just cached, the home-set
 // check would pass for B, and the test would be measuring this fixture instead
 // of the code. The warning sign is "B's commit is not refused".
+//
+// Since Phase 9 plan 09-05 the callbacks key that cache by the signed-in
+// principal, so B's commit can no longer find A's home. The step is kept: it is
+// harmless, and removing it is not that plan's call.
 // ---------------------------------------------------------------------------
 
 /** What A's preview handed back: the one-time token and the change it covers. */
@@ -967,7 +1006,7 @@ interface PreviewOfA {
  */
 async function previewAsA(stub: TwoUserDavStub): Promise<PreviewOfA | null> {
   try {
-    await clearDavCache(env, "caldav");
+    await clearDavCache(env, principal, "caldav");
     vi.stubGlobal("fetch", stub.fetch);
 
     const result = await toolsFor(USER_A).call("calendar_update_event", {
@@ -1085,7 +1124,7 @@ describe("confirm token: a one-time confirmation belongs to the user who preview
     expect(preview, "the fixture failed to preview").not.toBeNull();
     if (preview === null) throw new Error("unreachable");
 
-    await clearDavCache(env, "caldav");
+    await clearDavCache(env, principal, "caldav");
     const resultB = await toolsFor(USER_B).call("calendar_commit", {
       confirmToken: preview.confirmToken,
       change: preview.change,
@@ -1150,7 +1189,7 @@ describe("confirm token: a one-time confirmation belongs to the user who preview
     if (preview === null) return;
 
     // B's turn. Forget the home A's preview cached, or B would be handed it.
-    const beforeB = await attempt(() => clearDavCache(env, "caldav"));
+    const beforeB = await attempt(() => clearDavCache(env, principal, "caldav"));
     if (beforeB.refused) return;
     const resultB = await toolsFor(USER_B).call("calendar_commit", {
       confirmToken: preview.confirmToken,
@@ -1158,7 +1197,7 @@ describe("confirm token: a one-time confirmation belongs to the user who preview
     });
 
     // A's turn again. Forget B's home the same way.
-    const beforeA = await attempt(() => clearDavCache(env, "caldav"));
+    const beforeA = await attempt(() => clearDavCache(env, principal, "caldav"));
     if (beforeA.refused) return;
     const resultA = await toolsFor(USER_A).call("calendar_commit", {
       confirmToken: preview.confirmToken,
@@ -1193,7 +1232,7 @@ describe("confirm token: a one-time confirmation belongs to the user who preview
     if (jti === null) return;
 
     // B's turn. Forget the home A's preview cached, or B would be handed it.
-    const beforeB = await attempt(() => clearDavCache(env, "caldav"));
+    const beforeB = await attempt(() => clearDavCache(env, principal, "caldav"));
     if (beforeB.refused) return;
     const resultB = await toolsFor(USER_B).call("calendar_commit", {
       confirmToken: preview.confirmToken,

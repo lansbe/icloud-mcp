@@ -14,7 +14,15 @@
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { SAFE_MESSAGES } from "../src/errors";
 import type { DavDiagnosticOutcome } from "../src/dav/diagnose";
 import { runDavDiagnosticOutcome } from "../src/dav/diagnose";
@@ -31,6 +39,7 @@ import {
   assertMailSecretsBound,
   ownerPrincipal,
 } from "./fixtures/bound-secrets";
+import type { Principal } from "../src/principal";
 
 // The owner's principal, as the PROMISE the real env constructor returns over
 // the pool's ambient environment. The DAV fetch builder and the registrars take
@@ -39,6 +48,14 @@ import {
 // the refusal.
 const owner = ownerPrincipal();
 owner.catch(() => {});
+
+// What that promise resolves to. Resolved once, and the very same object is
+// handed to every call: the password reader answers only the object a
+// constructor built, so it is never spread and never cloned.
+let principal: Principal;
+beforeAll(async () => {
+  principal = await owner;
+});
 
 // ---------------------------------------------------------------------------
 // The account this fixture describes
@@ -207,6 +224,9 @@ function davStub(
 /** Pull the one registered `dav_diagnose` callback out, without a real server. */
 function diagnoseHandler(
   davFetch: ReturnType<typeof createDavFetch>,
+  // Who the callback acts for. The owner, unless a case hands in a promise of
+  // its own, such as one that rejects.
+  who: Promise<Principal> = owner,
 ): (args: { refresh?: boolean }) => Promise<{
   isError?: boolean;
   content: { type: "text"; text: string }[];
@@ -229,7 +249,7 @@ function diagnoseHandler(
       captured = callback;
     },
   };
-  registerDavDiagnoseTool(server as unknown as McpServer, davFetch);
+  registerDavDiagnoseTool(server as unknown as McpServer, davFetch, who);
   expect(captured, "dav_diagnose registered no callback").not.toBeNull();
   return captured!;
 }
@@ -250,7 +270,7 @@ function serviceOf(
 
 describe("dav_diagnose, end to end", () => {
   beforeEach(async () => {
-    await clearDavCache(env);
+    await clearDavCache(env, principal);
   });
 
   afterEach(() => {
@@ -321,7 +341,7 @@ describe("dav_diagnose, end to end", () => {
 
     const cold = davStub();
     vi.stubGlobal("fetch", cold.fetch);
-    const cached = await resolveDavAccount(env, createDavFetch(owner), "caldav");
+    const cached = await resolveDavAccount(env, principal, createDavFetch(owner), "caldav");
 
     expect(cached.cacheHit).toBe(true);
     expect(cached.homeUrl).toBe(CALDAV_HOME);
@@ -402,19 +422,18 @@ describe("dav_diagnose, end to end", () => {
     const stub = davStub();
     vi.stubGlobal("fetch", stub.fetch);
 
+    // An absent secret can no longer be expressed below the door: the
+    // diagnostic takes a principal, and none can be built without both values.
+    // So the REGISTERED callback is driven with the promise the door would hand
+    // over. It rejects, the callback's first await throws, and the callback's
+    // own catch shapes the refusal. Same two assertions as before, on the same
+    // two fields.
     const refused = principalFromEnv({ ...env, APPLE_ID: undefined });
     refused.catch(() => {});
 
-    const outcome: DavDiagnosticOutcome = await runDavDiagnosticOutcome(
-      { ...env, APPLE_ID: undefined },
-      createDavFetch(refused),
-      { refresh: false },
-    );
+    const shaped = await diagnoseHandler(createDavFetch(refused), refused)({});
 
-    expect(outcome.failed).toBe(true);
     expect(stub.requests.length).toBe(0);
-
-    const shaped = davDiagnosticResult(outcome);
     expect(shaped.isError).toBe(true);
     const body = JSON.parse(shaped.content[0].text) as {
       category: string;

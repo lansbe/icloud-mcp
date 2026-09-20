@@ -58,6 +58,7 @@ import type {
   ContactTel,
   ParsedContact,
 } from "./vcard";
+import type { Principal } from "../principal";
 
 /**
  * The report name that decides the route, as the library spells it.
@@ -365,9 +366,10 @@ async function fetchBooks(
  */
 export async function listAddressBooks(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
 ): Promise<AddressBookListing> {
-  return withRediscovery(env, davFetch, "carddav", async (resolved) => {
+  return withRediscovery(env, principal, davFetch, "carddav", async (resolved) => {
     const books = await fetchBooks(davFetch, resolved);
 
     return {
@@ -780,6 +782,7 @@ function detailFor(
  */
 export async function searchContacts(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   options: ContactSearchOptions,
 ): Promise<ContactPage> {
@@ -796,7 +799,7 @@ export async function searchContacts(
 
   const pageSize = clampPageSize(options.pageSize);
 
-  return withRediscovery(env, davFetch, "carddav", async (resolved) => {
+  return withRediscovery(env, principal, davFetch, "carddav", async (resolved) => {
     const books = await fetchBooks(davFetch, resolved);
 
     const pending: PendingContact[] = [];
@@ -913,10 +916,11 @@ export async function searchContacts(
  */
 export async function getContact(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   ref: ContactRef,
 ): Promise<ContactDetail> {
-  return withRediscovery(env, davFetch, "carddav", async (resolved) => {
+  return withRediscovery(env, principal, davFetch, "carddav", async (resolved) => {
     // BEFORE the multi-get, because everything after this line reaches the
     // network and `./transport.ts` attaches the credential to whatever URL it is
     // handed. Both URLs, because each independently names what the server is

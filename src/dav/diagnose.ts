@@ -24,6 +24,7 @@ import {
   resolveDavAccount,
 } from "./discovery";
 import type { DavFetch } from "./transport";
+import type { Principal } from "../principal";
 
 /** Where the time went, stage by stage. `null` means "this stage did not run". */
 export interface DavServiceTimings {
@@ -204,16 +205,17 @@ function reportNamesOf(collections: { reports?: unknown }[]): string[] {
  */
 export async function runDavDiagnosticOutcome(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   options: { refresh: boolean },
 ): Promise<DavDiagnosticOutcome> {
   const report = emptyReport(options.refresh);
 
   try {
-    if (options.refresh) await clearDavCache(env);
+    if (options.refresh) await clearDavCache(env, principal);
 
     for (const service of DAV_SERVICES) {
-      await runOneService(env, davFetch, service, report[service]);
+      await runOneService(env, principal, davFetch, service, report[service]);
     }
   } catch (err) {
     return { report, failed: true, error: err };
@@ -224,12 +226,13 @@ export async function runDavDiagnosticOutcome(
 
 async function runOneService(
   env: Env,
+  principal: Principal,
   davFetch: DavFetch,
   service: DavService,
   into: DavServiceReport,
 ): Promise<void> {
   const discoveryStart = Date.now();
-  const resolved = await resolveDavAccount(env, davFetch, service);
+  const resolved = await resolveDavAccount(env, principal, davFetch, service);
   into.timings.discoveryMs = Date.now() - discoveryStart;
   fillResolved(into, resolved);
 

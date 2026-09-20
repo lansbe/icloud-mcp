@@ -95,6 +95,7 @@ import type { AttendeeChange, NormalizedChange } from "../../confirm";
 import type { ToolResult } from "../untrusted";
 import { untrustedToolResult } from "../untrusted";
 import { davErrorResult } from "./dav-diagnose";
+import type { Principal } from "../../principal";
 
 /**
  * The line every calendar tool description carries (D-39 layer 1).
@@ -1481,13 +1482,14 @@ function scopeRefusalFor(
  * relearns; a refusal that names itself is one it can report.
  */
 async function buildPreview(
+  principal: Principal,
   davFetch: DavFetch,
   ref: EventRef,
   id: string,
   requested: UpdateRequest,
   scope: WriteScope | undefined,
 ): Promise<EventPreview> {
-  const read = await getEventWithEtag(env, davFetch, ref);
+  const read = await getEventWithEtag(env, principal, davFetch, ref);
   const current = currentChange(read.detail);
   const desired: NormalizedChange = {
     ...desiredChange(current, requested),
@@ -1761,12 +1763,13 @@ function addedFields(change: NormalizedChange): FieldChange[] {
  * saying nothing, because a send must never be inferred from silence.
  */
 async function buildDeletePreview(
+  principal: Principal,
   davFetch: DavFetch,
   ref: EventRef,
   id: string,
   scope: WriteScope | undefined,
 ): Promise<EventPreview> {
-  const read = await getEventWithEtag(env, davFetch, ref);
+  const read = await getEventWithEtag(env, principal, davFetch, ref);
   const change = deletionChange(read.detail, scope);
   const fields = removedFields(change);
   const recipients = change.attendees;
@@ -1995,6 +1998,7 @@ function createChange(
  * from `If-Match`.
  */
 async function buildCreatePreview(
+  principal: Principal,
   davFetch: DavFetch,
   requested: CreateRequest,
   recipients: AttendeeChange[],
@@ -2061,7 +2065,7 @@ async function buildCreatePreview(
   // and a preview that echoed the account's own address would put an identity
   // into a block the model is free to repeat. What this call buys is the
   // refusal above — an account that cannot organise a meeting finds out now.
-  await resolveOrganizerAddress(env, davFetch);
+  await resolveOrganizerAddress(env, principal, davFetch);
 
   const confirmToken = await mintConfirmation(
     {
@@ -2178,6 +2182,7 @@ interface SuppliedChange {
  * resolved URL verbatim, which carries the account DSID.
  */
 async function observeDelivery(
+  principal: Principal,
   davFetch: DavFetch,
   ref: EventRef,
   recipientCount: number,
@@ -2185,7 +2190,7 @@ async function observeDelivery(
   if (recipientCount === 0) return UNOBSERVED_DELIVERY;
 
   try {
-    const read = await getEventWithEtag(env, davFetch, ref);
+    const read = await getEventWithEtag(env, principal, davFetch, ref);
     return deliveryReportOf(read.detail.attendees);
   } catch {
     return UNOBSERVED_DELIVERY;
@@ -2233,13 +2238,14 @@ async function observeDelivery(
  * condition.
  */
 async function occurrenceBody(
+  principal: Principal,
   davFetch: DavFetch,
   ref: EventRef,
   signedEtag: string | null,
   input: BuildEventInput,
   scope: WriteScope,
 ): Promise<{ body: string; affected: number | string; scheduling: boolean }> {
-  const read = await getEventWithEtag(env, davFetch, ref);
+  const read = await getEventWithEtag(env, principal, davFetch, ref);
   if (signedEtag === null || read.etag !== signedEtag) {
     throw new DavStaleResourceError();
   }
@@ -2326,13 +2332,14 @@ async function occurrenceBody(
  * the same number, and each writer reads it from the place that is right for it.
  */
 async function scopelessBody(
+  principal: Principal,
   davFetch: DavFetch,
   ref: EventRef,
   signedEtag: string | null,
   carriedSequence: number | null,
   input: BuildEventInput,
 ): Promise<{ body: string; scheduling: boolean }> {
-  const read = await getEventWithEtag(env, davFetch, ref);
+  const read = await getEventWithEtag(env, principal, davFetch, ref);
   if (signedEtag === null || read.etag !== signedEtag) {
     throw new DavStaleResourceError();
   }
@@ -2390,12 +2397,13 @@ async function scopelessBody(
  * distinction precisely so a later plan could dispatch between them.
  */
 async function applyNarrowedDelete(
+  principal: Principal,
   davFetch: DavFetch,
   ref: EventRef,
   signedEtag: string | null,
   scope: WriteScope,
 ): Promise<{ id: string; applied: boolean; affected: number | string }> {
-  const read = await getEventWithEtag(env, davFetch, ref);
+  const read = await getEventWithEtag(env, principal, davFetch, ref);
   if (signedEtag === null || read.etag !== signedEtag) {
     throw new DavStaleResourceError();
   }
@@ -2418,8 +2426,8 @@ async function applyNarrowedDelete(
 
   const written =
     plan.removesResource || plan.body === null
-      ? await deleteEvent(env, davFetch, ref, signedEtag)
-      : await updateEvent(env, davFetch, ref, plan.body, signedEtag);
+      ? await deleteEvent(env, principal, davFetch, ref, signedEtag)
+      : await updateEvent(env, principal, davFetch, ref, plan.body, signedEtag);
 
   return { ...written, affected };
 }
@@ -2500,6 +2508,7 @@ function isDispatchableScope(scope: string | null): boolean {
  * way to reach one is a model probing the format.
  */
 async function applyCommit(
+  principal: Principal,
   davFetch: DavFetch,
   confirmToken: string,
   supplied: SuppliedChange,
@@ -2588,9 +2597,9 @@ async function applyCommit(
     // decision and its cost are recorded on `resolveOrganizerAddress`: an
     // attendee-carrying write pays a serial +1 per leg on a path that is
     // already gated behind a human confirmation.
-    const organizer = await resolveOrganizerAddress(env, davFetch);
+    const organizer = await resolveOrganizerAddress(env, principal, davFetch);
 
-    const written = await createEvent(env, davFetch, {
+    const written = await createEvent(env, principal, davFetch, {
       // Re-minted from the SIGNED collection URL, so the write lands where the
       // confirmation says and not where a re-supplied argument asks.
       calendarId: encodeCalendarId({ collectionUrl: payload.c }),
@@ -2619,6 +2628,7 @@ async function applyCommit(
     // iCloud says it did — the write's own 2xx says the resource was accepted
     // and nothing at all about anyone being told.
     const delivery = await observeDelivery(
+      principal,
       davFetch,
       ref,
       change.attendees.length,
@@ -2674,9 +2684,9 @@ async function applyCommit(
     // whole-resource `DELETE` by falling past two positive matches.
     const removed =
       change.scope === "occurrence" || change.scope === "this-and-future"
-        ? await applyNarrowedDelete(davFetch, ref, payload.e, change.scope)
+        ? await applyNarrowedDelete(principal, davFetch, ref, payload.e, change.scope)
         : {
-            ...(await deleteEvent(env, davFetch, ref, payload.e)),
+            ...(await deleteEvent(env, principal, davFetch, ref, payload.e)),
             // A scopeless removal is only ever reached for a resource that does
             // not repeat — `deleteBlockerOf` refuses one that does, precisely
             // because it would take every occurrence while the preview
@@ -2763,9 +2773,10 @@ async function applyCommit(
   // two positive matches.
   const rewrite =
     change.scope === "occurrence" || change.scope === "this-and-future"
-      ? await occurrenceBody(davFetch, ref, payload.e, buildInput, change.scope)
+      ? await occurrenceBody(principal, davFetch, ref, payload.e, buildInput, change.scope)
       : {
           ...(await scopelessBody(
+            principal,
             davFetch,
             ref,
             payload.e,
@@ -2781,7 +2792,7 @@ async function applyCommit(
           affected: 1 as number | string,
         };
 
-  const written = await updateEvent(env, davFetch, ref, rewrite.body, payload.e);
+  const written = await updateEvent(env, principal, davFetch, ref, rewrite.body, payload.e);
 
   // **Only for a resource that actually carries people.** A rebuild wrote no
   // `ATTENDEE` at all, so there is nothing for iCloud to have reported and the
@@ -2789,7 +2800,7 @@ async function applyCommit(
   // makes the count zero for the arm where the change's array is a description
   // of a resource that no longer describes it.
   const recipientCount = rewrite.scheduling ? change.attendees.length : 0;
-  const delivery = await observeDelivery(davFetch, ref, recipientCount);
+  const delivery = await observeDelivery(principal, davFetch, ref, recipientCount);
 
   return {
     applied: written.applied,
@@ -3036,6 +3047,7 @@ function withinSlotDayCap(start: string, end: string): boolean {
 export function registerCalendarTools(
   server: McpServer,
   davFetch: DavFetch,
+  principal: Promise<Principal>,
 ): void {
   server.registerTool(
     "calendar_list_calendars",
@@ -3050,7 +3062,10 @@ export function registerCalendarTools(
     },
     async () => {
       try {
-        return calendarListToolResult(await listCalendars(env, davFetch));
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
+        return calendarListToolResult(await listCalendars(env, actor, davFetch));
       } catch (err) {
         // The same backstop shape every tool in this tree uses: one boundary,
         // one fixed vocabulary, nothing of the caught value escaping.
@@ -3116,6 +3131,9 @@ export function registerCalendarTools(
     },
     async ({ start, end, calendarId, pageSize, cursor }) => {
       try {
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
         const range = rangeOf(start, end);
         // Unreachable through the schema, which refines on exactly this. Kept
         // because the alternative is a non-null assertion, and an assertion is
@@ -3123,7 +3141,7 @@ export function registerCalendarTools(
         if (range === null) throw new DavNotFoundError();
 
         return eventPageToolResult(
-          await listEvents(env, davFetch, {
+          await listEvents(env, actor, davFetch, {
             calendarId,
             rangeStart: range.start,
             rangeEnd: range.end,
@@ -3152,10 +3170,13 @@ export function registerCalendarTools(
     },
     async ({ id }) => {
       try {
-        // Decoded FIRST, before the KV read discovery performs and before any
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
+        // Decoded next, before the KV read discovery performs and before any
         // outbound request. The cheapest possible refusal, and the one that
         // spends none of the connection budget.
-        return eventToolResult(await getEvent(env, davFetch, decodeEventId(id)));
+        return eventToolResult(await getEvent(env, actor, davFetch, decodeEventId(id)));
       } catch (err) {
         return davErrorResult(err);
       }
@@ -3226,13 +3247,16 @@ export function registerCalendarTools(
     },
     async ({ keyword, attendee, start, end, calendarId, pageSize, cursor }) => {
       try {
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
         const range = rangeOf(start, end);
         if (range === null) throw new DavNotFoundError();
 
         // The same shaper the plain listing uses. A search result IS a
         // listing, so it is not given a second response shape to learn.
         return eventPageToolResult(
-          await searchEvents(env, davFetch, {
+          await searchEvents(env, actor, davFetch, {
             keyword,
             attendee,
             calendarId,
@@ -3334,6 +3358,9 @@ export function registerCalendarTools(
     },
     async ({ start, end, durationMinutes, tzid, workingHours, pageSize, cursor }) => {
       try {
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
         // Anchored to the CALLER's tzid, not UTC midnight — see `slotRangeOf`.
         // `null` on an unsupported zone, which the service layer then reports as
         // unsupportedTimezone; a thrown range error here would be misleading.
@@ -3346,7 +3373,7 @@ export function registerCalendarTools(
         // service as unsupportedTimezone with no request made, so hand it a range
         // it will not use rather than a null: the tzid check fires first there.
         return slotPageToolResult(
-          await findFreeSlots(env, davFetch, {
+          await findFreeSlots(env, actor, davFetch, {
             rangeStart: range?.start ?? 0,
             rangeEnd: range?.end ?? 0,
             durationMinutes,
@@ -3477,6 +3504,9 @@ export function registerCalendarTools(
       attendees,
     }) => {
       try {
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
         // **COLLAPSE FIRST, then discriminate.** Three spellings of one address
         // is one recipient and must not gate differently from one spelling of
         // it, and the count the preview reports has to be the count the
@@ -3494,7 +3524,7 @@ export function registerCalendarTools(
         // making it pay for one would tax the tool this surface calls most.
         if (recipients.length === 0) {
           return eventCreatedToolResult(
-            await createEvent(env, davFetch, {
+            await createEvent(env, actor, davFetch, {
               calendarId,
               summary,
               startLocal,
@@ -3514,6 +3544,7 @@ export function registerCalendarTools(
         return previewToolResult(
           await withConfirmationBoundary(() =>
             buildCreatePreview(
+              actor,
               davFetch,
               {
                 calendarId,
@@ -3599,13 +3630,17 @@ export function registerCalendarTools(
       scope,
     }) => {
       try {
-        // Decoded FIRST, before the KV read discovery performs and before any
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
+        // Decoded next, before the KV read discovery performs and before any
         // outbound request. The cheapest possible refusal of a forged id.
         const ref = decodeEventId(id);
 
         return previewToolResult(
           await withConfirmationBoundary(() =>
             buildPreview(
+              actor,
               davFetch,
               ref,
               id,
@@ -3666,13 +3701,16 @@ export function registerCalendarTools(
     },
     async ({ id, scope }) => {
       try {
-        // Decoded FIRST, before the KV read discovery performs and before any
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
+        // Decoded next, before the KV read discovery performs and before any
         // outbound request. The cheapest possible refusal of a forged id.
         const ref = decodeEventId(id);
 
         return previewToolResult(
           await withConfirmationBoundary(() =>
-            buildDeletePreview(davFetch, ref, id, scope),
+            buildDeletePreview(actor, davFetch, ref, id, scope),
           ),
         );
       } catch (err) {
@@ -3740,9 +3778,12 @@ export function registerCalendarTools(
     },
     async ({ confirmToken, change }) => {
       try {
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
         return commitToolResult(
           await withConfirmationBoundary(() =>
-            applyCommit(davFetch, confirmToken, change),
+            applyCommit(actor, davFetch, confirmToken, change),
           ),
         );
       } catch (err) {

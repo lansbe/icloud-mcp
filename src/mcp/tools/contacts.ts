@@ -35,6 +35,7 @@ import type { DavFetch } from "../../dav/transport";
 import type { ToolResult } from "../untrusted";
 import { untrustedToolResult } from "../untrusted";
 import { davErrorResult } from "./dav-diagnose";
+import type { Principal } from "../../principal";
 
 /**
  * The line every contacts tool description carries (D-39 layer 1).
@@ -252,6 +253,7 @@ export function contactToolResult(detail: ContactDetail): ToolResult {
 export function registerContactsTools(
   server: McpServer,
   davFetch: DavFetch,
+  principal: Promise<Principal>,
 ): void {
   server.registerTool(
     "contacts_search",
@@ -285,8 +287,11 @@ export function registerContactsTools(
     },
     async ({ term, pageSize, cursor }) => {
       try {
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
         return contactPageToolResult(
-          await searchContacts(env, davFetch, { term, pageSize, cursor }),
+          await searchContacts(env, actor, davFetch, { term, pageSize, cursor }),
         );
       } catch (err) {
         // The same backstop shape every tool in this tree uses: one boundary,
@@ -308,11 +313,14 @@ export function registerContactsTools(
     },
     async ({ id }) => {
       try {
-        // Decoded FIRST, before the KV read discovery performs and before any
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
+        // Decoded next, before the KV read discovery performs and before any
         // outbound request. The cheapest possible refusal, and the one that
         // spends none of the connection budget.
         return contactToolResult(
-          await getContact(env, davFetch, decodeContactId(id)),
+          await getContact(env, actor, davFetch, decodeContactId(id)),
         );
       } catch (err) {
         return davErrorResult(err);
