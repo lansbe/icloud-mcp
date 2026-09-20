@@ -95,6 +95,9 @@ export declare const PROPS_READER_SCOPE: string;
 export declare const PASSWORD_READER_IMPORT: RegExp;
 export declare const PASSWORD_READER_OWNERS: readonly string[];
 export declare const PASSWORD_READER_SCOPE: string;
+export declare const MAIL_SECRET_READ: RegExp;
+export declare const MAIL_SECRET_READ_OWNER: string;
+export declare const MAIL_SECRET_READ_SCOPE: string;
 export declare const OWNERSHIP_VIOLATION_IDS: readonly string[];
 
 export declare function checkDavHostOwnership(
@@ -114,4 +117,7 @@ export declare function checkPropsReaderOwnership(
 ): Violation[];
 export declare function checkPasswordReaderOwnership(
   importers: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function checkMailSecretReaderOwnership(
+  readers: ReadonlyArray<OwnershipMatch>,
 ): Violation[];

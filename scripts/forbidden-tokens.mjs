@@ -905,6 +905,65 @@ export const PASSWORD_READER_OWNERS = Object.freeze([
 export const PASSWORD_READER_SCOPE = "src/";
 
 /**
+ * A read of one of the two mail secrets off the environment object, permitted
+ * in exactly one file of the source tree.
+ *
+ * THE RULE. Exactly one file under `src/` reads either mail secret off the
+ * environment object, and it is `src/principal.ts` — the one constructor that
+ * turns the owner's two Worker secrets into a principal. Phase 13 removes the
+ * secrets and that constructor together. Until then, everything else that acts
+ * for the owner is handed the principal and never sees a secret name.
+ *
+ * WHY A COUNT RATHER THAN A NEGATIVE. A second reader is a second place a
+ * password enters the program without a principal around it, arriving without a
+ * decision. Zero is the other failure and the quieter one: it means the owner's
+ * constructor was deleted, renamed, or stopped spelling the read this way, and
+ * nothing fails on the way out — the tests that covered the deleted code leave
+ * with it. "No second reader" is trivially true of a tree with no reader at all.
+ *
+ * WHY THE LOGIN GATE'S SECRET IS LEFT OUT (Phase 9 D-28). The gate's own secret
+ * is not an Apple credential: it gates the authorize form and reaches no
+ * account. It has its own single reader in the login gate, and folding it in
+ * here would make one count answer two different questions. The pattern names
+ * the two mail secrets only, and a row in the test pins the gate's secret as a
+ * miss so nobody adds it later by accident.
+ *
+ * WHAT IT DOES NOT SEE. Each of these reads a mail secret and fires nothing:
+ *
+ *   1. a destructuring of the environment object (`const { APPLE_ID } = env`);
+ *   2. an index access with the name as a string (`env["APPLE_ID"]`);
+ *   3. an alias of the environment object under another name (`e.APPLE_ID`);
+ *   4. a narrow-typed parameter under another name (`secrets.APPLE_ID`).
+ *
+ * The compiler is the FIRST check for all four (Phase 9 D-14). The three secret
+ * names left the shared binding type, so a stray reader does not compile at all,
+ * and `test/env-narrowing.test.ts` pins that with expect-error lines. This count
+ * is the SECOND check, and it exists because the compiler sees types while this
+ * sees text: a cast, a comment or a file the typecheck never reaches gets past
+ * one and not the other. Neither sees everything.
+ *
+ * THE OWNER IS FOUND BY THE SPELLING. The pattern anchors on an identifier
+ * named `env`, so the owner's parameter must keep that name. Rename it and this
+ * count reports the owner as missing, which is the point: a renamed parameter is
+ * how the read would quietly stop being seen.
+ *
+ * Comments count. In every file under `src/` except the owner, write "the two
+ * mail secrets" or "the Apple ID secret" and never the spelled read. A comment
+ * that spells it fails the commit hook in the middle of unrelated work. No `g`
+ * flag: `scan()` uses `String.prototype.search`, which takes the first match
+ * only.
+ */
+export const MAIL_SECRET_READ = /\benv\.(?:APPLE_ID|APPLE_APP_PASSWORD)\b/;
+
+/** The one file under `MAIL_SECRET_READ_SCOPE` permitted to match
+ *  `MAIL_SECRET_READ`. */
+export const MAIL_SECRET_READ_OWNER = "src/principal.ts";
+
+/** The tree `MAIL_SECRET_READ` is collected from. Tests bind all three secrets
+ *  and must be able to spell them, and a test is not a credential path. */
+export const MAIL_SECRET_READ_SCOPE = "src/";
+
+/**
  * Every violation id a count constraint can emit, both directions of each.
  *
  * Named here rather than left implicit so the test can assert set equality
@@ -932,6 +991,8 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "props-reader-missing",
   "password-reader-outside-owners",
   "password-reader-missing",
+  "mail-secret-reader-outside-owner",
+  "mail-secret-reader-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -1124,6 +1185,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const subscriptionFeedFetchCallers = [];
   const propsReaders = [];
   const passwordReaderImporters = [];
+  const mailSecretReaders = [];
 
   for (const absolute of files) {
     const relativePath = toRepoRelative(absolute);
@@ -1192,6 +1254,15 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
         });
       }
     }
+    if (relativePath.startsWith(MAIL_SECRET_READ_SCOPE)) {
+      const mailSecretReadIndex = contents.search(MAIL_SECRET_READ);
+      if (mailSecretReadIndex !== -1) {
+        mailSecretReaders.push({
+          file: relativePath,
+          ...positionOf(contents, mailSecretReadIndex),
+        });
+      }
+    }
   }
 
   violations.push(...checkSocketOwnership(socketImporters));
@@ -1203,6 +1274,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   );
   violations.push(...checkPropsReaderOwnership(propsReaders));
   violations.push(...checkPasswordReaderOwnership(passwordReaderImporters));
+  violations.push(...checkMailSecretReaderOwnership(mailSecretReaders));
 
   return violations.sort(
     (a, b) =>
@@ -1459,6 +1531,43 @@ export function checkPasswordReaderOwnership(importers) {
       pattern: "password-reader-missing",
       patternIndex: FORBIDDEN.length + 13,
       why: `${owner} no longer imports the password reader from the principal module, which means that login path was deleted, moved, or rewritten to get the password some other way this count cannot see. Nothing fails on the way out when a login path leaves, and a path that reads the password another way is unguarded. Restore the plain named import of the reader in ${owner}. If the login path really moved, that is a change to the safety boundary: get a decision, then change the owner list, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The one reader of the two mail secrets, as a pure function over a list of
+ * readers.
+ *
+ * Same split and same shape as the props count: one owner, both failure
+ * directions exercised against a list rather than a fixture tree on disk. See
+ * the `MAIL_SECRET_READ` docstring for why this is a count at all, why the
+ * login gate's secret is left out, and what it does not see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} readers
+ */
+export function checkMailSecretReaderOwnership(readers) {
+  const violations = [];
+  for (const reader of readers) {
+    if (reader.file === MAIL_SECRET_READ_OWNER) continue;
+    violations.push({
+      file: reader.file,
+      line: reader.line,
+      column: reader.column,
+      pattern: "mail-secret-reader-outside-owner",
+      patternIndex: FORBIDDEN.length + 14,
+      why: `A read of one of the two mail secrets off the environment object under ${MAIL_SECRET_READ_SCOPE} outside ${MAIL_SECRET_READ_OWNER}. That file is the one constructor that turns the owner's Worker secrets into a principal, and Phase 13 removes it. A second reader is a second place a password enters the program with no principal around it. Thread the principal to this code instead and read its Apple ID field, or hand it to one of the two password owners. If this fired on a comment, write "the two mail secrets" and not the spelled read. Do not narrow the pattern, do not rename the environment object to hide the read, and do not fold the login gate's secret into this count.`,
+    });
+  }
+  if (readers.length === 0) {
+    violations.push({
+      file: MAIL_SECRET_READ_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "mail-secret-reader-missing",
+      patternIndex: FORBIDDEN.length + 15,
+      why: `No file under ${MAIL_SECRET_READ_SCOPE} reads the two mail secrets off the environment object, which means the owner's constructor in ${MAIL_SECRET_READ_OWNER} was deleted, renamed, or rewritten into a form this count cannot see. Nothing fails on the way out when a constructor leaves: the tests that covered it leave with it. Restore the read in that constructor, and keep its parameter named as it is — this count finds its owner by that spelling. If the constructor really moved, that is a change to the safety boundary: get a decision, then change the owner, never the pattern.`,
     });
   }
   return violations;

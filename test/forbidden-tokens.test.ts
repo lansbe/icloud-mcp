@@ -24,6 +24,9 @@ import {
   EXCLUDED,
   FORBIDDEN,
   OWNERSHIP_VIOLATION_IDS,
+  MAIL_SECRET_READ,
+  MAIL_SECRET_READ_OWNER,
+  MAIL_SECRET_READ_SCOPE,
   PASSWORD_READER_IMPORT,
   PASSWORD_READER_OWNERS,
   PASSWORD_READER_SCOPE,
@@ -38,6 +41,7 @@ import {
   checkCommitHook,
   checkDavFetchOwnership,
   checkDavHostOwnership,
+  checkMailSecretReaderOwnership,
   checkPasswordReaderOwnership,
   checkPropsReaderOwnership,
   checkSocketOwnership,
@@ -2322,6 +2326,121 @@ describe("the two readers of the password are a count constraint with two owners
   });
 });
 
+describe("the one reader of the two mail secrets is a count constraint too (Phase 9 D-28)", () => {
+  // The spelled read IS written literally here, as the props read and the
+  // password import are in the blocks above. The pattern is collected from src/
+  // only, and this file is skipped by path for every rule, so nothing here can
+  // trip the count. No sample below sits inside a logging call: that would fire
+  // four other rules and prove none of this one.
+  const owner = { file: MAIL_SECRET_READ_OWNER, line: 262, column: 22 };
+  const elsewhere = { file: "src/dav/transport.ts", line: 134, column: 20 };
+
+  /** A fresh copy per probe, so no state can carry between samples. */
+  const fires = (sample: string): boolean =>
+    new RegExp(MAIL_SECRET_READ.source, MAIL_SECRET_READ.flags).test(sample);
+
+  it("passes when the owner's constructor is the only file that reads them", () => {
+    expect(checkMailSecretReaderOwnership([owner])).toEqual([]);
+  });
+
+  it("reports a violation naming the second file when another module reads one", () => {
+    const violations = checkMailSecretReaderOwnership([owner, elsewhere]);
+    expect(violations.map((v) => v.pattern)).toEqual([
+      "mail-secret-reader-outside-owner",
+    ]);
+    expect(violations[0]!.file).toBe(elsewhere.file);
+    expect(violations[0]!.line).toBe(elsewhere.line);
+  });
+
+  it("reports a violation naming the owner when no file reads them", () => {
+    // The direction a negative cannot see: a constructor that stopped reading
+    // the secrets was deleted or renamed, and nothing fails on the way out.
+    const violations = checkMailSecretReaderOwnership([]);
+    expect(violations.map((v) => v.pattern)).toEqual(["mail-secret-reader-missing"]);
+    expect(violations[0]!.file).toBe(MAIL_SECRET_READ_OWNER);
+  });
+
+  it("names the owner's constructor, and collects from the source tree only", () => {
+    expect(MAIL_SECRET_READ_OWNER).toBe("src/principal.ts");
+    expect(MAIL_SECRET_READ_SCOPE).toBe("src/");
+  });
+
+  it("matches a read of either mail secret off the environment object", () => {
+    for (const sample of [
+      "  const appleId = env.APPLE_ID;",
+      "  const appPassword = env.APPLE_APP_PASSWORD;",
+      "return this.env.APPLE_ID;",
+      "if (!isConfiguredSecret(env.APPLE_APP_PASSWORD)) return;",
+      " * reads `env.APPLE_ID` before anything else.",
+    ]) {
+      expect(fires(sample), `missed ${sample}`).toBe(true);
+    }
+  });
+
+  it("does not match the login gate's own secret (D-28)", () => {
+    // It is not an Apple credential and it has its own single reader in the
+    // login gate. If this ever starts matching, the count has been widened to
+    // answer a second question and the docstring is no longer true.
+    for (const sample of [
+      "if (!isConfiguredSecret(env.AUTH_SECRET)) {",
+      "await secretMatches(submitted, env.AUTH_SECRET)",
+    ]) {
+      expect(fires(sample), `now sees ${sample}`).toBe(false);
+    }
+  });
+
+  it("does not match a look-alike, a field declaration, or a principal's field", () => {
+    for (const sample of [
+      // A longer identifier that merely starts with a secret name.
+      "const cached = env.APPLE_ID_CACHE;",
+      "const legacy = env.APPLE_APP_PASSWORD_V1;",
+      // A field on the principal, which is the shape everything else now uses.
+      "const address = principal.appleId;",
+      // A type field declaration. The narrow interfaces spell both names.
+      "  APPLE_ID: string | undefined;",
+      "  APPLE_APP_PASSWORD: string | undefined;",
+      // The bare name in prose, with no environment object in front of it.
+      " * Apple ID used for IMAP authentication. Workers Secret.",
+      // Another object's field of the same name.
+      "const value = bindings.APPLE_ID;",
+    ]) {
+      expect(fires(sample), `false-positived on ${sample}`).toBe(false);
+    }
+  });
+
+  it("pins the known evasions as unseen, so nobody believes they are covered", () => {
+    // Each of these DOES read a mail secret. The docstring lists them, and says
+    // the compiler is the first check for all of them (D-14). If the pattern
+    // later starts to see one, this goes red: move the row out and update the
+    // docstring.
+    for (const sample of [
+      "const { APPLE_ID } = env;",
+      'const value = env["APPLE_ID"];',
+    ]) {
+      expect(fires(sample), `now sees ${sample}`).toBe(false);
+    }
+  });
+
+  it("carries no global flag, because scan() takes the first match with search()", () => {
+    expect(MAIL_SECRET_READ.flags).toBe("");
+  });
+
+  it("is wired into scan(): a tree with no owner file fails", () => {
+    // scripts/ is outside MAIL_SECRET_READ_SCOPE, so scanning it alone
+    // exercises the deleted direction against a real tree rather than a
+    // synthetic list.
+    expect(scan("scripts").map((v) => v.pattern)).toContain(
+      "mail-secret-reader-missing",
+    );
+  });
+
+  it("passes on the real tree: the owner's constructor is the one reader", () => {
+    const patterns = scan().map((v) => v.pattern);
+    expect(patterns).not.toContain("mail-secret-reader-missing");
+    expect(patterns).not.toContain("mail-secret-reader-outside-owner");
+  });
+});
+
 describe("the count constraints as a set", () => {
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
@@ -2351,6 +2470,9 @@ describe("the count constraints as a set", () => {
       // Two owners: a non-owner beside both, then one owner missing.
       ...checkPasswordReaderOwnership([...bothPasswordOwners, nonOwner]).map((v) => v.pattern),
       ...checkPasswordReaderOwnership(bothPasswordOwners.slice(0, 1)).map((v) => v.pattern),
+      // One owner, so the same two lists the props count is fed.
+      ...checkMailSecretReaderOwnership([nonOwner]).map((v) => v.pattern),
+      ...checkMailSecretReaderOwnership([]).map((v) => v.pattern),
     ]);
     expect([...observed].sort()).toEqual([...OWNERSHIP_VIOLATION_IDS].sort());
   });
@@ -2376,6 +2498,9 @@ describe("the count constraints as a set", () => {
       // exactly one outside; one owner alone is exactly one missing.
       ...checkPasswordReaderOwnership([...bothPasswordOwners, nonOwner]),
       ...checkPasswordReaderOwnership(bothPasswordOwners.slice(0, 1)),
+      // One owner, so a lone non-owner and an empty list give one of each.
+      ...checkMailSecretReaderOwnership([nonOwner]),
+      ...checkMailSecretReaderOwnership([]),
     ];
     expect(violations.length).toBe(OWNERSHIP_VIOLATION_IDS.length);
     for (const violation of violations) {
