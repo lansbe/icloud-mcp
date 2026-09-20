@@ -330,6 +330,14 @@ describe("the patterns have teeth", () => {
     // Every one of the four key expressions in this project was written this
     // way before Phase 10 reshaped them.
     "store-key-without-a-user": "const key = `${CONFIRM_KEY_PREFIX}${jti}`;",
+    // The one-time reservation keyed on the confirmation instead of on the
+    // caller presenting it. A one-word edit that reads as MORE correct — the
+    // slot belongs to the token, surely — and which quietly removes the second
+    // of audit row T1's two layers. The two values are equal in every
+    // execution this project can produce, so no test can separate them; this
+    // rule is the only thing that can.
+    "confirm-reserve-keyed-on-the-token":
+      "await reserveConfirmation(env.CONFIRM_KV, payload.u, payload.j, payload.x);",
   };
 
   it("covers every rule with a known-violating sample", () => {

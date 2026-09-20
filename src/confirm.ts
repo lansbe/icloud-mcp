@@ -698,7 +698,29 @@ export async function changeHashMatches(
  */
 export async function reserveConfirmation(
   kv: KVNamespace,
-  /** The signed-in user, from the principal. Never parsed out of the key. */
+  /**
+   * The signed-in user, from the principal.
+   *
+   * Never parsed out of the key, and never the id the confirmation itself
+   * carries. That second half is the one a reader is tempted by — the slot
+   * belongs to the token, surely — and it is wrong. The two values are equal
+   * whenever this runs, because `verifyConfirmation` already refused a
+   * mismatch, so taking it off the confirmation would make this slot DEPEND on
+   * that check instead of standing beside it. Audit row T1 is closed by the
+   * two standing separately: keyed on the caller, somebody presenting another
+   * person's confirmation burns a slot under their OWN id and the owner's
+   * confirmation still spends. Keyed on the confirmation, they burn the
+   * owner's slot and the owner previews again, which is T1 as it was.
+   *
+   * The swap is invisible to every test in this repository. What refuses it is
+   * the `confirm-reserve-keyed-on-the-token` scan rule, which is anchored on
+   * this call and reads the argument list. Its limits are written down beside
+   * it; binding the value to a local first walks past it.
+   *
+   * The banned member is described by role here and never spelled, on the same
+   * footing as the transport and write rules: a comment naming it would fail
+   * the check it was explaining.
+   */
   userId: string,
   jti: string,
   expirySeconds: number,

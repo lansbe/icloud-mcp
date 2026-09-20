@@ -686,6 +686,62 @@ export const FORBIDDEN = [
       /\$\{\s*[A-Z0-9_]{0,40}(?:KEY|KV|CACHE|STAGING|CONFIRM|BUCKET|R2|STORE)[A-Z0-9_]{0,40}PREFIX\s*\}(?!\s*\$\{\s*(?:[A-Za-z_][A-Za-z0-9_]{0,40}\s*\.\s*)?userId\s*\})/g,
     why: "A store key built under src/ from a key-prefix constant with no user id straight after it. Every KV and R2 key this project writes belongs to exactly one person -- the staging bucket holds their attachments, the confirm namespace holds their pending writes, the DAV cache holds their account's home URLs. A key with no user segment is a key any signed-in caller can name, so one person's object becomes reachable through another person's request, and nothing fails on the way in: the store returns the object it was asked for. Interpolate the user id straight after the prefix constant, and take it from the signed-in principal -- never from the key, the token or the id being checked, because those are caller-supplied and a caller who chooses the segment chooses whose data to read. If this fired on something that is not a store key, rename the constant so it no longer reads as one. Do not buy it off with a path exclusion: this scanner's skip list is per file and not per rule, so excluding one file here would silently drop the logging, fan-out and write rules on it as well.",
   },
+
+  // THE RULE. The one-time reservation for a confirmation is keyed on the
+  // CALLER's own user id and on nothing else. This rule bans the one
+  // alternative a reader is actually tempted by: the id carried inside the
+  // confirmation payload, reached as a `.u` member in the reservation's own
+  // argument list.
+  //
+  // WHY THE TWO ARE NOT INTERCHANGEABLE, EVEN THOUGH THEY ARE ALWAYS EQUAL.
+  // Audit row T1 is closed by TWO layers, and this is the second of them
+  // (D-12, corrected by measurement in plan 10-04). Layer one is the user
+  // check inside `verifyConfirmation`, which refuses a caller presenting
+  // somebody else's confirmation. Layer two is this key: a caller who ever
+  // reached the reservation holding somebody else's confirmation burns a slot
+  // under their OWN id, so the owner's confirmation still spends. Reading the
+  // payload here would collapse layer two onto layer one -- the slot would
+  // belong to whoever the token names, which is audit row T1 exactly as it
+  // was, where a refused commit spends the owner's slot and the owner must
+  // preview again.
+  //
+  // WHY A RULE RATHER THAN A TEST. No test in this repository can tell the two
+  // expressions apart. Layer one guarantees they are equal by the time the
+  // reservation runs, so every execution this project can produce agrees.
+  // Reaching the reservation with a mismatched pair would need layer one
+  // disabled, and the only way to do that from a test is a test-only path into
+  // the verifier -- a back door that would cost more than it bought. So the
+  // swap is a one-word edit that reads as more correct, removes a layer, and
+  // leaves the whole suite green. That is the same hazard class as the D-20
+  // colon, and it gets the same answer.
+  //
+  // WHAT IT DOES NOT SEE. Every one of these makes the swap and fires nothing:
+  //
+  //   1. the id bound to a local first -- `const u = payload.u;` and then
+  //      `reserveConfirmation(kv, u, ...)`;
+  //   2. subscript access -- `payload["u"]`;
+  //   3. the field renamed from `u` to anything else;
+  //   4. an argument list longer than 200 characters, or one carrying a `)`
+  //      of its own -- a nested call among the arguments ends the span early,
+  //      and the rule then sees nothing past it;
+  //   5. the reservation renamed, or reached through a variable.
+  //
+  // A rule believed to prove more than it does is worse than one whose limits
+  // are written down.
+  //
+  // MEASURED ON THE REAL TREE. 0 hits under `src/` -- the declaration in
+  // `src/confirm.ts` and the single call site in `src/mcp/tools/calendar.ts`
+  // are both clean, so it is armed on a tree it refuses nothing on. One
+  // consequence: the parameter's own documentation in `src/confirm.ts` states
+  // the ban by ROLE and never by name, exactly as the transport and write
+  // rules require, because a comment spelling the banned member out would fail
+  // the check it was trying to explain.
+  {
+    id: "confirm-reserve-keyed-on-the-token",
+    scope: "src/",
+    pattern: /reserveConfirmation\s*\([^)]{0,200}\.\s*u\b/g,
+    why: "The one-time reservation for a confirmation is being keyed on the id carried inside the confirmation instead of the id of the caller presenting it. Those two values are always equal by the time the reservation runs, because the verifier already refused a mismatch -- which is exactly why this matters: reading the payload here makes the reservation DEPEND on that earlier check instead of standing beside it, and audit row T1 is closed by the two of them standing separately. The reservation keyed on the caller means a caller who ever reached it holding somebody else's confirmation burns a slot under their own id, and the owner's confirmation still spends. Keyed on the token, that caller burns the owner's slot and the owner has to preview their calendar change again -- the original T1 leak, restored by a one-word edit that reads as more correct and that no test in this repository can see. Pass the signed-in principal's user id and nothing else. If this fired on a reservation that genuinely has no caller to key on, that is a change to how confirmations are scoped and needs a decision, not a pattern edit.",
+  },
 ];
 
 /**
