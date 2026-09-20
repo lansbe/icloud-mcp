@@ -384,6 +384,13 @@ describe("the patterns have teeth", () => {
       // The two member-access spellings of the same id, both permitted.
       "  const key = `${STAGING_PREFIX}${principal.userId}/x`;",
       "  const key = `${STAGING_PREFIX}${actor.userId}/x`;",
+      // A correct key reached through a deeper path. Nothing on the tree is
+      // written this way today, and that is exactly why it needs a row: when
+      // the chain was bounded at one, this FIRED. A false positive here is not
+      // one refused line — `.husky/pre-commit` runs under `set -e`, so it
+      // refuses every commit in the repository, including unrelated work.
+      "  const key = `${STAGING_PREFIX}${ctx.actor.userId}/x`;",
+      "  const key = `${CONFIRM_KEY_PREFIX}${a.b.c.userId}:${jti}`;",
     ]) {
       expect(fires(sample), `false-positived on ${sample}`).toBe(false);
     }

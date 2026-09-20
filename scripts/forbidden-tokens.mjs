@@ -642,9 +642,9 @@ export const FORBIDDEN = [
   //   3. a prefix constant renamed so it no longer ends in `PREFIX`, or no
   //      longer contains one of the eight store words;
   //   4. the user id interpolated under another name -- `${who}`, `${uid}`.
-  //      The rule keys on the spelling `userId`, optionally behind one member
-  //      access, so `${userId}`, `${actor.userId}` and `${principal.userId}`
-  //      are the three live spellings and all three pass;
+  //      The rule keys on the spelling `userId`, optionally behind up to three
+  //      member accesses, so `${userId}`, `${actor.userId}` and
+  //      `${principal.userId}` are the three live spellings and all three pass;
   //   5. the prefix constant copied into a variable first: `const p =
   //      CONFIRM_KEY_PREFIX;` and then `` `${p}${jti}` ``;
   //   6. the source-IP-keyed counter at `src/auth/login-handler.ts` -- it is
@@ -671,6 +671,24 @@ export const FORBIDDEN = [
   // relies on. Dropped, so anything at all between the prefix and the id fires.
   // This only ever refuses more. `test/forbidden-tokens.test.ts` carries the
   // space and newline cases as must-fire rows so the gap cannot reopen quietly.
+  //
+  // THE MEMBER-ACCESS CHAIN IS BOUNDED AT THREE, NOT AT ONE, AND THE REASON IS
+  // THE FAILURE MODE RATHER THAN TASTE. At one, a perfectly correct key written
+  // `` `${STAGING_PREFIX}${ctx.actor.userId}/...` `` FIRED. `.husky/pre-commit`
+  // runs under `set -e`, so a false positive here does not refuse one line: it
+  // refuses every commit in the repository, including commits on work that has
+  // nothing to do with keys — which is the failure D-21 and the armed-last
+  // ordering exist to avoid, arriving later and by a different door. Widening
+  // the chain admits nothing a one-deep chain did not already admit: the
+  // literal spelling `userId` is still required at the end, so a key with no
+  // user in it fires exactly as before. It is bounded rather than left open for
+  // the reason both upper-case runs are bounded, and measured on the same
+  // 200,000-character adversarial input.
+  //
+  // A DEEPER OR COMPUTED PATH IS STILL A FALSE POSITIVE, and the remedy is to
+  // bind the id to a local first -- `const userId = a.b.c.d.userId;` -- rather
+  // than to widen this rule again. A call in the path, `${resolve(x).userId}`,
+  // is the same case and the same remedy.
   // Both upper-case runs are bounded at 40 rather than left unbounded: that is
   // what makes a 200,000-character adversarial input return in 0 ms, and it is
   // not a tidiness knob. The MIME boundary constant in the message-assembly
@@ -695,7 +713,7 @@ export const FORBIDDEN = [
     id: "store-key-without-a-user",
     scope: "src/",
     pattern:
-      /\$\{\s*[A-Z0-9_]{0,40}(?:KEY|KV|CACHE|STAGING|CONFIRM|BUCKET|R2|STORE)[A-Z0-9_]{0,40}PREFIX\s*\}(?!\$\{\s*(?:[A-Za-z_][A-Za-z0-9_]{0,40}\s*\.\s*)?userId\s*\})/g,
+      /\$\{\s*[A-Z0-9_]{0,40}(?:KEY|KV|CACHE|STAGING|CONFIRM|BUCKET|R2|STORE)[A-Z0-9_]{0,40}PREFIX\s*\}(?!\$\{\s*(?:[A-Za-z_][A-Za-z0-9_]{0,40}\s*\.\s*){0,3}userId\s*\})/g,
     why: "A store key built under src/ from a key-prefix constant with no user id straight after it. Every KV and R2 key this project writes belongs to exactly one person -- the staging bucket holds their attachments, the confirm namespace holds their pending writes, the DAV cache holds their account's home URLs. A key with no user segment is a key any signed-in caller can name, so one person's object becomes reachable through another person's request, and nothing fails on the way in: the store returns the object it was asked for. Interpolate the user id straight after the prefix constant, and take it from the signed-in principal -- never from the key, the token or the id being checked, because those are caller-supplied and a caller who chooses the segment chooses whose data to read. If this fired on something that is not a store key, rename the constant so it no longer reads as one. Do not buy it off with a path exclusion: this scanner's skip list is per file and not per rule, so excluding one file here would silently drop the logging, fan-out and write rules on it as well.",
   },
 
