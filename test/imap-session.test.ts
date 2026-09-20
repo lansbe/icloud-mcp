@@ -6,7 +6,6 @@
 // the test environment offers no interception facility that would make an
 // automated "integration test" anything other than a real login.
 
-import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   ImapAuthError,

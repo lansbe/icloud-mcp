@@ -11,7 +11,6 @@
 // behavioural half is a recorded manual UAT owned by plan 02-13.
 
 import type { McpServer } from "@modelcontextprotocol/server";
-import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {

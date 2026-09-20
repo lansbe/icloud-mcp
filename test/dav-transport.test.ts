@@ -13,7 +13,6 @@
 // uses: the global `fetch` these tests stub is the one `createDavFetch` closes
 // over.
 
-import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DavAuthError,

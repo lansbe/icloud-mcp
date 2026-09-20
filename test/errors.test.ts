@@ -7,7 +7,6 @@
 // `subscription_unreadable`, arrived with quick task 260822-h1c, from the DAV
 // side only, on the same footing.
 
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import {
   DavAuthError,

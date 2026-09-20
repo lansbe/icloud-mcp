@@ -12,7 +12,6 @@
 // appears only for an authentication refusal, decided by the error's TYPE, and
 // neither bound credential appears in any response.
 
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import {
   ImapAuthError,

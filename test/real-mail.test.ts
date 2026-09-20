@@ -44,7 +44,6 @@
 // credential, so `npx vitest run` on a machine with no secrets configured is
 // green and silent, with nothing to gate.
 
-import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
 import { createSessionGate, getMessageOver } from "../src/mail/service";
 import { messageToolResult } from "../src/mcp/tools/mail";

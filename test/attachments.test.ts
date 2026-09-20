@@ -28,7 +28,6 @@
 // Nothing here opens a network connection and nothing authenticates against the
 // real Apple ID (D-09).
 
-import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
 import { ImapNotFoundError } from "../src/errors";
 import { decodeAttachmentId, encodeAttachmentId } from "../src/mail/ids";

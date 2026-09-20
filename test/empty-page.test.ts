@@ -33,7 +33,6 @@
 //
 // This file contains no logging calls of any kind and must never acquire any.
 
-import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
 import { encodeCursor } from "../src/mail/ids";
 import { createSessionGate, listMessagesOver } from "../src/mail/service";

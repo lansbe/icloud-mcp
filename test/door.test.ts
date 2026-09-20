@@ -38,7 +38,6 @@
 // the ambient one. With the secrets unset the principal is refused before any
 // socket opens, so nothing here reaches the network.
 
-import { env } from "cloudflare:workers";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { EntryEnv } from "../src/env";

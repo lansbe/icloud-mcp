@@ -20,7 +20,6 @@
 // difference is the Authorization header. That is what makes "still false" mean
 // "the gate stopped it" rather than "the request was malformed anyway".
 
-import { env } from "cloudflare:workers";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { entryEnv } from "./fixtures/bound-secrets";

@@ -12,7 +12,6 @@
 // exchange, and none of the assertions depends on a token only Apple could
 // have produced.
 
-import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
 import { ImapConnectError, ImapNotFoundError, ImapThrottleError } from "../src/errors";
 import {
