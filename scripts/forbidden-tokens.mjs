@@ -841,6 +841,70 @@ export const PROPS_READER_OWNER = "src/mcp/api-handler.ts";
 export const PROPS_READER_SCOPE = "src/";
 
 /**
+ * An import of the one password reader, permitted in exactly two files of the
+ * source tree.
+ *
+ * THE RULE. Exactly two files under `src/` import `passwordOf` from the
+ * principal module: `src/mail/credentials.ts` and `src/dav/transport.ts`. The
+ * principal module defines the reader and imports nothing, so it is not an
+ * importer and is not counted. Everything else that needs to act for a
+ * principal hands the principal to one of those two files and never sees the
+ * password.
+ *
+ * WHY A COUNT RATHER THAN A NEGATIVE. One owner gone means a login path was
+ * deleted, moved, or rewritten to get the password some other way, and nothing
+ * fails on the way out: the tests that covered the deleted code leave with it.
+ * "No third importer" is trivially true of a tree with no importer at all. A
+ * third importer is the other failure: a second thing in this project that can
+ * read a password, arriving without a decision. Zero, one and three are all
+ * violations. Only two passes, and only these two.
+ *
+ * WHY THERE ARE TWO OWNERS. Every count above has one owner. This one has two
+ * because the password is spent in two places that cannot share code. One
+ * writes the mail login onto the socket. The other builds the DAV
+ * authorization header. `src/mail` and `src/dav` may not import each other, so
+ * neither can borrow the other's reader. The missing arm therefore fires once
+ * PER absent owner and names that owner, not once when the list is empty.
+ *
+ * WHAT IT DOES NOT SEE. Each of these reaches the reader and fires nothing:
+ *
+ *   1. a namespace import of the principal module (`import * as p from ...`),
+ *      followed by `p.passwordOf(...)`;
+ *   2. a re-export of the reader through another module, imported from there;
+ *   3. a dynamic import of the principal module (`await import(...)`);
+ *   4. an alias: a module path alias that does not end in `/principal`, or the
+ *      reader re-bound to another name inside an owner file and handed on.
+ *
+ * A renamed binding in the braces (`passwordOf as read`) IS seen, because the
+ * reader's own name is still spelled inside them. A count believed to prove
+ * more than it does is worse than one whose limits are written down.
+ *
+ * THE SHAPE. An import statement that names the reader inside its braces, from
+ * a module path ending in `/principal` with an optional TypeScript or
+ * JavaScript extension. A type-only import matches too, and so does an import
+ * spread over several lines, because the brace span is "anything but a closing
+ * brace". It matched nothing under `src/` at the Phase 9 base. It was armed
+ * only after both chains landed (Phase 9 D-25): armed after one, the hook would
+ * have refused every commit of the other.
+ *
+ * No `g` flag: `scan()` uses `String.prototype.search`, which takes the first
+ * match only, so a file that imports the reader twice is one entry.
+ */
+export const PASSWORD_READER_IMPORT =
+  /import\s*(?:type\s*)?\{[^}]*\bpasswordOf\b[^}]*\}\s*from\s*["'][^"'\n]*\/principal(?:\.[cm]?[jt]s)?["']/;
+
+/** The two files under `PASSWORD_READER_SCOPE` permitted to match
+ *  `PASSWORD_READER_IMPORT`. The mail login first, then the DAV header. */
+export const PASSWORD_READER_OWNERS = Object.freeze([
+  "src/mail/credentials.ts",
+  "src/dav/transport.ts",
+]);
+
+/** The tree `PASSWORD_READER_IMPORT` is collected from. Tests build principals
+ *  and may read one back, and a test is not a login path. */
+export const PASSWORD_READER_SCOPE = "src/";
+
+/**
  * Every violation id a count constraint can emit, both directions of each.
  *
  * Named here rather than left implicit so the test can assert set equality
@@ -866,6 +930,8 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "subscription-feed-fetch-choke-point-missing",
   "props-reader-outside-owner",
   "props-reader-missing",
+  "password-reader-outside-owners",
+  "password-reader-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -1057,6 +1123,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const appenders = [];
   const subscriptionFeedFetchCallers = [];
   const propsReaders = [];
+  const passwordReaderImporters = [];
 
   for (const absolute of files) {
     const relativePath = toRepoRelative(absolute);
@@ -1114,6 +1181,17 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
         propsReaders.push({ file: relativePath, ...positionOf(contents, propsReadIndex) });
       }
     }
+    // The principal module is not skipped: it defines the reader and imports
+    // nothing, so the pattern cannot match it.
+    if (relativePath.startsWith(PASSWORD_READER_SCOPE)) {
+      const passwordImportIndex = contents.search(PASSWORD_READER_IMPORT);
+      if (passwordImportIndex !== -1) {
+        passwordReaderImporters.push({
+          file: relativePath,
+          ...positionOf(contents, passwordImportIndex),
+        });
+      }
+    }
   }
 
   violations.push(...checkSocketOwnership(socketImporters));
@@ -1124,6 +1202,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
     ...checkSubscriptionFeedFetchOwnership(subscriptionFeedFetchCallers),
   );
   violations.push(...checkPropsReaderOwnership(propsReaders));
+  violations.push(...checkPasswordReaderOwnership(passwordReaderImporters));
 
   return violations.sort(
     (a, b) =>
@@ -1341,6 +1420,45 @@ export function checkPropsReaderOwnership(readers) {
       pattern: "props-reader-missing",
       patternIndex: FORBIDDEN.length + 11,
       why: `No file under ${PROPS_READER_SCOPE} reads the grant's props, which means the owner guard in ${PROPS_READER_OWNER} was deleted, moved, or rewritten into a form this count cannot see. A door that never reads the grant serves every grant, and nothing fails on the way out. Restore the owner guard in that file, reading the props off the request context by its usual name.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The two readers of the password, as a pure function over a list of
+ * importers.
+ *
+ * Same split as the counts above, but NOT the same body: this count has two
+ * owners. See the `PASSWORD_READER_IMPORT` docstring for why.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} importers
+ */
+export function checkPasswordReaderOwnership(importers) {
+  const violations = [];
+  const owners = PASSWORD_READER_OWNERS.join(" and ");
+  for (const importer of importers) {
+    if (PASSWORD_READER_OWNERS.includes(importer.file)) continue;
+    violations.push({
+      file: importer.file,
+      line: importer.line,
+      column: importer.column,
+      pattern: "password-reader-outside-owners",
+      patternIndex: FORBIDDEN.length + 12,
+      why: `An import of the password reader under ${PASSWORD_READER_SCOPE} outside ${owners}. Those two files are the only places a password is spent: one writes the mail login, the other builds the DAV authorization header. A third importer is a second thing in this project that can read a password, arriving without a decision. Do not read the password here. Hand the principal to one of the two owners and let it do the login. Do not reach the reader another way (a namespace import, a re-export, a dynamic import, an alias), and do not narrow the pattern. If this fired on a comment, describe the import in plain words.`,
+    });
+  }
+  // One per absent owner, not one for an empty list: each owner is its own
+  // login path, and losing either is its own failure.
+  for (const owner of PASSWORD_READER_OWNERS) {
+    if (importers.some((importer) => importer.file === owner)) continue;
+    violations.push({
+      file: owner,
+      line: 0,
+      column: 0,
+      pattern: "password-reader-missing",
+      patternIndex: FORBIDDEN.length + 13,
+      why: `${owner} no longer imports the password reader from the principal module, which means that login path was deleted, moved, or rewritten to get the password some other way this count cannot see. Nothing fails on the way out when a login path leaves, and a path that reads the password another way is unguarded. Restore the plain named import of the reader in ${owner}. If the login path really moved, that is a change to the safety boundary: get a decision, then change the owner list, never the pattern.`,
     });
   }
   return violations;

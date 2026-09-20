@@ -24,6 +24,9 @@ import {
   EXCLUDED,
   FORBIDDEN,
   OWNERSHIP_VIOLATION_IDS,
+  PASSWORD_READER_IMPORT,
+  PASSWORD_READER_OWNERS,
+  PASSWORD_READER_SCOPE,
   PROPS_READER,
   PROPS_READER_OWNER,
   PROPS_READER_SCOPE,
@@ -35,6 +38,7 @@ import {
   checkCommitHook,
   checkDavFetchOwnership,
   checkDavHostOwnership,
+  checkPasswordReaderOwnership,
   checkPropsReaderOwnership,
   checkSocketOwnership,
   checkSubscriptionFeedFetchOwnership,
@@ -2146,7 +2150,182 @@ describe("the single reader of the grant's props is a count constraint too (Phas
   });
 });
 
+describe("the two readers of the password are a count constraint with two owners (Phase 9 D-03, D-25)", () => {
+  // The spelled import IS written literally here, as the props read is in the
+  // block above. The pattern is collected from src/ only, and this file is
+  // skipped by path for every rule, so nothing here can trip the count.
+  const [mailOwnerPath, davOwnerPath] = PASSWORD_READER_OWNERS as readonly [string, string];
+  const mailOwner = { file: mailOwnerPath, line: 29, column: 1 };
+  const davOwner = { file: davOwnerPath, line: 29, column: 1 };
+  const outsider = { file: "src/mcp/tools/mail.ts", line: 12, column: 1 };
+
+  /** A fresh copy per probe, so no state can carry between samples. */
+  const fires = (sample: string): boolean =>
+    new RegExp(PASSWORD_READER_IMPORT.source, PASSWORD_READER_IMPORT.flags).test(sample);
+
+  it("names exactly the mail login and the DAV header as owners, in that order", () => {
+    expect([...PASSWORD_READER_OWNERS]).toEqual([
+      "src/mail/credentials.ts",
+      "src/dav/transport.ts",
+    ]);
+    expect(PASSWORD_READER_SCOPE).toBe("src/");
+  });
+
+  it("two: passes when both owners import the reader and nothing else does", () => {
+    expect(checkPasswordReaderOwnership([mailOwner, davOwner])).toEqual([]);
+    // Order in the list is the walk order of the tree, so it must not matter.
+    expect(checkPasswordReaderOwnership([davOwner, mailOwner])).toEqual([]);
+  });
+
+  it("one: reports the DAV owner as missing when only the mail owner imports it", () => {
+    const violations = checkPasswordReaderOwnership([mailOwner]);
+    expect(violations.map((v) => v.pattern)).toEqual(["password-reader-missing"]);
+    expect(violations[0]!.file).toBe(davOwnerPath);
+    expect(violations[0]!.why).toContain(davOwnerPath);
+  });
+
+  it("one: reports the mail owner as missing when only the DAV owner imports it", () => {
+    const violations = checkPasswordReaderOwnership([davOwner]);
+    expect(violations.map((v) => v.pattern)).toEqual(["password-reader-missing"]);
+    expect(violations[0]!.file).toBe(mailOwnerPath);
+    expect(violations[0]!.why).toContain(mailOwnerPath);
+  });
+
+  it("zero: reports two missing violations, one naming each owner", () => {
+    // The direction a negative cannot see, and the reason a one-owner checker
+    // cannot be copied: an empty list is TWO login paths gone, not one.
+    const violations = checkPasswordReaderOwnership([]);
+    expect(violations.map((v) => v.pattern)).toEqual([
+      "password-reader-missing",
+      "password-reader-missing",
+    ]);
+    expect(violations.map((v) => v.file)).toEqual([mailOwnerPath, davOwnerPath]);
+  });
+
+  it("three: reports one outside violation naming the third file", () => {
+    const violations = checkPasswordReaderOwnership([mailOwner, davOwner, outsider]);
+    expect(violations.map((v) => v.pattern)).toEqual(["password-reader-outside-owners"]);
+    expect(violations[0]!.file).toBe(outsider.file);
+    expect(violations[0]!.line).toBe(outsider.line);
+  });
+
+  it("one owner plus an outsider: reports one of each, so a moved reader is not a pass", () => {
+    // Two importers is the right NUMBER and the wrong answer. The count is of
+    // these two files, not of any two files.
+    const violations = checkPasswordReaderOwnership([mailOwner, outsider]);
+    expect(violations.map((v) => v.pattern).sort()).toEqual([
+      "password-reader-missing",
+      "password-reader-outside-owners",
+    ]);
+    const missing = violations.find((v) => v.pattern === "password-reader-missing")!;
+    const outside = violations.find((v) => v.pattern === "password-reader-outside-owners")!;
+    expect(missing.file).toBe(davOwnerPath);
+    expect(outside.file).toBe(outsider.file);
+  });
+
+  it("gives the two ids distinct sort keys, straight after the props count's", () => {
+    const violations = checkPasswordReaderOwnership([mailOwner, outsider]);
+    const outside = violations.find((v) => v.pattern === "password-reader-outside-owners")!;
+    const missing = violations.find((v) => v.pattern === "password-reader-missing")!;
+    expect(outside.patternIndex).toBe(FORBIDDEN.length + 12);
+    expect(missing.patternIndex).toBe(FORBIDDEN.length + 13);
+  });
+
+  it("matches the real import lines of both owners, and the other ways to write one", () => {
+    for (const sample of [
+      // The line both owners carry today, byte for byte.
+      'import { passwordOf } from "../principal";',
+      // Beside other names, and as a type-only import.
+      'import { type Principal, passwordOf } from "../principal";',
+      'import type { passwordOf } from "../principal";',
+      'import { type passwordOf } from "../principal";',
+      // Spread over three lines.
+      'import {\n  passwordOf,\n} from "../principal";',
+      'import {\n  appleIdOf,\n  passwordOf,\n  type Principal,\n} from "../../principal";',
+      // An explicit extension, single quotes, a deeper path.
+      "import { passwordOf } from '../principal.ts';",
+      'import { passwordOf } from "../../principal.js";',
+      'import { passwordOf } from "./principal.mjs";',
+      // A renamed binding still spells the reader's name in the braces.
+      'import { passwordOf as readSecret } from "../principal";',
+      // Comments count, as they do for every count.
+      ' * import { passwordOf } from "../principal" is how the reader arrives.',
+    ]) {
+      expect(fires(sample), `missed ${JSON.stringify(sample)}`).toBe(true);
+    }
+  });
+
+  it("does not match another name, another module, or the bare word", () => {
+    for (const sample of [
+      // Another name from the principal module.
+      'import { appleIdOf } from "../principal";',
+      'import { type Principal, principalFromEnv } from "../principal";',
+      // A longer identifier that merely contains the reader's name.
+      'import { passwordOfTheDay } from "../principal";',
+      'import { myPasswordOf } from "../principal";',
+      // The reader's name from a module that is not the principal module.
+      'import { passwordOf } from "../credentials";',
+      'import { passwordOf } from "../principals";',
+      'import { passwordOf } from "../principal-helpers";',
+      'import { passwordOf } from "../myprincipal";',
+      // The bare word: a call, a definition, a comment.
+      "const password = passwordOf(principal);",
+      "export function passwordOf(principal: Principal): string {",
+      "// `passwordOf` is the one reader.",
+      // Two imports side by side: the braces of one never reach the other.
+      'import { appleIdOf } from "../principal";\nimport { passwordOf } from "../credentials";',
+    ]) {
+      expect(fires(sample), `false-positived on ${JSON.stringify(sample)}`).toBe(false);
+    }
+  });
+
+  it("pins the known evasions as unseen, so nobody believes they are covered", () => {
+    // Each of these DOES reach the reader. The docstring lists all four. If the
+    // pattern later starts to see one, this goes red: move the row out and
+    // update the docstring.
+    for (const sample of [
+      'import * as principal from "../principal";',
+      'export { passwordOf } from "../principal";',
+      'const { passwordOf } = await import("../principal");',
+      'import { passwordOf } from "#principal";',
+    ]) {
+      expect(fires(sample), `now sees ${JSON.stringify(sample)}`).toBe(false);
+    }
+  });
+
+  it("collects a file that imports the reader twice once, at its first import", () => {
+    // scan() takes `contents.search(pattern)`: one index per file, the first.
+    // The count is of distinct file paths, so a second import in the same file
+    // adds nothing to it.
+    const first = 'import { passwordOf } from "../principal";';
+    const twice = `// header\n${first}\nimport { passwordOf as again } from "../principal";\n`;
+    expect(PASSWORD_READER_IMPORT.flags).toBe("");
+    expect(twice.search(PASSWORD_READER_IMPORT)).toBe(twice.indexOf(first));
+    // Without the global flag, match() is the first match and no more.
+    expect(twice.match(PASSWORD_READER_IMPORT)).toHaveLength(1);
+    // Both owners are still one entry each on the real tree.
+    const patterns = scan().map((v) => v.pattern);
+    expect(patterns).not.toContain("password-reader-outside-owners");
+  });
+
+  it("is wired into scan(): a tree with neither owner reports both as missing", () => {
+    // scripts/ is outside PASSWORD_READER_SCOPE, so scanning it alone exercises
+    // the deleted direction against a real tree rather than a synthetic list.
+    const missing = scan("scripts").filter((v) => v.pattern === "password-reader-missing");
+    expect(missing.map((v) => v.file).sort()).toEqual([...PASSWORD_READER_OWNERS].sort());
+  });
+
+  it("passes on the real tree: the two owners are the two importers", () => {
+    const patterns = scan().map((v) => v.pattern);
+    expect(patterns).not.toContain("password-reader-missing");
+    expect(patterns).not.toContain("password-reader-outside-owners");
+  });
+});
+
 describe("the count constraints as a set", () => {
+  /** One entry per password owner, in the owners' own order. */
+  const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
+
   it("covers every ownership violation id with an exercised sample, in both directions", () => {
     // The parallel of the rule-id set-equality assertion above, and it exists
     // for the same reason: a count constraint that can never emit one of its
@@ -2169,6 +2348,9 @@ describe("the count constraints as a set", () => {
       ...checkSubscriptionFeedFetchOwnership([]).map((v) => v.pattern),
       ...checkPropsReaderOwnership([nonOwner]).map((v) => v.pattern),
       ...checkPropsReaderOwnership([]).map((v) => v.pattern),
+      // Two owners: a non-owner beside both, then one owner missing.
+      ...checkPasswordReaderOwnership([...bothPasswordOwners, nonOwner]).map((v) => v.pattern),
+      ...checkPasswordReaderOwnership(bothPasswordOwners.slice(0, 1)).map((v) => v.pattern),
     ]);
     expect([...observed].sort()).toEqual([...OWNERSHIP_VIOLATION_IDS].sort());
   });
@@ -2188,6 +2370,12 @@ describe("the count constraints as a set", () => {
       ...checkSubscriptionFeedFetchOwnership([]),
       ...checkPropsReaderOwnership([nonOwner]),
       ...checkPropsReaderOwnership([]),
+      // The password count has TWO owners, so it cannot be fed the same pair
+      // of lists. A lone non-owner would give one outside AND two missing, and
+      // an empty list would give two missing. Both owners plus a non-owner is
+      // exactly one outside; one owner alone is exactly one missing.
+      ...checkPasswordReaderOwnership([...bothPasswordOwners, nonOwner]),
+      ...checkPasswordReaderOwnership(bothPasswordOwners.slice(0, 1)),
     ];
     expect(violations.length).toBe(OWNERSHIP_VIOLATION_IDS.length);
     for (const violation of violations) {

@@ -92,6 +92,9 @@ export declare const SUBSCRIPTION_FEED_FETCH_SCOPE: string;
 export declare const PROPS_READER: RegExp;
 export declare const PROPS_READER_OWNER: string;
 export declare const PROPS_READER_SCOPE: string;
+export declare const PASSWORD_READER_IMPORT: RegExp;
+export declare const PASSWORD_READER_OWNERS: readonly string[];
+export declare const PASSWORD_READER_SCOPE: string;
 export declare const OWNERSHIP_VIOLATION_IDS: readonly string[];
 
 export declare function checkDavHostOwnership(
@@ -108,4 +111,7 @@ export declare function checkSubscriptionFeedFetchOwnership(
 ): Violation[];
 export declare function checkPropsReaderOwnership(
   readers: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function checkPasswordReaderOwnership(
+  importers: ReadonlyArray<OwnershipMatch>,
 ): Violation[];
