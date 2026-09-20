@@ -133,9 +133,9 @@ const DAV_CACHE_KEY_PREFIX = "dav:v1:";
  * paths — the cache-hit path, where no request is ever built, included.
  */
 // `async` with nothing to await, ON PURPOSE (D-19). There is no digest left in
-// here, so the Promise is vestigial — and dropping it would take three `await`
-// sites with it, on a call graph this phase is already changing, for a purely
-// cosmetic gain. Do not tidy it away.
+// here, so the Promise is vestigial — and dropping it would take the `await` at
+// both call sites with it, on a call graph this phase is already changing, for
+// a purely cosmetic gain. Do not tidy it away.
 async function davCacheKey(userId: string, service: DavService): Promise<string> {
   return `${DAV_CACHE_KEY_PREFIX}${userId}:${service}`;
 }
