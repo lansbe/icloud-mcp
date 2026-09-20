@@ -29,6 +29,7 @@ import type { StageResult } from "./r2";
 import {
   MAX_STAGED_FILE_BYTES,
   STAGING_PREFIX,
+  USER_SEGMENT,
   deleteStaged,
   headStaged,
 } from "./r2";
@@ -189,11 +190,18 @@ function assertNoIllegalCharacters(value: string): void {
  * style**, exactly as in `underStagingPrefix` one file over. They are two
  * adjacent strings, so a call site can transpose them and the typecheck cannot
  * see it; putting the id first makes every signature in both staging modules
- * read the same way round. What CATCHES a transposition is plan 10-03's shape
- * test: once this checker requires the id to be 64 hex characters, a key handed
- * where an id belongs is refused the first time it happens, at runtime.
+ * read the same way round. What CATCHES a transposition is the shape test
+ * below: a key handed where an id belongs is not 64 hex characters, and an id
+ * handed where a key belongs does not start with the prefix.
  *
- * `userId` is accepted and unread in this commit. Plan 10-03 is what reads it.
+ * **The id is PASSED IN and is never parsed out of the key**, for the reason
+ * `underStagingPrefix` gives in full: a checker that read the user segment out
+ * of the value it was handed would be comparing a caller's choice against
+ * itself.
+ *
+ * The rule is the same one the read side applies, condition for condition, and
+ * the shape constant is imported rather than copied so the two cannot drift.
+ * Only the refusal differs, for the reason three paragraphs up.
  */
 function assertGrantableKey(
   userId: string,
@@ -202,8 +210,21 @@ function assertGrantableKey(
   if (typeof key !== "string" || !key.startsWith(STAGING_PREFIX)) {
     throw new ImapNotFoundError();
   }
-  const named = key.slice(STAGING_PREFIX.length);
-  if (named.length === 0 || named.includes("/") || named.includes("..")) {
+
+  const rest = key.slice(STAGING_PREFIX.length);
+  const slash = rest.indexOf("/");
+  // No user segment, or a second separator: too shallow, or deeper than
+  // anything this project builds.
+  if (slash <= 0 || rest.indexOf("/", slash + 1) !== -1) {
+    throw new ImapNotFoundError();
+  }
+
+  const segment = rest.slice(0, slash);
+  const named = rest.slice(slash + 1);
+  if (!USER_SEGMENT.test(segment) || segment !== userId) {
+    throw new ImapNotFoundError();
+  }
+  if (named.length === 0 || segment.includes("..") || named.includes("..")) {
     throw new ImapNotFoundError();
   }
 }
@@ -211,9 +232,9 @@ function assertGrantableKey(
 /**
  * Derive the key one presigned upload is aimed at.
  *
- * `staging/upload-{random}-{epoch milliseconds}`. See `PRESIGNED_KEY_STEM` for
- * why the offered filename is deliberately absent from it, and why the random
- * segment is here rather than deferred.
+ * `staging/{user id}/upload-{random}-{epoch milliseconds}`. See
+ * `PRESIGNED_KEY_STEM` for why the offered filename is deliberately absent from
+ * it, and why the random segment is here rather than deferred.
  *
  * Returns a key directly rather than routing through `stagingKeyFor`, because
  * that function's whole purpose is to reduce an untrusted name to something
@@ -222,8 +243,9 @@ function assertGrantableKey(
  * read as though there were.
  *
  * `userId` is the signed-in user's id, and it LEADS the parameter list for
- * `assertGrantableKey`'s reason — see that function. It is accepted and unread
- * here; plan 10-03 is what builds the user segment from it.
+ * `assertGrantableKey`'s reason — see that function. It becomes the key's own
+ * segment, directly beneath the prefix, so the grant this key is aimed at is a
+ * grant to write inside one user's own scope and nowhere else.
  */
 export function presignedKeyFor(
   userId: string,
@@ -237,7 +259,7 @@ export function presignedKeyFor(
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
 
-  return `${STAGING_PREFIX}${PRESIGNED_KEY_STEM}-${segment}-${nowMs}`;
+  return `${STAGING_PREFIX}${userId}/${PRESIGNED_KEY_STEM}-${segment}-${nowMs}`;
 }
 
 /**
@@ -566,7 +588,11 @@ export async function confirmStagedUpload(
   return {
     staged: true,
     id: encodeStagedId({ key, expiresAt }, nowMs),
-    filename: key.slice(STAGING_PREFIX.length),
+    // The NAME, and only the name. `headStaged` above answered non-null, which
+    // is only possible when the key's user segment is exactly `userId`, so this
+    // offset is exact. Slicing the prefix alone would put the caller's own user
+    // id into a tool response.
+    filename: key.slice(STAGING_PREFIX.length + userId.length + 1),
     sizeBytes,
     expiresAt: new Date(expiresAt).toISOString(),
     offeredFilename: object.filename,

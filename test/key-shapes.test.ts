@@ -2,12 +2,25 @@
 //
 // Phase 10 changes every pin in this file on purpose.
 //
-// That is what the file is for. The two R2 keys and the confirm key hold no
-// user segment today, and Phase 10 adds one. The DAV key already holds a hash
-// of the Apple ID, and Phase 10 takes that hash from the signed-in user
-// instead. When those changes land, the pins here go red, and whoever is making
-// the change rewrites each pin to the new shape with their eyes open. A key
-// shape that moved without a pin moving would be a change nobody decided.
+// That is what the file is for. When a change lands, the pin here goes red, and
+// whoever is making the change rewrites it to the new shape with their eyes
+// open. A key shape that moved without a pin moving would be a change nobody
+// decided.
+//
+// **Two of the four have moved. Two have not yet.**
+//
+// | Pin | State |
+// |-----|-------|
+// | R2, binding side | moved — a user segment sits between the prefix and the name |
+// | R2, presigned ingress | moved — the same segment, same place |
+// | `CONFIRM_KV` | not yet. It holds no user today and the confirm scope adds one |
+// | `DAV_CACHE` | not yet. It holds a hash of the Apple ID, and the cache-key change takes that hash from the signed-in user instead |
+//
+// The two that moved gained `/[0-9a-f]{64}/` in the pattern and went from two
+// asserted segments to three. Neither reads the user id back out of the value
+// under test: a pin built from the thing it is pinning moves with it and so
+// pins nothing, which is the same reason the prefixes below are typed out
+// rather than imported.
 //
 // **Four older pins already exist, and they stay.** Two are in
 // `test/staging.test.ts`, one is in `test/confirm.test.ts`, and one is in
@@ -137,28 +150,35 @@ afterEach(() => {
 });
 
 describe("key shapes today, one pin per store", () => {
-  it("R2, binding side: staging/{16 hex}-{name}-{ms}", () => {
+  it("R2, binding side: staging/{user id}/{16 hex}-{name}-{ms}", () => {
     const key = stagingKeyFor(USER_A.userId, "Resume-2026.pdf", NOW);
 
     expect(key, "no key was built").not.toBeNull();
     expect(String(key)).toMatch(
-      /^staging\/[0-9a-f]{16}-Resume-2026\.pdf-1776000000000$/,
+      /^staging\/[0-9a-f]{64}\/[0-9a-f]{16}-Resume-2026\.pdf-1776000000000$/,
     );
-    // One separator, the one after the prefix. A user segment would add a
-    // second, and that is the change Phase 10 makes.
-    expect(String(key).split("/").length, "the key holds a second segment").toBe(
-      2,
-    );
+    // Two separators now: the one after the prefix and the one after the user
+    // segment. Phase 10 added the second, which is the change this pin records.
+    // The middle segment is asserted as 64 hex by the pattern above rather than
+    // compared against `USER_A.userId`, because a pin that read the id back out
+    // of the value under test would move with it.
+    expect(
+      String(key).split("/").length,
+      "the key holds no user segment between the prefix and the name",
+    ).toBe(3);
   });
 
-  it("R2, presigned ingress: staging/upload-{16 hex}-{ms}", () => {
+  it("R2, presigned ingress: staging/{user id}/upload-{16 hex}-{ms}", () => {
     const key = presignedKeyFor(USER_A.userId, NOW);
 
     expect(key, "no key was built").not.toBeNull();
-    expect(String(key)).toMatch(/^staging\/upload-[0-9a-f]{16}-1776000000000$/);
-    expect(String(key).split("/").length, "the key holds a second segment").toBe(
-      2,
+    expect(String(key)).toMatch(
+      /^staging\/[0-9a-f]{64}\/upload-[0-9a-f]{16}-1776000000000$/,
     );
+    expect(
+      String(key).split("/").length,
+      "the key holds no user segment between the prefix and the name",
+    ).toBe(3);
   });
 
   it("CONFIRM_KV: confirm:v1:{jti}", async () => {

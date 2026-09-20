@@ -121,7 +121,9 @@ describe("stagingKeyFor: a legible name that cannot leave its prefix", () => {
     const key = stagingKeyFor(principal.userId, "Resume-2026.pdf", NOW);
 
     expect(key).toMatch(
-      new RegExp(`^${STAGING_PREFIX}[0-9a-f]{16}-Resume-2026\\.pdf-${NOW}$`),
+      new RegExp(
+        `^${STAGING_PREFIX}${principal.userId}/[0-9a-f]{16}-Resume-2026\\.pdf-${NOW}$`,
+      ),
     );
   });
 
@@ -275,8 +277,15 @@ describe("the adversarial filename corpus", () => {
       // It holds regardless of what the sanitiser missed, which is the whole
       // reason it is asserted separately from the sanitiser's own output.
       expect(key!.startsWith(STAGING_PREFIX)).toBe(true);
+      // The key sits under the caller's OWN segment, and the name is what
+      // follows it. Slicing the prefix alone would hand the assertions below a
+      // string that begins with the user id and a separator, so every one of
+      // them would be deciding about the wrong half of the key.
+      expect(key!.startsWith(`${STAGING_PREFIX}${principal.userId}/`)).toBe(true);
 
-      const named = key!.slice(STAGING_PREFIX.length);
+      const named = key!.slice(
+        STAGING_PREFIX.length + principal.userId.length + 1,
+      );
       expect(named).not.toContain("/");
       expect(named).not.toContain("\\");
       expect(named).not.toContain("..");
@@ -488,7 +497,16 @@ describe("put, get and delete over the real Miniflare binding", () => {
   });
 
   it("returns null for a key that is not there", async () => {
-    expect(await getStaged(env, principal.userId, `${STAGING_PREFIX}absent-1.pdf`)).toBeNull();
+    // Well formed for THIS caller, and simply not there. A flat key would be
+    // null too, but for the scope check rather than for absence, which would
+    // make this case pass without ever reaching the store.
+    expect(
+      await getStaged(
+        env,
+        principal.userId,
+        `${STAGING_PREFIX}${principal.userId}/absent-1.pdf`,
+      ),
+    ).toBeNull();
   });
 
   it("deletes, and a delete of an absent key does not fail", async () => {
@@ -561,7 +579,9 @@ describe("the staged identifier", () => {
     // this case is about is that the id round-trips to the key the object was
     // actually written under, and the name is still legible in it.
     expect(decodeStagedId(result.id, NOW).key).toMatch(
-      new RegExp(`^${STAGING_PREFIX}[0-9a-f]{16}-Round-Trip\\.pdf-${NOW}$`),
+      new RegExp(
+        `^${STAGING_PREFIX}${principal.userId}/[0-9a-f]{16}-Round-Trip\\.pdf-${NOW}$`,
+      ),
     );
   });
 
@@ -871,7 +891,9 @@ describe("staging from a message: the copy that never reaches the transcript", (
     // the one in the key — matched by shape, since the key gained a leading
     // random segment on 2026-08-21 (D-83's collision closure).
     expect(key).toMatch(
-      new RegExp(`^${STAGING_PREFIX}[0-9a-f]{16}-job-description\\.pdf-${NOW}$`),
+      new RegExp(
+        `^${STAGING_PREFIX}${principal.userId}/[0-9a-f]{16}-job-description\\.pdf-${NOW}$`,
+      ),
     );
     expect((await getStaged(env, principal.userId, key))!.filename).toBe("job-description.pdf");
   });
@@ -1865,7 +1887,7 @@ function envWithout(
 /** One ordinary mint, with a fixed key so the assertions are reproducible. */
 async function mintOne(over: Partial<Parameters<typeof mintUploadUrl>[2]> = {}) {
   return mintUploadUrl(env, principal.userId, {
-    key: `${STAGING_PREFIX}upload-a1b2c3d4e5f60718-${NOW}`,
+    key: `${STAGING_PREFIX}${principal.userId}/upload-a1b2c3d4e5f60718-${NOW}`,
     contentType: "application/pdf",
     contentLength: 65_536,
     filename: "Staff Engineer — job description.pdf",
@@ -1994,7 +2016,7 @@ describe("the minted upload URL", () => {
     ] as const) {
       await expect(
         mintUploadUrl(envWithout(binding), principal.userId, {
-          key: `${STAGING_PREFIX}upload-a1b2c3d4e5f60718-${NOW}`,
+          key: `${STAGING_PREFIX}${principal.userId}/upload-a1b2c3d4e5f60718-${NOW}`,
           contentType: "application/pdf",
           contentLength: 65_536,
           filename: "x.pdf",
@@ -2060,7 +2082,9 @@ describe("the key a presigned upload is aimed at", () => {
 
     expect(key).not.toBeNull();
     expect(String(key)).toMatch(
-      new RegExp(`^${STAGING_PREFIX}upload-[0-9a-f]{16}-${NOW}$`),
+      new RegExp(
+        `^${STAGING_PREFIX}${principal.userId}/upload-[0-9a-f]{16}-${NOW}$`,
+      ),
     );
   });
 
@@ -2513,7 +2537,15 @@ describe("the third ingress, end to end", () => {
 // ---------------------------------------------------------------------------
 
 describe("the declared type survives an object written outside putStaged", () => {
-  const KEY = `${STAGING_PREFIX}0123456789abcdef-typed.txt-${NOW}`;
+  // A LET assigned in `beforeAll`, not a `const` at collection time. The key
+  // now carries the owner's user segment, and `principal` is itself resolved in
+  // a `beforeAll` — a const here would interpolate `undefined` into the key
+  // before any hook had run.
+  let KEY: string;
+
+  beforeAll(() => {
+    KEY = `${STAGING_PREFIX}${principal.userId}/0123456789abcdef-typed.txt-${NOW}`;
+  });
 
   beforeEach(async () => {
     await env.ATTACHMENT_STAGING.delete(KEY);

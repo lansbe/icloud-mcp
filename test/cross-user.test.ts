@@ -446,7 +446,7 @@ describe("R2 staging, read: a staged file belongs to the user who staged it", ()
   // path asks who is calling. When a fix makes B's call refuse, this test goes
   // red with "Expect test to fail": remove the mark then, on purpose, and leave
   // the body exactly as it is.
-  it.fails("B cannot attach a file A staged", async () => {
+  it("B cannot attach a file A staged", async () => {
     if (!storesClean) return;
     const now = Date.now();
 
@@ -517,7 +517,7 @@ describe("R2 staging, delete: only the user who staged a file can remove it", ()
   // whether B's call returns or throws. When a fix leaves A's object in place,
   // this test goes red with "Expect test to fail": remove the mark then, on
   // purpose, and leave the body exactly as it is.
-  it.fails("B cannot delete a file A staged", async () => {
+  it("B cannot delete a file A staged", async () => {
     if (!storesClean) return;
     const now = Date.now();
 
@@ -593,7 +593,7 @@ describe("staged id, built by hand: the id proves nothing about who holds it", (
   // Only a check against the signed-in user refuses this. When such a fix
   // lands, this test goes red with "Expect test to fail": remove the mark then,
   // on purpose, and leave the body exactly as it is.
-  it.fails("B cannot read A's file with an id B built by hand", async () => {
+  it("B cannot read A's file with an id B built by hand", async () => {
     if (!storesClean) return;
     const now = Date.now();
 
@@ -815,7 +815,7 @@ describe("upload ticket: an upload belongs to the user who asked for the grant",
   // here can never be read as "no leak". When a fix makes B's confirm refuse,
   // this test goes red with "Expect test to fail": remove the mark then, on
   // purpose, and leave the body exactly as it is.
-  it.fails("B cannot confirm A's upload", async () => {
+  it("B cannot confirm A's upload", async () => {
     if (!storesClean) return;
     const now = Date.now();
 
@@ -843,7 +843,7 @@ describe("upload ticket: an upload belongs to the user who asked for the grant",
   // copy, so A has to upload the file again. When a fix leaves A's object in
   // place, this test goes red with "Expect test to fail": remove the mark then,
   // on purpose, and leave the body exactly as it is.
-  it.fails("B's wrong-size confirm cannot delete A's upload", async () => {
+  it("B's wrong-size confirm cannot delete A's upload", async () => {
     if (!storesClean) return;
     const now = Date.now();
 
@@ -881,7 +881,7 @@ describe("upload ticket: an upload belongs to the user who asked for the grant",
   // the same call, and is red whenever that call gives null. When a fix makes
   // B's confirm refuse, this test goes red with "Expect test to fail": remove
   // the mark then, on purpose, and leave the body exactly as it is.
-  it.fails("B cannot confirm a ticket B built by hand", async () => {
+  it("B cannot confirm a ticket B built by hand", async () => {
     if (!storesClean) return;
     const now = Date.now();
 

@@ -33,12 +33,21 @@ import { STAGED_ID_TTL_MS, encodeStagedId } from "../mail/ids";
  * **A lifecycle rule created OUT OF BAND expires everything beneath this prefix
  * after one day, and that rule is not in git.** It is account state; nothing in
  * this repository proves it exists, and
- * `.planning/phases/04-mail-write-attachments/04-UAT.md` holds its recorded
- * listing instead. That sentence is here because the alternative is a later
- * reader treating this prefix as decoration — renaming it, flattening it, or
- * dropping it for a bare key — which would silently detach every object written
- * afterwards from the only thing that sweeps abandoned bytes away (D-81's third
- * layer). The prefix IS the sweep's selector.
+ * `.planning/milestones/v1.0-phases/04-mail-write-attachments/04-UAT.md` holds
+ * its recorded listing instead. That path moved when the first milestone was
+ * archived; the listing is the same one. That sentence is here because the
+ * alternative is a later reader treating this prefix as decoration — renaming
+ * it, flattening it, or dropping it for a bare key — which would silently
+ * detach every object written afterwards from the only thing that sweeps
+ * abandoned bytes away (D-81's third layer). The prefix IS the sweep's
+ * selector.
+ *
+ * **A key carries a user segment beneath this prefix, and the sweep still
+ * reaches it.** A store prefix matches through separators, so a rule on
+ * `staging/` covers `staging/<user id>/<name>` exactly as it covered the flat
+ * form. The rule was read again before the segment was added, and it was
+ * unchanged; no expiry has been observed, only the rule read and the semantics
+ * cited.
  *
  * Trailing slash included, so a key is a concatenation and never a join.
  */
@@ -118,10 +127,21 @@ const MAX_STAGED_FILENAME_CHARS = 96;
  * build keys the same width. Sixty-four bits is far more than the collision it
  * closes needs — two stages inside one millisecond — and the segment is not a
  * secret and guards nothing: `underStagingPrefix` is what keeps a forged
- * identifier confined, and it does that by comparing the prefix rather than by
- * anyone having to guess these characters.
+ * identifier confined, and it does that by comparing the key's USER SEGMENT
+ * against the signed-in caller's own id rather than by anyone having to guess
+ * these characters. Guessing these eight bytes would buy nothing anyway: a key
+ * naming someone else's segment is refused however well formed the rest of it
+ * is.
  */
 const KEY_RANDOM_BYTES = 8;
+
+/**
+ * The one shape a user id can take: 64 lowercase hex, anchored at both ends.
+ *
+ * No `g` flag, so it carries no `lastIndex` between calls and is safe to share
+ * with `./presign.ts`, which imports it so the two checkers cannot drift.
+ */
+export const USER_SEGMENT = /^[0-9a-f]{64}$/;
 
 /**
  * The character class refused outright in a name, rather than stripped.
@@ -370,8 +390,9 @@ export function sanitiseFilename(name: string): string | null {
  * across two calls would be asserting the collision.
  *
  * `userId` is the signed-in user's id, and it LEADS the parameter list for
- * `underStagingPrefix`'s reason — see that function. It is accepted and unread
- * here; plan 10-03 is what builds the user segment from it.
+ * `underStagingPrefix`'s reason — see that function. It becomes the key's own
+ * segment, directly beneath the prefix, which is what makes a staged object
+ * belong to one user rather than to whoever can name it.
  */
 export function stagingKeyFor(
   userId: string,
@@ -389,13 +410,17 @@ export function stagingKeyFor(
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
 
-  const key = `${STAGING_PREFIX}${segment}-${safe}-${nowMs}`;
+  const key = `${STAGING_PREFIX}${userId}/${segment}-${safe}-${nowMs}`;
 
   // The post-condition. Anything below this line is a statement about the
   // FINISHED key rather than about the name it was built from.
-  if (!key.startsWith(STAGING_PREFIX)) return null;
-  const named = key.slice(STAGING_PREFIX.length);
-  if (named.includes("/") || named.includes("..")) return null;
+  //
+  // It calls the READ side's own checker rather than restating its rules. One
+  // rule then governs both sides, and this function cannot emit a key the read
+  // path would refuse — which is the failure mode a second copy produces the
+  // moment the two copies drift by one condition.
+  if (!underStagingPrefix(userId, key)) return null;
+  const named = key.slice(STAGING_PREFIX.length + userId.length + 1);
   if (DISALLOWED_IN_NAME.test(named)) {
     DISALLOWED_IN_NAME.lastIndex = 0;
     return null;
@@ -406,7 +431,8 @@ export function stagingKeyFor(
 }
 
 /**
- * Refuse a key that does not sit beneath the staging prefix.
+ * Refuse a key that does not sit beneath the CALLER's own segment of the
+ * staging prefix.
  *
  * **This is not belt-and-braces on the writer; it is the check that makes the
  * READ side safe.** A staged identifier is unsigned — the identifier module
@@ -423,21 +449,56 @@ export function stagingKeyFor(
  * style.** They are two adjacent strings, so a call site can transpose them and
  * the typecheck cannot see it. Placing the id first makes every signature in
  * both staging modules read the same way round, which is the property a reader
- * can check at a glance. What CATCHES a transposition is plan 10-03's shape
- * test: once this checker requires the id to be 64 hex characters, a key handed
- * where an id belongs is refused the first time it happens, at runtime.
+ * can check at a glance. What CATCHES a transposition is the shape test below:
+ * a key handed where an id belongs is not 64 hex characters, and an id handed
+ * where a key belongs does not start with the prefix, so a transposed call is
+ * refused the first time it happens, at runtime.
  *
- * `userId` is accepted and unread in this commit. Plan 10-03 is what reads it.
- * That is deliberate: this commit changes no check body, which is what makes
- * its claim to change no behaviour provable rather than asserted.
+ * **The id is PASSED IN and is never parsed out of the key.** That is the whole
+ * difference between a check and a decoration. A staged identifier is something
+ * a caller can write from nothing, so a checker that read the user segment out
+ * of the key it was given would be comparing a value the caller chose against
+ * itself: every check would pass and nothing would be refused.
+ *
+ * The rule, in the order it runs: the value is a string; it starts with the
+ * prefix; the remainder holds a separator past its first character; the
+ * remainder holds no SECOND separator; the segment before the separator is 64
+ * lowercase hex; that segment equals the passed-in id; the segment after it is
+ * non-empty; neither segment holds a dot-dot.
+ *
+ * It is deliberately NOT "any depth beneath the user segment". Nothing this
+ * project builds produces a deeper key, so the only producer of one is a
+ * forgery.
  */
 function underStagingPrefix(userId: string, key: string): boolean {
-  return (
-    typeof key === "string" &&
-    key.startsWith(STAGING_PREFIX) &&
-    key.length > STAGING_PREFIX.length &&
-    !key.slice(STAGING_PREFIX.length).includes("/")
-  );
+  if (typeof key !== "string") return false;
+  if (!key.startsWith(STAGING_PREFIX)) return false;
+
+  const rest = key.slice(STAGING_PREFIX.length);
+  const slash = rest.indexOf("/");
+  // No user segment at all — the shape every object staged before this landed.
+  if (slash <= 0) return false;
+  // A second separator: deeper than anything this project builds.
+  if (rest.indexOf("/", slash + 1) !== -1) return false;
+
+  const segment = rest.slice(0, slash);
+  const named = rest.slice(slash + 1);
+
+  // **The shape test is not redundant with the equality below.** It refuses a
+  // key when the CALLER's own id is malformed — an empty or absent id would
+  // otherwise admit whatever key happened to carry the same empty segment —
+  // and it is what catches a transposed `userId`/`key` pair, which the
+  // typecheck cannot see because both are strings. It also states the shape at
+  // the one place a reader will look for it.
+  if (!USER_SEGMENT.test(segment)) return false;
+  if (segment !== userId) return false;
+  if (named.length === 0) return false;
+  // The hex shape already excludes a dot-dot from the first segment. The line
+  // states the rule for both segments rather than leaving one of them resting
+  // on a second constant's shape, which is what would silently go false if that
+  // shape were ever widened.
+  if (segment.includes("..") || named.includes("..")) return false;
+  return true;
 }
 
 /**
@@ -658,7 +719,11 @@ export async function putStaged(
   return {
     staged: true,
     id: encodeStagedId({ key, expiresAt }, request.nowMs),
-    filename: key.slice(STAGING_PREFIX.length),
+    // The NAME, and only the name. The key carries a user segment between the
+    // prefix and the name now, so slicing the prefix alone would put the
+    // caller's own user id into a tool response. The post-condition above
+    // proved the segment is exactly `userId`, so this offset is exact.
+    filename: key.slice(STAGING_PREFIX.length + userId.length + 1),
     sizeBytes,
     expiresAt: new Date(expiresAt).toISOString(),
   };
