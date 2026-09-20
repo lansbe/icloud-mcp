@@ -362,6 +362,71 @@ describe.each(LANES)("every other grant is refused at the door, %s", (_lane, bui
   });
 });
 
+describe.each(LANES)(
+  "a grant the door cannot inspect is refused, not a 500, %s",
+  (_lane, build) => {
+    // Code review WR-01. The guard reads three things off the props, and each
+    // read can run code the props brought with them. A throw out of the guard
+    // is a 500 with no challenge, which tells the client nothing about signing
+    // in again. So the guard fails closed and these get the ordinary 401.
+    //
+    // Neither shape is reachable today: props reach the context only through a
+    // parse of the decrypted grant. These are the Phase 11 shapes, pinned now.
+    const UNINSPECTABLE: ReadonlyArray<readonly [string, () => unknown]> = [
+      [
+        "props whose user id is an accessor that throws",
+        () => {
+          const props = {};
+          Object.defineProperty(props, "userId", {
+            enumerable: true,
+            get(): string {
+              throw new Error("the accessor ran");
+            },
+          });
+          return props;
+        },
+      ],
+      [
+        "props that are a proxy whose membership trap throws",
+        () =>
+          new Proxy(
+            { userId: "owner" },
+            {
+              has(): boolean {
+                throw new Error("the trap ran");
+              },
+            },
+          ),
+      ],
+    ];
+
+    it.each(UNINSPECTABLE)("refuses %s", async (_shape, makeProps) => {
+      const response = await callDoor(build("/mcp"), {
+        absent: false,
+        props: makeProps(),
+      });
+
+      expect(
+        response.status,
+        "a grant the guard could not inspect was not refused with a 401",
+      ).toBe(401);
+      expect(response.headers.get("WWW-Authenticate")).toBe(EXPECTED_CHALLENGE);
+
+      const body = JSON.parse(await response.text()) as Record<string, unknown>;
+      expect(body.error).toBe("invalid_token");
+      expect(
+        Object.keys(body).sort(),
+        "the 401 body grew a key, or carries the caught value",
+      ).toEqual(["error", "error_description"]);
+
+      expect(
+        await canaryWasInvoked(),
+        "a grant the guard could not inspect reached the tool layer",
+      ).toBe(false);
+    });
+  },
+);
+
 describe("a missing Worker secret is not a 401 (D-09)", () => {
   /** A fresh copy of the environment with both mail secrets unset. */
   function envWithoutMailSecrets(): EntryEnv {

@@ -195,17 +195,39 @@ const HANDLER_OPTIONS: HandlerOptions = {
  * it should sign in again. The narrowing is the cast-free idiom the principal
  * module uses.
  *
+ * THE CATCH IS WHAT MAKES "NEVER THROWS" TRUE (code review WR-01). Three of the
+ * lines below run code this function did not write. The membership test and the
+ * own-keys read go through a Proxy's traps if the value is a Proxy, and reading
+ * the id runs an accessor if the key is one. Today none of that is reachable:
+ * props reach the context only through a parse of the decrypted grant, which
+ * builds plain objects with data properties, and the external-token resolver is
+ * not configured. So the catch costs nothing today and the claim above is a
+ * claim about the code rather than about what currently feeds it. Phase 11
+ * changes what fills the props, and a guarantee that rests on the caller is the
+ * kind that leaves without anything failing.
+ *
+ * IT FAILS CLOSED. A grant this function cannot inspect is not the owner's, so
+ * the catch returns false and the request gets the 401 every other bad grant
+ * gets. The caught value is never read, never logged and never echoed: it can
+ * carry text a stranger wrote.
+ *
  * The guard stays until Phase 13. While credentials still come from the Worker
  * secrets, whoever gets past it is served as the owner.
  */
 function isOwnerGrant(props: unknown): boolean {
-  if (typeof props !== "object" || props === null || Array.isArray(props)) {
+  try {
+    if (typeof props !== "object" || props === null || Array.isArray(props)) {
+      return false;
+    }
+    if (!("userId" in props)) return false;
+    if (Reflect.ownKeys(props).length !== 1) return false;
+    if (!Object.hasOwn(props, "userId")) return false;
+    return props.userId === "owner";
+  } catch {
+    // Never read the caught value. A grant we cannot inspect is not the
+    // owner's, so this answers the same way every other bad grant is answered.
     return false;
   }
-  if (!("userId" in props)) return false;
-  if (Reflect.ownKeys(props).length !== 1) return false;
-  if (!Object.hasOwn(props, "userId")) return false;
-  return props.userId === "owner";
 }
 
 /**
@@ -276,7 +298,10 @@ export function buildRequestHandler(
  * **Nothing in `fetch` throws and nothing in it awaits.**
  *
  * - A throw here becomes a 500 with no challenge (spike S1). So the guard
- *   returns a boolean and the 401 is built right here.
+ *   returns a boolean and the 401 is built right here. The guard's own catch is
+ *   what holds that up against props this code did not build (code review
+ *   WR-01): it inspects the grant, and inspecting is the part that can run
+ *   someone else's code.
  * - The principal is handed on as a PROMISE (D-09, D-27). An unset or bad
  *   Worker secret must read `auth_failed` from the tool, exactly as it does
  *   today, and never a 401: a 401 tells the client to sign in again, and
