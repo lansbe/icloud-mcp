@@ -860,8 +860,16 @@ export interface UploadGrantReport {
  * of untrusted text must not be published in the trusted block, because it
  * shares most of its characters with the original and arrives looking like
  * server-derived data. `presignedKeyFor` is what makes the argument hold — the
- * key on this path carries a fixed stem, random bytes and a timestamp, and not
- * one character of anything a caller supplied.
+ * key on this path carries a user segment taken from the signed-in principal,
+ * a fixed stem, random bytes and a timestamp, and not one character of anything
+ * a caller supplied.
+ *
+ * The user segment was added in Phase 10 and it changes the enumeration above
+ * without changing the argument: the id comes off the principal through
+ * `userIdOf`, so it is server-derived exactly as the other three parts are. The
+ * list is kept current because the next person to touch this block will check
+ * it rather than re-derive the argument — which is the whole reason the list is
+ * written out instead of summarised.
  *
  * Everything the caller offered stays inside the fence: the name, the declared
  * type, and the percent-encoded form of the name. An echo is not this server's

@@ -714,6 +714,15 @@ export async function putStaged(
   const key = stagingKeyFor(userId, request.filename, request.nowMs);
   const storedFilename = metadataValue(request.filename);
   const storedType = metadataValue(request.mimeType);
+  // `filename-unusable` has a second cause that the name does not describe, and
+  // it is worth one clause here so nobody spends an afternoon on the filename.
+  // Since Phase 10 `stagingKeyFor` also returns null when its post-condition
+  // rejects the finished key because the USER ID is malformed, which has
+  // nothing to do with the name. Unreachable today: every caller passes
+  // `actor.userId`, and `userIdOf` guarantees 64 lowercase hex characters. The
+  // refusal is not split because a second value would be a distinction the
+  // caller cannot act on and this project does not hand callers refusal
+  // vocabulary it cannot use.
   if (key === null || storedFilename === null || storedType === null) {
     return { staged: false, refusal: "filename-unusable", sizeBytes, limitBytes };
   }
