@@ -1362,14 +1362,19 @@ describe("confirm token: a one-time confirmation belongs to the user who preview
       "B's refused commit still issued a write somewhere",
     ).toEqual([]);
 
-    // B was refused for the expected reason. A token that failed to verify is
-    // refused before any request is made. B's requests are on the list, so the
-    // token verified, B's own home was resolved, and the home-set check is what
-    // turned B away.
+    // B was refused for the expected reason, and the reason CHANGED with the
+    // confirm scope. This assertion used to read `toBeGreaterThan(0)` under a
+    // comment saying B's requests were on the list, so the token had verified
+    // and the home-set check was what turned B away. That is no longer how B
+    // is refused: the confirmation carries the user it was minted for, and the
+    // verify compares it before the account is resolved and before any request
+    // is built. So B's list is EMPTY, and that is the fix working rather than
+    // a regression — this is the strictly stronger property, one notch wider
+    // than the two assertions above, which only say B issued no WRITE.
     expect(
-      stub.observed.filter((one) => one.user === "B").length,
-      "B was refused before B's home was ever resolved",
-    ).toBeGreaterThan(0);
+      stub.observed.filter((one) => one.user === "B"),
+      "B's refused commit issued a DAV request, so B reached the network at all",
+    ).toEqual([]);
 
     expect(
       JSON.stringify(resultB),
@@ -1390,7 +1395,7 @@ describe("confirm token: a one-time confirmation belongs to the user who preview
   // on a commit nobody interfered with, so it is known to be able to pass. When
   // a fix leaves A's slot alone, this test goes red with "Expect test to fail":
   // remove the mark then, on purpose, and leave the body exactly as it is.
-  it.fails("B's refused commit cannot spend A's confirm slot", async () => {
+  it("B's refused commit cannot spend A's confirm slot", async () => {
     if (!storesClean) return;
     const stub = twoUserDavStub();
 
@@ -1431,7 +1436,7 @@ describe("confirm token: a one-time confirmation belongs to the user who preview
   // shows the same store check comes back empty after a preview alone. When a
   // fix stops B's call reaching the store, this test goes red with "Expect test
   // to fail": remove the mark then, on purpose, and leave the body as it is.
-  it.fails("B's refused commit cannot write A's jti into CONFIRM_KV", async () => {
+  it("B's refused commit cannot write A's jti into CONFIRM_KV", async () => {
     if (!storesClean) return;
     const stub = twoUserDavStub();
 

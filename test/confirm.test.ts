@@ -37,6 +37,16 @@ const SECRET = "a-test-signing-key-not-real";
 const OTHER_SECRET = "a-different-test-signing-key-not-real";
 
 /**
+ * The signed-in user every confirmation in this suite is minted for.
+ *
+ * 64 lowercase hex, the shape `userIdOf` produces, though nothing in
+ * `src/confirm.ts` asserts that shape — the module compares the field against
+ * the id it was handed and cares about nothing else. A fixed literal rather
+ * than a computed hash, so no case here depends on what any address hashes to.
+ */
+const USER = "1111111111111111111111111111111111111111111111111111111111111111";
+
+/**
  * Freeze the clock at a whole second.
  *
  * `Date.now` is spied rather than the whole timer set faked, because the module
@@ -72,6 +82,12 @@ function payload(overrides: Partial<ConfirmPayload> = {}): ConfirmPayload {
     s: 3,
     h: "cGxhY2Vob2xkZXItY2hhbmdlLWhhc2g",
     x: soon(),
+    // The user this confirmation was minted for. One edit here covers every
+    // case in the file that builds on this helper, which is all twenty of
+    // them — and a case that wanted a DIFFERENT user overrides it, so a
+    // mismatch has to be written down on purpose rather than reached by
+    // forgetting a field.
+    u: USER,
     ...overrides,
   };
 }
@@ -214,7 +230,7 @@ describe("the confirmation token's wire format", () => {
     const original = payload();
     const token = await mintConfirmation(original, SECRET);
 
-    expect(await verifyConfirmation(token, SECRET)).toEqual(original);
+    expect(await verifyConfirmation(token, SECRET, USER)).toEqual(original);
   });
 
   it("round-trips a create's null etag and an occurrence's recurrence id", async () => {
@@ -226,12 +242,17 @@ describe("the confirmation token's wire format", () => {
     const occurrence = payload({ r: "2026-09-01T09:00:00" });
 
     expect(
-      await verifyConfirmation(await mintConfirmation(created, SECRET), SECRET),
+      await verifyConfirmation(
+        await mintConfirmation(created, SECRET),
+        SECRET,
+        USER,
+      ),
     ).toEqual(created);
     expect(
       await verifyConfirmation(
         await mintConfirmation(occurrence, SECRET),
         SECRET,
+        USER,
       ),
     ).toEqual(occurrence);
   });
@@ -247,7 +268,7 @@ describe("the confirmation token cannot be forged or tampered with", () => {
     const [payloadPart, macPart] = token.split(".");
 
     await expect(
-      verifyConfirmation(`${flip(payloadPart, 4)}.${macPart}`, SECRET),
+      verifyConfirmation(`${flip(payloadPart, 4)}.${macPart}`, SECRET, USER),
     ).rejects.toBeInstanceOf(ConfirmationInvalidError);
   });
 
@@ -256,16 +277,16 @@ describe("the confirmation token cannot be forged or tampered with", () => {
     const [payloadPart, macPart] = token.split(".");
 
     await expect(
-      verifyConfirmation(`${payloadPart}.${flip(macPart, 4)}`, SECRET),
+      verifyConfirmation(`${payloadPart}.${flip(macPart, 4)}`, SECRET, USER),
     ).rejects.toBeInstanceOf(ConfirmationInvalidError);
   });
 
   it("refuses a token minted under a different secret", async () => {
     const token = await mintConfirmation(payload(), SECRET);
 
-    await expect(verifyConfirmation(token, OTHER_SECRET)).rejects.toBeInstanceOf(
-      ConfirmationInvalidError,
-    );
+    await expect(
+      verifyConfirmation(token, OTHER_SECRET, USER),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
   });
 
   it.each([
@@ -277,7 +298,7 @@ describe("the confirmation token cannot be forged or tampered with", () => {
     ["a separator and nothing else", "."],
     ["a MAC part outside the alphabet", "aGVsbG8.!!!!"],
   ])("refuses a token with %s", async (_label, token) => {
-    await expect(verifyConfirmation(token, SECRET)).rejects.toBeInstanceOf(
+    await expect(verifyConfirmation(token, SECRET, USER)).rejects.toBeInstanceOf(
       ConfirmationInvalidError,
     );
   });
@@ -290,7 +311,7 @@ describe("the confirmation token cannot be forged or tampered with", () => {
       SECRET,
     );
 
-    await expect(verifyConfirmation(token, SECRET)).rejects.toBeInstanceOf(
+    await expect(verifyConfirmation(token, SECRET, USER)).rejects.toBeInstanceOf(
       ConfirmationInvalidError,
     );
   });
@@ -306,7 +327,7 @@ describe("the confirmation dies at the second its payload names", () => {
     freezeClockAt(now);
     const token = await mintConfirmation(payload({ x: now + 1 }), SECRET);
 
-    expect(await verifyConfirmation(token, SECRET)).toMatchObject({
+    expect(await verifyConfirmation(token, SECRET, USER)).toMatchObject({
       x: now + 1,
     });
   });
@@ -318,7 +339,7 @@ describe("the confirmation dies at the second its payload names", () => {
 
     // `>=` means expired: the boundary second belongs to the dead side, so a
     // token can never be spent in the second it names.
-    await expect(verifyConfirmation(token, SECRET)).rejects.toBeInstanceOf(
+    await expect(verifyConfirmation(token, SECRET, USER)).rejects.toBeInstanceOf(
       ConfirmationInvalidError,
     );
   });
@@ -328,7 +349,7 @@ describe("the confirmation dies at the second its payload names", () => {
     freezeClockAt(now);
     const token = await mintConfirmation(payload({ x: now - 1 }), SECRET);
 
-    await expect(verifyConfirmation(token, SECRET)).rejects.toBeInstanceOf(
+    await expect(verifyConfirmation(token, SECRET, USER)).rejects.toBeInstanceOf(
       ConfirmationInvalidError,
     );
   });
@@ -357,7 +378,7 @@ describe("an unusable signing secret fails closed on BOTH paths", () => {
     // loses its key must refuse everything, not accept what it signed earlier.
     const token = await mintConfirmation(payload(), SECRET);
 
-    await expect(verifyConfirmation(token, secret)).rejects.toBeInstanceOf(
+    await expect(verifyConfirmation(token, secret, USER)).rejects.toBeInstanceOf(
       ConfirmationInvalidError,
     );
   });
@@ -407,17 +428,21 @@ describe("every refusal on the verify path answers identically", () => {
     const [payloadPart, macPart] = token.split(".");
 
     return [
-      ["an unusable signing key", verifyConfirmation(token, undefined)],
-      ["a token that is not two encoded parts", verifyConfirmation("nodot", SECRET)],
+      ["an unusable signing key", verifyConfirmation(token, undefined, USER)],
+      [
+        "a token that is not two encoded parts",
+        verifyConfirmation("nodot", SECRET, USER),
+      ],
       [
         "a seal that does not verify",
-        verifyConfirmation(`${payloadPart}.${flip(macPart, 2)}`, SECRET),
+        verifyConfirmation(`${payloadPart}.${flip(macPart, 2)}`, SECRET, USER),
       ],
       [
         "a payload that is not JSON",
         verifyConfirmation(
           await sealAs(toBase64Url(TOKEN_ENCODER.encode("not json")), SECRET),
           SECRET,
+          USER,
         ),
       ],
       [
@@ -428,6 +453,7 @@ describe("every refusal on the verify path answers identically", () => {
             SECRET,
           ),
           SECRET,
+          USER,
         ),
       ],
       [
@@ -435,6 +461,7 @@ describe("every refusal on the verify path answers identically", () => {
         verifyConfirmation(
           await mintConfirmation(payload({ x: now - 1 }), SECRET),
           SECRET,
+          USER,
         ),
       ],
     ];
@@ -486,7 +513,7 @@ describe("every refusal on the verify path answers identically", () => {
   }
 
   it("names nothing about the check that failed", async () => {
-    const err = (await verifyConfirmation("nodot", SECRET).catch(
+    const err = (await verifyConfirmation("nodot", SECRET, USER).catch(
       (caught: unknown) => caught,
     )) as Error;
 
@@ -705,31 +732,31 @@ describe("the single-use reservation", () => {
     const jti = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
     await expect(
-      reserveConfirmation(kv.binding, jti, soon()),
+      reserveConfirmation(kv.binding, USER, jti, soon()),
     ).resolves.toBeUndefined();
     await expect(
-      reserveConfirmation(kv.binding, jti, soon()),
+      reserveConfirmation(kv.binding, USER, jti, soon()),
     ).rejects.toBeInstanceOf(ConfirmationInvalidError);
 
     // Exactly one write. A second `put` would mean the refusal happened after
     // the record had been rewritten, which would extend the record's own life.
     expect(kv.puts).toHaveLength(1);
-    expect(kv.puts[0].key).toBe(`${CONFIRM_KEY_PREFIX}${jti}`);
+    expect(kv.puts[0].key).toBe(`${CONFIRM_KEY_PREFIX}${USER}:${jti}`);
   });
 
   it("reads the key before it writes, so a spent token costs no DAV request", async () => {
     const kv = fakeKv();
     const jti = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeef";
 
-    await reserveConfirmation(kv.binding, jti, soon());
+    await reserveConfirmation(kv.binding, USER, jti, soon());
 
-    expect(kv.gets).toEqual([`${CONFIRM_KEY_PREFIX}${jti}`]);
+    expect(kv.gets).toEqual([`${CONFIRM_KEY_PREFIX}${USER}:${jti}`]);
   });
 
   it("writes the record BEFORE returning, so a caller that then fails has spent the token", async () => {
     const kv = fakeKv();
 
-    await reserveConfirmation(kv.binding, "written-first", soon());
+    await reserveConfirmation(kv.binding, USER, "written-first", soon());
 
     // Fail toward the recoverable side: a spent token with no write costs one
     // re-preview, where an unspent token after a successful write is a second
@@ -745,7 +772,7 @@ describe("the single-use reservation", () => {
     const kv = fakeKv({ putRejects: true });
 
     await expect(
-      reserveConfirmation(kv.binding, "write-rejects", soon()),
+      reserveConfirmation(kv.binding, USER, "write-rejects", soon()),
     ).rejects.toBeInstanceOf(ConfirmationInvalidError);
   });
 
@@ -754,7 +781,7 @@ describe("the single-use reservation", () => {
     const now = 1_800_000_000;
     freezeClockAt(now);
 
-    await reserveConfirmation(kv.binding, "far", now + CONFIRM_TTL_SECONDS);
+    await reserveConfirmation(kv.binding, USER, "far", now + CONFIRM_TTL_SECONDS);
 
     expect(kv.puts[0].options?.expirationTtl).toBe(CONFIRM_TTL_SECONDS);
   });
@@ -764,7 +791,7 @@ describe("the single-use reservation", () => {
     const now = 1_800_000_000;
     freezeClockAt(now);
 
-    await reserveConfirmation(kv.binding, "near", now + 5);
+    await reserveConfirmation(kv.binding, USER, "near", now + 5);
 
     // The floor extends the RECORD and never the token: the token still dies at
     // `x`, and a record that outlives it is exactly what stops a double spend.
@@ -774,10 +801,10 @@ describe("the single-use reservation", () => {
   it("stores a key whose presence is the whole datum", async () => {
     const kv = fakeKv();
 
-    await reserveConfirmation(kv.binding, "value-shape", soon());
+    await reserveConfirmation(kv.binding, USER, "value-shape", soon());
 
     expect(kv.puts[0].value).toBe("1");
-    expect(CONFIRM_KEY_PREFIX).toBe("confirm:v1:");
+    expect(CONFIRM_KEY_PREFIX).toBe("confirm:v2:");
   });
 
   it("refuses a spent token with the same error every other cause raises", async () => {
@@ -785,14 +812,15 @@ describe("the single-use reservation", () => {
     // on the verify path do — a spent confirmation that looked different from a
     // forged one would tell a caller which of the two it had.
     const kv = fakeKv();
-    await reserveConfirmation(kv.binding, "same-answer", soon());
+    await reserveConfirmation(kv.binding, USER, "same-answer", soon());
 
     const spent = (await reserveConfirmation(
       kv.binding,
+      USER,
       "same-answer",
       soon(),
     ).catch((err: unknown) => err)) as Error;
-    const forged = (await verifyConfirmation("nodot", SECRET).catch(
+    const forged = (await verifyConfirmation("nodot", SECRET, USER).catch(
       (err: unknown) => err,
     )) as Error;
 
@@ -825,7 +853,9 @@ describe("a confirmation and an event id cannot be used for one another", () => 
     // the case cannot pass because the fixture happened to be malformed.
     const eventId = encodeEventId(ref);
 
-    await expect(verifyConfirmation(eventId, SECRET)).rejects.toBeInstanceOf(
+    await expect(
+      verifyConfirmation(eventId, SECRET, USER),
+    ).rejects.toBeInstanceOf(
       ConfirmationInvalidError,
     );
   });
@@ -869,7 +899,7 @@ describe("the refusal is translated at the DAV tree's own boundary", () => {
    */
   async function davBoundary(token: string): Promise<ConfirmPayload> {
     try {
-      return await verifyConfirmation(token, SECRET);
+      return await verifyConfirmation(token, SECRET, USER);
     } catch {
       throw new DavConfirmationError();
     }

@@ -7,20 +7,28 @@
 // open. A key shape that moved without a pin moving would be a change nobody
 // decided.
 //
-// **Two of the four have moved. Two have not yet.**
+// **Three of the four have moved. One has not yet.**
 //
 // | Pin | State |
 // |-----|-------|
 // | R2, binding side | moved — a user segment sits between the prefix and the name |
 // | R2, presigned ingress | moved — the same segment, same place |
-// | `CONFIRM_KV` | not yet. It holds no user today and the confirm scope adds one |
+// | `CONFIRM_KV` | moved — the version went to 2 and the user id sits between the prefix and the jti |
 // | `DAV_CACHE` | not yet. It holds a hash of the Apple ID, and the cache-key change takes that hash from the signed-in user instead |
 //
-// The two that moved gained `/[0-9a-f]{64}/` in the pattern and went from two
+// The two R2 pins gained `/[0-9a-f]{64}/` in the pattern and went from two
 // asserted segments to three. Neither reads the user id back out of the value
 // under test: a pin built from the thing it is pinning moves with it and so
 // pins nothing, which is the same reason the prefixes below are typed out
 // rather than imported.
+//
+// The `CONFIRM_KV` pin does compare against a user id — `USER_A.userId`, a
+// literal row from the vectors file — and that is the DAV pin's habit rather
+// than a departure from the R2 pins'. The difference is where the id comes
+// from. The R2 builders generate their own key, so a pin reading the id back
+// out of it would move with it; here the caller HANDS the id in, so comparing
+// the written key against the literal that was passed is comparing two
+// independent things.
 //
 // **Four older pins already exist, and they stay.** Two are in
 // `test/staging.test.ts`, one is in `test/confirm.test.ts`, and one is in
@@ -181,18 +189,25 @@ describe("key shapes today, one pin per store", () => {
     ).toBe(3);
   });
 
-  it("CONFIRM_KV: confirm:v1:{jti}", async () => {
+  it("CONFIRM_KV: confirm:v2:{user id}:{jti}", async () => {
     const kv = fakeKv();
     const jti = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     const soon = Math.floor(Date.now() / 1000) + 300;
 
-    await reserveConfirmation(kv.binding, jti, soon);
+    await reserveConfirmation(kv.binding, USER_A.userId, jti, soon);
 
     expect(kv.puts.length, "the reservation wrote nothing").toBe(1);
-    // The literal prefix, then the jti, and nothing between them. There is no
-    // user in this key today.
+    // The literal prefix at version 2, then the user id the caller passed in,
+    // then the jti. The prefix is typed out rather than imported so the prefix
+    // itself is pinned; the user id is the literal vectors row, which is a
+    // different thing from the key it is being compared against.
     expect(kv.puts[0]!.key).toBe(
-      "confirm:v1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "confirm:v2:" + USER_A.userId + ":aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    );
+    // Three colon-separated parts after the scheme word, and the middle one is
+    // 64 hex. A key with no user in it fails this even if the prefix moved.
+    expect(kv.puts[0]!.key).toMatch(
+      /^confirm:v2:[0-9a-f]{64}:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee$/,
     );
   });
 

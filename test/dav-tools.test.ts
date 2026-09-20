@@ -1836,6 +1836,12 @@ describe("the calendar_commit write", () => {
         s: null,
         h: await changeHashOf(good.change),
         x: now - 1,
+        // The OWNER, who is the caller every commit in this file is made as.
+        // Not null and not omitted: the commit refuses a confirmation minted
+        // for anyone else BEFORE it looks at the expiry, so a fixture without
+        // this field is refused for the wrong reason and stays green while
+        // testing nothing about expiry at all.
+        u: principal.userId,
       },
       env.CONFIRM_SECRET,
     );
@@ -1854,6 +1860,10 @@ describe("the calendar_commit write", () => {
         s: null,
         h: await changeHashOf(good.change),
         x: now + CONFIRM_TTL_SECONDS,
+        // The OWNER, for the same reason as the fixture above: without it this
+        // case is refused by the user check rather than by the kind check its
+        // name claims.
+        u: principal.userId,
       },
       env.CONFIRM_SECRET,
     );
@@ -2765,6 +2775,10 @@ describe("the calendar_commit delete", () => {
             // guard alone, which is what makes the case a real one.
             h: await changeHashOf(change),
             x: now + CONFIRM_TTL_SECONDS,
+            // The OWNER, and it is part of "every check ahead of the dispatch
+            // passes". A token minted for anyone else is refused at step 3b,
+            // which is before the scope guard this case exists to exercise.
+            u: principal.userId,
           },
           env.CONFIRM_SECRET,
         );
@@ -2967,6 +2981,10 @@ describe("the calendar_commit delete", () => {
         s: null,
         h: await changeHashOf(change),
         x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+        // The OWNER. The disagreement this case is about is between the signed
+        // kind and the supplied change; giving the token a different user would
+        // move the refusal to step 3b and the case would stop being about that.
+        u: principal.userId,
       },
       env.CONFIRM_SECRET,
     );
@@ -3015,6 +3033,9 @@ describe("the calendar_commit delete", () => {
         s: null,
         h: await changeHashOf(created),
         x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+        // The OWNER. This case is about a create that names an ETag, and the
+        // ETag check is reached only by a token whose user matches the caller.
+        u: principal.userId,
       },
       env.CONFIRM_SECRET,
     );
@@ -3102,6 +3123,10 @@ describe("the calendar_commit delete", () => {
         s: null,
         h: await changeHashOf(fresh.change),
         x: now - 1,
+        // The OWNER, so "expired" is genuinely the cause this row contributes
+        // to the same-shape comparison below. A wrong user would make it a
+        // second copy of a cause the row above already covers.
+        u: principal.userId,
       },
       env.CONFIRM_SECRET,
     );
@@ -4857,6 +4882,15 @@ describe("an attendee list this server read cannot reach one it writes", () => {
         s: null,
         h: await changeHashOf(laundered),
         x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+        // The OWNER — and this is the ONE of the seven hand-built payloads in
+        // this file that asserts a SUCCESS rather than a refusal. It commits,
+        // and the assertion below is that the write names no attendees. So
+        // unlike its six siblings this one HAS a warning sign: a missing or
+        // wrong user here turns the commit into a refusal and the case goes
+        // red rather than silently green. The copied `s: null` comment above
+        // says "each is asserting a REFUSAL"; that sentence is inherited and
+        // is not true of this fixture.
+        u: principal.userId,
       },
       env.CONFIRM_SECRET,
     );

@@ -30,9 +30,14 @@
 //
 //   - the token's own lifetime is minutes, so the window is a small fraction
 //     of the period in which a replay is even possible;
-//   - this is a single-user server whose calls arrive from one client in one
-//     session, so a genuine two-colo race requires two clients that do not
-//     exist; and
+//   - a confirmation is bound to ONE user — `ConfirmPayload.u` — and the
+//     reserved slot is keyed under that same user, so the two commits racing
+//     for one slot have to be signed in as the SAME person on two clients at
+//     once. This bullet used to say something stronger and simpler: that this
+//     is a single-user server, so two racing clients do not exist at all. That
+//     stopped being true the moment the payload gained a user field, and a
+//     bound that is quietly false is worse than a narrower one that is true;
+//     and
 //   - `If-Match` at the DAV server is an entirely independent second layer.
 //     The loser of the race carries an etag the winner's write already
 //     invalidated, and no amount of KV staleness turns that into a success.
@@ -109,8 +114,17 @@ export class ConfirmationInvalidError extends Error {
  * one — but it earns its bytes for the same reason: a future format change
  * becomes DETECTABLE, refused outright, rather than silently misread as the
  * current shape and applied to the wrong resource.
+ *
+ * **Bumped to 2 when the payload gained `u`, and the cost is named rather than
+ * discovered.** Every preview in flight at that deploy dies: its token carries
+ * `v: 1`, the check below is a strict inequality against this constant, and a
+ * version this build does not know is refused outright. That is the correct
+ * behaviour rather than a fault — a v1 token has no `u` at all, and admitting
+ * one would be admitting a confirmation nobody can say belongs to anyone. The
+ * owner accepted this cost by name (D-12); it costs each affected preview one
+ * re-preview and nothing else.
  */
-export const CONFIRM_VERSION = 1;
+export const CONFIRM_VERSION = 2;
 
 /**
  * The operation a confirmation authorises.
@@ -153,12 +167,17 @@ export const CONFIRM_TTL_SECONDS = 300;
 /**
  * The key namespace for spent-confirmation records, versioned.
  *
- * `v1` buys the hedge `DAV_CACHE_KEY_PREFIX` and `DAV_TOKEN_VERSION` buy: a
- * future change to the stored shape becomes detectable rather than silently
- * misread as the current one. The stored value carries nothing — the KEY is the
- * fact — so there is no payload to leak and no shape to misparse.
+ * The version buys the hedge `DAV_CACHE_KEY_PREFIX` and `DAV_TOKEN_VERSION`
+ * buy: a future change to the stored shape becomes detectable rather than
+ * silently misread as the current one. The stored value carries nothing — the
+ * KEY is the fact — so there is no payload to leak and no shape to misparse.
+ *
+ * `v2` because the user id now sits between this prefix and the jti. The jti is
+ * a UUID and could not have collided across users anyway, so this is tidiness
+ * rather than the fix: what actually refuses another user's confirmation is the
+ * check inside `verifyConfirmation`, five checks ahead of the reservation.
  */
-export const CONFIRM_KEY_PREFIX = "confirm:v1:";
+export const CONFIRM_KEY_PREFIX = "confirm:v2:";
 
 /**
  * The separator between the sealed payload and its seal.
@@ -262,6 +281,25 @@ export interface ConfirmPayload {
    * second it expires.
    */
   x: number;
+  /**
+   * The user this confirmation was minted FOR.
+   *
+   * The 64-hex id of the signed-in principal at the preview, taken from
+   * `Principal.userId` and from nothing else. It is never read off a caller's
+   * request, never parsed out of a URL, and never recovered from a key — a
+   * subject a caller could choose is not a subject, it is a field.
+   *
+   * **What it buys, and it is not the obvious thing.** A confirmation is
+   * already tied to one resource by `c` and `o`, so another user presenting it
+   * cannot write to their own calendar with it — the home containment check
+   * turns them away. What they COULD do until this field existed is spend the
+   * one-time slot: the reservation ran before anyone asked who the token
+   * belonged to, so a refused commit still burnt the owner's confirmation and
+   * the owner had to preview again. `verifyConfirmation` compares this field
+   * five checks and one KV round trip ahead of that reservation, so a mismatch
+   * now spends nothing at all.
+   */
+  u: string;
 }
 
 /**
@@ -357,10 +395,10 @@ export async function mintConfirmation(
  * Read a confirmation back, or refuse it.
  *
  * **The order is fixed and is not negotiable.** Split into exactly two parts;
- * verify the seal; decode and parse; check the version; check the expiry.
- * Nothing reads a field out of the payload before the seal has verified, so a
- * caller-authored payload never reaches the field extraction at all — the
- * discipline `decodeDavPayload` records for its own decode.
+ * verify the seal; decode and parse; check the version; check the user; check
+ * the expiry. Nothing reads a field out of the payload before the seal has
+ * verified, so a caller-authored payload never reaches the field extraction at
+ * all — the discipline `decodeDavPayload` records for its own decode.
  *
  * `crypto.subtle.verify` and never `crypto.subtle.sign` followed by a
  * comparison. Cloudflare's own signing example says why in a comment: a string
@@ -380,6 +418,8 @@ export async function mintConfirmation(
 export async function verifyConfirmation(
   token: string,
   secret: string | undefined,
+  /** The signed-in user. Never read out of the token it is checked against. */
+  userId: string,
 ): Promise<ConfirmPayload> {
   const key = await importConfirmationKey(secret);
 
@@ -420,6 +460,27 @@ export async function verifyConfirmation(
 
   if (!isConfirmPayload(parsed)) throw new ConfirmationInvalidError();
   if (parsed.v !== CONFIRM_VERSION) throw new ConfirmationInvalidError();
+
+  // The user this confirmation was minted for. A plain comparison, not the
+  // timing-safe one `changeHashMatches` uses two functions down: that one is
+  // timing-safe because the change hash is CALLER-SUPPLIED and a length-
+  // dependent throw would be an oracle. Neither operand here is caller-supplied
+  // — one comes from the signed-in principal and the other out of a payload
+  // this server sealed — so there is no secret for a timing difference to leak,
+  // and the runtime primitive would additionally demand both sides be 32 bytes,
+  // which a 64-character hex string is not.
+  //
+  // The refusal is the SAME single throw every other cause uses, with no
+  // message, no cause and no distinguishable shape: a wrong user must be
+  // indistinguishable from an expired, forged or malformed token, or the
+  // refusal tells an attacker their guess was well formed.
+  //
+  // It runs HERE, and the position is the point rather than an accident.
+  // `applyCommit` reaches this line first, then checks the kind, the supplied
+  // kind's agreement, the change hash and the scope, and only then claims the
+  // one-time slot. So a mismatch is refused five checks and one KV round trip
+  // ahead of the reservation, and costs the user it was minted for nothing.
+  if (parsed.u !== userId) throw new ConfirmationInvalidError();
 
   // `>=`: the second a token names belongs to the dead side.
   if (Math.floor(Date.now() / 1000) >= parsed.x) {
@@ -618,10 +679,12 @@ export async function changeHashMatches(
  */
 export async function reserveConfirmation(
   kv: KVNamespace,
+  /** The signed-in user, from the principal. Never parsed out of the key. */
+  userId: string,
   jti: string,
   expirySeconds: number,
 ): Promise<void> {
-  const key = `${CONFIRM_KEY_PREFIX}${jti}`;
+  const key = `${CONFIRM_KEY_PREFIX}${userId}:${jti}`;
 
   const existing = await kv.get(key);
   if (existing !== null) throw new ConfirmationInvalidError();
@@ -668,6 +731,13 @@ function isConfirmPayload(value: unknown): value is ConfirmPayload {
       (typeof candidate.s === "number" && Number.isInteger(candidate.s))) &&
     "s" in candidate &&
     typeof candidate.h === "string" &&
+    // No `"u" in candidate` companion, and the difference from `s` directly
+    // above is deliberate rather than an omission. `s` needs one because its
+    // type ADMITS null, so an absent field and a present null are both
+    // `candidate.s === null` and the predicate cannot tell them apart. `u` is a
+    // plain string, and `undefined` fails a `typeof === "string"` test on its
+    // own — a payload with no user field is already refused by this line.
+    typeof candidate.u === "string" &&
     typeof candidate.x === "number" &&
     Number.isInteger(candidate.x)
   );

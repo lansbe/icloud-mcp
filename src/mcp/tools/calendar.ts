@@ -1614,6 +1614,10 @@ async function buildPreview(
       s: read.sequence,
       h: await changeHashOf(scoped),
       x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+      // The user this preview belongs to, sealed so the commit can refuse
+      // anyone else before it spends the one-time slot. From the signed-in
+      // principal and nowhere else.
+      u: principal.userId,
     },
     env.CONFIRM_SECRET,
   );
@@ -1849,6 +1853,10 @@ async function buildDeletePreview(
       s: read.sequence,
       h: await changeHashOf(change),
       x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+      // The user this preview belongs to. Same field, same source, same reason
+      // as the update leg: a delete confirmation another user presents must be
+      // refused before it burns this user's slot.
+      u: principal.userId,
     },
     env.CONFIRM_SECRET,
   );
@@ -2086,6 +2094,10 @@ async function buildCreatePreview(
       s: null,
       h: await changeHashOf(change),
       x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+      // NOT null, unlike the two fields above it. A create has no ETag and no
+      // stored revision because there is no resource yet, but it has a user:
+      // the one who asked for it, from the signed-in principal.
+      u: principal.userId,
     },
     env.CONFIRM_SECRET,
   );
@@ -2494,6 +2506,12 @@ function isDispatchableScope(scope: string | null): boolean {
  *
  *   1-3. Split, verify the seal, check the expiry — all inside
  *        `verifyConfirmation`, which refuses each identically.
+ *   3b.  The confirmation was minted for the CALLER, not for somebody else —
+ *        also inside `verifyConfirmation`, and deliberately there rather than
+ *        here. Step six below spends a one-time slot, and a refusal that
+ *        arrived after it would burn the slot belonging to the user who
+ *        previewed, forcing them to preview again. Five checks earlier, it
+ *        costs them nothing.
  *   4.   The kind is one this handler knows.
  *   4b.  The SUPPLIED change's kind agrees with the SIGNED one.
  *   5.   Recompute the change hash and compare it constant-time.
@@ -2513,8 +2531,12 @@ async function applyCommit(
   confirmToken: string,
   supplied: SuppliedChange,
 ): Promise<CommitOutcome> {
-  // Steps 1, 2 and 3.
-  const payload = await verifyConfirmation(confirmToken, env.CONFIRM_SECRET);
+  // Steps 1, 2, 3 and 3b.
+  const payload = await verifyConfirmation(
+    confirmToken,
+    env.CONFIRM_SECRET,
+    principal.userId,
+  );
 
   // Step 4. Read from the SIGNED payload, never inferred from which tool was
   // called. All three kinds reach here now: `create` joined them when the
@@ -2558,7 +2580,12 @@ async function applyCommit(
   // Step 6. A KV read and a KV write, before any DAV request — which is the
   // whole reason the reservation exists rather than leaning on `If-Match`:
   // `If-Match` IS the request it is supposed to precede.
-  await reserveConfirmation(env.CONFIRM_KV, payload.j, payload.x);
+  await reserveConfirmation(
+    env.CONFIRM_KV,
+    principal.userId,
+    payload.j,
+    payload.x,
+  );
 
   // Step 7. The target comes from the payload's own `c`, `o` and `r`.
   const ref: EventRef = {
