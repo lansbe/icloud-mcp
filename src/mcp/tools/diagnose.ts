@@ -111,6 +111,47 @@ export function diagnosticResult(outcome: DiagnosticOutcome): ToolResult {
 }
 
 /**
+ * The tool's answer when THIS SERVER refused the stored credential, before any
+ * byte reached Apple (code review WR-04).
+ *
+ * WHY THIS EXISTS. The whole point of `authFailureDetail` above is that "iCloud
+ * rejected the stored credentials" is true of a wrong password and of a
+ * username format iCloud will not accept, and those need different fixes. Apple
+ * saying so is what tells them apart. Since Phase 9 the principal constructor
+ * refuses some credentials itself — an address with no `@` or more than one, a
+ * character outside printable ASCII, more than 254 typed characters, a password
+ * holding a control character or only white space. Those never reach Apple now,
+ * so Apple says nothing about them, so the field is empty and the caller is
+ * told `auth_failed` with nothing to go on. That is a step backwards from a
+ * diagnostic whose only job is telling credential failures apart.
+ *
+ * WHAT IT ADDS, AND WHAT IT LEAVES ALONE. One fixed field naming WHICH SIDE
+ * refused. Nothing else moves: the category is still `auth_failed` with its
+ * same fixed message (D-05), the refusal itself is unchanged, and the Apple
+ * case is byte-for-byte what it was — it still carries `authFailureDetail` and
+ * never this field. So the two are distinguishable by presence: this field
+ * means the socket never opened; its absence means iCloud was asked.
+ *
+ * THE VALUE IS A FIXED STRING. Never the caught value, never which check
+ * refused, never any part of the input. The address itself is the credential
+ * half this server may not echo, and the message a refusal carries can hold it.
+ * Phase 11 may want to report which check refused; that is a category, decided
+ * then, and it is still never the input.
+ */
+function refusedHereResult(err: unknown): ToolResult {
+  const { category, message } = toErrorCategory(err);
+  return {
+    isError: true,
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({ category, message, authRefusedBy: "this server" }),
+      },
+    ],
+  };
+}
+
+/**
  * Register `mail_imap_diagnose` on a per-request server instance.
  *
  * The `mail_` prefix is deliberate: once calendar and contacts tools land,
@@ -125,6 +166,16 @@ export function diagnosticResult(outcome: DiagnosticOutcome): ToolResult {
  * as the first line of its `try` (D-27). A refusal is already the auth error,
  * and the `catch` below already maps that to `auth_failed`, so an unset secret
  * reads the same as it always has.
+ *
+ * THE AWAIT HAS ITS OWN `try`, AND THAT IS THE WHOLE POINT (code review WR-04).
+ * A refusal from the principal constructor answers BEFORE the socket, so it can
+ * carry no `authFailureDetail`: Apple was never asked and said nothing. An
+ * unset secret reads identically either way, which is why 09-04-SUMMARY.md
+ * first recorded this tool as unchanged — that row was right about the unset
+ * case and wrong about a secret that is SET and refused here. Splitting the
+ * await out is what lets the answer say which side refused, without changing
+ * one byte of what goes on the wire or weakening the refusal. See
+ * `refusedHereResult` above.
  */
 export function registerDiagnoseTool(
   server: McpServer,
@@ -138,8 +189,15 @@ export function registerDiagnoseTool(
       description: "Check iCloud IMAP connectivity, auth, and capabilities.",
     },
     async () => {
+      let actor: Principal;
       try {
-        const actor = await principal;
+        actor = await principal;
+      } catch (err) {
+        // This server refused the stored credential. Nothing was sent.
+        return refusedHereResult(err);
+      }
+
+      try {
         return diagnosticResult(await runDiagnosticOutcome(actor));
       } catch (err) {
         // A backstop for anything the diagnostic did not already fold into an

@@ -465,8 +465,23 @@ describe("a missing Worker secret is not a 401 (D-09)", () => {
 
       const answer = JSON.parse(result?.content?.[0]?.text ?? "null") as {
         category?: string;
+        authRefusedBy?: string;
+        authFailureDetail?: string;
       } | null;
       expect(answer?.category).toBe("auth_failed");
+
+      // Code review WR-04. The answer says WHICH SIDE refused. This server did,
+      // before any socket opened, so Apple said nothing and there is no
+      // rejection text to carry. An answer with no such field means iCloud was
+      // asked. The category and its message are untouched (D-05).
+      expect(
+        answer?.authRefusedBy,
+        "the answer does not say the refusal happened before iCloud was asked",
+      ).toBe("this server");
+      expect(
+        answer?.authFailureDetail,
+        "a refusal that never reached Apple carries Apple's rejection text",
+      ).toBeUndefined();
     },
   );
 
