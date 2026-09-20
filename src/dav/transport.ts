@@ -96,8 +96,18 @@ function assertNoIllegalCharacters(value: string): void {
  * Takes bytes, not a string, so the caller is forced to decide the encoding
  * before reaching here. Handing a JavaScript string straight to the runtime's
  * base64 primitive encodes UTF-16 code units, which is wrong for every
- * non-ASCII byte — and an Apple ID can carry non-ASCII, so this is a live
- * concern rather than a stylistic one.
+ * non-ASCII byte.
+ *
+ * THAT IS NO LONGER A LIVE CONCERN, AND THE HELPER STAYS ANYWAY (code review
+ * IN-06). This docstring used to call a non-ASCII Apple ID a live concern. It
+ * is not one now: since Phase 8 the user-id function refuses any address
+ * holding a character outside printable ASCII, and since Phase 9 every DAV
+ * header here is built from a principal, so no such address can reach this
+ * function. This is the second layer, not the only one. It stays because
+ * handing a string to the base64 primitive is wrong in a way no green test
+ * would show — the mistake produces a header that encodes cleanly and means
+ * something else — and because the layer in front of it is one decision away
+ * from being relaxed.
  *
  * **Copied from `src/mail/credentials.ts` rather than imported from it, with
  * its rationale carried across.** That module's helper is private and stays
