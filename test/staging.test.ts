@@ -543,6 +543,33 @@ describe("put, get and delete over the real Miniflare binding", () => {
     expect(keys[0]!.startsWith(STAGING_PREFIX)).toBe(true);
   });
 
+  it("a key one segment deeper is still INSIDE a listing by the prefix", async () => {
+    // **What this case shows, and what it does not.**
+    //
+    // It shows that in an R2 implementation a prefix match reaches through a
+    // separator: an object at `staging/<user id>/<name>` comes back from a
+    // listing whose prefix is `staging/`. That is the property the whole user
+    // segment rests on, because the one-day lifecycle rule that sweeps
+    // abandoned bytes selects on that same prefix, and adding a segment
+    // beneath it would be worth nothing if the sweep stopped at the first
+    // separator.
+    //
+    // It shows NOTHING about whether the production lifecycle rule fires. No
+    // expiry is observed here and none can be: this is the pool's local bucket,
+    // the rule is account state created out of band, and the only evidence for
+    // it is that the rule was read and found unchanged. This case is a local
+    // measurement of prefix semantics standing beside that citation, not a
+    // replacement for it.
+    const deeper = `${STAGING_PREFIX}${principal.userId}/deeper-probe.txt`;
+    await env.ATTACHMENT_STAGING.put(deeper, "bytes");
+
+    const listed = await env.ATTACHMENT_STAGING.list({
+      prefix: STAGING_PREFIX,
+    });
+
+    expect(listed.objects.map((one) => one.key)).toContain(deeper);
+  });
+
   it("refuses to read or delete a key outside the prefix", async () => {
     // The staged token is UNSIGNED — `encodeStagedId` is base64url over JSON
     // with no MAC — so a caller can mint one naming any key it likes. The
@@ -2001,7 +2028,27 @@ describe("the minted upload URL", () => {
     // somewhere the one-day sweep does not reach, so it is refused rather than
     // signed and reported.
     await expect(mintOne({ key: "elsewhere/x" })).rejects.toThrow();
+    // Kept, and worth knowing it changed meaning without changing colour. It
+    // was green because the NAME held a separator. It is green now because `a`
+    // is not the caller's user id. The sibling below is what actually holds the
+    // depth rule, and nothing else in the suite does.
     await expect(mintOne({ key: `${STAGING_PREFIX}a/b` })).rejects.toThrow();
+  });
+
+  it("refuses a key one segment DEEPER than the caller's own", async () => {
+    // The depth half of the rule, and the only assertion in the suite that can
+    // see it. The first segment here IS the caller's own id, so every other
+    // condition passes: the prefix matches, the segment is 64 lowercase hex,
+    // and it equals the id this call carries. Only the second separator refuses
+    // it.
+    //
+    // The rule is deliberately "exactly one user segment, then a name with no
+    // separator" rather than "any depth beneath the user segment". Nothing this
+    // project builds produces a deeper key, so the only producer of one is a
+    // forgery — and a check that stopped at the user segment would admit it.
+    await expect(
+      mintOne({ key: `${STAGING_PREFIX}${principal.userId}/a/b` }),
+    ).rejects.toThrow();
   });
 
   it("refuses before constructing anything when a binding is absent", async () => {
