@@ -7,7 +7,9 @@
 // `Imap*` counterpart, because nothing on the mail path can raise them.
 //
 // What IS shared is the vocabulary: `ErrorCategory` and `SAFE_MESSAGES` are
-// imported from `src/errors.ts`, and nothing else is. That import is legal
+// imported from `src/errors.ts`. Since Phase 9 one class comes with them: the
+// auth error the principal module raises, which the translation function below
+// has to recognise by type (D-10). Nothing else is imported. That import is legal
 // under ARCHITECTURE Q1's zero-import boundary because `src/errors.ts` sits at
 // the source root beside `src/env.ts` — it is not `src/mail/`, and it has no
 // knowledge of either protocol tree. Importing the vocabulary is what keeps the
@@ -19,7 +21,7 @@
 // This module contains no logging calls of any kind and must never acquire any.
 
 import type { ErrorCategory } from "../errors";
-import { SAFE_MESSAGES } from "../errors";
+import { ImapAuthError, SAFE_MESSAGES } from "../errors";
 
 /**
  * Thrown when iCloud rejects the credentials, or when a credential is absent.
@@ -229,7 +231,10 @@ export class DavSubscriptionError extends Error {
  * the same answer the default already gives, and a branch appended after it
  * would sit below the floor while looking like a peer of the others. The two
  * Phase 5 branches, and now `DavSubscriptionError`, are therefore inserted
- * before it, and any eighth goes in the same place.
+ * before it, and any eighth goes in the same place. The first branch also
+ * answers for the principal module's refusal, because a DAV callback awaits the
+ * promise of the principal and a bad secret must read `auth_failed` and not a
+ * connection fault.
  *
  * The safe messages name "iCloud Mail" on the connection branch, which is a
  * small inaccuracy on a calendar call. It is accepted deliberately, on the same
@@ -244,8 +249,9 @@ export function davToErrorCategory(err: unknown): {
 } {
   let category: ErrorCategory = "connection_failed";
 
-  if (err instanceof DavAuthError) category = "auth_failed";
-  else if (err instanceof DavThrottleError) category = "rate_limited";
+  if (err instanceof DavAuthError || err instanceof ImapAuthError) {
+    category = "auth_failed";
+  } else if (err instanceof DavThrottleError) category = "rate_limited";
   else if (err instanceof DavNotFoundError) category = "not_found";
   else if (err instanceof DavStaleResourceError) category = "stale_resource";
   else if (err instanceof DavConfirmationError) {

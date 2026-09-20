@@ -460,6 +460,43 @@ describe("every category is reachable, and every reachable answer is a category"
   });
 });
 
+describe("the DAV categoriser and the principal module's refusal (Phase 9 D-10)", () => {
+  it("answers the principal module's auth error exactly as it answers the DAV auth error", () => {
+    // A DAV tool callback awaits the promise of the principal. With an unset
+    // or bad secret that promise rejects with the MAIL tree's auth error class,
+    // because that is the one error the principal module raises. Read as a
+    // connection fault it would invite a retry, and retries against a bad
+    // credential are how an account gets locked.
+    //
+    // The whole result object is compared with the DAV auth error's, so the
+    // category and the fixed text are both pinned without the text being typed
+    // a second time here (D-05: the text does not change).
+    const forDav = davToErrorCategory(new DavAuthError());
+    expect(forDav.category, "the control itself is wrong").toBe("auth_failed");
+    expect(forDav.message.length).toBeGreaterThan(0);
+
+    expect(
+      davToErrorCategory(new ImapAuthError()),
+      "the principal module's refusal does not read auth_failed on the DAV side",
+    ).toEqual(forDav);
+  });
+
+  it("still answers a plain Error with connection_failed", () => {
+    // The widened first branch must not have become a catch-all. A bare Error
+    // is what the DAV library throws, and it stays on the floor.
+    expect(davToErrorCategory(new Error("anything")).category).toBe(
+      "connection_failed",
+    );
+    // Nor may any other mail-tree class ride in on the widened branch.
+    expect(davToErrorCategory(new ImapConnectError()).category).toBe(
+      "connection_failed",
+    );
+    expect(davToErrorCategory(new ImapThrottleError()).category).toBe(
+      "connection_failed",
+    );
+  });
+});
+
 describe("DavSubscriptionError and subscription_unreadable", () => {
   it("maps to subscription_unreadable, never to not_found", () => {
     // The class this project trades one confident falsehood for another by

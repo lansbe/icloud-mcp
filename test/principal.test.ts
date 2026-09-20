@@ -73,7 +73,7 @@ import {
   principalFromProps,
   userIdOf,
 } from "../src/principal";
-import { USER_A, USER_B, envFor } from "./fixtures/two-users";
+import { USER_A, USER_B, envFor, testPrincipal } from "./fixtures/two-users";
 import type { TestUser } from "./fixtures/two-users";
 import { REFUSED, USER_ID_VECTORS } from "./fixtures/user-id-vectors";
 
@@ -976,4 +976,54 @@ describe("the invariant: three ways to an id, one answer", () => {
       expect(direct).toBe(user.userId);
     },
   );
+});
+
+describe("test principals are built by the real constructor (Phase 9 D-17)", () => {
+  it("has two test users whose ids and passwords differ, so the cases below mean something", () => {
+    expect(USER_A.userId).not.toBe(USER_B.userId);
+    expect(USER_A.appPassword).not.toBe(USER_B.appPassword);
+    expect(USER_A.appPassword.length).toBeGreaterThan(0);
+    expect(USER_B.appPassword.length).toBeGreaterThan(0);
+  });
+
+  it.each([USER_A, USER_B].map((user) => [user.label, user] as const))(
+    "testPrincipal gives user %s a real principal, with that user's id and password",
+    async (_label, user) => {
+      // The passwords compared here are the fixture's fakes. The password
+      // reader answering at all is the proof the real constructor built this
+      // object: it answers for nothing else.
+      const principal = await testPrincipal(user);
+
+      expect(principal.userId).toBe(user.userId);
+      expect(principal.appleId).toBe(user.appleId);
+      expect(passwordOf(principal)).toBe(user.appPassword);
+    },
+  );
+
+  it("gives A and B different principals, and neither answers the other's password", async () => {
+    const forA = await testPrincipal(USER_A);
+    const forB = await testPrincipal(USER_B);
+
+    expect(forA.userId).not.toBe(forB.userId);
+    expect(passwordOf(forA)).not.toBe(passwordOf(forB));
+  });
+
+  it("refuses a spread copy of a test principal with the auth error (D-16)", async () => {
+    const principal = await testPrincipal(USER_A);
+    const copy = { ...principal };
+
+    // The copy is equal field for field, so only its identity differs.
+    expect(copy).toEqual(principal);
+    // And the original does answer, so the refusal below is about the copy.
+    expect(passwordOf(principal)).toBe(USER_A.appPassword);
+
+    let raised: unknown = null;
+    try {
+      passwordOf(copy);
+    } catch (err) {
+      raised = err;
+    }
+    expect(raised, "a spread copy was given a password").toBeInstanceOf(ImapAuthError);
+    expect(toErrorCategory(raised).category).toBe("auth_failed");
+  });
 });

@@ -5,21 +5,22 @@
 // fake. They are shaped like app-specific passwords only so the fixture keeps
 // working once a later phase starts checking that shape at the login page.
 //
-// **Today the environment object is the only carrier of "which user".** There is
-// no principal yet. Every exported function at the tool layer takes that object
-// as its first argument and reads the account from it, so handing a function a
-// copy with B's two values in it IS being user B, as far as today's code can
-// tell. That is what `envFor` does, and it is all it does.
+// **There are two carriers of "which user" while Phase 9 is under way.**
 //
-// It returns a NEW object and never assigns to the ambient one. Assigning would
-// leak B into every later test in the file, and Phase 8 adds a scan rule that
-// rejects it outright.
+// - `envFor(user)` is the old one. Every exported function at the tool layer
+//   that has not been moved yet takes the environment object as its first
+//   argument and reads the account from it, so handing a function a copy with
+//   B's two values in it IS being user B, as far as that code can tell. It
+//   returns a NEW object and never assigns to the ambient one. Assigning would
+//   leak B into every later test in the file, and a scan rule rejects it
+//   outright.
+// - `testPrincipal(user)` is the new one. It is a real principal, built by the
+//   real props constructor (Phase 9 D-17).
 //
-// **Phase 9 swaps `envFor` for a principal.** When the tool layer starts taking
-// a signed-in user, this file is the one place that changes: `envFor(user)`
-// becomes whatever hands that user over. What the cross-user tests ASSERT does
-// not change, which is the point of writing them against today's signatures
-// (D-05).
+// **Phase 9 swaps `envFor` for the principal, one chain at a time.** The mail
+// chain moves in plan 09-04 and the DAV chain in plan 09-05. Each changes one
+// line of `toolsFor` below. What the cross-user tests ASSERT does not change,
+// which is the point of writing them against the old signatures (D-05).
 //
 // A and B both differ from the pool's own ambient identity, on purpose. A test
 // user that happened to match it could pass by accident. No test may read,
@@ -36,6 +37,8 @@ import type { Env } from "../../src/env";
 import { createSessionGate } from "../../src/mail/service";
 import { registerCalendarTools } from "../../src/mcp/tools/calendar";
 import { registerMailTools } from "../../src/mcp/tools/mail";
+import type { Principal } from "../../src/principal";
+import { principalFromProps } from "../../src/principal";
 import { USER_A_VECTOR, USER_B_VECTOR } from "./user-id-vectors";
 
 /** One test user: who they are, and the user id the spec gives them. */
@@ -75,6 +78,32 @@ export function envFor(user: TestUser): Env {
     APPLE_ID: user.appleId,
     APPLE_APP_PASSWORD: user.appPassword,
   };
+}
+
+/**
+ * A real principal for `user`, as a promise (D-17).
+ *
+ * It returns exactly what the REAL props constructor returns, given the one
+ * shape that constructor accepts: three keys, `v` set to 1, the Apple ID and
+ * the app password. There is no hand-built principal, no test-only export from
+ * the principal module and no test-only way into the password store. So the
+ * password reader answers for this object for the same reason it answers in
+ * production: the real constructor built it.
+ *
+ * **Never spread or clone what this resolves to (D-16).** The password reader
+ * answers only the very object the constructor returned. A copy has the same
+ * two fields and gets the auth error. Pass the promise on as it is, or await it
+ * and pass that one object on.
+ *
+ * `envFor` is still the carrier of "which user" for the DAV side. It stays
+ * until plan 09-05 moves the DAV fetch onto the principal.
+ */
+export function testPrincipal(user: TestUser): Promise<Principal> {
+  return principalFromProps({
+    v: 1,
+    appleId: user.appleId,
+    appPassword: user.appPassword,
+  });
 }
 
 /** What one attempt came to: a value, or a refusal. Never a throw. */
