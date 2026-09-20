@@ -780,6 +780,67 @@ export const SUBSCRIPTION_FEED_FETCH_OWNER = "src/feed/subscription-feed.ts";
 export const SUBSCRIPTION_FEED_FETCH_SCOPE = "src/feed/";
 
 /**
+ * A read of the grant's props, permitted in exactly one file of the source
+ * tree.
+ *
+ * THE RULE. Exactly one file under `src/` reads the grant's props, and that
+ * file is the door in `src/mcp/api-handler.ts`. The door checks that the grant
+ * is the owner's, answers every other grant with a 401 it builds itself, and
+ * hands the tool layer a promise of the principal. Everything past the door
+ * gets the principal by closure. Nothing past the door looks at the grant
+ * again, so nothing past the door can serve a grant the door would refuse.
+ *
+ * WHY A COUNT RATHER THAN A NEGATIVE. Zero readers means the owner guard was
+ * deleted or moved, and nothing fails on the way out: a handler that never
+ * reads the grant serves every grant. "No second reader" is trivially true of
+ * a tree with no reader at all. A second reader is the other failure: a read
+ * added for convenience is a second place that decides who the caller is, and
+ * the two drift. Zero is as much a violation as two.
+ *
+ * TWO ARMS. The first is the props member read off an identifier named `ctx`,
+ * bounded as whole words, with the optional-chaining form included. The second
+ * is a call to the auth context reader, `getMcpAuthContext`. Phase 9 D-08 says
+ * the factory never calls it, and spike S1 showed it is the other way to reach
+ * the same props. The second arm goes beyond D-22's wording. It only refuses
+ * more, and it had zero hits under `src/` when it was added. To drop it,
+ * delete that one arm here and its two rows in the test.
+ *
+ * WHAT IT DOES NOT SEE. Each of these reads the props and fires nothing:
+ *
+ *   1. props destructured from the context (`const { props } = ctx`);
+ *   2. the context under another name (`context.props`, `executionCtx.props`);
+ *   3. a props read hidden behind a helper that lives in the owner file and is
+ *      called from elsewhere.
+ *
+ * A computed member (`ctx["props"]`) is a fourth. A count believed to prove
+ * more than it does is worse than one whose limits are written down.
+ *
+ * NEVER MATCH THE BARE WORD. The DAV library uses `props` all over `src/dav/`
+ * for PROPFIND results (`response.props`, `props.displayname`). A rule that
+ * fires there would be narrowed by the next person in a hurry, and a narrowed
+ * rule is how this guard would quietly leave.
+ *
+ * A NOTE FOR PHASE 11 (Phase 9 D-22). This count deliberately does NOT count
+ * calls to the props constructor, `principalFromProps`. Nothing calls it until
+ * Phase 11, so a count of its callers would fail on zero today, and the only
+ * hit under `src/` is its own definition. When the door starts calling it, add
+ * an arm for a call to it that is not its own definition (the `function`
+ * keyword in front is the difference), so a second caller is seen too.
+ *
+ * Comments count. In every file under `src/` except the owner, write "the
+ * grant's props" and never the spelled read. No `g` flag: `scan()` uses
+ * `String.prototype.search`, which takes the first match only.
+ */
+export const PROPS_READER = /\bctx\s*\??\.\s*props\b|\bgetMcpAuthContext\s*\(/;
+
+/** The one file under `PROPS_READER_SCOPE` permitted to match `PROPS_READER`. */
+export const PROPS_READER_OWNER = "src/mcp/api-handler.ts";
+
+/** The tree `PROPS_READER` is collected from. Tests build props on a real
+ *  execution context and must spell the read, and a test is not a code path. */
+export const PROPS_READER_SCOPE = "src/";
+
+/**
  * Every violation id a count constraint can emit, both directions of each.
  *
  * Named here rather than left implicit so the test can assert set equality
@@ -803,6 +864,8 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "append-choke-point-missing",
   "subscription-feed-fetch-outside-owner",
   "subscription-feed-fetch-choke-point-missing",
+  "props-reader-outside-owner",
+  "props-reader-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -993,6 +1056,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const davNetworkCallers = [];
   const appenders = [];
   const subscriptionFeedFetchCallers = [];
+  const propsReaders = [];
 
   for (const absolute of files) {
     const relativePath = toRepoRelative(absolute);
@@ -1044,6 +1108,12 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
         });
       }
     }
+    if (relativePath.startsWith(PROPS_READER_SCOPE)) {
+      const propsReadIndex = contents.search(PROPS_READER);
+      if (propsReadIndex !== -1) {
+        propsReaders.push({ file: relativePath, ...positionOf(contents, propsReadIndex) });
+      }
+    }
   }
 
   violations.push(...checkSocketOwnership(socketImporters));
@@ -1053,6 +1123,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   violations.push(
     ...checkSubscriptionFeedFetchOwnership(subscriptionFeedFetchCallers),
   );
+  violations.push(...checkPropsReaderOwnership(propsReaders));
 
   return violations.sort(
     (a, b) =>
@@ -1233,6 +1304,43 @@ export function checkSubscriptionFeedFetchOwnership(callers) {
       pattern: "subscription-feed-fetch-choke-point-missing",
       patternIndex: FORBIDDEN.length + 9,
       why: `No file under ${SUBSCRIPTION_FEED_FETCH_SCOPE} reaches the network, which means ${SUBSCRIPTION_FEED_FETCH_OWNER} was moved, renamed, or emptied. A choke point that no longer exists guards nothing, and that failure is far easier to miss than a duplicated one.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The single reader of the grant's props, as a pure function over a list of
+ * readers.
+ *
+ * Same split as the counts above, and for the same reason: both failure
+ * directions are exercised against a list rather than against a fixture tree
+ * on disk. See the `PROPS_READER` docstring for why this is a count at all,
+ * what it does not see, and what Phase 11 must add.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} readers
+ */
+export function checkPropsReaderOwnership(readers) {
+  const violations = [];
+  for (const reader of readers) {
+    if (reader.file === PROPS_READER_OWNER) continue;
+    violations.push({
+      file: reader.file,
+      line: reader.line,
+      column: reader.column,
+      pattern: "props-reader-outside-owner",
+      patternIndex: FORBIDDEN.length + 10,
+      why: `A read of the grant's props under ${PROPS_READER_SCOPE} outside ${PROPS_READER_OWNER}. That file is the door: it checks the grant is the owner's, answers every other grant with a 401, and hands the tool layer a promise of the principal. A second reader is a second place that decides who the caller is, and it can serve a grant the door would refuse. Route the read through the door: take the principal it passes down, and do not read the grant again. If this fired on a comment, write "the grant's props" and not the spelled read. Do not narrow the pattern.`,
+    });
+  }
+  if (readers.length === 0) {
+    violations.push({
+      file: PROPS_READER_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "props-reader-missing",
+      patternIndex: FORBIDDEN.length + 11,
+      why: `No file under ${PROPS_READER_SCOPE} reads the grant's props, which means the owner guard in ${PROPS_READER_OWNER} was deleted, moved, or rewritten into a form this count cannot see. A door that never reads the grant serves every grant, and nothing fails on the way out. Restore the owner guard in that file, reading the props off the request context by its usual name.`,
     });
   }
   return violations;

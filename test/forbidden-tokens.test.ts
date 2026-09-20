@@ -24,6 +24,9 @@ import {
   EXCLUDED,
   FORBIDDEN,
   OWNERSHIP_VIOLATION_IDS,
+  PROPS_READER,
+  PROPS_READER_OWNER,
+  PROPS_READER_SCOPE,
   SOCKET_IMPORT,
   SOCKET_OWNER,
   SUBSCRIPTION_FEED_FETCH_CALL,
@@ -32,6 +35,7 @@ import {
   checkCommitHook,
   checkDavFetchOwnership,
   checkDavHostOwnership,
+  checkPropsReaderOwnership,
   checkSocketOwnership,
   checkSubscriptionFeedFetchOwnership,
   formatViolation,
@@ -2027,6 +2031,121 @@ describe("the subscription-feed fetch choke point is a count constraint too", ()
   });
 });
 
+describe("the single reader of the grant's props is a count constraint too (Phase 9 D-22)", () => {
+  // The spelled read IS written literally here, as the hostnames are in the
+  // host block above. The pattern is collected from src/ only, and this file
+  // is skipped by path for every rule, so nothing here can trip the count.
+  const owner = { file: PROPS_READER_OWNER, line: 293, column: 25 };
+  const elsewhere = { file: "src/mcp/server.ts", line: 40, column: 9 };
+
+  /** A fresh copy per probe, so no state can carry between samples. */
+  const fires = (sample: string): boolean =>
+    new RegExp(PROPS_READER.source, PROPS_READER.flags).test(sample);
+
+  it("passes when the door is the only file that reads the grant's props", () => {
+    expect(checkPropsReaderOwnership([owner])).toEqual([]);
+  });
+
+  it("reports a violation naming the second file when another module reads them", () => {
+    const violations = checkPropsReaderOwnership([owner, elsewhere]);
+    expect(violations.map((v) => v.pattern)).toEqual(["props-reader-outside-owner"]);
+    expect(violations[0]!.file).toBe(elsewhere.file);
+    expect(violations[0]!.line).toBe(elsewhere.line);
+  });
+
+  it("reports a violation naming the owner when no file reads them", () => {
+    // The direction a negative cannot see: a door that stopped reading the
+    // grant serves every grant, and nothing fails on the way out.
+    const violations = checkPropsReaderOwnership([]);
+    expect(violations.map((v) => v.pattern)).toEqual(["props-reader-missing"]);
+    expect(violations[0]!.file).toBe(PROPS_READER_OWNER);
+  });
+
+  it("names the door as the owner, and collects from the source tree only", () => {
+    expect(PROPS_READER_OWNER).toBe("src/mcp/api-handler.ts");
+    expect(PROPS_READER_SCOPE).toBe("src/");
+  });
+
+  it("matches the props read off the request context", () => {
+    for (const sample of [
+      "if (!isOwnerGrant(ctx.props)) {",
+      "const grant = ctx.props;",
+      "const id = ctx.props.userId;",
+      "const grant = ctx?.props;",
+      "return this.ctx.props;",
+      " * `ctx.props` with it.",
+    ]) {
+      expect(fires(sample), `missed ${sample}`).toBe(true);
+    }
+  });
+
+  it("matches a call to the auth context reader, the other way to the same props", () => {
+    // Beyond D-22's wording, and it only refuses more. To drop the arm, delete
+    // it from the pattern and delete this test and the import row below.
+    for (const sample of [
+      "const auth = getMcpAuthContext();",
+      "const grant = getMcpAuthContext ()?.props;",
+    ]) {
+      expect(fires(sample), `missed ${sample}`).toBe(true);
+    }
+  });
+
+  it("does not match an import of the auth context reader, only a call to it", () => {
+    expect(fires('import { getMcpAuthContext } from "agents/mcp";')).toBe(false);
+  });
+
+  it("does not match the bare word, a DAV props field, or a look-alike", () => {
+    for (const sample of [
+      // The DAV library's PROPFIND results, all over src/dav/.
+      "const name = response.props?.displayname;",
+      "for (const [key, value] of Object.entries(result.props)) {",
+      "const props = [`${DAVNamespaceShort.DAV}:displayname`];",
+      // A props member on some other object.
+      "const grant = request.props;",
+      "const grant = authInfo.props;",
+      // The context under a longer name: a known evasion, pinned as unseen.
+      "const grant = myctx.props;",
+      // A longer member that merely starts with the word.
+      "const table = ctx.propsById;",
+      "const table = ctx.props_cache;",
+      // The props constructor. Phase 11 adds an arm for it (see the docstring).
+      "const principal = principalFromProps(grant);",
+      "export function principalFromProps(props: unknown): Principal {",
+    ]) {
+      expect(fires(sample), `false-positived on ${sample}`).toBe(false);
+    }
+  });
+
+  it("pins the known evasions as unseen, so nobody believes they are covered", () => {
+    // Each of these DOES read the grant's props. The docstring lists them. If
+    // the pattern later starts to see one, this goes red: move the row out and
+    // update the docstring.
+    for (const sample of [
+      "const { props } = ctx;",
+      "const grant = context.props;",
+      'const grant = ctx["props"];',
+    ]) {
+      expect(fires(sample), `now sees ${sample}`).toBe(false);
+    }
+  });
+
+  it("carries no global flag, because scan() takes the first match with search()", () => {
+    expect(PROPS_READER.flags).toBe("");
+  });
+
+  it("is wired into scan(): a tree with no owner file fails", () => {
+    // scripts/ is outside PROPS_READER_SCOPE, so scanning it alone exercises
+    // the deleted direction against a real tree rather than a synthetic list.
+    expect(scan("scripts").map((v) => v.pattern)).toContain("props-reader-missing");
+  });
+
+  it("passes on the real tree: the door is the one reader", () => {
+    const patterns = scan().map((v) => v.pattern);
+    expect(patterns).not.toContain("props-reader-missing");
+    expect(patterns).not.toContain("props-reader-outside-owner");
+  });
+});
+
 describe("the count constraints as a set", () => {
   it("covers every ownership violation id with an exercised sample, in both directions", () => {
     // The parallel of the rule-id set-equality assertion above, and it exists
@@ -2048,6 +2167,8 @@ describe("the count constraints as a set", () => {
       ...checkAppendOwnership([]).map((v) => v.pattern),
       ...checkSubscriptionFeedFetchOwnership([nonOwner]).map((v) => v.pattern),
       ...checkSubscriptionFeedFetchOwnership([]).map((v) => v.pattern),
+      ...checkPropsReaderOwnership([nonOwner]).map((v) => v.pattern),
+      ...checkPropsReaderOwnership([]).map((v) => v.pattern),
     ]);
     expect([...observed].sort()).toEqual([...OWNERSHIP_VIOLATION_IDS].sort());
   });
@@ -2065,6 +2186,8 @@ describe("the count constraints as a set", () => {
       ...checkAppendOwnership([]),
       ...checkSubscriptionFeedFetchOwnership([nonOwner]),
       ...checkSubscriptionFeedFetchOwnership([]),
+      ...checkPropsReaderOwnership([nonOwner]),
+      ...checkPropsReaderOwnership([]),
     ];
     expect(violations.length).toBe(OWNERSHIP_VIOLATION_IDS.length);
     for (const violation of violations) {
@@ -2088,6 +2211,9 @@ describe("the count constraints as a set", () => {
     // repository handed a stranger-supplied third-party URL, so it is also the
     // one that most needs the logging ban applying to it in full.
     expect(EXCLUDED.has(SUBSCRIPTION_FEED_FETCH_OWNER)).toBe(false);
+    // And for the door: it is the one module that holds the grant's props, so
+    // it is the one that most needs the props-in-log rule applying to it.
+    expect(EXCLUDED.has(PROPS_READER_OWNER)).toBe(false);
     const logging = FORBIDDEN.find((r) => r.id === "logging-anywhere-under-src")!;
     expect(
       matchRule(logging, 0, DAV_HOST_OWNER, 'console.log("resolved", homeUrl);').length,
