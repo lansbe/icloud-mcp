@@ -25,11 +25,20 @@ import {
   davDiagnosticResult,
   registerDavDiagnoseTool,
 } from "../src/mcp/tools/dav-diagnose";
+import { principalFromEnv } from "../src/principal";
 import {
   type BoundMailSecrets,
   assertMailSecretsBound,
   ownerPrincipal,
 } from "./fixtures/bound-secrets";
+
+// The owner's principal, as the PROMISE the real env constructor returns over
+// the pool's ambient environment. The DAV fetch builder and the registrars take
+// the promise. The no-op handler means a file that builds it and awaits it
+// nowhere leaves no rejection unheard. Everyone who does await it still sees
+// the refusal.
+const owner = ownerPrincipal();
+owner.catch(() => {});
 
 // ---------------------------------------------------------------------------
 // The account this fixture describes
@@ -252,7 +261,7 @@ describe("dav_diagnose, end to end", () => {
     const stub = davStub();
     vi.stubGlobal("fetch", stub.fetch);
 
-    const result = await diagnoseHandler(createDavFetch(env))({});
+    const result = await diagnoseHandler(createDavFetch(owner))({});
 
     expect(result.isError).toBeUndefined();
     const caldav = serviceOf(result, "caldav");
@@ -278,7 +287,7 @@ describe("dav_diagnose, end to end", () => {
     const stub = davStub();
     vi.stubGlobal("fetch", stub.fetch);
 
-    const result = await diagnoseHandler(createDavFetch(env))({});
+    const result = await diagnoseHandler(createDavFetch(owner))({});
     const report = reportOf(result);
 
     expect((report.caldav as Record<string, unknown>).shardHost).toBe(
@@ -294,7 +303,7 @@ describe("dav_diagnose, end to end", () => {
     const stub = davStub({ carddavHome: matchedCarddav });
     vi.stubGlobal("fetch", stub.fetch);
 
-    const result = await diagnoseHandler(createDavFetch(env))({});
+    const result = await diagnoseHandler(createDavFetch(owner))({});
     const caldav = serviceOf(result, "caldav");
     const carddav = serviceOf(result, "carddav");
 
@@ -307,12 +316,12 @@ describe("dav_diagnose, end to end", () => {
   it("issues ZERO outbound requests on a cache hit", async () => {
     const warm = davStub();
     vi.stubGlobal("fetch", warm.fetch);
-    await diagnoseHandler(createDavFetch(env))({});
+    await diagnoseHandler(createDavFetch(owner))({});
     expect(warm.requests.length).toBeGreaterThan(0);
 
     const cold = davStub();
     vi.stubGlobal("fetch", cold.fetch);
-    const cached = await resolveDavAccount(env, createDavFetch(env), "caldav");
+    const cached = await resolveDavAccount(env, createDavFetch(owner), "caldav");
 
     expect(cached.cacheHit).toBe(true);
     expect(cached.homeUrl).toBe(CALDAV_HOME);
@@ -322,18 +331,18 @@ describe("dav_diagnose, end to end", () => {
   it("deletes both entries and re-resolves live on refresh: true (D-61)", async () => {
     const warm = davStub();
     vi.stubGlobal("fetch", warm.fetch);
-    const first = await diagnoseHandler(createDavFetch(env))({});
+    const first = await diagnoseHandler(createDavFetch(owner))({});
     expect(serviceOf(first, "caldav").cacheHit).toBe(false);
 
     const second = davStub();
     vi.stubGlobal("fetch", second.fetch);
-    const cachedRun = await diagnoseHandler(createDavFetch(env))({});
+    const cachedRun = await diagnoseHandler(createDavFetch(owner))({});
     expect(serviceOf(cachedRun, "caldav").cacheHit).toBe(true);
     expect(serviceOf(cachedRun, "carddav").cacheHit).toBe(true);
 
     const refreshed = davStub();
     vi.stubGlobal("fetch", refreshed.fetch);
-    const third = await diagnoseHandler(createDavFetch(env))({ refresh: true });
+    const third = await diagnoseHandler(createDavFetch(owner))({ refresh: true });
 
     expect(reportOf(third).refresh).toBe(true);
     expect(serviceOf(third, "caldav").cacheHit).toBe(false);
@@ -346,7 +355,7 @@ describe("dav_diagnose, end to end", () => {
     const stub = davStub();
     vi.stubGlobal("fetch", stub.fetch);
 
-    await diagnoseHandler(createDavFetch(env))({});
+    await diagnoseHandler(createDavFetch(owner))({});
 
     expect(stub.requests.length).toBeGreaterThan(0);
     for (const request of stub.requests) {
@@ -363,7 +372,7 @@ describe("dav_diagnose, end to end", () => {
     const stub = davStub();
     vi.stubGlobal("fetch", stub.fetch);
 
-    await diagnoseHandler(createDavFetch(env))({});
+    await diagnoseHandler(createDavFetch(owner))({});
 
     expect(stub.overlapped).toBe(false);
     // And strictly: each request finished before the next one started.
@@ -382,7 +391,7 @@ describe("dav_diagnose, end to end", () => {
 
     const stub = davStub();
     vi.stubGlobal("fetch", stub.fetch);
-    const result = await diagnoseHandler(createDavFetch(env))({});
+    const result = await diagnoseHandler(createDavFetch(owner))({});
     const serialized = JSON.stringify(result);
 
     expect(serialized).not.toContain(bound.APPLE_ID);
@@ -393,9 +402,12 @@ describe("dav_diagnose, end to end", () => {
     const stub = davStub();
     vi.stubGlobal("fetch", stub.fetch);
 
+    const refused = principalFromEnv({ ...env, APPLE_ID: undefined });
+    refused.catch(() => {});
+
     const outcome: DavDiagnosticOutcome = await runDavDiagnosticOutcome(
       { ...env, APPLE_ID: undefined },
-      createDavFetch({ ...env, APPLE_ID: undefined }),
+      createDavFetch(refused),
       { refresh: false },
     );
 

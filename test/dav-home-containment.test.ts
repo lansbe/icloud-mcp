@@ -146,6 +146,15 @@ import { DavNotFoundError } from "../src/dav/errors";
 import { encodeCalendarId } from "../src/dav/ids";
 import type { EventRef } from "../src/dav/ids";
 import { createDavFetch } from "../src/dav/transport";
+import { ownerPrincipal } from "./fixtures/bound-secrets";
+
+// The owner's principal, as the PROMISE the real env constructor returns over
+// the pool's ambient environment. The DAV fetch builder and the registrars take
+// the promise. The no-op handler means a file that builds it and awaits it
+// nowhere leaves no rejection unheard. Everyone who does await it still sees
+// the refusal.
+const owner = ownerPrincipal();
+owner.catch(() => {});
 
 /** The directory this gate owns. Every key in `SOURCES` begins with it. */
 const DAV_DIR = "src/dav/";
@@ -955,7 +964,7 @@ beforeEach(async () => {
   // Cleared first, so the warm-up is a real miss rather than a hit left behind
   // by another file in the pool.
   await clearDavCache(env, "caldav");
-  const resolved = await resolveDavAccount(env, createDavFetch(env), "caldav");
+  const resolved = await resolveDavAccount(env, createDavFetch(owner), "caldav");
   expect(resolved.cacheHit).toBe(false);
   live.observed.length = 0;
 });
@@ -981,8 +990,8 @@ function refOf(calendarUrl: string, objectUrl: string): EventRef {
 /** The two writers that take an `EventRef`, driven with whatever ref is given. */
 const REF_WRITERS: Record<string, (ref: EventRef) => Promise<unknown>> = {
   updateEvent: (ref) =>
-    updateEvent(env, createDavFetch(env), ref, CONTAINMENT_ICS, '"etag-1"'),
-  deleteEvent: (ref) => deleteEvent(env, createDavFetch(env), ref, '"etag-1"'),
+    updateEvent(env, createDavFetch(owner), ref, CONTAINMENT_ICS, '"etag-1"'),
+  deleteEvent: (ref) => deleteEvent(env, createDavFetch(owner), ref, '"etag-1"'),
 };
 
 describe("a forged reference is refused before the credential leaves", () => {
@@ -997,7 +1006,7 @@ describe("a forged reference is refused before the credential leaves", () => {
     }
 
     live.observed.length = 0;
-    await createEvent(env, createDavFetch(env), {
+    await createEvent(env, createDavFetch(owner), {
       calendarId: encodeCalendarId({ collectionUrl: WORK_URL }),
       summary: "Interview",
       startLocal: "2026-09-03T14:00:00",
@@ -1069,7 +1078,7 @@ describe("a forged reference is refused before the credential leaves", () => {
     ] as const) {
       live.observed.length = 0;
       const err = await refusal(() =>
-        createEvent(env, createDavFetch(env), {
+        createEvent(env, createDavFetch(owner), {
           calendarId: encodeCalendarId({ collectionUrl: collection }),
           summary: "Interview",
           startLocal: "2026-09-03T14:00:00",
@@ -1109,7 +1118,7 @@ describe("a forged reference is refused before the credential leaves", () => {
     await clearDavCache(env, "caldav");
     const resolved = await resolveDavAccount(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       "caldav",
     );
     expect(resolved.cacheHit).toBe(false);

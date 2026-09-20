@@ -44,7 +44,7 @@ import type { Env } from "../src/env";
 import { presignedKeyFor } from "../src/staging/presign";
 import { stagingKeyFor } from "../src/staging/r2";
 import { HOME_A, HOME_B, twoUserDavStub } from "./fixtures/two-user-dav";
-import { USER_A, USER_B, envFor } from "./fixtures/two-users";
+import { USER_A, USER_B, envFor, testPrincipal } from "./fixtures/two-users";
 import type { TestUser } from "./fixtures/two-users";
 
 /** A fixed instant, so the clock segment of a key can be compared exactly. */
@@ -117,7 +117,7 @@ async function davKeyWrittenFor(
   vi.stubGlobal("fetch", twoUserDavStub().fetch);
   const resolved = await resolveDavAccount(
     scoped,
-    createDavFetch(scoped),
+    createDavFetch(testPrincipal(user)),
     "caldav",
   );
 

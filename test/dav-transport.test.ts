@@ -26,10 +26,21 @@ import {
 } from "../src/dav/errors";
 import { createDavFetch, davAuthHeader } from "../src/dav/transport";
 import { SAFE_MESSAGES } from "../src/errors";
+import type { Principal } from "../src/principal";
+import { principalFromEnv, principalFromProps } from "../src/principal";
 import {
-  type BoundMailSecrets,
   assertMailSecretsBound,
+  type BoundMailSecrets,
+  ownerPrincipal,
 } from "./fixtures/bound-secrets";
+
+// The owner's principal, as the PROMISE the real env constructor returns over
+// the pool's ambient environment. The DAV fetch builder and the registrars take
+// the promise. The no-op handler means a file that builds it and awaits it
+// nowhere leaves no rejection unheard. Everyone who does await it still sees
+// the refusal.
+const owner = ownerPrincipal();
+owner.catch(() => {});
 
 const TARGET = "https://p42-caldav.icloud.com/1234567890/calendars/";
 
@@ -144,11 +155,19 @@ async function raise(
 // ---------------------------------------------------------------------------
 
 describe("davAuthHeader", () => {
-  it("builds a Basic header from the two bound secrets", () => {
+  // The refusal cases below stub the global fetch, to count what left.
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("builds a Basic header from the two bound secrets", async () => {
     assertMailSecretsBound(env);
     const bound: BoundMailSecrets = env;
 
-    const header = davAuthHeader(env);
+    // The owner's principal, from the real env constructor. The two assertions
+    // below still compare against the BOUND values, untouched: they are the
+    // proof that threading the principal did not move one byte of the header.
+    const header = davAuthHeader(await owner);
 
     expect(header.startsWith("Basic ")).toBe(true);
     expect(atob(header.slice("Basic ".length))).toBe(
@@ -156,16 +175,26 @@ describe("davAuthHeader", () => {
     );
   });
 
-  it("encodes a non-ASCII Apple ID over UTF-8 BYTES, not UTF-16 code units", () => {
+  it("encodes a non-ASCII password over UTF-8 BYTES, not UTF-16 code units", async () => {
     // U+00FC is the case that separates the two encodings while staying inside
     // btoa's own range, so the wrong answer is producible rather than merely
     // theoretical: as a code unit it is one byte 0xFC, as UTF-8 it is 0xC3 0xBC.
     // A header built the wrong way is accepted by btoa and rejected by Apple,
     // and the user is told their app-specific password is wrong when only its
     // encoding was.
-    const appleId = "rüssell@example.invalid";
-    const password = "test-password-not-real";
-    const scoped = { ...env, APPLE_ID: appleId, APPLE_APP_PASSWORD: password };
+    //
+    // The non-ASCII character used to sit in the Apple ID. It moved to the
+    // password in Phase 9: a principal cannot be built from an Apple ID outside
+    // printable ASCII (Apple IDs follow email conventions, D-21), and only a
+    // real principal reaches the header now. A password may still carry one,
+    // and it goes through the very same encoder call.
+    const appleId = "russell@example.invalid";
+    const password = "test-pässword-not-real";
+    const scoped = await principalFromProps({
+      v: 1,
+      appleId,
+      appPassword: password,
+    });
 
     const header = davAuthHeader(scoped);
     const encoded = header.slice("Basic ".length);
@@ -185,28 +214,110 @@ describe("davAuthHeader", () => {
     ["APPLE_ID empty", { APPLE_ID: "" }],
     ["APPLE_APP_PASSWORD absent", { APPLE_APP_PASSWORD: undefined }],
     ["APPLE_APP_PASSWORD empty", { APPLE_APP_PASSWORD: "" }],
-  ])("throws DavAuthError when %s", (_label, patch) => {
-    expect(() => davAuthHeader({ ...env, ...patch })).toThrow(DavAuthError);
+  ])("refuses with DavAuthError and sends nothing when %s", async (_label, patch) => {
+    // An absent secret can no longer be expressed at the header function: only
+    // a real principal reaches it, and none can be built from these values. So
+    // the same claim is made one level up. The promise rejects, the DAV fetch
+    // built over it raises the DAV auth error, and no request leaves.
+    const stub = statusStub(207);
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const refused = principalFromEnv({ ...env, ...patch });
+    refused.catch(() => {});
+
+    expect(await raise(createDavFetch(refused))).toBeInstanceOf(DavAuthError);
+    expect(stub.observed.length).toBe(0);
   });
 
   it.each([
     ["a trailing newline", "test-password-not-real\n"],
     ["a carriage return", "test-\rpassword"],
     ["a NUL", "test-\u0000password"],
-  ])("throws DavAuthError on a secret carrying %s", (_label, password) => {
+  ])("refuses with DavAuthError and sends nothing on a secret carrying %s", async (_label, password) => {
     // A secret provisioned from a file carries the file's trailing newline, so
     // this is the mundane case rather than the hostile one. Refusing beats
     // escaping: an escaped value is rejected by the server, and the user is
     // told the credential is wrong when only its encoding was.
-    expect(() =>
-      davAuthHeader({ ...env, APPLE_APP_PASSWORD: password }),
-    ).toThrow(DavAuthError);
+    //
+    // The principal module refuses these first now. The header function's own
+    // check is the second layer behind it.
+    const stub = statusStub(207);
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const refused = principalFromEnv({ ...env, APPLE_APP_PASSWORD: password });
+    refused.catch(() => {});
+
+    expect(await raise(createDavFetch(refused))).toBeInstanceOf(DavAuthError);
+    expect(stub.observed.length).toBe(0);
   });
 
-  it("refuses an illegal character in the Apple ID too", () => {
-    expect(() => davAuthHeader({ ...env, APPLE_ID: "a\nb@example.invalid" })).toThrow(
-      DavAuthError,
-    );
+  it("refuses an illegal character in the Apple ID too", async () => {
+    const stub = statusStub(207);
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const refused = principalFromEnv({ ...env, APPLE_ID: "a\nb@example.invalid" });
+    refused.catch(() => {});
+
+    expect(await raise(createDavFetch(refused))).toBeInstanceOf(DavAuthError);
+    expect(stub.observed.length).toBe(0);
+  });
+
+  it("reads a refused principal as auth_failed, never as a connection fault", async () => {
+    // The await of the promise sits OUTSIDE the try around the fetch. Inside it,
+    // this would read `connection_failed`, and that invites a retry that can
+    // never work (D-27).
+    const stub = statusStub(207);
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const refused = principalFromEnv({ ...env, APPLE_ID: undefined });
+    refused.catch(() => {});
+
+    const raised = await raise(createDavFetch(refused));
+    expect(davToErrorCategory(raised).category).toBe("auth_failed");
+    expect(stub.observed.length).toBe(0);
+  });
+
+  describe("a principal no constructor built (D-16)", () => {
+    it("refuses a hand-made look-alike, and sends nothing", async () => {
+      const stub = statusStub(207);
+      vi.stubGlobal("fetch", stub.fetch);
+
+      // The right two fields and the right types. It is still not an object a
+      // constructor returned, so the password reader has nothing for it.
+      const lookalike: Principal = {
+        userId: "0".repeat(64),
+        appleId: "lookalike@example.invalid",
+      };
+
+      expect(() => davAuthHeader(lookalike)).toThrow(DavAuthError);
+      expect(
+        await raise(createDavFetch(Promise.resolve(lookalike))),
+      ).toBeInstanceOf(DavAuthError);
+      expect(stub.observed.length).toBe(0);
+    });
+
+    it("refuses a spread copy of a real principal, and sends nothing", async () => {
+      const stub = statusStub(207);
+      vi.stubGlobal("fetch", stub.fetch);
+
+      // Done here ONLY to prove it is refused. Nothing under `src/` may do this.
+      const copy: Principal = { ...(await owner) };
+
+      expect(() => davAuthHeader(copy)).toThrow(DavAuthError);
+      expect(await raise(createDavFetch(Promise.resolve(copy)))).toBeInstanceOf(
+        DavAuthError,
+      );
+      expect(stub.observed.length).toBe(0);
+    });
+
+    it("serves the real object the copy was made from (the control)", async () => {
+      const stub = statusStub(207);
+      vi.stubGlobal("fetch", stub.fetch);
+
+      await createDavFetch(owner)(TARGET);
+
+      expect(stub.observed.length).toBe(1);
+    });
   });
 });
 
@@ -219,7 +330,7 @@ describe("createDavFetch — the credential", () => {
     const stub = statusStub(207);
     vi.stubGlobal("fetch", stub.fetch);
 
-    await createDavFetch(env)(TARGET, {
+    await createDavFetch(owner)(TARGET, {
       method: "PROPFIND",
       headers: { depth: "1", "content-type": "application/xml" },
     });
@@ -236,7 +347,7 @@ describe("createDavFetch — the credential", () => {
     const stub = statusStub(207);
     vi.stubGlobal("fetch", stub.fetch);
 
-    await createDavFetch(env)(TARGET, {
+    await createDavFetch(owner)(TARGET, {
       headers: { authorization: "Bearer caller-supplied" },
     });
 
@@ -252,8 +363,11 @@ describe("createDavFetch — the credential", () => {
     const stub = statusStub(207);
     vi.stubGlobal("fetch", stub.fetch);
 
-    const scoped = { ...env, APPLE_ID: undefined };
-    await expect(createDavFetch(scoped)(TARGET)).rejects.toBeInstanceOf(
+    // The promise the door would hand over with that secret unset. It rejects,
+    // and the DAV fetch turns the rejection into its own auth error.
+    const refused = principalFromEnv({ ...env, APPLE_ID: undefined });
+    refused.catch(() => {});
+    await expect(createDavFetch(refused)(TARGET)).rejects.toBeInstanceOf(
       DavAuthError,
     );
     expect(stub.observed.length).toBe(0);
@@ -268,7 +382,7 @@ describe("createDavFetch — the redirect policy (T-03-01)", () => {
   it("passes redirect: manual on every request", async () => {
     const stub = statusStub(207);
     vi.stubGlobal("fetch", stub.fetch);
-    const davFetch = createDavFetch(env);
+    const davFetch = createDavFetch(owner);
 
     await davFetch(TARGET);
     await davFetch(TARGET, { method: "PROPFIND" });
@@ -287,7 +401,7 @@ describe("createDavFetch — the redirect policy (T-03-01)", () => {
     const stub = statusStub(207);
     vi.stubGlobal("fetch", stub.fetch);
 
-    await createDavFetch(env)(TARGET, { redirect: "follow" });
+    await createDavFetch(owner)(TARGET, { redirect: "follow" });
 
     expect(stub.observed[0].init.redirect).toBe("manual");
   });
@@ -301,7 +415,7 @@ describe("createDavFetch — serialisation", () => {
   it("holds at most one request in flight under overlapping callers", async () => {
     const stub = statusStub(207);
     vi.stubGlobal("fetch", stub.fetch);
-    const davFetch = createDavFetch(env);
+    const davFetch = createDavFetch(owner);
 
     // Fired without awaiting: this is the shape tsdav's own internal fan-out
     // takes, and the gate is the only thing between it and the six-connection
@@ -330,7 +444,7 @@ describe("createDavFetch — serialisation", () => {
       (_url, seq) => new Response(null, { status: seq === 1 ? 500 : 207 }),
     );
     vi.stubGlobal("fetch", stub.fetch);
-    const davFetch = createDavFetch(env);
+    const davFetch = createDavFetch(owner);
 
     await expect(davFetch(TARGET)).rejects.toBeInstanceOf(DavConnectError);
     const second = await davFetch(TARGET);
@@ -346,8 +460,8 @@ describe("createDavFetch — serialisation", () => {
     const stub = statusStub(207);
     vi.stubGlobal("fetch", stub.fetch);
 
-    const first = createDavFetch(env);
-    const second = createDavFetch(env);
+    const first = createDavFetch(owner);
+    const second = createDavFetch(owner);
     await Promise.all([first(`${TARGET}a/`), second(`${TARGET}b/`)]);
 
     // The stub still records them, and the assertion here is about
@@ -363,7 +477,7 @@ describe("createDavFetch — status to typed error (D-60)", () => {
 
   it.each([200, 201, 204, 207])("returns the response on %i", async (status) => {
     vi.stubGlobal("fetch", statusStub(status).fetch);
-    const response = await createDavFetch(env)(TARGET);
+    const response = await createDavFetch(owner)(TARGET);
     expect(response.status).toBe(status);
   });
 
@@ -371,7 +485,7 @@ describe("createDavFetch — status to typed error (D-60)", () => {
     "throws DavAuthError on %i, which is never retried",
     async (status) => {
       vi.stubGlobal("fetch", statusStub(status).fetch);
-      expect(await raise(createDavFetch(env))).toBeInstanceOf(DavAuthError);
+      expect(await raise(createDavFetch(owner))).toBeInstanceOf(DavAuthError);
     },
   );
 
@@ -379,7 +493,7 @@ describe("createDavFetch — status to typed error (D-60)", () => {
     "throws DavThrottleError on %i, which is never retried",
     async (status) => {
       vi.stubGlobal("fetch", statusStub(status).fetch);
-      expect(await raise(createDavFetch(env))).toBeInstanceOf(DavThrottleError);
+      expect(await raise(createDavFetch(owner))).toBeInstanceOf(DavThrottleError);
     },
   );
 
@@ -387,7 +501,7 @@ describe("createDavFetch — status to typed error (D-60)", () => {
     "throws a re-discovery-ELIGIBLE DavNotFoundError on %i",
     async (status) => {
       vi.stubGlobal("fetch", statusStub(status).fetch);
-      const raised = await raise(createDavFetch(env));
+      const raised = await raise(createDavFetch(owner));
       expect(raised).toBeInstanceOf(DavNotFoundError);
       expect((raised as DavNotFoundError).rediscoverable).toBe(true);
     },
@@ -401,7 +515,7 @@ describe("createDavFetch — status to typed error (D-60)", () => {
       // 03-08's contacts fallback needs exactly this signal to tell a refused
       // server-side filter apart from a failed network.
       vi.stubGlobal("fetch", statusStub(status).fetch);
-      const raised = await raise(createDavFetch(env));
+      const raised = await raise(createDavFetch(owner));
       expect(raised).toBeInstanceOf(DavNotFoundError);
       expect((raised as DavNotFoundError).rediscoverable).toBe(false);
     },
@@ -417,7 +531,7 @@ describe("createDavFetch — status to typed error (D-60)", () => {
     // budget in the project, and guidance telling the model to do the one
     // thing that can never work.
     vi.stubGlobal("fetch", statusStub(412).fetch);
-    const raised = await raise(createDavFetch(env));
+    const raised = await raise(createDavFetch(owner));
 
     expect(raised).toBeInstanceOf(DavStaleResourceError);
     expect(raised).not.toBeInstanceOf(DavConnectError);
@@ -428,7 +542,7 @@ describe("createDavFetch — status to typed error (D-60)", () => {
     "throws DavConnectError on %i",
     async (status) => {
       vi.stubGlobal("fetch", statusStub(status).fetch);
-      expect(await raise(createDavFetch(env))).toBeInstanceOf(DavConnectError);
+      expect(await raise(createDavFetch(owner))).toBeInstanceOf(DavConnectError);
     },
   );
 
@@ -454,7 +568,7 @@ describe("createDavFetch — status to typed error (D-60)", () => {
       // reason; this one asserts the whole table has not moved, so a
       // regression names the status rather than the feature.
       vi.stubGlobal("fetch", statusStub(status).fetch);
-      const raised = await raise(createDavFetch(env));
+      const raised = await raise(createDavFetch(owner));
 
       expect(raised).toBeInstanceOf(klass);
       if (rediscoverable !== null) {
@@ -478,7 +592,7 @@ describe("createDavFetch — status to typed error (D-60)", () => {
       }) as typeof globalThis.fetch,
     );
 
-    expect(await raise(createDavFetch(env))).toBeInstanceOf(DavConnectError);
+    expect(await raise(createDavFetch(owner))).toBeInstanceOf(DavConnectError);
   });
 });
 
@@ -564,7 +678,7 @@ describe("no Dav* error carries anything a server said (T-03-03, T-03-04)", () =
         ).fetch,
       );
 
-      const raised = await raise(createDavFetch(env));
+      const raised = await raise(createDavFetch(owner));
       const fields = ownFields(raised);
 
       expect(Object.keys(fields).sort()).toEqual(expected);
@@ -581,7 +695,7 @@ describe("no Dav* error carries anything a server said (T-03-03, T-03-04)", () =
     "the message on %i is a fixed internal label, never server text",
     async (status) => {
       vi.stubGlobal("fetch", statusStub(status).fetch);
-      const raised = (await raise(createDavFetch(env))) as Error;
+      const raised = (await raise(createDavFetch(owner))) as Error;
 
       expect(raised.message).toMatch(/^dav-[a-z-]+$/);
       expect(raised.message).not.toContain("http");
@@ -596,7 +710,7 @@ describe("no Dav* error carries anything a server said (T-03-03, T-03-04)", () =
     expect(bound.APPLE_APP_PASSWORD.length).toBeGreaterThan(0);
 
     vi.stubGlobal("fetch", statusStub(401).fetch);
-    const raised = (await raise(createDavFetch(env))) as Error;
+    const raised = (await raise(createDavFetch(owner))) as Error;
     const serialized = `${JSON.stringify(ownFields(raised))}${raised.message}${raised.stack ?? ""}`;
 
     expect(serialized).not.toContain(bound.APPLE_ID);

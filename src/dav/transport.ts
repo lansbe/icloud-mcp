@@ -26,7 +26,8 @@
 // This module contains no logging calls of any kind and must never acquire any.
 
 import { isConfiguredSecret } from "../auth/login-handler";
-import type { Env } from "../env";
+import { passwordOf } from "../principal";
+import type { Principal } from "../principal";
 import {
   DavAuthError,
   DavConnectError,
@@ -73,6 +74,12 @@ const ILLEGAL_IN_HEADER_VALUE = /[\r\n\u0000]/;
  * `isConfiguredSecret` is reused rather than restated: one definition of what a
  * usable configured secret looks like, shared with the `/authorize` path that
  * first needed it (CR-01).
+ *
+ * **Since Phase 9 this is the SECOND layer.** The two values now come from a
+ * signed-in principal, and the principal module refuses an absent or blank
+ * value when it builds one. A principal's type is only a claim at runtime,
+ * though, so the check stays: it costs one comparison and it is the last thing
+ * standing between a hand-made object and a placeholder username sent to Apple.
  */
 function assertProvisioned(value: string | undefined): asserts value is string {
   if (!isConfiguredSecret(value)) throw new DavAuthError();
@@ -129,10 +136,28 @@ function base64(bytes: Uint8Array): string {
  * logging the username, which names the Apple ID — a violation of
  * ./.claude/CLAUDE.md §4 that this project cannot see, because the scan does not
  * walk `node_modules/`.
+ *
+ * **It takes the signed-in principal, not the environment (Phase 9, D-11).**
+ * The login address comes off the principal. The password comes from the
+ * principal module's password reader and from nowhere else. That reader answers
+ * only the very object a constructor built, so a spread copy, a clone or a
+ * hand-made look-alike is refused here before any header exists (D-16). This
+ * file is one of exactly two that may call it. The other is the mail tree's
+ * credential writer.
+ *
+ * The reader refuses with the mail tree's auth error. That is mapped to the DAV
+ * auth error right here, without binding the caught value, so everything this
+ * module raises stays inside the DAV error vocabulary.
  */
-export function davAuthHeader(env: Env): string {
-  const appleId = env.APPLE_ID;
-  const password = env.APPLE_APP_PASSWORD;
+export function davAuthHeader(principal: Principal): string {
+  const appleId = principal.appleId;
+  let password: string;
+  try {
+    password = passwordOf(principal);
+  } catch {
+    // Never read the caught value. A refusal is a refusal.
+    throw new DavAuthError();
+  }
   assertProvisioned(appleId);
   assertProvisioned(password);
   assertNoIllegalCharacters(appleId);
@@ -229,8 +254,23 @@ function throwForStatus(status: number): void {
  * `fetchCalendars` and `fetchAddressBooks`, and the source scan cannot see
  * inside `node_modules/` — so this gate is what makes that fan-out serial
  * without forking the library.
+ *
+ * **It takes a PROMISE of the signed-in principal, and stays synchronous
+ * (Phase 9, D-09, D-27).** The server factory builds this function and must not
+ * await anything: a rejection there would become a 500 with no challenge. So
+ * the promise is awaited at the top of `run` instead, which is already async
+ * and already behind the queue, so request order does not change.
+ *
+ * That await has a `try` of its own, and it sits OUTSIDE the `try` around the
+ * fetch on purpose. A promise that rejects means the Worker's two mail secrets
+ * are unset or unusable. Inside the fetch's `try` that would be reported as a
+ * connection fault, and a connection fault invites a retry that can never work.
+ * Out here it is the DAV auth error, and no request is sent.
+ *
+ * Whatever the promise resolves to is handed on as it is. It is never spread
+ * and never cloned, because the password reader answers only that one object.
  */
-export function createDavFetch(env: Env): DavFetch {
+export function createDavFetch(principal: Promise<Principal>): DavFetch {
   // Per-instance, and therefore per request. See the docstring above for why
   // module scope would be wrong here for the opposite reason it is wrong for
   // the session gate.
@@ -238,10 +278,21 @@ export function createDavFetch(env: Env): DavFetch {
 
   const davFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
     const run = async (): Promise<Response> => {
+      // Who this request acts for. Its own `try`, outside the one around the
+      // fetch below: see the docstring for why a refusal here must not read as
+      // a connection fault.
+      let actor: Principal;
+      try {
+        actor = await principal;
+      } catch {
+        // Never read the caught value.
+        throw new DavAuthError();
+      }
+
       // Built per call, and merged rather than assigned, so no caller ever
       // holds a header carrying the credential.
       const headers = new Headers(init?.headers);
-      headers.set("authorization", davAuthHeader(env));
+      headers.set("authorization", davAuthHeader(actor));
 
       let response: Response;
       try {

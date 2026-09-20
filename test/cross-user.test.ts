@@ -78,12 +78,13 @@ import {
   twoUserDavStub,
 } from "./fixtures/two-user-dav";
 import {
-  USER_A,
-  USER_B,
   attempt,
   envFor,
   readToolResult,
+  testPrincipal,
   toolsFor,
+  USER_A,
+  USER_B,
 } from "./fixtures/two-users";
 import type { StagedAttachments } from "../src/mcp/tools/mail";
 import type { TwoUserDavStub } from "./fixtures/two-user-dav";
@@ -826,7 +827,7 @@ describe("DAV_CACHE: a cached home belongs to the account it was resolved for", 
 
     const firstA = await resolveDavAccount(
       envFor(USER_A),
-      createDavFetch(envFor(USER_A)),
+      createDavFetch(testPrincipal(USER_A)),
       "caldav",
     );
     expect(firstA.cacheHit, "A's first resolve was not a cold one").toBe(false);
@@ -834,7 +835,7 @@ describe("DAV_CACHE: a cached home belongs to the account it was resolved for", 
 
     const firstB = await resolveDavAccount(
       envFor(USER_B),
-      createDavFetch(envFor(USER_B)),
+      createDavFetch(testPrincipal(USER_B)),
       "caldav",
     );
     expect(firstB.cacheHit, "B's first resolve was answered from A's entry").toBe(
@@ -857,7 +858,7 @@ describe("DAV_CACHE: a cached home belongs to the account it was resolved for", 
     // B resolving did not move A's entry.
     const secondA = await resolveDavAccount(
       envFor(USER_A),
-      createDavFetch(envFor(USER_A)),
+      createDavFetch(testPrincipal(USER_A)),
       "caldav",
     );
     expect(secondA.cacheHit, "A's second resolve missed the cache").toBe(true);
@@ -880,7 +881,7 @@ describe("home-set check: an event id only works under the caller's own home", (
 
     const detail = await getEvent(
       envFor(USER_A),
-      createDavFetch(envFor(USER_A)),
+      createDavFetch(testPrincipal(USER_A)),
       decodeEventId(EVENT_A_ID),
     );
 
@@ -906,7 +907,7 @@ describe("home-set check: an event id only works under the caller's own home", (
     try {
       received = await getEvent(
         envFor(USER_B),
-        createDavFetch(envFor(USER_B)),
+        createDavFetch(testPrincipal(USER_B)),
         decodeEventId(EVENT_A_ID),
       );
     } catch (err) {

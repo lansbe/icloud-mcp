@@ -255,7 +255,7 @@ export function toolsFor(user: TestUser, extra?: ExtraTools): UserTools {
 
   try {
     registerMailTools(server, createSessionGate(), principal);
-    registerCalendarTools(server, createDavFetch(envFor(user)));
+    registerCalendarTools(server, createDavFetch(principal));
 
     // After the real registrations, onto the same list, so an extra tool is
     // reached through the very same `call` path as a real one.

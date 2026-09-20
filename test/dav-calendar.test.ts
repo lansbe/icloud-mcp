@@ -110,6 +110,15 @@ import {
   eventToolResult,
   registerCalendarTools,
 } from "../src/mcp/tools/calendar";
+import { ownerPrincipal } from "./fixtures/bound-secrets";
+
+// The owner's principal, as the PROMISE the real env constructor returns over
+// the pool's ambient environment. The DAV fetch builder and the registrars take
+// the promise. The no-op handler means a file that builds it and awaits it
+// nowhere leaves no rejection unheard. Everyone who does await it still sees
+// the refusal.
+const owner = ownerPrincipal();
+owner.catch(() => {});
 
 // ---------------------------------------------------------------------------
 // The account this fixture describes
@@ -710,7 +719,7 @@ async function warm(stub: Stub): Promise<void> {
   // assert a miss that cannot happen — which is a failing test rather than a
   // wrong one, but only because the miss is asserted.
   await clearDavCache(env, "caldav");
-  const resolved = await resolveDavAccount(env, createDavFetch(env), "caldav");
+  const resolved = await resolveDavAccount(env, createDavFetch(owner), "caldav");
   expect(resolved.cacheHit).toBe(false);
   stub.observed.length = 0;
 }
@@ -759,14 +768,14 @@ describe("listCalendars", () => {
     // The library's own calendar-listing helper issues an extra request per
     // collection to read each one's supported report set. On this account that
     // is nine round trips for information no tool here reads.
-    await listCalendars(env, createDavFetch(env));
+    await listCalendars(env, createDavFetch(owner));
 
     expect(stub.observed.length).toBe(1);
     expect(stub.observed[0].method).toBe("PROPFIND");
   });
 
   it("returns one row per calendar collection and filters the rest", async () => {
-    const listing = await listCalendars(env, createDavFetch(env));
+    const listing = await listCalendars(env, createDavFetch(owner));
 
     // The home collection, the reminders-only calendar and the scheduling
     // inbox are all absent.
@@ -777,8 +786,8 @@ describe("listCalendars", () => {
   });
 
   it("orders rows by collection URL, so two identical calls agree", async () => {
-    const first = await listCalendars(env, createDavFetch(env));
-    const second = await listCalendars(env, createDavFetch(env));
+    const first = await listCalendars(env, createDavFetch(owner));
+    const second = await listCalendars(env, createDavFetch(owner));
 
     // Document order is work, notes, home — deliberately not URL order, so an
     // implementation that simply passed the server's order through would fail.
@@ -793,7 +802,7 @@ describe("listCalendars", () => {
   });
 
   it("yields an EMPTY display name for one that arrives as an object", async () => {
-    const listing = await listCalendars(env, createDavFetch(env));
+    const listing = await listCalendars(env, createDavFetch(owner));
     const notes = listing.calendars.find(
       (one) => decodeCalendarId(one.id).collectionUrl === NOTES_URL,
     );
@@ -806,7 +815,7 @@ describe("listCalendars", () => {
   });
 
   it("keeps two identically-named calendars as two rows with different ids", async () => {
-    const listing = await listCalendars(env, createDavFetch(env));
+    const listing = await listCalendars(env, createDavFetch(owner));
     const shared = listing.calendars.filter(
       (one) => one.displayName === SHARED_NAME,
     );
@@ -830,7 +839,7 @@ describe("listCalendars", () => {
       ],
     });
 
-    const listing = await listCalendars(env, createDavFetch(env));
+    const listing = await listCalendars(env, createDavFetch(owner));
 
     expect(listing.calendars.length).toBe(4);
     const subscribed = listing.calendars.find(
@@ -863,7 +872,7 @@ describe("listCalendars", () => {
       ],
     });
 
-    const listing = await listCalendars(env, createDavFetch(env));
+    const listing = await listCalendars(env, createDavFetch(owner));
 
     expect(listing.calendars.length).toBe(3);
     const urls = listing.calendars.map(
@@ -888,18 +897,18 @@ describe("listCalendars", () => {
       ],
     });
 
-    const listing = await listCalendars(env, createDavFetch(env));
+    const listing = await listCalendars(env, createDavFetch(owner));
 
     expect(listing.calendars).toEqual([]);
   });
 
   it("reports whether discovery came from cache", async () => {
-    const warmListing = await listCalendars(env, createDavFetch(env));
+    const warmListing = await listCalendars(env, createDavFetch(owner));
     expect(warmListing.cacheHit).toBe(true);
   });
 
   it("carries the colour when the collection declares one", async () => {
-    const listing = await listCalendars(env, createDavFetch(env));
+    const listing = await listCalendars(env, createDavFetch(owner));
     const work = listing.calendars.find(
       (one) => decodeCalendarId(one.id).collectionUrl === WORK_URL,
     );
@@ -912,7 +921,7 @@ describe("listCalendars", () => {
   });
 
   it("puts no hostname in any row", async () => {
-    const listing = await listCalendars(env, createDavFetch(env));
+    const listing = await listCalendars(env, createDavFetch(owner));
 
     expect(JSON.stringify(listing)).not.toContain("p42-caldav");
     expect(JSON.stringify(listing)).not.toContain("icloud.com");
@@ -930,7 +939,7 @@ async function walk(pageSize: number): Promise<EventSummary[]> {
   // Bounded so a cursor that fails to advance fails the test rather than
   // hanging the suite.
   for (let page = 0; page < 50; page += 1) {
-    const result = await listEvents(env, createDavFetch(env), {
+    const result = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1071,7 +1080,7 @@ describe("the events path against a subscribed calendar", () => {
 
     it("listEvents throws DavSubscriptionError, never DavNotFoundError", async () => {
       const error = await capture(() =>
-        listEvents(env, createDavFetch(env), {
+        listEvents(env, createDavFetch(owner), {
           calendarId: SUBSCRIBED_ID,
           rangeStart: RANGE_START,
           rangeEnd: RANGE_END,
@@ -1084,7 +1093,7 @@ describe("the events path against a subscribed calendar", () => {
 
     it("searchEvents throws the same refusal", async () => {
       const error = await capture(() =>
-        searchEvents(env, createDavFetch(env), {
+        searchEvents(env, createDavFetch(owner), {
           calendarId: SUBSCRIBED_ID,
           keyword: "anything",
           rangeStart: RANGE_START,
@@ -1098,7 +1107,7 @@ describe("the events path against a subscribed calendar", () => {
 
     it("fires BEFORE any calendar-query REPORT — one request, the enumeration only", async () => {
       await capture(() =>
-        listEvents(env, createDavFetch(env), {
+        listEvents(env, createDavFetch(owner), {
           calendarId: SUBSCRIBED_ID,
           rangeStart: RANGE_START,
           rangeEnd: RANGE_END,
@@ -1115,14 +1124,14 @@ describe("the events path against a subscribed calendar", () => {
       // before this ever runs) — narrow enough to hold nothing and wide
       // enough to hold everything, and the refusal does not tell them apart.
       const narrow = await capture(() =>
-        listEvents(env, createDavFetch(env), {
+        listEvents(env, createDavFetch(owner), {
           calendarId: SUBSCRIBED_ID,
           rangeStart: RANGE_START,
           rangeEnd: RANGE_START + 1,
         }),
       );
       const wide = await capture(() =>
-        listEvents(env, createDavFetch(env), {
+        listEvents(env, createDavFetch(owner), {
           calendarId: SUBSCRIBED_ID,
           rangeStart: RANGE_START,
           rangeEnd: RANGE_END,
@@ -1134,7 +1143,7 @@ describe("the events path against a subscribed calendar", () => {
     });
 
     it("leaves an owned calendar in the SAME account answering normally — the differential control", async () => {
-      const page = await listEvents(env, createDavFetch(env), {
+      const page = await listEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         rangeStart: RANGE_START,
         rangeEnd: RANGE_END,
@@ -1151,7 +1160,7 @@ describe("the events path against a subscribed calendar", () => {
     });
 
     it("returns one row per VEVENT, each with a distinct id", async () => {
-      const page = await listEvents(env, createDavFetch(env), {
+      const page = await listEvents(env, createDavFetch(owner), {
         calendarId: SUBSCRIBED_ID,
         rangeStart: AUG_22_2026,
         rangeEnd: AUG_23_2026,
@@ -1168,7 +1177,7 @@ describe("the events path against a subscribed calendar", () => {
     });
 
     it("resolves the reported event to the correct Pacific instant", async () => {
-      const page = await listEvents(env, createDavFetch(env), {
+      const page = await listEvents(env, createDavFetch(owner), {
         calendarId: SUBSCRIBED_ID,
         rangeStart: AUG_22_2026,
         rangeEnd: AUG_23_2026,
@@ -1185,7 +1194,7 @@ describe("the events path against a subscribed calendar", () => {
     });
 
     it("leaves the untranslatable zone honestly unresolved, never a guessed instant", async () => {
-      const page = await listEvents(env, createDavFetch(env), {
+      const page = await listEvents(env, createDavFetch(owner), {
         calendarId: SUBSCRIBED_ID,
         rangeStart: AUG_22_2026,
         rangeEnd: AUG_23_2026,
@@ -1206,7 +1215,7 @@ describe("the events path against a subscribed calendar", () => {
       let sawFinalPage = false;
 
       for (let guard = 0; guard < 20; guard += 1) {
-        const page = await listEvents(env, createDavFetch(env), {
+        const page = await listEvents(env, createDavFetch(owner), {
           calendarId: SUBSCRIBED_ID,
           rangeStart: AUG_22_2026,
           rangeEnd: AUG_23_2026,
@@ -1228,7 +1237,7 @@ describe("the events path against a subscribed calendar", () => {
     });
 
     it("searchEvents with a keyword returns only the matching row", async () => {
-      const page = await searchEvents(env, createDavFetch(env), {
+      const page = await searchEvents(env, createDavFetch(owner), {
         calendarId: SUBSCRIBED_ID,
         keyword: "Bellevue",
         rangeStart: AUG_22_2026,
@@ -1241,7 +1250,7 @@ describe("the events path against a subscribed calendar", () => {
     });
 
     it("calls the mock with collection.source and nothing else — no credential-bearing argument", async () => {
-      await listEvents(env, createDavFetch(env), {
+      await listEvents(env, createDavFetch(owner), {
         calendarId: SUBSCRIBED_ID,
         rangeStart: AUG_22_2026,
         rangeEnd: AUG_23_2026,
@@ -1252,8 +1261,8 @@ describe("the events path against a subscribed calendar", () => {
     });
 
     it("never leaks the feed host into a calendar_list_calendars-shaped listing or an events page", async () => {
-      const listing = await listCalendars(env, createDavFetch(env));
-      const page = await listEvents(env, createDavFetch(env), {
+      const listing = await listCalendars(env, createDavFetch(owner));
+      const page = await listEvents(env, createDavFetch(owner), {
         calendarId: SUBSCRIBED_ID,
         rangeStart: AUG_22_2026,
         rangeEnd: AUG_23_2026,
@@ -1279,7 +1288,7 @@ describe("the events path against a subscribed calendar", () => {
 describe("listEvents", () => {
   it("refuses a range wider than the cap without touching the network", async () => {
     const error = await capture(() =>
-      listEvents(env, createDavFetch(env), {
+      listEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         rangeStart: RANGE_START,
         rangeEnd: RANGE_START + (MAX_RANGE_DAYS + 1) * 86400,
@@ -1293,7 +1302,7 @@ describe("listEvents", () => {
   });
 
   it("admits a range exactly at the cap", async () => {
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_START + MAX_RANGE_DAYS * 86400,
@@ -1303,7 +1312,7 @@ describe("listEvents", () => {
   });
 
   it("returns an empty page for a range holding nothing", async () => {
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: at("2019-01-01T00:00:00Z"),
       rangeEnd: at("2019-02-01T00:00:00Z"),
@@ -1316,7 +1325,7 @@ describe("listEvents", () => {
   });
 
   it("expands a recurring series to the occurrences it actually has", async () => {
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1354,7 +1363,7 @@ describe("listEvents", () => {
     // asserted over the comparator itself in `test/dav-ids.test.ts`.
     stub = restub({ objects: MIXED_OBJECTS });
 
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1383,7 +1392,7 @@ describe("listEvents", () => {
   });
 
   it("pages every occurrence exactly once, with no duplicate and no gap", async () => {
-    const single = await listEvents(env, createDavFetch(env), {
+    const single = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1405,7 +1414,7 @@ describe("listEvents", () => {
       },
     });
 
-    const single = await listEvents(env, createDavFetch(env), {
+    const single = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1422,7 +1431,7 @@ describe("listEvents", () => {
   });
 
   it("computes has-more from one extra row and mints the cursor from the last returned", async () => {
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1449,7 +1458,7 @@ describe("listEvents", () => {
     // longer depends on how many calendars the account has. The fixture still
     // advertises several, which is what makes the count below a measurement
     // rather than a restatement of the stub.
-    await listEvents(env, createDavFetch(env), {
+    await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1480,7 +1489,7 @@ describe("listEvents", () => {
   });
 
   it("has NOWHERE to put a long free-text body", async () => {
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1497,7 +1506,7 @@ describe("listEvents", () => {
   });
 
   it("reports the attendee COUNT and no attendee identity", async () => {
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1515,7 +1524,7 @@ describe("listEvents", () => {
   it("keeps the instant ABSENT when the zone did not resolve", async () => {
     // The notes calendar, because that is where the fixture's floating-zone
     // resource lives and a listing no longer sweeps the account to find it.
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: NOTES_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1534,7 +1543,7 @@ describe("listEvents", () => {
   it("never publishes the derived sort key on a row", async () => {
     // Notes again: the unresolved row is the one whose sort key is a number
     // this server invented, so it is the only row that can leak one.
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: NOTES_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1553,7 +1562,7 @@ describe("listEvents", () => {
 
   it("keeps an all-day occurrence date-only with no instant", async () => {
     // The home calendar holds the all-day series.
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: HOME_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1575,7 +1584,7 @@ describe("listEvents", () => {
       objects: { [WORK_PATH]: { [`${WORK_PATH}minutely.ics`]: MINUTELY_ICS } },
     });
 
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: at("2026-01-01T00:00:00Z"),
       rangeEnd: at("2026-01-03T00:00:00Z"),
@@ -1588,7 +1597,7 @@ describe("listEvents", () => {
   });
 
   it("leaves truncation false when nothing was cut", async () => {
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1643,7 +1652,7 @@ describe("listEvents", () => {
     // simply never produced rows would satisfy every assertion there.
     stub = restub({ objects: CONTROL_OBJECTS });
 
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       ...STARVED_RANGE,
       pageSize: 25,
@@ -1680,7 +1689,7 @@ describe("listEvents", () => {
 
       stub = restub({ objects: starved });
 
-      const page = await listEvents(env, createDavFetch(env), {
+      const page = await listEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         ...STARVED_RANGE,
         pageSize: 25,
@@ -1704,13 +1713,13 @@ describe("listEvents", () => {
   );
 
   it("scopes to one calendar when given one", async () => {
-    const listing = await listCalendars(env, createDavFetch(env));
+    const listing = await listCalendars(env, createDavFetch(owner));
     const work = listing.calendars.find(
       (one) => decodeCalendarId(one.id).collectionUrl === WORK_URL,
     );
     stub.observed.length = 0;
 
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: work!.id,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1731,7 +1740,7 @@ describe("listEvents", () => {
     });
 
     const error = await capture(() =>
-      listEvents(env, createDavFetch(env), {
+      listEvents(env, createDavFetch(owner), {
         calendarId: foreign,
         rangeStart: RANGE_START,
         rangeEnd: RANGE_END,
@@ -1743,7 +1752,7 @@ describe("listEvents", () => {
 
   it("refuses a malformed calendar id before any request", async () => {
     const error = await capture(() =>
-      listEvents(env, createDavFetch(env), {
+      listEvents(env, createDavFetch(owner), {
         calendarId: "not-a-token",
         rangeStart: RANGE_START,
         rangeEnd: RANGE_END,
@@ -1755,7 +1764,7 @@ describe("listEvents", () => {
   });
 
   it("refuses a cursor minted for a different range before any request", async () => {
-    const first = await listEvents(env, createDavFetch(env), {
+    const first = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1764,7 +1773,7 @@ describe("listEvents", () => {
     stub.observed.length = 0;
 
     const error = await capture(() =>
-      listEvents(env, createDavFetch(env), {
+      listEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         rangeStart: RANGE_START,
         rangeEnd: RANGE_END - 86400,
@@ -1797,7 +1806,7 @@ describe("listEvents", () => {
     // requested calendar to compare against. This is the comparison that
     // catches it, and it runs before any request.
     const error = await capture(() =>
-      listEvents(env, createDavFetch(env), {
+      listEvents(env, createDavFetch(owner), {
         calendarId: HOME_ID,
         rangeStart: RANGE_START,
         rangeEnd: RANGE_END,
@@ -1825,7 +1834,7 @@ describe("listEvents", () => {
     stub.observed.length = 0;
 
     const error = await capture(() =>
-      listEvents(env, createDavFetch(env), {
+      listEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         rangeStart: RANGE_START,
         rangeEnd: RANGE_END,
@@ -1842,7 +1851,7 @@ describe("listEvents", () => {
   });
 
   it("clamps an oversized page size rather than refusing it", async () => {
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1855,7 +1864,7 @@ describe("listEvents", () => {
   });
 
   it("reports whether discovery came from cache", async () => {
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1865,7 +1874,7 @@ describe("listEvents", () => {
   });
 
   it("puts no hostname on any row", async () => {
-    const page = await listEvents(env, createDavFetch(env), {
+    const page = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -1916,7 +1925,7 @@ async function idFromListing(
     calendarId: string;
   }> = {},
 ): Promise<string> {
-  const page = await listEvents(env, createDavFetch(env), {
+  const page = await listEvents(env, createDavFetch(owner), {
     calendarId: options.calendarId ?? WORK_ID,
     rangeStart: options.rangeStart ?? RANGE_START,
     rangeEnd: options.rangeEnd ?? RANGE_END,
@@ -1932,7 +1941,7 @@ describe("getEvent", () => {
     const id = await idFromListing((one) => one.summary === WEEKLY_SERIES_SUMMARY);
     stub.observed.length = 0;
 
-    await getEvent(env, createDavFetch(env), decodeEventId(id));
+    await getEvent(env, createDavFetch(owner), decodeEventId(id));
 
     // One multi-get. No collection enumeration: the calendar URL is inside the
     // token, so resolving it costs no lookup — the argument that chose this
@@ -1944,7 +1953,7 @@ describe("getEvent", () => {
   it("returns the wall clock, the zone the organiser chose, and the instant", async () => {
     const id = await idFromListing((one) => one.summary === WEEKLY_SERIES_SUMMARY);
 
-    const detail = await getEvent(env, createDavFetch(env), decodeEventId(id));
+    const detail = await getEvent(env, createDavFetch(owner), decodeEventId(id));
 
     // The zone is carried ON the start and the end rather than as a separate
     // top-level field — the value a user actually needs, and precisely the one
@@ -1961,7 +1970,7 @@ describe("getEvent", () => {
   it("returns the description, the organiser and every attendee as data", async () => {
     const id = await idFromListing((one) => one.summary === WEEKLY_SERIES_SUMMARY);
 
-    const detail = await getEvent(env, createDavFetch(env), decodeEventId(id));
+    const detail = await getEvent(env, createDavFetch(owner), decodeEventId(id));
 
     expect(detail.description).toBe(WEEKLY_SERIES_DESCRIPTION);
     expect(detail.organizer).toEqual({
@@ -1991,7 +2000,7 @@ describe("getEvent", () => {
       calendarId: NOTES_ID,
     });
 
-    const detail = await getEvent(env, createDavFetch(env), decodeEventId(id));
+    const detail = await getEvent(env, createDavFetch(owner), decodeEventId(id));
 
     expect(detail.timezoneUnresolved).toBe(true);
     // The requested identifier is the only evidence there is, so it is what
@@ -2006,7 +2015,7 @@ describe("getEvent", () => {
       calendarId: NOTES_ID,
     });
 
-    const detail = await getEvent(env, createDavFetch(env), decodeEventId(id));
+    const detail = await getEvent(env, createDavFetch(owner), decodeEventId(id));
 
     // The unresolved row's sort key is its wall clock read as if UTC. Published
     // as an instant it would look entirely plausible.
@@ -2020,7 +2029,7 @@ describe("getEvent", () => {
       calendarId: HOME_ID,
     });
 
-    const detail = await getEvent(env, createDavFetch(env), decodeEventId(id));
+    const detail = await getEvent(env, createDavFetch(owner), decodeEventId(id));
 
     expect(detail.allDay).toBe(true);
     expect(detail.startLocal).toBe("2026-03-02");
@@ -2041,7 +2050,7 @@ describe("getEvent", () => {
     });
     next.observed.length = 0;
 
-    const detail = await getEvent(env, createDavFetch(env), decodeEventId(id));
+    const detail = await getEvent(env, createDavFetch(owner), decodeEventId(id));
 
     expect(detail.startLocal).toBe("2026-04-15T13:00:00");
     expect(detail.endLocal).toBe(detail.startLocal);
@@ -2052,7 +2061,7 @@ describe("getEvent", () => {
     const id = await idFromListing((one) => one.isOverride);
 
     const ref = decodeEventId(id);
-    const detail = await getEvent(env, createDavFetch(env), ref);
+    const detail = await getEvent(env, createDavFetch(owner), ref);
 
     // The recurrence id is the slot the occurrence was moved OUT of, which is
     // what makes it stable across the edit.
@@ -2070,7 +2079,7 @@ describe("getEvent", () => {
     stub.observed.length = 0;
 
     const error = await capture(() =>
-      getEvent(env, createDavFetch(env), decodeEventId(gone)),
+      getEvent(env, createDavFetch(owner), decodeEventId(gone)),
     );
 
     // A silently substituted meeting is a worse answer than none.
@@ -2084,7 +2093,7 @@ describe("getEvent", () => {
     stub.observed.length = 0;
 
     const error = await capture(() =>
-      getEvent(env, createDavFetch(env), decodeEventId(gone)),
+      getEvent(env, createDavFetch(owner), decodeEventId(gone)),
     );
 
     // A local selection failure over bytes already in hand. Marking it
@@ -2098,8 +2107,8 @@ describe("getEvent", () => {
   it("returns deep-equal output twice against unchanged bytes", async () => {
     const id = await idFromListing((one) => one.isOverride);
 
-    const first = await getEvent(env, createDavFetch(env), decodeEventId(id));
-    const second = await getEvent(env, createDavFetch(env), decodeEventId(id));
+    const first = await getEvent(env, createDavFetch(owner), decodeEventId(id));
+    const second = await getEvent(env, createDavFetch(owner), decodeEventId(id));
 
     // Re-expansion is deterministic given the same bytes, which is the property
     // that lets an occurrence id be a POSITION in a series rather than a stored
@@ -2120,7 +2129,7 @@ describe("getEvent", () => {
       },
     });
 
-    const error = await capture(() => getEvent(env, createDavFetch(env), ref));
+    const error = await capture(() => getEvent(env, createDavFetch(owner), ref));
 
     // Two attempts, never three. `allowRediscovery` is a parameter that is
     // false on the retry and is read before the error is classified, so there
@@ -2137,7 +2146,7 @@ describe("getEvent", () => {
   it("puts no hostname anywhere in the detail", async () => {
     const id = await idFromListing((one) => one.summary === WEEKLY_SERIES_SUMMARY);
 
-    const detail = await getEvent(env, createDavFetch(env), decodeEventId(id));
+    const detail = await getEvent(env, createDavFetch(owner), decodeEventId(id));
 
     expect(JSON.stringify(detail)).not.toContain("p42-caldav");
     expect(JSON.stringify(detail)).not.toContain("icloud.com");
@@ -2166,7 +2175,7 @@ describe("getEvent", () => {
     });
 
     const error = await capture(() =>
-      getEvent(env, createDavFetch(env), decodeEventId(forged)),
+      getEvent(env, createDavFetch(owner), decodeEventId(forged)),
     );
 
     expect(error).toBeInstanceOf(DavNotFoundError);
@@ -2190,7 +2199,7 @@ describe("getEvent", () => {
     });
 
     const error = await capture(() =>
-      getEvent(env, createDavFetch(env), decodeEventId(forged)),
+      getEvent(env, createDavFetch(owner), decodeEventId(forged)),
     );
 
     expect(error).toBeInstanceOf(DavNotFoundError);
@@ -2214,7 +2223,7 @@ function blocksOf(result: { content: { text: string }[] }): {
 
 async function weeklyDetail(): Promise<EventDetail> {
   const id = await idFromListing((one) => one.summary === WEEKLY_SERIES_SUMMARY);
-  return getEvent(env, createDavFetch(env), decodeEventId(id));
+  return getEvent(env, createDavFetch(owner), decodeEventId(id));
 }
 
 describe("the event detail response", () => {
@@ -2291,7 +2300,7 @@ describe("the event detail response", () => {
     const id = await idFromListing((one) => one.timezoneUnresolved, {
       calendarId: NOTES_ID,
     });
-    const detail = await getEvent(env, createDavFetch(env), decodeEventId(id));
+    const detail = await getEvent(env, createDavFetch(owner), decodeEventId(id));
 
     const parsed = JSON.parse(blocksOf(eventToolResult(detail)).trusted);
 
@@ -2332,7 +2341,7 @@ async function searchWalk(
   let cursor: string | undefined;
 
   for (let guard = 0; guard < 50; guard += 1) {
-    const page = await searchEvents(env, createDavFetch(env), {
+    const page = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       ...options,
       rangeStart: RANGE_START,
@@ -2352,7 +2361,7 @@ async function search(options: {
   keyword?: string;
   attendee?: string;
 }): Promise<EventSummary[]> {
-  const page = await searchEvents(env, createDavFetch(env), {
+  const page = await searchEvents(env, createDavFetch(owner), {
     calendarId: WORK_ID,
     ...options,
     rangeStart: RANGE_START,
@@ -2430,7 +2439,7 @@ describe("searchEvents", () => {
   });
 
   it("returns an EMPTY page for a term matching nothing, never an error", async () => {
-    const page = await searchEvents(env, createDavFetch(env), {
+    const page = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       keyword: "no event anywhere says this",
       rangeStart: RANGE_START,
@@ -2451,7 +2460,7 @@ describe("searchEvents", () => {
     ]) {
       stub.observed.length = 0;
       const error = await capture(() =>
-        searchEvents(env, createDavFetch(env), {
+        searchEvents(env, createDavFetch(owner), {
           calendarId: WORK_ID,
           ...options,
           rangeStart: RANGE_START,
@@ -2468,7 +2477,7 @@ describe("searchEvents", () => {
     stub.observed.length = 0;
 
     const error = await capture(() =>
-      searchEvents(env, createDavFetch(env), {
+      searchEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         rangeStart: RANGE_START,
         rangeEnd: RANGE_END,
@@ -2483,7 +2492,7 @@ describe("searchEvents", () => {
     stub.observed.length = 0;
 
     const error = await capture(() =>
-      searchEvents(env, createDavFetch(env), {
+      searchEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         keyword: "standup",
         rangeStart: RANGE_START,
@@ -2509,13 +2518,13 @@ describe("searchEvents", () => {
     // the same page shape. That is unchanged. What a cursor is not is
     // INTERCHANGEABLE across queries — see the terms block below, which is the
     // half 03-07 left open and the user authorised closing.
-    const listed = await listEvents(env, createDavFetch(env), {
+    const listed = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
       pageSize: 3,
     });
-    const searched = await searchEvents(env, createDavFetch(env), {
+    const searched = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       keyword: "standup",
       rangeStart: RANGE_START,
@@ -2536,7 +2545,7 @@ describe("searchEvents", () => {
   });
 
   it("refuses a cursor pinned to a different range, exactly as the listing does", async () => {
-    const first = await searchEvents(env, createDavFetch(env), {
+    const first = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       keyword: "standup",
       rangeStart: RANGE_START,
@@ -2546,7 +2555,7 @@ describe("searchEvents", () => {
     stub.observed.length = 0;
 
     const error = await capture(() =>
-      searchEvents(env, createDavFetch(env), {
+      searchEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         keyword: "standup",
         rangeStart: RANGE_START,
@@ -2560,11 +2569,11 @@ describe("searchEvents", () => {
   });
 
   it("refuses a cursor pinned to a different calendar scope", async () => {
-    const listing = await listCalendars(env, createDavFetch(env));
+    const listing = await listCalendars(env, createDavFetch(owner));
     const work = listing.calendars.find(
       (one) => decodeCalendarId(one.id).collectionUrl === WORK_URL,
     );
-    const scoped = await searchEvents(env, createDavFetch(env), {
+    const scoped = await searchEvents(env, createDavFetch(owner), {
       keyword: "standup",
       calendarId: work!.id,
       rangeStart: RANGE_START,
@@ -2580,7 +2589,7 @@ describe("searchEvents", () => {
     // calendar — which is the only way the two scopes can now disagree, since
     // there is no account-wide form left to resume a scoped cursor against.
     const error = await capture(() =>
-      searchEvents(env, createDavFetch(env), {
+      searchEvents(env, createDavFetch(owner), {
         calendarId: HOME_ID,
         keyword: "standup",
         rangeStart: RANGE_START,
@@ -2602,7 +2611,7 @@ describe("searchEvents", () => {
     stub.observed.length = 0;
 
     const error = await capture(() =>
-      searchEvents(env, createDavFetch(env), {
+      searchEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         keyword: "standup",
         rangeStart: RANGE_START,
@@ -2634,7 +2643,7 @@ describe("searchEvents", () => {
   // -------------------------------------------------------------------------
 
   it("refuses a cursor minted under a DIFFERENT keyword, before any request", async () => {
-    const first = await searchEvents(env, createDavFetch(env), {
+    const first = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       keyword: "standup",
       rangeStart: RANGE_START,
@@ -2648,7 +2657,7 @@ describe("searchEvents", () => {
     // the OTHER term's ordered set, and every match sorting before the recorded
     // position vanishes with no signal at all.
     const error = await capture(() =>
-      searchEvents(env, createDavFetch(env), {
+      searchEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         keyword: "two-sentence",
         rangeStart: RANGE_START,
@@ -2662,7 +2671,7 @@ describe("searchEvents", () => {
   });
 
   it("marks the wrong-terms refusal NON-rediscoverable", async () => {
-    const first = await searchEvents(env, createDavFetch(env), {
+    const first = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       keyword: "standup",
       rangeStart: RANGE_START,
@@ -2671,7 +2680,7 @@ describe("searchEvents", () => {
     });
 
     const error = await capture(() =>
-      searchEvents(env, createDavFetch(env), {
+      searchEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         keyword: "two-sentence",
         rangeStart: RANGE_START,
@@ -2688,7 +2697,7 @@ describe("searchEvents", () => {
   });
 
   it("refuses a cursor minted under a DIFFERENT attendee term", async () => {
-    const first = await searchEvents(env, createDavFetch(env), {
+    const first = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       attendee: "priya",
       rangeStart: RANGE_START,
@@ -2699,7 +2708,7 @@ describe("searchEvents", () => {
     stub.observed.length = 0;
 
     const error = await capture(() =>
-      searchEvents(env, createDavFetch(env), {
+      searchEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         attendee: "whitaker",
         rangeStart: RANGE_START,
@@ -2716,7 +2725,7 @@ describe("searchEvents", () => {
     // Both axes are pinned separately because they narrow separately: adding an
     // attendee term to a keyword search is a different result set, and a
     // one-field pin would miss it.
-    const first = await searchEvents(env, createDavFetch(env), {
+    const first = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       keyword: "standup",
       rangeStart: RANGE_START,
@@ -2726,7 +2735,7 @@ describe("searchEvents", () => {
     stub.observed.length = 0;
 
     const error = await capture(() =>
-      searchEvents(env, createDavFetch(env), {
+      searchEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         keyword: "standup",
         attendee: "priya",
@@ -2741,7 +2750,7 @@ describe("searchEvents", () => {
   });
 
   it("refuses a cursor when an axis is DROPPED, which widens the set", async () => {
-    const first = await searchEvents(env, createDavFetch(env), {
+    const first = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       keyword: "standup",
       attendee: "priya",
@@ -2753,7 +2762,7 @@ describe("searchEvents", () => {
     stub.observed.length = 0;
 
     const error = await capture(() =>
-      searchEvents(env, createDavFetch(env), {
+      searchEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         keyword: "standup",
         rangeStart: RANGE_START,
@@ -2771,7 +2780,7 @@ describe("searchEvents", () => {
     // A listing pins neither term; a search pins at least one; so the two can
     // never compare equal, and a position in the unfiltered set can no longer
     // be resumed against a filtered one.
-    const listed = await listEvents(env, createDavFetch(env), {
+    const listed = await listEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       rangeStart: RANGE_START,
       rangeEnd: RANGE_END,
@@ -2780,7 +2789,7 @@ describe("searchEvents", () => {
     stub.observed.length = 0;
 
     const error = await capture(() =>
-      searchEvents(env, createDavFetch(env), {
+      searchEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         keyword: "standup",
         rangeStart: RANGE_START,
@@ -2794,7 +2803,7 @@ describe("searchEvents", () => {
   });
 
   it("refuses a SEARCH cursor handed to the plain listing", async () => {
-    const searched = await searchEvents(env, createDavFetch(env), {
+    const searched = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       keyword: "standup",
       rangeStart: RANGE_START,
@@ -2805,7 +2814,7 @@ describe("searchEvents", () => {
     stub.observed.length = 0;
 
     const error = await capture(() =>
-      listEvents(env, createDavFetch(env), {
+      listEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         rangeStart: RANGE_START,
         rangeEnd: RANGE_END,
@@ -2822,7 +2831,7 @@ describe("searchEvents", () => {
     // makes the pin discriminate the thing that actually changes the answer.
     // "STANDUP" and "standup" return the identical set, so refusing between
     // them would be a false refusal rather than a safe one.
-    const first = await searchEvents(env, createDavFetch(env), {
+    const first = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       keyword: "standup",
       rangeStart: RANGE_START,
@@ -2830,7 +2839,7 @@ describe("searchEvents", () => {
       pageSize: 3,
     });
 
-    const resumed = await searchEvents(env, createDavFetch(env), {
+    const resumed = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       keyword: "STANDUP",
       rangeStart: RANGE_START,
@@ -2843,7 +2852,7 @@ describe("searchEvents", () => {
   });
 
   it("resumes across surrounding WHITESPACE, which the term normaliser strips", async () => {
-    const first = await searchEvents(env, createDavFetch(env), {
+    const first = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       keyword: "standup",
       rangeStart: RANGE_START,
@@ -2851,7 +2860,7 @@ describe("searchEvents", () => {
       pageSize: 3,
     });
 
-    const resumed = await searchEvents(env, createDavFetch(env), {
+    const resumed = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       keyword: "  standup  ",
       rangeStart: RANGE_START,
@@ -2864,7 +2873,7 @@ describe("searchEvents", () => {
   });
 
   it("does not report WHICH field matched, only that a row did", async () => {
-    const page = await searchEvents(env, createDavFetch(env), {
+    const page = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       keyword: "standup",
       rangeStart: RANGE_START,
@@ -2889,7 +2898,7 @@ describe("searchEvents", () => {
     });
 
     const error = await capture(() =>
-      searchEvents(env, createDavFetch(env), {
+      searchEvents(env, createDavFetch(owner), {
         calendarId: WORK_ID,
         keyword: "standup",
         rangeStart: RANGE_START,
@@ -2908,7 +2917,7 @@ describe("searchEvents", () => {
   });
 
   it("reports truncation and cache state exactly as the listing does", async () => {
-    const page = await searchEvents(env, createDavFetch(env), {
+    const page = await searchEvents(env, createDavFetch(owner), {
       calendarId: WORK_ID,
       keyword: "standup",
       rangeStart: RANGE_START,
@@ -3058,7 +3067,7 @@ function onlyOccurrence(icsText: string): Occurrence {
 
 describe("createEvent", () => {
   it("issues exactly ONE conditional PUT, under the account's own home set", async () => {
-    await createEvent(env, createDavFetch(env), createInput());
+    await createEvent(env, createDavFetch(owner), createInput());
 
     // ONE. `withRediscovery` retries a read on a rediscoverable failure, and a
     // write leg that inherited that behaviour would send the PUT twice
@@ -3073,7 +3082,7 @@ describe("createEvent", () => {
   });
 
   it("round-trips through this server's OWN reader with the zone resolved", async () => {
-    await createEvent(env, createDavFetch(env), createInput());
+    await createEvent(env, createDavFetch(owner), createInput());
 
     // The bytes that actually went out, read back through the shipped parser.
     // A resource this server would itself flag as broken is a self-inflicted
@@ -3090,7 +3099,7 @@ describe("createEvent", () => {
   it("refuses a zone it holds no definition for WITHOUT reaching the network", async () => {
     const result = await createEvent(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       createInput({ tzid: "Mars/Olympus_Mons" }),
     );
 
@@ -3108,7 +3117,7 @@ describe("createEvent", () => {
   it("writes an all-day event as a DATE with no zone at all", async () => {
     await createEvent(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       createInput({ allDay: true, endLocal: "2026-09-04T00:00:00" }),
     );
 
@@ -3126,7 +3135,7 @@ describe("createEvent", () => {
     // these is something a hand-rolled writer gets wrong on the first real
     // event and right on the developer's test one.
     const summary = "Review: costs, risks; the \\ plan — café";
-    await createEvent(env, createDavFetch(env), createInput({ summary }));
+    await createEvent(env, createDavFetch(owner), createInput({ summary }));
 
     const body = sentBody(stub);
     // The escapes are present in the SERIALISED form...
@@ -3136,10 +3145,10 @@ describe("createEvent", () => {
   });
 
   it("is NOT idempotent: two identical calls mint two different UIDs", async () => {
-    const first = await createEvent(env, createDavFetch(env), createInput());
+    const first = await createEvent(env, createDavFetch(owner), createInput());
     const bodyOne = sentBody(stub);
     stub.observed.length = 0;
-    const second = await createEvent(env, createDavFetch(env), createInput());
+    const second = await createEvent(env, createDavFetch(owner), createInput());
     const bodyTwo = sentBody(stub);
 
     expect(first.uid).not.toBe(second.uid);
@@ -3159,7 +3168,7 @@ describe("createEvent", () => {
       );
     const before = registered();
 
-    await createEvent(env, createDavFetch(env), createInput());
+    await createEvent(env, createDavFetch(owner), createInput());
 
     expect(registered()).toEqual(before);
   });
@@ -3173,7 +3182,7 @@ describe("createEvent", () => {
     });
 
     const err = await capture(() =>
-      createEvent(env, createDavFetch(env), createInput({ calendarId: foreign })),
+      createEvent(env, createDavFetch(owner), createInput({ calendarId: foreign })),
     );
 
     expect(err).toBeInstanceOf(DavNotFoundError);
@@ -3197,7 +3206,7 @@ describe("createEvent", () => {
 
 describe("resolveOrganizerAddress", () => {
   it("costs exactly ONE request, a PROPFIND at the principal", async () => {
-    await resolveOrganizerAddress(env, createDavFetch(env));
+    await resolveOrganizerAddress(env, createDavFetch(owner));
 
     // ONE, on a warm discovery cache. This runs on a path that is already
     // gated behind a human confirmation, and it runs on BOTH legs of it — so a
@@ -3216,7 +3225,7 @@ describe("resolveOrganizerAddress", () => {
     // would be, but it is an identity the user did not choose, and 04-03
     // already decided this question one protocol over: the From identity is
     // fixed and never a parameter.
-    expect(await resolveOrganizerAddress(env, createDavFetch(env))).toBe(
+    expect(await resolveOrganizerAddress(env, createDavFetch(owner))).toBe(
       LOGIN_ADDRESS,
     );
   });
@@ -3235,7 +3244,7 @@ describe("resolveOrganizerAddress", () => {
       ],
     });
 
-    expect(await resolveOrganizerAddress(env, createDavFetch(env))).toBe(
+    expect(await resolveOrganizerAddress(env, createDavFetch(owner))).toBe(
       ALIAS_BEFORE_LOGIN,
     );
   });
@@ -3252,7 +3261,7 @@ describe("resolveOrganizerAddress", () => {
     });
 
     const err = await capture(() =>
-      resolveOrganizerAddress(env, createDavFetch(env)),
+      resolveOrganizerAddress(env, createDavFetch(owner)),
     );
 
     expect(err).toBeInstanceOf(DavNotFoundError);
@@ -3265,7 +3274,7 @@ describe("resolveOrganizerAddress", () => {
     restub({ userAddresses: [] });
 
     expect(
-      await capture(() => resolveOrganizerAddress(env, createDavFetch(env))),
+      await capture(() => resolveOrganizerAddress(env, createDavFetch(owner))),
     ).toBeInstanceOf(DavNotFoundError);
   });
 
@@ -3274,7 +3283,7 @@ describe("resolveOrganizerAddress", () => {
     // both are legitimate calendar user addresses in the protocol's own terms.
     // They are not addresses a person receives mail at, which is what an
     // invitation needs.
-    const resolved = await resolveOrganizerAddress(env, createDavFetch(env));
+    const resolved = await resolveOrganizerAddress(env, createDavFetch(owner));
 
     expect(resolved.startsWith("/")).toBe(false);
     expect(resolved.startsWith("urn:")).toBe(false);
@@ -3288,7 +3297,7 @@ describe("createEvent with people on it", () => {
   it("writes the organiser and the attendees, in ONE conditional PUT", async () => {
     await createEvent(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       createInput({
         participants: {
           organizer: LOGIN_ADDRESS,
@@ -3311,7 +3320,7 @@ describe("createEvent with people on it", () => {
   });
 
   it("writes no scheduling property at all when nobody is invited", async () => {
-    await createEvent(env, createDavFetch(env), createInput());
+    await createEvent(env, createDavFetch(owner), createInput());
 
     const body = sentBody(stub);
     expect(body).not.toContain("ORGANIZER");
@@ -3333,7 +3342,7 @@ describe("createEvent with people on it", () => {
 
     const written = await createEvent(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       createInput({ uid }),
     );
 
@@ -3357,7 +3366,7 @@ describe("createEvent with people on it", () => {
     const uid = decodeURIComponent(
       target.objectUrl.slice(WORK_URL.length, -".ics".length),
     );
-    await createEvent(env, createDavFetch(env), createInput({ uid }));
+    await createEvent(env, createDavFetch(owner), createInput({ uid }));
     expect(stub.observed[0].url).toBe(target.objectUrl);
   });
 });
@@ -3453,7 +3462,7 @@ function calendarRegistrations(): Recorded[] {
       recorded.push({ name, options, callback });
     },
   };
-  registerCalendarTools(server as unknown as McpServer, createDavFetch(env));
+  registerCalendarTools(server as unknown as McpServer, createDavFetch(owner));
   return recorded;
 }
 
@@ -3629,7 +3638,7 @@ describe("the etag read", () => {
   it("reads the body and the etag from ONE multi-get", async () => {
     const one = restub({ objects: SIMPLE_OBJECTS });
 
-    const read = await getEventWithEtag(env, createDavFetch(env), SIMPLE_REF);
+    const read = await getEventWithEtag(env, createDavFetch(owner), SIMPLE_REF);
 
     // ONE. Reading the etag in a second call would open a race between the
     // etag and the body that the confirmation then pins as though the two were
@@ -3643,7 +3652,7 @@ describe("the etag read", () => {
   it("returns the etag byte-exact, with its quotes still on it", async () => {
     const one = restub({ objects: SIMPLE_OBJECTS });
 
-    const read = await getEventWithEtag(env, createDavFetch(env), SIMPLE_REF);
+    const read = await getEventWithEtag(env, createDavFetch(owner), SIMPLE_REF);
 
     expect(one.observed.length).toBe(1);
     expect(read.etag.startsWith('"')).toBe(true);
@@ -3658,7 +3667,7 @@ describe("the etag read", () => {
       etags: { [SIMPLE_HREF]: 'W/"abc"' },
     });
 
-    const read = await getEventWithEtag(env, createDavFetch(env), SIMPLE_REF);
+    const read = await getEventWithEtag(env, createDavFetch(owner), SIMPLE_REF);
 
     expect(read.etag).toBe('W/"abc"');
   });
@@ -3679,7 +3688,7 @@ describe("the etag read", () => {
     });
 
     const err = await capture(() =>
-      getEventWithEtag(env, createDavFetch(env), SIMPLE_REF),
+      getEventWithEtag(env, createDavFetch(owner), SIMPLE_REF),
     );
 
     expect(err).toBeInstanceOf(DavNotFoundError);
@@ -3691,7 +3700,7 @@ describe("the etag read", () => {
     // that the sharing did not change what the older caller sees.
     const one = restub({ objects: SIMPLE_OBJECTS });
 
-    const detail = await getEvent(env, createDavFetch(env), SIMPLE_REF);
+    const detail = await getEvent(env, createDavFetch(owner), SIMPLE_REF);
 
     expect(one.observed.length).toBe(1);
     expect(detail.summary).toBe("Interview with Northwind");
@@ -3701,7 +3710,7 @@ describe("the etag read", () => {
   it("reports a rewritable resource as carrying no blocker at all", async () => {
     restub({ objects: SIMPLE_OBJECTS });
 
-    const read = await getEventWithEtag(env, createDavFetch(env), SIMPLE_REF);
+    const read = await getEventWithEtag(env, createDavFetch(owner), SIMPLE_REF);
 
     expect(read.unsupportedTarget).toBeNull();
   });
@@ -3723,7 +3732,7 @@ describe("what the etag read refuses to let a rewrite touch", () => {
   ) {
     const href = `${WORK_PATH}${uid}.ics`;
     restub({ objects: { [WORK_PATH]: { [href]: body } } });
-    return getEventWithEtag(env, createDavFetch(env), {
+    return getEventWithEtag(env, createDavFetch(owner), {
       calendarUrl: WORK_URL,
       objectUrl: `https://p42-caldav.icloud.com${href}`,
       recurrenceId,
@@ -3927,7 +3936,7 @@ describe("what the etag read refuses to let a rewrite touch", () => {
     const href = `${WORK_PATH}not-the-uid.ics`;
     restub({ objects: { [WORK_PATH]: { [href]: SIMPLE_ICS } } });
 
-    const read = await getEventWithEtag(env, createDavFetch(env), {
+    const read = await getEventWithEtag(env, createDavFetch(owner), {
       calendarUrl: WORK_URL,
       objectUrl: `https://p42-caldav.icloud.com${href}`,
       recurrenceId: null,
@@ -3955,7 +3964,7 @@ describe("what the etag read refuses to let a rewrite touch", () => {
     );
     restub({ objects: { [WORK_PATH]: { [href]: body } } });
 
-    const read = await getEventWithEtag(env, createDavFetch(env), {
+    const read = await getEventWithEtag(env, createDavFetch(owner), {
       calendarUrl: WORK_URL,
       objectUrl: `https://p42-caldav.icloud.com${href}`,
       recurrenceId: null,
@@ -3994,7 +4003,7 @@ describe("updateEvent and its conditional etag header", () => {
 
     await updateEvent(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       SIMPLE_REF,
       SIMPLE_ICS,
       'W/"abc"',
@@ -4015,7 +4024,7 @@ describe("updateEvent and its conditional etag header", () => {
     const one = restub({ objects: SIMPLE_OBJECTS });
 
     const err = await capture(() =>
-      updateEvent(env, createDavFetch(env), SIMPLE_REF, SIMPLE_ICS, ""),
+      updateEvent(env, createDavFetch(owner), SIMPLE_REF, SIMPLE_ICS, ""),
     );
 
     // The COUNT, not just the throw. The throw alone passes on an
@@ -4035,7 +4044,7 @@ describe("updateEvent and its conditional etag header", () => {
     const err = await capture(() =>
       updateEvent(
         env,
-        createDavFetch(env),
+        createDavFetch(owner),
         SIMPLE_REF,
         SIMPLE_ICS,
         '"etag-1"',
@@ -4054,7 +4063,7 @@ describe("updateEvent and its conditional etag header", () => {
     const err = await capture(() =>
       updateEvent(
         env,
-        createDavFetch(env),
+        createDavFetch(owner),
         {
           calendarUrl: "https://attacker.example/1234567890/calendars/work/",
           objectUrl:
@@ -4079,7 +4088,7 @@ describe("updateEvent and its conditional etag header", () => {
     const err = await capture(() =>
       updateEvent(
         env,
-        createDavFetch(env),
+        createDavFetch(owner),
         {
           calendarUrl: WORK_URL,
           objectUrl: "https://attacker.example/steal.ics",
@@ -4134,7 +4143,7 @@ describe("updateEvent and its conditional etag header", () => {
       objects: { [WORK_PATH]: { [href]: invitation("NEEDS-ACTION") } },
       etags: { [href]: '"etag-A"' },
     });
-    const read = await getEventWithEtag(env, createDavFetch(env), ref);
+    const read = await getEventWithEtag(env, createDavFetch(owner), ref);
     expect(before.observed.length).toBe(1);
     expect(read.etag).toBe('"etag-A"');
     expect(read.detail.attendees[0].partstat).toBe("NEEDS-ACTION");
@@ -4150,7 +4159,7 @@ describe("updateEvent and its conditional etag header", () => {
 
     // 3. The same refusal as an edit race, in the same one request.
     const err = await capture(() =>
-      updateEvent(env, createDavFetch(env), ref, invitation("NEEDS-ACTION"), read.etag),
+      updateEvent(env, createDavFetch(owner), ref, invitation("NEEDS-ACTION"), read.etag),
     );
     expect(err).toBeInstanceOf(DavStaleResourceError);
     expect(after.observed.length).toBe(1);
@@ -4159,7 +4168,7 @@ describe("updateEvent and its conditional etag header", () => {
     // 4. And a fresh read shows the reply, which is what the user is told to
     //    go and look at.
     after.observed.length = 0;
-    const again = await getEventWithEtag(env, createDavFetch(env), ref);
+    const again = await getEventWithEtag(env, createDavFetch(owner), ref);
     expect(again.etag).toBe('"etag-B"');
     expect(again.detail.attendees[0].partstat).toBe("ACCEPTED");
   });
@@ -4169,7 +4178,7 @@ describe("updateEvent and its conditional etag header", () => {
 
     const result = await updateEvent(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       SIMPLE_REF,
       SIMPLE_ICS,
       '"etag-1"',
@@ -4197,7 +4206,7 @@ describe("deleteEvent and its conditional etag header", () => {
   it("issues exactly ONE DELETE carrying the etag byte-exact as If-Match", async () => {
     const one = restub({ objects: SIMPLE_OBJECTS });
 
-    await deleteEvent(env, createDavFetch(env), SIMPLE_REF, 'W/"abc"');
+    await deleteEvent(env, createDavFetch(owner), SIMPLE_REF, 'W/"abc"');
 
     expect(one.observed.length).toBe(1);
     expect(one.observed[0].method).toBe("DELETE");
@@ -4213,7 +4222,7 @@ describe("deleteEvent and its conditional etag header", () => {
     const one = restub({ objects: SIMPLE_OBJECTS });
 
     const err = await capture(() =>
-      deleteEvent(env, createDavFetch(env), SIMPLE_REF, ""),
+      deleteEvent(env, createDavFetch(owner), SIMPLE_REF, ""),
     );
 
     // The COUNT, not just the throw. The throw alone passes on an
@@ -4231,7 +4240,7 @@ describe("deleteEvent and its conditional etag header", () => {
     });
 
     const err = await capture(() =>
-      deleteEvent(env, createDavFetch(env), SIMPLE_REF, '"etag-1"'),
+      deleteEvent(env, createDavFetch(owner), SIMPLE_REF, '"etag-1"'),
     );
 
     expect(err).toBeInstanceOf(DavStaleResourceError);
@@ -4250,7 +4259,7 @@ describe("deleteEvent and its conditional etag header", () => {
     });
 
     const err = await capture(() =>
-      deleteEvent(env, createDavFetch(env), SIMPLE_REF, '"etag-1"'),
+      deleteEvent(env, createDavFetch(owner), SIMPLE_REF, '"etag-1"'),
     );
 
     expect(err).toBeInstanceOf(DavNotFoundError);
@@ -4263,7 +4272,7 @@ describe("deleteEvent and its conditional etag header", () => {
     const err = await capture(() =>
       deleteEvent(
         env,
-        createDavFetch(env),
+        createDavFetch(owner),
         {
           calendarUrl: "https://attacker.example/1234567890/calendars/work/",
           objectUrl:
@@ -4284,7 +4293,7 @@ describe("deleteEvent and its conditional etag header", () => {
     const err = await capture(() =>
       deleteEvent(
         env,
-        createDavFetch(env),
+        createDavFetch(owner),
         {
           calendarUrl: WORK_URL,
           objectUrl: "https://attacker.example/steal.ics",
@@ -4303,7 +4312,7 @@ describe("deleteEvent and its conditional etag header", () => {
 
     const result = await deleteEvent(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       SIMPLE_REF,
       '"etag-1"',
     );
@@ -4409,7 +4418,7 @@ describe("the revision a rewrite emits", () => {
   it("reports the sequence the FETCHED resource carried", async () => {
     restub({ objects: { [WORK_PATH]: { [REVISED_HREF]: REVISED_ICS } } });
 
-    const read = await getEventWithEtag(env, createDavFetch(env), REVISED_REF);
+    const read = await getEventWithEtag(env, createDavFetch(owner), REVISED_REF);
 
     // Read off the resource, so the value costs no extra request — it comes
     // out of the same multi-get the etag does.
@@ -4419,7 +4428,7 @@ describe("the revision a rewrite emits", () => {
   it("reports an ABSENT sequence as absent, never as zero", async () => {
     restub({ objects: { [WORK_PATH]: { [UNREVISED_HREF]: UNREVISED_ICS } } });
 
-    const read = await getEventWithEtag(env, createDavFetch(env), UNREVISED_REF);
+    const read = await getEventWithEtag(env, createDavFetch(owner), UNREVISED_REF);
 
     // Null rather than zero, so a reader can tell "the resource said zero" from
     // "the resource said nothing". Both take the next revision to one; the
@@ -4435,7 +4444,7 @@ describe("the revision a rewrite emits", () => {
 
     await updateEvent(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       REVISED_REF,
       updateEventBody(REVISED_REF, rewriteInput(0), 3),
       '"etag-1"',
@@ -4454,7 +4463,7 @@ describe("the revision a rewrite emits", () => {
 
     await updateEvent(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       UNREVISED_REF,
       updateEventBody(UNREVISED_REF, rewriteInput(0), null),
       '"etag-1"',
@@ -4474,7 +4483,7 @@ describe("the revision a rewrite emits", () => {
 
     await updateEvent(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       REVISED_REF,
       updateEventBody(REVISED_REF, rewriteInput(99), 3),
       '"etag-1"',
@@ -4490,7 +4499,7 @@ describe("the revision a rewrite emits", () => {
 
     await updateEvent(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       REVISED_REF,
       updateEventBody(REVISED_REF, rewriteInput(0), 3),
       '"etag-1"',
@@ -4508,7 +4517,7 @@ describe("the revision a rewrite emits", () => {
   it("emits SEQUENCE:0 on a CREATE, which is a new event's first revision", async () => {
     const one = restub({});
 
-    await createEvent(env, createDavFetch(env), {
+    await createEvent(env, createDavFetch(owner), {
       calendarId: encodeCalendarId({ collectionUrl: WORK_URL }),
       summary: "Interview with Northwind",
       startLocal: "2026-02-10T15:00:00",
@@ -4566,7 +4575,7 @@ describe("the form a cancellation takes, from probe P-4", () => {
       objects: { [WORK_PATH]: { [INVITED_HREF]: INVITED_ICS } },
     });
 
-    await deleteEvent(env, createDavFetch(env), INVITED_REF, '"etag-1"');
+    await deleteEvent(env, createDavFetch(owner), INVITED_REF, '"etag-1"');
 
     expect(one.observed.map((request) => request.method)).toEqual(["DELETE"]);
     // No cancellation body was written first. A PUT here would be the two-step
@@ -4580,7 +4589,7 @@ describe("the form a cancellation takes, from probe P-4", () => {
     // left on the user's own calendar is a worse outcome than a deleted one.
     const one = restub({ objects: SIMPLE_OBJECTS });
 
-    await deleteEvent(env, createDavFetch(env), SIMPLE_REF, '"etag-1"');
+    await deleteEvent(env, createDavFetch(owner), SIMPLE_REF, '"etag-1"');
 
     expect(one.observed.map((request) => request.method)).toEqual(["DELETE"]);
   });
@@ -4726,20 +4735,20 @@ const CONDITIONAL_WRITE_GATE: Record<string, WriterCase> = {
   createEvent: {
     header: "if-none-match",
     value: "*",
-    drive: () => createEvent(env, createDavFetch(env), createInput()),
+    drive: () => createEvent(env, createDavFetch(owner), createInput()),
     etagBearing: false,
   },
   updateEvent: {
     header: "if-match",
     value: GATE_ETAG,
     drive: (etag) =>
-      updateEvent(env, createDavFetch(env), SIMPLE_REF, SIMPLE_ICS, etag),
+      updateEvent(env, createDavFetch(owner), SIMPLE_REF, SIMPLE_ICS, etag),
     etagBearing: true,
   },
   deleteEvent: {
     header: "if-match",
     value: GATE_ETAG,
-    drive: (etag) => deleteEvent(env, createDavFetch(env), SIMPLE_REF, etag),
+    drive: (etag) => deleteEvent(env, createDavFetch(owner), SIMPLE_REF, etag),
     etagBearing: true,
   },
 };
@@ -4840,7 +4849,7 @@ describe("what the etag read refuses to let a DELETE touch", () => {
   ): Promise<string | null> {
     const href = `${WORK_PATH}${uid}.ics`;
     restub({ objects: { [WORK_PATH]: { [href]: body } } });
-    const read = await getEventWithEtag(env, createDavFetch(env), {
+    const read = await getEventWithEtag(env, createDavFetch(owner), {
       calendarUrl: WORK_URL,
       objectUrl: `https://p42-caldav.icloud.com${href}`,
       recurrenceId,
@@ -4900,7 +4909,7 @@ describe("what the etag read refuses to let a DELETE touch", () => {
     const href = `${WORK_PATH}${uid}.ics`;
     restub({ objects: { [WORK_PATH]: { [href]: body } } });
 
-    const read = await getEventWithEtag(env, createDavFetch(env), {
+    const read = await getEventWithEtag(env, createDavFetch(owner), {
       calendarUrl: WORK_URL,
       objectUrl: `https://p42-caldav.icloud.com${href}`,
       recurrenceId: null,
@@ -4939,7 +4948,7 @@ describe("what the etag read refuses to let a DELETE touch", () => {
     );
     restub({ objects: { [WORK_PATH]: { [href]: body } } });
 
-    const read = await getEventWithEtag(env, createDavFetch(env), {
+    const read = await getEventWithEtag(env, createDavFetch(owner), {
       calendarUrl: WORK_URL,
       objectUrl: `https://p42-caldav.icloud.com${href}`,
       recurrenceId: null,
@@ -4952,7 +4961,7 @@ describe("what the etag read refuses to let a DELETE touch", () => {
   it("reports NO delete blocker on the plain event, so the case above is not vacuous", async () => {
     restub({ objects: SIMPLE_OBJECTS });
 
-    const read = await getEventWithEtag(env, createDavFetch(env), SIMPLE_REF);
+    const read = await getEventWithEtag(env, createDavFetch(owner), SIMPLE_REF);
 
     expect(read.unsupportedDeleteTarget).toBeNull();
     expect(read.unsupportedTarget).toBeNull();
@@ -5270,7 +5279,7 @@ describe("findFreeSlots across every calendar", () => {
   it("returns the full working-hours window for every working day when nothing is busy", () => {
     setupFindSlots();
 
-    return findFreeSlots(env, createDavFetch(env), fsOptions()).then((page) => {
+    return findFreeSlots(env, createDavFetch(owner), fsOptions()).then((page) => {
       // Three candidates a day (09:00, 09:30, 10:00), three working days, in
       // ascending order — a subscribed calendar with an empty feed still counts.
       expect(startsOf(page.candidates)).toEqual([
@@ -5309,7 +5318,7 @@ describe("findFreeSlots across every calendar", () => {
 
     const page = await findFreeSlots(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       fsOptions({ rangeEnd: FS_ONE_DAY_END }),
     );
 
@@ -5333,7 +5342,7 @@ describe("findFreeSlots across every calendar", () => {
       },
     });
 
-    const page = await findFreeSlots(env, createDavFetch(env), fsOptions());
+    const page = await findFreeSlots(env, createDavFetch(owner), fsOptions());
 
     expect(startsOf(page.candidates)).toEqual([
       "2026-01-05T09:00:00",
@@ -5354,7 +5363,7 @@ describe("findFreeSlots across every calendar", () => {
 
     const first = await findFreeSlots(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       fsOptions({ pageSize: 4 }),
     );
     expect(first.candidates.length).toBe(4);
@@ -5363,7 +5372,7 @@ describe("findFreeSlots across every calendar", () => {
 
     const second = await findFreeSlots(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       fsOptions({ pageSize: 4, cursor: first.nextCursor! }),
     );
 
@@ -5400,7 +5409,7 @@ describe("findFreeSlots across every calendar", () => {
     const err = await capture(() =>
       findFreeSlots(
         env,
-        createDavFetch(env),
+        createDavFetch(owner),
         fsOptions({ durationMinutes: 90, cursor }),
       ),
     );
@@ -5415,7 +5424,7 @@ describe("findFreeSlots across every calendar", () => {
 
     const page = await findFreeSlots(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       fsOptions({ tzid: "Mars/Olympus" }),
     );
 
@@ -5437,7 +5446,7 @@ describe("findFreeSlots across every calendar", () => {
     // so the free/busy set is empty by a different route and the window is whole.
     setupFindSlots({ collections: [] });
 
-    const page = await findFreeSlots(env, createDavFetch(env), fsOptions());
+    const page = await findFreeSlots(env, createDavFetch(owner), fsOptions());
 
     expect(startsOf(page.candidates)).toEqual([
       "2026-01-05T09:00:00",
@@ -5477,7 +5486,7 @@ describe("findFreeSlots across every calendar", () => {
 
     const page = await findFreeSlots(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       fsOptions({ rangeEnd: FS_ONE_DAY_END, workDayEndLocal: "12:00" }),
     );
 
@@ -5493,7 +5502,7 @@ describe("findFreeSlots across every calendar", () => {
 
     const whole = await findFreeSlots(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       fsOptions({ pageSize: 100 }),
     );
     const wholeStarts = startsOf(whole.candidates);
@@ -5505,7 +5514,7 @@ describe("findFreeSlots across every calendar", () => {
     for (let guard = 0; guard < 100; guard += 1) {
       const page: import("../src/dav/calendar").SlotPage = await findFreeSlots(
         env,
-        createDavFetch(env),
+        createDavFetch(owner),
         fsOptions({ pageSize: 1, cursor }),
       );
       walked.push(...startsOf(page.candidates));
@@ -5528,7 +5537,7 @@ describe("findFreeSlots across every calendar", () => {
       objects: { [WORK_PATH]: { [`${WORK_PATH}minutely.ics`]: MINUTELY_ICS } },
     });
 
-    const page = await findFreeSlots(env, createDavFetch(env), fsOptions());
+    const page = await findFreeSlots(env, createDavFetch(owner), fsOptions());
 
     expect(page.truncated).toBe(true);
     expect(page.candidates).toEqual([]);
@@ -5564,7 +5573,7 @@ describe("findFreeSlots across every calendar", () => {
       objects: {},
     });
 
-    const page = await findFreeSlots(env, createDavFetch(env), fsOptions());
+    const page = await findFreeSlots(env, createDavFetch(owner), fsOptions());
 
     expect(page.truncated).toBe(true);
     expect(page.candidates).toEqual([]);
@@ -5610,7 +5619,7 @@ describe("findFreeSlots across every calendar", () => {
 
     const page = await findFreeSlots(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       fsOptions({
         // Fri 2026-03-06 00:00 EST … Tue 2026-03-10 00:00 EDT — the Friday and
         // the Monday are the only two working days inside it.
@@ -5652,7 +5661,7 @@ describe("findFreeSlots across every calendar", () => {
 
     const page = await findFreeSlots(
       env,
-      createDavFetch(env),
+      createDavFetch(owner),
       fsOptions({
         // Mon 2026-03-09 00:00 EDT … Thu 2026-03-12 00:00 EDT — Mon, Tue, Wed.
         rangeStart: at("2026-03-09T04:00:00Z"),

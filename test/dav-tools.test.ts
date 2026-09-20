@@ -70,6 +70,15 @@ import type { CommitOutcome, EventPreview } from "../src/mcp/tools/calendar";
 import { registerContactsTools } from "../src/mcp/tools/contacts";
 import { registerDavDiagnoseTool } from "../src/mcp/tools/dav-diagnose";
 import { UNTRUSTED_PREAMBLE } from "../src/mcp/untrusted";
+import { ownerPrincipal } from "./fixtures/bound-secrets";
+
+// The owner's principal, as the PROMISE the real env constructor returns over
+// the pool's ambient environment. The DAV fetch builder and the registrars take
+// the promise. The no-op handler means a file that builds it and awaits it
+// nowhere leaves no rejection unheard. Everyone who does await it still sees
+// the refusal.
+const owner = ownerPrincipal();
+owner.catch(() => {});
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -581,7 +590,7 @@ function registeredDav(): Registration[] {
       recorded.push({ name, options, callback });
     },
   };
-  const davFetch = createDavFetch(env);
+  const davFetch = createDavFetch(owner);
   registerDavDiagnoseTool(server as unknown as McpServer, davFetch);
   registerCalendarTools(server as unknown as McpServer, davFetch);
   // The last registrar the phase adds. After this line the ceiling loop below
@@ -1551,7 +1560,7 @@ function writeDavStub(options: WriteStubOptions = {}): WriteStub {
 async function warmWrite(stub: WriteStub): Promise<void> {
   vi.stubGlobal("fetch", stub.fetch);
   await clearDavCache(env, "caldav");
-  const resolved = await resolveDavAccount(env, createDavFetch(env), "caldav");
+  const resolved = await resolveDavAccount(env, createDavFetch(owner), "caldav");
   expect(resolved.cacheHit).toBe(false);
   stub.observed.length = 0;
 }
@@ -6844,7 +6853,7 @@ describe("calendar_find_free_slots returns an unfenced, trusted-only response", 
   async function warmSlots(fetchStub: typeof globalThis.fetch): Promise<void> {
     vi.stubGlobal("fetch", fetchStub);
     await clearDavCache(env, "caldav");
-    await resolveDavAccount(env, createDavFetch(env), "caldav");
+    await resolveDavAccount(env, createDavFetch(owner), "caldav");
   }
 
   const ARGS = {

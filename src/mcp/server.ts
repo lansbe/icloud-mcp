@@ -6,7 +6,6 @@
 
 import { McpServer } from "@modelcontextprotocol/server";
 import type { McpServerFactory } from "@modelcontextprotocol/server";
-import { env } from "cloudflare:workers";
 import { createDavFetch } from "../dav/transport";
 import { createSessionGate } from "../mail/service";
 import type { Principal } from "../principal";
@@ -58,7 +57,10 @@ export function createServerFactory(
     // whole isolate into a single-file line. Both belong here; neither belongs
     // at module scope.
     const gate = createSessionGate();
-    const davFetch = createDavFetch(env);
+    // The DAV fetch takes the PROMISE and awaits it inside each request it
+    // sends, so this body stays synchronous. It was this file's only use of the
+    // ambient environment, which is why that import is gone.
+    const davFetch = createDavFetch(principal);
     // The mail diagnostic and the mail tools act for the principal. The DAV
     // registrars get the same promise when the DAV chain lands.
     registerDiagnoseTool(server, principal);
