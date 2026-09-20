@@ -1030,21 +1030,38 @@ describe("the patterns have teeth", () => {
    *
    *  Each line carries ONLY what its own rule looks for, so a row cannot pass
    *  because a neighbouring rule's trigger happens to be on the same line. */
-  const logLineFor = (ruleId: string, method: string): string => {
+  const logLineWithAccess = (ruleId: string, access: string): string => {
     switch (ruleId) {
       case "secret-binding-in-log-call":
-        return `console.${method}("sending", holder.APPLE_APP_PASSWORD);`;
+        return `${access}("sending", holder.APPLE_APP_PASSWORD);`;
       case "env-object-in-log-call":
-        return `console.${method}("diagnose", env);`;
+        return `${access}("diagnose", env);`;
       case "props-object-in-log-call":
-        return `console.${method}("grant reached the handler", ctx.props);`;
+        return `${access}("grant reached the handler", ctx.props);`;
       case "logging-on-the-credential-path":
       case "logging-anywhere-under-src":
-        return `console.${method}("handler reached");`;
+        return `${access}("handler reached");`;
       default:
         throw new Error(`no logging line is defined for ${ruleId}`);
     }
   };
+
+  const logLineFor = (ruleId: string, method: string): string =>
+    logLineWithAccess(ruleId, `console.${method}`);
+
+  /** The member-access spellings the dot-only pattern could not see (code
+   *  review WR-02). The first is the ACCIDENT the widening is aimed at: the
+   *  formatter breaks a long call after the object name, and a debug line
+   *  carrying a wide object is exactly the call that wraps. The second is the
+   *  optional-chaining member access, with the question mark BEFORE the dot —
+   *  a different shape from the optional-CALL form pinned as an evasion below,
+   *  which has it after the method name and still escapes. */
+  const WIDENED_MEMBER_ACCESS: ReadonlyArray<readonly [string, string]> = [
+    ["a line break before the dot, as the formatter writes it", "console\n  .log"],
+    ["the optional-chaining member access", "console?.log"],
+    ["a line break and the optional-chaining mark together", "console\n  ?.log"],
+    ["a space on each side of the dot", "console . log"],
+  ];
 
   const hitsOf = (ruleId: string, path: string, line: string): number => {
     const rule = FORBIDDEN.find((r) => r.id === ruleId)!;
@@ -1102,6 +1119,49 @@ describe("the patterns have teeth", () => {
           `the old six-name list already held ${method}: the line no longer discriminates`,
         ).toBe(false);
       }
+    }
+  });
+
+  it("fires every widened logging rule on a member access the dot-only text missed", () => {
+    // Code review WR-02. The dot had to be bare, so a wrapped call and an
+    // optional-chaining member access fired nothing. The old text misses the
+    // same lines, which is what makes these rows mean something.
+    expect(WIDENED_MEMBER_ACCESS.length).toBe(4);
+    for (const [shape, access] of WIDENED_MEMBER_ACCESS) {
+      for (const id of WIDENED_LOG_RULE_IDS) {
+        const line = logLineWithAccess(id, access);
+        expect(
+          hitsOf(id, LOG_RULE_PROBE_PATHS[id], line),
+          `${id} did not fire on ${shape}`,
+        ).toBeGreaterThan(0);
+
+        const old = OLD_LOG_PATTERNS[id];
+        expect(
+          new RegExp(old.source, old.flags).test(line),
+          `the old ${id} pattern already saw ${shape}: the line no longer discriminates`,
+        ).toBe(false);
+      }
+    }
+  });
+
+  it("keeps the widened member access inside the two scoped rules' scope", () => {
+    // Widening the member access must not widen the reach, exactly as widening
+    // the method part must not.
+    for (const [shape, access] of WIDENED_MEMBER_ACCESS) {
+      for (const id of ["logging-on-the-credential-path", "logging-anywhere-under-src"]) {
+        expect(
+          hitsOf(id, "test/probe.test.ts", logLineWithAccess(id, access)),
+          `${id} fired on a test file through ${shape}`,
+        ).toBe(0);
+      }
+      expect(
+        hitsOf(
+          "logging-on-the-credential-path",
+          "src/mcp/probe.ts",
+          logLineWithAccess("logging-on-the-credential-path", access),
+        ),
+        `the src/mail/ rule fired outside src/mail/ through ${shape}`,
+      ).toBe(0);
     }
   });
 

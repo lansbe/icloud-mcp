@@ -104,10 +104,23 @@ export const FORBIDDEN = [
   // with. All five are evasions rather than accidents, and this rule is aimed
   // at the accident. They are pinned by a test row that asserts the rule does
   // NOT fire on them, so nobody believes they are covered.
+  //
+  // THE MEMBER ACCESS WAS WIDENED TOO, IN ALL FIVE RULES TOGETHER (code review
+  // WR-02). They used to demand a bare dot with nothing around it, and two
+  // shapes therefore fired nothing. The first is an ACCIDENT, and it is why
+  // this changed: the formatter breaks a long call after the object name, so a
+  // debug line carrying a wide object is exactly the line that wraps. The
+  // second is the optional-chaining member access, a question mark BEFORE the
+  // dot. That is not the optional-CALL form listed above, which has the
+  // question mark AFTER the method name and still escapes. White space, a new
+  // line and an optional question mark are now allowed on either side of the
+  // dot, in every rule that opens with these two words, so the five cannot
+  // disagree with each other about it. The two new shapes only refuse more,
+  // and each rule carries its own sample of both in the test file.
   {
     id: "secret-binding-in-log-call",
     pattern:
-      /\b(?:console|logger)\.[A-Za-z_$][\w$]*\s*\([^)]*\b(?:APPLE_APP_PASSWORD|APPLE_ID|AUTH_SECRET|appPassword|appleId)\b/g,
+      /\b(?:console|logger)\s*\??\.\s*[A-Za-z_$][\w$]*\s*\([^)]*\b(?:APPLE_APP_PASSWORD|APPLE_ID|AUTH_SECRET|appPassword|appleId)\b/g,
     why: "A logging call whose arguments mention a secret binding name, or one of the two credential field names the grant's props carry. A log line naming either field leaks the Apple ID or the app-specific password. Credentials must never reach a log, an error, or a tool response.",
   },
   // Phase 9 (D-02). Widened together with the blanket src/ rule below, so the
@@ -117,7 +130,7 @@ export const FORBIDDEN = [
   {
     id: "logging-on-the-credential-path",
     scope: "src/mail/",
-    pattern: /\b(?:console|logger)\.[A-Za-z_$][\w$]*\s*\(/g,
+    pattern: /\b(?:console|logger)\s*\??\.\s*[A-Za-z_$][\w$]*\s*\(/g,
     why: "No logging call of any kind may exist under src/mail/. The LOGIN command line is itself the credential, so a 'log what I am about to write' line leaks it with no secret-named variable anywhere in sight.",
   },
   // The two rules above do not compose to cover Convention 4's stated rule, and
@@ -145,10 +158,17 @@ export const FORBIDDEN = [
   // rather than accidents. Naming them here is what stops a later reader
   // believing "no logging under src/" is proven by this rule alone. They are
   // pinned by a test row that asserts the rule does NOT fire on them.
+  //
+  // THE MEMBER ACCESS WAS WIDENED TOO (code review WR-02). See the paragraph
+  // above the first rule in this section: white space, a new line and an
+  // optional question mark are allowed on either side of the dot, in all five
+  // rules together. The line-broken form is the accident the formatter
+  // produces, and it is why this rule's own claim — no logging call of any
+  // kind under src/ — was not what the rule enforced.
   {
     id: "logging-anywhere-under-src",
     scope: "src/",
-    pattern: /\b(?:console|logger)\.[A-Za-z_$][\w$]*\s*\(/g,
+    pattern: /\b(?:console|logger)\s*\??\.\s*[A-Za-z_$][\w$]*\s*\(/g,
     why: "No logging call of any kind may exist under src/, not only under src/mail/. The environment binding carries AUTH_SECRET, the Apple ID, and the app-specific password, so one debug line that passes it names no secret and leaks all three -- and observability logging is enabled, so 'a log' means retained Cloudflare storage, not a terminal.",
   },
   {
@@ -167,8 +187,13 @@ export const FORBIDDEN = [
     // object. The optional-call form. A logger that is not named by either of
     // the two words the pattern opens with. The comment above the first rule
     // in this section spells each one out, and a test row pins all five.
+    //
+    // THE MEMBER ACCESS WAS WIDENED TOO (code review WR-02), with the other
+    // four: white space, a new line and an optional question mark on either
+    // side of the dot. A wrapped call passing the environment object is the
+    // exact line this rule exists for, and it used to commit cleanly.
     id: "env-object-in-log-call",
-    pattern: /\b(?:console|logger)\.[A-Za-z_$][\w$]*\s*\([^)]*\benv\b/g,
+    pattern: /\b(?:console|logger)\s*\??\.\s*[A-Za-z_$][\w$]*\s*\([^)]*\benv\b/g,
     why: "A logging call whose arguments mention the bare environment object. It carries APPLE_ID and APPLE_APP_PASSWORD, so nothing needs to name a secret for the credentials to reach the log -- which is exactly the shape the secret-binding rule cannot see.",
   },
   // Phase 8, CRED-05 (D-07). The rule above, moved to where the credentials
@@ -236,13 +261,19 @@ export const FORBIDDEN = [
   // and the parenthesis. A logger that is not named by either of the two
   // words the pattern opens with. All five are pinned by a test row that
   // asserts the rule does NOT fire on them.
+  //
+  // THE MEMBER ACCESS WAS WIDENED TOO (code review WR-02), with the other
+  // four: white space, a new line and an optional question mark on either side
+  // of the dot. A call passing the grant's props is long by nature, so the
+  // formatter's line break after the object name is the likeliest shape this
+  // rule will ever meet.
   {
     // No `scope`, on purpose: this one holds in every scanned directory. A
     // throwaway script or a test helper that prints the grant's props leaks the
     // same two values as a Worker that does.
     id: "props-object-in-log-call",
     pattern:
-      /\b(?:console|logger)\.[A-Za-z_$][\w$]*\s*\([^;]{0,400}?\b(?:props|principal|authInfo|getMcpAuthContext|passwordOf)\b/g,
+      /\b(?:console|logger)\s*\??\.\s*[A-Za-z_$][\w$]*\s*\([^;]{0,400}?\b(?:props|principal|authInfo|getMcpAuthContext|passwordOf)\b/g,
     why: "A logging call whose arguments mention the grant's props, the principal, the auth info, the auth context reader or the password reader. The grant's props carry the Apple ID and the app-specific password, so a log line that passes them names no secret and leaks both -- and observability logging is enabled, so 'a log' means retained Cloudflare storage, not a terminal. The rule reads text, so it also fires when one of those names is only a word inside the message string or a comment, or sits in the next statement after a logging call with no semicolon. If that is what happened, reword the message or add the semicolon. Do not loosen this rule.",
   },
 
