@@ -930,6 +930,27 @@ describe("the patterns have teeth", () => {
       "object merge onto a dotted path ending in it",
       "Object.assign(ctx.env, { APPLE_ID: userB.appleId });",
     ],
+    // Code review WR-01. The forms the first version of the rule missed. The
+    // cast is the important one: a plain write onto the object is a type error,
+    // so the cast is the very next thing an author tries.
+    ["member assignment through a type cast", "(env as Env).APPLE_ID = userB.appleId;"],
+    [
+      "member assignment through a chained type cast",
+      "(env as unknown as Record<string, string>).APPLE_ID = userB.appleId;",
+    ],
+    ["member assignment after a non-null mark", "env!.APPLE_ID = userB.appleId;"],
+    ["non-null mark between two links of the chain", "env.DAV_CACHE!.put = stubPut;"],
+    ["postfix increment", "env.RETRY_BUDGET++;"],
+    ["postfix decrement", "env.RETRY_BUDGET--;"],
+    ["prefix increment", "++env.RETRY_BUDGET;"],
+    ["prefix decrement", "--env.RETRY_BUDGET;"],
+    ["prefix increment through a type cast", "++(env as Env).RETRY_BUDGET;"],
+    ["prefix increment on a dotted path ending in it", "++this.env.RETRY_BUDGET;"],
+    ["prefix increment on an index", '++env["RETRY_BUDGET"];'],
+    ["computed key holding square brackets", "env[keys[0]] = userB.appleId;"],
+    // The first version already saw this one. It is here so a later rewrite of
+    // the index arm into a balanced-brackets-only form goes red.
+    ["index key holding an unclosed bracket", 'env["a[b"] = userB.appleId;'],
   ];
 
   /** Reads, comparisons, declarations and copies. None is a write onto the
@@ -958,11 +979,32 @@ describe("the patterns have teeth", () => {
       "an object merge INTO an empty object",
       "const copy = Object.assign({}, env, { APPLE_ID: userB.appleId });",
     ],
+    // Code review WR-01. The widened rule must stay off the READ side of every
+    // form it newly sees on the write side.
+    ["a read through a type cast", "const appleId = (env as Env).APPLE_ID;"],
+    ["a comparison through a type cast", "const inRange = (env as Env).LIMIT >= floor;"],
+    ["a call through a type cast", "const out = (env as Env).handler(() => 1);"],
+    ["a read after a non-null mark", "const appleId = env!.APPLE_ID;"],
+    ["a read through a computed key", "const value = env[keys[0]];"],
+    // The non-null mark and the loose inequality share a character. A mark
+    // allowed right before the operator would turn this comparison into a hit.
+    ["loose inequality", "if (env.MODE != expected) return;"],
+    ["an increment of something else, then a read", "const sum = i++ + env.LIMIT;"],
+    ["the same with no spaces", "const sum = i+++env.LIMIT;"],
+    ["a subtraction of a negative", "const less = env.LIMIT - -1;"],
+    // The prefix arm opens on two dashes, and so does a command-line flag.
+    ["a command-line flag with this name", 'const args = ["deploy", "--env", "staging"];'],
+    ["the same flag with a value attached", 'const args = ["deploy", "--env=staging"];'],
+    ["the same flag at the end of a sentence", "// pass --env. Then deploy."],
+    ["a prefix decrement of a local with this name", "const n = --env;"],
   ];
 
   it("refuses every form of write onto the env object", () => {
     const rule = FORBIDDEN.find((r) => r.id === "env-assignment")!;
-    expect(ENV_WRITE_FORMS.length, "the forms D-09 names, and their variants").toBe(9);
+    expect(
+      ENV_WRITE_FORMS.length,
+      "9 forms from D-09 and their variants, and 13 from code review WR-01",
+    ).toBe(22);
     for (const [form, line] of ENV_WRITE_FORMS) {
       const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
       expect(fresh.test(line), `the ${form} form was not seen`).toBe(true);

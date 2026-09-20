@@ -177,10 +177,32 @@ export const FORBIDDEN = [
   // fields overridden is a new object and is left alone: that is the permitted
   // form, and it is what the two-user test fixture does.
   //
+  // WIDENED AFTER CODE REVIEW (WR-01). The first version needed the accessor
+  // chain to start right after the object's name, and the type checker pushes
+  // people away from that spelling. A plain write is a type error, so the next
+  // thing an author tries is a type cast in parentheses, or a non-null mark.
+  // Both sat between the name and the chain and hid the write. That is an
+  // accident, not an evasion, and it is the exact case this rule exists for.
+  // The rule now also sees:
+  //   - a type cast in parentheses before the chain, single or chained;
+  //   - a non-null mark after the name, or between two links of the chain;
+  //   - the postfix increment and decrement;
+  //   - the prefix increment and decrement, which is its own arm because the
+  //     operator comes BEFORE the name. That arm needs an accessor right after
+  //     the name with no space, so a command-line flag spelled with two dashes
+  //     and this name is not a hit;
+  //   - a computed key that itself holds one level of square brackets.
+  // Every one of these refuses more and none refuses less. Each has its own
+  // sample row in ENV_WRITE_FORMS in test/forbidden-tokens.test.ts.
+  //
   // WHAT IT DOES NOT AND CANNOT SEE. The delete form. The property-definition
   // call and the reflective set call. An alias of the object, written through
   // under another name. A destructuring assignment. A bare rebinding of a local
-  // with this name, which changes no shared object and is not a leak. A
+  // with this name, which changes no shared object and is not a leak. A type
+  // cast written with angle brackets before the name, or with the newer
+  // type-check keyword in place of the cast keyword. A cast whose type holds a
+  // closing parenthesis or runs past 80 characters. A computed key with square
+  // brackets nested more than one level deep. A
   // different spelling or letter case of the object's name. All have zero hits
   // today. These are evasions rather than accidents, and this rule is aimed at
   // the accident. Naming the gaps here is what stops a later reader believing
@@ -191,8 +213,8 @@ export const FORBIDDEN = [
     // as well as src/.
     id: "env-assignment",
     pattern:
-      /\benv\s*(?:\.\s*[A-Za-z_$][\w$]*|\[[^\]\n]*\])+\s*(?:\*\*|<<|>>>?|&&|\|\||\?\?|[-+*\/%&|^])?=(?![=>])|\bObject\.assign\s*\(\s*(?:[\w$]+\.)*env\b/g,
-    why: "A write onto the environment object: a member assignment, an index assignment, or an object merge with it as the target. That object is shared by every test in a file and every request in an isolate, so a write onto it is how one user's identity leaks into another test or another request. Build a fresh copy with the two account fields overridden instead.",
+      /\benv\b(?:\s+as\s+[^)\n]{1,80}\))?(?:\s*!?\s*(?:\.\s*[A-Za-z_$][\w$]*|\[[^\]\n]*\]|\[[^\[\]\n]*(?:\[[^\[\]\n]*\][^\[\]\n]*)+\]))+\s*(?:(?:\*\*|<<|>>>?|&&|\|\||\?\?|[-+*\/%&|^])?=(?![=>])|\+\+|--)|(?<![\w$)\]+\-])(?:\+\+|--)[ \t]*\(?[ \t]*(?:[\w$]+\.)*env\b(?:\s+as\s+[^)\n]{1,80}\))?!?(?:\.[A-Za-z_$]|\[)|\bObject\.assign\s*\(\s*(?:[\w$]+\.)*env\b/g,
+    why: "A write onto the environment object: a member assignment, an index assignment, an increment or decrement, or an object merge with it as the target, with or without a type cast or a non-null mark in front of the accessor. That object is shared by every test in a file and every request in an isolate, so a write onto it is how one user's identity leaks into another test or another request. Build a fresh copy with the two account fields overridden instead.",
   },
 
   // -------------------------------------------------------------- concurrency
