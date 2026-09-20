@@ -14,6 +14,9 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  ADDRESS_HASH,
+  ADDRESS_HASH_OWNER,
+  ADDRESS_HASH_SCOPE,
   APPEND_COMMAND,
   APPEND_OWNER,
   APPEND_SCOPE,
@@ -37,6 +40,7 @@ import {
   SOCKET_OWNER,
   SUBSCRIPTION_FEED_FETCH_CALL,
   SUBSCRIPTION_FEED_FETCH_OWNER,
+  checkAddressHashOwnership,
   checkAppendOwnership,
   checkCommitHook,
   checkDavFetchOwnership,
@@ -2582,6 +2586,130 @@ describe("the one reader of the two mail secrets is a count constraint too (Phas
   });
 });
 
+describe("one function turns an address into a user id (D-18, ISO-05 rule 10)", () => {
+  const owner = { file: ADDRESS_HASH_OWNER, line: 151, column: 18 };
+  const elsewhere = { file: "src/dav/discovery.ts", line: 142, column: 18 };
+
+  /** A fresh copy per probe, so no state can carry between samples. */
+  const fires = (sample: string): boolean =>
+    new RegExp(ADDRESS_HASH.source, ADDRESS_HASH.flags).test(sample);
+
+  it("passes when the owner is the only file that hashes an address", () => {
+    expect(checkAddressHashOwnership([owner])).toEqual([]);
+  });
+
+  it("reports a violation naming the second file when another module hashes one", () => {
+    const violations = checkAddressHashOwnership([owner, elsewhere]);
+    expect(violations.map((v) => v.pattern)).toEqual([
+      "address-hashing-site-outside-owner",
+    ]);
+    expect(violations[0]!.file).toBe(elsewhere.file);
+    expect(violations[0]!.line).toBe(elsewhere.line);
+    expect(violations[0]!.column).toBe(elsewhere.column);
+  });
+
+  it("reports a violation naming the owner when no file hashes one", () => {
+    // The direction a negative cannot see. "No second producer" is trivially
+    // true of a tree with no producer left, and nothing goes red on the way
+    // out: the tests that covered the deleted code leave with it.
+    const violations = checkAddressHashOwnership([]);
+    expect(violations.map((v) => v.pattern)).toEqual(["address-hashing-site-missing"]);
+    expect(violations[0]!.file).toBe(ADDRESS_HASH_OWNER);
+    expect(violations[0]!.line).toBe(0);
+    expect(violations[0]!.column).toBe(0);
+  });
+
+  it("names the one producer, and collects from the source tree only", () => {
+    expect(ADDRESS_HASH_OWNER).toBe("src/principal.ts");
+    expect(ADDRESS_HASH_SCOPE).toBe("src/");
+  });
+
+  it("matches the owner's own hashing site, on one line and split across several", () => {
+    for (const sample of [
+      // src/principal.ts as it is written today.
+      '  const digest = await crypto.subtle.digest("SHA-256", ENCODER.encode(folded));',
+      // The same call after a formatter breaks it up. The character class
+      // matches newlines, which is what keeps this seen.
+      '  const digest = await crypto.subtle.digest(\n    "SHA-256",\n    ENCODER.encode(folded),\n  );',
+      // White space between the call and its parenthesis.
+      '  await crypto.subtle.digest ( "SHA-256", ENCODER.encode(address) );',
+    ]) {
+      expect(fires(sample), `missed ${sample}`).toBe(true);
+    }
+  });
+
+  it("does not match the three change-hash sites in the confirm module", () => {
+    // These are the rows a MISSING WORD BOUNDARY silently catches. The confirm
+    // module's encoder ends with the owner's encoder name, and the character
+    // in front of it is a word character, so the boundary fails there. Without
+    // these rows the block passes just as happily with a broken anchor as with
+    // a correct one — and a broken anchor reports a second owner, which the
+    // pre-commit hook turns into a refusal of every commit in the repository.
+    for (const sample of [
+      '  const digest = await crypto.subtle.digest(\n    "SHA-256",\n    TOKEN_ENCODER.encode(canonicalChange(change)),\n  );',
+      '    crypto.subtle.digest("SHA-256", TOKEN_ENCODER.encode(a)),',
+      '    crypto.subtle.digest("SHA-256", TOKEN_ENCODER.encode(b)),',
+    ]) {
+      expect(fires(sample), `now sees ${sample}`).toBe(false);
+    }
+  });
+
+  it("does not match the two gate-secret sites in the login handler (D-28)", () => {
+    // These are the rows a CASE-INSENSITIVE FLAG silently catches. The login
+    // gate's encoder is a function-local lower-case name. What it hashes is
+    // the submitted secret, which is neither an address nor a user id, and
+    // Phase 9 D-28 set the precedent for narrowing rather than folding: one
+    // count answering two questions answers neither well.
+    for (const sample of [
+      '  const submittedDigest = await crypto.subtle.digest(\n    "SHA-256",\n    encoder.encode(submitted),\n  );',
+      '  const expectedDigest = await crypto.subtle.digest(\n    "SHA-256",\n    encoder.encode(expected),\n  );',
+    ]) {
+      expect(fires(sample), `now sees ${sample}`).toBe(false);
+    }
+  });
+
+  it("keeps the word boundary and the absence of a case flag as asserted properties", () => {
+    // Not merely described in the docstring. The boundary is also shown doing
+    // work: an unbounded copy of the same name DOES reach inside the longer
+    // one, so a boundary that silently stopped mattering is distinguishable
+    // from one that is load-bearing.
+    expect(ADDRESS_HASH.flags).toBe("");
+    expect(ADDRESS_HASH.source).toContain("\\b");
+    expect(new RegExp("\\bENCODER\\b").test("TOKEN_ENCODER")).toBe(false);
+    expect(new RegExp("ENCODER").test("TOKEN_ENCODER")).toBe(true);
+  });
+
+  it("pins the known evasions as unseen, so nobody believes they are covered", () => {
+    // Each of these DOES turn an address into an id. The docstring lists them.
+    // If the pattern later starts to see one, this goes red: move the row out
+    // and update the docstring.
+    for (const sample of [
+      // 1. the encoder renamed
+      '  const digest = await crypto.subtle.digest("SHA-256", UTF8.encode(folded));',
+      // 2. an encoder constructed inline at the call
+      '  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(folded));',
+      // 3. hashed by a library rather than by Web Crypto
+      "  const digest = await sha256(folded);",
+    ]) {
+      expect(fires(sample), `now sees ${sample}`).toBe(false);
+    }
+  });
+
+  it("is wired into scan(): a tree with no producer reports the owner as missing", () => {
+    // scripts/ is outside ADDRESS_HASH_SCOPE, so scanning it alone exercises
+    // the deleted direction against a real tree rather than a synthetic list.
+    expect(scan("scripts").map((v) => v.pattern)).toContain(
+      "address-hashing-site-missing",
+    );
+  });
+
+  it("passes on the real tree: exactly one producer, and it is the owner", () => {
+    const patterns = scan().map((v) => v.pattern);
+    expect(patterns).not.toContain("address-hashing-site-missing");
+    expect(patterns).not.toContain("address-hashing-site-outside-owner");
+  });
+});
+
 describe("the count constraints as a set", () => {
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
@@ -2614,6 +2742,9 @@ describe("the count constraints as a set", () => {
       // One owner, so the same two lists the props count is fed.
       ...checkMailSecretReaderOwnership([nonOwner]).map((v) => v.pattern),
       ...checkMailSecretReaderOwnership([]).map((v) => v.pattern),
+      // One owner again, so the same pair once more.
+      ...checkAddressHashOwnership([nonOwner]).map((v) => v.pattern),
+      ...checkAddressHashOwnership([]).map((v) => v.pattern),
     ]);
     expect([...observed].sort()).toEqual([...OWNERSHIP_VIOLATION_IDS].sort());
   });
@@ -2642,6 +2773,9 @@ describe("the count constraints as a set", () => {
       // One owner, so a lone non-owner and an empty list give one of each.
       ...checkMailSecretReaderOwnership([nonOwner]),
       ...checkMailSecretReaderOwnership([]),
+      // Same again for the one address-hashing producer.
+      ...checkAddressHashOwnership([nonOwner]),
+      ...checkAddressHashOwnership([]),
     ];
     expect(violations.length).toBe(OWNERSHIP_VIOLATION_IDS.length);
     for (const violation of violations) {

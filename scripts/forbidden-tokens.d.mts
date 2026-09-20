@@ -98,6 +98,9 @@ export declare const PASSWORD_READER_SCOPE: string;
 export declare const MAIL_SECRET_READ: RegExp;
 export declare const MAIL_SECRET_READ_OWNER: string;
 export declare const MAIL_SECRET_READ_SCOPE: string;
+export declare const ADDRESS_HASH: RegExp;
+export declare const ADDRESS_HASH_OWNER: string;
+export declare const ADDRESS_HASH_SCOPE: string;
 export declare const OWNERSHIP_VIOLATION_IDS: readonly string[];
 
 export declare function checkDavHostOwnership(
@@ -120,4 +123,7 @@ export declare function checkPasswordReaderOwnership(
 ): Violation[];
 export declare function checkMailSecretReaderOwnership(
   readers: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function checkAddressHashOwnership(
+  hashers: ReadonlyArray<OwnershipMatch>,
 ): Violation[];

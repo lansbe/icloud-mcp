@@ -1111,6 +1111,93 @@ export const MAIL_SECRET_READ_OWNER = "src/principal.ts";
 export const MAIL_SECRET_READ_SCOPE = "src/";
 
 /**
+ * The one function that turns an address into a user id, permitted in exactly
+ * one file of the source tree.
+ *
+ * THE RULE. Exactly one file under `src/` hashes an address into the id every
+ * store key is scoped by, and it is `src/principal.ts`. ISO-05 rule 10 states
+ * it in prose -- "no second function that turns an address into a user id may
+ * exist anywhere" -- and D-18 makes it mechanical. Everything that needs the id
+ * reads it off the signed-in principal; nothing computes one for itself.
+ *
+ * WHY A COUNT RATHER THAN A NEGATIVE. Two producers is the loud failure: they
+ * drift, and the day they disagree one person becomes two users or two people
+ * become one. A user whose id changed loses every staged attachment and every
+ * pending confirmation in a single deploy; two users who collapsed onto one id
+ * read each other's. Zero producers is the quiet failure, and it is the one a
+ * negative cannot see at all: "no second hashing site" is trivially true of a
+ * tree with no hashing site left. A choke-point that was deleted, renamed, or
+ * rewritten into a form this count cannot see guards nothing, and nothing goes
+ * red on the way out, because the tests that covered it leave with it.
+ *
+ * WHY THE ANCHOR NAMES THE ENCODER, AND WHY A BARE DIGEST COUNT DOES NOT WORK.
+ * There are three Web Crypto digest call sites under `src/` and two of them are
+ * legitimate non-owners: `src/confirm.ts` hashes a canonical change and two
+ * change hashes through `TOKEN_ENCODER`, and `src/auth/login-handler.ts` hashes
+ * the login gate's own submitted secret through a function-local lower-case
+ * encoder. None of them hashes an address. A bare digest count would report
+ * three owners and -- because the pre-commit hook runs this scanner under
+ * `set -e` -- would refuse every commit in the repository, including commits on
+ * unrelated work. So the anchor is the digest call TOGETHER WITH the module
+ * scope encoder's name, and two properties of it are load-bearing rather than
+ * cosmetic:
+ *
+ *   1. THE WORD BOUNDARY IS MANDATORY. The encoder's name is a SUBSTRING of
+ *      the confirm module's. Without a boundary on both sides the anchor
+ *      matches there too and the count reports a second owner.
+ *   2. THERE IS NO CASE-INSENSITIVE FLAG. The login gate's encoder differs
+ *      only in letter case, and a case-insensitive anchor reaches it.
+ *
+ * Both were measured in both directions before this count was armed. Every
+ * unsafe variant reports at least one owner too many, and every one of them
+ * freezes the repository. The test block carries a must-not-match row for each
+ * of the five non-owner digest lines, so a broken anchor fails there first.
+ *
+ * WHY THE LOGIN GATE'S SECRET AND THE CHANGE HASHES ARE NOT FOLDED IN. Phase 9
+ * D-28 set the precedent when it left the login gate's own secret out of the
+ * mail-secret count: one count answering two different questions answers
+ * neither well. This count answers "how many things produce a user id", and
+ * neither a submitted secret nor a canonical change is an address.
+ *
+ * WHAT IT DOES NOT SEE. Each of these turns an address into an id and fires
+ * nothing:
+ *
+ *   1. the encoder renamed -- `const E = new TextEncoder()` and then
+ *      `E.encode(address)`. That is the price of anchoring on a name, and it
+ *      is written down here rather than hidden. The tell is the gap between
+ *      the digest population and the anchored count;
+ *   2. an encoder constructed inline at the digest call, with no module-scope
+ *      constant at all;
+ *   3. an address hashed by a library rather than by Web Crypto;
+ *   4. a digest call whose arguments are spread over more than 200 characters
+ *      between the opening parenthesis and the encoder name. The bound is what
+ *      keeps the match linear; it is not a licence to reformat past it;
+ *   5. WHAT the site hashes. This sees an encoder name, not an address. The
+ *      owner could start hashing something else entirely and the count would
+ *      still say one. `test/key-shapes.test.ts` is what holds the OUTPUT to
+ *      the spec; this holds the number of producers.
+ *
+ * A count believed to prove more than it does is worse than one whose limits
+ * are written down.
+ *
+ * THE SHAPE. A Web Crypto digest call, then at most 200 characters that do not
+ * cross a closing parenthesis, then the encoder's name as a whole word. The
+ * character class matches newlines, so a call formatted across several lines is
+ * still one match; it cannot cross a `)`, so the anchor cannot reach past the
+ * end of the call's argument list. No `g` flag: `scan()` uses
+ * `String.prototype.search`, which takes the first match only.
+ */
+export const ADDRESS_HASH =
+  /crypto\.subtle\.digest\s*\(\s*[^)]{0,200}\bENCODER\b/;
+
+/** The one file under `ADDRESS_HASH_SCOPE` permitted to match `ADDRESS_HASH`. */
+export const ADDRESS_HASH_OWNER = "src/principal.ts";
+
+/** The tree `ADDRESS_HASH` is collected from. Tests compute expected ids to
+ *  compare against, and a test is not a producer. */
+export const ADDRESS_HASH_SCOPE = "src/";
+
+/**
  * Every violation id a count constraint can emit, both directions of each.
  *
  * Named here rather than left implicit so the test can assert set equality
@@ -1140,6 +1227,8 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "password-reader-missing",
   "mail-secret-reader-outside-owner",
   "mail-secret-reader-missing",
+  "address-hashing-site-outside-owner",
+  "address-hashing-site-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -1333,6 +1422,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const propsReaders = [];
   const passwordReaderImporters = [];
   const mailSecretReaders = [];
+  const addressHashers = [];
 
   for (const absolute of files) {
     const relativePath = toRepoRelative(absolute);
@@ -1410,6 +1500,15 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
         });
       }
     }
+    if (relativePath.startsWith(ADDRESS_HASH_SCOPE)) {
+      const addressHashIndex = contents.search(ADDRESS_HASH);
+      if (addressHashIndex !== -1) {
+        addressHashers.push({
+          file: relativePath,
+          ...positionOf(contents, addressHashIndex),
+        });
+      }
+    }
   }
 
   violations.push(...checkSocketOwnership(socketImporters));
@@ -1422,6 +1521,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   violations.push(...checkPropsReaderOwnership(propsReaders));
   violations.push(...checkPasswordReaderOwnership(passwordReaderImporters));
   violations.push(...checkMailSecretReaderOwnership(mailSecretReaders));
+  violations.push(...checkAddressHashOwnership(addressHashers));
 
   return violations.sort(
     (a, b) =>
@@ -1715,6 +1815,44 @@ export function checkMailSecretReaderOwnership(readers) {
       pattern: "mail-secret-reader-missing",
       patternIndex: FORBIDDEN.length + 15,
       why: `No file under ${MAIL_SECRET_READ_SCOPE} reads the two mail secrets off the environment object, which means the owner's constructor in ${MAIL_SECRET_READ_OWNER} was deleted, renamed, or rewritten into a form this count cannot see. Nothing fails on the way out when a constructor leaves: the tests that covered it leave with it. Restore the read in that constructor, and keep its parameter named as it is — this count finds its owner by that spelling. If the constructor really moved, that is a change to the safety boundary: get a decision, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The one site that turns an address into a user id, as a pure function over a
+ * list of hashing sites.
+ *
+ * Same split and same shape as the mail-secret count above: one owner, both
+ * failure directions exercised against a list rather than a fixture tree on
+ * disk. See the `ADDRESS_HASH` docstring for why this is a count at all, why
+ * the anchor names the encoder, why the word boundary and the absence of a
+ * case-insensitive flag are both mandatory, and what it does not see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} hashers
+ */
+export function checkAddressHashOwnership(hashers) {
+  const violations = [];
+  for (const hasher of hashers) {
+    if (hasher.file === ADDRESS_HASH_OWNER) continue;
+    violations.push({
+      file: hasher.file,
+      line: hasher.line,
+      column: hasher.column,
+      pattern: "address-hashing-site-outside-owner",
+      patternIndex: FORBIDDEN.length + 16,
+      why: `A second site under ${ADDRESS_HASH_SCOPE} turns an address into a user id, outside ${ADDRESS_HASH_OWNER}. That file holds the one producer of the id every store key in this project is scoped by (ISO-05 rule 10, D-14, D-18). Two producers drift, and the day they disagree one person becomes two users or two people become one: a user whose id moved loses every staged attachment and every pending confirmation in a single deploy, and two users who collapsed onto one id read each other's. Delete this hashing and read the id off the signed-in principal instead, which is what every other caller in the tree does. Do not narrow the pattern and do not rename the encoder to hide the site.`,
+    });
+  }
+  if (hashers.length === 0) {
+    violations.push({
+      file: ADDRESS_HASH_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "address-hashing-site-missing",
+      patternIndex: FORBIDDEN.length + 17,
+      why: `No site under ${ADDRESS_HASH_SCOPE} turns an address into a user id, which means the one producer in ${ADDRESS_HASH_OWNER} was deleted, renamed, or rewritten into a form this count cannot see. Zero producers is as much a violation as two, and it is the quieter of the pair: nothing goes red on the way out, because the tests that covered the deleted code leave with it. Restore the hashing in that file, and keep the module-scope encoder named as it is — this count finds its owner by that spelling, and the tell of a rename is a digest call still present while this count reads zero. If the producer really moved, that is a change to the safety boundary: get a decision, then change the owner, never the pattern.`,
     });
   }
   return violations;
