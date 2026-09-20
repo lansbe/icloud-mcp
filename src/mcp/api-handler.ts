@@ -278,6 +278,19 @@ function unauthorized(request: Request): Response {
  * Built per request rather than once at module scope because the principal
  * belongs to the request. Spike S1 ran this shape on both lanes and saw no
  * problem from it.
+ *
+ * **NOTHING PUTS A DOOR IN FRONT OF THIS FUNCTION** (code review IN-04). It
+ * builds a fully served tool layer out of any promise of a principal, with no
+ * owner check anywhere ahead of it. The long comment further up this file
+ * argues that there is one door, and this export is a way to the same handler
+ * that goes around it. Two callers today: `createMcpApiHandler` below, which
+ * answers the 401 first and only then calls this; and the canary test fixture,
+ * which calls it deliberately as the positive control that proves the door is
+ * what stops a bad grant. Nothing routes it from `src/index.ts`, so nothing
+ * deployed can reach it.
+ *
+ * A second caller under `src/` would be a change to the project's safety
+ * boundary and not a refactor. Get a decision first.
  */
 export function buildRequestHandler(
   principal: Promise<Principal>,
