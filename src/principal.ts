@@ -15,9 +15,13 @@
 // sooner or later. So the password is not on it. The password sits in a
 // WeakMap that is private to this module and is keyed by the very object that
 // was built. A spread copy, a clone or a look-alike made by hand is a different
-// object, so it reaches nothing. The entry also dies with its principal: when
-// the request is over and the object is gone, so is the password. Nothing here
-// holds a password under a string key, and nothing here may start to.
+// object, so it reaches no password. It reaches the rest: the Apple ID is a
+// plain field on the object, so a copy still answers the draft sender address,
+// the DAV cache key and the organiser match. Only `passwordOf` refuses, and
+// this sentence used to say "reaches nothing", which is a bigger claim than the
+// WeakMap can back (code review IN-05). The entry also dies with its principal:
+// when the request is over and the object is gone, so is the password. Nothing
+// here holds a password under a string key, and nothing here may start to.
 //
 // `passwordOf` is the one reader. Phase 9 adds a scan rule that counts the
 // files allowed to import it.
