@@ -94,26 +94,14 @@ function hex(buffer: ArrayBuffer): string {
 /**
  * The Apple ID this request acts for, off the signed-in principal.
  *
- * **Until Phase 9 this function read the two mail secrets off the environment
- * and refused when either was absent. That check is gone from here, and it did
- * not get weaker: it moved.** A principal cannot be built without both values.
- * The principal module's constructors refuse an absent, empty or unusable Apple
- * ID or app password, so by the time a principal exists both are known good.
- * An unset secret now shows up as a promise of the principal that rejects. Each
- * DAV tool callback awaits that promise as the first line of its `try`, and the
- * DAV fetch awaits it at the top of every request, so "auth_failed before any
- * request is made" still holds on both paths: the cache-hit path, where no
- * request is ever built, included.
+ * The address is returned exactly as the principal carries it, with no trim and
+ * no case change, because the key below hashes it as given.
  *
- * **This is the identity the cache is keyed by, and it is the same object the
- * DAV fetch logs in with (D-13).** The two moved to the principal together, in
- * one plan. A key read from one identity and a login from another would let the
- * home-set check compare a caller's target against somebody else's home.
- *
- * The Apple ID is returned exactly as the principal carries it, with no trim
- * and no case change, because the key below hashes it as given. The owner's
- * principal carries the binding untouched, so the owner's key did not move.
- * Nothing else in this module retains it.
+ * Until Phase 9 this function read the two mail secrets and refused when either
+ * was absent. That check is not gone, it moved: a principal cannot be built
+ * without both, so by the time one exists both are known good. The rest of that
+ * argument now sits on `davCacheKey` below, where the identity it is about is
+ * actually used (code review IN-02).
  */
 function requireAppleId(principal: Principal): string {
   return principal.appleId;
@@ -135,6 +123,20 @@ function requireAppleId(principal: Principal): string {
  * a single object never pays. Two keys let a CalDAV entry survive a CardDAV
  * re-discovery, and they make DAV-03's `{appleId, service}` key literal rather
  * than encoded inside a value.
+ *
+ * **THE IDENTITY KEYED HERE IS THE SAME ONE THE DAV FETCH LOGS IN WITH (D-13).**
+ * The cache key and the DAV login moved to the principal together, in one plan,
+ * and that is why. A key read from one identity and a login from another would
+ * let the home-set check compare a caller's target against somebody else's
+ * home. The hash is over the Apple ID exactly as the principal carries it, so
+ * the owner's key did not move when this changed. Nothing in this module
+ * retains the address.
+ *
+ * **An unset secret answers before any request is built.** It shows up as a
+ * promise of the principal that rejects. Each DAV tool callback awaits that
+ * promise as the first line of its `try`, and the DAV fetch awaits it at the
+ * top of every request, so `auth_failed` arrives ahead of the network on both
+ * paths — the cache-hit path, where no request is ever built, included.
  */
 async function davCacheKey(appleId: string, service: DavService): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", ENCODER.encode(appleId));
