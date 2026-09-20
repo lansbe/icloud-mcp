@@ -392,6 +392,37 @@ describe("refuses an unprovisioned binding before writing anything", () => {
   });
 });
 
+// The password reader answers only the very object a constructor built (Phase 9
+// D-16). Both write helpers ask it BEFORE the write, so an object that merely
+// has the right two fields puts nothing on the wire. The spread below is the
+// thing under test, not a pattern to copy: production code never spreads or
+// clones a principal.
+describe("refuses a principal no constructor built, before writing anything", () => {
+  for (const [helperName, invoke] of HELPERS) {
+    it(`${helperName}: a hand-made look-alike`, async () => {
+      await expectRefusal((writer) =>
+        invoke(writer, lookAlike("someone@icloud.com")),
+      );
+    });
+
+    it(`${helperName}: a spread copy of a real principal`, async () => {
+      const real = await principalOf("someone@icloud.com", "abcd-efgh");
+      const copy: Principal = { ...real };
+
+      // The copy is field-for-field the same, so only identity tells them apart.
+      expect(copy).toEqual(real);
+      await expectRefusal((writer) => invoke(writer, copy));
+    });
+
+    it(`${helperName}: the real principal beside them does write (the control)`, async () => {
+      const real = await principalOf("someone@icloud.com", "abcd-efgh");
+      const { bytes } = await capture((writer) => invoke(writer, real));
+
+      expect(bytes.byteLength).toBeGreaterThan(0);
+    });
+  }
+});
+
 // The invariant `src/mcp/tools/diagnose.ts` and `src/mail/diagnose.ts` both
 // depend on, stated here as a check rather than left as prose in two places.
 //
@@ -463,10 +494,11 @@ describe("a written command is exactly one line", () => {
  * An object with a principal's two fields that no constructor built.
  *
  * It has no entry in the password store, so it can never reach a password
- * (D-17): the password reader refuses it. It is only ever handed to
- * `draftFromAddress`, which must not ask for one. It is also the only way to
- * put an absent or a broken address in front of that function's own checks,
- * because the real constructors refuse such an address before it gets there.
+ * (D-17): the password reader refuses it. Two uses. Handed to a write helper,
+ * it must be refused with nothing written. Handed to `draftFromAddress`, which
+ * must not ask for a password, it is the only way to put an absent or a broken
+ * address in front of that function's own checks, because the real
+ * constructors refuse such an address before it gets there.
  */
 function lookAlike(appleId: string | undefined): Principal {
   return { userId: "0".repeat(64), appleId } as unknown as Principal;

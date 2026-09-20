@@ -1202,6 +1202,141 @@ describe("the UIDVALIDITY gate (MAIL-06, T-02-12)", () => {
   });
 });
 
+// This project carries no Node type package and a Workers isolate has no
+// filesystem, so the source is read with Vite's build-time glob, as
+// `test/dav-home-containment.test.ts` does. The one suppression is proven
+// non-vacuous by `tsc` itself, which errors on one that suppresses nothing.
+// @ts-expect-error — Vite's `import.meta.glob` has no ambient declaration here; see above.
+const SERVICE_SOURCE: Record<string, string> = import.meta.glob(
+  "../src/mail/service.ts",
+  { query: "?raw", import: "default", eager: true },
+);
+
+/** Drop block comments and line comments, so prose cannot count as code. */
+function withoutComments(text: string): string {
+  return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+}
+
+/**
+ * The code of one function, from its `function` keyword up to `marker`.
+ *
+ * Comments are dropped BEFORE the marker is looked for. A comment that names
+ * the marker would otherwise end the span early and hide an await behind it.
+ * Null when the function or the marker is not there, so a rename turns the
+ * test red rather than letting it pass on an empty span.
+ */
+function spanAheadOf(
+  source: string,
+  functionName: string,
+  marker: string,
+): string | null {
+  const start = source.search(new RegExp(`\\bfunction\\s+${functionName}\\b`));
+  if (start === -1) return null;
+  const code = withoutComments(source.slice(start));
+  const end = code.indexOf(marker);
+  return end === -1 ? null : code.slice(0, end);
+}
+
+/** Whether anything awaits in that span. Null means the span was not found. */
+function awaitsAheadOf(
+  source: string,
+  functionName: string,
+  marker: string,
+): boolean | null {
+  const span = spanAheadOf(source, functionName, marker);
+  return span === null ? null : /\bawait\b/.test(span);
+}
+
+// What this guards: the socket cap for a legacy batch. Part (c) of the long
+// comment in `src/mcp/api-handler.ts` records that two tool calls in one legacy
+// JSON-RPC batch share ONE server, so they share one gate and one principal.
+// The gate check and the acquire are atomic only because nothing awaits
+// between them. An await ahead of the socket open would let both calls pass
+// the check, and both would open a socket. Nothing in the suite sends a real
+// batch, so this text guard and the shared-gate test below are what hold it.
+// The principal is awaited in the tool callback for exactly this reason
+// (Phase 9 D-27).
+describe("nothing awaits ahead of the gate", () => {
+  const source = Object.values(SERVICE_SOURCE)[0] ?? "";
+
+  it("loaded the real source, not an empty string", () => {
+    expect(Object.keys(SERVICE_SOURCE)).toHaveLength(1);
+    expect(source.length).toBeGreaterThan(10_000);
+  });
+
+  it("withMailSession holds no await ahead of the call that opens the socket", () => {
+    const span = spanAheadOf(source, "withMailSession", "connectImap(");
+
+    // Non-vacuity: this is the right function, and the span is real code.
+    expect(span).not.toBeNull();
+    expect(span).toContain("gate.held");
+    expect(span).toContain("principal: Principal");
+    expect(awaitsAheadOf(source, "withMailSession", "connectImap(")).toBe(false);
+  });
+
+  it("withMailSessionOver holds no await ahead of gate.acquire()", () => {
+    const span = spanAheadOf(source, "withMailSessionOver", "gate.acquire(");
+
+    expect(span).not.toBeNull();
+    expect(span).toContain("duplex: DuplexLike");
+    expect(span).toContain("principal: Principal");
+    expect(awaitsAheadOf(source, "withMailSessionOver", "gate.acquire(")).toBe(
+      false,
+    );
+  });
+
+  it("does not mistake the longer name for the shorter one", () => {
+    // `withMailSession` is a prefix of `withMailSessionOver`. The span for the
+    // shorter name must be the socket wrapper, which takes no duplex.
+    expect(spanAheadOf(source, "withMailSession", "connectImap(")).not.toContain(
+      "duplex: DuplexLike",
+    );
+  });
+
+  describe("the matcher can see an await (the control)", () => {
+    const madeUp = [
+      "export async function madeUp(principal, gate) {",
+      "  if (gate.held) throw new Error();",
+      "  const who = await principal;",
+      "  const sock = connectImap();",
+      "  return [who, sock];",
+      "}",
+    ].join("\n");
+
+    it("says yes for a made-up function with an await ahead of the socket call", () => {
+      expect(awaitsAheadOf(madeUp, "madeUp", "connectImap(")).toBe(true);
+    });
+
+    it("says no when the only await comes after the socket call", () => {
+      const after = madeUp
+        .replace("  const who = await principal;\n", "")
+        .replace("return [who, sock]", "return await sock");
+      expect(awaitsAheadOf(after, "madeUp", "connectImap(")).toBe(false);
+    });
+
+    it("says no when the word only appears in a comment", () => {
+      const commented = madeUp.replace(
+        "  const who = await principal;",
+        "  // never await principal here\n  /* await nothing */",
+      );
+      expect(awaitsAheadOf(commented, "madeUp", "connectImap(")).toBe(false);
+    });
+
+    it("is not fooled by a comment that names the marker early", () => {
+      const early = madeUp.replace(
+        "  if (gate.held)",
+        "  // connectImap() comes later\n  if (gate.held)",
+      );
+      expect(awaitsAheadOf(early, "madeUp", "connectImap(")).toBe(true);
+    });
+
+    it("says null, not no, when the function or the marker is missing", () => {
+      expect(awaitsAheadOf(madeUp, "notThere", "connectImap(")).toBeNull();
+      expect(awaitsAheadOf(madeUp, "madeUp", "notThere(")).toBeNull();
+    });
+  });
+});
+
 describe("the session gate is request-scoped (D-46)", () => {
   it("refuses a SECOND session against ONE gate, loudly", async () => {
     // A fan-out inside one request. Production allows six simultaneous
@@ -1214,11 +1349,17 @@ describe("the session gate is request-scoped (D-46)", () => {
       releaseFirst = resolve;
     });
 
+    // ONE principal too, the very same object for both callers. That is what
+    // two tool calls in one legacy batch have: one server, so one gate and one
+    // promise of the principal, which resolves to one object.
+    const shared = principal;
+    const firstDuplex = happyPathDuplex();
+
     // The gate is acquired synchronously at the top of the call, before any
     // await, so it is already held by the time the next line runs.
     const first = withMailSessionOver(
-      happyPathDuplex(),
-      principal,
+      firstDuplex,
+      shared,
       gate,
       MAILBOX,
       null,
@@ -1233,7 +1374,7 @@ describe("the session gate is request-scoped (D-46)", () => {
     await expect(
       withMailSessionOver(
         secondDuplex,
-        principal,
+        shared,
         gate,
         MAILBOX,
         null,
@@ -1248,6 +1389,15 @@ describe("the session gate is request-scoped (D-46)", () => {
 
     releaseFirst();
     await expect(first).resolves.toBe("first");
+
+    // The first caller logged in exactly once, and the refused one never did.
+    // Only a COUNT is asserted. The login line carries the pool's ambient
+    // credential, and a failed length check on the lines themselves would
+    // print them.
+    const loginLines = (lines: string[]): number =>
+      lines.filter((line) => /^\S+ LOGIN /.test(line)).length;
+    expect(loginLines(firstDuplex.writtenLines())).toBe(1);
+    expect(loginLines(secondDuplex.writtenLines())).toBe(0);
   });
 
   it("lets TWO gates each run a session, because two requests are not a fan-out", async () => {

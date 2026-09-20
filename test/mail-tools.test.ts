@@ -12,7 +12,7 @@
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
   ImapAuthError,
@@ -1018,7 +1018,11 @@ describe("the registrations themselves", () => {
     };
     // The callbacks are recorded and never invoked, so nothing here opens a
     // socket or reads a credential.
-    registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
+    registerMailTools(
+      server as unknown as McpServer,
+      createSessionGate(),
+      ownerPrincipal(),
+    );
     return recorded;
   }
 
@@ -1619,7 +1623,11 @@ describe("the search and unread registrations", () => {
         recorded.push({ name, options });
       },
     };
-    registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
+    registerMailTools(
+      server as unknown as McpServer,
+      createSessionGate(),
+      ownerPrincipal(),
+    );
     return recorded;
   }
 
@@ -2028,7 +2036,11 @@ describe("the compose registration", () => {
         recorded.push({ name, options });
       },
     };
-    registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
+    registerMailTools(
+      server as unknown as McpServer,
+      createSessionGate(),
+      ownerPrincipal(),
+    );
     return recorded;
   }
 
@@ -2261,7 +2273,11 @@ describe("the reply registration", () => {
         recorded.push({ name, options });
       },
     };
-    registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
+    registerMailTools(
+      server as unknown as McpServer,
+      createSessionGate(),
+      ownerPrincipal(),
+    );
     return recorded;
   }
 
@@ -2901,7 +2917,11 @@ describe("the mail_get_attachment registration", () => {
         recorded.push({ name, options });
       },
     };
-    registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
+    registerMailTools(
+      server as unknown as McpServer,
+      createSessionGate(),
+      ownerPrincipal(),
+    );
     return recorded;
   }
 
@@ -3056,7 +3076,11 @@ describe("the mail_stage_attachment registration", () => {
         recorded.push({ name, options });
       },
     };
-    registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
+    registerMailTools(
+      server as unknown as McpServer,
+      createSessionGate(),
+      ownerPrincipal(),
+    );
     return recorded;
   }
 
@@ -3332,7 +3356,11 @@ describe("the mail_confirm_upload registration", () => {
         recorded.push({ name, options });
       },
     };
-    registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
+    registerMailTools(
+      server as unknown as McpServer,
+      createSessionGate(),
+      ownerPrincipal(),
+    );
     return recorded;
   }
 
@@ -3396,5 +3424,77 @@ describe("the mail_confirm_upload registration", () => {
 
     expect(described).toContain("own size is what actually decides");
     expect(described).toContain("deleted");
+  });
+});
+
+// Phase 9 D-09 and D-27. The promise of the principal is awaited as the first
+// line of every callback's try. When it rejects, the tool answers auth_failed
+// and nothing below it runs: the gate is never touched, so no socket opens. An
+// unset Worker secret is exactly this case, because the env constructor rejects
+// with the auth error.
+describe("a principal that was refused opens nothing", () => {
+  type Callback = (args: Record<string, unknown>) => Promise<{
+    isError?: boolean;
+    content: { type: string; text: string }[];
+  }>;
+
+  /** Register against a rejected promise, with a spy on the gate. */
+  function refusedTools() {
+    const rejected: Promise<never> = Promise.reject(new ImapAuthError());
+    // Straight away, before anything else can run: a rejected promise nobody
+    // listens to is reported as unhandled. Each callback still awaits
+    // `rejected` itself and still sees the refusal.
+    rejected.catch(() => {});
+
+    const gate = createSessionGate();
+    const acquire = vi.spyOn(gate, "acquire");
+    const callbacks = new Map<string, Callback>();
+    const server = {
+      registerTool(
+        name: string,
+        _options: Record<string, unknown>,
+        callback: Callback,
+      ) {
+        callbacks.set(name, callback);
+      },
+    };
+    registerMailTools(server as unknown as McpServer, gate, rejected);
+    return { gate, acquire, callbacks };
+  }
+
+  it("registers all ten tools, so the table below leaves none out", () => {
+    expect(refusedTools().callbacks.size).toBe(10);
+  });
+
+  it("mail_list_folders answers auth_failed with the fixed message and never acquires the gate", async () => {
+    const { gate, acquire, callbacks } = refusedTools();
+
+    const result = await callbacks.get("mail_list_folders")!({});
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0]!.text)).toEqual({
+      category: "auth_failed",
+      message: SAFE_MESSAGES.auth_failed,
+    });
+    expect(acquire).not.toHaveBeenCalled();
+    expect(gate.held).toBe(false);
+  });
+
+  it("every mail tool does the same, whatever its arguments would have been", async () => {
+    // Empty arguments on purpose. A callback that looked at them first would
+    // answer not_found for a missing id, or throw. auth_failed for all ten
+    // means the await really is ahead of everything else in the try, the
+    // storage-only tool included.
+    const { gate, acquire, callbacks } = refusedTools();
+
+    for (const [name, callback] of callbacks) {
+      const result = await callback({});
+      const body = JSON.parse(result.content[0]!.text) as { category: string };
+
+      expect(result.isError, name).toBe(true);
+      expect(body.category, name).toBe("auth_failed");
+    }
+    expect(acquire).not.toHaveBeenCalled();
+    expect(gate.held).toBe(false);
   });
 });
