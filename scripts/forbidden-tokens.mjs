@@ -88,16 +88,36 @@ export const FORBIDDEN = [
   // names match as whole identifiers, with a word boundary on each side and no
   // case-insensitive flag, so a longer identifier that merely starts with one
   // is not caught. The rule below it for the props object is the wider net.
+  //
+  // Phase 9 (D-02). THE METHOD PART MATCHES ANY IDENTIFIER, IN ANY LETTER CASE.
+  // It used to be lower-case letters only, so a timed-log or collapsed-group
+  // call that passed a secret fired nothing here. The method is now any
+  // identifier, with white space allowed before the parenthesis. Only the
+  // method part changed: the span and the name list are what they were.
+  //
+  // WHAT THE METHOD PART STILL DOES NOT SEE. A computed member on the console
+  // object, where the method name is a string in square brackets. A method
+  // pulled out by destructuring and then called bare. An alias of the console
+  // object, called through its new name. The optional-call form, where a
+  // question mark and a dot sit between the method and the parenthesis. A
+  // logger that is not named by either of the two words the pattern opens
+  // with. All five are evasions rather than accidents, and this rule is aimed
+  // at the accident. They are pinned by a test row that asserts the rule does
+  // NOT fire on them, so nobody believes they are covered.
   {
     id: "secret-binding-in-log-call",
     pattern:
-      /\b(?:console|logger)\.[a-z]+\([^)]*\b(?:APPLE_APP_PASSWORD|APPLE_ID|AUTH_SECRET|appPassword|appleId)\b/g,
+      /\b(?:console|logger)\.[A-Za-z_$][\w$]*\s*\([^)]*\b(?:APPLE_APP_PASSWORD|APPLE_ID|AUTH_SECRET|appPassword|appleId)\b/g,
     why: "A logging call whose arguments mention a secret binding name, or one of the two credential field names the grant's props carry. A log line naming either field leaks the Apple ID or the app-specific password. Credentials must never reach a log, an error, or a tool response.",
   },
+  // Phase 9 (D-02). Widened together with the blanket src/ rule below, so the
+  // two cannot drift: both listed the same six method names, and both now
+  // match any method. D-02 does not name this rule. It had the same gap, the
+  // same fix closes it, and it only refuses more.
   {
     id: "logging-on-the-credential-path",
     scope: "src/mail/",
-    pattern: /\b(?:console|logger)\.(?:log|info|warn|error|debug|trace)\s*\(/g,
+    pattern: /\b(?:console|logger)\.[A-Za-z_$][\w$]*\s*\(/g,
     why: "No logging call of any kind may exist under src/mail/. The LOGIN command line is itself the credential, so a 'log what I am about to write' line leaks it with no secret-named variable anywhere in sight.",
   },
   // The two rules above do not compose to cover Convention 4's stated rule, and
@@ -107,18 +127,48 @@ export const FORBIDDEN = [
   // passes the whole environment object matches neither -- and that object holds
   // every secret this Worker has. These two close it, and the second is
   // deliberately unscoped so it reaches scripts/ and test/ as well.
+  //
+  // Phase 9 (D-02). THE METHOD PART MATCHES ANY IDENTIFIER, IN ANY LETTER CASE.
+  // It used to list six method names. "No logging call of any kind" was the
+  // rule's own claim, and the list did not hold it: a table or dir call was
+  // free to log under src/, and so was a timed-log or collapsed-group call
+  // that passed the grant's props, which fired nothing anywhere. The method is
+  // now any identifier. This landed before the first code under src/ held a
+  // principal, on purpose.
+  //
+  // WHAT IT STILL DOES NOT SEE. A computed member on the console object, where
+  // the method name is a string in square brackets. A method pulled out by
+  // destructuring and then called bare. An alias of the console object, called
+  // through its new name. The optional-call form, where a question mark and a
+  // dot sit between the method and the parenthesis. A logger that is not named
+  // by either of the two words the pattern opens with. All five are evasions
+  // rather than accidents. Naming them here is what stops a later reader
+  // believing "no logging under src/" is proven by this rule alone. They are
+  // pinned by a test row that asserts the rule does NOT fire on them.
   {
     id: "logging-anywhere-under-src",
     scope: "src/",
-    pattern: /\b(?:console|logger)\.(?:log|info|warn|error|debug|trace)\s*\(/g,
+    pattern: /\b(?:console|logger)\.[A-Za-z_$][\w$]*\s*\(/g,
     why: "No logging call of any kind may exist under src/, not only under src/mail/. The environment binding carries AUTH_SECRET, the Apple ID, and the app-specific password, so one debug line that passes it names no secret and leaks all three -- and observability logging is enabled, so 'a log' means retained Cloudflare storage, not a terminal.",
   },
   {
     // No `scope`, on purpose: this one holds in every scanned directory. A
     // throwaway script or a test helper that prints the environment leaks the
     // same three values as a Worker that does.
+    //
+    // Phase 9 (D-24). THE METHOD PART MATCHES ANY IDENTIFIER, IN ANY LETTER
+    // CASE. It used to be lower-case letters only, the same gap the two name
+    // rules beside it had, so a timed-log or collapsed-group call that passed
+    // the environment object fired nothing outside src/. Only the method part
+    // changed: the span is what it was.
+    //
+    // WHAT THE METHOD PART STILL DOES NOT SEE. A computed member on the console
+    // object. A method pulled out by destructuring. An alias of the console
+    // object. The optional-call form. A logger that is not named by either of
+    // the two words the pattern opens with. The comment above the first rule
+    // in this section spells each one out, and a test row pins all five.
     id: "env-object-in-log-call",
-    pattern: /\b(?:console|logger)\.[a-z]+\([^)]*\benv\b/g,
+    pattern: /\b(?:console|logger)\.[A-Za-z_$][\w$]*\s*\([^)]*\benv\b/g,
     why: "A logging call whose arguments mention the bare environment object. It carries APPLE_ID and APPLE_APP_PASSWORD, so nothing needs to name a secret for the credentials to reach the log -- which is exactly the shape the secret-binding rule cannot see.",
   },
   // Phase 8, CRED-05 (D-07). The rule above, moved to where the credentials
@@ -170,13 +220,29 @@ export const FORBIDDEN = [
   // Under src/ the question does not come up, because every logging call there
   // is refused anyway. The over-match is pinned by test rows that assert the
   // rule DOES fire on those lines, so a later "fix" that narrows it goes red.
+  //
+  // Phase 9 (D-02). THE METHOD PART MATCHES ANY IDENTIFIER, IN ANY LETTER CASE.
+  // It used to be lower-case letters only, so a timed-log or collapsed-group
+  // call that passed the props fired nothing here, and nothing anywhere else
+  // either. That was the gap closed before the first caller of the principal
+  // landed. Only the method part changed: the statement-bounded span and the
+  // five names are what they were.
+  //
+  // WHAT THE METHOD PART STILL DOES NOT SEE, added to the list above. A
+  // computed member on the console object, where the method name is a string
+  // in square brackets. A method pulled out by destructuring and then called
+  // bare. An alias of the console object, called through its new name. The
+  // optional-call form, where a question mark and a dot sit between the method
+  // and the parenthesis. A logger that is not named by either of the two
+  // words the pattern opens with. All five are pinned by a test row that
+  // asserts the rule does NOT fire on them.
   {
     // No `scope`, on purpose: this one holds in every scanned directory. A
     // throwaway script or a test helper that prints the grant's props leaks the
     // same two values as a Worker that does.
     id: "props-object-in-log-call",
     pattern:
-      /\b(?:console|logger)\.[a-z]+\s*\([^;]{0,400}?\b(?:props|principal|authInfo|getMcpAuthContext|passwordOf)\b/g,
+      /\b(?:console|logger)\.[A-Za-z_$][\w$]*\s*\([^;]{0,400}?\b(?:props|principal|authInfo|getMcpAuthContext|passwordOf)\b/g,
     why: "A logging call whose arguments mention the grant's props, the principal, the auth info, the auth context reader or the password reader. The grant's props carry the Apple ID and the app-specific password, so a log line that passes them names no secret and leaks both -- and observability logging is enabled, so 'a log' means retained Cloudflare storage, not a terminal. The rule reads text, so it also fires when one of those names is only a word inside the message string or a comment, or sits in the next statement after a logging call with no semicolon. If that is what happened, reword the message or add the semicolon. Do not loosen this rule.",
   },
 

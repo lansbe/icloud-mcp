@@ -949,6 +949,252 @@ describe("the patterns have teeth", () => {
     ).toBeGreaterThan(0);
   });
 
+  // ------------------------------- any logging method, in any letter case
+  // Phase 9 (D-02, D-24). Until this phase the three name rules matched the
+  // method as lower-case letters only, and the two blanket rules listed six
+  // method names. So a timed-log or collapsed-group call that passed the
+  // grant's props fired NO rule, under src/ included. All five now match any
+  // identifier as the method. Same four-part shape as the blocks above: a
+  // hand-written list, a per-item loop, a control, and a set-equality.
+  //
+  // `violatingSamples` holds ONE sample per rule id and is set-equal to the
+  // rule ids, so a mixed-case line cannot be a new key there. These rows are
+  // where the widening is proven instead.
+
+  /** Real console methods with a capital letter in them. Hand-written. Every
+   *  one is a line a contributor would really type while timing or grouping
+   *  debug output, and every one was invisible to all five rules before. */
+  const MIXED_CASE_LOG_METHODS = [
+    "timeLog",
+    "groupCollapsed",
+    "countReset",
+    "timeEnd",
+    "timeStamp",
+    "groupEnd",
+  ];
+
+  /** Real console methods that are all lower-case but were on neither blanket
+   *  rule's six-name list. The name rules already saw these; the two blanket
+   *  rules did not, so under src/ a table or dir call was free to log. */
+  const UNLISTED_LOG_METHODS = ["table", "dir", "dirxml", "assert", "group", "count"];
+
+  /** The five rules whose method part was widened. Hand-written, and compared
+   *  below with what the shipped list actually holds. */
+  const WIDENED_LOG_RULE_IDS = [
+    "secret-binding-in-log-call",
+    "logging-on-the-credential-path",
+    "logging-anywhere-under-src",
+    "env-object-in-log-call",
+    "props-object-in-log-call",
+  ];
+
+  /** Each widened rule's pattern AS IT WAS at the phase base, typed out. This
+   *  is the control: a row only proves the widening if the old text misses the
+   *  same line. Never derive these from the shipped rules. */
+  const OLD_LOG_PATTERNS: Record<string, RegExp> = {
+    "secret-binding-in-log-call":
+      /\b(?:console|logger)\.[a-z]+\([^)]*\b(?:APPLE_APP_PASSWORD|APPLE_ID|AUTH_SECRET|appPassword|appleId)\b/g,
+    "logging-on-the-credential-path":
+      /\b(?:console|logger)\.(?:log|info|warn|error|debug|trace)\s*\(/g,
+    "logging-anywhere-under-src":
+      /\b(?:console|logger)\.(?:log|info|warn|error|debug|trace)\s*\(/g,
+    "env-object-in-log-call": /\b(?:console|logger)\.[a-z]+\([^)]*\benv\b/g,
+    "props-object-in-log-call":
+      /\b(?:console|logger)\.[a-z]+\s*\([^;]{0,400}?\b(?:props|principal|authInfo|getMcpAuthContext|passwordOf)\b/g,
+  };
+
+  /** A path inside each rule's reach. The two scoped rules only fire under
+   *  their prefix, so they are driven through the real scope mechanism. The
+   *  three unscoped ones are given a test path, to show they hold there too. */
+  const LOG_RULE_PROBE_PATHS: Record<string, string> = {
+    "secret-binding-in-log-call": "test/probe.test.ts",
+    "logging-on-the-credential-path": "src/mail/probe.ts",
+    "logging-anywhere-under-src": "src/mcp/probe.ts",
+    "env-object-in-log-call": "test/probe.test.ts",
+    "props-object-in-log-call": "test/probe.test.ts",
+  };
+
+  /** The logging line each rule needs, with the method substituted in.
+   *
+   *  Each line carries ONLY what its own rule looks for, so a row cannot pass
+   *  because a neighbouring rule's trigger happens to be on the same line. */
+  const logLineFor = (ruleId: string, method: string): string => {
+    switch (ruleId) {
+      case "secret-binding-in-log-call":
+        return `console.${method}("sending", holder.APPLE_APP_PASSWORD);`;
+      case "env-object-in-log-call":
+        return `console.${method}("diagnose", env);`;
+      case "props-object-in-log-call":
+        return `console.${method}("grant reached the handler", ctx.props);`;
+      case "logging-on-the-credential-path":
+      case "logging-anywhere-under-src":
+        return `console.${method}("handler reached");`;
+      default:
+        throw new Error(`no logging line is defined for ${ruleId}`);
+    }
+  };
+
+  const hitsOf = (ruleId: string, path: string, line: string): number => {
+    const rule = FORBIDDEN.find((r) => r.id === ruleId)!;
+    return matchRule(rule, FORBIDDEN.indexOf(rule), path, line).length;
+  };
+
+  it("fires every widened logging rule on a mixed-case console method", () => {
+    // The gap this phase closes first. Before it, every line here fired no
+    // rule at all. If this goes red, a method part was narrowed back.
+    expect(MIXED_CASE_LOG_METHODS.length).toBeGreaterThanOrEqual(6);
+    for (const method of MIXED_CASE_LOG_METHODS) {
+      expect(method, `${method} holds no capital, so it is not a mixed-case row`).toMatch(/[A-Z]/);
+      for (const id of WIDENED_LOG_RULE_IDS) {
+        expect(
+          hitsOf(id, LOG_RULE_PROBE_PATHS[id], logLineFor(id, method)),
+          `${id} did not fire on the ${method} method`,
+        ).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it("misses every mixed-case line with the old pattern text, so the rows above have teeth", () => {
+    // Guards the guard. If the old text matched these lines too, the rows
+    // above would pass with the widening reverted and would prove nothing.
+    for (const method of MIXED_CASE_LOG_METHODS) {
+      for (const id of WIDENED_LOG_RULE_IDS) {
+        const old = OLD_LOG_PATTERNS[id];
+        const fresh = new RegExp(old.source, old.flags);
+        expect(
+          fresh.test(logLineFor(id, method)),
+          `the old ${id} pattern already saw the ${method} method: the line no longer discriminates`,
+        ).toBe(false);
+      }
+    }
+  });
+
+  it("fires both blanket rules on a lower-case method the old six-name list left out", () => {
+    // The blanket rules' own gap, and a different one from letter case: the
+    // method is all lower-case and simply was not one of the six. The old text
+    // misses the same line, which is what makes the row mean something.
+    expect(UNLISTED_LOG_METHODS.length).toBeGreaterThanOrEqual(6);
+    for (const method of UNLISTED_LOG_METHODS) {
+      expect(method, `${method} is not all lower-case`).toMatch(/^[a-z]+$/);
+      for (const id of ["logging-on-the-credential-path", "logging-anywhere-under-src"]) {
+        const line = logLineFor(id, method);
+        expect(
+          hitsOf(id, LOG_RULE_PROBE_PATHS[id], line),
+          `${id} did not fire on the ${method} method`,
+        ).toBeGreaterThan(0);
+
+        const old = OLD_LOG_PATTERNS[id];
+        const fresh = new RegExp(old.source, old.flags);
+        expect(
+          fresh.test(line),
+          `the old six-name list already held ${method}: the line no longer discriminates`,
+        ).toBe(false);
+      }
+    }
+  });
+
+  it("types out old patterns that really were the rules, and the new ones still see the old samples", () => {
+    // Two controls in one. A mistyped entry in OLD_LOG_PATTERNS would miss
+    // every line, and the "old text misses it" tests above would pass for the
+    // wrong reason. So each old pattern must FIRE on its rule's standing
+    // sample. And the widened rule must fire on it too: only refuses more.
+    for (const id of WIDENED_LOG_RULE_IDS) {
+      const sample = violatingSamples[id];
+      const old = OLD_LOG_PATTERNS[id];
+      expect(
+        new RegExp(old.source, old.flags).test(sample),
+        `the typed-out old pattern for ${id} misses the rule's own sample, so it is not the old rule`,
+      ).toBe(true);
+      const rule = FORBIDDEN.find((r) => r.id === id)!;
+      expect(
+        new RegExp(rule.pattern.source, rule.pattern.flags).test(sample),
+        `${id} lost its standing sample when it was widened`,
+      ).toBe(true);
+    }
+  });
+
+  it("keeps the two scoped logging rules inside their scope", () => {
+    // Widening the method must not widen the reach. The same mixed-case line
+    // in a test file fires neither scoped rule, and the credential-path rule
+    // stays out of the rest of src/.
+    for (const method of [...MIXED_CASE_LOG_METHODS, ...UNLISTED_LOG_METHODS]) {
+      for (const id of ["logging-on-the-credential-path", "logging-anywhere-under-src"]) {
+        expect(
+          hitsOf(id, "test/probe.test.ts", logLineFor(id, method)),
+          `${id} fired on a test file through the ${method} method`,
+        ).toBe(0);
+      }
+      expect(
+        hitsOf(
+          "logging-on-the-credential-path",
+          "src/mcp/probe.ts",
+          logLineFor("logging-on-the-credential-path", method),
+        ),
+        "the src/mail/ rule fired outside src/mail/",
+      ).toBe(0);
+    }
+  });
+
+  it("covers every rule that opens with the console-or-logger group, with nothing left over", () => {
+    // The other direction. A sixth logging rule added later without rows here
+    // would be unproven against letter case and would look exactly like a
+    // proven one. The list is hand-written; only the comparand is read from
+    // the shipped rules.
+    const opensWithLoggerGroup = FORBIDDEN.filter((rule) =>
+      rule.pattern.source.startsWith("\\b(?:console|logger)"),
+    ).map((rule) => rule.id);
+    const asserted = [...WIDENED_LOG_RULE_IDS].sort();
+    expect(new Set(asserted).size, "a rule id is listed twice").toBe(asserted.length);
+    expect(opensWithLoggerGroup.sort()).toEqual(asserted);
+    expect(Object.keys(OLD_LOG_PATTERNS).sort()).toEqual(asserted);
+    expect(Object.keys(LOG_RULE_PROBE_PATHS).sort()).toEqual(asserted);
+  });
+
+  it("still cannot see the five evasions the rule comments list, and says so", () => {
+    // Pins the known limits so nobody believes they are covered. Every line
+    // here passes the grant's props to a log and fires NO widened rule, under
+    // src/ included. They are evasions rather than accidents, and the rules
+    // are aimed at the accident. If one of these starts firing, a rule got
+    // better: move the row out of this list and update the rule's comment.
+    const evasions: ReadonlyArray<readonly [string, string]> = [
+      ["a computed member on the console object", 'console["timeLog"]("grant", ctx.props);'],
+      ["a method pulled out by destructuring", 'const { timeLog } = console;\ntimeLog("grant", ctx.props);'],
+      ["an alias of the console object", 'const out = console;\nout.timeLog("grant", ctx.props);'],
+      ["the optional-call form", 'console.timeLog?.("grant", ctx.props);'],
+      ["a logger under another name", 'pino.info("grant", ctx.props);'],
+    ];
+    expect(evasions.length).toBe(5);
+    for (const [shape, line] of evasions) {
+      for (const id of WIDENED_LOG_RULE_IDS) {
+        expect(
+          hitsOf(id, LOG_RULE_PROBE_PATHS[id], line),
+          `${id} now sees ${shape}; move this row and update the rule's comment`,
+        ).toBe(0);
+      }
+    }
+  });
+
+  it("runs each widened logging pattern in linear time on a long method name with no call", () => {
+    // The new method part is a run of word characters followed by an optional
+    // white-space run and a parenthesis. With no parenthesis anywhere, the run
+    // has to be given back one character at a time. That is linear, and this
+    // holds it there: the sizes climb, so a regression fails early with a
+    // message rather than hanging on the longest line.
+    const BOUND_MS = 500;
+    for (const id of WIDENED_LOG_RULE_IDS) {
+      const rule = FORBIDDEN.find((r) => r.id === id)!;
+      for (const length of [1_000, 10_000, 100_000, 1_000_000]) {
+        const line = `console.${"aB_$9".repeat(length / 5)} ;`;
+        const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+        const started = performance.now();
+        const hit = fresh.test(line);
+        const ms = performance.now() - started;
+        expect(hit, `${id} fired on a member read that is not a call`).toBe(false);
+        expect(ms, `${id} took ${ms.toFixed(0)} ms on ${length} characters`).toBeLessThan(BOUND_MS);
+      }
+    }
+  });
+
   // -------------------------------------------- writes onto the env object
   // Phase 8, CRED-05 (D-09). This rule has no name list: the last non-capturing
   // group in its source is the dotted prefix inside the merge arm, so
