@@ -368,8 +368,16 @@ export function sanitiseFilename(name: string): string | null {
  * **This function is no longer deterministic, and that is the point.** Two calls
  * with identical arguments return different keys. A test asserting equality
  * across two calls would be asserting the collision.
+ *
+ * `userId` is the signed-in user's id, and it LEADS the parameter list for
+ * `underStagingPrefix`'s reason — see that function. It is accepted and unread
+ * here; plan 10-03 is what builds the user segment from it.
  */
-export function stagingKeyFor(filename: string, nowMs: number): string | null {
+export function stagingKeyFor(
+  userId: string,
+  filename: string,
+  nowMs: number,
+): string | null {
   if (!Number.isSafeInteger(nowMs) || nowMs <= 0) return null;
 
   const safe = sanitiseFilename(filename);
@@ -410,8 +418,20 @@ export function stagingKeyFor(filename: string, nowMs: number): string | null {
  *
  * Returns rather than throws, because both callers already have a "there is
  * nothing there" answer that says exactly the right thing.
+ *
+ * **`userId` comes BEFORE `key`, and the order is the guard rather than a
+ * style.** They are two adjacent strings, so a call site can transpose them and
+ * the typecheck cannot see it. Placing the id first makes every signature in
+ * both staging modules read the same way round, which is the property a reader
+ * can check at a glance. What CATCHES a transposition is plan 10-03's shape
+ * test: once this checker requires the id to be 64 hex characters, a key handed
+ * where an id belongs is refused the first time it happens, at runtime.
+ *
+ * `userId` is accepted and unread in this commit. Plan 10-03 is what reads it.
+ * That is deliberate: this commit changes no check body, which is what makes
+ * its claim to change no behaviour provable rather than asserted.
  */
-function underStagingPrefix(key: string): boolean {
+function underStagingPrefix(userId: string, key: string): boolean {
   return (
     typeof key === "string" &&
     key.startsWith(STAGING_PREFIX) &&
@@ -598,6 +618,7 @@ function metadataValueOf(
  */
 export async function putStaged(
   env: Env,
+  userId: string,
   request: StageRequest,
 ): Promise<StageResult> {
   const sizeBytes = request.bytes.byteLength;
@@ -611,7 +632,7 @@ export async function putStaged(
     return { staged: false, refusal: "too-large", sizeBytes, limitBytes };
   }
 
-  const key = stagingKeyFor(request.filename, request.nowMs);
+  const key = stagingKeyFor(userId, request.filename, request.nowMs);
   const storedFilename = metadataValue(request.filename);
   const storedType = metadataValue(request.mimeType);
   if (key === null || storedFilename === null || storedType === null) {
@@ -654,9 +675,10 @@ export async function putStaged(
  */
 export async function getStaged(
   env: Env,
+  userId: string,
   key: string,
 ): Promise<StagedObject | null> {
-  if (!underStagingPrefix(key)) return null;
+  if (!underStagingPrefix(userId, key)) return null;
 
   const object = await env.ATTACHMENT_STAGING.get(key);
   if (object === null) return null;
@@ -700,9 +722,10 @@ export async function getStaged(
  */
 export async function headStaged(
   env: Env,
+  userId: string,
   key: string,
 ): Promise<StagedHead | null> {
-  if (!underStagingPrefix(key)) return null;
+  if (!underStagingPrefix(userId, key)) return null;
 
   const object = await env.ATTACHMENT_STAGING.head(key);
   if (object === null) return null;
@@ -729,7 +752,11 @@ export async function headStaged(
  *
  * A key outside the prefix is a silent no-op for `getStaged`'s reason.
  */
-export async function deleteStaged(env: Env, key: string): Promise<void> {
-  if (!underStagingPrefix(key)) return;
+export async function deleteStaged(
+  env: Env,
+  userId: string,
+  key: string,
+): Promise<void> {
+  if (!underStagingPrefix(userId, key)) return;
   await env.ATTACHMENT_STAGING.delete(key);
 }

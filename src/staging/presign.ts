@@ -184,8 +184,21 @@ function assertNoIllegalCharacters(value: string): void {
  * guards a READ, where "there is nothing there" is both true and the right
  * answer; this guards the construction of a capability, where there is no
  * capability to hand back and silence would be indistinguishable from success.
+ *
+ * **`userId` comes BEFORE `key`, and the order is the guard rather than a
+ * style**, exactly as in `underStagingPrefix` one file over. They are two
+ * adjacent strings, so a call site can transpose them and the typecheck cannot
+ * see it; putting the id first makes every signature in both staging modules
+ * read the same way round. What CATCHES a transposition is plan 10-03's shape
+ * test: once this checker requires the id to be 64 hex characters, a key handed
+ * where an id belongs is refused the first time it happens, at runtime.
+ *
+ * `userId` is accepted and unread in this commit. Plan 10-03 is what reads it.
  */
-function assertGrantableKey(key: string): asserts key is string {
+function assertGrantableKey(
+  userId: string,
+  key: string,
+): asserts key is string {
   if (typeof key !== "string" || !key.startsWith(STAGING_PREFIX)) {
     throw new ImapNotFoundError();
   }
@@ -207,8 +220,15 @@ function assertGrantableKey(key: string): asserts key is string {
  * safe, and there is no untrusted name on this path — every character below is
  * this module's own. Running a sanitiser over a string with no input in it would
  * read as though there were.
+ *
+ * `userId` is the signed-in user's id, and it LEADS the parameter list for
+ * `assertGrantableKey`'s reason — see that function. It is accepted and unread
+ * here; plan 10-03 is what builds the user segment from it.
  */
-export function presignedKeyFor(nowMs: number): string | null {
+export function presignedKeyFor(
+  userId: string,
+  nowMs: number,
+): string | null {
   if (!Number.isSafeInteger(nowMs) || nowMs <= 0) return null;
 
   const random = new Uint8Array(KEY_RANDOM_BYTES);
@@ -300,6 +320,7 @@ export function uploadHeadersFor(request: UploadRequest): Record<string, string>
  */
 export async function mintUploadUrl(
   env: Env,
+  userId: string,
   request: UploadRequest,
 ): Promise<string> {
   const accountId = env.R2_ACCOUNT_ID;
@@ -311,7 +332,7 @@ export async function mintUploadUrl(
   assertProvisioned(accessKeyId);
   assertProvisioned(secretAccessKey);
   assertNoIllegalCharacters(accountId);
-  assertGrantableKey(request.key);
+  assertGrantableKey(userId, request.key);
 
   const headers = uploadHeadersFor(request);
 
@@ -483,12 +504,13 @@ export type ConfirmResult =
  */
 export async function confirmStagedUpload(
   env: Env,
+  userId: string,
   key: string,
   declaredSize: number,
   nowMs: number,
   expiresNoLaterThan: number,
 ): Promise<ConfirmResult> {
-  const object = await headStaged(env, key);
+  const object = await headStaged(env, userId, key);
 
   if (object === null) {
     // The same answer a key outside the prefix gets, and for the same reason the
@@ -513,7 +535,7 @@ export async function confirmStagedUpload(
   const limitBytes = Math.min(declaredSize, MAX_STAGED_FILE_BYTES);
 
   if (sizeBytes > limitBytes) {
-    await deleteStaged(env, key);
+    await deleteStaged(env, userId, key);
     return { staged: false, refusal: "too-large", sizeBytes, limitBytes };
   }
 
@@ -535,7 +557,7 @@ export async function confirmStagedUpload(
   // signature binds an EXACT length rather than a range, so an upload that
   // reaches the bucket at all already agreed to this number. See `mintUploadUrl`.
   if (sizeBytes !== declaredSize) {
-    await deleteStaged(env, key);
+    await deleteStaged(env, userId, key);
     return { staged: false, refusal: "size-mismatch", sizeBytes, limitBytes };
   }
 

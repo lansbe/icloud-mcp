@@ -118,7 +118,7 @@ describe("stagingKeyFor: a legible name that cannot leave its prefix", () => {
     // `resume.pdf` beats seeing a UUID when working out what accumulated. The
     // random segment added on 2026-08-21 LEADS the name rather than replacing
     // it, so that reason survives the collision fix intact.
-    const key = stagingKeyFor("Resume-2026.pdf", NOW);
+    const key = stagingKeyFor(principal.userId, "Resume-2026.pdf", NOW);
 
     expect(key).toMatch(
       new RegExp(`^${STAGING_PREFIX}[0-9a-f]{16}-Resume-2026\\.pdf-${NOW}$`),
@@ -139,13 +139,13 @@ describe("stagingKeyFor: a legible name that cannot leave its prefix", () => {
     // The superseded assertion was `toBe` across two calls with identical
     // arguments — i.e. it asserted determinism, which on this function is
     // exactly the collision. Same arguments, different keys, is the fix.
-    const identicalArguments = stagingKeyFor("note.txt", NOW);
-    expect(identicalArguments).not.toBe(stagingKeyFor("note.txt", NOW));
+    const identicalArguments = stagingKeyFor(principal.userId, "note.txt", NOW);
+    expect(identicalArguments).not.toBe(stagingKeyFor(principal.userId, "note.txt", NOW));
 
     // And the timestamp still moves independently, so neither half is carrying
     // the property alone.
-    expect(stagingKeyFor("note.txt", NOW)).not.toBe(
-      stagingKeyFor("note.txt", NOW + 1),
+    expect(stagingKeyFor(principal.userId, "note.txt", NOW)).not.toBe(
+      stagingKeyFor(principal.userId, "note.txt", NOW + 1),
     );
 
     // A hundred draws with one name and one instant, all distinct. A regression
@@ -153,7 +153,7 @@ describe("stagingKeyFor: a legible name that cannot leave its prefix", () => {
     // would do so silently against the two assertions above only if they were
     // read as being about the timestamp.
     const drawn = new Set(
-      Array.from({ length: 100 }, () => stagingKeyFor("note.txt", NOW)),
+      Array.from({ length: 100 }, () => stagingKeyFor(principal.userId, "note.txt", NOW)),
     );
     expect(drawn.size).toBe(100);
   });
@@ -165,7 +165,7 @@ describe("stagingKeyFor: a legible name that cannot leave its prefix", () => {
     expect(sanitiseFilename("....")).toBeNull();
     expect(sanitiseFilename("-----")).toBeNull();
     expect(sanitiseFilename("")).toBeNull();
-    expect(stagingKeyFor("....", NOW)).toBeNull();
+    expect(stagingKeyFor(principal.userId, "....", NOW)).toBeNull();
   });
 
   it("refuses CR, LF and NUL outright rather than stripping them", () => {
@@ -263,7 +263,7 @@ describe("the adversarial filename corpus", () => {
 
   for (const entry of ADVERSARIAL_NAMES) {
     it(`confines or refuses: ${JSON.stringify(entry.name).slice(0, 48)} — ${entry.why}`, () => {
-      const key = stagingKeyFor(entry.name, NOW);
+      const key = stagingKeyFor(principal.userId, entry.name, NOW);
 
       if (entry.refused) {
         expect(key).toBeNull();
@@ -287,7 +287,7 @@ describe("the adversarial filename corpus", () => {
   }
 
   it("produces a key short enough for the object store, from any length of name", () => {
-    const key = stagingKeyFor(`${"a".repeat(4000)}.pdf`, NOW);
+    const key = stagingKeyFor(principal.userId, `${"a".repeat(4000)}.pdf`, NOW);
 
     expect(key).not.toBeNull();
     expect(ENCODER.encode(key!).byteLength).toBeLessThan(1024);
@@ -317,7 +317,7 @@ describe("the caps and their arithmetic", () => {
   it("refuses over-cap bytes with BOTH numbers, and does not raise", async () => {
     const oversize = new Uint8Array(MAX_STAGED_FILE_BYTES + 1);
 
-    const result = await putStaged(env, {
+    const result = await putStaged(env, principal.userId, {
       bytes: oversize,
       filename: "huge.pdf",
       mimeType: "application/pdf",
@@ -337,7 +337,7 @@ describe("the caps and their arithmetic", () => {
   });
 
   it("refuses an empty payload", async () => {
-    const result = await putStaged(env, {
+    const result = await putStaged(env, principal.userId, {
       bytes: new Uint8Array(0),
       filename: "nothing.pdf",
       mimeType: "application/pdf",
@@ -353,7 +353,7 @@ describe("the caps and their arithmetic", () => {
   });
 
   it("refuses an unusable filename and writes NOTHING", async () => {
-    const result = await putStaged(env, {
+    const result = await putStaged(env, principal.userId, {
       bytes: ENCODER.encode("real bytes"),
       filename: "....",
       mimeType: "text/plain",
@@ -378,7 +378,7 @@ describe("the caps and their arithmetic", () => {
     // it escapes to the tool boundary as an unrecognised class, which is
     // reported to the model as a transient connection failure that is "safe to
     // retry once". The same name fails identically forever.
-    const result = await putStaged(env, {
+    const result = await putStaged(env, principal.userId, {
       bytes: ENCODER.encode("real bytes"),
       filename: JSON.parse('"\\ud800.pdf"') as string,
       mimeType: "text/plain",
@@ -396,7 +396,7 @@ describe("the caps and their arithmetic", () => {
     // The parameter exists so the inline path can be bounded LOWER. Letting it
     // bound HIGHER would make the module's own ceiling advisory, and the caller
     // is one edit away from being wrong about it.
-    const result = await putStaged(env, {
+    const result = await putStaged(env, principal.userId, {
       bytes: new Uint8Array(MAX_STAGED_FILE_BYTES + 1),
       filename: "huge.pdf",
       mimeType: "application/pdf",
@@ -420,7 +420,7 @@ describe("put, get and delete over the real Miniflare binding", () => {
   it("round-trips the exact bytes that were written", async () => {
     const bytes = ENCODER.encode(PAYLOAD);
 
-    const result = await putStaged(env, {
+    const result = await putStaged(env, principal.userId, {
       bytes,
       filename: "Job Description.pdf",
       mimeType: "application/pdf",
@@ -432,7 +432,7 @@ describe("put, get and delete over the real Miniflare binding", () => {
     if (!result.staged) return;
 
     const { key } = decodeStagedId(result.id, NOW);
-    const fetched = await getStaged(env, key);
+    const fetched = await getStaged(env, principal.userId, key);
 
     expect(fetched).not.toBeNull();
     expect(DECODER.decode(fetched!.bytes)).toBe(PAYLOAD);
@@ -443,7 +443,7 @@ describe("put, get and delete over the real Miniflare binding", () => {
     // The key is sanitised; the metadata is not. Both facts matter: the key is
     // what a human reads in a listing, and the original is what the user called
     // the file.
-    const result = await putStaged(env, {
+    const result = await putStaged(env, principal.userId, {
       bytes: ENCODER.encode(PAYLOAD),
       filename: "resumé — final(2).pdf",
       mimeType: "application/pdf",
@@ -454,7 +454,7 @@ describe("put, get and delete over the real Miniflare binding", () => {
     expect(result.staged).toBe(true);
     if (!result.staged) return;
 
-    const fetched = await getStaged(env, decodeStagedId(result.id, NOW).key);
+    const fetched = await getStaged(env, principal.userId, decodeStagedId(result.id, NOW).key);
 
     expect(fetched!.filename).toBe("resumé — final(2).pdf");
     expect(fetched!.mimeType).toBe("application/pdf");
@@ -465,7 +465,7 @@ describe("put, get and delete over the real Miniflare binding", () => {
     // The second place the same untrusted string lands (T-04-08-02), and the
     // easiest to miss: these keys become `x-amz-meta-*` HEADERS on the S3 path.
     // Asserted on what was actually STORED rather than on what was passed in.
-    const result = await putStaged(env, {
+    const result = await putStaged(env, principal.userId, {
       bytes: ENCODER.encode(PAYLOAD),
       filename: "quarterly—report.pdf",
       mimeType: "application/pdf",
@@ -488,11 +488,11 @@ describe("put, get and delete over the real Miniflare binding", () => {
   });
 
   it("returns null for a key that is not there", async () => {
-    expect(await getStaged(env, `${STAGING_PREFIX}absent-1.pdf`)).toBeNull();
+    expect(await getStaged(env, principal.userId, `${STAGING_PREFIX}absent-1.pdf`)).toBeNull();
   });
 
   it("deletes, and a delete of an absent key does not fail", async () => {
-    const result = await putStaged(env, {
+    const result = await putStaged(env, principal.userId, {
       bytes: ENCODER.encode(PAYLOAD),
       filename: "gone.txt",
       mimeType: "text/plain",
@@ -504,15 +504,15 @@ describe("put, get and delete over the real Miniflare binding", () => {
     if (!result.staged) return;
     const { key } = decodeStagedId(result.id, NOW);
 
-    await deleteStaged(env, key);
-    expect(await getStaged(env, key)).toBeNull();
+    await deleteStaged(env, principal.userId, key);
+    expect(await getStaged(env, principal.userId, key)).toBeNull();
     // D-81's sweep and its delete-on-attach layer both re-delete freely, and an
     // absent object is the NORMAL outcome for the second of them.
-    await expect(deleteStaged(env, key)).resolves.toBeUndefined();
+    await expect(deleteStaged(env, principal.userId, key)).resolves.toBeUndefined();
   });
 
   it("stages every object under the one prefix", async () => {
-    await putStaged(env, {
+    await putStaged(env, principal.userId, {
       bytes: ENCODER.encode(PAYLOAD),
       filename: "../../escape.pdf",
       mimeType: "application/pdf",
@@ -533,8 +533,8 @@ describe("put, get and delete over the real Miniflare binding", () => {
     // protocol over.
     await env.ATTACHMENT_STAGING.put("elsewhere/secret.txt", "not yours");
 
-    expect(await getStaged(env, "elsewhere/secret.txt")).toBeNull();
-    await deleteStaged(env, "elsewhere/secret.txt");
+    expect(await getStaged(env, principal.userId, "elsewhere/secret.txt")).toBeNull();
+    await deleteStaged(env, principal.userId, "elsewhere/secret.txt");
     expect(await everyKey()).toEqual(["elsewhere/secret.txt"]);
   });
 });
@@ -545,7 +545,7 @@ describe("put, get and delete over the real Miniflare binding", () => {
 
 describe("the staged identifier", () => {
   it("decodes back to the key that was written", async () => {
-    const result = await putStaged(env, {
+    const result = await putStaged(env, principal.userId, {
       bytes: ENCODER.encode("bytes"),
       filename: "Round-Trip.pdf",
       mimeType: "application/pdf",
@@ -569,7 +569,7 @@ describe("the staged identifier", () => {
     // D-82's ordering, asserted rather than described: the token must die
     // BEFORE the bytes, because the bucket sweep lands 24-48 hours out. A token
     // that outlived its object would decode cleanly and name nothing.
-    const result = await putStaged(env, {
+    const result = await putStaged(env, principal.userId, {
       bytes: ENCODER.encode("bytes"),
       filename: "Expiring.pdf",
       mimeType: "application/pdf",
@@ -590,7 +590,7 @@ describe("the staged identifier", () => {
     // The expiry is enforced by the decoder, so a caller holding a staged id
     // cannot forget to ask whether it is still good (D-81). The boundary is
     // closed rather than open: a token is dead AT its stated instant.
-    const result = await putStaged(env, {
+    const result = await putStaged(env, principal.userId, {
       bytes: ENCODER.encode("bytes"),
       filename: "Expiring.pdf",
       mimeType: "application/pdf",
@@ -770,12 +770,12 @@ describe("staging from a message: the copy that never reaches the transcript", (
       ATTACHMENT_REF,
       FAST_BOUNDS,
     );
-    const outcome = await stageAttachmentContent(env, content, null, NOW);
+    const outcome = await stageAttachmentContent(env, principal.userId, content, null, NOW);
 
     expect(outcome.staged).toBe(true);
     if (!outcome.staged) return;
 
-    const fetched = await getStaged(env, decodeStagedId(outcome.id, NOW).key);
+    const fetched = await getStaged(env, principal.userId, decodeStagedId(outcome.id, NOW).key);
     // The bytes that landed are the DECODED file, not the wire form.
     expect(DECODER.decode(fetched!.bytes)).toBe(SENDER_PAYLOAD);
     expect(outcome.sizeBytes).toBe(ENCODER.encode(SENDER_PAYLOAD).byteLength);
@@ -802,7 +802,7 @@ describe("staging from a message: the copy that never reaches the transcript", (
     ).toBe(true);
     expect(await everyKey(), "an object existed before the session closed").toEqual([]);
 
-    await stageAttachmentContent(env, content, null, NOW);
+    await stageAttachmentContent(env, principal.userId, content, null, NOW);
 
     expect(await everyKey()).toHaveLength(1);
   });
@@ -837,11 +837,11 @@ describe("staging from a message: the copy that never reaches the transcript", (
       FAST_BOUNDS,
     );
 
-    const outcome = await stageAttachmentContent(env, content, null, NOW);
+    const outcome = await stageAttachmentContent(env, principal.userId, content, null, NOW);
 
     expect(outcome.staged).toBe(true);
     if (!outcome.staged) return;
-    const fetched = await getStaged(env, decodeStagedId(outcome.id, NOW).key);
+    const fetched = await getStaged(env, principal.userId, decodeStagedId(outcome.id, NOW).key);
     expect(fetched!.filename).toBe(SENDER_FILENAME);
   });
 
@@ -858,7 +858,7 @@ describe("staging from a message: the copy that never reaches the transcript", (
     );
 
     const outcome = await stageAttachmentContent(
-      env,
+      env, principal.userId,
       content,
       "job-description.pdf",
       NOW,
@@ -873,7 +873,7 @@ describe("staging from a message: the copy that never reaches the transcript", (
     expect(key).toMatch(
       new RegExp(`^${STAGING_PREFIX}[0-9a-f]{16}-job-description\\.pdf-${NOW}$`),
     );
-    expect((await getStaged(env, key))!.filename).toBe("job-description.pdf");
+    expect((await getStaged(env, principal.userId, key))!.filename).toBe("job-description.pdf");
   });
 
   it("refuses an over-size part with NO part fetch written and NO object created", async () => {
@@ -889,7 +889,7 @@ describe("staging from a message: the copy that never reaches the transcript", (
       ATTACHMENT_REF,
       FAST_BOUNDS,
     );
-    const outcome = await stageAttachmentContent(env, content, null, NOW);
+    const outcome = await stageAttachmentContent(env, principal.userId, content, null, NOW);
 
     expect(fetchLines(duplex)).toEqual([
       `a5 UID FETCH ${UID} (UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE)`,
@@ -907,7 +907,7 @@ describe("staging from a message: the copy that never reaches the transcript", (
     // The four-value error vocabulary stays closed (D-35). A part this server
     // declined to ask for is a successful call carrying two numbers.
     const outcome = await stageAttachmentContent(
-      env,
+      env, principal.userId,
       contentOf({
         fetch: {
           fetched: false,
@@ -932,7 +932,7 @@ describe("staging from a message: the copy that never reaches the transcript", (
     // while the fetched bytes are tiny. An implementation that decoded first
     // and measured afterwards would report the SMALL number and stage the file.
     const outcome = await stageAttachmentContent(
-      env,
+      env, principal.userId,
       contentOf({ sizeBytes: MAX_STAGED_FILE_BYTES + 1 }),
       null,
       NOW,
@@ -949,7 +949,7 @@ describe("staging from a message: the copy that never reaches the transcript", (
 
   it("stages a part whose sender declared no filename at all", async () => {
     const outcome = await stageAttachmentContent(
-      env,
+      env, principal.userId,
       contentOf({ filename: null }),
       null,
       NOW,
@@ -987,7 +987,7 @@ describe("staging from bytes handed over in the tool call", () => {
     for (const byte of original) binary += String.fromCharCode(byte);
 
     const outcome = await stageInlineBytes(
-      env,
+      env, principal.userId,
       { base64: btoa(binary), filename: "cover-letter.txt", mimeType: "text/plain" },
       NOW,
     );
@@ -995,7 +995,7 @@ describe("staging from bytes handed over in the tool call", () => {
     expect(outcome.staged).toBe(true);
     if (!outcome.staged) return;
 
-    const fetched = await getStaged(env, decodeStagedId(outcome.id, NOW).key);
+    const fetched = await getStaged(env, principal.userId, decodeStagedId(outcome.id, NOW).key);
     expect(DECODER.decode(fetched!.bytes)).toBe(
       "Cover letter, third draft.\r\nSincerely,",
     );
@@ -1011,14 +1011,14 @@ describe("staging from bytes handed over in the tool call", () => {
     for (const byte of original) binary += String.fromCharCode(byte);
 
     const outcome = await stageInlineBytes(
-      env,
+      env, principal.userId,
       { base64: btoa(binary), filename: "every-byte.bin", mimeType: null },
       NOW,
     );
 
     expect(outcome.staged).toBe(true);
     if (!outcome.staged) return;
-    const fetched = await getStaged(env, decodeStagedId(outcome.id, NOW).key);
+    const fetched = await getStaged(env, principal.userId, decodeStagedId(outcome.id, NOW).key);
     expect([...fetched!.bytes]).toEqual([...original]);
   });
 
@@ -1026,7 +1026,7 @@ describe("staging from bytes handed over in the tool call", () => {
     const payload = inlineBase64(MAX_INLINE_BASE64_BYTES + 3);
 
     const outcome = await stageInlineBytes(
-      env,
+      env, principal.userId,
       { base64: payload, filename: "too-big.pdf", mimeType: "application/pdf" },
       NOW,
     );
@@ -1047,7 +1047,7 @@ describe("staging from bytes handed over in the tool call", () => {
     // observable difference.
     const encodedLength = 4 * Math.ceil((MAX_INLINE_BASE64_BYTES + 64) / 3);
     const outcome = await stageInlineBytes(
-      env,
+      env, principal.userId,
       { base64: "!".repeat(encodedLength), filename: "junk.pdf", mimeType: null },
       NOW,
     );
@@ -1061,7 +1061,7 @@ describe("staging from bytes handed over in the tool call", () => {
   it("refuses a payload that is not valid base64 rather than staging garbage", async () => {
     for (const payload of ["not base64 at all!!", "aGk", "###=", "aGk*"]) {
       const outcome = await stageInlineBytes(
-        env,
+        env, principal.userId,
         { base64: payload, filename: "junk.bin", mimeType: null },
         NOW,
       );
@@ -1075,7 +1075,7 @@ describe("staging from bytes handed over in the tool call", () => {
 
   it("refuses an empty payload", async () => {
     const outcome = await stageInlineBytes(
-      env,
+      env, principal.userId,
       { base64: "", filename: "empty.txt", mimeType: "text/plain" },
       NOW,
     );
@@ -1093,7 +1093,7 @@ describe("staging from bytes handed over in the tool call", () => {
     const wrapped = btoa(binary).replace(/(.{4})/g, "$1\r\n");
 
     const outcome = await stageInlineBytes(
-      env,
+      env, principal.userId,
       { base64: wrapped, filename: "wrapped.txt", mimeType: "text/plain" },
       NOW,
     );
@@ -1106,7 +1106,7 @@ describe("staging from bytes handed over in the tool call", () => {
     // nothing branches on it, and it is reported as declared rather than as
     // verified — the same footing `AttachmentMeta.mimeType` already sits on.
     const outcome = await stageInlineBytes(
-      env,
+      env, principal.userId,
       {
         base64: btoa("zip-ish"),
         filename: "archive.7z",
@@ -1117,7 +1117,7 @@ describe("staging from bytes handed over in the tool call", () => {
 
     expect(outcome.staged).toBe(true);
     if (!outcome.staged) return;
-    expect((await getStaged(env, decodeStagedId(outcome.id, NOW).key))!.mimeType).toBe(
+    expect((await getStaged(env, principal.userId, decodeStagedId(outcome.id, NOW).key))!.mimeType).toBe(
       "application/x-made-up",
     );
   });
@@ -1128,7 +1128,7 @@ describe("staging from bytes handed over in the tool call", () => {
     const payload = inlineBase64(MAX_INLINE_BASE64_BYTES + 3);
 
     const outcome = await stageInlineBytes(
-      env,
+      env, principal.userId,
       { base64: payload, filename: "mid.pdf", mimeType: "application/pdf" },
       NOW,
     );
@@ -1259,7 +1259,7 @@ async function stageOne(
   body: string | Uint8Array,
   at = NOW,
 ): Promise<{ id: string; key: string }> {
-  const result = await putStaged(env, {
+  const result = await putStaged(env, principal.userId, {
     bytes: typeof body === "string" ? ENCODER.encode(body) : body,
     filename,
     mimeType: "application/pdf",
@@ -1277,7 +1277,7 @@ describe("resolving staged ids into attachments", () => {
     const second = await stageOne("notes.txt", "the second document");
 
     const staged = await resolveStagedAttachments(
-      env,
+      env, principal.userId,
       [first.id, second.id],
       NOW,
     );
@@ -1304,7 +1304,12 @@ describe("resolving staged ids into attachments", () => {
     const recording = recordingEnv();
 
     await expect(
-      resolveStagedAttachments(recording.env, [staged.id], NOW + STAGED_ID_TTL_MS),
+      resolveStagedAttachments(
+        recording.env,
+        principal.userId,
+        [staged.id],
+        NOW + STAGED_ID_TTL_MS,
+      ),
     ).rejects.toThrow(ImapNotFoundError);
 
     expect(recording.events).toEqual([]);
@@ -1323,17 +1328,17 @@ describe("resolving staged ids into attachments", () => {
     const recording = recordingEnv();
 
     await expect(
-      resolveStagedAttachments(recording.env, [foreign], NOW),
+      resolveStagedAttachments(recording.env, principal.userId, [foreign], NOW),
     ).rejects.toThrow(ImapNotFoundError);
     expect(recording.events).toEqual([]);
   });
 
   it("refuses a well-formed id naming an object that is not there", async () => {
     const staged = await stageOne("gone.pdf", "about to vanish");
-    await deleteStaged(env, staged.key);
+    await deleteStaged(env, principal.userId, staged.key);
 
     await expect(
-      resolveStagedAttachments(env, [staged.id], NOW),
+      resolveStagedAttachments(env, principal.userId, [staged.id], NOW),
     ).rejects.toThrow(ImapNotFoundError);
   });
 
@@ -1347,7 +1352,7 @@ describe("resolving staged ids into attachments", () => {
       NOW,
     );
 
-    await expect(resolveStagedAttachments(env, [forged], NOW)).rejects.toThrow(
+    await expect(resolveStagedAttachments(env, principal.userId, [forged], NOW)).rejects.toThrow(
       ImapNotFoundError,
     );
   });
@@ -1365,7 +1370,7 @@ describe("resolving staged ids into attachments", () => {
       filename: "",
     });
     const confirmed = await confirmStagedUpload(
-      env,
+      env, principal.userId,
       key,
       "an unnamed document".length,
       NOW,
@@ -1374,7 +1379,7 @@ describe("resolving staged ids into attachments", () => {
     expect(confirmed.staged).toBe(true);
     if (!confirmed.staged) return;
 
-    const staged = await resolveStagedAttachments(env, [confirmed.id], NOW);
+    const staged = await resolveStagedAttachments(env, principal.userId, [confirmed.id], NOW);
 
     expect(staged.attachments[0]!.filename).toBe("attachment");
 
@@ -1399,7 +1404,12 @@ describe("resolving staged ids into attachments", () => {
     const recording = recordingEnv();
 
     await expect(
-      resolveStagedAttachments(recording.env, [staged.id, staged.id], NOW),
+      resolveStagedAttachments(
+        recording.env,
+        principal.userId,
+        [staged.id, staged.id],
+        NOW,
+      ),
     ).rejects.toThrow(ImapNotFoundError);
 
     expect(recording.events).toEqual([]);
@@ -1418,7 +1428,7 @@ describe("resolving staged ids into attachments", () => {
     const recording = recordingEnv();
 
     await expect(
-      resolveStagedAttachments(recording.env, ids, NOW),
+      resolveStagedAttachments(recording.env, principal.userId, ids, NOW),
     ).rejects.toThrow(ImapNotFoundError);
     expect(recording.events).toEqual([]);
   });
@@ -1431,7 +1441,7 @@ describe("resolving staged ids into attachments", () => {
       ids.push((await stageOne(`file-${index}.pdf`, `document ${index}`)).id);
     }
 
-    const staged = await resolveStagedAttachments(env, ids, NOW);
+    const staged = await resolveStagedAttachments(env, principal.userId, ids, NOW);
 
     expect(staged.attachments).toHaveLength(MAX_ATTACHMENTS_PER_DRAFT);
   });
@@ -1458,7 +1468,7 @@ describe("resolving staged ids into attachments", () => {
     // is `MEDIA_TYPE`'s own stated property, so a type carrying a parameter
     // comes back out byte for byte.
     const injected = 'text/plain; boundary="x"';
-    const staged = await putStaged(env, {
+    const staged = await putStaged(env, principal.userId, {
       bytes: ENCODER.encode("some notes"),
       filename: "notes.txt",
       mimeType: injected,
@@ -1469,14 +1479,14 @@ describe("resolving staged ids into attachments", () => {
     if (!staged.staged) return;
     const key = decodeStagedId(staged.id, NOW).key;
 
-    expect((await getStaged(env, key))?.mimeType).toBe(injected);
+    expect((await getStaged(env, principal.userId, key))?.mimeType).toBe(injected);
 
     // Half two, and this is the half that makes the first one safe. The one
     // consumer that puts this value into a header re-applies `MEDIA_TYPE` and
     // falls back to the neutral default, so a caller-supplied parameter cannot
     // reach the `Content-Type` of a message the user sends under their own
     // name.
-    const resolved = await resolveStagedAttachments(env, [staged.id], NOW);
+    const resolved = await resolveStagedAttachments(env, principal.userId, [staged.id], NOW);
     const built = buildDraft(
       draftInput({ attachments: resolved.attachments }),
     );
@@ -1498,7 +1508,12 @@ describe("resolving staged ids into attachments", () => {
     const second = await stageOne("two.pdf", "second");
     const recording = recordingEnv();
 
-    await resolveStagedAttachments(recording.env, [first.id, second.id], NOW);
+    await resolveStagedAttachments(
+      recording.env,
+      principal.userId,
+      [first.id, second.id],
+      NOW,
+    );
 
     expect(recording.events).toEqual([
       `get:start ${first.key}`,
@@ -1519,7 +1534,7 @@ describe("composing with an attachment: every read before the socket", () => {
     let linesAtAssembly: string[] = ["not recorded"];
 
     const composition = await composeWithAttachments(
-      env,
+      env, principal.userId,
       [staged.id],
       (attachments) => {
         linesAtAssembly = duplex.writtenLines();
@@ -1550,7 +1565,7 @@ describe("composing with an attachment: every read before the socket", () => {
     let written: Uint8Array = new Uint8Array(0);
 
     await composeWithAttachments(
-      env,
+      env, principal.userId,
       [staged.id],
       (attachments) => buildDraft(draftInput({ attachments })),
       async (message) => {
@@ -1600,7 +1615,7 @@ describe("composing with an attachment: every read before the socket", () => {
     let appendCalls = 0;
 
     const composition = await composeWithAttachments(
-      env,
+      env, principal.userId,
       ids,
       (attachments) => buildDraft(draftInput({ attachments })),
       (message) => {
@@ -1642,6 +1657,9 @@ describe("D-81's delete-on-attach layer", () => {
   ) {
     return composeWithAttachments(
       over,
+      // `over` is the storage environment and nothing else. The compose acts
+      // for the owner, whichever storage is swapped in.
+      principal.userId,
       ids,
       (attachments) => buildDraft(draftInput({ attachments })),
       (message) =>
@@ -1686,7 +1704,7 @@ describe("D-81's delete-on-attach layer", () => {
     const duplex = appendingDuplex();
 
     const composition = await composeWithAttachments(
-      env,
+      env, principal.userId,
       [staged.id],
       (attachments) => buildDraft(draftInput({ attachments })),
       async () => ({
@@ -1745,7 +1763,12 @@ describe("releaseStagedAttachments, on its own", () => {
     const staged = await stageOne("kept.pdf", "still here");
     const recording = recordingEnv();
 
-    await releaseStagedAttachments(recording.env, [staged.key], false);
+    await releaseStagedAttachments(
+      recording.env,
+      principal.userId,
+      [staged.key],
+      false,
+    );
 
     expect(recording.events).toEqual([]);
     expect(await everyKey()).toEqual([staged.key]);
@@ -1758,6 +1781,7 @@ describe("releaseStagedAttachments, on its own", () => {
 
     await releaseStagedAttachments(
       recording.env,
+      principal.userId,
       [first.key, second.key],
       true,
     );
@@ -1788,6 +1812,7 @@ describe("releaseStagedAttachments, on its own", () => {
     await expect(
       releaseStagedAttachments(
         { ...env, ATTACHMENT_STAGING: bucket as unknown as R2Bucket },
+        principal.userId,
         [first.key, second.key],
         true,
       ),
@@ -1838,8 +1863,8 @@ function envWithout(
 }
 
 /** One ordinary mint, with a fixed key so the assertions are reproducible. */
-async function mintOne(over: Partial<Parameters<typeof mintUploadUrl>[1]> = {}) {
-  return mintUploadUrl(env, {
+async function mintOne(over: Partial<Parameters<typeof mintUploadUrl>[2]> = {}) {
+  return mintUploadUrl(env, principal.userId, {
     key: `${STAGING_PREFIX}upload-a1b2c3d4e5f60718-${NOW}`,
     contentType: "application/pdf",
     contentLength: 65_536,
@@ -1968,7 +1993,7 @@ describe("the minted upload URL", () => {
       "R2_SECRET_ACCESS_KEY",
     ] as const) {
       await expect(
-        mintUploadUrl(envWithout(binding), {
+        mintUploadUrl(envWithout(binding), principal.userId, {
           key: `${STAGING_PREFIX}upload-a1b2c3d4e5f60718-${NOW}`,
           contentType: "application/pdf",
           contentLength: 65_536,
@@ -2031,7 +2056,7 @@ describe("the key a presigned upload is aimed at", () => {
     // block, because it is derived from untrusted text and shares most of its
     // characters. The minted URL DOES sit in the trusted block — it is a value
     // this server generated — so the key inside it cannot be name-derived.
-    const key = presignedKeyFor(NOW);
+    const key = presignedKeyFor(principal.userId, NOW);
 
     expect(key).not.toBeNull();
     expect(String(key)).toMatch(
@@ -2044,7 +2069,7 @@ describe("the key a presigned upload is aimed at", () => {
     // fix: a random segment. This path takes that fix, because it has already
     // given up the legibility the window was accepted to buy.
     const keys = new Set(
-      Array.from({ length: 64 }, () => String(presignedKeyFor(NOW))),
+      Array.from({ length: 64 }, () => String(presignedKeyFor(principal.userId, NOW))),
     );
 
     expect(keys.size).toBe(64);
@@ -2079,7 +2104,7 @@ async function uploadRaw(
 
 /** The key a presigned upload in this block is aimed at. */
 function uploadKey(): string {
-  return String(presignedKeyFor(NOW));
+  return String(presignedKeyFor(principal.userId, NOW));
 }
 
 describe("confirming a presigned upload", () => {
@@ -2087,7 +2112,7 @@ describe("confirming a presigned upload", () => {
     const key = uploadKey();
     await uploadRaw(key, ENCODER.encode("a real upload"));
 
-    const result = await confirmStagedUpload(env, key, 13, NOW, NOW + STAGED_ID_TTL_MS);
+    const result = await confirmStagedUpload(env, principal.userId, key, 13, NOW, NOW + STAGED_ID_TTL_MS);
 
     expect(result.staged).toBe(true);
     if (!result.staged) return;
@@ -2107,7 +2132,7 @@ describe("confirming a presigned upload", () => {
     const key = uploadKey();
     await uploadRaw(key, ENCODER.encode("x".repeat(4096)));
 
-    const result = await confirmStagedUpload(env, key, 1024, NOW, NOW + STAGED_ID_TTL_MS);
+    const result = await confirmStagedUpload(env, principal.userId, key, 1024, NOW, NOW + STAGED_ID_TTL_MS);
 
     expect(result.staged).toBe(false);
     if (result.staged) return;
@@ -2121,7 +2146,7 @@ describe("confirming a presigned upload", () => {
     // id, so leaving it costs storage and leaves an unreferenced blob under a
     // prefix the user may well inspect.
     expect(await everyKey()).not.toContain(key);
-    expect(await getStaged(env, key)).toBeNull();
+    expect(await getStaged(env, principal.userId, key)).toBeNull();
   });
 
   it("deletes an over-cap object even when the DECLARED size was under it", async () => {
@@ -2132,7 +2157,7 @@ describe("confirming a presigned upload", () => {
     await uploadRaw(key, new Uint8Array(MAX_STAGED_FILE_BYTES + 1));
 
     const result = await confirmStagedUpload(
-      env,
+      env, principal.userId,
       key,
       MAX_STAGED_FILE_BYTES + 4096,
       NOW,
@@ -2157,7 +2182,7 @@ describe("confirming a presigned upload", () => {
     const key = uploadKey();
     await uploadRaw(key, new Uint8Array(5000), { declaredSize: "10" });
 
-    const result = await confirmStagedUpload(env, key, 100, NOW, NOW + STAGED_ID_TTL_MS);
+    const result = await confirmStagedUpload(env, principal.userId, key, 100, NOW, NOW + STAGED_ID_TTL_MS);
 
     expect(result.staged).toBe(false);
     if (result.staged) return;
@@ -2187,6 +2212,7 @@ describe("confirming a presigned upload", () => {
 
     const accepted = await confirmStagedUpload(
       recording.env,
+      principal.userId,
       passing,
       13,
       NOW,
@@ -2194,6 +2220,7 @@ describe("confirming a presigned upload", () => {
     );
     const rejected = await confirmStagedUpload(
       recording.env,
+      principal.userId,
       refused,
       1024,
       NOW,
@@ -2223,7 +2250,7 @@ describe("confirming a presigned upload", () => {
     await uploadRaw(key, ENCODER.encode("x".repeat(600)));
 
     const result = await confirmStagedUpload(
-      env,
+      env, principal.userId,
       key,
       1024,
       NOW,
@@ -2250,7 +2277,7 @@ describe("confirming a presigned upload", () => {
     await uploadRaw(key, ENCODER.encode("x".repeat(600)));
 
     const result = await confirmStagedUpload(
-      env,
+      env, principal.userId,
       key,
       600,
       NOW,
@@ -2261,7 +2288,7 @@ describe("confirming a presigned upload", () => {
   });
 
   it("refuses a key with nothing behind it, without throwing", async () => {
-    const result = await confirmStagedUpload(env, uploadKey(), 1024, NOW, NOW + STAGED_ID_TTL_MS);
+    const result = await confirmStagedUpload(env, principal.userId, uploadKey(), 1024, NOW, NOW + STAGED_ID_TTL_MS);
 
     expect(result.staged).toBe(false);
     if (result.staged) return;
@@ -2274,8 +2301,8 @@ describe("confirming a presigned upload", () => {
     // The staged identifier is unsigned, so a caller can name any key it likes.
     // A distinguishable refusal here would be an existence oracle handed to
     // exactly that forgery, which is the reasoning `getStaged` already carries.
-    const outside = await confirmStagedUpload(env, "elsewhere/secret", 1024, NOW, NOW + STAGED_ID_TTL_MS);
-    const missing = await confirmStagedUpload(env, uploadKey(), 1024, NOW, NOW + STAGED_ID_TTL_MS);
+    const outside = await confirmStagedUpload(env, principal.userId, "elsewhere/secret", 1024, NOW, NOW + STAGED_ID_TTL_MS);
+    const missing = await confirmStagedUpload(env, principal.userId, uploadKey(), 1024, NOW, NOW + STAGED_ID_TTL_MS);
 
     expect(outside).toEqual(missing);
   });
@@ -2289,8 +2316,8 @@ describe("confirming a presigned upload", () => {
     await uploadRaw(key, ENCODER.encode("uploaded once"));
 
     const declared = "uploaded once".length;
-    const first = await confirmStagedUpload(env, key, declared, NOW, NOW + STAGED_ID_TTL_MS);
-    const second = await confirmStagedUpload(env, key, declared, NOW, NOW + STAGED_ID_TTL_MS);
+    const first = await confirmStagedUpload(env, principal.userId, key, declared, NOW, NOW + STAGED_ID_TTL_MS);
+    const second = await confirmStagedUpload(env, principal.userId, key, declared, NOW, NOW + STAGED_ID_TTL_MS);
 
     expect(first.staged && second.staged).toBe(true);
     if (!first.staged || !second.staged) return;
@@ -2311,7 +2338,7 @@ describe("confirming a presigned upload", () => {
     });
 
     const result = await confirmStagedUpload(
-      env,
+      env, principal.userId,
       key,
       "the uploaded document".length,
       NOW,
@@ -2320,7 +2347,7 @@ describe("confirming a presigned upload", () => {
     expect(result.staged).toBe(true);
     if (!result.staged) return;
 
-    const staged = await resolveStagedAttachments(env, [result.id], NOW);
+    const staged = await resolveStagedAttachments(env, principal.userId, [result.id], NOW);
 
     expect(staged.attachments).toHaveLength(1);
     expect(staged.attachments[0].filename).toBe(
@@ -2345,7 +2372,7 @@ describe("the confirmed identifier cannot outlive the bytes (D-82)", () => {
     const mintedAt = NOW;
     const confirmedAt = NOW + 6 * 60 * 60 * 1000;
     const result = await confirmStagedUpload(
-      env,
+      env, principal.userId,
       key,
       "uploaded late".length,
       confirmedAt,
@@ -2371,7 +2398,7 @@ describe("the confirmed identifier cannot outlive the bytes (D-82)", () => {
     await uploadRaw(key, ENCODER.encode("uploaded promptly"));
 
     const result = await confirmStagedUpload(
-      env,
+      env, principal.userId,
       key,
       "uploaded promptly".length,
       NOW,
@@ -2392,7 +2419,7 @@ describe("the third ingress, end to end", () => {
     // the person with a command line: bytes arrive at the key the grant named,
     // carrying the metadata header the signature required.
     const key = uploadKey();
-    const minted = await mintUploadUrl(env, {
+    const minted = await mintUploadUrl(env, principal.userId, {
       key,
       contentType: "application/pdf",
       contentLength: 13,
@@ -2407,7 +2434,7 @@ describe("the third ingress, end to end", () => {
     });
 
     const confirmed = await confirmStagedUpload(
-      env,
+      env, principal.userId,
       key,
       13,
       NOW,
@@ -2421,7 +2448,7 @@ describe("the third ingress, end to end", () => {
     let written: Uint8Array = new Uint8Array(0);
 
     const composition = await composeWithAttachments(
-      env,
+      env, principal.userId,
       [confirmed.id],
       (attachments) => buildDraft(draftInput({ attachments })),
       async (message) => {
@@ -2459,13 +2486,13 @@ describe("the third ingress, end to end", () => {
 
     const ticket = encodeUploadId({ key, expiresAt: NOW + STAGED_ID_TTL_MS }, NOW);
 
-    await expect(resolveStagedAttachments(env, [ticket], NOW)).rejects.toThrow(
+    await expect(resolveStagedAttachments(env, principal.userId, [ticket], NOW)).rejects.toThrow(
       ImapNotFoundError,
     );
     // And the reverse: a confirmed staged id is not a ticket that can be
     // re-confirmed.
     const confirmed = await confirmStagedUpload(
-      env,
+      env, principal.userId,
       key,
       64,
       NOW,
@@ -2506,7 +2533,7 @@ describe("the declared type survives an object written outside putStaged", () =>
       customMetadata: { filename: "typed.txt", stagedAt: String(NOW) },
     });
 
-    const fetched = await getStaged(env, KEY);
+    const fetched = await getStaged(env, principal.userId, KEY);
 
     expect(fetched).not.toBeNull();
     expect(fetched!.mimeType).toBe("text/plain");
@@ -2525,7 +2552,7 @@ describe("the declared type survives an object written outside putStaged", () =>
       },
     });
 
-    expect((await getStaged(env, KEY))!.mimeType).toBe("application/pdf");
+    expect((await getStaged(env, principal.userId, KEY))!.mimeType).toBe("application/pdf");
   });
 
   it("refuses a stored type that is not a media type, rather than passing it on", async () => {
@@ -2539,7 +2566,7 @@ describe("the declared type survives an object written outside putStaged", () =>
       customMetadata: { filename: "typed.txt", stagedAt: String(NOW) },
     });
 
-    expect((await getStaged(env, KEY))!.mimeType).toBe(
+    expect((await getStaged(env, principal.userId, KEY))!.mimeType).toBe(
       "application/octet-stream",
     );
   });

@@ -148,6 +148,7 @@ async function stageAsA(
   try {
     const staged = await stageInlineBytes(
       envFor(USER_A),
+      USER_A.userId,
       { base64: btoa(MARKER_A), filename: "a.txt", mimeType: "text/plain" },
       now,
     );
@@ -223,6 +224,7 @@ async function grantAndUploadAsA(
   try {
     const grant = await mintUploadGrant(
       envFor(USER_A),
+      USER_A.userId,
       {
         filename: "a.pdf",
         mimeType: "application/pdf",
@@ -402,6 +404,7 @@ describe("R2 staging, read: a staged file belongs to the user who staged it", ()
 
     const staged = await stageInlineBytes(
       envFor(USER_A),
+      USER_A.userId,
       { base64: btoa(MARKER_A), filename: "a.txt", mimeType: "text/plain" },
       now,
     );
@@ -410,6 +413,7 @@ describe("R2 staging, read: a staged file belongs to the user who staged it", ()
 
     const resolved = await resolveStagedAttachments(
       envFor(USER_A),
+      USER_A.userId,
       [staged.id],
       now,
     );
@@ -451,7 +455,7 @@ describe("R2 staging, read: a staged file belongs to the user who staged it", ()
     const idFromA = staged.id;
 
     const outcome = await attempt(() =>
-      resolveStagedAttachments(envFor(USER_B), [idFromA], now),
+      resolveStagedAttachments(envFor(USER_B), USER_B.userId, [idFromA], now),
     );
 
     // Null means the check itself broke. "control: A can attach a file A
@@ -475,7 +479,12 @@ describe("R2 staging, delete: only the user who staged a file can remove it", ()
       "A's object was not in the bucket after staging",
     ).not.toBeNull();
 
-    await releaseStagedAttachments(envFor(USER_A), [staged.key], true);
+    await releaseStagedAttachments(
+      envFor(USER_A),
+      USER_A.userId,
+      [staged.key],
+      true,
+    );
 
     expect(
       await env.ATTACHMENT_STAGING.head(staged.key),
@@ -517,7 +526,7 @@ describe("R2 staging, delete: only the user who staged a file can remove it", ()
     const keyOfA = staged.key;
 
     await attempt(() =>
-      releaseStagedAttachments(envFor(USER_B), [keyOfA], true),
+      releaseStagedAttachments(envFor(USER_B), USER_B.userId, [keyOfA], true),
     );
 
     // The bucket is read OUTSIDE the assertion. A read that rejected inside it
@@ -549,6 +558,7 @@ describe("staged id, built by hand: the id proves nothing about who holds it", (
 
     const resolved = await resolveStagedAttachments(
       envFor(USER_A),
+      USER_A.userId,
       [rebuilt],
       now,
     );
@@ -599,7 +609,7 @@ describe("staged id, built by hand: the id proves nothing about who holds it", (
     const idFromB = forged.value;
 
     const outcome = await attempt(() =>
-      resolveStagedAttachments(envFor(USER_B), [idFromB], now),
+      resolveStagedAttachments(envFor(USER_B), USER_B.userId, [idFromB], now),
     );
 
     // Null means the check itself broke. "control: A can resolve an id A
@@ -727,6 +737,7 @@ describe("upload ticket: an upload belongs to the user who asked for the grant",
     // The id is real: it resolves, as A, to the bytes A uploaded.
     const resolved = await resolveStagedAttachments(
       envFor(USER_A),
+      USER_A.userId,
       [String(trusted?.id)],
       now,
     );

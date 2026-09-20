@@ -910,6 +910,7 @@ export function uploadUrlToolResult(report: UploadGrantReport): ToolResult {
  */
 export async function mintUploadGrant(
   env: Env,
+  userId: string,
   input: { filename: string; mimeType: string; sizeBytes: number },
   nowMs: number,
 ): Promise<UploadGrantReport> {
@@ -934,7 +935,7 @@ export async function mintUploadGrant(
     return refused("too-large");
   }
 
-  const key = presignedKeyFor(nowMs);
+  const key = presignedKeyFor(userId, nowMs);
   if (key === null) throw new ImapNotFoundError();
 
   const grant = {
@@ -947,7 +948,7 @@ export async function mintUploadGrant(
   return {
     stagedFrom: "presigned",
     granted: true,
-    uploadUrl: await mintUploadUrl(env, grant),
+    uploadUrl: await mintUploadUrl(env, userId, grant),
     // The ticket's expiry is a day out rather than the URL's fifteen minutes,
     // because it bounds the CONFIRM rather than the write — and confirm carries
     // that instant forward as the ceiling on the identifier it mints, which is
@@ -1000,6 +1001,7 @@ export async function mintUploadGrant(
  */
 export async function stageAttachmentContent(
   env: Env,
+  userId: string,
   content: AttachmentContent,
   filenameOverride: string | null,
   nowMs: number,
@@ -1028,7 +1030,7 @@ export async function stageAttachmentContent(
   // Outside the session, always. The decode is megabytes of arithmetic and the
   // per-call deadline races only the session callback, so spending it here costs
   // nothing and spending it there would hold a socket open for it.
-  return putStaged(env, {
+  return putStaged(env, userId, {
     bytes: transferDecode(content.fetch.bytes, content.encoding),
     filename: filenameOverride ?? content.filename ?? DEFAULT_STAGED_FILENAME,
     mimeType: content.mimeType,
@@ -1084,6 +1086,7 @@ export interface InlineStageInput {
  */
 export async function stageInlineBytes(
   env: Env,
+  userId: string,
   input: InlineStageInput,
   nowMs: number,
 ): Promise<StageOutcome> {
@@ -1146,7 +1149,7 @@ export async function stageInlineBytes(
     bytes[at] = binary.charCodeAt(at);
   }
 
-  return putStaged(env, {
+  return putStaged(env, userId, {
     bytes,
     filename: input.filename,
     mimeType: input.mimeType ?? DEFAULT_INLINE_MEDIA_TYPE,
@@ -1220,6 +1223,7 @@ export interface StagedAttachments {
  */
 export async function resolveStagedAttachments(
   env: Env,
+  userId: string,
   ids: string[],
   nowMs: number,
 ): Promise<StagedAttachments> {
@@ -1255,7 +1259,7 @@ export async function resolveStagedAttachments(
   const attachments: DraftAttachment[] = [];
   let totalBytes = 0;
   for (const key of keys) {
-    const object = await getStaged(env, key);
+    const object = await getStaged(env, userId, key);
     if (object === null) throw new ImapNotFoundError();
 
     attachments.push({
@@ -1330,6 +1334,7 @@ export async function resolveStagedAttachments(
  */
 export async function releaseStagedAttachments(
   env: Env,
+  userId: string,
   keys: string[],
   appended: boolean,
 ): Promise<void> {
@@ -1337,7 +1342,7 @@ export async function releaseStagedAttachments(
 
   for (const key of keys) {
     try {
-      await deleteStaged(env, key);
+      await deleteStaged(env, userId, key);
     } catch {
       // Deliberately swallowed. See rule 2 above before changing this.
     }
@@ -1400,12 +1405,18 @@ export interface DraftComposition {
  */
 export async function composeWithAttachments(
   env: Env,
+  userId: string,
   attachmentIds: string[],
   build: (attachments: DraftAttachment[]) => BuildResult,
   append: (message: Uint8Array) => Promise<AppendOutcome>,
   nowMs: number,
 ): Promise<DraftComposition> {
-  const staged = await resolveStagedAttachments(env, attachmentIds, nowMs);
+  const staged = await resolveStagedAttachments(
+    env,
+    userId,
+    attachmentIds,
+    nowMs,
+  );
   const attached = {
     attachedCount: staged.attachments.length,
     attachedBytes: staged.totalBytes,
@@ -1417,7 +1428,7 @@ export async function composeWithAttachments(
   }
 
   const outcome = await append(built.bytes);
-  await releaseStagedAttachments(env, staged.keys, outcome.appended);
+  await releaseStagedAttachments(env, userId, staged.keys, outcome.appended);
 
   return {
     built,
@@ -1809,6 +1820,7 @@ export function registerMailTools(
         // `composeWithAttachments` for why the ordering is the correctness.
         const composed = await composeWithAttachments(
           env,
+          actor.userId,
           attachmentIds ?? [],
           (attachments) =>
             buildDraft({
@@ -2044,6 +2056,7 @@ export function registerMailTools(
         // storage round trip.
         const composed = await composeWithAttachments(
           env,
+          actor.userId,
           attachmentIds ?? [],
           (attachments) =>
             buildDraft({
@@ -2415,6 +2428,7 @@ export function registerMailTools(
           return uploadUrlToolResult(
             await mintUploadGrant(
               env,
+              actor.userId,
               { filename, mimeType, sizeBytes },
               Date.now(),
             ),
@@ -2435,6 +2449,7 @@ export function registerMailTools(
           // opens a socket, and the whole operation is one storage write.
           const inline = await stageInlineBytes(
             env,
+            actor.userId,
             { base64, filename, mimeType: mimeType ?? null },
             Date.now(),
           );
@@ -2470,6 +2485,7 @@ export function registerMailTools(
         const content = await getAttachmentContent(actor, gate, ref);
         const outcome = await stageAttachmentContent(
           env,
+          actor.userId,
           content,
           filename ?? null,
           Date.now(),
@@ -2538,10 +2554,17 @@ export function registerMailTools(
     },
     async ({ uploadId, sizeBytes }) => {
       try {
-        // This tool opens no session, so the resolved value goes unused. The
-        // await stays so every mail tool answers a refused principal the same
-        // way, and none works for a caller the others turn away.
-        await principal;
+        // This tool still opens no session — nothing below it logs in. What
+        // changed is that the resolved value is no longer unused: the store
+        // call further down has to know WHO is asking, so the id travels to it
+        // as an argument. The await was already here for the other reason, and
+        // that reason stands unaltered: every mail tool answers a refused
+        // principal the same way, and none works for a caller the others turn
+        // away. This comment is rewritten rather than deleted because its first
+        // sentence stopped being true in plan 10-02, and a reader who finds the
+        // await with no explanation will assume one of the two reasons and act
+        // on the wrong one.
+        const actor = await principal;
         const nowMs = Date.now();
 
         // Decoded before anything is read, exactly as every other tool in this
@@ -2555,6 +2578,7 @@ export function registerMailTools(
         // delete, and no socket.
         const outcome = await confirmStagedUpload(
           env,
+          actor.userId,
           ref.key,
           sizeBytes,
           nowMs,

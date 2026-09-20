@@ -138,7 +138,7 @@ afterEach(() => {
 
 describe("key shapes today, one pin per store", () => {
   it("R2, binding side: staging/{16 hex}-{name}-{ms}", () => {
-    const key = stagingKeyFor("Resume-2026.pdf", NOW);
+    const key = stagingKeyFor(USER_A.userId, "Resume-2026.pdf", NOW);
 
     expect(key, "no key was built").not.toBeNull();
     expect(String(key)).toMatch(
@@ -152,7 +152,7 @@ describe("key shapes today, one pin per store", () => {
   });
 
   it("R2, presigned ingress: staging/upload-{16 hex}-{ms}", () => {
-    const key = presignedKeyFor(NOW);
+    const key = presignedKeyFor(USER_A.userId, NOW);
 
     expect(key, "no key was built").not.toBeNull();
     expect(String(key)).toMatch(/^staging\/upload-[0-9a-f]{16}-1776000000000$/);
