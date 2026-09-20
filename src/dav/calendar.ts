@@ -554,6 +554,14 @@ function collectionsFrom(
  * no benefit at all. `./discovery.ts` passes an empty header set for the same
  * reason, and this follows it.
  *
+ * IT TAKES NEITHER THE ENVIRONMENT NOR THE PRINCIPAL (code review WR-05). It
+ * used to take both and read neither. `noUnusedParameters` is off, so nothing
+ * said so, and a reader had to open the body to learn the principal meant
+ * nothing here — while the CardDAV twin, `fetchBooks` in `./contacts.ts`, took
+ * neither. Two halves of one job disagreeing about their own signature is what
+ * makes this one read as principal-scoped when it is not. It is not: the
+ * request is made for whoever `davFetch` was built for.
+ *
  * **Collection enumeration is not cached, deliberately.** The KV entry holds
  * discovery only — the root, principal and home URLs — and PROJECT.md's "local
  * caching is not a product feature" constraint is what keeps it that way. The
@@ -561,8 +569,6 @@ function collectionsFrom(
  * dominant share of the wall clock, and every `listEvents` call pays it.
  */
 async function fetchCollections(
-  env: Env,
-  principal: Principal,
   davFetch: DavFetch,
   resolved: ResolvedDavAccount,
 ): Promise<Collection[]> {
@@ -598,7 +604,7 @@ export async function listCalendars(
   davFetch: DavFetch,
 ): Promise<CalendarListing> {
   return withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
-    const collections = await fetchCollections(env, principal, davFetch, resolved);
+    const collections = await fetchCollections(davFetch, resolved);
 
     return {
       calendars: collections.map((one) => ({
@@ -1037,7 +1043,7 @@ async function pagedEvents(
   const pageSize = clampPageSize(options.pageSize);
 
   return withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
-    const collections = await fetchCollections(env, principal, davFetch, resolved);
+    const collections = await fetchCollections(davFetch, resolved);
 
     // The INTERSECTION of the decoded id with the account's own enumeration,
     // and it is the reason `collectFrom`'s request needs no separate containment
@@ -1492,7 +1498,7 @@ export async function findFreeSlots(
   const stepSeconds = SLOT_GRANULARITY_MINUTES * 60;
 
   return withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
-    const collections = await fetchCollections(env, principal, davFetch, resolved);
+    const collections = await fetchCollections(davFetch, resolved);
 
     // ONE allowance for the WHOLE multi-calendar sweep (WR-01, widened from "one
     // per page" to "one per sweep"): the cost the caller pays is the sweep, and a
