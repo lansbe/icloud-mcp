@@ -47,6 +47,16 @@ const OTHER_SECRET = "a-different-test-signing-key-not-real";
 const USER = "1111111111111111111111111111111111111111111111111111111111111111";
 
 /**
+ * A DIFFERENT signed-in user. Same shape, and nothing else in common.
+ *
+ * Used only where a case needs a confirmation minted for somebody other than
+ * the caller presenting it — which is the cause the token's user field exists
+ * to refuse.
+ */
+const OTHER_USER =
+  "2222222222222222222222222222222222222222222222222222222222222222";
+
+/**
  * Freeze the clock at a whole second.
  *
  * `Date.now` is spied rather than the whole timer set faked, because the module
@@ -315,6 +325,59 @@ describe("the confirmation token cannot be forged or tampered with", () => {
       ConfirmationInvalidError,
     );
   });
+
+  it("refuses a version 1 token outright, whether or not it names a user", async () => {
+    // Version 1 is the format this build REPLACED, and the claim being made is
+    // sharper than "an old token is refused": a v1 token must never be read as
+    // a v2 whose user field happens to be missing, because a confirmation
+    // nobody can say belongs to anyone is exactly the thing the field was
+    // added to stop.
+    //
+    // Two tokens, because the realistic one is refused by TWO independent
+    // checks and a case resting on whichever runs first would prove less than
+    // it looks:
+    //
+    //   the real v1 shape — ten fields, no user at all. The payload predicate
+    //   refuses it on the missing field, and the version check would too.
+    //   a v1 that DOES name a user — eleven fields with the version set back.
+    //   The predicate passes it, so only the strict version comparison can
+    //   refuse it, which is the claim on its own.
+    //
+    // Sealed by hand rather than minted, because the minter takes a payload of
+    // the CURRENT type and a v1 payload is not one.
+    const withoutUser: Record<string, unknown> = { ...payload() };
+    delete withoutUser.u;
+    withoutUser.v = 1;
+    const withUser: Record<string, unknown> = { ...payload(), v: 1 };
+
+    for (const stale of [withoutUser, withUser]) {
+      const token = await sealAs(
+        toBase64Url(TOKEN_ENCODER.encode(JSON.stringify(stale))),
+        SECRET,
+      );
+
+      await expect(
+        verifyConfirmation(token, SECRET, USER),
+      ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+    }
+  });
+
+  it("refuses a token minted for a different user, presented by this one", async () => {
+    // The whole point of the field, asserted on its own rather than only
+    // inside the table below. The seal verifies, the version is current, the
+    // lifetime has not run out and the payload is well formed — the ONLY thing
+    // wrong with this token is who it was minted for.
+    const token = await mintConfirmation(payload({ u: OTHER_USER }), SECRET);
+
+    await expect(verifyConfirmation(token, SECRET, USER)).rejects.toBeInstanceOf(
+      ConfirmationInvalidError,
+    );
+    // And the same token still works for the user it WAS minted for, which is
+    // the half that stops the check passing by refusing everybody.
+    expect(await verifyConfirmation(token, SECRET, OTHER_USER)).toMatchObject({
+      u: OTHER_USER,
+    });
+  });
 });
 
 // ===========================================================================
@@ -409,19 +472,25 @@ describe("the HMAC key is write-only", () => {
 
 describe("every refusal on the verify path answers identically", () => {
   /**
-   * The six causes `verifyConfirmation` can raise, LISTED BY NAME.
+   * The seven causes `verifyConfirmation` can raise, LISTED BY NAME.
    *
    * Named rather than generated, on the same non-vacuity discipline
    * `test/dav-tools.test.ts`'s stranger-authored walk uses: a helper that
    * quietly stopped producing one of these would otherwise make the loop below
-   * run over five and still pass. The count assertion is what says so.
+   * run over six and still pass. The count assertion is what says so.
    *
-   * These are the six the NEUTRAL module owns. The DAV commit handler's own
-   * six — which add a change that does not match and one already spent, and
-   * fold several of these together — are a different list reaching the same
+   * The seventh is the wrong user, and it is on this list rather than only in
+   * a case of its own for a reason the others share: a refusal that named its
+   * cause would tell whoever probed the format which guess was well formed.
+   * The user check is the one most worth proving that about, because it is the
+   * one an attacker is actively guessing at.
+   *
+   * These are the seven the NEUTRAL module owns. The DAV commit handler's own
+   * list — which adds a change that does not match and one already spent, and
+   * folds several of these together — is a different list reaching the same
    * answer; `reserveConfirmation` is asserted against that answer separately.
    */
-  async function sixCauses(): Promise<[string, Promise<unknown>][]> {
+  async function sevenCauses(): Promise<[string, Promise<unknown>][]> {
     const now = 1_800_000_000;
     freezeClockAt(now);
     const token = await mintConfirmation(payload(), SECRET);
@@ -464,10 +533,18 @@ describe("every refusal on the verify path answers identically", () => {
           USER,
         ),
       ],
+      [
+        "a confirmation minted for a different user",
+        verifyConfirmation(
+          await mintConfirmation(payload({ u: OTHER_USER }), SECRET),
+          SECRET,
+          USER,
+        ),
+      ],
     ];
   }
 
-  it("exercises exactly the six causes that exist, named one by one", async () => {
+  it("exercises exactly the seven causes that exist, named one by one", async () => {
     const causes = await causeResults();
 
     expect(causes.map(([label]) => label)).toEqual([
@@ -477,6 +554,7 @@ describe("every refusal on the verify path answers identically", () => {
       "a payload that is not JSON",
       "a version this build does not know",
       "a lifetime that has run out",
+      "a confirmation minted for a different user",
     ]);
     // Every one of them actually threw. A cause that resolved instead would be
     // a branch this suite believes it covers and does not.
@@ -485,7 +563,7 @@ describe("every refusal on the verify path answers identically", () => {
     }
   });
 
-  it("gives one message, one name and one property set across all six", async () => {
+  it("gives one message, one name and one property set across all seven", async () => {
     const causes = await causeResults();
     const errors = causes.map(([, err]) => err as Error);
 
@@ -499,8 +577,8 @@ describe("every refusal on the verify path answers identically", () => {
   });
 
   async function causeResults(): Promise<[string, unknown][]> {
-    const causes = await sixCauses();
-    expect(causes).toHaveLength(6);
+    const causes = await sevenCauses();
+    expect(causes).toHaveLength(7);
 
     const settled: [string, unknown][] = [];
     for (const [label, attempt] of causes) {
@@ -808,9 +886,9 @@ describe("the single-use reservation", () => {
   });
 
   it("refuses a spent token with the same error every other cause raises", async () => {
-    // The seventh producer of the class, and it must answer exactly as the six
-    // on the verify path do — a spent confirmation that looked different from a
-    // forged one would tell a caller which of the two it had.
+    // The EIGHTH producer of the class, and it must answer exactly as the
+    // seven on the verify path do — a spent confirmation that looked different
+    // from a forged one would tell a caller which of the two it had.
     const kv = fakeKv();
     await reserveConfirmation(kv.binding, USER, "same-answer", soon());
 
