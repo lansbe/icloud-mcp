@@ -313,6 +313,88 @@ export function createStallingDuplex(script: Uint8Array[]): FakeDuplex {
   );
 }
 
+/** A held-first-read duplex, and the one way to let its first read go. */
+export interface HeldFirstReadDuplex {
+  readonly duplex: FakeDuplex;
+  /** Let the first read complete. Safe to call more than once. */
+  release(): void;
+}
+
+/**
+ * A duplex whose FIRST read waits until the test says go, and which then
+ * replays `script` and closes cleanly, exactly as `createFakeDuplex` does.
+ *
+ * What this models is a server that is slow to greet: the connection is open,
+ * the session has asked for the greeting, and nothing has arrived yet. The
+ * greeting read is the first thing a session awaits, and it sits BEFORE the
+ * login write. So a session over this duplex is parked at a known point, having
+ * written nothing, until `release()` is called. That is what lets a test run a
+ * whole second session for another user in the gap and then look at what the
+ * parked one sends when it wakes.
+ *
+ * No existing fixture can express it. `createFakeDuplex` answers every read at
+ * once, so there is no gap to run anything in. `createSilentPeerDuplex` and
+ * `createStallingDuplex` hold a read with a promise nobody can resolve, so the
+ * parked session could never be woken.
+ *
+ * The high-water mark stays at 0, as it does for the scripted readable above
+ * and for the same reason. With a positive mark the stream would call `pull`
+ * ahead of any read, and "parked at the greeting read" would stop being a fact
+ * about the session and become a fact about the stream's buffering.
+ *
+ * `closed` is the resolvable one, not a never-settling one, so teardown after
+ * the release is the ordinary clean teardown and costs no timeout.
+ */
+export function createHeldFirstReadDuplex(
+  script: Uint8Array[],
+): HeldFirstReadDuplex {
+  const events: DuplexEvent[] = [];
+  const writes: Uint8Array[] = [];
+  let resolveClosed: () => void = () => {};
+  const closed = new Promise<void>((resolve) => {
+    resolveClosed = resolve;
+  });
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let index = 0;
+  let first = true;
+
+  const readable = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        if (first) {
+          first = false;
+          // The stream will not pull again while this is pending, so the
+          // session's read stays outstanding until the test releases it.
+          await held;
+        }
+        if (index < script.length) {
+          controller.enqueue(script[index]);
+          index += 1;
+          return;
+        }
+        events.push({ kind: "readable-done" });
+        controller.close();
+      },
+    },
+    { highWaterMark: 0 },
+  );
+
+  return {
+    duplex: assemble(
+      readable,
+      recordingWritable(events, writes),
+      closed,
+      () => resolveClosed(),
+      events,
+      writes,
+    ),
+    release: () => release(),
+  };
+}
+
 /**
  * A duplex that rejects on first use, modelling a connection that never
  * establishes.
