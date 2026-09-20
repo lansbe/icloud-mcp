@@ -172,10 +172,29 @@ export const CONFIRM_TTL_SECONDS = 300;
  * silently misread as the current one. The stored value carries nothing — the
  * KEY is the fact — so there is no payload to leak and no shape to misparse.
  *
- * `v2` because the user id now sits between this prefix and the jti. The jti is
- * a UUID and could not have collided across users anyway, so this is tidiness
- * rather than the fix: what actually refuses another user's confirmation is the
- * check inside `verifyConfirmation`, five checks ahead of the reservation.
+ * `v2` because the user id now sits between this prefix and the jti, and that
+ * id is a SECOND LAYER rather than tidiness.
+ *
+ * An earlier version of this comment said the opposite — that the jti is a UUID
+ * and could not have collided across users anyway, so the id here was
+ * housekeeping and the real fix was the check inside `verifyConfirmation`.
+ * Measurement retracted that (D-12, corrected by plan 10-04). Mutating the user
+ * check out of `verifyConfirmation` did NOT redden the slot-leak test, because
+ * the scoped key closes the slot half of audit row T1 on its own: a caller who
+ * reaches the reservation holding somebody else's confirmation burns a slot
+ * under their OWN id, and the owner's confirmation still spends. Reddening that
+ * test took a PAIR of mutations — the check moved after the reservation AND
+ * this key flattened back. Two independent layers, not one layer and a tidy-up.
+ *
+ * So flattening this key would reopen half of T1. Two things refuse that today
+ * and both are worth knowing, because neither is obvious from here: the key
+ * shape is pinned byte-for-byte in `test/key-shapes.test.ts`, and a key
+ * expression that does not put a user id straight after a prefix constant is
+ * what the `store-key-without-a-user` scan rule exists to reject — the flat
+ * form is that rule's own known-violating sample. What is NOT held is the
+ * reasoning: a reader who decides from this paragraph that the id is optional
+ * can change both of those to match. That is why the measurement is written
+ * down here rather than only in the phase record.
  */
 export const CONFIRM_KEY_PREFIX = "confirm:v2:";
 
