@@ -178,6 +178,18 @@ function goodPropsFor(user: TestUser): {
   return { v: 1, appleId: user.appleId, appPassword: user.appPassword };
 }
 
+/** `base` with one more own key, a symbol. Its enumerable string keys do not change. */
+function withSymbolKey(base: object): object {
+  return { ...base, [Symbol("extra")]: 1 };
+}
+
+/** `base` with one more own key that is not enumerable, so a key listing skips it. */
+function withHiddenKey(base: object, key: string, value: unknown): object {
+  const copy = { ...base };
+  Object.defineProperty(copy, key, { value, enumerable: false });
+  return copy;
+}
+
 /** A made-up password for the rows that need one. Not a real credential. */
 const ROW_PASSWORD = "cccc-cccc-cccc-cccc";
 
@@ -227,6 +239,28 @@ const BAD_PROPS: ReadonlyArray<readonly [string, unknown]> = [
   [
     "a good shape with one extra key, a user id supplied from outside",
     { ...goodPropsFor(USER_A), userId: USER_B.userId },
+  ],
+  // Code review WR-05. The module says a fourth key "of any kind, a hidden one
+  // or a symbol included" is refused, and that the three fields must be the
+  // object's own. Each claim rests on one clause, and before these rows no test
+  // held any of them: the clause could be deleted with the suite green.
+  //
+  // The first two are seen ONLY by the own-keys count. The enumerable key list
+  // of each is exactly the three good names.
+  ["a good shape with one extra symbol key", withSymbolKey(goodPropsFor(USER_A))],
+  [
+    "a good shape with one extra hidden key, a user id supplied from outside",
+    withHiddenKey(goodPropsFor(USER_A), "userId", USER_B.userId),
+  ],
+  // Every `in` check passes for these two, because `in` looks up the prototype
+  // chain. They are refused because the fields are not the object's OWN.
+  ["all three fields carried only on the prototype", Object.create(goodPropsFor(USER_A))],
+  [
+    "the password carried only on the prototype",
+    Object.assign(Object.create({ appPassword: USER_A.appPassword }), {
+      v: 1,
+      appleId: USER_A.appleId,
+    }),
   ],
 ];
 
@@ -629,9 +663,102 @@ describe("the props constructor fails closed (D-02, D-04)", () => {
     expect(NON_ASCII_ADDRESS.charCodeAt(2)).toBe(0xe9);
   });
 
+  it("builds the hidden-key, symbol-key and prototype rows the way their names say", () => {
+    // Code review WR-05. Each of these rows is meant to get past every check
+    // but one. If a row were refused for a plainer reason, such as a missing
+    // field, it would hold nothing in place. So each is shown to look exactly
+    // like the good shape to the checks it is meant to get past.
+    const goodKeys = ["appPassword", "appleId", "v"];
+    const row = (name: string): object => {
+      const found = BAD_PROPS.find(([rowName]) => rowName === name);
+      expect(found, `the row "${name}" is missing`).toBeDefined();
+      return found![1] as object;
+    };
+
+    for (const name of [
+      "a good shape with one extra symbol key",
+      "a good shape with one extra hidden key, a user id supplied from outside",
+    ]) {
+      const value = row(name);
+      expect(Object.keys(value).sort(), `${name}: the key listing`).toEqual(goodKeys);
+      expect(Reflect.ownKeys(value).length, `${name}: the own-key count`).toBe(4);
+      const fields = value as Record<string, unknown>;
+      expect(fields.v, `${name}: v`).toBe(1);
+      expect(fields.appleId, `${name}: the address`).toBe(USER_A.appleId);
+      expect(fields.appPassword, `${name}: the password`).toBe(USER_A.appPassword);
+    }
+
+    for (const name of [
+      "all three fields carried only on the prototype",
+      "the password carried only on the prototype",
+    ]) {
+      const value = row(name) as Record<string, unknown>;
+      for (const key of goodKeys) {
+        expect(key in value, `${name}: ${key} must be reachable`).toBe(true);
+      }
+      expect(value.v).toBe(1);
+      expect(value.appleId).toBe(USER_A.appleId);
+      expect(value.appPassword).toBe(USER_A.appPassword);
+      expect(
+        Object.prototype.hasOwnProperty.call(value, "appPassword"),
+        `${name}: the password must not be an own field`,
+      ).toBe(false);
+    }
+  });
+
   it.each(BAD_PROPS)("refuses %s with the auth error", async (_name, value) => {
-    await expect(principalFromProps(value)).rejects.toBeInstanceOf(
-      ImapAuthError,
+    const raised = await principalFromProps(value).then(
+      () => null,
+      (err: unknown) => err,
+    );
+    expect(raised).toBeInstanceOf(ImapAuthError);
+    expect(toErrorCategory(raised).category).toBe("auth_failed");
+  });
+
+  it("reads each field once, so a getter that changes its answer changes nothing", async () => {
+    // Code review WR-05. The module says each field is read once into a local
+    // and only the locals are used after the checks. This is the row that
+    // holds it. Each getter answers with user A's value the first time and
+    // user B's every time after. Code that checked one read and used another
+    // would check A and then sign in as B.
+    let addressReads = 0;
+    let passwordReads = 0;
+    const shifting = Object.defineProperties(
+      { v: 1 },
+      {
+        appleId: {
+          enumerable: true,
+          get: () => {
+            addressReads += 1;
+            return addressReads === 1 ? USER_A.appleId : USER_B.appleId;
+          },
+        },
+        appPassword: {
+          enumerable: true,
+          get: () => {
+            passwordReads += 1;
+            return passwordReads === 1 ? USER_A.appPassword : USER_B.appPassword;
+          },
+        },
+      },
+    );
+    // The object passes the shape checks: three own enumerable keys.
+    expect(Object.keys(shifting).sort()).toEqual(["appPassword", "appleId", "v"]);
+    expect(Reflect.ownKeys(shifting).length).toBe(3);
+
+    const principal = await principalFromProps(shifting);
+
+    expect(addressReads, "the address was read more than once").toBe(1);
+    expect(passwordReads, "the password was read more than once").toBe(1);
+    expect(principal.appleId).toBe(USER_A.appleId);
+    expect(principal.userId).toBe(USER_A.userId);
+    expect(passwordOf(principal)).toBe(USER_A.appPassword);
+
+    // The control. The getters really do change their answer, so "A came out"
+    // above is the code reading once and not the getters standing still.
+    expect((shifting as unknown as { appleId: string }).appleId).toBe(USER_B.appleId);
+    expect((shifting as unknown as { appPassword: string }).appPassword).toBe(
+      USER_B.appPassword,
     );
   });
 
