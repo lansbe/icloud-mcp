@@ -208,7 +208,9 @@ export const FORBIDDEN = [
   //   - the prefix increment and decrement, which is its own arm because the
   //     operator comes BEFORE the name. That arm needs an accessor right after
   //     the name with no space, so a command-line flag spelled with two dashes
-  //     and this name is not a hit;
+  //     and this name is not a hit when a space, an equals sign or the end of
+  //     the string follows the name. A flag with a DOTTED suffix is a hit: see
+  //     the over-match section below;
   //   - a computed key that itself holds one level of square brackets.
   // Every one of these refuses more and none refuses less. Each has its own
   // sample row in ENV_WRITE_FORMS in test/forbidden-tokens.test.ts.
@@ -261,6 +263,20 @@ export const FORBIDDEN = [
   // titles -- "a write onto the environment object" -- and never by example.
   // This comment does exactly that.
   //
+  // TWO MORE, FROM THE PREFIX ARM (second code review, IN-05). That arm opens on
+  // two dashes, allows a space, then wants the name and an accessor. So it also
+  // fires on:
+  //   - a double dash used as PUNCTUATION in a comment or a string, right in
+  //     front of a plain read of a field on this object. Nothing in such a line
+  //     spells a write out, so "describe it by role" does not help its author:
+  //     the line already does. The plain fix is a different dash, or a word
+  //     between the dash and the name;
+  //   - a command-line flag spelled with two dashes, this name, a dot and a
+  //     suffix. Pass the value as its own argument instead.
+  // Both stay, for the same reason as the three above: a pattern cannot tell a
+  // decrement from a dash, and a rule that skipped comments and strings would
+  // skip real code held in a template.
+  //
   // That is a recorded choice and not a bug to fix. Anchoring on the object
   // would need the rule to know which object a name refers to, and a pattern
   // cannot. A dotted-path exception would also hide a write through any holder
@@ -277,7 +293,7 @@ export const FORBIDDEN = [
     id: "env-assignment",
     pattern:
       /\benv\b(?:\s+as\s+[^)\n]{1,80}\))?(?:(?:\s*!)?\s*(?:\.\s*[A-Za-z_$][\w$]*|\[[^\]\n]*\]|\[[^\[\]\n]*(?:\[[^\[\]\n]*\][^\[\]\n]*)+\]))+\s*(?:(?:\*\*|<<|>>>?|&&|\|\||\?\?|[-+*\/%&|^])?=(?![=>])|\+\+|--)|(?<![\w$)\]+\-])(?:\+\+|--)[ \t]*\(?[ \t]*(?:[\w$]+\.)*env\b(?:\s+as\s+[^)\n]{1,80}\))?!?(?:\.[A-Za-z_$]|\[)|\bObject\.assign\s*\(\s*(?:[\w$]+\.)*env\b/g,
-    why: "A write onto the environment object: a member assignment, an index assignment, an increment or decrement, or an object merge with it as the target, with or without a type cast or a non-null mark in front of the accessor. That object is shared by every test in a file and every request in an isolate, so a write onto it is how one user's identity leaks into another test or another request. Build a fresh copy with the two account fields overridden instead. The rule matches the word and reads text, so it also fires on a write onto the Node process's environment table or the build tool's, and on a comment or string that spells the write out. If that is what happened, set the variable from outside the script or pass a fresh copy, or describe the form by role in the comment. Do not loosen this rule.",
+    why: "A write onto the environment object: a member assignment, an index assignment, an increment or decrement, or an object merge with it as the target, with or without a type cast or a non-null mark in front of the accessor. That object is shared by every test in a file and every request in an isolate, so a write onto it is how one user's identity leaks into another test or another request. Build a fresh copy with the two account fields overridden instead. The rule matches the word and reads text, so it also fires on a write onto the Node process's environment table or the build tool's, and on a comment or string that spells the write out. If that is what happened, set the variable from outside the script or pass a fresh copy, or describe the form by role in the comment. It also fires on a double dash used as punctuation right before a read of a field on this object, and on a command-line flag made of two dashes, this name, a dot and a suffix. If that is what happened, use a different dash or put a word between, or pass the flag's value as its own argument. Do not loosen this rule.",
   },
 
   // -------------------------------------------------------------- concurrency

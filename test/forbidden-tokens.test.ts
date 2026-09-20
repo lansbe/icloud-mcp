@@ -1219,6 +1219,55 @@ describe("the patterns have teeth", () => {
     expect(rule.why).toContain("Do not loosen this rule");
   });
 
+  it("fires on a double dash used as punctuation and on a dotted flag, and that is a recorded choice", () => {
+    // Second code review, IN-05. Every line here is INNOCENT, and none of them
+    // spells a write out. The prefix arm opens on two dashes, allows a space,
+    // then wants the name and an accessor, so a dash used as punctuation right
+    // in front of a plain read looks the same to it as a prefix decrement. The
+    // over-match is kept on purpose, and this test is what makes it a known
+    // limit rather than a surprise.
+    //
+    // If this goes red, someone narrowed the rule. The fix for an innocent hit
+    // is a different dash, a word between the dash and the name, or the flag's
+    // value passed as its own argument. Never make the rule see less.
+    const rule = FORBIDDEN.find((r) => r.id === "env-assignment")!;
+    const innocentButRefused: ReadonlyArray<readonly [string, string]> = [
+      [
+        "a double dash as punctuation before a read, in a comment",
+        "// the binding is absent -- env.APPLE_ID reads as undefined",
+      ],
+      [
+        "the same before the first of two reads",
+        "// two cases -- env.MODE set, and env.MODE unset",
+      ],
+      [
+        "the same inside a string",
+        'const note = "unset binding -- env.APPLE_ID is undefined";',
+      ],
+      ["a flag with a dotted suffix", 'const args = ["deploy", "--env.staging"];'],
+    ];
+    expect(innocentButRefused.length).toBe(4);
+    for (const [shape, line] of innocentButRefused) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(fresh.test(line), `the rule no longer fires on ${shape}: it was narrowed`).toBe(true);
+    }
+
+    // The advice the reason text gives really does clear the line. Each of
+    // these is one of the rows above with that advice applied.
+    for (const reworded of [
+      "// the binding is absent, so env.APPLE_ID reads as undefined",
+      "// the binding is absent -- then env.APPLE_ID reads as undefined",
+      'const args = ["deploy", "--env", "staging"];',
+    ]) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(fresh.test(reworded), `the advice did not clear: ${reworded}`).toBe(false);
+    }
+
+    // The hook prints the reason text, so it has to tell the author what to do.
+    expect(rule.why).toContain("use a different dash");
+    expect(rule.why).toContain("Do not loosen this rule");
+  });
+
   it("holds both new rules in every scanned directory, driven through the scanner's own matcher", () => {
     // Not `rule.scope === undefined`: that would restate the scanner's prefix
     // logic here and pass even if `matchRule` grew a default scope. Driving the
