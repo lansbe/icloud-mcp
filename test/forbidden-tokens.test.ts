@@ -392,6 +392,29 @@ describe("the patterns have teeth", () => {
     expect(EXCLUDED.has("src/mail/compose.ts")).toBe(false);
   });
 
+  it("fires the store-key rule when anything at all sits between the prefix and the id", () => {
+    // The rule's own first paragraph says the user id must come straight after
+    // the prefix constant and that nothing may sit between the two. The
+    // lookahead used to open with `\s*`, which is OUTSIDE the interpolation and
+    // so matched literal template characters — both rows below passed the scan
+    // while building a key with a space or a newline in the middle of it. No
+    // cross-user leak, since the id is still there, but the rule proved less
+    // than it claimed, and a rule believed to prove more than it does is worse
+    // than one whose limits are written down. These rows are what keeps the
+    // gap shut: put the `\s*` back and both go red.
+    const rule = FORBIDDEN.find((r) => r.id === "store-key-without-a-user")!;
+    const fires = (sample: string): boolean =>
+      new RegExp(rule.pattern.source, rule.pattern.flags).test(sample);
+
+    for (const sample of [
+      "const key = `${CONFIRM_KEY_PREFIX} ${userId}:${jti}`;",
+      "const key = `${CONFIRM_KEY_PREFIX}\n${userId}:${jti}`;",
+      "const key = `${STAGING_PREFIX} ${principal.userId}/x`;",
+    ]) {
+      expect(fires(sample), `missed a gap before the id in ${sample}`).toBe(true);
+    }
+  });
+
   it("does not fire on the port and transport mode this project actually uses", () => {
     const permitted = 'connect({ hostname: h, port: 993 }, { secureTransport: "on" });';
     for (const rule of FORBIDDEN) {
