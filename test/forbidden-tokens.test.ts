@@ -2142,9 +2142,33 @@ describe("the single reader of the grant's props is a count constraint too (Phas
       "const grant = ctx?.props;",
       "return this.ctx.props;",
       " * `ctx.props` with it.",
+      // Code review WR-03. The shapes the bare-dot text missed. The non-null
+      // mark is the one that mattered: it is the natural spelling for a
+      // context parameter typed as possibly absent, and there is no compiler
+      // backstop on this count.
+      "const grant = ctx!.props;",
+      "const grant = ctx\n  .props;",
+      "const grant = ctx\n  ?.props;",
+      "const grant = ctx ! . props;",
     ]) {
       expect(fires(sample), `missed ${sample}`).toBe(true);
     }
+  });
+
+  it("agrees with the mail-secret count about the member access (code review WR-03)", () => {
+    // The two were written in the same phase and disagreed for no reason. A
+    // difference between them is a difference nobody decided, so it is pinned
+    // here rather than left to be noticed. The text is written out, so this
+    // cannot pass by reading one pattern twice.
+    const SHARED_MEMBER_ACCESS = "\\s*(?:[?!]\\s*)?\\.\\s*";
+    expect(
+      PROPS_READER.source.includes(SHARED_MEMBER_ACCESS),
+      "the props count no longer spells the shared member access",
+    ).toBe(true);
+    expect(
+      MAIL_SECRET_READ.source.includes(SHARED_MEMBER_ACCESS),
+      "the mail-secret count no longer spells the shared member access",
+    ).toBe(true);
   });
 
   it("matches a call to the auth context reader, the other way to the same props", () => {
@@ -2192,6 +2216,9 @@ describe("the single reader of the grant's props is a count constraint too (Phas
       "const { props } = ctx;",
       "const grant = context.props;",
       'const grant = ctx["props"];',
+      // Code review WR-03. The cast puts the cast keyword between the name and
+      // the dot, so the widened member access still cannot reach it.
+      "const grant = (ctx as ExecutionContext).props;",
     ]) {
       expect(fires(sample), `now sees ${sample}`).toBe(false);
     }
@@ -2432,6 +2459,13 @@ describe("the one reader of the two mail secrets is a count constraint too (Phas
       "return this.env.APPLE_ID;",
       "if (!isConfiguredSecret(env.APPLE_APP_PASSWORD)) return;",
       " * reads `env.APPLE_ID` before anything else.",
+      // Code review WR-03. The shapes the bare-dot text missed, and the reason
+      // this count and the props count now spell the member access the same
+      // way.
+      "const appleId = env?.APPLE_ID;",
+      "const appleId = env!.APPLE_ID;",
+      "const appleId = env\n  .APPLE_ID;",
+      "const appleId = env ! . APPLE_APP_PASSWORD;",
     ]) {
       expect(fires(sample), `missed ${sample}`).toBe(true);
     }
@@ -2476,6 +2510,9 @@ describe("the one reader of the two mail secrets is a count constraint too (Phas
     for (const sample of [
       "const { APPLE_ID } = env;",
       'const value = env["APPLE_ID"];',
+      // Code review WR-03. The cast puts the cast keyword between the name and
+      // the dot, so the widened member access still cannot reach it.
+      "const value = (env as MailSecrets).APPLE_ID;",
     ]) {
       expect(fires(sample), `now sees ${sample}`).toBe(false);
     }

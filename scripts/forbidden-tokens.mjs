@@ -829,21 +829,41 @@ export const SUBSCRIPTION_FEED_FETCH_SCOPE = "src/feed/";
  * the two drift. Zero is as much a violation as two.
  *
  * TWO ARMS. The first is the props member read off an identifier named `ctx`,
- * bounded as whole words, with the optional-chaining form included. The second
- * is a call to the auth context reader, `getMcpAuthContext`. Phase 9 D-08 says
- * the factory never calls it, and spike S1 showed it is the other way to reach
- * the same props. The second arm goes beyond D-22's wording. It only refuses
- * more, and it had zero hits under `src/` when it was added. To drop it,
- * delete that one arm here and its two rows in the test.
+ * bounded as whole words, with the optional-chaining form and the non-null mark
+ * included. The second is a call to the auth context reader,
+ * `getMcpAuthContext`. Phase 9 D-08 says the factory never calls it, and spike
+ * S1 showed it is the other way to reach the same props. The second arm goes
+ * beyond D-22's wording. It only refuses more, and it had zero hits under `src/`
+ * when it was added. To drop it, delete that one arm here and its two rows in
+ * the test.
+ *
+ * THE MEMBER ACCESS MATCHES WHAT `MAIL_SECRET_READ` MATCHES (code review
+ * WR-03). The two counts were written in the same phase and disagreed for no
+ * reason: this one allowed white space around the dot and an optional question
+ * mark, that one allowed neither. Both now allow white space, a new line, an
+ * optional question mark and an optional non-null mark on either side of the
+ * dot. THE MARK OWNS THE WHITE SPACE BEHIND IT, as one optional group, for the
+ * reason the environment-write rule spells out at length further up this file:
+ * split into two optional white-space runs, a space before the dot could be
+ * taken by either, which is two ways to match every link and a cost that
+ * doubles per link. Do not split that group into two optional pieces.
+ *
+ * The non-null mark is the one that mattered here: a context parameter
+ * typed as possibly absent is written that way by the compiler's own prompting,
+ * and there is no compiler backstop on this count, so a second reader spelled
+ * that way was invisible. Keep the two member accesses identical. A difference
+ * between them is a difference nobody decided.
  *
  * WHAT IT DOES NOT SEE. Each of these reads the props and fires nothing:
  *
  *   1. props destructured from the context (`const { props } = ctx`);
  *   2. the context under another name (`context.props`, `executionCtx.props`);
  *   3. a props read hidden behind a helper that lives in the owner file and is
- *      called from elsewhere.
+ *      called from elsewhere;
+ *   4. a type cast in parentheses around the context, which puts the cast
+ *      keyword between the name and the dot.
  *
- * A computed member (`ctx["props"]`) is a fourth. A count believed to prove
+ * A computed member (`ctx["props"]`) is a fifth. A count believed to prove
  * more than it does is worse than one whose limits are written down.
  *
  * NEVER MATCH THE BARE WORD. The DAV library uses `props` all over `src/dav/`
@@ -862,7 +882,8 @@ export const SUBSCRIPTION_FEED_FETCH_SCOPE = "src/feed/";
  * grant's props" and never the spelled read. No `g` flag: `scan()` uses
  * `String.prototype.search`, which takes the first match only.
  */
-export const PROPS_READER = /\bctx\s*\??\.\s*props\b|\bgetMcpAuthContext\s*\(/;
+export const PROPS_READER =
+  /\bctx\s*(?:[?!]\s*)?\.\s*props\b|\bgetMcpAuthContext\s*\(/;
 
 /** The one file under `PROPS_READER_SCOPE` permitted to match `PROPS_READER`. */
 export const PROPS_READER_OWNER = "src/mcp/api-handler.ts";
@@ -959,14 +980,27 @@ export const PASSWORD_READER_SCOPE = "src/";
  * the two mail secrets only, and a row in the test pins the gate's secret as a
  * miss so nobody adds it later by accident.
  *
+ * THE MEMBER ACCESS MATCHES WHAT `PROPS_READER` MATCHES (code review WR-03).
+ * The two counts were written in the same phase and disagreed for no reason:
+ * that one allowed white space around the dot and an optional question mark,
+ * this one allowed neither, so the optional-chaining form, the non-null mark
+ * and a read broken across two lines by the formatter all fired nothing. Both
+ * now allow white space, a new line, an optional question mark and an optional
+ * non-null mark on either side of the dot, with the mark owning the white space
+ * behind it as one optional group (see `PROPS_READER` for why that grouping is
+ * not a style choice). Keep the two identical. A difference between them is a
+ * difference nobody decided.
+ *
  * WHAT IT DOES NOT SEE. Each of these reads a mail secret and fires nothing:
  *
  *   1. a destructuring of the environment object (`const { APPLE_ID } = env`);
  *   2. an index access with the name as a string (`env["APPLE_ID"]`);
  *   3. an alias of the environment object under another name (`e.APPLE_ID`);
- *   4. a narrow-typed parameter under another name (`secrets.APPLE_ID`).
+ *   4. a narrow-typed parameter under another name (`secrets.APPLE_ID`);
+ *   5. a type cast in parentheses around the environment object, which puts
+ *      the cast keyword between the name and the dot.
  *
- * The compiler is the FIRST check for all four (Phase 9 D-14). The three secret
+ * The compiler is the FIRST check for all five (Phase 9 D-14). The three secret
  * names left the shared binding type, so a stray reader does not compile at all,
  * and `test/env-narrowing.test.ts` pins that with expect-error lines. This count
  * is the SECOND check, and it exists because the compiler sees types while this
@@ -984,7 +1018,8 @@ export const PASSWORD_READER_SCOPE = "src/";
  * flag: `scan()` uses `String.prototype.search`, which takes the first match
  * only.
  */
-export const MAIL_SECRET_READ = /\benv\.(?:APPLE_ID|APPLE_APP_PASSWORD)\b/;
+export const MAIL_SECRET_READ =
+  /\benv\s*(?:[?!]\s*)?\.\s*(?:APPLE_ID|APPLE_APP_PASSWORD)\b/;
 
 /** The one file under `MAIL_SECRET_READ_SCOPE` permitted to match
  *  `MAIL_SECRET_READ`. */
