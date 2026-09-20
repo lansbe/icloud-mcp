@@ -213,6 +213,12 @@ export const FORBIDDEN = [
   // Every one of these refuses more and none refuses less. Each has its own
   // sample row in ENV_WRITE_FORMS in test/forbidden-tokens.test.ts.
   //
+  // EVERY ARM OF THE COMPOUND-OPERATOR GROUP HAS ITS OWN SAMPLE ROW TOO (code
+  // review WR-04), in ENV_COMPOUND_OPERATORS in the same test file. An arm with
+  // no sample can be deleted with the whole suite still green, because the
+  // set-equality guard works at the rule level and cannot see inside a group.
+  // Adding an operator here means adding its row there.
+  //
   // WHAT IT DOES NOT AND CANNOT SEE. The delete form. The property-definition
   // call and the reflective set call. An alias of the object, written through
   // under another name. A destructuring assignment. A bare rebinding of a local

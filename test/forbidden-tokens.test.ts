@@ -1049,6 +1049,67 @@ describe("the patterns have teeth", () => {
     }
   });
 
+  /** Every compound operator the rule's operator group carries. Hand-written,
+   *  never read from the pattern.
+   *
+   *  Code review WR-04. The first version of this file held a row for two of
+   *  these and none for the rest, so deleting any other arm of the group left
+   *  the whole suite green. An arm with no sample is invisible to every other
+   *  assertion here, the rule-level set-equality included. One row per arm.
+   *
+   *  The two shift operators that share an arm in the pattern each get a row,
+   *  because that arm has an optional third character and either half of it can
+   *  be deleted on its own. */
+  const ENV_COMPOUND_OPERATORS = [
+    "**",
+    "<<",
+    ">>",
+    ">>>",
+    "&&",
+    "||",
+    "??",
+    "-",
+    "+",
+    "*",
+    "/",
+    "%",
+    "&",
+    "|",
+    "^",
+  ];
+
+  /** A compound write onto the object, with the operator substituted in. */
+  const compoundWriteWith = (operator: string) => `env.RETRY_BUDGET ${operator}= other;`;
+
+  it("refuses a compound write onto the env object for every operator, one row per arm", () => {
+    const rule = FORBIDDEN.find((r) => r.id === "env-assignment")!;
+    expect(ENV_COMPOUND_OPERATORS.length, "every compound assignment operator").toBe(15);
+    expect(new Set(ENV_COMPOUND_OPERATORS).size, "an operator is listed twice").toBe(
+      ENV_COMPOUND_OPERATORS.length,
+    );
+    for (const operator of ENV_COMPOUND_OPERATORS) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(
+        fresh.test(compoundWriteWith(operator)),
+        `the ${operator}= arm is missing from the operator group`,
+      ).toBe(true);
+    }
+  });
+
+  it("does not fire the compound template on a comparison, so the loop above has teeth", () => {
+    // Guards the guard. If the template matched whatever was substituted in,
+    // the per-operator loop would prove nothing. These six are comparisons
+    // spelled through the same template, and none is a write.
+    const rule = FORBIDDEN.find((r) => r.id === "env-assignment")!;
+    for (const comparison of ["=", "==", "!", "!=", "<", ">"]) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(
+        fresh.test(compoundWriteWith(comparison)),
+        `the template matched for ${comparison}=, which is a comparison`,
+      ).toBe(false);
+    }
+  });
+
   it("does not fire on a read, a comparison, a declaration or a copy of the env object", () => {
     // Every rule, not only the new one, in the style of the permitted-line
     // loops above: a false positive in ANY rule shows here. A rule that banned
