@@ -1065,6 +1065,34 @@ describe("the patterns have teeth", () => {
     }
   });
 
+  it("fires on a write onto another environment table and on a comment, and that is a recorded choice", () => {
+    // Code review WR-03. Every line here is INNOCENT: none writes onto the
+    // Worker's environment object. The rule fires on all of them anyway,
+    // because it is anchored on the word and reads text, not syntax. That
+    // over-match is kept on purpose, and this test is what makes it a known
+    // limit rather than a surprise.
+    //
+    // If this goes red, someone narrowed the rule. The fix for an innocent hit
+    // is to set the variable from outside the script, pass a fresh copy, or
+    // describe the form by role in the comment. Never make the rule see less.
+    const rule = FORBIDDEN.find((r) => r.id === "env-assignment")!;
+    const innocentButRefused: ReadonlyArray<readonly [string, string]> = [
+      ["a write onto the Node process's table", 'process.env.NODE_ENV = "test";'],
+      ["a write onto the build tool's table", 'import.meta.env.MODE = "x";'],
+      ["a comment that spells the write out", "// before: env.APPLE_ID = userB.appleId"],
+      ["a string that spells the write out", 'const hint = "do not write env.APPLE_ID = x";'],
+    ];
+    expect(innocentButRefused.length).toBe(4);
+    for (const [shape, line] of innocentButRefused) {
+      const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+      expect(fresh.test(line), `the rule no longer fires on ${shape}: it was narrowed`).toBe(true);
+    }
+
+    // The hook prints the reason text, so it has to tell the author what to do.
+    expect(rule.why).toContain("describe the form by role");
+    expect(rule.why).toContain("Do not loosen this rule");
+  });
+
   it("holds both new rules in every scanned directory, driven through the scanner's own matcher", () => {
     // Not `rule.scope === undefined`: that would restate the scanner's prefix
     // logic here and pass even if `matchRule` grew a default scope. Driving the

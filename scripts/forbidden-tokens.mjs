@@ -225,6 +225,31 @@ export const FORBIDDEN = [
   // today. These are evasions rather than accidents, and this rule is aimed at
   // the accident. Naming the gaps here is what stops a later reader believing
   // the rule proves more than it does.
+  //
+  // WHAT IT SEES BY MISTAKE, AND WHY THAT STAYS (code review WR-03). The rule
+  // is anchored on the WORD and not on the object, and it reads text, not
+  // syntax. Three innocent shapes are refused:
+  //   - a write onto the Node process's own environment table, which is a
+  //     normal thing for a file under scripts/ to do;
+  //   - a write onto the build tool's environment table, the one that hangs
+  //     off the module metadata object;
+  //   - a COMMENT or a string that spells the banned form out as an example.
+  // The third is the trap CLAUDE.md sections 1 and 2 already warn about for
+  // other rules: a comment that explains a ban by example fails the check it
+  // explains, and the failure arrives as a rejected commit in the middle of
+  // unrelated work. DESCRIBE THE BANNED FORM BY ROLE in comments and test
+  // titles -- "a write onto the environment object" -- and never by example.
+  // This comment does exactly that.
+  //
+  // That is a recorded choice and not a bug to fix. Anchoring on the object
+  // would need the rule to know which object a name refers to, and a pattern
+  // cannot. A dotted-path exception would also hide a write through any holder
+  // of the real object, which is a form the rule sees today on purpose. WHEN
+  // THIS FIRES ON AN INNOCENT LINE: set the process variable from outside the
+  // script (the command line or the runner's config), or hand a child process
+  // a fresh copy with the field overridden, or reword the comment. Never
+  // loosen the pattern. The over-match is pinned by test rows that assert the
+  // rule DOES fire on those lines, so a later "fix" that narrows it goes red.
   {
     // No `scope`, on purpose: a test that writes an identity onto the shared
     // object is the realistic case, so the rule has to reach test/ and scripts/
@@ -232,7 +257,7 @@ export const FORBIDDEN = [
     id: "env-assignment",
     pattern:
       /\benv\b(?:\s+as\s+[^)\n]{1,80}\))?(?:\s*!?\s*(?:\.\s*[A-Za-z_$][\w$]*|\[[^\]\n]*\]|\[[^\[\]\n]*(?:\[[^\[\]\n]*\][^\[\]\n]*)+\]))+\s*(?:(?:\*\*|<<|>>>?|&&|\|\||\?\?|[-+*\/%&|^])?=(?![=>])|\+\+|--)|(?<![\w$)\]+\-])(?:\+\+|--)[ \t]*\(?[ \t]*(?:[\w$]+\.)*env\b(?:\s+as\s+[^)\n]{1,80}\))?!?(?:\.[A-Za-z_$]|\[)|\bObject\.assign\s*\(\s*(?:[\w$]+\.)*env\b/g,
-    why: "A write onto the environment object: a member assignment, an index assignment, an increment or decrement, or an object merge with it as the target, with or without a type cast or a non-null mark in front of the accessor. That object is shared by every test in a file and every request in an isolate, so a write onto it is how one user's identity leaks into another test or another request. Build a fresh copy with the two account fields overridden instead.",
+    why: "A write onto the environment object: a member assignment, an index assignment, an increment or decrement, or an object merge with it as the target, with or without a type cast or a non-null mark in front of the accessor. That object is shared by every test in a file and every request in an isolate, so a write onto it is how one user's identity leaks into another test or another request. Build a fresh copy with the two account fields overridden instead. The rule matches the word and reads text, so it also fires on a write onto the Node process's environment table or the build tool's, and on a comment or string that spells the write out. If that is what happened, set the variable from outside the script or pass a fresh copy, or describe the form by role in the comment. Do not loosen this rule.",
   },
 
   // -------------------------------------------------------------- concurrency
