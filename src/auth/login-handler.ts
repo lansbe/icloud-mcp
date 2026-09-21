@@ -46,10 +46,11 @@
 // on the page when they expected the remote origin.
 //
 // ---------------------------------------------------------------------------
-// An omission stood here until plan 11-05, and it was CLOSED rather than
-// quietly erased — the same treatment the redirect-origin paragraph below
-// records, and for the same reason: a reader who finds the fix has to be able
-// to find what it replaced.
+// An omission stood here until plan 11-05. Plan 11-05 NARROWED it; it did not
+// close it, and this paragraph said "closed" until the phase review of
+// 2026-09-21 found otherwise. It is kept rather than erased — the same
+// treatment the redirect-origin paragraph below records, and for the same
+// reason: a reader who finds the fix has to be able to find what it replaced.
 //
 // This file used to record that its failure counter was not atomic and was not
 // being made atomic. `get` -> compare -> `put` is a read-modify-write over an
@@ -62,18 +63,40 @@
 // server's alone: every attempt lands at Apple, whose own lockout threshold is
 // unpublished and must be assumed small.
 //
-// **What closed it is not an atomic counter.** The burst is now caught by a
-// platform rate-limit binding, which is atomic and needs no read-modify-write
-// at all, and the store counter was kept only for the hour that binding's
-// window cannot reach. So the read-modify-write is still here, still
-// non-atomic, and no longer load-bearing for the case it was weak at: a
-// parallel burst is refused one layer above it. Three layers now stand in front
-// of Apple — the connecting source, the target address in a minute, the target
-// address across an hour — and each of them is argued where it is wired below.
+// **What narrowed it is not an atomic counter either.** A burst now meets a
+// platform rate-limit binding first, and the store counter was kept only for
+// the hour that binding's window cannot reach. Three layers stand in front of
+// Apple: the connecting source, the target address in a minute, and the target
+// address across an hour. Each is argued where it is wired below.
 //
-// A Durable Object was compared against that design and declined for v2.0 on
-// deploy risk. 11-CONTEXT.md records the comparison in full, deliberately, so a
-// later phase that wants one does not have to re-derive it.
+// **None of the three is exact, and this file used to say otherwise.** It
+// called the binding atomic. Cloudflare does not promise that. Its rate-limit
+// binding keeps a counter per Cloudflare location, and those counters are
+// eventually consistent. Cloudflare says plainly it is not for exact
+// accounting. So:
+//
+// - Requests that land on different locations are counted separately.
+// - Requests fired in parallel can all pass one window before the count
+//   catches up.
+// - The store counter cannot catch the overflow. It reads its value before the
+//   login runs, so a parallel burst all reads the same number.
+//
+// What that means in practice: against one address, the three-a-minute and
+// five-an-hour figures hold for a patient, serial guesser. They do NOT hold
+// for a parallel or many-location burst. How far over they go depends on how
+// many locations the attacker can reach and how fast they fire, and nothing in
+// this file can measure that. Apple's lockout threshold is unpublished. If it
+// is hit, what breaks is the owner's own Mail on his own devices.
+//
+// That is recorded as an ACCEPTED COST on 2026-09-21, not as a solved problem.
+// The only exact per-target count on this platform is a Durable Object per
+// person. 11-CONTEXT.md compared that design and declined it for v2.0 on
+// deploy risk, on the belief that the binding was exact. That belief was
+// wrong. So the comparison should be reopened with the real guarantee in hand,
+// not treated as settled.
+//
+// 11-CONTEXT.md records that Durable Object comparison in full, deliberately,
+// so a later phase that wants one does not have to re-derive it.
 //
 // A second omission stood here until 2026-08-14, and it was closed rather than
 // quietly erased: this file used to record that it carried no allowlist of
@@ -561,9 +584,82 @@ export { isConfiguredSecret };
  * The fallback literal is load-bearing. A request arriving without the header
  * must still be counted, or the cheapest way past the limiter would be to send
  * one fewer header.
+ *
+ * **An IPv6 source is keyed on its /64, not its full address.** An ISP or a
+ * cloud host usually hands one customer a whole /64. So a full-address key
+ * lets one attacker rotate through 2^64 addresses, each with a fresh budget,
+ * and the "five a minute per source" figure means nothing. The /64 is the
+ * smallest block one party normally controls, so that is the unit counted.
+ * The cost is that people sharing one /64 share one budget. That is rare
+ * outside a single household, and a household is one budget anyway.
+ *
+ * An IPv4 address is kept whole. So is anything that does not parse as IPv6:
+ * it is still counted, under its own spelling, which is the same fail-safe as
+ * the missing-header fallback.
  */
 function sourceLimiterKey(request: Request): string {
-  return request.headers.get("cf-connecting-ip") ?? "unknown-source";
+  const source = request.headers.get("cf-connecting-ip");
+  if (source === null) return "unknown-source";
+  if (!source.includes(":")) return source;
+  const prefix = ipv6Slash64(source);
+  return prefix === null ? source : `${prefix}::/64`;
+}
+
+/**
+ * The first four groups of an IPv6 address, in one canonical spelling.
+ *
+ * Canonical so that two spellings of the same /64 — leading zeros, upper or
+ * lower case, `::` in a different place — land on one key. Without that, an
+ * attacker could multiply their budget just by re-spelling their own address.
+ *
+ * Returns null for anything that is not a well-formed IPv6 address. A zone
+ * suffix (`%eth0`) is dropped first; it names a local interface and is not
+ * part of the address. A dotted IPv4 tail counts as the last two groups, which
+ * is how RFC 4291 spells it, and it never reaches the first four.
+ */
+function ipv6Slash64(address: string): string | null {
+  const bare = address.split("%")[0]!.toLowerCase();
+  const halves = bare.split("::");
+  if (halves.length > 2) return null;
+
+  const groupsOf = (part: string): string[] | null => {
+    if (part === "") return [];
+    const out: string[] = [];
+    const pieces = part.split(":");
+    for (let i = 0; i < pieces.length; i += 1) {
+      const piece = pieces[i]!;
+      if (i === pieces.length - 1 && piece.includes(".")) {
+        // A dotted IPv4 tail stands for two groups. Its value never matters
+        // here, because it can only ever sit in groups seven and eight.
+        if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(piece)) return null;
+        out.push("0", "0");
+      } else if (/^[0-9a-f]{1,4}$/.test(piece)) {
+        out.push(piece);
+      } else {
+        return null;
+      }
+    }
+    return out;
+  };
+
+  const head = groupsOf(halves[0]!);
+  const tail = halves.length === 2 ? groupsOf(halves[1]!) : [];
+  if (head === null || tail === null) return null;
+
+  let groups: string[];
+  if (halves.length === 2) {
+    const missing = 8 - head.length - tail.length;
+    if (missing < 1) return null;
+    groups = [...head, ...Array<string>(missing).fill("0"), ...tail];
+  } else {
+    if (head.length !== 8) return null;
+    groups = head;
+  }
+
+  return groups
+    .slice(0, 4)
+    .map((group) => parseInt(group, 16).toString(16))
+    .join(":");
 }
 
 /**
@@ -601,12 +697,13 @@ function failureCounterKey(userId: string): string {
  * either: the time floor is the limiter that does not depend on this write
  * succeeding, and it is applied outside this function.
  *
- * Non-atomic, and that is now a bounded cost rather than an open one. Read,
- * compare and write over an eventually-consistent store means concurrent
- * attempts all read the same value, so this layer UNDER-counts a parallel
- * burst. The platform limiter one layer up is atomic and is what actually
- * catches a burst; this layer exists for the hour the platform's window cannot
- * reach, over which a patient attacker's attempts are not concurrent.
+ * Non-atomic. Read, compare and write over an eventually-consistent store means
+ * concurrent attempts all read the same value, so this layer UNDER-counts a
+ * parallel burst. The platform limiter one layer up is the only other brake on
+ * a burst, and it is not exact either: it counts per Cloudflare location and
+ * is eventually consistent. This layer exists for the hour the platform's
+ * window cannot reach, and it counts a patient, serial attacker correctly.
+ * The file header records the parallel case as an accepted cost.
  *
  * The record outlives its own window, so a read taken near a boundary still
  * finds the bucket it is asking about.
@@ -1013,9 +1110,15 @@ async function handleAuthorize(
     //
     // It runs here, above the form read and above everything below it, so a
     // flood buys no round trip: not the provider's parse, not the client
-    // lookup, not a store read. An atomic platform counter, which is what makes
-    // it the right layer for a burst — the store counter further down cannot
-    // be, and no longer has to be.
+    // lookup, not a store read. It is a platform counter with no store round
+    // trip, which makes it the cheapest brake on a burst. It is not exact: it
+    // counts per Cloudflare location and is eventually consistent, so a burst
+    // spread across locations or fired in parallel gets past it by some
+    // margin. The file header records that as an accepted cost.
+    //
+    // Keyed on the /64 for an IPv6 source, not the full address. One IPv6
+    // client usually holds a whole /64, so a full-address key would give one
+    // attacker 2^64 separate budgets. `sourceLimiterKey` carries the detail.
     //
     // The allow-list gate still runs ABOVE this, up at the top of the handler,
     // and that ordering is deliberate too: a deployment with no configured list
@@ -1263,7 +1366,8 @@ async function handleAuthorize(
     if (userId === null) return refuseCredential();
 
     // LAYER 2, the target address in a minute. Three attempts against one
-    // address, atomic, and answered with the SAME body at the SAME status as
+    // address per Cloudflare location, eventually consistent rather than exact
+    // (see the file header), and answered with the SAME body at the SAME status as
     // every other credential-path failure — never this surface's 429. A status
     // that only ever appeared for a listed address would tell a stranger who is
     // on the list, which is precisely what success criterion 3 forbids.
@@ -1325,10 +1429,11 @@ async function handleAuthorize(
     // be a counter in a store. It is read AFTER the binding above, deliberately
     // — the binding costs no round trip and this does.
     //
-    // Non-atomic, and now bounded rather than load-bearing. A parallel burst is
-    // refused one layer up by something that is atomic; what is left for this
-    // counter is a patient attacker's serial attempts, which it counts
-    // correctly.
+    // Non-atomic. It counts a patient attacker's serial attempts correctly.
+    // It does not catch a parallel burst, because every request in the burst
+    // reads the same value before any of them writes. The layer above is the
+    // only other brake on that case, and it is not exact either. The file
+    // header records the gap as an accepted cost.
     //
     // A STORE THAT THROWS IS A REFUSAL too, for the same reason as the binding
     // above: only a listed address gets here. An unreadable counter reads as a

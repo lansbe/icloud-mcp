@@ -277,6 +277,15 @@
   // only ever appeared for a listed address would tell a stranger who is on
   // the list.
   //
+  // NEITHER LIMIT IS EXACT. Cloudflare keeps these counters per location, and
+  // they are eventually consistent. Cloudflare says they are not for exact
+  // accounting. So a burst fired in parallel, or spread across locations, can
+  // get past "five a minute" or "three a minute" by some margin. The figures
+  // hold for a patient, serial caller. src/auth/login-handler.ts records the
+  // parallel case as an accepted cost in its file header. The source key is
+  // the /64 for an IPv6 caller, not the full address, because one IPv6 client
+  // usually holds a whole /64.
+  //
   // WHY TWO BINDINGS AND NOT ONE WITH TWO KEY SPACES. The limit and the window
   // live on the BINDING, not on the call: the shipped options type accepts a
   // key and nothing else. One binding would force one pair of numbers on both

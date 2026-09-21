@@ -312,11 +312,12 @@ function stubEnv(
     burstRefused?: boolean;
     burstThrows?: boolean;
     limiterKeys?: string[];
+    sourceKeys?: string[];
   } = {},
 ): Env & LoginGateSecret {
   return {
     OAUTH_KV: options.kv ?? quietKv(options.failures),
-    LOGIN_IP_LIMITER: limiter(options.floodRefused !== true),
+    LOGIN_IP_LIMITER: limiter(options.floodRefused !== true, options.sourceKeys),
     LOGIN_ID_LIMITER:
       options.burstThrows === true
         ? throwingLimiter()
@@ -1827,6 +1828,61 @@ describe("the ip limiter, the first layer and the only one with its own status",
     },
     20_000,
   );
+});
+
+describe("the ip limiter key, which counts an IPv6 source by its /64", () => {
+  /** The key the source layer was asked about, for one connecting address. */
+  async function sourceKeyFor(source: string | null): Promise<string> {
+    const keys: string[] = [];
+    const record = recorder();
+    await handlerOver(record.proof).fetch(
+      post(
+        UNLISTED_APPLE_ID,
+        FAKE_APP_PASSWORD,
+        source === null ? {} : { "cf-connecting-ip": source },
+      ),
+      stubEnv(record, { sourceKeys: keys }),
+    );
+    expect(keys, "the source layer was not asked exactly once").toHaveLength(1);
+    return keys[0]!;
+  }
+
+  it("gives every address in one /64 the same key, however it is spelled", async () => {
+    // WR-02. One IPv6 client usually holds a whole /64. Keying on the full
+    // address would hand one attacker 2^64 separate budgets.
+    const spellings = [
+      "2001:db8:1:2:aaaa:bbbb:cccc:dddd",
+      "2001:db8:1:2::1",
+      "2001:0DB8:0001:0002:ffff:ffff:ffff:ffff",
+      "2001:db8:1:2:0:0:0:0",
+      "2001:db8:1:2::ffff:192.0.2.1",
+      "2001:db8:1:2::1%eth0",
+    ];
+    const keys = new Set<string>();
+    for (const spelling of spellings) keys.add(await sourceKeyFor(spelling));
+
+    expect([...keys]).toEqual(["2001:db8:1:2::/64"]);
+  });
+
+  it("gives a neighbouring /64 a different key", async () => {
+    const a = await sourceKeyFor("2001:db8:1:2::1");
+    const b = await sourceKeyFor("2001:db8:1:3::1");
+    const c = await sourceKeyFor("2001:db8::1");
+
+    expect(a).not.toBe(b);
+    expect(c).toBe("2001:db8:0:0::/64");
+    expect(new Set([a, b, c]).size).toBe(3);
+  });
+
+  it("keeps an IPv4 source whole, and still counts what it cannot parse", async () => {
+    expect(await sourceKeyFor("203.0.113.9")).toBe("203.0.113.9");
+    expect(await sourceKeyFor(null)).toBe("unknown-source");
+    // Not IPv6 under any reading. Counted under its own spelling rather than
+    // waved through, which is the same fail-safe as the missing header.
+    for (const odd of ["1:2:3", "::g::", "1:2:3:4:5:6:7:8:9", "not:an:address"]) {
+      expect(await sourceKeyFor(odd)).toBe(odd);
+    }
+  });
 });
 
 describe("the per-id layer, which answers as a wrong password and never as a 429", () => {
