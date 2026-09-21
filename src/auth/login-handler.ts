@@ -11,6 +11,14 @@
 // props that only this server can decrypt. `src/principal.ts` is where they
 // come back out.
 //
+// **This file renders nothing.** Every byte the reader sees is built by
+// `src/auth/login-page.ts`, which owns the approved design contract, the copy
+// and the security headers; this file decides WHICH response happens and in
+// what order, and calls into the page for the one that has a body worth
+// designing. That split is a locked decision rather than a tidiness: this file
+// was already 32 KB before the phase added a credential form and three limiter
+// layers to it.
+//
 // The full OAuth 2.1 ceremony still happens around this — dynamic client
 // registration, PKCE-protected code exchange, refresh rotation, revocation —
 // all owned by the provider. Only the identity step is ours.
@@ -91,6 +99,7 @@ import type { Principal } from "../principal";
 import { normaliseAppleId, principalFromProps, userIdOf } from "../principal";
 import type { AllowList } from "./allow-list";
 import { isAllowed, parseAllowList } from "./allow-list";
+import { renderForm } from "./login-page";
 
 /** The only scope this server issues. */
 const SUPPORTED_SCOPES = ["mcp"];
@@ -98,11 +107,18 @@ const SUPPORTED_SCOPES = ["mcp"];
 /** The version every props object this server writes carries. */
 const PROPS_VERSION = 1;
 
-/** The form field carrying the Apple ID. */
-const APPLE_ID_FIELD = "apple_id";
+/**
+ * The form field carrying the Apple ID.
+ *
+ * Exported so `src/auth/login-page.ts` writes the very name this file reads.
+ * Two spellings of a field name are two rules, and the failure is silent: the
+ * form renders, the person types, and the submitted value arrives under a name
+ * nothing looks for, which reaches the reader as the generic failure body.
+ */
+export const APPLE_ID_FIELD = "apple_id";
 
-/** The form field carrying the app-specific password. */
-const APP_PASSWORD_FIELD = "app_password";
+/** The form field carrying the app-specific password. Exported for the same reason. */
+export const APP_PASSWORD_FIELD = "app_password";
 
 /**
  * What it takes to prove a credential pair is real: one login, at Apple.
@@ -328,8 +344,12 @@ function failureKey(request: Request): string {
  * unauthenticated dynamic client registration, and the redirect URI is the one
  * the code will be delivered to. They are display-only — nothing branches on
  * either — and both are escaped at the interpolation.
+ *
+ * Exported as a type so the page module can take one without rebuilding the
+ * shape. It is built here, by `identityOf`, because resolving who is asking is
+ * flow control; displaying it is not.
  */
-interface ClientIdentity {
+export interface ClientIdentity {
   /** The registered name, or the client id when the client registered none. */
   name: string;
   /** The full redirect URI. Only its origin is ever displayed. */
@@ -360,8 +380,13 @@ function identityOf(client: ClientInfo, redirectUri: string): ClientIdentity {
  * what to do with that: the page renders a sentence saying so, and the
  * allowlist check treats it as not-allowed, so an unreadable destination fails
  * closed rather than falling through some parsing accident into permitted.
+ *
+ * Exported, but only so the sharing below can cross a module boundary. There is
+ * exactly one derivation of a destination origin under `src/auth/`, and a
+ * second one anywhere would let the allowlist check and the consent line
+ * disagree about what they are talking about.
  */
-function originOf(redirectUri: string): string | null {
+export function originOf(redirectUri: string): string | null {
   let parsed: URL;
   try {
     parsed = new URL(redirectUri);
@@ -384,8 +409,13 @@ function originOf(redirectUri: string): string | null {
  * function displays. Were the two to derive the origin separately, the page
  * could name an origin the check never looked at — a mitigation that lies
  * about what it mitigated.
+ *
+ * Exported for the page module to call. It stays HERE rather than moving with
+ * the rendering, because the value it answers is the one
+ * `refusedRedirectResponse` decides on two functions down, and the sharing is
+ * the entire point of the function existing.
  */
-function displayDestination(redirectUri: string): string {
+export function displayDestination(redirectUri: string): string {
   // Showing the raw string instead would reintroduce the very
   // push-the-origin-out-of-view problem origin-only display exists to stop.
   return originOf(redirectUri) ?? "an address this server could not read";
@@ -480,100 +510,6 @@ function refusedRedirectResponse(redirectUri: string): Response | null {
       "cache-control": "no-store",
     },
   });
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
-/**
- * The form.
- *
- * **This is a minimal field swap and nothing more.** The one secret field
- * became two credential fields, and every other property of the page is
- * untouched: the hidden `oauth_request` field still round-trips the raw query,
- * the `.client` and `.dest` marked elements still carry the consent screen's
- * two values, `escapeHtml` still wraps every interpolation, and neither
- * credential field carries a `value` attribute on any path, so nothing the
- * reader typed comes back to them.
- *
- * Plan 11-02 moves the rendering out to `src/auth/login-page.ts` and rewrites
- * it against the UI design contract — the explainer copy, the security headers
- * on every response, and the single failure string all land there. Doing any of
- * that here would be work thrown away one plan later.
- */
-function renderForm(
-  query: string,
-  failed: boolean,
-  identity: ClientIdentity,
-): Response {
-  const notice = failed
-    ? '<p class="err">That value was not accepted.</p>'
-    : "";
-
-  return new Response(
-    `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>iCloud MCP — authorize</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font: 16px/1.5 system-ui, sans-serif; margin: 0;
-         min-height: 100dvh; display: grid; place-items: center; }
-  main { width: min(22rem, 90vw); }
-  h1 { font-size: 1.125rem; margin: 0 0 .25rem; }
-  p { margin: 0 0 1.25rem; opacity: .7; font-size: .875rem; }
-  .err { color: #b3261e; opacity: 1; }
-  .who { opacity: 1; }
-  .client { overflow-wrap: anywhere; }
-  .dest { overflow-wrap: anywhere; }
-  label { display: block; font-size: .8125rem; margin-bottom: .375rem; }
-  input + label { margin-top: .75rem; }
-  input { width: 100%; box-sizing: border-box; padding: .625rem .75rem;
-          font: inherit; border: 1px solid currentColor; border-radius: .5rem;
-          background: transparent; color: inherit; }
-  button { width: 100%; margin-top: .75rem; padding: .625rem;
-           font: inherit; border: 0; border-radius: .5rem; cursor: pointer; }
-</style>
-</head>
-<body>
-<main>
-  <h1>Authorize iCloud MCP</h1>
-  <p>This endpoint reaches real personal mail.</p>
-  <p class="who"><strong class="client">${escapeHtml(identity.name)}</strong>
-     is asking for that access. Authorizing sends you to
-     <code class="dest">${escapeHtml(displayDestination(identity.redirectUri))}</code>.
-     If you do not recognise both, do not continue.</p>
-  ${notice}
-  <form method="post" action="/authorize">
-    <input type="hidden" name="oauth_request" value="${escapeHtml(query)}">
-    <label for="apple-id">Apple ID</label>
-    <input id="apple-id" name="${APPLE_ID_FIELD}" type="email"
-           autocomplete="off" autocapitalize="off" spellcheck="false"
-           autofocus required>
-    <label for="app-password">App-specific password</label>
-    <input id="app-password" name="${APP_PASSWORD_FIELD}" type="password"
-           autocomplete="off" required>
-    <button type="submit">Authorize</button>
-  </form>
-</main>
-</body>
-</html>`,
-    {
-      status: failed ? 401 : 200,
-      headers: {
-        "content-type": "text/html; charset=utf-8",
-        "cache-control": "no-store",
-      },
-    },
-  );
 }
 
 function authorizationErrorResponse(error: AuthorizationError): Response {
@@ -721,7 +657,7 @@ async function handleAuthorize(
       // rejected by the library rather than trusted by this handler.
       return renderForm(
         url.search.replace(/^\?/, ""),
-        false,
+        null,
         identityOf(client, oauthRequest.redirectUri),
       );
     }
@@ -801,6 +737,12 @@ async function handleAuthorize(
      * and the cheapest way to hold that true is for there to be one place the
      * answer is written. The single failure string, the Apple-throttle message
      * and the ~3s floor land in plans 11-02 and 11-04, all of them here.
+     *
+     * The single failure string has now landed: every caller of this helper
+     * renders the `credentials` state, which is one body for all of its causes.
+     * The Apple-throttle state exists on the page and is NOT built here yet —
+     * branching on the throttle error's type is plan 11-04's, and it is the one
+     * branch this helper will ever grow.
      */
     async function refuseCredential(): Promise<Response> {
       try {
@@ -819,7 +761,7 @@ async function handleAuthorize(
         // succeeding.
       }
       await new Promise((resolve) => setTimeout(resolve, FAILURE_DELAY_MS));
-      return renderForm(query, true, identity);
+      return renderForm(query, "credentials", identity);
     }
 
     // The allow-list check sits ABOVE every use of the credentials, and that

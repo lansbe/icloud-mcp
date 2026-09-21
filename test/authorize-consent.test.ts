@@ -47,6 +47,7 @@
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { loginHandler } from "../src/auth/login-handler";
+import { CREDENTIAL_FAILURE_BODY } from "../src/auth/login-page";
 import type { Env, LoginGateSecret } from "../src/env";
 import { entryEnv } from "./fixtures/bound-secrets";
 import worker, {
@@ -337,7 +338,10 @@ describe("a second attempt is no less informed than the first", () => {
     const body = await response.text();
 
     expect(response.status).toBe(401);
-    expect(body).toContain("That value was not accepted.");
+    // Asserted against the value the page actually serves. Since plan 11-02
+    // there is ONE body for every failure on the credential path, and it is a
+    // constant precisely so an assertion cannot drift from it.
+    expect(body).toContain(CREDENTIAL_FAILURE_BODY[0]);
     expect(clientFrom(body)).toBe("Stub Client");
   });
 });
@@ -460,7 +464,7 @@ describe("the counter's write cannot change the response", () => {
 
     expect(kv.puts).toHaveLength(1);
     expect(response.status).toBe(401);
-    expect(await response.text()).toContain("That value was not accepted.");
+    expect(await response.text()).toContain(CREDENTIAL_FAILURE_BODY[0]);
   });
 
   it("pays a delay a human does not notice and a parallel guesser is not slowed by", async () => {
