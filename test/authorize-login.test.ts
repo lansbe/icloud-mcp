@@ -169,6 +169,11 @@ interface CompleteArgs {
   metadata?: unknown;
   props?: unknown;
   scope?: unknown;
+  // Optional here on purpose: the case that reads it asserts the value is
+  // explicitly `false` rather than merely absent, and absent IS the library's
+  // revoking default. Typing it as required would make "we forgot to pass it"
+  // a compile error instead of the test failure it should be.
+  revokeExistingGrants?: unknown;
 }
 
 /** Everything the handler reached, and with what. */
@@ -925,6 +930,31 @@ describe("the round trip: what the page stores is what the door serves", () => {
 
     expect(served.status).toBe(401);
     expect(served.headers.get("WWW-Authenticate")).toMatch(/^Bearer/);
+  });
+
+  it("does not revoke an earlier grant when a second sign-in arrives", async () => {
+    // Measured, 2026-09-21, hours after the phase shipped. The client submits
+    // this form TWICE about 1.4s apart, and both submissions succeed — each
+    // completed in ~1s, under the three-second floor every failure is held to.
+    // Under the library's default the second grant's creation revoked the
+    // first, the client held a token for the one that lost, and the eventually
+    // consistent store served it for about sixty seconds before the delete
+    // caught up: 401, re-discovery, re-registration, and round again.
+    //
+    // The library's note on that default says it prevents "infinite re-auth
+    // loops". Here it caused one. LIFE-03 promises one Apple ID may be signed
+    // in from several Claude apps at once, so concurrent grants are the shape
+    // this project wants; this asserts we ask for them rather than inherit the
+    // opposite. Restoring the default reinstates the lockout.
+    const record = recorder();
+    const response = await handlerOver(record.proof).fetch(
+      post(LISTED_APPLE_ID),
+      stubEnv(record),
+    );
+    expect(response.status).toBe(302);
+
+    // Explicitly false, not merely absent — absent IS the revoking default.
+    expect(record.completed[0]?.revokeExistingGrants).toBe(false);
   });
 });
 

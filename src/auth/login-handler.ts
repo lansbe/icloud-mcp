@@ -1427,13 +1427,37 @@ async function handleAuthorize(
         appleId,
         appPassword: submittedPassword,
       },
-      // `revokeExistingGrants` is left at its default, which is TRUE. A second
-      // sign-in from the same client therefore replaces the first rather than
-      // adding to it. That is the dead-password recovery path and not a bug:
-      // when someone revokes their app-specific password at Apple, signing in
-      // again with a fresh one is what fixes it, and the stale grant holding
-      // the dead password goes away in the same step. Phase 12 owns the rest of
-      // the grant lifetime (LIFE-01 through LIFE-06).
+      // TRUE was the default and it locked the owner out of his own server on
+      // 2026-09-21, hours after the phase shipped. Measured, not theorised.
+      //
+      // The client submits this form TWICE, about 1.4 seconds apart, after
+      // registering twice. Both submissions SUCCEED — each completed in ~1s,
+      // well under the three-second floor every failure is held to, so neither
+      // was a retry after a refusal. Under the default, the second grant's
+      // creation revoked the first. The client was holding a token for the one
+      // that lost, and because this store is eventually consistent it kept
+      // working for about sixty seconds and four calls before the delete caught
+      // up. Then: 401, re-discovery, two more registrations, another
+      // authorization, and round again.
+      //
+      // The library's own note on the default says it "prevents stale tokens
+      // from causing infinite re-auth loops when props change". Here it CAUSED
+      // that loop. The condition it guards against is a second sign-in carrying
+      // DIFFERENT props; the condition it met was a second sign-in carrying
+      // identical ones, which is not a stale token at all.
+      //
+      // What is given up, stated plainly because it is real: when someone
+      // rotates their app-specific password and signs in again, the old grant
+      // holding the dead password is no longer swept away in the same step. It
+      // is not a hole — the dead password fails at Apple — but grants now
+      // accumulate, and clearing them is phase 12's revoke script (LIFE-05).
+      // LIFE-03 already promises one Apple ID may be signed in from several
+      // Claude apps at once, so concurrent grants are the intended shape; this
+      // makes that explicit rather than accidental.
+      //
+      // Do not restore the default to "tidy up" grant accumulation. That is
+      // LIFE-05's job, and putting it back reinstates the lockout above.
+      revokeExistingGrants: false,
     });
 
     // Constructed explicitly rather than through the static redirect helper,
