@@ -41,9 +41,9 @@ type ToolResult = {
  * keeping — its own rejection text alongside them, under a field named for
  * which refusal it was.
  *
- * That last part is the whole point. "iCloud rejected the stored credentials"
- * is true of a wrong password and of a username format iCloud will not accept,
- * and those need different fixes. Apple's own reply is what tells them apart,
+ * That last part is the whole point. "iCloud rejected the password saved for
+ * this connection" is true of a wrong password and of a username format iCloud
+ * will not accept, and those need different fixes. Apple's own reply is what tells them apart,
  * and it originates on the server: the credential travels in the command we
  * sent, never in the reply, so echoing the reply cannot echo the credential.
  *
@@ -115,8 +115,9 @@ export function diagnosticResult(outcome: DiagnosticOutcome): ToolResult {
  * byte reached Apple (code review WR-04).
  *
  * WHY THIS EXISTS. The whole point of `authFailureDetail` above is that "iCloud
- * rejected the stored credentials" is true of a wrong password and of a
- * username format iCloud will not accept, and those need different fixes. Apple
+ * rejected the password saved for this connection" is true of a wrong password
+ * and of a username format iCloud will not accept, and those need different
+ * fixes. Apple
  * saying so is what tells them apart. Since Phase 9 the principal constructor
  * refuses some credentials itself — an address with no `@` or more than one, a
  * character outside printable ASCII, more than 254 typed characters, a password

@@ -175,16 +175,31 @@ export class ImapNotFoundError extends Error {
  * constants, so no server response and no exception message can influence
  * them.
  *
- * The first four name "iCloud Mail", which is a small inaccuracy on a calendar
- * call. It is accepted deliberately — `src/dav/errors.ts` records the argument
- * — and the three strings that arrived after Phase 1 (the two from Phase 5,
- * plus `subscription_unreadable`) are written protocol-neutral so they do not
- * extend it.
+ * Three of the first four name "iCloud Mail", which is a small inaccuracy on a
+ * calendar call. It is accepted deliberately — `src/dav/errors.ts` records the
+ * argument — and the three strings that arrived after Phase 1 (the two from
+ * Phase 5, plus `subscription_unreadable`) are written protocol-neutral so they
+ * do not extend it. `auth_failed` joined them when Phase 11 reworded it: the
+ * recovery it now describes is a fresh sign-in, which is the same recovery on
+ * every tool.
  */
 export const SAFE_MESSAGES: Record<ErrorCategory, string> = {
+  // The fallback for a client that does not act on the door's 401. That door
+  // answers a grant with no usable credentials with a real challenge, and a
+  // client that honours it drops its token and starts a fresh login without
+  // the person ever seeing this string. How clients actually behave on a dead
+  // login is rated low confidence, so this text is the recovery that works
+  // either way: it reaches the person through the model's own answer.
+  //
+  // It names no protocol and no mailbox, because the same string is served on
+  // a calendar or a contacts call and a sentence naming mail would be wrong
+  // two thirds of the time. It also names no owner and no Worker secret: after
+  // Phase 11 the credential belongs to the signed-in person, and the only
+  // person who can fix it is the one reading this.
   auth_failed:
-    "iCloud rejected the stored credentials. A human needs to check the " +
-    "app-specific password; retrying will not help.",
+    "iCloud rejected the password saved for this connection. Reconnect " +
+    "this server in your Claude app and sign in again; retrying will not " +
+    "help.",
   connection_failed:
     "Could not establish a secure connection to iCloud Mail. This may be " +
     "transient — safe to retry once.",

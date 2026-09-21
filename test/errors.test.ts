@@ -126,6 +126,35 @@ describe("the category vocabulary", () => {
     expect(SAFE_MESSAGES.auth_failed).toContain("retrying will not help");
   });
 
+  it("tells the signed-in person the recovery that actually exists", () => {
+    // Asserted by VALUE rather than by substring. This text is a contract —
+    // 11-UI-SPEC.md carries it verbatim — and the two things it must not lose
+    // are the action and the clause that stops a client looping. A paraphrase
+    // check built out of the same words would survive losing either.
+    //
+    // The old wording told a human to check the app-specific password. That
+    // stopped being true at the Phase 11 switch, in two ways at once: the
+    // person who must act is the signed-in user rather than the owner, and the
+    // fix is a fresh sign-in rather than an owner editing a Worker secret.
+    expect(SAFE_MESSAGES.auth_failed).toBe(
+      "iCloud rejected the password saved for this connection. Reconnect " +
+        "this server in your Claude app and sign in again; retrying will not " +
+        "help.",
+    );
+  });
+
+  it.each(["mail", "mailbox", "imap", "calendar", "contact"])(
+    "recovers from a dead credential without ever naming %s",
+    (forbidden) => {
+      // The same string is served on a calendar call and on a contacts call,
+      // so a sentence naming mail would be wrong two thirds of the time — and
+      // wrong in the direction that sends the reader to look at the wrong
+      // thing. The three strings that arrived after Phase 1 are neutral for
+      // the same reason; this one joined them when it was reworded.
+      expect(SAFE_MESSAGES.auth_failed.toLowerCase()).not.toContain(forbidden);
+    },
+  );
+
   it("warns that an attendee reply is one of the things that moves an event", () => {
     // 05-RESEARCH.md Pitfall 5. RFC 6638 §3.2.10 records that the SERVER
     // rewrites a scheduling object resource when an attendee changes their
