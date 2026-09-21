@@ -99,7 +99,7 @@ import type { Principal } from "../principal";
 import { normaliseAppleId, principalFromProps, userIdOf } from "../principal";
 import type { AllowList } from "./allow-list";
 import { isAllowed, parseAllowList } from "./allow-list";
-import { renderForm } from "./login-page";
+import { RESPONSE_HEADERS, SOURCE_REFUSAL_BODY, renderForm } from "./login-page";
 
 /** The only scope this server issues. */
 const SUPPORTED_SCOPES = ["mcp"];
@@ -356,9 +356,19 @@ export interface ClientIdentity {
   redirectUri: string;
 }
 
-/** The body served when the provider cannot resolve the requesting client. */
+/**
+ * The body served when the provider cannot resolve the requesting client.
+ *
+ * The wording, the status and the plain-text shape are unchanged: this is an
+ * owner diagnostic with carefully argued text, and restyling it is scope this
+ * phase did not ask for. What it gains is the header set, which it did not
+ * carry before.
+ */
 function unknownClientResponse(): Response {
-  return new Response("Unknown OAuth client", { status: 400 });
+  return new Response("Unknown OAuth client", {
+    status: 400,
+    headers: { ...RESPONSE_HEADERS },
+  });
 }
 
 function identityOf(client: ClientInfo, redirectUri: string): ClientIdentity {
@@ -506,8 +516,8 @@ function refusedRedirectResponse(redirectUri: string): Response | null {
   return new Response(refusedRedirectBody(displayDestination(redirectUri)), {
     status: 403,
     headers: {
+      ...RESPONSE_HEADERS,
       "content-type": "text/plain; charset=utf-8",
-      "cache-control": "no-store",
     },
   });
 }
@@ -517,7 +527,10 @@ function authorizationErrorResponse(error: AuthorizationError): Response {
   // locally — redirecting an unvalidated URI is what CVE-class bugs in this
   // problem space are made of.
   if (!error.redirectUri) {
-    return new Response(error.description, { status: 400 });
+    return new Response(error.description, {
+      status: 400,
+      headers: { ...RESPONSE_HEADERS },
+    });
   }
 
   const redirect = new URL(error.redirectUri);
@@ -525,7 +538,17 @@ function authorizationErrorResponse(error: AuthorizationError): Response {
   redirect.searchParams.set("error_description", error.description);
   if (error.state) redirect.searchParams.set("state", error.state);
   if (error.issuer) redirect.searchParams.set("iss", error.issuer);
-  return Response.redirect(redirect.toString(), 302);
+
+  // Constructed explicitly rather than through the static redirect helper, and
+  // for one reason: that helper builds a response this code cannot put a header
+  // on, and this phase's requirement is that EVERY response carries the four.
+  // The location header is set by hand and the body is empty, which is what the
+  // helper produces anyway — a caller reading `location` off this response sees
+  // the identical value.
+  return new Response(null, {
+    status: 302,
+    headers: { ...RESPONSE_HEADERS, location: redirect.toString() },
+  });
 }
 
 /**
@@ -590,8 +613,8 @@ async function handleAuthorize(
       return new Response(notFoundBody(url.origin), {
         status: 404,
         headers: {
+          ...RESPONSE_HEADERS,
           "content-type": "text/plain; charset=utf-8",
-          "cache-control": "no-store",
         },
       });
     }
@@ -621,8 +644,8 @@ async function handleAuthorize(
       return new Response(UNCONFIGURED_BODY, {
         status: 503,
         headers: {
+          ...RESPONSE_HEADERS,
           "content-type": "text/plain; charset=utf-8",
-          "cache-control": "no-store",
         },
       });
     }
@@ -663,9 +686,12 @@ async function handleAuthorize(
     }
 
     if (request.method !== "POST") {
+      // One of the two sites that carried no caching header at all before this
+      // phase. The spread goes first and the site's own header follows, so a
+      // site can never silently drop one of the four.
       return new Response("Method not allowed", {
         status: 405,
-        headers: { allow: "GET, POST" },
+        headers: { ...RESPONSE_HEADERS, allow: "GET, POST" },
       });
     }
 
@@ -681,9 +707,15 @@ async function handleAuthorize(
     const failures = Number((await env.OAUTH_KV.get(key)) ?? "0");
     if (failures >= MAX_FAILURES_PER_BUCKET) {
       await new Promise((resolve) => setTimeout(resolve, FAILURE_DELAY_MS));
-      return new Response("Too many attempts. Try again shortly.", {
+      // The other site that carried no caching header. The body is the same
+      // sentence it has always been, now named where the rest of this surface's
+      // copy lives.
+      return new Response(SOURCE_REFUSAL_BODY, {
         status: 429,
-        headers: { "retry-after": String(BUCKET_SECONDS) },
+        headers: {
+          ...RESPONSE_HEADERS,
+          "retry-after": String(BUCKET_SECONDS),
+        },
       });
     }
 
@@ -853,6 +885,15 @@ async function handleAuthorize(
       // the grant lifetime (LIFE-01 through LIFE-06).
     });
 
-    return Response.redirect(redirectTo, 302);
+    // Constructed explicitly rather than through the static redirect helper,
+    // and this is the site where that matters most: this location header
+    // carries the authorization code, so a cached copy of this redirect is a
+    // cached copy of a credential-equivalent. The helper builds a response
+    // nothing can put a caching header on. A caller reading `location` off this
+    // response sees the same value the helper would have set.
+    return new Response(null, {
+      status: 302,
+      headers: { ...RESPONSE_HEADERS, location: redirectTo },
+    });
   }
 }
