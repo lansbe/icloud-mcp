@@ -28,8 +28,12 @@
 // itself the evidence that a login passed the store check when it was minted.
 // So removing someone is TWO steps: take them out of the store so they cannot
 // sign in again, and revoke their grants to end a live session. Phase 12's
-// LIFE-05 revoke script is that second half; until it ships the stopgap is
-// deleting the grant record from `OAUTH_KV` by hand with wrangler.
+// LIFE-05 revoke script is that second half. Until it ships, the stopgap is
+// deleting BOTH the person's grant records and their token records from
+// `OAUTH_KV` by hand with wrangler; the README gives the steps. Deleting only
+// the grant is not enough: the provider checks an access token against its own
+// token record, which carries a copy of the grant, so the live access token
+// keeps working for up to an hour.
 //
 // **The drift risk is real and is MANAGED, not denied.** The old header warned
 // that two definitions of "on the list" are two rules, and that two rules drift

@@ -218,8 +218,12 @@ const HANDLER_OPTIONS: HandlerOptions = {
  *
  * **What covers the gap.** Removal is two steps: take the person out of the
  * store so they cannot sign in again, then revoke their grants to end a live
- * session. Phase 12's LIFE-05 revoke script is that second half; until it ships
- * the stopgap is deleting the grant record from `OAUTH_KV` by hand.
+ * session. Phase 12's LIFE-05 revoke script is that second half. Until it
+ * ships, the stopgap is deleting BOTH the grant records and the token records
+ * for that user id from `OAUTH_KV` by hand; the README gives the steps. The
+ * grant record alone is not enough: an access token is checked against its own
+ * token record, which carries a copy of the grant, so it keeps working for up
+ * to an hour after the grant is gone.
  *
  * **What still holds today.** The allow list holds exactly one address — the
  * owner's — for the whole of this phase, and the store starts empty, so the

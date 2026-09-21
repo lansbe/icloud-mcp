@@ -291,14 +291,41 @@ Step 1 stops new sign-ins. It does **not** end a session already running: their
 existing token keeps working, because the token itself is the evidence that they
 passed the list check when they signed in.
 
-To end it, delete their grant:
+To end it, delete their grant **and** their tokens. Three commands.
+
+**1. Work out their user id.** Their keys are named by it, not by their
+address. It is the SHA-256 of their address in lower case:
 
 ```bash
-npx wrangler kv key list --namespace-id=YOUR_OAUTH_KV_ID --remote --prefix "grant:"
-npx wrangler kv key delete --namespace-id=YOUR_OAUTH_KV_ID --remote "<their grant key>"
+printf '%s' "their-address@example.com" | tr '[:upper:]' '[:lower:]' | shasum -a 256 | cut -d' ' -f1
 ```
 
-Their next request is then refused and their client shows a sign-in page.
+Type the address with no spaces around it. The 64-character result is
+`<userId>` below.
+
+**2. List their keys.** Both prefixes end in a colon. Keep it, or you may match
+somebody else.
+
+```bash
+npx wrangler kv key list --namespace-id=YOUR_OAUTH_KV_ID --remote --prefix "grant:<userId>:"
+npx wrangler kv key list --namespace-id=YOUR_OAUTH_KV_ID --remote --prefix "token:<userId>:"
+```
+
+**3. Delete every key both commands printed**, one at a time:
+
+```bash
+npx wrangler kv key delete --namespace-id=YOUR_OAUTH_KV_ID --remote "<key>"
+```
+
+**Delete the `token:` keys too, not just the `grant:` ones.** The server checks
+an access token against its own `token:` record. That record carries its own
+copy of the grant and never looks at the `grant:` key. So deleting only the
+grant stops their next refresh, but the access token they already hold keeps
+working until it expires, which can be up to one hour.
+
+Once both are gone, their next request is refused and their client shows a
+sign-in page. The store is eventually consistent, so allow about a minute for
+the deletes to be seen everywhere.
 
 A script that does this by address is planned and does not exist yet. Until it
 does, this is the way.
