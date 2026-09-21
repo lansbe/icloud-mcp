@@ -1987,13 +1987,16 @@ describe("the hourly counter, the layer no platform window can reach", () => {
     // buys: the five before it each spent a real attempt at a real account.
     expect(record.proofCalls(), "the sixth guess reached Apple").toBe(5);
 
-    // Six reads and five writes. The sixth read the counter and did not bump
-    // it — a trip that counted itself would refill its own cap, and an address
-    // that tripped once could never come back inside the window.
-    expect(counter.gets).toHaveLength(6);
+    // Twelve reads and five writes. Each attempt reads two buckets, this
+    // hour's and the one before (WR-03). The sixth read the counter and did
+    // not bump it — a trip that counted itself would refill its own cap, and an
+    // address that tripped once could never come back inside the window.
+    expect(counter.gets).toHaveLength(12);
     expect(counter.puts).toHaveLength(5);
-    // One key, because one address in one hour is one counter.
-    expect(new Set([...counter.gets, ...counter.puts]).size).toBe(1);
+    // Every write lands on one key, because one address in one hour is one
+    // counter, and the previous hour's bucket is read and never written.
+    expect(new Set(counter.puts).size).toBe(1);
+    expect(new Set([...counter.gets, ...counter.puts]).size).toBe(2);
 
     // THE PROPERTY, NOT THE SHAPE. The keys are read back out of the store and
     // checked for the address rather than matched against today's format: the
@@ -2007,5 +2010,59 @@ describe("the hourly counter, the layer no platform window can reach", () => {
       // recognise on its own.
       expect(key).not.toContain(LISTED_APPLE_ID.split("@")[0]!);
     }
+  });
+
+  it("counts the previous hour too, so an hour boundary does not reset the cap", async () => {
+    // WR-03. The buckets are fixed clock hours. Reading only the current one
+    // let a guesser spend five at 10:59 and five more at 11:00. The previous
+    // bucket is recognised by its numeric suffix being below the current
+    // hour, computed here the same way the handler computes it.
+    function kvWithPrevious(previous: number) {
+      const puts: string[] = [];
+      return {
+        puts,
+        binding: {
+          async get(key: string) {
+            const bucket = Number(key.slice(key.lastIndexOf(":") + 1));
+            const now = Math.floor(Date.now() / 1000 / 3600);
+            return bucket < now ? String(previous) : null;
+          },
+          async put(key: string) {
+            puts.push(key);
+          },
+        },
+      };
+    }
+
+    // Five in the previous hour, none in this one: refused before Apple.
+    const full = kvWithPrevious(5);
+    const refusedRecord = recorder({ rejectWith: () => new ImapAuthError() });
+    const refused = await handlerOver(refusedRecord.proof).fetch(
+      post(LISTED_APPLE_ID),
+      stubEnv(refusedRecord, { kv: full.binding }),
+    );
+    expect(refused.status).toBe(401);
+    expect(
+      refusedRecord.proofCalls(),
+      "five failures last hour did not count against this one",
+    ).toBe(0);
+    expect(full.puts).toHaveLength(0);
+
+    // The control: four in the previous hour leaves room for one more, and
+    // that one reaches Apple. Without it the refusal above would be satisfied
+    // by a handler that refused everybody.
+    const room = kvWithPrevious(4);
+    const allowedRecord = recorder({ rejectWith: () => new ImapAuthError() });
+    await handlerOver(allowedRecord.proof).fetch(
+      post(LISTED_APPLE_ID),
+      stubEnv(allowedRecord, { kv: room.binding }),
+    );
+    expect(allowedRecord.proofCalls()).toBe(1);
+    // The write goes to THIS hour's bucket, not the previous one.
+    expect(room.puts).toHaveLength(1);
+    const written = room.puts[0]!;
+    expect(Number(written.slice(written.lastIndexOf(":") + 1))).toBe(
+      Math.floor(Date.now() / 1000 / 3600),
+    );
   });
 });

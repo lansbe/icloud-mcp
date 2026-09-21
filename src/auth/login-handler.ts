@@ -421,7 +421,12 @@ const SOURCE_WINDOW_SECONDS = 60;
  */
 const FAILURE_WINDOW_SECONDS = 3600;
 
-/** Failed guesses tolerated against one address within one window. */
+/**
+ * Failed guesses tolerated against one address in any sixty minutes.
+ *
+ * Enforced over this hour's bucket plus the previous one, so the limit holds
+ * across an hour boundary too. See the layer-3 comment in the handler.
+ */
 const MAX_FAILURES_PER_WINDOW = 5;
 
 /**
@@ -679,10 +684,17 @@ function ipv6Slash64(address: string): string | null {
  * one person sorts together in a listing — which is what makes the owner's
  * escape in the phase runbook a prefix match rather than a guess at an hour
  * number.
+ *
+ * The bucket is a parameter because two are read: this hour's and the one
+ * before it. See `currentFailureBucket` and the layer-3 comment for why.
  */
-function failureCounterKey(userId: string): string {
-  const bucket = Math.floor(Date.now() / 1000 / FAILURE_WINDOW_SECONDS);
+function failureCounterKey(userId: string, bucket: number): string {
   return `${LOGIN_FAILURE_KEY_PREFIX}${userId}:${bucket}`;
+}
+
+/** Which fixed hour-long bucket the clock is in right now. */
+function currentFailureBucket(): number {
+  return Math.floor(Date.now() / 1000 / FAILURE_WINDOW_SECONDS);
 }
 
 /**
@@ -705,8 +717,10 @@ function failureCounterKey(userId: string): string {
  * window cannot reach, and it counts a patient, serial attacker correctly.
  * The file header records the parallel case as an accepted cost.
  *
- * The record outlives its own window, so a read taken near a boundary still
- * finds the bucket it is asking about.
+ * The record lives for two windows, because it is read for two: during its
+ * own hour, and during the next hour as the "previous" bucket. A record
+ * written at the very start of its hour is last read at the very end of the
+ * next one, just under two windows later, so two windows is enough.
  */
 async function countFailedGuess(
   store: KVNamespace,
@@ -1435,19 +1449,42 @@ async function handleAuthorize(
     // only other brake on that case, and it is not exact either. The file
     // header records the gap as an accepted cost.
     //
+    // TWO BUCKETS ARE READ, THIS HOUR'S AND THE ONE BEFORE, and the cap is
+    // applied to their sum. The buckets are fixed clock hours. With only the
+    // current one read, a guesser could spend five at 10:59 and five more at
+    // 11:00 — ten attempts at Apple inside a minute. Summing the pair means a
+    // new failure is counted only while this hour plus the last one stay
+    // under five. Any sixty minutes fits inside two neighbouring buckets, so
+    // that is a real "five in any hour" for a serial guesser. The cost is one
+    // more store read, and only for a listed address.
+    //
+    // Only THIS hour's count is written back. The previous bucket is read and
+    // never changed.
+    //
+    // Two awaits one after the other, never a combinator: convention 3 forbids
+    // one anywhere in `src/auth/`.
+    //
     // A STORE THAT THROWS IS A REFUSAL too, for the same reason as the binding
     // above: only a listed address gets here. An unreadable counter reads as a
     // full one. So does a value that is not a number. `NaN >= 5` is false, so
     // without the finiteness check a corrupted value would switch this layer
     // off for that person for good.
-    const counterKey = failureCounterKey(userId);
+    const bucket = currentFailureBucket();
+    const counterKey = failureCounterKey(userId, bucket);
+    const previousKey = failureCounterKey(userId, bucket - 1);
     let failures = MAX_FAILURES_PER_WINDOW;
+    let previousFailures = MAX_FAILURES_PER_WINDOW;
     try {
       failures = Number((await env.OAUTH_KV.get(counterKey)) ?? "0");
+      previousFailures = Number((await env.OAUTH_KV.get(previousKey)) ?? "0");
     } catch {
       /* Fail closed. The caught value is never read. */
     }
-    if (!Number.isFinite(failures) || failures >= MAX_FAILURES_PER_WINDOW) {
+    if (
+      !Number.isFinite(failures) ||
+      !Number.isFinite(previousFailures) ||
+      failures + previousFailures >= MAX_FAILURES_PER_WINDOW
+    ) {
       return refuseCredential();
     }
 
