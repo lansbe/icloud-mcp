@@ -467,6 +467,106 @@ describe.each(LANES)(
   },
 );
 
+describe.each(LANES)(
+  "removal from the allow list takes effect on the next request, %s",
+  (_lane, build) => {
+    // GATE-03, and the pair is the whole assertion — neither half means
+    // anything alone. One grant, two environments, two answers. If only the
+    // refusal existed it would be satisfied by a door that refuses everything;
+    // if only the service existed it would be satisfied by a door that checks
+    // nothing at all.
+    //
+    // **The removal is expressed by varying the ENVIRONMENT, not by editing a
+    // binding.** `callDoor` already takes an environment override for exactly
+    // this. Assigning onto the ambient environment would leak the change into
+    // every later case in the run, and a scan rule rejects it outright.
+    //
+    // **There is no cache to wait out and no token to expire.** The list is
+    // parsed and compared inside `fetch` on every single request, which is why
+    // "deploy without them and their access ends" is a true sentence for the
+    // owner to read in the README.
+
+    /** The pool's environment with user A taken off the allow list. */
+    function envWithoutUserA(): EntryEnv {
+      return {
+        ...entryEnv(),
+        ALLOWED_APPLE_IDS: JSON.stringify(["somebody-else@example.invalid"]),
+      };
+    }
+
+    it("serves the grant while the address is listed", async () => {
+      // The positive control for the pair. The SAME grant, one environment
+      // over, is what makes the refusal below mean "the list stopped it".
+      const response = await callDoor(build("/mcp"), LISTED);
+
+      expect(response.status, "a listed grant was not served").toBe(200);
+      expect(response.headers.get("WWW-Authenticate")).toBeNull();
+
+      await response.text();
+      expect(
+        await canaryWasInvoked(),
+        "a listed grant did not reach the tool layer",
+      ).toBe(true);
+    });
+
+    it("refuses that identical grant once the address is gone", async () => {
+      const response = await callDoor(build("/mcp"), LISTED, envWithoutUserA());
+
+      expect(
+        response.status,
+        "a grant whose address was removed from the list was still served",
+      ).toBe(401);
+      expect(response.headers.get("WWW-Authenticate")).toBe(EXPECTED_CHALLENGE);
+
+      const bodyText = await response.text();
+      const body = JSON.parse(bodyText) as Record<string, unknown>;
+      expect(body.error).toBe("invalid_token");
+      expect(Object.keys(body).sort(), "the 401 body grew a key").toEqual([
+        "error",
+        "error_description",
+      ]);
+
+      // The marks. This grant holds a real-shaped address and password, and
+      // neither may come back in the refusal — not in the body and not in a
+      // header. A removed person's own credentials echoed at them would be the
+      // one place this server leaks what it is holding.
+      const everyHeader = [...response.headers.entries()]
+        .map(([name, value]) => `${name}: ${value}`)
+        .join("\n");
+      for (const mark of [USER_A.appleId, USER_A.appPassword]) {
+        expect(bodyText, "the 401 body echoes the props").not.toContain(mark);
+        expect(everyHeader, "a 401 header echoes the props").not.toContain(mark);
+      }
+
+      expect(
+        await canaryWasInvoked(),
+        "a removed person's grant reached the tool layer",
+      ).toBe(false);
+    });
+
+    it("refuses that grant against an allow list that cannot be read", async () => {
+      // Fail-closed, at the door as well as at the login page. A deployment
+      // whose list is missing or malformed serves nobody — including people
+      // whose grants were minted while it was fine.
+      for (const broken of [undefined, "", "not json", "[]", '{"a":1}']) {
+        const response = await callDoor(build("/mcp"), LISTED, {
+          ...entryEnv(),
+          ALLOWED_APPLE_IDS: broken,
+        });
+
+        expect(
+          response.status,
+          `an unreadable allow list (${String(broken)}) still served a grant`,
+        ).toBe(401);
+        expect(response.headers.get("WWW-Authenticate")).toBe(EXPECTED_CHALLENGE);
+        await response.text();
+      }
+
+      expect(await canaryWasInvoked()).toBe(false);
+    });
+  },
+);
+
 describe("an unusable stored credential is not a 401 (D-09)", () => {
   // **The claim is unchanged; what carries it moved with identity itself.**
   //
