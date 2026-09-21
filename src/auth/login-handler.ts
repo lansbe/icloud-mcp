@@ -197,11 +197,18 @@ const MAX_MEASURED_APP_PASSWORD = 64;
  * absent: Apple decides, because Apple is the only party that knows.
  *
  * **How to get the measurement later**, if somebody is refused at sign-in and
- * suspects the dash form is why: swap the live `APPLE_APP_PASSWORD` secret to
- * the dashless form, call `mail_imap_diagnose` for the IMAP half and
- * `dav_diagnose` for the DAV half, then swap the secret back. Nothing in this
- * file has to change first — the person can simply try the other form, because
- * both now reach Apple as typed.
+ * suspects the dash form is why: sign in through the login page with the
+ * dashless form. Nothing in this file has to change first, because both forms
+ * now reach Apple as typed. It costs one real attempt at Apple and one tick of
+ * that person's hourly counter, so do it once, deliberately. If it signs in,
+ * call `mail_imap_diagnose` and `dav_diagnose` from that session to check the
+ * IMAP and DAV halves; both act for the credentials stored in the grant.
+ *
+ * Do NOT measure it by changing the `APPLE_APP_PASSWORD` secret. An earlier
+ * version of this note said to. Since phase 11 nothing that serves a request
+ * reads that secret — every tool, the two diagnose tools included, acts for
+ * the grant's stored credentials — so a swap changes nothing, and the two
+ * identical results would be misread as "both forms work".
  *
  * **What this function still does, and why it is not the same act.** It derives
  * its own MEASUREMENT form — trim the ends, drop the separators — purely to
