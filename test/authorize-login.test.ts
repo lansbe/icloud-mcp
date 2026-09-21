@@ -46,6 +46,31 @@
 //
 // **This file holds no real value.** Both addresses sit under `.invalid`, a
 // name reserved so it can never resolve, and the password is plainly fake.
+//
+// ---------------------------------------------------------------------------
+// **What the counter counts, and why that is the same thing as a socket
+// count.** This matters enough to write down, because it is TRANSITIVE and a
+// later reader who mistakes it for a direct measurement will trust it in a
+// situation where one of its three links has moved.
+//
+// The counter counts calls to the INJECTED PROOF. It does not count calls to
+// the socket opener, and this repository has no harness that does. The two are
+// equivalent here only because three separate things hold at once:
+//
+//   1. The proof is the single call site in this flow that reaches the session
+//      runner. Every other branch of the handler returns a response without
+//      touching it.
+//   2. No second session helper may exist under `src/auth/`. Convention 3
+//      permits exactly one orchestrator, and the scan enforces that as a COUNT
+//      in both directions — zero owners is as much a violation as two.
+//   3. The socket specifier may be imported by exactly one file,
+//      `src/mail/socket.ts`, whose opener takes no parameters. That too is a
+//      count enforced in both directions.
+//
+// Break any one of those and a zero here stops meaning "no socket was opened"
+// while still looking exactly as green. If one of them changes, this file's
+// claim has to be re-derived rather than assumed.
+// ---------------------------------------------------------------------------
 
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
@@ -54,6 +79,7 @@ import {
   FAILURE_FLOOR_MS,
   UNCONFIGURED_BODY,
   createLoginHandler,
+  loginHandler,
 } from "../src/auth/login-handler";
 import {
   APPLE_THROTTLE_BODY,
@@ -77,7 +103,7 @@ import {
   taggedOk,
 } from "./fixtures/icloud-bytes";
 import { DEPLOYED_HOSTNAME, createMcpApiHandler } from "../src/mcp/api-handler";
-import {
+import worker, {
   FAKE_APP_PASSWORD,
   LISTED_APPLE_ID,
   UNLISTED_APPLE_ID,
@@ -1031,5 +1057,247 @@ describe("what the page says depends on the error's type and on nothing else", (
       expect(body).toContain(line);
     }
     expect(body).not.toContain(APPLE_THROTTLE_BODY[0]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Criterion 2. The socket count, the counter that proves it, the control that
+// proves the counter can move, and the sweep that measures the "only" in
+// "stored only in the grant's encrypted props".
+// ---------------------------------------------------------------------------
+
+describe("zero sockets to Apple, and a counter that has been shown to move", () => {
+  // Titled so `-t "zero sockets"` matches — 11-VALIDATION.md's GATE-02 command.
+
+  /**
+   * Drive one request through a freshly-zeroed counter.
+   *
+   * The two assertions before the call are the non-vacuity guard, in the shape
+   * the source-text block in `test/service.test.ts` uses on itself: prove the
+   * instrument is the one under test and prove it is at rest, so a zero
+   * afterwards is a READING rather than a default. A new recorder per call is
+   * also the reset — the reason `test/door.test.ts` gives for its own is that a
+   * passing first case must not mask a failing second.
+   */
+  async function countFor(
+    request: Request,
+    options: { allowList?: string | undefined } = {},
+  ): Promise<{ record: Recorder; response: Response }> {
+    const record = recorder();
+    const handler = handlerOver(record.proof);
+
+    // Not the production export. That one carries `proveWithApple`, which opens
+    // a real socket to iCloud — so a case that reached it would both violate
+    // D-09 and count nothing.
+    expect(handler).not.toBe(loginHandler);
+    expect(record.proofCalls()).toBe(0);
+
+    const response = await handler.fetch(request, stubEnv(record, options));
+    return { record, response };
+  }
+
+  it("opens nothing for a password that cannot be an app-specific one", async () => {
+    const { record, response } = await countFor(post(LISTED_APPLE_ID, "abcd"));
+
+    expect(record.proofCalls()).toBe(0);
+    expect(response.status).toBe(401);
+    expect(record.calls).not.toContain("completeAuthorization");
+  });
+
+  it("opens nothing for an address that is not on the list", async () => {
+    const { record, response } = await countFor(post(UNLISTED_APPLE_ID));
+
+    expect(record.proofCalls()).toBe(0);
+    expect(response.status).toBe(401);
+  });
+
+  it("opens nothing for an address this server cannot read", async () => {
+    const { record, response } = await countFor(post("no-at-sign-at-all"));
+
+    expect(record.proofCalls()).toBe(0);
+    expect(response.status).toBe(401);
+  });
+
+  it("opens nothing for a deployment whose allow list is not configured", async () => {
+    const { record, response } = await countFor(post(LISTED_APPLE_ID), {
+      allowList: undefined,
+    });
+
+    expect(record.proofCalls()).toBe(0);
+    expect(response.status).toBe(503);
+    // The gate is above everything: the provider was never consulted either.
+    expect(record.calls).toHaveLength(0);
+  });
+
+  it("records exactly one for a good sign-in (the control)", async () => {
+    // WITHOUT THIS CASE EVERY ZERO ABOVE IS UNFALSIFIABLE. A counter that can
+    // never increment looks exactly like a counter that stayed at zero, and
+    // four green rows would say nothing at all about where the refusals happen.
+    // Do not delete this as redundant with the sign-in cases higher up: those
+    // prove the ceremony completes, this one proves the INSTRUMENT the four
+    // rows above are read from is capable of moving.
+    const { record, response } = await countFor(post(LISTED_APPLE_ID));
+
+    expect(response.status).toBe(302);
+    expect(record.proofCalls()).toBe(1);
+  });
+});
+
+describe("a credential arriving in a query string authenticates nothing", () => {
+  // Titled so `-t "query string"` matches — 11-VALIDATION.md's D3 command.
+
+  it("is answered with the form, and the ceremony is not completed", async () => {
+    // D3 is the reason invocation logs are allowed to stay on: they record no
+    // bodies, and a credential in a URL is the one shape that would reach a
+    // retained log. The form is POST-only, so this is what a GET carrying the
+    // two field names in its query does.
+    //
+    // What this case asserts is that nothing was AUTHENTICATED, not that
+    // nothing was echoed. The raw query is round-tripped into the hidden
+    // `oauth_request` field on purpose, so the POST re-runs the provider's own
+    // client, redirect-URI, response-type and PKCE validation against it — a
+    // value a requester put in their own URL therefore comes back on their own
+    // page, which is the same posture the 404 body already takes with the
+    // caller's own Host header. The credential-reflection rule LOGIN-07 states
+    // is about values the FORM submitted, and both of those fields still carry
+    // no value attribute below.
+    const query = new URLSearchParams({
+      response_type: "code",
+      client_id: "stub-client",
+      apple_id: LISTED_APPLE_ID,
+      app_password: FAKE_APP_PASSWORD,
+    }).toString();
+
+    const record = recorder();
+    const response = await handlerOver(record.proof).fetch(
+      new Request(`${ORIGIN}/authorize?${query}`),
+      stubEnv(record),
+    );
+    const body = await response.text();
+
+    expect(record.proofCalls(), "a query string reached Apple").toBe(0);
+    expect(record.calls).not.toContain("completeAuthorization");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("location")).toBeNull();
+
+    // The rendered form, with both boxes empty.
+    expect(body).toContain(`name="apple_id"`);
+    expect(body).toContain(`name="app_password"`);
+    expect(body).not.toMatch(/name="apple_id"[^>]*value=/);
+    expect(body).not.toMatch(/name="app_password"[^>]*value=/);
+  });
+});
+
+describe("after a sign-in the password is in the grant and nowhere else", () => {
+  // Titled so `-t "nowhere else"` matches — 11-VALIDATION.md's LOGIN-06 row,
+  // and the one case here whose whole job is to find something that should not
+  // be there.
+  //
+  // Criterion 1 says the credentials are stored ONLY in the grant's encrypted
+  // props. The props SHAPE is asserted higher up in this file; "only" is the
+  // security half of that claim and nothing measured it until now. An audit
+  // cell in a planning document cannot go red.
+
+  /** A password no other test, fixture or binding in this repository holds. */
+  const SWEEP_TYPED = "zqxjk7-vbnm42-plok98";
+
+  /** What the canonicaliser makes of it, which is what actually gets stored. */
+  const SWEEP_CANONICAL = "zqxjk7vbnm42plok98";
+
+  /** Drive the real provider over the injected proof, through its real fetch. */
+  async function callWorker(request: Request): Promise<Response> {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(request, entryEnv(), ctx);
+    await waitOnExecutionContext(ctx);
+    return response;
+  }
+
+  /** Register a real client through the real registration endpoint. */
+  async function register(redirectUri: string): Promise<string> {
+    const response = await callWorker(
+      new Request(`${ORIGIN}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          client_name: "Sweep Client",
+          redirect_uris: [redirectUri],
+          token_endpoint_auth_method: "none",
+          grant_types: ["authorization_code", "refresh_token"],
+          response_types: ["code"],
+        }),
+      }),
+    );
+
+    expect(response.status).toBeLessThan(300);
+    const body = (await response.json()) as { client_id: string };
+    return body.client_id;
+  }
+
+  it("holds it in no key of any store this Worker binds", async () => {
+    // The non-empty guard, first and for the reason `test/fixtures/bound-secrets.ts`
+    // already gives about its own: `not.toContain("")` is true of every string,
+    // so a containment sweep run against an empty needle passes while proving
+    // nothing at all.
+    expect(SWEEP_TYPED.length).toBeGreaterThan(0);
+    expect(SWEEP_CANONICAL.length).toBeGreaterThan(0);
+
+    const redirectUri = "https://claude.ai/sweep-callback";
+    const clientId = await register(redirectUri);
+    const query = new URLSearchParams({
+      response_type: "code",
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      code_challenge_method: "S256",
+      state: "sweep",
+    }).toString();
+
+    const signedIn = await callWorker(
+      new Request(`${ORIGIN}/authorize`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          apple_id: LISTED_APPLE_ID,
+          app_password: SWEEP_TYPED,
+          oauth_request: query,
+        }).toString(),
+      }),
+    );
+
+    // The sweep means nothing unless a sign-in really happened: a grant that
+    // was never written cannot have leaked into anything.
+    expect(signedIn.status).toBe(302);
+
+    const env = entryEnv();
+    const stores: ReadonlyArray<readonly [string, KVNamespace]> = [
+      ["OAUTH_KV", env.OAUTH_KV],
+      ["CONFIRM_KV", env.CONFIRM_KV],
+      ["DAV_CACHE", env.DAV_CACHE],
+    ];
+
+    let swept = 0;
+    for (const [name, store] of stores) {
+      const listed = await store.list();
+      // A partial page would make this a sweep of the first thousand keys
+      // wearing the name of a sweep of all of them.
+      expect(listed.list_complete, `${name} listing was truncated`).toBe(true);
+
+      for (const key of listed.keys) {
+        swept += 1;
+        // KEYS are enumerated rather than a key SHAPE being asserted. A shape
+        // assertion pins today's format; the claim is that the value is absent
+        // from all of them, whatever they are called.
+        const value = await store.get(key.name);
+        expect(
+          value ?? "",
+          `${name}/${key.name} holds the submitted password`,
+        ).not.toContain(SWEEP_CANONICAL);
+        expect(value ?? "").not.toContain(SWEEP_TYPED);
+      }
+    }
+
+    // A sweep over nothing is a sweep that proves nothing. The grant this case
+    // just minted is itself at least one key.
+    expect(swept, "the sweep enumerated no keys at all").toBeGreaterThan(0);
   });
 });
