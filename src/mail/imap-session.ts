@@ -757,6 +757,34 @@ export async function awaitContinuation(
 export type AuthMechanism = "LOGIN" | "AUTHENTICATE PLAIN";
 
 /** What the authentication exchange established. */
+/**
+ * What the login path may ask the authentication step to do differently.
+ *
+ * One field, optional, and absent means today's behaviour everywhere.
+ *
+ * Why the login path wants it: a wrong password costs Apple TWO attempts by
+ * default, because a refused first attempt falls back to the second mechanism
+ * and that is a second real attempt against a real Apple account. The login
+ * page already has its answer after the first refusal — the person typed a
+ * password and it was wrong — so the second attempt buys nothing and spends
+ * half of what Apple sees per guess. Apple publishes no lockout threshold, so
+ * this is sized as if the threshold is small.
+ *
+ * The tools keep both mechanisms, unchanged. A tool call is not a guess: its
+ * credential came out of a grant that already logged in successfully once, so a
+ * refusal there is far more likely to be the legacy-username case the fallback
+ * exists to rescue than a wrong password.
+ */
+export interface AuthOptions {
+  /**
+   * Spend one attempt at Apple rather than two, for one call only.
+   *
+   * This does NOT choose a mechanism — see `authenticate`. The first attempt is
+   * the same command it always is; all this suppresses is the fallback.
+   */
+  oneAttemptPerGuess?: boolean;
+}
+
 export interface AuthOutcome {
   authenticated: boolean;
   /** Which mechanism the server accepted, or `null` if none did. */
@@ -779,7 +807,7 @@ function replyText(result: CommandResult): string {
 }
 
 /**
- * Authenticate, with exactly one fallback.
+ * Authenticate, with at most one fallback.
  *
  * `LOGIN` is attempted first: the greeting does not advertise that the command
  * is disabled, so it should be permitted, and it is the simpler path. If the
@@ -794,6 +822,13 @@ function replyText(result: CommandResult): string {
  * defined as taking none, and the point of this function is to *discover*
  * which mechanism the server accepts, not to be told.
  *
+ * `oneAttemptPerGuess` does not weaken that. It cannot name a mechanism and it
+ * cannot reorder them: the first attempt is the same command it always is, and
+ * all the flag does is stop after it. The caller is saying how many attempts it
+ * is willing to spend at Apple, which is a different question from which
+ * mechanism to use, and `AuthOptions` argues why the login path answers it
+ * differently from every tool.
+ *
  * Classification happens here, at the point of knowledge. A refusal that names
  * a connection ceiling is a throttle rather than a credential problem, and
  * retrying the other mechanism against it would make things worse — so that
@@ -807,6 +842,7 @@ function replyText(result: CommandResult): string {
 export async function authenticate(
   channel: ImapChannel,
   principal: Principal,
+  options: AuthOptions = {},
 ): Promise<AuthOutcome> {
   const loginTag = channel.nextTag();
   await channel.withWriter((writer) =>
@@ -821,6 +857,22 @@ export async function authenticate(
   // `ImapThrottleError` for why that distinction is the whole safety argument.
   if (indicatesConnectionLimit(login.tagged.text)) {
     throw new ImapThrottleError(boundedReplyDetail(replyText(login)));
+  }
+
+  // The stop, and it sits BELOW the classification rather than above it. A
+  // server refusing on availability grounds is not a wrong password, and that
+  // distinction has to survive on this path too — the login page branches on
+  // the error type and would otherwise report a throttled server as a bad
+  // credential. The verdict here is the same one a double rejection returns, so
+  // the caller raises the same error it already raises.
+  //
+  // Exactly one truncation, applied to the finished string, as below.
+  if (options.oneAttemptPerGuess === true) {
+    return {
+      authenticated: false,
+      mechanism: null,
+      failureDetail: `LOGIN: ${replyText(login)}`.slice(0, MAX_FAILURE_DETAIL),
+    };
   }
 
   const saslTag = channel.nextTag();

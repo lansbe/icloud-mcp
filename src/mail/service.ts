@@ -52,6 +52,7 @@ import {
   resolveFolderRole,
 } from "./imap-parser";
 import type {
+  AuthOptions,
   ChannelOptions,
   DuplexLike,
   TeardownOptions,
@@ -170,7 +171,10 @@ export const CALL_DEADLINE_MS = 20000;
  * the bounds and watching all three hang to the runner timeout, and the
  * injected versions must still fail that way at roughly 1% of the cost.
  */
-export interface MailSessionOptions extends ChannelOptions, TeardownOptions {
+export interface MailSessionOptions
+  extends ChannelOptions,
+    TeardownOptions,
+    AuthOptions {
   /** Overrides `CALL_DEADLINE_MS` for this call only. */
   callDeadlineMs?: number;
 }
@@ -350,7 +354,13 @@ export async function withMailSessionOver<T>(
     await readGreeting(channel);
     await sendCommand(channel, channel.nextTag(), "CAPABILITY");
 
-    const auth = await authenticate(channel, principal);
+    // Threaded by name rather than by handing the whole options object over,
+    // the way the channel's two bounds are threaded above. The authentication
+    // step then receives exactly the one field that is its business, and a
+    // reader can see at this line which fields reach it.
+    const auth = await authenticate(channel, principal, {
+      oneAttemptPerGuess: options.oneAttemptPerGuess,
+    });
     if (!auth.authenticated) throw new ImapAuthError();
 
     const postLogin = await sendCommand(channel, channel.nextTag(), "CAPABILITY");
