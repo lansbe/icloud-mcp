@@ -186,6 +186,82 @@
     { "binding": "ATTACHMENT_STAGING", "bucket_name": "icloud-mcp-attachments" }
   ],
 
+  // Login rate limiting (GATE-04, layers 1 and 2). Two bindings, not one.
+  //
+  // WHAT EACH ONE IS FOR. LOGIN_IP_LIMITER is a flood brake keyed by the
+  // connecting source: five attempts a minute, refused with a 429 before the
+  // authorization query is re-parsed and before the client is looked up, so a
+  // flood buys no round trip to anything. LOGIN_ID_LIMITER is a guess brake
+  // keyed by the derived user id of the address being tried: three a minute,
+  // refused with the same body at the same 401 every other failed sign-in
+  // gets. That second detail is a requirement and not a detail — a status that
+  // only ever appeared for a listed address would tell a stranger who is on
+  // the list.
+  //
+  // WHY TWO BINDINGS AND NOT ONE WITH TWO KEY SPACES. The limit and the window
+  // live on the BINDING, not on the call: the shipped options type accepts a
+  // key and nothing else. One binding would force one pair of numbers on both
+  // key spaces, and the two layers want different ones. The first brakes HTTP
+  // requests, which cost this server. The second bounds how many times this
+  // Worker may ask Apple about one person's password, and Apple does not
+  // publish the threshold at which it locks that person out of their own mail.
+  //
+  // THE NAMESPACE ID IS ACCOUNT-WIDE AND IS NOT PER-WORKER. Cloudflare states
+  // it plainly: two rate limiting bindings sharing one namespace id — EVEN
+  // ACROSS DIFFERENT WORKERS ON THE SAME ACCOUNT — share the same counters for
+  // a given key. Occupancy observed on 2026-09-20 by reading two sibling
+  // repositories on disk: one sibling uses the lowest id, and another uses two
+  // ids in the thousand block. The 2000 block is taken here so a sibling
+  // growing upward out of the thousand block cannot grow into us, and we
+  // cannot grow into it.
+  //
+  // THAT IS A CLAIM ABOUT THE ACCOUNT, AND THIS REPOSITORY CANNOT CHECK IT.
+  // Two sibling repositories are not an account-wide enumeration, and there is
+  // no wrangler command that lists rate-limit namespaces. It is recorded here
+  // for the same reason the store namespace ids above point at a phase
+  // document: this file is the only place a reader learns the claim was made
+  // deliberately rather than by picking a number.
+  //
+  // THERE IS NO DIAGNOSTIC IF IT IS WRONG. ./.claude/CLAUDE.md §4 forbids
+  // logging anywhere under src/, so a shared counter surfaces only as a
+  // refusal on the login page with no traffic of ours to explain it — the
+  // owner locked out of their own server by a Worker they were not thinking
+  // about. This comment is the whole mitigation.
+  //
+  // THE WINDOW ACCEPTS TWO VALUES, 10 OR 60, AND THIS BLOCK IS VALIDATED BY
+  // THE DEPLOY PATH. That is the OPPOSITE of the lesson the note at the foot
+  // of this file teaches about its neighbour, and the difference has to be
+  // stated or a reader carries the wrong one over: that block accepts an
+  // unknown key silently and does nothing with it, while wrangler's own parser
+  // rejects a missing name, a non-string namespace id, a missing or
+  // non-numeric limit, a period that is neither 10 nor 60, and any extra key
+  // here. A mistake in this block fails the deploy instead of going quiet.
+  //
+  // ONE OPTION IS PROHIBITED, recorded inline the way the prohibited binding
+  // name above is. The local simulator the test suite runs against accepts a
+  // per-call limit and window override on the binding's limit method; the
+  // shipped options type does not. Code that passes them is green on every
+  // local test and then fails `npm run typecheck`. Pass a key and nothing else.
+  //
+  // NOTHING CREATES THESE NAMESPACES OUT OF BAND. Unlike the store namespaces
+  // above, which `wrangler kv namespace create` makes and whose ids are pasted
+  // in afterwards, a rate-limit namespace comes into existence on first use.
+  // There is no provisioning step and no id to look up: the ids below are
+  // chosen, not discovered, which is exactly why the collision argument above
+  // is the only thing standing between us and a sibling's counters.
+  "ratelimits": [
+    {
+      "name": "LOGIN_IP_LIMITER",
+      "namespace_id": "2001",
+      "simple": { "limit": 5, "period": 60 }
+    },
+    {
+      "name": "LOGIN_ID_LIMITER",
+      "namespace_id": "2002",
+      "simple": { "limit": 3, "period": 60 }
+    }
+  ],
+
   "observability": {
     "enabled": true,
     "logs": { "enabled": true, "invocation_logs": true }

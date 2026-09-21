@@ -129,6 +129,48 @@ declare global {
       ATTACHMENT_STAGING: R2Bucket;
 
       /**
+       * The login flood brake, keyed by the connecting source (GATE-04 layer 1).
+       *
+       * Five attempts a minute. Consulted at the top of a `/authorize` POST,
+       * before the authorization query is re-parsed and before the client is
+       * looked up, so a flood buys no round trip to anything. It is the ONE
+       * refusal on that surface allowed a status of its own, because it is
+       * keyed by who is connecting rather than by which address is being
+       * tried and therefore carries nothing about who may sign in.
+       *
+       * The limit and the window are declared on the binding in wrangler.jsonc
+       * and cannot be passed per call: `RateLimitOptions` in the shipped types
+       * is `{ key }` and nothing else. The local simulator accepts more, which
+       * is a trap rather than a convenience — code using it is green on every
+       * local test and fails `npm run typecheck`.
+       *
+       * Typed `RateLimit`, NOT `RateLimit | undefined`. The widening on every
+       * Secret below is a statement about what a Workers Secret is at runtime,
+       * and it does not transfer to a binding declared in config, which either
+       * resolves at deploy time or fails the deploy.
+       */
+      LOGIN_IP_LIMITER: RateLimit;
+
+      /**
+       * The login guess brake, keyed by the target's user id (GATE-04 layer 2).
+       *
+       * Three a minute against one address. Consulted only after the shape
+       * check and the allow-list check have both passed, so an address nobody
+       * listed is never counted against anybody. A trip renders the single
+       * credential-path failure string at 401 and NEVER this layer's
+       * neighbour's 429: a status that only ever appeared for a listed address
+       * would be a list-membership oracle.
+       *
+       * A second binding rather than a second key space on the one above,
+       * because the numbers differ and the numbers live on the binding. This
+       * one bounds how many times this Worker may ask Apple about one person's
+       * password, against a lockout threshold Apple does not publish.
+       *
+       * Typed `RateLimit` for the reason given on the binding above.
+       */
+      LOGIN_ID_LIMITER: RateLimit;
+
+      /**
        * The Cloudflare account id. A Worker var declared in wrangler.jsonc, not
        * a Secret.
        *
