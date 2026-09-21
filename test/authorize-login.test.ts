@@ -259,6 +259,33 @@ function limiter(success: boolean, keys?: string[]) {
 }
 
 /**
+ * A rate-limit binding stub whose every call rejects.
+ *
+ * The one fault a real binding cannot be asked to produce on demand. The
+ * per-target layer runs only for a listed address, so this is what proves a
+ * fault there cannot become a membership signal.
+ */
+function throwingLimiter() {
+  return {
+    async limit(): Promise<{ success: boolean }> {
+      throw new Error("the binding is unreachable");
+    },
+  };
+}
+
+/** A KV stub whose read rejects, for the per-target counter's fault case. */
+function throwingKv() {
+  return {
+    async get(): Promise<string | null> {
+      throw new Error("the store is unreachable");
+    },
+    async put() {
+      /* never reached: the read above refuses first. */
+    },
+  };
+}
+
+/**
  * An env whose provider records what the handler reached, and with what.
  *
  * `allowList` is the SEED, and it is a parameter rather than a constant because
@@ -283,16 +310,17 @@ function stubEnv(
     kv?: unknown;
     floodRefused?: boolean;
     burstRefused?: boolean;
+    burstThrows?: boolean;
     limiterKeys?: string[];
   } = {},
 ): Env & LoginGateSecret {
   return {
     OAUTH_KV: options.kv ?? quietKv(options.failures),
     LOGIN_IP_LIMITER: limiter(options.floodRefused !== true),
-    LOGIN_ID_LIMITER: limiter(
-      options.burstRefused !== true,
-      options.limiterKeys,
-    ),
+    LOGIN_ID_LIMITER:
+      options.burstThrows === true
+        ? throwingLimiter()
+        : limiter(options.burstRefused !== true, options.limiterKeys),
     ALLOWED_APPLE_IDS_SEED:
       "allowList" in options ? options.allowList : STUB_ALLOW_LIST,
     ALLOW_LIST_KV: {
@@ -1233,6 +1261,79 @@ describe("every failed sign-in answers with the same body", () => {
     expect(shape.proofCalls()).toBe(0);
     expect(a.status).toBe(b.status);
     expect(await a.text()).toBe(await b.text());
+  });
+  it("gives a listed and an unlisted address the same answer when a per-target layer throws", async () => {
+    // WR-01. Both faults sit below the allow-list check, so only a listed
+    // address can ever reach them. A fault that escaped as a fast 500 would
+    // sort the list by status and by stopwatch. Each fault is compared against
+    // an unlisted address under the SAME fault, so the pair differs only in
+    // whether the address is on the list.
+    const faults: Array<[string, { burstThrows?: boolean; kv?: unknown }]> = [
+      ["the per-target binding", { burstThrows: true }],
+      ["the hourly counter read", { kv: throwingKv() }],
+    ];
+
+    for (const [name, fault] of faults) {
+      const listed = recorder();
+      const unlisted = recorder();
+
+      const a = await timed(() =>
+        handlerOver(listed.proof).fetch(
+          post(LISTED_APPLE_ID),
+          stubEnv(listed, fault),
+        ),
+      );
+      const b = await timed(() =>
+        handlerOver(unlisted.proof).fetch(
+          post(UNLISTED_APPLE_ID),
+          stubEnv(unlisted, fault),
+        ),
+      );
+
+      expect(a.response.status, `${name}: the listed address`).toBe(401);
+      expect(b.response.status, `${name}: the unlisted address`).toBe(401);
+      expect(
+        a.elapsed,
+        `${name}: the listed address skipped the floor`,
+      ).toBeGreaterThanOrEqual(TEST_FLOOR_MS);
+      expect(b.elapsed).toBeGreaterThanOrEqual(TEST_FLOOR_MS);
+
+      const bodyA = await a.response.text();
+      expect(bodyA, `${name}: the two bodies differ`).toBe(
+        await b.response.text(),
+      );
+      for (const line of CREDENTIAL_FAILURE_BODY) {
+        expect(bodyA).toContain(line);
+      }
+
+      // Fail CLOSED, not open: a fault must not wave the guess through to
+      // Apple either.
+      expect(listed.proofCalls(), `${name}: the fault reached Apple`).toBe(0);
+      expect(listed.calls).not.toContain("completeAuthorization");
+    }
+  });
+
+  it("refuses a listed address whose hourly counter holds something that is not a number", async () => {
+    // A corrupted value reads as NaN, and NaN compares false against the cap.
+    // Without the finiteness check that one bad value would switch the hourly
+    // layer off for that person for good.
+    const record = recorder();
+    const response = await handlerOver(record.proof).fetch(
+      post(LISTED_APPLE_ID),
+      stubEnv(record, {
+        kv: {
+          async get() {
+            return "not a number";
+          },
+          async put() {},
+        },
+      }),
+    );
+
+    expect(response.status).toBe(401);
+    expect(record.proofCalls(), "a corrupted counter let a guess through").toBe(
+      0,
+    );
   });
 });
 

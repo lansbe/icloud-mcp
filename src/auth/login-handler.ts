@@ -1302,8 +1302,20 @@ async function handleAuthorize(
     // several has nothing to bind that the per-target layer does not already
     // bind. Revisit when the list grows past one.
     // ---------------------------------------------------------------------
-    const burst = await env.LOGIN_ID_LIMITER.limit({ key: userId });
-    if (!burst.success) return refuseCredential();
+    //
+    // A BINDING THAT THROWS IS A REFUSAL, and it takes the same exit as a trip.
+    // This line runs only for a listed address. So a throw that escaped here
+    // would come back as a fast 500 for listed addresses and never for unlisted
+    // ones, which sorts the list by status and by stopwatch. Refusing through
+    // the one helper keeps the body, the status and the floor the same. The
+    // caught value is never read.
+    let burstOk = false;
+    try {
+      burstOk = (await env.LOGIN_ID_LIMITER.limit({ key: userId })).success;
+    } catch {
+      /* Fail closed. See the paragraph above. */
+    }
+    if (!burstOk) return refuseCredential();
 
     // LAYER 3, the target address across an hour. Five failed guesses, and the
     // sixth is refused.
@@ -1317,9 +1329,22 @@ async function handleAuthorize(
     // refused one layer up by something that is atomic; what is left for this
     // counter is a patient attacker's serial attempts, which it counts
     // correctly.
+    //
+    // A STORE THAT THROWS IS A REFUSAL too, for the same reason as the binding
+    // above: only a listed address gets here. An unreadable counter reads as a
+    // full one. So does a value that is not a number. `NaN >= 5` is false, so
+    // without the finiteness check a corrupted value would switch this layer
+    // off for that person for good.
     const counterKey = failureCounterKey(userId);
-    const failures = Number((await env.OAUTH_KV.get(counterKey)) ?? "0");
-    if (failures >= MAX_FAILURES_PER_WINDOW) return refuseCredential();
+    let failures = MAX_FAILURES_PER_WINDOW;
+    try {
+      failures = Number((await env.OAUTH_KV.get(counterKey)) ?? "0");
+    } catch {
+      /* Fail closed. The caught value is never read. */
+    }
+    if (!Number.isFinite(failures) || failures >= MAX_FAILURES_PER_WINDOW) {
+      return refuseCredential();
+    }
 
     // Whether a real attempt was spent at Apple. It decides, and is the only
     // thing that decides, whether the counter above moves.
