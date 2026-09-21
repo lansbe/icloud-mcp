@@ -44,8 +44,10 @@ you supply. See [Deploy](#deploy).
 - **Act on its own.** No cron jobs, no background watchers, no digests.
 - **Cache your content.** iCloud is the system of record; only discovery
   metadata (which server holds your account) is cached, for 24 hours.
-- **Support multiple users** or other iCloud services (Reminders, Notes,
-  Photos).
+- **Let anyone in.** Who may sign in is an allow list you set. Everyone else is
+  refused before Apple is ever contacted, and taking somebody off the list ends
+  their access on their next request. See [Removing someone](#removing-someone).
+- **Support other iCloud services** (Reminders, Notes, Photos).
 
 ---
 
@@ -221,6 +223,34 @@ Dynamic Client Registration.
 
 The redirect-origin allowlist is `https://claude.ai` plus loopback. To authorize
 a client on a different origin, add it in `src/auth/login-handler.ts`.
+
+---
+
+## Removing someone
+
+Take their address out of the `ALLOWED_APPLE_IDS` secret and deploy. Their
+access ends on their next request.
+
+```bash
+npx wrangler secret put ALLOWED_APPLE_IDS   # the remaining addresses, as a JSON array
+npm run deploy
+```
+
+Three things worth knowing.
+
+**It takes effect on the next request, not at the end of the hour.** The list is
+read on every single request. There is no cache to wait out.
+
+**Their existing token stops working. It does not expire.** They hold a token
+that was valid a moment ago and is now refused. Nothing needs to be revoked by
+hand, and nothing needs to time out first.
+
+**They are not told they were removed.** Their client sees a sign-in page again,
+the same one anybody who was never on the list sees. If you want them to know,
+tell them yourself.
+
+An empty or unreadable list means nobody, including you. The server refuses
+every sign-in rather than guessing.
 
 ---
 
