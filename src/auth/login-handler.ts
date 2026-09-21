@@ -82,8 +82,8 @@
 //   login runs, so a parallel burst all reads the same number.
 //
 // What that means in practice: against one address, the three-a-minute and
-// about-five-an-hour figures hold for a patient, serial guesser (the hourly one
-// is approximate by design; see layer 3). They do NOT hold
+// five-in-any-sixty-minutes figures hold for a patient, serial guesser (the
+// hourly one exactly; see layer 3). They do NOT hold
 // for a parallel or many-location burst. How far over they go depends on how
 // many locations the attacker can reach and how fast they fire, and nothing in
 // this file can measure that. Apple's lockout threshold is unpublished. If it
@@ -430,12 +430,14 @@ const SOURCE_WINDOW_SECONDS = 60;
 const FAILURE_WINDOW_SECONDS = 3600;
 
 /**
- * Failed guesses tolerated against one address, about five per rolling hour.
+ * Failed guesses tolerated against one address in any rolling sixty minutes.
  *
- * Approximate by design. It is enforced over this hour's bucket plus a
- * weighted share of the previous one, so the limit holds across an hour
- * boundary too, and a lockout lasts about an hour. See the layer-3 comment in
- * the handler for the formula and the owner's decision.
+ * Exact for a serial guesser. The counter stores the time of each of the last
+ * five failures, so there are no fixed hours and no boundary to straddle. The
+ * sixth attempt is refused until the oldest of the five is sixty minutes old,
+ * so a lockout lasts exactly an hour from the first of the five. A parallel or
+ * many-location burst can still go over it; see the layer-3 comment in the
+ * handler for why, and for the owner's decision.
  */
 const MAX_FAILURES_PER_WINDOW = 5;
 
@@ -454,11 +456,12 @@ const MAX_FAILURES_PER_WINDOW = 5;
  *
  * The version segment is the same hedge `confirm:v2:` and `dav:v1:` carry: a
  * later change to the shape becomes detectable rather than silently misread as
- * the current one. It matters immediately here, because the keys this replaces
- * are still in the store until their own TTL runs out, and they were keyed by
- * source rather than by target.
+ * the current one. It has been needed twice. The keys before `v2` were
+ * keyed by source rather than by target. `v2` keys held a plain count per
+ * clock hour. `v3` holds a list of failure times, one key per person. No older
+ * shape is read, so a leftover key is ignored and expires on its own TTL.
  */
-const LOGIN_FAILURE_KEY_PREFIX = "authorize-failures:v2:";
+const LOGIN_FAILURE_KEY_PREFIX = "authorize-failures:v3:";
 
 /**
  * The exact origins this server will deliver an authorization code to.
@@ -678,7 +681,7 @@ function ipv6Slash64(address: string): string | null {
 }
 
 /**
- * The per-target failure counter's key: who is being guessed at, and when.
+ * The per-target failure counter's key: who is being guessed at.
  *
  * The derived user id and never the address. This key name is stored in plain
  * text — `props` is the only field this server writes that is encrypted — so an
@@ -690,30 +693,62 @@ function ipv6Slash64(address: string): string | null {
  * its lookahead on the very next character, and a key that fails it does not
  * fail one commit, it fails every commit in the repository.
  *
- * The bucket follows the id rather than preceding it, so every key belonging to
- * one person sorts together in a listing — which is what makes the owner's
- * escape in the phase runbook a prefix match rather than a guess at an hour
- * number.
- *
- * The bucket is a parameter because two are read: this hour's and the one
- * before it. See `failureWindowAt` and the layer-3 comment for why.
+ * One key per person, with nothing after the id. The value carries the failure
+ * times, so the key needs no hour in it. The owner's escape in the phase
+ * runbook stays a prefix listing.
  */
-function failureCounterKey(userId: string, bucket: number): string {
-  return `${LOGIN_FAILURE_KEY_PREFIX}${userId}:${bucket}`;
+function failureCounterKey(userId: string): string {
+  return `${LOGIN_FAILURE_KEY_PREFIX}${userId}`;
 }
 
 /**
- * Where one clock reading falls in the fixed hour-long buckets.
+ * How long a counter record lives: one window plus a minute.
  *
- * `bucket` is the hour the reading is in. `remaining` is the share of that
- * hour still to come, from 1 at the top of the hour down towards 0 at its end.
- * Both come from ONE reading, so they can never disagree about which hour it
- * is — two separate reads could straddle the top of an hour.
+ * The record stops mattering when its newest entry is one window old, and the
+ * newest entry is the one written with this TTL. The extra minute is margin, so
+ * the record never expires a moment before its newest entry stops counting. It
+ * is also well clear of the store's sixty-second minimum TTL.
  */
-function failureWindowAt(nowMs: number): { bucket: number; remaining: number } {
-  const position = nowMs / 1000 / FAILURE_WINDOW_SECONDS;
-  const bucket = Math.floor(position);
-  return { bucket, remaining: 1 - (position - bucket) };
+const FAILURE_RECORD_TTL_SECONDS = FAILURE_WINDOW_SECONDS + 60;
+
+/**
+ * The failure times a counter value holds, or `null` if it cannot be trusted.
+ *
+ * An absent key is an empty list: nobody has failed. Anything else must parse
+ * as a JSON array whose every entry is a finite number. Text that is not JSON,
+ * an object, a bare number, or an array holding a string or a `null` is all
+ * `null`, and the caller refuses on `null`. Reading a corrupted value as empty
+ * would switch this layer off for that person for good.
+ *
+ * `JSON.parse` throws on bad text. That throw is caught here, and the caught
+ * value is never read.
+ */
+function failureTimesFrom(raw: string | null): number[] | null {
+  if (raw === null) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  const times: unknown[] = parsed;
+  return times.every((t) => Number.isFinite(t)) ? (times as number[]) : null;
+}
+
+/**
+ * The failures that still count at `now`: those at most one window old.
+ *
+ * Inclusive at the edge. A failure exactly sixty minutes old still counts, and
+ * one a millisecond older does not. So after five failures the next attempt is
+ * refused until the oldest of the five is sixty minutes old, and allowed from
+ * the millisecond after.
+ *
+ * A time later than `now` is kept, because `now - t` is negative. That is the
+ * safe direction for a clock that stepped backwards.
+ */
+function failuresWithinWindow(times: number[], now: number): number[] {
+  return times.filter((t) => now - t <= FAILURE_WINDOW_SECONDS * 1000);
 }
 
 /**
@@ -729,26 +764,35 @@ function failureWindowAt(nowMs: number): { bucket: number; remaining: number } {
  * succeeding, and it is applied outside this function.
  *
  * Non-atomic. Read, compare and write over an eventually-consistent store means
- * concurrent attempts all read the same value, so this layer UNDER-counts a
- * parallel burst. The platform limiter one layer up is the only other brake on
- * a burst, and it is not exact either: it counts per Cloudflare location and
- * is eventually consistent. This layer exists for the hour the platform's
- * window cannot reach, and it counts a patient, serial attacker correctly.
- * The file header records the parallel case as an accepted cost.
+ * concurrent attempts all read the same list, and the last write wins, so this
+ * layer UNDER-counts a parallel burst. The platform limiter one layer up is the
+ * only other brake on a burst, and it is not exact either: it counts per
+ * Cloudflare location and is eventually consistent. This layer exists for the
+ * hour the platform's window cannot reach, and it counts a patient, serial
+ * attacker exactly. The file header records the parallel case as an accepted
+ * cost.
  *
- * The record lives for two windows, because it is read for two: during its
- * own hour, and during the next hour as the "previous" bucket. A record
- * written at the very start of its hour is last read at the very end of the
- * next one, just under two windows later, so two windows is enough.
+ * What is written: the failures still inside the window, then this one, newest
+ * last, trimmed to the newest five. Entries that have aged out are dropped
+ * here, so the value never grows. The trim does not bite today: the check
+ * refuses at five, so at most four in-window entries ever reach this write. It
+ * stays as a guard, so the value remains bounded if the check ever changes.
+ *
+ * `failedAt` is a fresh clock reading taken after Apple answered, so the entry
+ * records when the failure happened rather than when the request arrived. If
+ * the clock ever returns something that is not a finite number, the entry is
+ * written as `null` and the next read refuses: fail closed.
  */
 async function countFailedGuess(
   store: KVNamespace,
   key: string,
-  failures: number,
+  recent: number[],
+  failedAt: number,
 ): Promise<void> {
   try {
-    await store.put(key, String(failures + 1), {
-      expirationTtl: FAILURE_WINDOW_SECONDS * 2,
+    const times = [...recent, failedAt].slice(-MAX_FAILURES_PER_WINDOW);
+    await store.put(key, JSON.stringify(times), {
+      expirationTtl: FAILURE_RECORD_TTL_SECONDS,
     });
   } catch {
     /* See the paragraph above: this rejection must not change the response. */
@@ -989,11 +1033,12 @@ function authorizationErrorResponse(error: AuthorizationError): Response {
  * while one case still drives the default and asserts the real figure.
  *
  * `clock` is the third seam, and it feeds the hourly counter (layer 3) and
- * nothing else. It is read once per request there. Production passes nothing
- * and gets the real wall clock. A test pins it to a chosen minute of a chosen
- * hour, which is the only way to show how the previous hour's failures decay
- * without a test that can flake across the top of a real hour. The time floor
- * keeps the real clock on purpose: it has to measure real elapsed time.
+ * nothing else. It is read once before the counter is checked, and once more
+ * to stamp a failure that Apple turned down. Production passes nothing and
+ * gets the real wall clock. A test pins it to a chosen millisecond, which is
+ * the only way to show exactly when a lockout ends without waiting an hour.
+ * The time floor keeps the real clock on purpose: it has to measure real
+ * elapsed time.
  */
 export function createLoginHandler(
   proof: LoginProof = proveWithApple,
@@ -1431,13 +1476,12 @@ async function handleAuthorize(
     // it acceptable. It blocks NEW sign-ins only. An existing grant never
     // touches this path — it is served by the token endpoint and the API
     // handler, neither of which consults a limiter — so nobody already signed
-    // in loses anything, and the person locked out is locked out for about an
-    // hour rather than indefinitely. At worst a little over an hour: layer 3
-    // below is approximate by design, and a burst early in one hour holds the
-    // door shut until about twelve minutes into the next. The owner confirmed
-    // "about an hour" on 2026-09-21, after the hour-boundary fix had briefly
-    // stretched it towards two. The owner's own escape from a counter they
-    // tripped themselves is in the phase runbook.
+    // in loses anything, and the person locked out is locked out for an hour
+    // rather than indefinitely: layer 3 below refuses until the oldest of the
+    // last five failures is sixty minutes old. The owner chose an hour's
+    // lockout on 2026-09-21, after the hour-boundary fix had briefly stretched
+    // it towards two. The owner's own escape from a counter they tripped
+    // themselves is in the phase runbook.
     //
     // Re-keying by attacker instead would not bound Apple attempts at all,
     // which is the one thing these layers exist to do: a guesser spread thin
@@ -1483,92 +1527,64 @@ async function handleAuthorize(
     }
     if (!burstOk) return refuseCredential();
 
-    // LAYER 3, the target address across an hour. About five failed guesses
-    // per rolling hour, and the next is refused. Approximate by design, and a
-    // lockout lasts about an hour.
+    // LAYER 3, the target address across an hour. At most five failed guesses
+    // reach Apple in any rolling sixty minutes, and the next is refused.
     //
     // This is the layer the platform cannot supply: a rate-limit binding's
     // window accepts ten seconds or sixty and nothing longer, so an hour has to
-    // be a counter in a store. It is read AFTER the binding above, deliberately
+    // be a record in a store. It is read AFTER the binding above, deliberately
     // — the binding costs no round trip and this does.
     //
-    // Non-atomic. It counts a patient attacker's serial attempts correctly.
-    // It does not catch a parallel burst, because every request in the burst
-    // reads the same value before any of them writes. The layer above is the
-    // only other brake on that case, and it is not exact either. The file
-    // header records the gap as an accepted cost.
+    // A SLIDING LOG, NOT A COUNT. One key per person holds the times of their
+    // last five failures, newest last. A failure counts while it is at most
+    // sixty minutes old. Five that count means refuse. So, for a serial
+    // guesser:
     //
-    // TWO BUCKETS ARE READ, THIS HOUR'S AND THE ONE BEFORE. The buckets are
-    // fixed clock hours. With only the current one read, a guesser could spend
-    // five at 10:59 and five more at 11:00 — ten attempts at Apple inside a
-    // minute. The cost of the fix is one more store read, and only for a
-    // listed address.
+    // - At most five failures reach Apple in any sixty minutes. There are no
+    //   fixed hours, so there is no boundary to straddle.
+    // - A lockout lasts until the oldest of the five is sixty minutes old, and
+    //   the next attempt is allowed a millisecond later.
+    // - A success writes nothing, and a refusal writes nothing.
     //
-    // THE PREVIOUS HOUR IS WEIGHTED, NOT SUMMED. The owner chose this on
-    // 2026-09-21. The count is:
+    // Why this and not a count per clock hour. The owner chose a lockout of
+    // about an hour on 2026-09-21. The first design read two hourly buckets
+    // and summed them, which held a lockout for up to two hours. The second
+    // weighted the previous hour instead. That brought the lockout back to
+    // about an hour but let a patient guesser place nine attempts at Apple in
+    // forty-nine minutes, because a count with no times in it cannot tell a
+    // burst at 10:59 from one at 10:00. It was replaced with this log the same
+    // day. Keeping the times is what makes the bound exact.
     //
-    //   this hour's failures
-    //     + the previous hour's failures × the share of this hour still to come
+    // Non-atomic. It counts a patient attacker's serial attempts exactly. It
+    // does not catch a parallel or many-location burst, because every request
+    // in the burst reads the same list before any of them writes, and the store
+    // is eventually consistent. Such a burst can go over five. That is the same
+    // accepted cost as layer 2, and the file header records it.
     //
-    // with the previous hour's share rounded UP to a whole failure. Refuse when
-    // that count reaches five. So the previous hour counts in full at the top
-    // of this hour and fades to nothing by its end.
-    //
-    // Why not a plain sum. A plain sum counted a failure until the END of the
-    // next hour, so one burst of five at 10:00 held the door shut until 12:00.
-    // That quietly doubled the lockout the owner had accepted (layer 2's
-    // accepted cost). The weighting brings it back to about an hour.
-    //
-    // Why round up. The counter cannot tell a burst at 10:00 from one at
-    // 10:59. Unrounded, five failures at 10:59 would weigh just under five one
-    // second after 11:00 and let the next guess through at once. Rounding up
-    // keeps a full previous hour at five until twelve minutes into this one,
-    // so a late burst still refuses just after the boundary. The price is that
-    // an early burst also holds for those twelve minutes: a lockout of up to
-    // about seventy-two minutes rather than sixty.
-    //
-    // What it bounds. The count is an estimate, because the counter keeps no
-    // timestamps. A serial guesser straddling a boundary gets about five in any
-    // rolling hour, sometimes one more. Never the ten the single bucket
-    // allowed.
-    //
-    // ONE CLOCK READING. The bucket and the share still to come come from the
-    // same reading of the injected clock, so they cannot disagree about which
-    // hour it is.
-    //
-    // Only THIS hour's count is written back, as this hour's own value plus
-    // one — never the weighted count. The previous bucket is read and never
-    // changed.
-    //
-    // Two awaits one after the other, never a combinator: convention 3 forbids
-    // one anywhere in `src/auth/`.
+    // One read and, on a failure at Apple, one write. Never a combinator:
+    // convention 3 forbids one anywhere in `src/auth/`.
     //
     // A STORE THAT THROWS IS A REFUSAL too, for the same reason as the binding
-    // above: only a listed address gets here. An unreadable counter reads as a
-    // full one. So does a value that is not a number. `NaN >= 5` is false, so
-    // without the finiteness check a corrupted value would switch this layer
-    // off for that person for good.
-    const { bucket, remaining } = failureWindowAt(clock());
-    const counterKey = failureCounterKey(userId, bucket);
-    const previousKey = failureCounterKey(userId, bucket - 1);
-    let failures = MAX_FAILURES_PER_WINDOW;
-    let previousFailures = MAX_FAILURES_PER_WINDOW;
+    // above: only a listed address gets here. An unreadable record reads as a
+    // full one. So does one that is not a JSON list of finite numbers, and so
+    // does a clock reading that is not a finite number. Each of those would
+    // otherwise make every entry look old or absent, which would switch this
+    // layer off for that person for good.
+    const now = clock();
+    const counterKey = failureCounterKey(userId);
+    let recent: number[] | null = null;
     try {
-      failures = Number((await env.OAUTH_KV.get(counterKey)) ?? "0");
-      previousFailures = Number((await env.OAUTH_KV.get(previousKey)) ?? "0");
+      const times = failureTimesFrom(await env.OAUTH_KV.get(counterKey));
+      if (times !== null && Number.isFinite(now)) {
+        recent = failuresWithinWindow(times, now);
+      }
     } catch {
       /* Fail closed. The caught value is never read. */
     }
-    if (!Number.isFinite(failures) || !Number.isFinite(previousFailures)) {
+    if (recent === null || recent.length >= MAX_FAILURES_PER_WINDOW) {
       return refuseCredential();
     }
-    const carried = Math.ceil(previousFailures * remaining);
-    if (
-      !Number.isFinite(carried) ||
-      failures + carried >= MAX_FAILURES_PER_WINDOW
-    ) {
-      return refuseCredential();
-    }
+    const failuresInWindow: number[] = recent;
 
     // Whether a real attempt was spent at Apple. It decides, and is the only
     // thing that decides, whether the counter above moves.
@@ -1629,7 +1645,12 @@ async function handleAuthorize(
       // swallows its own rejection; what it must not do is settle after the
       // response has gone.
       if (askedApple && !throttled) {
-        await countFailedGuess(env.OAUTH_KV, counterKey, failures);
+        await countFailedGuess(
+          env.OAUTH_KV,
+          counterKey,
+          failuresInWindow,
+          clock(),
+        );
       }
 
       return refuseCredential(throttled ? "throttled" : "credentials");

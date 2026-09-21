@@ -219,13 +219,16 @@ function recorder(
 /**
  * A KV stub: no real namespace, and nothing over the cap unless asked.
  *
- * `failures` is what the per-target hourly counter reads back, so one case can
- * drive the third layer without making five real attempts first.
+ * `failures` is how many failures the per-target hourly log reads back, all
+ * stamped at the moment of the read, so one case can drive the third layer
+ * without making five real attempts first.
  */
 function quietKv(failures?: number) {
   return {
     async get() {
-      return failures === undefined ? null : String(failures);
+      return failures === undefined
+        ? null
+        : JSON.stringify(new Array<number>(failures).fill(Date.now()));
     },
     async put() {
       /* nothing here asserts on the counter. */
@@ -1314,27 +1317,66 @@ describe("every failed sign-in answers with the same body", () => {
     }
   });
 
-  it("refuses a listed address whose hourly counter holds something that is not a number", async () => {
-    // A corrupted value reads as NaN, and NaN compares false against the cap.
-    // Without the finiteness check that one bad value would switch the hourly
-    // layer off for that person for good.
-    const record = recorder();
-    const response = await handlerOver(record.proof).fetch(
-      post(LISTED_APPLE_ID),
-      stubEnv(record, {
-        kv: {
-          async get() {
-            return "not a number";
-          },
-          async put() {},
-        },
-      }),
-    );
+  it("refuses a listed address whose hourly log holds anything but a list of finite numbers", async () => {
+    // Each of these would otherwise read as "no recent failures" — a parse
+    // that fails, a value that is not a list, or an entry that drops out of
+    // the window comparison because it is not a number. Any one of them would
+    // switch the hourly layer off for that person for good. Every case is
+    // compared with the same body a wrong password gets, and nothing is
+    // written.
+    const corrupt: Array<[string, string]> = [
+      ["text that is not JSON", "not a number"],
+      ["a bare number, the old count shape", "3"],
+      ["an object", '{"times":[]}'],
+      ["a JSON string", '"[]"'],
+      ["JSON null", "null"],
+      ["a list holding a null", "[1, null]"],
+      ["a list holding a string", '[1, "2"]'],
+      ["a list holding a nested list", "[[1]]"],
+      ["a list holding a boolean", "[true]"],
+    ];
 
-    expect(response.status).toBe(401);
-    expect(record.proofCalls(), "a corrupted counter let a guess through").toBe(
-      0,
-    );
+    for (const [name, value] of corrupt) {
+      const record = recorder();
+      const puts: string[] = [];
+      const response = await handlerOver(record.proof).fetch(
+        post(LISTED_APPLE_ID),
+        stubEnv(record, {
+          kv: {
+            async get() {
+              return value;
+            },
+            async put(key: string) {
+              puts.push(key);
+            },
+          },
+        }),
+      );
+
+      expect(response.status, name).toBe(401);
+      const body = await response.text();
+      for (const line of CREDENTIAL_FAILURE_BODY) {
+        expect(body, name).toContain(line);
+      }
+      expect(record.proofCalls(), `${name} let a guess through`).toBe(0);
+      expect(puts, `${name} was written over`).toHaveLength(0);
+    }
+  });
+
+  it("refuses when the injected clock returns something that is not a finite number", async () => {
+    // A NaN clock makes every `now - t` NaN, and NaN compares false, so without
+    // the check every stored failure would drop out of the window at once.
+    for (const reading of [Number.NaN, Number.POSITIVE_INFINITY]) {
+      const record = recorder();
+      const response = await createLoginHandler(
+        record.proof,
+        TEST_FLOOR_MS,
+        () => reading,
+      ).fetch(post(LISTED_APPLE_ID), stubEnv(record));
+
+      expect(response.status, String(reading)).toBe(401);
+      expect(record.proofCalls(), `${reading} let a guess through`).toBe(0);
+    }
   });
 });
 
@@ -1938,58 +1980,107 @@ describe("the per-id layer, which answers as a wrong password and never as a 429
 
 describe("the hourly counter, the layer no platform window can reach", () => {
   // Titled so `-t "hourly"` matches — 11-VALIDATION.md's third GATE-04 row.
+  //
+  // Layer 3 is a sliding log: one key per person holding the times of the
+  // last five failures. The owner chose a lockout of about an hour on
+  // 2026-09-21. A weighted count per clock hour was replaced the same day,
+  // because it let nine attempts reach Apple in forty-nine minutes. Every case
+  // here pins the clock through the factory's third argument, so nothing reads
+  // the real clock and nothing can flake at the top of a real hour.
 
-  /**
-   * The hour every case here pins its clock to, as hours since the epoch.
-   *
-   * A fixed number rather than "now", so no case reads the real clock and no
-   * case can flake across the top of a real hour (IN-05).
-   */
+  /** The hour every case pins its clock to, as hours since the epoch. */
   const HOUR = 500_000;
 
-  /** Milliseconds since the epoch at `minute` and `second` past `hour`. */
-  function clockAt(hour: number, minute: number, second = 0): number {
-    return (hour * 3600 + minute * 60 + second) * 1000;
+  /** Milliseconds since the epoch at `minute:second.ms` past `hour`. */
+  function clockAt(hour: number, minute: number, second = 0, ms = 0): number {
+    return (hour * 3600 + minute * 60 + second) * 1000 + ms;
   }
 
-  /** A store that really counts, and remembers every key it was handed. */
-  function countingKv() {
-    const values = new Map<string, string>();
+  /** 10:59:0s in the story the review told: the minute before the boundary. */
+  function lateInPreviousHour(second: number): number {
+    return clockAt(HOUR - 1, 59, second);
+  }
+
+  /**
+   * A store that really keeps what it is handed, and records every call.
+   *
+   * `seed` is a raw value to start the one key with, for the cases that need a
+   * log already in place.
+   */
+  function logKv(seed?: string) {
+    let value: string | null = seed ?? null;
     const gets: string[] = [];
-    const puts: string[] = [];
+    const puts: { key: string; value: string; ttl: number | undefined }[] = [];
     return {
       gets,
       puts,
+      /** The failure times the store holds right now. */
+      times(): number[] {
+        return value === null ? [] : (JSON.parse(value) as number[]);
+      },
       binding: {
         async get(key: string) {
           gets.push(key);
-          return values.get(key) ?? null;
+          return value;
         },
-        async put(key: string, value: string) {
-          puts.push(key);
-          values.set(key, value);
+        async put(
+          key: string,
+          next: string,
+          options?: { expirationTtl?: number },
+        ) {
+          puts.push({ key, value: next, ttl: options?.expirationTtl });
+          value = next;
         },
       },
     };
   }
 
+  /**
+   * One sign-in at a pinned time. It fails at Apple unless `succeed` is set.
+   * A fresh recorder each time, so `proofCalls` is this attempt's alone.
+   */
+  async function attemptAt(
+    store: ReturnType<typeof logKv>,
+    at: number,
+    succeed = false,
+  ): Promise<{ status: number; proofCalls: number }> {
+    const record = succeed
+      ? recorder()
+      : recorder({ rejectWith: () => new ImapAuthError() });
+    const response = await createLoginHandler(
+      record.proof,
+      TEST_FLOOR_MS,
+      () => at,
+    ).fetch(post(LISTED_APPLE_ID), stubEnv(record, { kv: store.binding }));
+    return { status: response.status, proofCalls: record.proofCalls() };
+  }
+
+  /** Five failures at Apple, one a second from 10:59:00. */
+  async function lateBurstOfFive(store: ReturnType<typeof logKv>) {
+    for (let second = 0; second < 5; second += 1) {
+      const turned = await attemptAt(store, lateInPreviousHour(second));
+      expect(turned.proofCalls, `failure ${second + 1} did not reach Apple`).toBe(
+        1,
+      );
+    }
+  }
+
   it("refuses the sixth failed guess in the window, under a key that names nobody", async () => {
     // Both limiters stubbed open, deliberately. The per-target binding refuses
     // a fourth attempt in a minute, so six real attempts could never reach
-    // this layer — which is exactly why the hour needs a counter of its own
+    // this layer — which is exactly why the hour needs a record of its own
     // and cannot be a fourth binding.
-    const counter = countingKv();
+    const store = logKv();
     const record = recorder({ rejectWith: () => new ImapAuthError() });
-    // The clock is pinned to the middle of an hour, so all six requests see the
-    // same hour however long the suite takes (IN-05).
-    const handler = createLoginHandler(record.proof, TEST_FLOOR_MS, () =>
-      clockAt(HOUR, 30),
-    );
-    const env = stubEnv(record, { kv: counter.binding });
+    // A minute apart, all inside one sixty-minute window.
+    let now = clockAt(HOUR, 10);
+    const handler = createLoginHandler(record.proof, TEST_FLOOR_MS, () => now);
+    const env = stubEnv(record, { kv: store.binding });
 
     for (let attempt = 1; attempt <= 5; attempt += 1) {
       const turned = await handler.fetch(post(LISTED_APPLE_ID), env);
       expect(turned.status, `guess ${attempt} was not refused`).toBe(401);
+      now += 60_000;
     }
     expect(record.proofCalls(), "five guesses did not each cost one").toBe(5);
 
@@ -2004,22 +2095,33 @@ describe("the hourly counter, the layer no platform window can reach", () => {
     // buys: the five before it each spent a real attempt at a real account.
     expect(record.proofCalls(), "the sixth guess reached Apple").toBe(5);
 
-    // Twelve reads and five writes. Each attempt reads two buckets, this
-    // hour's and the one before (WR-03). The sixth read the counter and did
-    // not bump it — a trip that counted itself would refill its own cap, and an
-    // address that tripped once could never come back inside the window.
-    expect(counter.gets).toHaveLength(12);
-    expect(counter.puts).toHaveLength(5);
-    // Every write lands on one key, because one address in one hour is one
-    // counter, and the previous hour's bucket is read and never written.
-    expect(new Set(counter.puts).size).toBe(1);
-    expect(new Set([...counter.gets, ...counter.puts]).size).toBe(2);
+    // Six reads and five writes, all on ONE key. The sixth read the log and
+    // did not add to it — a trip that counted itself would refill its own
+    // cap, and an address that tripped once could never come back.
+    expect(store.gets).toHaveLength(6);
+    expect(store.puts).toHaveLength(5);
+    expect(new Set([...store.gets, ...store.puts.map((p) => p.key)]).size).toBe(
+      1,
+    );
 
-    // THE PROPERTY, NOT THE SHAPE. The keys are read back out of the store and
+    // The log holds the five failure times, oldest first.
+    expect(store.times()).toEqual(
+      [10, 11, 12, 13, 14].map((minute) => clockAt(HOUR, minute)),
+    );
+
+    // It outlives its newest entry's window, and stays above the store's
+    // sixty-second minimum TTL.
+    for (const put of store.puts) {
+      expect(put.ttl, "the log could expire while it still counts").toBeGreaterThan(
+        3600,
+      );
+    }
+
+    // THE PROPERTY, NOT THE SHAPE. The key is read back out of the store and
     // checked for the address rather than matched against today's format: the
     // claim is that no key names a person, and a format assertion would move
     // with the format instead of holding it to anything.
-    for (const key of [...counter.gets, ...counter.puts]) {
+    for (const key of [...store.gets, ...store.puts.map((p) => p.key)]) {
       expect(key, "a counter key carries the address").not.toContain(
         LISTED_APPLE_ID,
       );
@@ -2029,108 +2131,122 @@ describe("the hourly counter, the layer no platform window can reach", () => {
     }
   });
 
-  describe("an hour boundary, with the previous hour weighted (WR-03, then WR-01 of the re-review)", () => {
-    // The buckets are fixed clock hours. Reading only the current one let a
-    // guesser spend five at 10:59 and five more at 11:00. A plain sum of the
-    // two buckets fixed that but held a lockout for up to two hours. The owner
-    // chose a weighted previous hour on 2026-09-21, so a lockout lasts about
-    // an hour.
-    //
-    // Every case pins the clock through the factory's third argument. Nothing
-    // here reads the real clock, so nothing here can flake at the top of a
-    // real hour (IN-05).
+  it("holds a late burst across the top of the hour until exactly sixty minutes after its oldest failure", async () => {
+    // WR-03 then WR-01. Five failures at 10:59:00 to 10:59:04. A count per
+    // clock hour either forgot them at 11:00 or held them to 12:00. The log
+    // holds them for sixty minutes from each failure, whatever the hour.
+    const store = logKv();
+    await lateBurstOfFive(store);
 
-    /** A store holding a chosen count in each of the two buckets. */
-    function kvWith(previous: number, current = 0) {
-      const puts: { bucket: number; value: string }[] = [];
-      return {
-        puts,
-        binding: {
-          async get(key: string) {
-            const bucket = Number(key.slice(key.lastIndexOf(":") + 1));
-            if (bucket === HOUR - 1 && previous > 0) return String(previous);
-            if (bucket === HOUR && current > 0) return String(current);
-            return null;
-          },
-          async put(key: string, value: string) {
-            puts.push({
-              bucket: Number(key.slice(key.lastIndexOf(":") + 1)),
-              value,
-            });
-          },
-        },
-      };
+    // Just after the boundary: refused.
+    expect((await attemptAt(store, clockAt(HOUR, 0, 30))).proofCalls).toBe(0);
+
+    // Exactly sixty minutes after the oldest failure: still refused. The edge
+    // is inclusive.
+    expect(
+      (await attemptAt(store, clockAt(HOUR, 59, 0, 0))).proofCalls,
+      "refused a millisecond early",
+    ).toBe(0);
+    expect(store.puts, "a refusal wrote to the log").toHaveLength(5);
+
+    // One millisecond later the oldest has aged out, so there is room for one.
+    expect(
+      (await attemptAt(store, clockAt(HOUR, 59, 0, 1))).proofCalls,
+      "the lockout outlived the oldest failure",
+    ).toBe(1);
+    // That failure took the freed place, so the next one is refused again:
+    // the window slides one failure at a time.
+    expect(store.times()).toEqual([
+      lateInPreviousHour(1),
+      lateInPreviousHour(2),
+      lateInPreviousHour(3),
+      lateInPreviousHour(4),
+      clockAt(HOUR, 59, 0, 1),
+    ]);
+    expect((await attemptAt(store, clockAt(HOUR, 59, 0, 2))).proofCalls).toBe(0);
+  });
+
+  it("refuses the review's nine-in-forty-nine-minutes sequence after the fifth failure", async () => {
+    // The sequence the weighted count let through: five at 10:59:00-04, then
+    // one each at 11:12:01, 11:24:00, 11:36:01 and 11:48:00. All four late
+    // ones are inside sixty minutes of all five early ones, so all four are
+    // refused and Apple sees five attempts, not nine.
+    const store = logKv();
+    await lateBurstOfFive(store);
+
+    const later: Array<[number, number]> = [
+      [12, 1],
+      [24, 0],
+      [36, 1],
+      [48, 0],
+    ];
+    for (const [minute, second] of later) {
+      const attempt = await attemptAt(store, clockAt(HOUR, minute, second));
+      expect(attempt.status).toBe(401);
+      expect(
+        attempt.proofCalls,
+        `11:${minute}:0${second} reached Apple`,
+      ).toBe(0);
     }
+    expect(store.puts, "a refusal wrote to the log").toHaveLength(5);
+  });
 
-    /** One failing sign-in at the given minute and second of HOUR. */
-    async function attemptAt(
-      store: ReturnType<typeof kvWith>,
-      minute: number,
-      second = 0,
-    ) {
-      const record = recorder({ rejectWith: () => new ImapAuthError() });
-      const response = await createLoginHandler(
-        record.proof,
-        TEST_FLOOR_MS,
-        () => clockAt(HOUR, minute, second),
-      ).fetch(post(LISTED_APPLE_ID), stubEnv(record, { kv: store.binding }));
-      return { status: response.status, proofCalls: record.proofCalls() };
+  it("leaves room for a fifth failure after four (the control)", async () => {
+    // Without this case every refusal above would be satisfied by a handler
+    // that refused everybody.
+    const store = logKv();
+    for (let second = 0; second < 4; second += 1) {
+      await attemptAt(store, lateInPreviousHour(second));
     }
+    const fifth = await attemptAt(store, clockAt(HOUR, 0, 30));
 
-    it("five failures early in the previous hour mostly decay, so a sign-in late in this hour reaches Apple", async () => {
-      // A burst at the start of the previous hour. At 11:50 only a sixth of
-      // this hour is left, so the burst weighs one failure, not five.
-      const store = kvWith(5);
-      const late = await attemptAt(store, 50);
+    expect(fifth.status).toBe(401);
+    expect(fifth.proofCalls, "four failures refused a fifth").toBe(1);
+    expect(store.times()).toHaveLength(5);
+  });
 
-      expect(late.proofCalls, "an hour-old burst still locked the door").toBe(1);
-      // The write goes to THIS hour's bucket, and it is this hour's own count
-      // plus one. Never the weighted count.
-      expect(store.puts).toEqual([{ bucket: HOUR, value: "1" }]);
-    });
+  it("writes nothing for a sign-in that works", async () => {
+    // Only a failure at Apple is recorded. A success adds no entry and clears
+    // none: the log is left exactly as it was found.
+    const empty = logKv();
+    const first = await attemptAt(empty, clockAt(HOUR, 30), true);
+    expect(first.status).toBe(302);
+    expect(first.proofCalls).toBe(1);
+    expect(empty.puts, "a success wrote to an empty log").toHaveLength(0);
 
-    it("five failures late in the previous hour still refuse just after the boundary", async () => {
-      // The counter cannot tell a burst at 10:00 from one at 10:59, so this is
-      // the same store as the case above, read thirty seconds into the hour.
-      // The previous hour is still counted in full.
-      const store = kvWith(5);
-      const early = await attemptAt(store, 0, 30);
+    const seed = JSON.stringify(
+      [1, 2, 3, 4].map((minute) => clockAt(HOUR, minute)),
+    );
+    const four = logKv(seed);
+    const second = await attemptAt(four, clockAt(HOUR, 30), true);
+    expect(second.status).toBe(302);
+    expect(four.puts, "a success wrote to a log holding four").toHaveLength(0);
+  });
 
-      expect(early.status).toBe(401);
-      expect(early.proofCalls, "a burst from a minute ago did not count").toBe(0);
-      expect(store.puts, "a refusal counted itself").toHaveLength(0);
-    });
+  it("never stores more than five times, and drops the ones that have aged out", async () => {
+    // A log holding three stale entries and four live ones. The next failure
+    // is allowed (four count), and what is written is the four live ones plus
+    // this one. The stale three are gone.
+    const stale = [1, 2, 3].map((minute) => clockAt(HOUR - 2, minute));
+    const live = [20, 21, 22, 23].map((minute) => clockAt(HOUR, minute));
+    const store = logKv(JSON.stringify([...stale, ...live]));
 
-    it("a lockout from a full previous hour lasts about an hour, not two", async () => {
-      // Rounded up to whole failures, five in the previous hour hold until
-      // twelve minutes past. Before the weighting, a plain sum held them to
-      // the end of this hour. The seconds keep both readings clear of the
-      // exact twelve-minute edge.
-      expect((await attemptAt(kvWith(5), 11, 50)).proofCalls).toBe(0);
-      expect((await attemptAt(kvWith(5), 12, 10)).proofCalls).toBe(1);
-      expect((await attemptAt(kvWith(5), 59, 59)).proofCalls).toBe(1);
-    });
+    const attempt = await attemptAt(store, clockAt(HOUR, 30));
+    expect(attempt.proofCalls).toBe(1);
+    expect(store.times()).toEqual([...live, clockAt(HOUR, 30)]);
 
-    it("counts this hour in full on top of the weighted previous hour", async () => {
-      // 11:50 again, where five from the previous hour weigh one. Three this
-      // hour make four, so one more is allowed, and it writes 3 + 1 = 4 to this
-      // hour — the bucket's own count, not the weighted total plus one.
-      const room = kvWith(5, 3);
-      expect((await attemptAt(room, 50)).proofCalls).toBe(1);
-      expect(room.puts).toEqual([{ bucket: HOUR, value: "4" }]);
-
-      // Four this hour make five, which is the cap.
-      const full = kvWith(5, 4);
-      expect((await attemptAt(full, 50)).proofCalls).toBe(0);
-      expect(full.puts).toHaveLength(0);
-    });
-
-    it("four in the previous hour leave room for one more just after the boundary", async () => {
-      // The control for the refusal above. Without it, that case would be
-      // satisfied by a handler that refused everybody at the top of the hour.
-      const store = kvWith(4);
-      expect((await attemptAt(store, 0, 30)).proofCalls).toBe(1);
-      expect(store.puts).toEqual([{ bucket: HOUR, value: "1" }]);
-    });
+    // A patient guesser over five hours, one try every thirteen minutes. Every
+    // value ever written holds at most five finite times, in order.
+    const patient = logKv();
+    for (let step = 0; step < 24; step += 1) {
+      await attemptAt(patient, clockAt(HOUR, step * 13));
+    }
+    expect(patient.puts.length).toBeGreaterThan(5);
+    for (const put of patient.puts) {
+      const times = JSON.parse(put.value) as number[];
+      expect(times.length, put.value).toBeLessThanOrEqual(5);
+      expect(times.every((t) => Number.isFinite(t))).toBe(true);
+      expect([...times].sort((a, b) => a - b)).toEqual(times);
+    }
   });
 });
