@@ -129,6 +129,44 @@ declare global {
       ATTACHMENT_STAGING: R2Bucket;
 
       /**
+       * Everybody who may sign in who is NOT the owner (GATE-01, GATE-03).
+       *
+       * A FOURTH namespace, and its reason is operational rather than
+       * structural. The three above are separate from each other so two writers
+       * cannot collide in one keyspace. This one exists because the thing it
+       * holds used to be a Workers Secret, and a Secret cannot be read back —
+       * not from the dashboard, not from wrangler, not from anywhere — so "who
+       * is on the allow list?" was a question the administrator could not
+       * answer. The owner reversed that storage decision on 2026-09-20 on that
+       * ground alone.
+       *
+       * **One key, holding a configuration document rather than a person's
+       * data.** `allow-list:v1`, whose value is the same JSON array grammar the
+       * seed below holds. One grammar, because one parse rule in
+       * `src/auth/allow-list.ts` serves both sources and two grammars would be
+       * two rules that can drift.
+       *
+       * **Read at LOGIN ONLY, and that is a constraint rather than a choice.**
+       * `src/mcp/api-handler.ts`'s `fetch` has a tested contract that it never
+       * awaits, and there is no way to read a namespace synchronously. So the
+       * door reads the seed below instead, and the trade the owner accepted is
+       * written on `ALLOWED_APPLE_IDS_SEED` and in the module header.
+       *
+       * **A read that fails means NOBODY, never a pass.** `readStoredAllowList`
+       * catches without reading the caught value: a store this server cannot
+       * reach admits nobody the store would have admitted, and leaves the
+       * seed's own answer untouched — which is why a store outage cannot lock
+       * the owner out of his own server.
+       *
+       * Typed `KVNamespace`, NOT `KVNamespace | undefined`, for the reason
+       * spelled out on `DAV_CACHE` above: the widening on the Secret bindings
+       * is a statement about what a Workers Secret is at runtime, and it does
+       * not transfer to a namespace binding, which either resolves at deploy
+       * time or fails the deploy.
+       */
+      ALLOW_LIST_KV: KVNamespace;
+
+      /**
        * The login flood brake, keyed by the connecting source (GATE-04 layer 1).
        *
        * Five attempts a minute. Consulted at the top of a `/authorize` POST,
@@ -184,6 +222,58 @@ declare global {
        * needed to build the host of a presigned upload URL.
        */
       R2_ACCOUNT_ID: string;
+
+      /**
+       * The OWNER's own address, as a JSON array. A Worker var declared in
+       * wrangler.jsonc, not a Secret.
+       *
+       * **Half of the allow list, not all of it.** The other half is
+       * `ALLOW_LIST_KV` above. The two are read in different places because
+       * they answer different questions:
+       *
+       * - This seed is read SYNCHRONOUSLY, at the login page and on every
+       *   served request. It is what keeps `createMcpApiHandler`'s tested
+       *   never-awaits contract — the contract that makes an unusable stored
+       *   credential surface as a tool error rather than as a 401, which would
+       *   tell the client to sign in again when signing in again cannot fix a
+       *   password Apple has revoked.
+       * - The namespace is read at LOGIN ONLY, which is already an async path.
+       *
+       * So the STORE decides who may sign in, and the SEED decides whether this
+       * deployment serves anybody at all. The consequence the owner accepted on
+       * 2026-09-20: the door cannot re-check membership for a store-listed
+       * person, so removing someone is two steps — take them out of the store,
+       * then revoke their grants. Phase 12's LIFE-05 script is the second half.
+       *
+       * **It also stops the owner locking himself out.** Whatever state the
+       * namespace is in — empty, unreachable, holding nonsense — the seed still
+       * answers, and it still names him.
+       *
+       * **Typed `string | undefined`, and the widening is argued against its
+       * neighbour rather than copied from it.** `R2_ACCOUNT_ID` directly above
+       * is a `vars` entry typed `string` with no widening, because a var is part
+       * of the deployed configuration and is present whenever the Worker is.
+       * That argument does not transfer here, for a reason specific to this
+       * binding: `wrangler.jsonc` is git-ignored, so NOTHING TRACKED IN THIS
+       * REPOSITORY guarantees the key is present at all — the tracked template
+       * can carry it and a live config can still be missing it. And this one is
+       * a safety gate: its absence must be visible to the compiler rather than
+       * discovered at runtime by a locked-out owner. An absent seed parses as
+       * NOBODY, so the login page answers 503 above the method dispatch and the
+       * door refuses every grant.
+       *
+       * **A JSON array rather than a bare address, deliberately.** It is the
+       * same grammar the namespace's value holds, which is what lets ONE parse
+       * rule serve both sources, and it is what keeps GATE-01's rule
+       * expressible here: only exactly `["*"]` means open, and a rule that
+       * accepted a bare string would make `"*"` — five characters, no brackets,
+       * the single easiest typo in a config file — mean everybody.
+       *
+       * Consumed only through `parseAllowList` in `src/auth/allow-list.ts`,
+       * which reads it, answers a three-member verdict, and hands back nothing
+       * that carries the raw value.
+       */
+      ALLOWED_APPLE_IDS_SEED: string | undefined;
 
       /**
        * Injected by the OAuth provider on every request before it dispatches
@@ -275,38 +365,24 @@ declare global {
       CONFIRM_SECRET: string | undefined;
 
       /**
-       * Who may sign in, as a JSON array of Apple IDs. Workers Secret.
+       * BEING RETIRED. The single write-only Secret that used to hold the whole
+       * allow list, superseded by `ALLOWED_APPLE_IDS_SEED` above plus
+       * `ALLOW_LIST_KV`. Its readers move in the next commit of this plan and
+       * this declaration goes with them; nothing new may read it.
        *
-       * **On the shared type rather than a narrow interface, and deliberately
-       * so.** The three names below this block were moved off the shared type
-       * precisely so the compiler would refuse a new reader. This one has TWO
-       * legitimate readers by design — the login page, which decides whether a
-       * person may sign in at all, and the door, which decides on every served
-       * request whether the person in the grant is still permitted — so a
-       * narrow interface would have to name both and would say nothing the
-       * shared type does not.
-       *
-       * A Workers Secret rather than a `vars` entry, because `wrangler.jsonc`
-       * is git-ignored while `wrangler.jsonc.example` is tracked, and a list of
-       * real people's Apple IDs is personal data that should not sit next to a
-       * tracked example config even by accident.
-       *
-       * Admits `undefined` for the reason every Secret above it does: unset,
-       * deleted and failed-to-provision all arrive absent, and nothing at
-       * runtime tells that apart from a configured value until something reads
-       * it. The specific silent failure the widening exists to surface is worth
-       * naming, because it is the one that hurts the OWNER rather than a
-       * stranger: an absent secret parses as NOBODY, so the login page stops
-       * issuing authorizations for everyone including the person who would fix
-       * it. `src/auth/allow-list.ts` fails closed on purpose — the other
-       * direction would open a server that reaches real personal mail to
-       * anyone who can authenticate at Apple — and the 503 body is the channel
-       * that says so, because Convention 4 forbids logging anywhere under
-       * `src/` and the response is the only diagnostic a locked-out owner has.
-       *
-       * Consumed only through `parseAllowList` in `src/auth/allow-list.ts`,
-       * which reads it, answers a three-member verdict, and hands back nothing
-       * that carries the raw value.
+       * **The argument that put it here is no longer true, and it is replaced
+       * rather than left standing.** It said a Workers Secret was right because
+       * `wrangler.jsonc` is git-ignored while `wrangler.jsonc.example` is
+       * tracked, and a list of real Apple IDs should not sit next to a tracked
+       * example config even by accident. Two things overturned it on
+       * 2026-09-20. The arrangement that replaces it keeps the real addresses
+       * out of the tracked file anyway — the template carries a placeholder and
+       * only the git-ignored config carries an address. And the owner weighed
+       * the privacy ground against the operational one and found it much the
+       * weaker: these are his own family's addresses, on his own Cloudflare
+       * account, in a config nobody else reads, while a Secret CANNOT BE READ
+       * BACK from anywhere, which made "who is on the allow list?" a question
+       * the administrator could not answer at all.
        */
       ALLOWED_APPLE_IDS: string | undefined;
     }

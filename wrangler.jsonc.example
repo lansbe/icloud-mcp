@@ -68,8 +68,50 @@
   // it lives in config for the same reason the route hostname above does: one
   // declared place, so a change is visible in a diff rather than buried as a
   // literal under src/.
+  //
+  // ALLOWED_APPLE_IDS_SEED is the OWNER's own address, and it is half of the
+  // allow list rather than all of it. The other half is the ALLOW_LIST_KV
+  // namespace below. The split exists because the two readers ask genuinely
+  // different questions at genuinely different costs:
+  //
+  //   - This seed is read SYNCHRONOUSLY, at the login page and on every served
+  //     request. src/mcp/api-handler.ts has a tested contract that its `fetch`
+  //     never awaits — that is what makes an unusable stored credential surface
+  //     as a tool error rather than as a 401 telling the client to sign in
+  //     again, which is advice that cannot help when the password died at
+  //     Apple. A store read there would break that contract, so this seed is
+  //     the only allow-list source the door can consult at all.
+  //   - The namespace below is read at LOGIN ONLY, which is already an async
+  //     path, and it holds everybody who is not the owner.
+  //
+  // The consequence the owner accepted on 2026-09-20, stated plainly: the door
+  // can no longer re-check membership for a store-listed person, so removing
+  // that person is two steps — take them out of the store so they cannot sign
+  // in again, and revoke their grants to end a live session.
+  //
+  // WHY THIS IS A `vars` ENTRY AND NOT A WORKERS SECRET. It was a Secret in the
+  // superseded design and the owner reversed that on 2026-09-20, on operational
+  // ground: a Cloudflare Secret cannot be read back — not from the dashboard,
+  // not from wrangler, not from anywhere — so "who is on the allow list?" was a
+  // question the administrator could not answer, and every troubleshooting call
+  // started with guessing.
+  //
+  // THE VALUE IS A JSON ARRAY, and the grammar is load-bearing rather than a
+  // formatting habit. Both sources go through ONE parse rule in
+  // src/auth/allow-list.ts, so keeping one grammar is what lets a single rule
+  // serve both — and it is what keeps GATE-01's rule expressible here: missing,
+  // empty or malformed means nobody, and only exactly `["*"]` means open.
+  //
+  // PLACEHOLDER, AND DELIBERATELY SO. This file is TRACKED and this repository
+  // has a public remote; a real Apple ID is personal data. Put your own address
+  // in your git-ignored wrangler.jsonc. A placeholder that ships fails closed
+  // and loudly: the list parses to a set holding one address nobody can sign in
+  // as, so every real person is refused, and an absent or malformed seed makes
+  // the deployed login page answer 503 with a body that sends the reader to
+  // look at a binding rather than at their own password.
   "vars": {
-    "R2_ACCOUNT_ID": "YOUR_CLOUDFLARE_ACCOUNT_ID"
+    "R2_ACCOUNT_ID": "YOUR_CLOUDFLARE_ACCOUNT_ID",
+    "ALLOWED_APPLE_IDS_SEED": "[\"YOUR_APPLE_ID@example.com\"]"
   },
 
   // Required by @cloudflare/workers-oauth-provider for token storage. The
@@ -140,10 +182,47 @@
   // does not resolve namespace ids against the account, and it does not
   // validate inside a `limits` block at all — a bad config there produces no
   // output and exit 0. `wrangler kv namespace list` naming the id is the check.
+  //
+  // ALLOW_LIST_KV is a FOURTH namespace, and its reason is operational rather
+  // than structural. The other three are separate from each other so two
+  // writers cannot collide in one keyspace; this one exists because the thing
+  // it holds was previously a Workers Secret and a Secret CANNOT BE READ BACK —
+  // not from the dashboard, not from wrangler, not from anywhere. So "who is on
+  // the allow list?" was a question the administrator could not answer, and
+  // every troubleshooting call started with guessing. The owner reversed that
+  // storage decision on 2026-09-20.
+  //
+  // WHAT IT HOLDS, AND WHERE IT IS READ. One key, `allow-list:v1`, holding the
+  // same JSON array grammar the seed above holds: everybody who may sign in who
+  // is NOT the owner. It is consulted at LOGIN ONLY. It is not consulted on a
+  // served request, and that is a constraint rather than an oversight —
+  // src/mcp/api-handler.ts's `fetch` has a tested contract that it never
+  // awaits, and there is no way to read KV synchronously. The seed above is
+  // what the door reads instead.
+  //
+  // Its TITLE carries the project prefix for exactly the reason all three
+  // titles above do — a bare `allow-list` or `allowlist` is precisely the sort
+  // of name a sibling Worker on this account also reaches for, and this account
+  // already demonstrated that hazard concretely when a namespace named plainly
+  // `OAUTH_KV` turned out to belong to a different MCP Worker.
+  //
+  // THE NAMESPACE IS ACCOUNT STATE AND IS NOT IN GIT, like the three above it.
+  // `wrangler kv namespace create` makes it and prints the id; this config only
+  // points at what that command printed, so the id is a claim about the account
+  // that this repository cannot check. A placeholder here is harmless to every
+  // local gate: the deploy path does not resolve namespace ids, and the vitest
+  // pool simulates a namespace by BINDING NAME, so the tests bind a real local
+  // namespace whatever this string says.
+  //
+  // The administrator reads and writes it with no deploy, which is the whole
+  // point of the change:
+  //   wrangler kv key put   --namespace-id=<id> --remote "allow-list:v1" '["someone@example.com"]'
+  //   wrangler kv key get   --namespace-id=<id> --remote "allow-list:v1"
   "kv_namespaces": [
     { "binding": "OAUTH_KV", "id": "YOUR_OAUTH_KV_NAMESPACE_ID" },
     { "binding": "DAV_CACHE", "id": "YOUR_DAV_CACHE_NAMESPACE_ID" },
-    { "binding": "CONFIRM_KV", "id": "YOUR_CONFIRM_KV_NAMESPACE_ID" }
+    { "binding": "CONFIRM_KV", "id": "YOUR_CONFIRM_KV_NAMESPACE_ID" },
+    { "binding": "ALLOW_LIST_KV", "id": "YOUR_ALLOW_LIST_NAMESPACE_ID" }
   ],
 
   // Attachment staging (D-83, ATT-03). A bucket of its own rather than a prefix

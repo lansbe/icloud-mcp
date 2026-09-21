@@ -75,6 +75,34 @@ export default defineConfig({
                 // can never resolve, following the habit the fakes above set.
                 ALLOWED_APPLE_IDS:
                   '["listed-user@example.invalid","user-a@example.invalid"]',
+
+                // The SEED half of the allow list, holding the same two
+                // addresses for the same two reasons. It replaces the binding
+                // directly above, which is being retired in this same plan;
+                // both are bound while the readers move, so the suite is green
+                // at every commit rather than only at the end.
+                //
+                // Two addresses, because two different suites need one. The
+                // first is what the authorize tests sign in as. The second is
+                // user A from test/fixtures/two-users.ts, so the door test can
+                // prove a listed grant is SERVED — without it that positive
+                // control could not exist and every refusal beside it would be
+                // vacuous. Both sit under the reserved `.invalid` domain, which
+                // can never resolve, following the habit the fakes above set.
+                //
+                // WITHOUT THIS BINDING EVERY /authorize TEST GETS THE 503: an
+                // absent seed parses as nobody, and the gate that answers 503
+                // sits above the method dispatch, so neither verb reaches the
+                // form.
+                //
+                // THE STORE HALF IS DELIBERATELY NOT HERE. `ALLOW_LIST_KV` is a
+                // KV namespace, and namespaces reach this pool from
+                // wrangler.jsonc rather than from `miniflare.bindings` — an
+                // entry here would be a second declaration with nothing keeping
+                // it in step with the first. A test that wants a value in the
+                // store writes one through the pool's own binding.
+                ALLOWED_APPLE_IDS_SEED:
+                  '["listed-user@example.invalid","user-a@example.invalid"]',
               },
             },
           }),

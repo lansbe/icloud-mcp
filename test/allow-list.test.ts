@@ -29,6 +29,7 @@
 // **This file holds no real value.** Every address sits under `.invalid`, a name
 // reserved so that it can never resolve.
 
+import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AllowList } from "../src/auth/allow-list";
 import { isAllowed, parseAllowList } from "../src/auth/allow-list";
@@ -45,6 +46,42 @@ function folded(address: string): string {
 function admits(list: AllowList, address: string): boolean {
   return isAllowed(list, folded(address));
 }
+
+describe("both sources are actually bound", () => {
+  // **The cheapest case in this file and the one it could least do without.**
+  // Everything else here drives the parse rule with a string this file wrote,
+  // so a rule that answered perfectly while NOTHING BOUND THE SOURCE would pass
+  // every one of them. This case reads both halves off the pool's own
+  // environment, which is built from `wrangler.jsonc` and
+  // `vitest.config.ts` — the same two files a deploy is built from.
+  //
+  // It also de-risks the namespace id. The tracked template carries a
+  // placeholder there, and the claim in that file's comment is that a
+  // placeholder is harmless because the pool simulates a namespace by BINDING
+  // NAME rather than by id. If that claim is ever wrong, it surfaces here — in
+  // the smallest test file in the set — rather than three commits later in a
+  // login test, where it would read as something else entirely.
+
+  it("binds the store, and it answers like a namespace", async () => {
+    expect(env.ALLOW_LIST_KV, "ALLOW_LIST_KV is not bound").toBeDefined();
+    expect(typeof env.ALLOW_LIST_KV.get).toBe("function");
+    // A real read against the local namespace, not just a shape check. An
+    // absent key answers null, which is also the store's own "nobody" case.
+    expect(await env.ALLOW_LIST_KV.get("nothing-is-here")).toBeNull();
+  });
+
+  it("binds the seed, and it parses to a named set", () => {
+    // Not merely present — USABLE. A seed bound to something the parse rule
+    // refuses would make every /authorize test in the suite answer 503, and the
+    // failure would look like a handler bug rather than a binding one.
+    const list = parseAllowList(env.ALLOWED_APPLE_IDS_SEED);
+
+    expect(list.kind, "the bound seed does not parse to a named set").toBe(
+      "some",
+    );
+    expect(admits(list, "listed-user@example.invalid")).toBe(true);
+  });
+});
 
 describe("every unusable list means nobody", () => {
   it("refuses a secret that was never provisioned", () => {
