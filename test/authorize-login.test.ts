@@ -51,7 +51,17 @@ import { describe, expect, it } from "vitest";
 import type { LoginProof } from "../src/auth/login-handler";
 import { UNCONFIGURED_BODY, createLoginHandler } from "../src/auth/login-handler";
 import type { Env, LoginGateSecret } from "../src/env";
+import { withMailSessionOver } from "../src/mail/service";
 import { entryEnv } from "./fixtures/bound-secrets";
+import { createFakeDuplex } from "./fixtures/fake-duplex";
+import {
+  GREETING,
+  POST_AUTH_CAPABILITY,
+  PRE_AUTH_CAPABILITY,
+  capabilityResponse,
+  logoutExchange,
+  taggedOk,
+} from "./fixtures/icloud-bytes";
 import { DEPLOYED_HOSTNAME, createMcpApiHandler } from "../src/mcp/api-handler";
 import {
   FAKE_APP_PASSWORD,
@@ -542,5 +552,171 @@ describe("the round trip: what the page stores is what the door serves", () => {
 
     expect(served.status).toBe(401);
     expect(served.headers.get("WWW-Authenticate")).toMatch(/^Bearer/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LOGIN-03 and LOGIN-04. The refusal that opens nothing, and the one
+// canonicalisation — proved on the wire rather than in a return value.
+// ---------------------------------------------------------------------------
+
+/**
+ * Bounds that keep a scripted conversation from waiting on a real timeout.
+ *
+ * The same four values `test/service.test.ts` uses, for the same reason: a fake
+ * duplex answers instantly, so the production read timeout would be nothing but
+ * dead wall-clock in the suite.
+ */
+const FAST_BOUNDS = {
+  readTimeoutMs: 40,
+  drainTimeoutMs: 20,
+  closeTimeoutMs: 20,
+  callDeadlineMs: 200,
+};
+
+/** The observed shape, as a person is most likely to paste it. */
+const DASHED_PASSWORD = "dddd-eeee-ffff-gggg";
+
+/** The very same password, typed without the separators Apple showed. */
+const DASHLESS_PASSWORD = "ddddeeeeffffgggg";
+
+/**
+ * One sign-in driven through the REAL session runner over a scripted duplex.
+ *
+ * The proof handed to the handler is the production one in every respect but
+ * the socket: it calls `withMailSessionOver`, so the command line this reads
+ * back is built by the code that builds the real one. Asserting a helper's
+ * return value instead would prove that something canonicalises, not that the
+ * canonical form is what Apple is actually told.
+ *
+ * Both passwords driven through here are declared in this file and are plainly
+ * fake, so a failed assertion that prints the line discloses nothing. That is
+ * the one thing that makes a line assertion safe here and unsafe in
+ * `test/service.test.ts`, whose conversations carry the pool's ambient
+ * credential and are therefore asserted by COUNT.
+ */
+async function loginLineFor(typed: string): Promise<string | undefined> {
+  const duplex = createFakeDuplex([
+    GREETING,
+    capabilityResponse("a1", PRE_AUTH_CAPABILITY),
+    taggedOk("a2", "LOGIN completed"),
+    capabilityResponse("a3", POST_AUTH_CAPABILITY),
+    logoutExchange("a4"),
+  ]);
+  const record = recorder();
+  const overTheWire: LoginProof = (principal, gate) =>
+    withMailSessionOver(
+      duplex,
+      principal,
+      gate,
+      null,
+      null,
+      async () => {},
+      FAST_BOUNDS,
+    );
+
+  const response = await createLoginHandler(overTheWire).fetch(
+    post(LISTED_APPLE_ID, typed),
+    stubEnv(record),
+  );
+  expect(response.status).toBe(302);
+
+  return duplex.writtenLines().find((line) => line.includes(" LOGIN "));
+}
+
+describe("the app-password shape check, and what it deliberately does not check", () => {
+  // Titled so `-t "shape"` matches. 11-VALIDATION.md ships that exact command
+  // for LOGIN-03, and a name filter that matches nothing passes SILENTLY —
+  // which would leave the row looking covered while measuring nothing.
+  //
+  // The check refuses only what cannot be an app-specific password under ANY
+  // grammar. Apple documents no format; the four-dashed-groups shape is one
+  // observed sample, the owner's own. So the refused table below holds three
+  // classes and no fourth, and the accepted table is what stops a later session
+  // tightening this into the grammar it happens to remember.
+
+  const REFUSED: ReadonlyArray<readonly [string, string]> = [
+    ["empty", ""],
+    ["nothing but white space", "   "],
+    ["carrying a space in the middle", "abcd efgh ijkl mnop"],
+    ["carrying a tab in the middle", "abcd-efgh\tijkl-mnop"],
+    ["far too short to be any credential", "abcd"],
+    ["far longer than any credential", "z".repeat(96)],
+  ];
+
+  it.each(REFUSED)(
+    "refuses a password that is %s, with nothing opened to Apple",
+    async (_label, password) => {
+      const record = recorder();
+      const response = await createLoginHandler(record.proof).fetch(
+        post(LISTED_APPLE_ID, password),
+        stubEnv(record),
+      );
+
+      // The assertion that carries the requirement. A row asserting only the
+      // status would pass against a handler that refused AFTER opening a
+      // socket — both answers are the identical 401.
+      expect(
+        record.proofCalls(),
+        "a clearly-wrong password reached Apple",
+      ).toBe(0);
+      expect(response.status).toBe(401);
+      expect(record.calls).not.toContain("completeAuthorization");
+    },
+  );
+
+  const ACCEPTED: ReadonlyArray<readonly [string, string]> = [
+    ["the observed shape, with dashes", "abcd-efgh-ijkl-mnop"],
+    ["the observed shape, without them", "abcdefghijklmnop"],
+    ["a grammar nobody here has ever observed", "Xy7Q-9mK2-Ws4R-pL8Z"],
+    ["a longer value still inside the band", "abcdefghijklmnopqrstuvwx"],
+  ];
+
+  it.each(ACCEPTED)(
+    "accepts %s rather than guessing at Apple's grammar",
+    async (_label, password) => {
+      // The third row is the one this table exists for. It carries digits and
+      // upper case, which the single observed sample does not, and a strict
+      // rule would refuse it behind a message that deliberately will not say
+      // why — locking out a legitimate person with no way to learn the reason.
+      const record = recorder();
+      const response = await createLoginHandler(record.proof).fetch(
+        post(LISTED_APPLE_ID, password),
+        stubEnv(record),
+      );
+
+      expect(record.proofCalls()).toBe(1);
+      expect(response.status).toBe(302);
+    },
+  );
+});
+
+describe("the dashes a person may or may not type", () => {
+  // Titled so `-t "dashes"` matches — 11-VALIDATION.md's LOGIN-04 command.
+
+  it("reach Apple as the same bytes on the wire either way", async () => {
+    // Titled so `-t "wire"` matches as well, and the word is literal: this is
+    // the recorded outbound command line, not a value a helper handed back.
+    const dashed = await loginLineFor(DASHED_PASSWORD);
+    const dashless = await loginLineFor(DASHLESS_PASSWORD);
+
+    expect(dashed).toBe(dashless);
+    expect(dashed).toBe(
+      `a2 LOGIN "${LISTED_APPLE_ID}" "${DASHLESS_PASSWORD}"`,
+    );
+  });
+
+  it("are stripped before the grant is written, so the grant and the wire agree", async () => {
+    // The other half of LOGIN-04, and the reason there is ONE canonicaliser: a
+    // grant holding the typed form while Apple was told the canonical one would
+    // work on the day it was written and fail on every request afterwards.
+    const record = recorder();
+    await createLoginHandler(record.proof).fetch(
+      post(LISTED_APPLE_ID, DASHED_PASSWORD),
+      stubEnv(record),
+    );
+
+    const props = record.completed[0]?.props as Record<string, unknown>;
+    expect(props.appPassword).toBe(DASHLESS_PASSWORD);
   });
 });
