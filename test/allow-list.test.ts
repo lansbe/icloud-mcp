@@ -30,9 +30,14 @@
 // reserved so that it can never resolve.
 
 import { env } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { AllowList } from "../src/auth/allow-list";
-import { isAllowed, parseAllowList } from "../src/auth/allow-list";
+import {
+  ALLOW_LIST_KEY,
+  isAllowed,
+  parseAllowList,
+  readStoredAllowList,
+} from "../src/auth/allow-list";
 
 const ONE = "someone@example.invalid";
 const TWO = "another@example.invalid";
@@ -218,6 +223,131 @@ describe("a usable list says who", () => {
     expect(list.kind).toBe("some");
     expect(admits(list, ONE)).toBe(true);
     expect(admits(list, "  SOMEONE@example.invalid ")).toBe(true);
+  });
+});
+
+describe("the store half, read through the one parse rule", () => {
+  // **What this block adds to the ones above.** They prove the RULE against
+  // strings this file wrote. These prove the READER: that the bytes the store
+  // hands back reach that same rule, and that every way a store read can go
+  // wrong answers NOBODY. There is no second parse rule here and there must
+  // never be one — a second definition of "on the list" is a second rule, and
+  // the day the two disagree, whichever one nobody was reading is the one that
+  // admits everybody.
+  //
+  // **The happy paths run against the pool's REAL namespace**, written and then
+  // deleted, rather than against a stub with a `get`. A stub would prove the
+  // function calls something; only the real binding proves the key it asks for
+  // is a key the store answers.
+
+  afterEach(async () => {
+    // The store outlives a case. A value left behind would be read by the next
+    // one, and the two would only disagree in a full run — which is exactly the
+    // shape that shows up as a flake rather than as a failure.
+    await env.ALLOW_LIST_KV.delete(ALLOW_LIST_KEY);
+  });
+
+  it("means nobody when the key is not there", async () => {
+    // The state the store is in on the day this ships: created, empty. It must
+    // mean nobody rather than "no restrictions" — the same reading the empty
+    // array gets above, and for the same reason.
+    expect((await readStoredAllowList(env.ALLOW_LIST_KV)).kind).toBe("nobody");
+  });
+
+  it("means nobody for a value that is not a JSON array", async () => {
+    // Every one of these goes through the SAME rule the seed goes through, so
+    // the cases above are what make these true rather than these re-proving
+    // them. What is proved here is only that the bytes arrive at that rule.
+    for (const bad of ["", "   ", "not json", '"*"', "{}", "42", "[]", '[1]']) {
+      await env.ALLOW_LIST_KV.put(ALLOW_LIST_KEY, bad);
+      expect(
+        (await readStoredAllowList(env.ALLOW_LIST_KV)).kind,
+        `a stored value of ${JSON.stringify(bad)} did not mean nobody`,
+      ).toBe("nobody");
+    }
+  });
+
+  it("means nobody when the read itself throws", async () => {
+    // **THE case this module exists to make unspeakable, and the only one that
+    // cannot be driven through the real binding** — a namespace cannot be made
+    // to fail on demand, so the store is hand-written here.
+    //
+    // Fail-closed is the whole design. A reader that swallowed a throw into a
+    // pass would turn a KV outage into an open server that reaches real
+    // personal mail, and it would do it silently: nothing under src/ may log,
+    // so there would be no trace at all. A throw means nobody the store would
+    // have admitted, and never a pass.
+    const throwing = {
+      get(): never {
+        throw new Error("the store is unreachable");
+      },
+    } as unknown as KVNamespace;
+
+    expect((await readStoredAllowList(throwing)).kind).toBe("nobody");
+  });
+
+  it("means nobody when the read rejects", async () => {
+    // The same failure arriving as a rejected promise rather than a synchronous
+    // throw. Both are what `await` on a store read can do, and a `try` placed
+    // around the call but not around the await would catch only the first —
+    // which is a distinction no test that asserted the throw alone could see.
+    const rejecting = {
+      get(): Promise<string | null> {
+        return Promise.reject(new Error("the store is unreachable"));
+      },
+    } as unknown as KVNamespace;
+
+    expect((await readStoredAllowList(rejecting)).kind).toBe("nobody");
+  });
+
+  it("holds the named set that was stored, folded", async () => {
+    // The positive control. Without it every refusal above is satisfied by a
+    // reader that answers nobody unconditionally.
+    await env.ALLOW_LIST_KV.put(
+      ALLOW_LIST_KEY,
+      JSON.stringify([`  ${ONE.toUpperCase()}  `, TWO]),
+    );
+    const list = await readStoredAllowList(env.ALLOW_LIST_KV);
+
+    expect(list.kind).toBe("some");
+    // Folded on the way in, by the same rule the seed's entries go through, so
+    // a padded or capitalised entry the administrator typed still matches.
+    expect(admits(list, ONE)).toBe(true);
+    expect(admits(list, TWO)).toBe(true);
+    expect(admits(list, "third@example.invalid")).toBe(false);
+  });
+
+  it("opens sign-in for exactly one star and nothing else", async () => {
+    await env.ALLOW_LIST_KV.put(ALLOW_LIST_KEY, '["*"]');
+    expect((await readStoredAllowList(env.ALLOW_LIST_KV)).kind).toBe(
+      "everybody",
+    );
+
+    // A star beside a name is the ambiguous value, and it resolves closed in
+    // the store for the same reason it does in the seed.
+    await env.ALLOW_LIST_KV.put(ALLOW_LIST_KEY, `["*", "${ONE}"]`);
+    expect((await readStoredAllowList(env.ALLOW_LIST_KV)).kind).toBe("nobody");
+  });
+
+  it("answers a verdict and hands back nothing carrying the stored bytes", async () => {
+    // The verdict is a closed three-member type, so the raw value cannot ride
+    // out on it. Asserted rather than assumed, because the tempting shape for a
+    // reader like this is to return what it read "for diagnostics" — and the
+    // stored value is a list of real people's addresses.
+    await env.ALLOW_LIST_KV.put(ALLOW_LIST_KEY, JSON.stringify([ONE]));
+    const list = await readStoredAllowList(env.ALLOW_LIST_KV);
+
+    expect(JSON.stringify(list)).not.toContain(ALLOW_LIST_KEY);
+    if (list.kind !== "some") throw new Error("expected a named set");
+    expect(Object.keys(list).sort()).toEqual(["addresses", "kind"]);
+  });
+
+  it("asks for one whole key, with a version segment", () => {
+    // The key is a CONSTANT and not a template, and the shape is pinned here so
+    // a change to it is a visible decision. The version segment buys the hedge
+    // every other key in this project buys with one: a future change to the
+    // stored shape becomes detectable rather than silently misread as this one.
+    expect(ALLOW_LIST_KEY).toBe("allow-list:v1");
   });
 });
 
