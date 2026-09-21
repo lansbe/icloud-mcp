@@ -33,6 +33,9 @@ import {
   PASSWORD_READER_IMPORT,
   PASSWORD_READER_OWNERS,
   PASSWORD_READER_SCOPE,
+  PRINCIPAL_CONSTRUCTOR,
+  PRINCIPAL_CONSTRUCTOR_OWNERS,
+  PRINCIPAL_CONSTRUCTOR_SCOPE,
   PROPS_READER,
   PROPS_READER_OWNER,
   PROPS_READER_SCOPE,
@@ -47,6 +50,7 @@ import {
   checkDavHostOwnership,
   checkMailSecretReaderOwnership,
   checkPasswordReaderOwnership,
+  checkPrincipalConstructorOwnership,
   checkPropsReaderOwnership,
   checkSocketOwnership,
   checkSubscriptionFeedFetchOwnership,
@@ -2286,7 +2290,13 @@ describe("the single reader of the grant's props is a count constraint too (Phas
       // A longer member that merely starts with the word.
       "const table = ctx.propsById;",
       "const table = ctx.props_cache;",
-      // The props constructor. Phase 11 adds an arm for it (see the docstring).
+      // The props CONSTRUCTOR, which is a different question and now has a
+      // count of its own — `PRINCIPAL_CONSTRUCTOR`, two owners, the block
+      // further down this file. This count is about files that READ the props
+      // off the execution context; that one is about sites that MINT a
+      // principal from a props object. Neither answers the other, which is why
+      // Phase 11 built a separate count rather than the arm the old note here
+      // asked for.
       "const principal = principalFromProps(grant);",
       "export function principalFromProps(props: unknown): Principal {",
     ]) {
@@ -2748,9 +2758,211 @@ describe("one function turns an address into a user id (D-18, ISO-05 rule 10)", 
   });
 });
 
+describe("the two sites that mint a principal are a count constraint with two owners (Phase 11)", () => {
+  // The constructor's name IS written literally here, as the props read and the
+  // spelled import are in the blocks above. The pattern is collected from src/
+  // only, and this file is skipped by path for every rule, so nothing here can
+  // trip the count.
+  const [doorPath, loginPath] = PRINCIPAL_CONSTRUCTOR_OWNERS as readonly [
+    string,
+    string,
+  ];
+  const door = { file: doorPath, line: 383, column: 25 };
+  const login = { file: loginPath, line: 1271, column: 31 };
+  const outsider = { file: "src/mcp/tools/mail.ts", line: 12, column: 1 };
+
+  /** A fresh copy per probe, so no state can carry between samples. */
+  const fires = (sample: string): boolean =>
+    new RegExp(PRINCIPAL_CONSTRUCTOR.source, PRINCIPAL_CONSTRUCTOR.flags).test(
+      sample,
+    );
+
+  it("names exactly the door and the login page as owners, in that order", () => {
+    expect([...PRINCIPAL_CONSTRUCTOR_OWNERS]).toEqual([
+      "src/mcp/api-handler.ts",
+      "src/auth/login-handler.ts",
+    ]);
+    expect(PRINCIPAL_CONSTRUCTOR_SCOPE).toBe("src/");
+  });
+
+  it("two: passes when both owners call the constructor and nothing else does", () => {
+    expect(checkPrincipalConstructorOwnership([door, login])).toEqual([]);
+    // Order in the list is the walk order of the tree, so it must not matter.
+    expect(checkPrincipalConstructorOwnership([login, door])).toEqual([]);
+  });
+
+  it("one: reports the login page as missing when only the door calls it", () => {
+    const violations = checkPrincipalConstructorOwnership([door]);
+    expect(violations.map((v) => v.pattern)).toEqual([
+      "principal-constructor-missing",
+    ]);
+    expect(violations[0]!.file).toBe(loginPath);
+    expect(violations[0]!.why).toContain(loginPath);
+  });
+
+  it("one: reports the door as missing when only the login page calls it", () => {
+    const violations = checkPrincipalConstructorOwnership([login]);
+    expect(violations.map((v) => v.pattern)).toEqual([
+      "principal-constructor-missing",
+    ]);
+    expect(violations[0]!.file).toBe(doorPath);
+    expect(violations[0]!.why).toContain(doorPath);
+  });
+
+  it("zero: reports two missing violations, one naming each owner", () => {
+    // The direction a negative cannot see, and the reason a one-owner checker
+    // could not be copied: an empty list is TWO identity paths gone, not one.
+    // The door losing its call is the Phase 11 switch coming undone.
+    const violations = checkPrincipalConstructorOwnership([]);
+    expect(violations.map((v) => v.pattern)).toEqual([
+      "principal-constructor-missing",
+      "principal-constructor-missing",
+    ]);
+    expect(violations.map((v) => v.file)).toEqual([doorPath, loginPath]);
+  });
+
+  it("three: reports one outside violation naming the third file", () => {
+    const violations = checkPrincipalConstructorOwnership([
+      door,
+      login,
+      outsider,
+    ]);
+    expect(violations.map((v) => v.pattern)).toEqual([
+      "principal-constructor-outside-owners",
+    ]);
+    expect(violations[0]!.file).toBe(outsider.file);
+    expect(violations[0]!.line).toBe(outsider.line);
+  });
+
+  it("one owner plus an outsider: reports one of each, so a moved minter is not a pass", () => {
+    // Two callers is the right NUMBER and the wrong answer. The count is of
+    // these two files, not of any two files.
+    const violations = checkPrincipalConstructorOwnership([door, outsider]);
+    expect(violations.map((v) => v.pattern).sort()).toEqual([
+      "principal-constructor-missing",
+      "principal-constructor-outside-owners",
+    ]);
+    const missing = violations.find(
+      (v) => v.pattern === "principal-constructor-missing",
+    )!;
+    const outside = violations.find(
+      (v) => v.pattern === "principal-constructor-outside-owners",
+    )!;
+    expect(missing.file).toBe(loginPath);
+    expect(outside.file).toBe(outsider.file);
+  });
+
+  it("gives the two ids distinct sort keys, straight after the address-hash count's", () => {
+    const violations = checkPrincipalConstructorOwnership([door, outsider]);
+    const outside = violations.find(
+      (v) => v.pattern === "principal-constructor-outside-owners",
+    )!;
+    const missing = violations.find(
+      (v) => v.pattern === "principal-constructor-missing",
+    )!;
+    expect(outside.patternIndex).toBe(FORBIDDEN.length + 18);
+    expect(missing.patternIndex).toBe(FORBIDDEN.length + 19);
+  });
+
+  it("matches the real call lines of both owners, and the other ways to write one", () => {
+    for (const sample of [
+      // The two lines the owners carry today, byte for byte.
+      "      const principal = principalFromProps(ctx.props);",
+      "      const principal = await principalFromProps({",
+      // Returned, awaited, or handed straight on.
+      "return principalFromProps(props);",
+      "await principalFromProps(grant);",
+      "buildRequestHandler(principalFromProps(ctx.props));",
+      // Space before the parenthesis, and a call broken across lines.
+      "principalFromProps (grant);",
+      "principalFromProps(\n  props,\n);",
+      // Through a namespace import. Seen, and only refuses more.
+      "const principal = principal_module.principalFromProps(props);",
+      // Comments count, as they do for every count.
+      " * principalFromProps(grant) is how the principal arrives.",
+    ]) {
+      expect(fires(sample), `missed ${sample}`).toBe(true);
+    }
+  });
+
+  it("does not match the constructor's own definition, or a mention with no call", () => {
+    for (const sample of [
+      // The definition in the principal module, byte for byte. This is the one
+      // that matters: without the lookbehind the defining file is a third
+      // "caller" and the count freezes the repository.
+      "export async function principalFromProps(props: unknown): Promise<Principal> {",
+      "function principalFromProps(props) {",
+      "async function principalFromProps(props) {",
+      // A definition the formatter broke after the keyword.
+      "export async function\n  principalFromProps(props: unknown) {",
+      // A plain named import: no parenthesis after the name.
+      'import { normaliseAppleId, principalFromProps, userIdOf } from "../principal";',
+      'import { principalFromProps } from "../principal";',
+      // Prose naming it without calling it, which both owners and the door's
+      // own comments already do.
+      " * `principalFromProps` is the ONE constructor, and it refuses first.",
+      " * `principalFromProps` makes the same choice one module over.",
+      // A longer name that merely starts with it.
+      "principalFromPropsUnchecked(props);",
+      // The environment constructor, which is a different function and a
+      // different count's business.
+      "const principal = principalFromEnv(env);",
+    ]) {
+      expect(fires(sample), `false-positived on ${sample}`).toBe(false);
+    }
+  });
+
+  it("pins the known evasions as unseen, so nobody believes they are covered", () => {
+    // Each of these DOES mint a principal. The docstring lists them. If the
+    // pattern later starts to see one, this goes red: move the row out and
+    // update the docstring.
+    for (const sample of [
+      // Re-bound to another name, by a renamed import or by a local.
+      'import { principalFromProps as build } from "../principal";\nbuild(props);',
+      "const build = principalFromProps;\nbuild(props);",
+      // Reached as a computed member.
+      'principalModule["principalFromProps"](props);',
+      // A comment between the name and the parenthesis.
+      "principalFromProps /* here */ (props);",
+    ]) {
+      expect(fires(sample), `now sees ${sample}`).toBe(false);
+    }
+  });
+
+  it("carries no global flag, because scan() takes the first match with search()", () => {
+    expect(PRINCIPAL_CONSTRUCTOR.flags).toBe("");
+  });
+
+  it("is wired into scan(): a tree with no owner file fails, once per owner", () => {
+    // scripts/ is outside PRINCIPAL_CONSTRUCTOR_SCOPE, so scanning it alone
+    // exercises the deleted direction against a real tree rather than a
+    // synthetic list — and it must report BOTH owners, not one.
+    const patterns = scan("scripts")
+      .map((v) => v.pattern)
+      .filter((p) => p === "principal-constructor-missing");
+    expect(patterns).toEqual([
+      "principal-constructor-missing",
+      "principal-constructor-missing",
+    ]);
+  });
+
+  it("passes on the real tree: exactly two minting sites, and they are the owners", () => {
+    const patterns = scan().map((v) => v.pattern);
+    expect(patterns).not.toContain("principal-constructor-missing");
+    expect(patterns).not.toContain("principal-constructor-outside-owners");
+  });
+});
+
 describe("the count constraints as a set", () => {
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
+
+  /** The same, for the second two-owner count. */
+  const bothConstructorOwners = PRINCIPAL_CONSTRUCTOR_OWNERS.map((file) => ({
+    file,
+    line: 1,
+    column: 1,
+  }));
 
   it("covers every ownership violation id with an exercised sample, in both directions", () => {
     // The parallel of the rule-id set-equality assertion above, and it exists
@@ -2783,6 +2995,15 @@ describe("the count constraints as a set", () => {
       // One owner again, so the same pair once more.
       ...checkAddressHashOwnership([nonOwner]).map((v) => v.pattern),
       ...checkAddressHashOwnership([]).map((v) => v.pattern),
+      // The second two-owner count, fed the same pair of lists the password
+      // count is fed and for the same reason.
+      ...checkPrincipalConstructorOwnership([
+        ...bothConstructorOwners,
+        nonOwner,
+      ]).map((v) => v.pattern),
+      ...checkPrincipalConstructorOwnership(
+        bothConstructorOwners.slice(0, 1),
+      ).map((v) => v.pattern),
     ]);
     expect([...observed].sort()).toEqual([...OWNERSHIP_VIOLATION_IDS].sort());
   });
@@ -2814,6 +3035,14 @@ describe("the count constraints as a set", () => {
       // Same again for the one address-hashing producer.
       ...checkAddressHashOwnership([nonOwner]),
       ...checkAddressHashOwnership([]),
+      // TWO owners again, so the same asymmetric pair the password count needs:
+      // both owners plus a non-owner is exactly one outside, and one owner
+      // alone is exactly one missing.
+      ...checkPrincipalConstructorOwnership([
+        ...bothConstructorOwners,
+        nonOwner,
+      ]),
+      ...checkPrincipalConstructorOwnership(bothConstructorOwners.slice(0, 1)),
     ];
     expect(violations.length).toBe(OWNERSHIP_VIOLATION_IDS.length);
     for (const violation of violations) {
@@ -2840,6 +3069,15 @@ describe("the count constraints as a set", () => {
     // And for the door: it is the one module that holds the grant's props, so
     // it is the one that most needs the props-in-log rule applying to it.
     expect(EXCLUDED.has(PROPS_READER_OWNER)).toBe(false);
+    // And for both minting sites. These two are the files that hold a live
+    // credential longest — the door holds a decrypted grant, the login page
+    // holds a value somebody just typed — so they are the two that most need
+    // the logging ban applying to them in full. Buying either a count
+    // exemption with a path exclusion would drop that ban at the same time,
+    // which is the whole reason these are counts rather than exclusions.
+    for (const owner of PRINCIPAL_CONSTRUCTOR_OWNERS) {
+      expect(EXCLUDED.has(owner), `${owner} is excluded by path`).toBe(false);
+    }
     const logging = FORBIDDEN.find((r) => r.id === "logging-anywhere-under-src")!;
     expect(
       matchRule(logging, 0, DAV_HOST_OWNER, 'console.log("resolved", homeUrl);').length,

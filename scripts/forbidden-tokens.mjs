@@ -647,14 +647,20 @@ export const FORBIDDEN = [
   //      `${principal.userId}` are the three live spellings and all three pass;
   //   5. the prefix constant copied into a variable first: `const p =
   //      CONFIRM_KEY_PREFIX;` and then `` `${p}${jti}` ``;
-  //   6. the source-IP-keyed counter at `src/auth/login-handler.ts` -- it is
-  //      not a constant and not a per-user store. It is audit row S5 and it
-  //      belongs to Phase 11, which must not assume this rule covers it;
-  //   7. the OAuth library's own keys (`grant:`, `token:`, `client:`), which
+  //   6. the OAuth library's own keys (`grant:`, `token:`, `client:`), which
   //      live in `node_modules`, outside every entry in `SCAN_ROOTS`.
   //
   // A rule believed to prove more than it does is worse than one whose limits
   // are written down.
+  //
+  // ONE ENTRY LEFT THIS LIST IN PHASE 11, and the departure is recorded rather
+  // than silently dropped. The login failure counter in `src/auth/login-handler.ts`
+  // used to be keyed by the connecting SOURCE and built from bare literals, so
+  // this rule could not see it at all; the list said so, and told Phase 11 not
+  // to assume otherwise. Phase 11 re-keyed that counter to the TARGET's derived
+  // user id behind a prefix constant, so this rule now does see it, and it
+  // passes because the id sits immediately after the prefix. Audit row S5. It
+  // is the first thing under `src/auth/` this rule has ever reached.
   //
   // THE SHAPE. An interpolation whose whole content is an upper-case identifier
   // containing one of eight store words and ending in `PREFIX`, NOT followed by
@@ -1038,12 +1044,22 @@ export const SUBSCRIPTION_FEED_FETCH_SCOPE = "src/feed/";
  * fires there would be narrowed by the next person in a hurry, and a narrowed
  * rule is how this guard would quietly leave.
  *
- * A NOTE FOR PHASE 11 (Phase 9 D-22). This count deliberately does NOT count
- * calls to the props constructor, `principalFromProps`. Nothing calls it until
- * Phase 11, so a count of its callers would fail on zero today, and the only
- * hit under `src/` is its own definition. When the door starts calling it, add
- * an arm for a call to it that is not its own definition (the `function`
- * keyword in front is the difference), so a second caller is seen too.
+ * THIS COUNT IS NOT THE PROPS CONSTRUCTOR'S COUNT, AND THE TWO ARE DIFFERENT
+ * QUESTIONS (Phase 9 D-22, settled by Phase 11). This one counts files that
+ * READ the grant's props off the execution context. `PRINCIPAL_CONSTRUCTOR`
+ * below counts sites that MINT a principal from a props object. A reader can
+ * hand the props anywhere; a minter can be handed props from anywhere. Neither
+ * question answers the other, which is why the constructor got a count of its
+ * own rather than an arm on this one.
+ *
+ * The note that used to sit here asked Phase 11 for that arm, on the ground
+ * that nothing called the constructor yet and a count of its callers would fail
+ * on zero. All three claims stopped being true when Phase 11 landed. The
+ * constructor now has exactly TWO callers — `src/mcp/api-handler.ts`, which
+ * builds a principal from a stored grant, and `src/auth/login-handler.ts`,
+ * which builds one from values a person just typed — so an arm on a one-owner
+ * rule was the wrong shape as well as the wrong place. See
+ * `PRINCIPAL_CONSTRUCTOR` for the argument that there are legitimately two.
  *
  * Comments count. In every file under `src/` except the owner, write "the
  * grant's props" and never the spelled read. No `g` flag: `scan()` uses
@@ -1284,6 +1300,110 @@ export const ADDRESS_HASH_OWNER = "src/principal.ts";
 export const ADDRESS_HASH_SCOPE = "src/";
 
 /**
+ * A call to the props-backed principal constructor, permitted in exactly two
+ * files of the source tree.
+ *
+ * THE RULE. Exactly two files under `src/` turn a props object into a
+ * principal: `src/mcp/api-handler.ts` and `src/auth/login-handler.ts`. The
+ * principal module DEFINES the constructor and is not a caller, so it is not
+ * counted. Everything else that needs to act for somebody is handed the
+ * principal the door already built and never mints one.
+ *
+ * WHY A COUNT RATHER THAN A NEGATIVE. A third minting site is a third place in
+ * this project that can turn a props object into a live session, arriving
+ * without a decision — and the props it is handed need not be the props the
+ * door checked. Zero is the other failure and the quieter one: one caller gone
+ * means an identity path was deleted, moved, or rewritten to get identity some
+ * other way, and nothing fails on the way out, because the tests that covered
+ * the deleted code leave with it. "No third caller" is trivially true of a tree
+ * with no caller at all. Zero, one, and three are all violations. Only two
+ * passes, and only these two.
+ *
+ * WHY THERE ARE TWO OWNERS. The count above this one has a single owner. This
+ * one has two because the two callers build from two different SOURCES and
+ * neither can borrow the other's:
+ *
+ *   1. The door builds from a STORED grant's props, which the OAuth provider
+ *      decrypted and put on the execution context. That is the serving path.
+ *   2. The login handler builds from values the person JUST TYPED, before any
+ *      grant exists, because that is the only way to hand a principal to the
+ *      session runner and prove the credentials at Apple. It cannot take one
+ *      from the door — there is no grant yet — and it cannot hand a look-alike
+ *      to the password reader either: that reader answers only the very object
+ *      this constructor built, so a hand-made stand-in reaches nothing.
+ *
+ * The missing arm therefore fires once PER absent owner and names that owner,
+ * not once when the list is empty. This is the same shape as the password
+ * count, for the same reason, and NOT the shape of the one-owner counts.
+ *
+ * WHY IT IS NOT AN ARM ON `PROPS_READER`. That count's own note used to ask for
+ * one. The two ask different questions — that one counts files that READ the
+ * props off the context, this one counts sites that MINT a principal from a
+ * props object — and folding them together would make one count answer both
+ * and neither well. Phase 9 D-28 set that precedent when it left the login
+ * gate's secret out of the mail-secret count.
+ *
+ * WHAT IT DOES SEE that a reader might not expect: a call through a namespace
+ * import. The word boundary sits on the constructor's own name, and a member
+ * access puts a dot in front of it rather than a word character, so a namespace
+ * call is matched and counted like any other. That only refuses more.
+ *
+ * WHAT IT DOES NOT SEE. Each of these mints a principal and fires nothing:
+ *
+ *   1. the constructor RE-BOUND to another name and called through it, whether
+ *      by a renamed import, by an assignment to a local, or by a parameter it
+ *      is passed as. The name is the whole anchor, and this is the price of
+ *      anchoring on a name — written down here rather than hidden;
+ *   2. a re-export of the constructor through another module, imported from
+ *      there under a different name;
+ *   3. a dynamic import of the principal module, then a call off the resolved
+ *      namespace under a different name;
+ *   4. a computed call: the name reached as a string through square brackets,
+ *      or through a table of constructors keyed by anything at all;
+ *   5. a call with a COMMENT between the name and its opening parenthesis.
+ *      White space of any kind, a line break included, IS matched — only a
+ *      comment breaks the run.
+ *
+ * Two more shapes are worth naming because they are the tempting ones rather
+ * than the exotic ones: a WRAPPER inside one of the two owner files, exported
+ * and called from a third file — the call this count sees still lives in an
+ * owner, so the count still reads two — and a principal built by hand as an
+ * object literal, which this cannot see at all and which the password reader
+ * refuses at run time instead. A count believed to prove more than it does is
+ * worse than one whose limits are written down.
+ *
+ * THE SHAPE. The constructor's name as a whole word followed by an opening
+ * parenthesis, NOT preceded by the declaration keyword — that keyword in front
+ * is what tells a definition from a call, and it is why the principal module's
+ * own definition is not counted as a caller there. The lookbehind is bounded at
+ * eight white-space characters so a definition split across lines by the
+ * formatter is still recognised as one; it is bounded rather than open for the
+ * same reason every other bound in this file is. A plain named import is not
+ * matched, because an import does not put a parenthesis after the name. No `g`
+ * flag: `scan()` uses `String.prototype.search`, which takes the first match
+ * only, so a file that calls the constructor twice is one entry.
+ *
+ * Comments count. In every file under `src/`, describe the construction in
+ * plain words unless you mean the call — a comment that spells the name with a
+ * parenthesis after it in a third file fails the commit hook in the middle of
+ * unrelated work. Naming it with no parenthesis, as both owners and the door's
+ * prose already do, is always safe.
+ */
+export const PRINCIPAL_CONSTRUCTOR =
+  /(?<!\bfunction\s{1,8})\bprincipalFromProps\s*\(/;
+
+/** The two files under `PRINCIPAL_CONSTRUCTOR_SCOPE` permitted to match
+ *  `PRINCIPAL_CONSTRUCTOR`. The door first, then the login page. */
+export const PRINCIPAL_CONSTRUCTOR_OWNERS = Object.freeze([
+  "src/mcp/api-handler.ts",
+  "src/auth/login-handler.ts",
+]);
+
+/** The tree `PRINCIPAL_CONSTRUCTOR` is collected from. Tests build principals
+ *  from hand-made props all over `test/`, and a test is not an identity path. */
+export const PRINCIPAL_CONSTRUCTOR_SCOPE = "src/";
+
+/**
  * Every violation id a count constraint can emit, both directions of each.
  *
  * Named here rather than left implicit so the test can assert set equality
@@ -1315,6 +1435,8 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "mail-secret-reader-missing",
   "address-hashing-site-outside-owner",
   "address-hashing-site-missing",
+  "principal-constructor-outside-owners",
+  "principal-constructor-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -1509,6 +1631,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const passwordReaderImporters = [];
   const mailSecretReaders = [];
   const addressHashers = [];
+  const principalConstructors = [];
 
   for (const absolute of files) {
     const relativePath = toRepoRelative(absolute);
@@ -1595,6 +1718,18 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
         });
       }
     }
+    // The principal module is not skipped: it DEFINES the constructor, and the
+    // declaration keyword in front of the definition is what the pattern's
+    // lookbehind refuses, so it cannot match there.
+    if (relativePath.startsWith(PRINCIPAL_CONSTRUCTOR_SCOPE)) {
+      const constructorIndex = contents.search(PRINCIPAL_CONSTRUCTOR);
+      if (constructorIndex !== -1) {
+        principalConstructors.push({
+          file: relativePath,
+          ...positionOf(contents, constructorIndex),
+        });
+      }
+    }
   }
 
   violations.push(...checkSocketOwnership(socketImporters));
@@ -1608,6 +1743,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   violations.push(...checkPasswordReaderOwnership(passwordReaderImporters));
   violations.push(...checkMailSecretReaderOwnership(mailSecretReaders));
   violations.push(...checkAddressHashOwnership(addressHashers));
+  violations.push(...checkPrincipalConstructorOwnership(principalConstructors));
 
   return violations.sort(
     (a, b) =>
@@ -1939,6 +2075,49 @@ export function checkAddressHashOwnership(hashers) {
       pattern: "address-hashing-site-missing",
       patternIndex: FORBIDDEN.length + 17,
       why: `No site under ${ADDRESS_HASH_SCOPE} turns an address into a user id, which means the one producer in ${ADDRESS_HASH_OWNER} was deleted, renamed, or rewritten into a form this count cannot see. Zero producers is as much a violation as two, and it is the quieter of the pair: nothing goes red on the way out, because the tests that covered the deleted code leave with it. Restore the hashing in that file, and keep the module-scope encoder named as it is — this count finds its owner by that spelling, and the tell of a rename is a digest call still present while this count reads zero. If the producer really moved, that is a change to the safety boundary: get a decision, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The two sites that mint a principal from props, as a pure function over a
+ * list of callers.
+ *
+ * Same split as the counts above, and NOT the same body as the one-owner ones:
+ * this count has two owners, so its missing arm fires once per absent owner in
+ * the same shape the password count uses. See the `PRINCIPAL_CONSTRUCTOR`
+ * docstring for why there are legitimately two, why it is a separate count
+ * rather than an arm on the props-reader count, and what it does not see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} callers
+ */
+export function checkPrincipalConstructorOwnership(callers) {
+  const violations = [];
+  const owners = PRINCIPAL_CONSTRUCTOR_OWNERS.join(" and ");
+  for (const caller of callers) {
+    if (PRINCIPAL_CONSTRUCTOR_OWNERS.includes(caller.file)) continue;
+    violations.push({
+      file: caller.file,
+      line: caller.line,
+      column: caller.column,
+      pattern: "principal-constructor-outside-owners",
+      patternIndex: FORBIDDEN.length + 18,
+      why: `A call to the props-backed principal constructor under ${PRINCIPAL_CONSTRUCTOR_SCOPE} outside ${owners}. Those two files are the only places a principal is minted: the first builds one from a stored grant's props, which the door has already checked against the allow list, and the second builds one from values a person just typed, because no grant exists yet and the password reader answers only the very object this constructor built. A third minting site is a third place in this project that can turn a props object into a live session, and the props it is handed need not be the props the door checked — so it can act for somebody the door would have refused. Do not mint a principal here. Take the one the door passed down, or hand your props to the door. If a third site genuinely belongs, that is a change to the safety boundary and not a refactor: get a decision, then change the owner list, never the pattern. If this fired on a comment, describe the construction in plain words or name the constructor without a parenthesis after it.`,
+    });
+  }
+  // One per absent owner, not one for an empty list: each owner is its own
+  // identity path, built from its own source, and losing either is its own
+  // failure.
+  for (const owner of PRINCIPAL_CONSTRUCTOR_OWNERS) {
+    if (callers.some((caller) => caller.file === owner)) continue;
+    violations.push({
+      file: owner,
+      line: 0,
+      column: 0,
+      pattern: "principal-constructor-missing",
+      patternIndex: FORBIDDEN.length + 19,
+      why: `${owner} no longer calls the props-backed principal constructor, which means that identity path was deleted, moved, or rewritten to get identity some other way this count cannot see. Zero callers is as much a violation as three, and it is the quieter of the pair: nothing goes red on the way out, because the tests that covered the deleted code leave with it. The specific regression this arm exists to catch is the one Phase 11 spent a whole phase making impossible — identity read back out of the Worker environment instead of out of the grant, which serves the wrong person's mail to whoever still holds a token. Restore the plain named call in ${owner}. If the identity path really moved, that is a change to the safety boundary: get a decision, then change the owner list, never the pattern.`,
     });
   }
   return violations;

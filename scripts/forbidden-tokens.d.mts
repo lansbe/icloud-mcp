@@ -101,6 +101,9 @@ export declare const MAIL_SECRET_READ_SCOPE: string;
 export declare const ADDRESS_HASH: RegExp;
 export declare const ADDRESS_HASH_OWNER: string;
 export declare const ADDRESS_HASH_SCOPE: string;
+export declare const PRINCIPAL_CONSTRUCTOR: RegExp;
+export declare const PRINCIPAL_CONSTRUCTOR_OWNERS: readonly string[];
+export declare const PRINCIPAL_CONSTRUCTOR_SCOPE: string;
 export declare const OWNERSHIP_VIOLATION_IDS: readonly string[];
 
 export declare function checkDavHostOwnership(
@@ -126,4 +129,7 @@ export declare function checkMailSecretReaderOwnership(
 ): Violation[];
 export declare function checkAddressHashOwnership(
   hashers: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function checkPrincipalConstructorOwnership(
+  callers: ReadonlyArray<OwnershipMatch>,
 ): Violation[];
