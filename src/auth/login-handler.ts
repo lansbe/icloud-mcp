@@ -82,7 +82,8 @@
 //   login runs, so a parallel burst all reads the same number.
 //
 // What that means in practice: against one address, the three-a-minute and
-// five-an-hour figures hold for a patient, serial guesser. They do NOT hold
+// about-five-an-hour figures hold for a patient, serial guesser (the hourly one
+// is approximate by design; see layer 3). They do NOT hold
 // for a parallel or many-location burst. How far over they go depends on how
 // many locations the attacker can reach and how fast they fire, and nothing in
 // this file can measure that. Apple's lockout threshold is unpublished. If it
@@ -429,10 +430,12 @@ const SOURCE_WINDOW_SECONDS = 60;
 const FAILURE_WINDOW_SECONDS = 3600;
 
 /**
- * Failed guesses tolerated against one address in any sixty minutes.
+ * Failed guesses tolerated against one address, about five per rolling hour.
  *
- * Enforced over this hour's bucket plus the previous one, so the limit holds
- * across an hour boundary too. See the layer-3 comment in the handler.
+ * Approximate by design. It is enforced over this hour's bucket plus a
+ * weighted share of the previous one, so the limit holds across an hour
+ * boundary too, and a lockout lasts about an hour. See the layer-3 comment in
+ * the handler for the formula and the owner's decision.
  */
 const MAX_FAILURES_PER_WINDOW = 5;
 
@@ -693,15 +696,24 @@ function ipv6Slash64(address: string): string | null {
  * number.
  *
  * The bucket is a parameter because two are read: this hour's and the one
- * before it. See `currentFailureBucket` and the layer-3 comment for why.
+ * before it. See `failureWindowAt` and the layer-3 comment for why.
  */
 function failureCounterKey(userId: string, bucket: number): string {
   return `${LOGIN_FAILURE_KEY_PREFIX}${userId}:${bucket}`;
 }
 
-/** Which fixed hour-long bucket the clock is in right now. */
-function currentFailureBucket(): number {
-  return Math.floor(Date.now() / 1000 / FAILURE_WINDOW_SECONDS);
+/**
+ * Where one clock reading falls in the fixed hour-long buckets.
+ *
+ * `bucket` is the hour the reading is in. `remaining` is the share of that
+ * hour still to come, from 1 at the top of the hour down towards 0 at its end.
+ * Both come from ONE reading, so they can never disagree about which hour it
+ * is — two separate reads could straddle the top of an hour.
+ */
+function failureWindowAt(nowMs: number): { bucket: number; remaining: number } {
+  const position = nowMs / 1000 / FAILURE_WINDOW_SECONDS;
+  const bucket = Math.floor(position);
+  return { bucket, remaining: 1 - (position - bucket) };
 }
 
 /**
@@ -975,10 +987,18 @@ function authorizationErrorResponse(error: AuthorizationError): Response {
  * nothing and behaves exactly as the constant says. A test can then exercise
  * every failure path for a few milliseconds each instead of three seconds each,
  * while one case still drives the default and asserts the real figure.
+ *
+ * `clock` is the third seam, and it feeds the hourly counter (layer 3) and
+ * nothing else. It is read once per request there. Production passes nothing
+ * and gets the real wall clock. A test pins it to a chosen minute of a chosen
+ * hour, which is the only way to show how the previous hour's failures decay
+ * without a test that can flake across the top of a real hour. The time floor
+ * keeps the real clock on purpose: it has to measure real elapsed time.
  */
 export function createLoginHandler(
   proof: LoginProof = proveWithApple,
   floorMs: number = FAILURE_FLOOR_MS,
+  clock: () => number = () => Date.now(),
 ): {
   fetch(request: Request, env: Env & LoginGateSecret): Promise<Response>;
 } {
@@ -993,7 +1013,7 @@ export function createLoginHandler(
       // work, and the amount of work already done is exactly what the floor is
       // hiding.
       const started = Date.now();
-      return handleAuthorize(request, env, proof, floorMs, started);
+      return handleAuthorize(request, env, proof, floorMs, started, clock);
     },
   };
 }
@@ -1023,6 +1043,7 @@ async function handleAuthorize(
   proof: LoginProof,
   floorMs: number,
   started: number,
+  clock: () => number,
 ): Promise<Response> {
   {
     const url = new URL(request.url);
@@ -1410,8 +1431,12 @@ async function handleAuthorize(
     // it acceptable. It blocks NEW sign-ins only. An existing grant never
     // touches this path — it is served by the token endpoint and the API
     // handler, neither of which consults a limiter — so nobody already signed
-    // in loses anything, and the person locked out is locked out for an hour
-    // rather than indefinitely. The owner's own escape from a counter they
+    // in loses anything, and the person locked out is locked out for about an
+    // hour rather than indefinitely. At worst a little over an hour: layer 3
+    // below is approximate by design, and a burst early in one hour holds the
+    // door shut until about twelve minutes into the next. The owner confirmed
+    // "about an hour" on 2026-09-21, after the hour-boundary fix had briefly
+    // stretched it towards two. The owner's own escape from a counter they
     // tripped themselves is in the phase runbook.
     //
     // Re-keying by attacker instead would not bound Apple attempts at all,
@@ -1458,8 +1483,9 @@ async function handleAuthorize(
     }
     if (!burstOk) return refuseCredential();
 
-    // LAYER 3, the target address across an hour. Five failed guesses, and the
-    // sixth is refused.
+    // LAYER 3, the target address across an hour. About five failed guesses
+    // per rolling hour, and the next is refused. Approximate by design, and a
+    // lockout lasts about an hour.
     //
     // This is the layer the platform cannot supply: a rate-limit binding's
     // window accepts ten seconds or sixty and nothing longer, so an hour has to
@@ -1472,17 +1498,47 @@ async function handleAuthorize(
     // only other brake on that case, and it is not exact either. The file
     // header records the gap as an accepted cost.
     //
-    // TWO BUCKETS ARE READ, THIS HOUR'S AND THE ONE BEFORE, and the cap is
-    // applied to their sum. The buckets are fixed clock hours. With only the
-    // current one read, a guesser could spend five at 10:59 and five more at
-    // 11:00 — ten attempts at Apple inside a minute. Summing the pair means a
-    // new failure is counted only while this hour plus the last one stay
-    // under five. Any sixty minutes fits inside two neighbouring buckets, so
-    // that is a real "five in any hour" for a serial guesser. The cost is one
-    // more store read, and only for a listed address.
+    // TWO BUCKETS ARE READ, THIS HOUR'S AND THE ONE BEFORE. The buckets are
+    // fixed clock hours. With only the current one read, a guesser could spend
+    // five at 10:59 and five more at 11:00 — ten attempts at Apple inside a
+    // minute. The cost of the fix is one more store read, and only for a
+    // listed address.
     //
-    // Only THIS hour's count is written back. The previous bucket is read and
-    // never changed.
+    // THE PREVIOUS HOUR IS WEIGHTED, NOT SUMMED. The owner chose this on
+    // 2026-09-21. The count is:
+    //
+    //   this hour's failures
+    //     + the previous hour's failures × the share of this hour still to come
+    //
+    // with the previous hour's share rounded UP to a whole failure. Refuse when
+    // that count reaches five. So the previous hour counts in full at the top
+    // of this hour and fades to nothing by its end.
+    //
+    // Why not a plain sum. A plain sum counted a failure until the END of the
+    // next hour, so one burst of five at 10:00 held the door shut until 12:00.
+    // That quietly doubled the lockout the owner had accepted (layer 2's
+    // accepted cost). The weighting brings it back to about an hour.
+    //
+    // Why round up. The counter cannot tell a burst at 10:00 from one at
+    // 10:59. Unrounded, five failures at 10:59 would weigh just under five one
+    // second after 11:00 and let the next guess through at once. Rounding up
+    // keeps a full previous hour at five until twelve minutes into this one,
+    // so a late burst still refuses just after the boundary. The price is that
+    // an early burst also holds for those twelve minutes: a lockout of up to
+    // about seventy-two minutes rather than sixty.
+    //
+    // What it bounds. The count is an estimate, because the counter keeps no
+    // timestamps. A serial guesser straddling a boundary gets about five in any
+    // rolling hour, sometimes one more. Never the ten the single bucket
+    // allowed.
+    //
+    // ONE CLOCK READING. The bucket and the share still to come come from the
+    // same reading of the injected clock, so they cannot disagree about which
+    // hour it is.
+    //
+    // Only THIS hour's count is written back, as this hour's own value plus
+    // one — never the weighted count. The previous bucket is read and never
+    // changed.
     //
     // Two awaits one after the other, never a combinator: convention 3 forbids
     // one anywhere in `src/auth/`.
@@ -1492,7 +1548,7 @@ async function handleAuthorize(
     // full one. So does a value that is not a number. `NaN >= 5` is false, so
     // without the finiteness check a corrupted value would switch this layer
     // off for that person for good.
-    const bucket = currentFailureBucket();
+    const { bucket, remaining } = failureWindowAt(clock());
     const counterKey = failureCounterKey(userId, bucket);
     const previousKey = failureCounterKey(userId, bucket - 1);
     let failures = MAX_FAILURES_PER_WINDOW;
@@ -1503,10 +1559,13 @@ async function handleAuthorize(
     } catch {
       /* Fail closed. The caught value is never read. */
     }
+    if (!Number.isFinite(failures) || !Number.isFinite(previousFailures)) {
+      return refuseCredential();
+    }
+    const carried = Math.ceil(previousFailures * remaining);
     if (
-      !Number.isFinite(failures) ||
-      !Number.isFinite(previousFailures) ||
-      failures + previousFailures >= MAX_FAILURES_PER_WINDOW
+      !Number.isFinite(carried) ||
+      failures + carried >= MAX_FAILURES_PER_WINDOW
     ) {
       return refuseCredential();
     }

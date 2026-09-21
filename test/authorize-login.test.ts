@@ -1939,6 +1939,19 @@ describe("the per-id layer, which answers as a wrong password and never as a 429
 describe("the hourly counter, the layer no platform window can reach", () => {
   // Titled so `-t "hourly"` matches — 11-VALIDATION.md's third GATE-04 row.
 
+  /**
+   * The hour every case here pins its clock to, as hours since the epoch.
+   *
+   * A fixed number rather than "now", so no case reads the real clock and no
+   * case can flake across the top of a real hour (IN-05).
+   */
+  const HOUR = 500_000;
+
+  /** Milliseconds since the epoch at `minute` and `second` past `hour`. */
+  function clockAt(hour: number, minute: number, second = 0): number {
+    return (hour * 3600 + minute * 60 + second) * 1000;
+  }
+
   /** A store that really counts, and remembers every key it was handed. */
   function countingKv() {
     const values = new Map<string, string>();
@@ -1967,7 +1980,11 @@ describe("the hourly counter, the layer no platform window can reach", () => {
     // and cannot be a fourth binding.
     const counter = countingKv();
     const record = recorder({ rejectWith: () => new ImapAuthError() });
-    const handler = handlerOver(record.proof);
+    // The clock is pinned to the middle of an hour, so all six requests see the
+    // same hour however long the suite takes (IN-05).
+    const handler = createLoginHandler(record.proof, TEST_FLOOR_MS, () =>
+      clockAt(HOUR, 30),
+    );
     const env = stubEnv(record, { kv: counter.binding });
 
     for (let attempt = 1; attempt <= 5; attempt += 1) {
@@ -2012,57 +2029,108 @@ describe("the hourly counter, the layer no platform window can reach", () => {
     }
   });
 
-  it("counts the previous hour too, so an hour boundary does not reset the cap", async () => {
-    // WR-03. The buckets are fixed clock hours. Reading only the current one
-    // let a guesser spend five at 10:59 and five more at 11:00. The previous
-    // bucket is recognised by its numeric suffix being below the current
-    // hour, computed here the same way the handler computes it.
-    function kvWithPrevious(previous: number) {
-      const puts: string[] = [];
+  describe("an hour boundary, with the previous hour weighted (WR-03, then WR-01 of the re-review)", () => {
+    // The buckets are fixed clock hours. Reading only the current one let a
+    // guesser spend five at 10:59 and five more at 11:00. A plain sum of the
+    // two buckets fixed that but held a lockout for up to two hours. The owner
+    // chose a weighted previous hour on 2026-09-21, so a lockout lasts about
+    // an hour.
+    //
+    // Every case pins the clock through the factory's third argument. Nothing
+    // here reads the real clock, so nothing here can flake at the top of a
+    // real hour (IN-05).
+
+    /** A store holding a chosen count in each of the two buckets. */
+    function kvWith(previous: number, current = 0) {
+      const puts: { bucket: number; value: string }[] = [];
       return {
         puts,
         binding: {
           async get(key: string) {
             const bucket = Number(key.slice(key.lastIndexOf(":") + 1));
-            const now = Math.floor(Date.now() / 1000 / 3600);
-            return bucket < now ? String(previous) : null;
+            if (bucket === HOUR - 1 && previous > 0) return String(previous);
+            if (bucket === HOUR && current > 0) return String(current);
+            return null;
           },
-          async put(key: string) {
-            puts.push(key);
+          async put(key: string, value: string) {
+            puts.push({
+              bucket: Number(key.slice(key.lastIndexOf(":") + 1)),
+              value,
+            });
           },
         },
       };
     }
 
-    // Five in the previous hour, none in this one: refused before Apple.
-    const full = kvWithPrevious(5);
-    const refusedRecord = recorder({ rejectWith: () => new ImapAuthError() });
-    const refused = await handlerOver(refusedRecord.proof).fetch(
-      post(LISTED_APPLE_ID),
-      stubEnv(refusedRecord, { kv: full.binding }),
-    );
-    expect(refused.status).toBe(401);
-    expect(
-      refusedRecord.proofCalls(),
-      "five failures last hour did not count against this one",
-    ).toBe(0);
-    expect(full.puts).toHaveLength(0);
+    /** One failing sign-in at the given minute and second of HOUR. */
+    async function attemptAt(
+      store: ReturnType<typeof kvWith>,
+      minute: number,
+      second = 0,
+    ) {
+      const record = recorder({ rejectWith: () => new ImapAuthError() });
+      const response = await createLoginHandler(
+        record.proof,
+        TEST_FLOOR_MS,
+        () => clockAt(HOUR, minute, second),
+      ).fetch(post(LISTED_APPLE_ID), stubEnv(record, { kv: store.binding }));
+      return { status: response.status, proofCalls: record.proofCalls() };
+    }
 
-    // The control: four in the previous hour leaves room for one more, and
-    // that one reaches Apple. Without it the refusal above would be satisfied
-    // by a handler that refused everybody.
-    const room = kvWithPrevious(4);
-    const allowedRecord = recorder({ rejectWith: () => new ImapAuthError() });
-    await handlerOver(allowedRecord.proof).fetch(
-      post(LISTED_APPLE_ID),
-      stubEnv(allowedRecord, { kv: room.binding }),
-    );
-    expect(allowedRecord.proofCalls()).toBe(1);
-    // The write goes to THIS hour's bucket, not the previous one.
-    expect(room.puts).toHaveLength(1);
-    const written = room.puts[0]!;
-    expect(Number(written.slice(written.lastIndexOf(":") + 1))).toBe(
-      Math.floor(Date.now() / 1000 / 3600),
-    );
+    it("five failures early in the previous hour mostly decay, so a sign-in late in this hour reaches Apple", async () => {
+      // A burst at the start of the previous hour. At 11:50 only a sixth of
+      // this hour is left, so the burst weighs one failure, not five.
+      const store = kvWith(5);
+      const late = await attemptAt(store, 50);
+
+      expect(late.proofCalls, "an hour-old burst still locked the door").toBe(1);
+      // The write goes to THIS hour's bucket, and it is this hour's own count
+      // plus one. Never the weighted count.
+      expect(store.puts).toEqual([{ bucket: HOUR, value: "1" }]);
+    });
+
+    it("five failures late in the previous hour still refuse just after the boundary", async () => {
+      // The counter cannot tell a burst at 10:00 from one at 10:59, so this is
+      // the same store as the case above, read thirty seconds into the hour.
+      // The previous hour is still counted in full.
+      const store = kvWith(5);
+      const early = await attemptAt(store, 0, 30);
+
+      expect(early.status).toBe(401);
+      expect(early.proofCalls, "a burst from a minute ago did not count").toBe(0);
+      expect(store.puts, "a refusal counted itself").toHaveLength(0);
+    });
+
+    it("a lockout from a full previous hour lasts about an hour, not two", async () => {
+      // Rounded up to whole failures, five in the previous hour hold until
+      // twelve minutes past. Before the weighting, a plain sum held them to
+      // the end of this hour. The seconds keep both readings clear of the
+      // exact twelve-minute edge.
+      expect((await attemptAt(kvWith(5), 11, 50)).proofCalls).toBe(0);
+      expect((await attemptAt(kvWith(5), 12, 10)).proofCalls).toBe(1);
+      expect((await attemptAt(kvWith(5), 59, 59)).proofCalls).toBe(1);
+    });
+
+    it("counts this hour in full on top of the weighted previous hour", async () => {
+      // 11:50 again, where five from the previous hour weigh one. Three this
+      // hour make four, so one more is allowed, and it writes 3 + 1 = 4 to this
+      // hour — the bucket's own count, not the weighted total plus one.
+      const room = kvWith(5, 3);
+      expect((await attemptAt(room, 50)).proofCalls).toBe(1);
+      expect(room.puts).toEqual([{ bucket: HOUR, value: "4" }]);
+
+      // Four this hour make five, which is the cap.
+      const full = kvWith(5, 4);
+      expect((await attemptAt(full, 50)).proofCalls).toBe(0);
+      expect(full.puts).toHaveLength(0);
+    });
+
+    it("four in the previous hour leave room for one more just after the boundary", async () => {
+      // The control for the refusal above. Without it, that case would be
+      // satisfied by a handler that refused everybody at the top of the hour.
+      const store = kvWith(4);
+      expect((await attemptAt(store, 0, 30)).proofCalls).toBe(1);
+      expect(store.puts).toEqual([{ bucket: HOUR, value: "1" }]);
+    });
   });
 });
