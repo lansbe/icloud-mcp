@@ -84,6 +84,7 @@ import {
 import {
   APPLE_THROTTLE_BODY,
   CREDENTIAL_FAILURE_BODY,
+  SOURCE_REFUSAL_BODY,
 } from "../src/auth/login-page";
 import type { Env, LoginGateSecret } from "../src/env";
 import {
@@ -103,10 +104,12 @@ import {
   taggedOk,
 } from "./fixtures/icloud-bytes";
 import { DEPLOYED_HOSTNAME, createMcpApiHandler } from "../src/mcp/api-handler";
+import { USER_A_VECTOR } from "./fixtures/user-id-vectors";
 import worker, {
   FAKE_APP_PASSWORD,
   LISTED_APPLE_ID,
   UNLISTED_APPLE_ID,
+  loginProofCalls,
 } from "./fixtures/worker-with-login-proof";
 
 const ORIGIN = `https://${DEPLOYED_HOSTNAME}`;
@@ -315,6 +318,89 @@ function post(
 
 function verb(name: string): Request {
   return new Request(`${ORIGIN}/authorize?${STUB_QUERY}`, { method: name });
+}
+
+// ---------------------------------------------------------------------------
+// The pool-backed half of this file: the REAL provider, the REAL bindings the
+// runner supplies from `wrangler.jsonc`, and the injected proof. Everything
+// above drives the handler over stubs, which is what lets those cases observe
+// ordering. These three helpers are what the cases that need a real binding or
+// a real store use instead, and they are shared rather than repeated because
+// two separate blocks below need the same registered client.
+// ---------------------------------------------------------------------------
+
+/** Drive the real provider over the injected proof, through its real fetch. */
+async function callWorker(request: Request): Promise<Response> {
+  const ctx = createExecutionContext();
+  const response = await worker.fetch(request, entryEnv(), ctx);
+  await waitOnExecutionContext(ctx);
+  return response;
+}
+
+/** Register a real client through the real registration endpoint. */
+async function register(clientName: string, redirectUri: string): Promise<string> {
+  const response = await callWorker(
+    new Request(`${ORIGIN}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_name: clientName,
+        redirect_uris: [redirectUri],
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+      }),
+    }),
+  );
+
+  expect(response.status).toBeLessThan(300);
+  const body = (await response.json()) as { client_id: string };
+  return body.client_id;
+}
+
+/** An authorization query the real provider parses and re-validates. */
+function authorizeQuery(
+  clientId: string,
+  redirectUri: string,
+  state: string,
+): string {
+  return new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+    code_challenge_method: "S256",
+    state,
+  }).toString();
+}
+
+/** A POST at the real Worker, from a named source connection. */
+function postFrom(source: string, appleId: string, query: string): Request {
+  return new Request(`${ORIGIN}/authorize`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "cf-connecting-ip": source,
+    },
+    body: new URLSearchParams({
+      apple_id: appleId,
+      app_password: FAKE_APP_PASSWORD,
+      oauth_request: query,
+    }).toString(),
+  });
+}
+
+/**
+ * A limiter key this invocation owns and nothing else in the repository uses.
+ *
+ * Not an address shape, and it does not need to be: the binding keys on the
+ * string it is handed and never parses it. Minting a fresh one per case is what
+ * keeps two cases in this file, and this file and its neighbours, from spending
+ * one another's windows — see the block comment on the GATE-04 cases below for
+ * why that is done this way rather than by resetting the counters.
+ */
+function freshSource(): string {
+  return `test-source-${crypto.randomUUID()}`;
 }
 
 describe("the method dispatch", () => {
@@ -1243,35 +1329,6 @@ describe("after a sign-in the password is in the grant and nowhere else", () => 
   /** What the canonicaliser makes of it, which is what actually gets stored. */
   const SWEEP_CANONICAL = "zqxjk7vbnm42plok98";
 
-  /** Drive the real provider over the injected proof, through its real fetch. */
-  async function callWorker(request: Request): Promise<Response> {
-    const ctx = createExecutionContext();
-    const response = await worker.fetch(request, entryEnv(), ctx);
-    await waitOnExecutionContext(ctx);
-    return response;
-  }
-
-  /** Register a real client through the real registration endpoint. */
-  async function register(redirectUri: string): Promise<string> {
-    const response = await callWorker(
-      new Request(`${ORIGIN}/oauth/register`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          client_name: "Sweep Client",
-          redirect_uris: [redirectUri],
-          token_endpoint_auth_method: "none",
-          grant_types: ["authorization_code", "refresh_token"],
-          response_types: ["code"],
-        }),
-      }),
-    );
-
-    expect(response.status).toBeLessThan(300);
-    const body = (await response.json()) as { client_id: string };
-    return body.client_id;
-  }
-
   it("holds it in no key of any store this Worker binds", async () => {
     // The non-empty guard, first and for the reason `test/fixtures/bound-secrets.ts`
     // already gives about its own: `not.toContain("")` is true of every string,
@@ -1281,15 +1338,8 @@ describe("after a sign-in the password is in the grant and nowhere else", () => 
     expect(SWEEP_CANONICAL.length).toBeGreaterThan(0);
 
     const redirectUri = "https://claude.ai/sweep-callback";
-    const clientId = await register(redirectUri);
-    const query = new URLSearchParams({
-      response_type: "code",
-      client_id: clientId,
-      redirect_uri: redirectUri,
-      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
-      code_challenge_method: "S256",
-      state: "sweep",
-    }).toString();
+    const clientId = await register("Sweep Client", redirectUri);
+    const query = authorizeQuery(clientId, redirectUri, "sweep");
 
     const signedIn = await callWorker(
       new Request(`${ORIGIN}/authorize`, {
@@ -1338,5 +1388,232 @@ describe("after a sign-in the password is in the grant and nowhere else", () => 
     // A sweep over nothing is a sweep that proves nothing. The grant this case
     // just minted is itself at least one key.
     expect(swept, "the sweep enumerated no keys at all").toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GATE-04. The three layers that stand between a stranger and Apple.
+//
+// The first two drive the REAL rate-limit bindings the runner supplies from
+// `wrangler.jsonc`. The third drives a counting store, because the hourly cap
+// and the per-target binding cannot both be exercised by the same six
+// requests: the binding refuses the fourth attempt in a minute, and six real
+// attempts inside an hour would never get past it.
+//
+// ---------------------------------------------------------------------------
+// HOW THE COUNTERS ARE KEPT FROM BLEEDING, AND WHY IT IS NOT `reset()`.
+//
+// The hazard is real and it is the reason this paragraph exists. The runner's
+// limiter is a counter with wall-clock-aligned windows, and nothing clears it
+// between tests — so two cases sharing a key spend one another's window, and a
+// suite that passes in isolation fails in file order. If that ever appears
+// here, the cause is a shared key and not the handler.
+//
+// Every case below therefore owns its key outright. The two that drive a real
+// binding mint a fresh connecting-address value per invocation, which is the
+// habit `test/authorize-redirect-allowlist.test.ts` already follows for the
+// same reason, and the second one also uses the OTHER address the pool's allow
+// list holds, so its per-target key is one nothing else in this repository
+// touches. The third case drives a store stub, so it has no shared counter at
+// all.
+//
+// `reset()` was the obvious alternative and it was MEASURED and declined, on
+// two findings. First, it is not needed: a fixed limiter key was driven seven
+// times in a throwaway case and answered with exactly five successes, and the
+// same case one second later answered with exactly five again — so the
+// counters do not survive a run, and there is nothing between runs to clear.
+// Second, it would be actively unsafe here: `reset()` deletes all data from
+// ALL bindings, and this runner persists the KV namespaces to disk while the
+// limiter counters live only in memory. The one thing it would really have
+// cleared is the store that the sweep case above, and whatever sibling file is
+// running beside this one, are using at that moment.
+// ---------------------------------------------------------------------------
+
+/**
+ * The OTHER address the pool's allow list holds. See `vitest.config.ts`.
+ *
+ * Taken from the user-id vectors rather than retyped, because that file is
+ * where the address and its derived id are held to each other, and a second
+ * spelling here is a second thing to keep in step. The per-target case below
+ * uses it so the key it spends belongs to no other case in this file.
+ */
+const SECOND_LISTED_APPLE_ID = USER_A_VECTOR.input;
+
+describe("the ip limiter, the first layer and the only one with its own status", () => {
+  // Titled so `-t "ip limiter"` matches — 11-VALIDATION.md's first GATE-04 row.
+
+  it(
+    "refuses a sixth attempt from one source, above everything it protects",
+    async () => {
+      const redirectUri = "https://claude.ai/flood-callback";
+      const clientId = await register("Flood Client", redirectUri);
+      const query = authorizeQuery(clientId, redirectUri, "flood");
+
+      // The control, and it comes FIRST because it has to come from a source
+      // that has spent nothing. Without it the refusal below would be
+      // satisfied by a request that was going to fail anyway — a bad client, a
+      // wrong address, a page that never works. This proves the very same
+      // POST, from a source with budget left, signs in.
+      const control = await callWorker(
+        postFrom(freshSource(), LISTED_APPLE_ID, query),
+      );
+      expect(control.status, "the control sign-in did not work").toBe(302);
+
+      const source = freshSource();
+
+      // Five priming requests whose authorization query cannot be parsed. Each
+      // is answered 400 by the provider — and each still spends a tick of this
+      // key, which is itself the ordering claim: the limiter sits ABOVE the
+      // parse, so a flood carrying nothing valid at all is still braked.
+      for (let attempt = 1; attempt <= 5; attempt += 1) {
+        const primed = await callWorker(
+          postFrom(source, LISTED_APPLE_ID, "not-a-valid-authorization-request"),
+        );
+        expect(primed.status, `priming attempt ${attempt} was not a 400`).toBe(
+          400,
+        );
+      }
+
+      // The sixth carries the SAME valid query the control just signed in
+      // with, from the same registered client, for an address that is on the
+      // list. The only thing different about it is the source's spent budget.
+      const before = loginProofCalls();
+      const refused = await callWorker(
+        postFrom(source, LISTED_APPLE_ID, query),
+      );
+
+      expect(refused.status).toBe(429);
+      expect(await refused.text()).toBe(SOURCE_REFUSAL_BODY);
+      expect(refused.headers.get("retry-after")).toBe("60");
+      // Never reached the allow-list check, which is what "above everything it
+      // protects" means: the proof is the instrument, and it did not move.
+      expect(loginProofCalls(), "the sixth attempt reached Apple").toBe(before);
+    },
+    20_000,
+  );
+});
+
+describe("the per-id layer, which answers as a wrong password and never as a 429", () => {
+  // Titled so `-t "per-id"` matches — 11-VALIDATION.md's second GATE-04 row.
+
+  it(
+    "refuses a fourth attempt against one address with the single failure string",
+    async () => {
+      const redirectUri = "https://claude.ai/per-id-callback";
+      const clientId = await register("Per Id Client", redirectUri);
+      const query = authorizeQuery(clientId, redirectUri, "per-id");
+
+      // One source for the whole case, with budget for all four attempts: the
+      // source limiter allows five a minute and this makes four, so whatever
+      // refuses the last one, it is not that layer.
+      const source = freshSource();
+
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const signedIn = await callWorker(
+          postFrom(source, SECOND_LISTED_APPLE_ID, query),
+        );
+        expect(signedIn.status, `attempt ${attempt} did not sign in`).toBe(302);
+      }
+
+      const before = loginProofCalls();
+      const refused = await callWorker(
+        postFrom(source, SECOND_LISTED_APPLE_ID, query),
+      );
+      const body = await refused.text();
+
+      // THE STATUS IS HALF THE CLAIM, and it is asserted on its own rather
+      // than left implied by the body. Success criterion 3 forbids a refusal
+      // that only ever appears for a listed address, and a 429 here would be
+      // exactly that: nobody who is not on the list can ever reach this layer,
+      // so its answer has to be indistinguishable from a wrong password.
+      expect(refused.status).toBe(401);
+      expect(refused.status).not.toBe(429);
+      expect(refused.headers.get("retry-after")).toBeNull();
+
+      // The body compared against the exported constant, not a retyped
+      // sentence that could drift from it.
+      for (const line of CREDENTIAL_FAILURE_BODY) {
+        expect(body).toContain(line);
+      }
+      expect(body).not.toContain(SOURCE_REFUSAL_BODY);
+
+      // And it cost Apple nothing, which is the point of refusing here.
+      expect(loginProofCalls(), "the fourth attempt reached Apple").toBe(before);
+    },
+    20_000,
+  );
+});
+
+describe("the hourly counter, the layer no platform window can reach", () => {
+  // Titled so `-t "hourly"` matches — 11-VALIDATION.md's third GATE-04 row.
+
+  /** A store that really counts, and remembers every key it was handed. */
+  function countingKv() {
+    const values = new Map<string, string>();
+    const gets: string[] = [];
+    const puts: string[] = [];
+    return {
+      gets,
+      puts,
+      binding: {
+        async get(key: string) {
+          gets.push(key);
+          return values.get(key) ?? null;
+        },
+        async put(key: string, value: string) {
+          puts.push(key);
+          values.set(key, value);
+        },
+      },
+    };
+  }
+
+  it("refuses the sixth failed guess in the window, under a key that names nobody", async () => {
+    // Both limiters stubbed open, deliberately. The per-target binding refuses
+    // a fourth attempt in a minute, so six real attempts could never reach
+    // this layer — which is exactly why the hour needs a counter of its own
+    // and cannot be a fourth binding.
+    const counter = countingKv();
+    const record = recorder({ rejectWith: () => new ImapAuthError() });
+    const handler = handlerOver(record.proof);
+    const env = stubEnv(record, { kv: counter.binding });
+
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const turned = await handler.fetch(post(LISTED_APPLE_ID), env);
+      expect(turned.status, `guess ${attempt} was not refused`).toBe(401);
+    }
+    expect(record.proofCalls(), "five guesses did not each cost one").toBe(5);
+
+    const refused = await handler.fetch(post(LISTED_APPLE_ID), env);
+    const body = await refused.text();
+
+    expect(refused.status).toBe(401);
+    for (const line of CREDENTIAL_FAILURE_BODY) {
+      expect(body).toContain(line);
+    }
+    // The sixth did not reach Apple. That is the whole of what an hourly cap
+    // buys: the five before it each spent a real attempt at a real account.
+    expect(record.proofCalls(), "the sixth guess reached Apple").toBe(5);
+
+    // Six reads and five writes. The sixth read the counter and did not bump
+    // it — a trip that counted itself would refill its own cap, and an address
+    // that tripped once could never come back inside the window.
+    expect(counter.gets).toHaveLength(6);
+    expect(counter.puts).toHaveLength(5);
+    // One key, because one address in one hour is one counter.
+    expect(new Set([...counter.gets, ...counter.puts]).size).toBe(1);
+
+    // THE PROPERTY, NOT THE SHAPE. The keys are read back out of the store and
+    // checked for the address rather than matched against today's format: the
+    // claim is that no key names a person, and a format assertion would move
+    // with the format instead of holding it to anything.
+    for (const key of [...counter.gets, ...counter.puts]) {
+      expect(key, "a counter key carries the address").not.toContain(
+        LISTED_APPLE_ID,
+      );
+      // And not the local part either, which is the half a reader would
+      // recognise on its own.
+      expect(key).not.toContain(LISTED_APPLE_ID.split("@")[0]!);
+    }
   });
 });
