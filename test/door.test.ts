@@ -91,7 +91,7 @@ type CaseProps = { absent: true } | { absent: false; props: unknown };
 /**
  * The grant the login page mints, for a person who is on the allow list.
  *
- * User A's address is bound into `ALLOWED_APPLE_IDS` in `vitest.config.ts`
+ * User A's address is bound into `ALLOWED_APPLE_IDS_SEED` in `vitest.config.ts`
  * precisely so this positive control can exist. Without a grant the door
  * actually serves, every refusal below is vacuous.
  */
@@ -479,35 +479,71 @@ describe.each(LANES)(
 );
 
 describe.each(LANES)(
-  "removal from the allow list takes effect on the next request, %s",
+  "the door checks the seed's usability, not membership, %s",
   (_lane, build) => {
-    // GATE-03, and the pair is the whole assertion — neither half means
-    // anything alone. One grant, two environments, two answers. If only the
-    // refusal existed it would be satisfied by a door that refuses everything;
-    // if only the service existed it would be satisfied by a door that checks
-    // nothing at all.
+    // ---------------------------------------------------------------------
+    // **THIS BLOCK REVERSED ON 2026-09-20, AND THE OLD ASSERTION IS RECORDED
+    // HERE RATHER THAN DELETED.** A silently flipped assertion is
+    // indistinguishable from a regression, so what it used to say and why it
+    // changed is written down.
     //
-    // **The removal is expressed by varying the ENVIRONMENT, not by editing a
+    // It used to be titled "removal from the allow list takes effect on the
+    // next request", and its middle case asserted that a grant carrying an
+    // address the list no longer named was REFUSED with a 401. That case now
+    // asserts the same grant is SERVED.
+    //
+    // WHY IT CHANGED. The allow list split into two sources: a `vars` seed the
+    // door can read synchronously, and a KV namespace it cannot read at all.
+    // There is no way to read a namespace without awaiting, and
+    // `createMcpApiHandler`'s `fetch` has a tested contract that it never
+    // awaits — the contract that makes an unusable stored credential surface as
+    // a tool error rather than as a 401 telling the client to sign in again,
+    // which is advice that cannot help when the password died at Apple. So the
+    // door asks a different question now: is this grant well shaped, and does
+    // this deployment serve anybody at all?
+    //
+    // WHY THE REVERSED BEHAVIOUR IS THE CORRECT ONE, and not merely the one
+    // that fell out. If the door checked MEMBERSHIP against the seed, a
+    // store-listed family member would sign in successfully and then be 401'd
+    // on their very next request — because the seed holds only the owner. They
+    // would have no live session at all, and phase 12's revoke script would
+    // have nothing to revoke.
+    //
+    // WHAT COVERS THE GAP. Removing somebody is two steps: take them out of the
+    // store so they cannot sign in again, then revoke their grants to end a
+    // live session. Phase 12's LIFE-05 revoke script is that second half; the
+    // interim stopgap is deleting the grant record from `OAUTH_KV` by hand.
+    //
+    // WHAT STILL HOLDS TODAY. The list holds one address, the owner's, and the
+    // store starts empty — so the only grant that can exist is his, and
+    // removing him leaves the seed unusable, which the last case below proves
+    // still refuses every grant.
+    // ---------------------------------------------------------------------
+    //
+    // **The pair is still the whole assertion** — neither half means anything
+    // alone. If only the refusal existed it would be satisfied by a door that
+    // refuses everything; if only the service existed, by a door that checks
+    // nothing at all. What varies between the halves moved from "is this
+    // address named" to "is this seed usable".
+    //
+    // **The change is expressed by varying the ENVIRONMENT, not by editing a
     // binding.** `callDoor` already takes an environment override for exactly
     // this. Assigning onto the ambient environment would leak the change into
     // every later case in the run, and a scan rule rejects it outright.
-    //
-    // **There is no cache to wait out and no token to expire.** The list is
-    // parsed and compared inside `fetch` on every single request, which is why
-    // "deploy without them and their access ends" is a true sentence for the
-    // owner to read in the README.
 
-    /** The pool's environment with user A taken off the allow list. */
-    function envWithoutUserA(): EntryEnv {
+    /** The pool's environment with the seed naming somebody else entirely. */
+    function envNamingSomebodyElse(): EntryEnv {
       return {
         ...entryEnv(),
-        ALLOWED_APPLE_IDS: JSON.stringify(["somebody-else@example.invalid"]),
+        ALLOWED_APPLE_IDS_SEED: JSON.stringify([
+          "somebody-else@example.invalid",
+        ]),
       };
     }
 
-    it("serves the grant while the address is listed", async () => {
-      // The positive control for the pair. The SAME grant, one environment
-      // over, is what makes the refusal below mean "the list stopped it".
+    it("serves the grant while the seed names the address", async () => {
+      // The positive control for the pair. The SAME grant, against a usable
+      // seed, is what makes the refusal below mean "the seed stopped it".
       const response = await callDoor(build("/mcp"), LISTED);
 
       expect(response.status, "a listed grant was not served").toBe(200);
@@ -520,57 +556,108 @@ describe.each(LANES)(
       ).toBe(true);
     });
 
-    it("refuses that identical grant once the address is gone", async () => {
-      const response = await callDoor(build("/mcp"), LISTED, envWithoutUserA());
+    it("serves that identical grant when the seed no longer names the address", async () => {
+      // **THE REVERSED CASE.** It used to assert a 401 here. The block comment
+      // above carries what it used to assert, why it changed, and what covers
+      // the gap. This is a deliberate weakening of GATE-03, accepted by the
+      // owner on 2026-09-20 and recorded in the GATE-03 amendment.
+      //
+      // The grant is the evidence: it can only exist because a login passed the
+      // store check when it was minted.
+      const response = await callDoor(
+        build("/mcp"),
+        LISTED,
+        envNamingSomebodyElse(),
+      );
 
       expect(
         response.status,
-        "a grant whose address was removed from the list was still served",
-      ).toBe(401);
-      expect(response.headers.get("WWW-Authenticate")).toBe(EXPECTED_CHALLENGE);
+        "a well-shaped grant was refused on a deployment whose seed is usable",
+      ).toBe(200);
+      expect(response.headers.get("WWW-Authenticate")).toBeNull();
 
-      const bodyText = await response.text();
-      const body = JSON.parse(bodyText) as Record<string, unknown>;
-      expect(body.error).toBe("invalid_token");
-      expect(Object.keys(body).sort(), "the 401 body grew a key").toEqual([
-        "error",
-        "error_description",
-      ]);
-
-      // The marks. This grant holds a real-shaped address and password, and
-      // neither may come back in the refusal — not in the body and not in a
-      // header. A removed person's own credentials echoed at them would be the
-      // one place this server leaks what it is holding.
-      const everyHeader = [...response.headers.entries()]
-        .map(([name, value]) => `${name}: ${value}`)
-        .join("\n");
-      for (const mark of [USER_A.appleId, USER_A.appPassword]) {
-        expect(bodyText, "the 401 body echoes the props").not.toContain(mark);
-        expect(everyHeader, "a 401 header echoes the props").not.toContain(mark);
-      }
-
+      await response.text();
       expect(
         await canaryWasInvoked(),
-        "a removed person's grant reached the tool layer",
-      ).toBe(false);
+        "a well-shaped grant did not reach the tool layer",
+      ).toBe(true);
     });
 
-    it("refuses that grant against an allow list that cannot be read", async () => {
-      // Fail-closed, at the door as well as at the login page. A deployment
-      // whose list is missing or malformed serves nobody — including people
-      // whose grants were minted while it was fine.
-      for (const broken of [undefined, "", "not json", "[]", '{"a":1}']) {
+    it("refuses a grant whose address this server cannot read", async () => {
+      // The fold survives the change even though nothing is compared against it
+      // any more. An address the folding turns away is not one this server can
+      // act for, under any seed — so this is refused beside the case above,
+      // which is served under the very same environment.
+      const response = await callDoor(build("/mcp"), {
+        absent: false,
+        props: { v: 1, appleId: "no-at-sign-at-all", appPassword: "x" },
+      });
+
+      expect(
+        response.status,
+        "a grant carrying an unreadable address was served",
+      ).toBe(401);
+      expect(response.headers.get("WWW-Authenticate")).toBe(EXPECTED_CHALLENGE);
+      await response.text();
+
+      expect(await canaryWasInvoked()).toBe(false);
+    });
+
+    it("refuses that grant against a seed that cannot be read", async () => {
+      // **THIS IS NOW THE DOOR'S WHOLE FAIL-CLOSED STORY**, and it carries more
+      // weight than it did: it used to sit beside a membership check, and it is
+      // now the only thing at this layer that can refuse a well-shaped grant on
+      // a running deployment. A seed that is missing, empty, malformed, or
+      // holding one unusable entry all mean NOBODY, and a deployment that
+      // serves nobody serves nobody — including people whose grants were minted
+      // while it was fine.
+      //
+      // It is also what makes "removing the owner still works today" true. The
+      // list holds his address alone, so taking it out leaves the seed
+      // unusable, which is this case.
+      //
+      // The positive control above is what keeps this from being vacuous: the
+      // same grant, the same door, one binding apart.
+      for (const broken of [
+        undefined,
+        "",
+        "not json",
+        "[]",
+        '{"a":1}',
+        '["*", "someone@example.invalid"]',
+      ]) {
         const response = await callDoor(build("/mcp"), LISTED, {
           ...entryEnv(),
-          ALLOWED_APPLE_IDS: broken,
+          ALLOWED_APPLE_IDS_SEED: broken,
         });
 
         expect(
           response.status,
-          `an unreadable allow list (${String(broken)}) still served a grant`,
+          `an unreadable seed (${String(broken)}) still served a grant`,
         ).toBe(401);
         expect(response.headers.get("WWW-Authenticate")).toBe(EXPECTED_CHALLENGE);
-        await response.text();
+
+        const bodyText = await response.text();
+        const body = JSON.parse(bodyText) as Record<string, unknown>;
+        expect(body.error).toBe("invalid_token");
+        expect(Object.keys(body).sort(), "the 401 body grew a key").toEqual([
+          "error",
+          "error_description",
+        ]);
+
+        // The marks. This grant holds a real-shaped address and password, and
+        // neither may come back in the refusal — not in the body and not in a
+        // header. A refused person's own credentials echoed at them would be
+        // the one place this server leaks what it is holding.
+        const everyHeader = [...response.headers.entries()]
+          .map(([name, value]) => `${name}: ${value}`)
+          .join("\n");
+        for (const mark of [USER_A.appleId, USER_A.appPassword]) {
+          expect(bodyText, "the 401 body echoes the props").not.toContain(mark);
+          expect(everyHeader, "a 401 header echoes the props").not.toContain(
+            mark,
+          );
+        }
       }
 
       expect(await canaryWasInvoked()).toBe(false);

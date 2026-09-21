@@ -97,7 +97,7 @@ import { createSessionGate, withMailSession } from "../mail/service";
 import type { Principal } from "../principal";
 import { normaliseAppleId, principalFromProps, userIdOf } from "../principal";
 import type { AllowList } from "./allow-list";
-import { isAllowed, parseAllowList } from "./allow-list";
+import { isAllowed, parseAllowList, readStoredAllowList } from "./allow-list";
 import { RESPONSE_HEADERS, SOURCE_REFUSAL_BODY, renderForm } from "./login-page";
 
 /** The only scope this server issues. */
@@ -924,13 +924,21 @@ async function handleAuthorize(
       });
     }
 
-    // The allow list is read ONCE, here, and the verdict is carried down. Gate
+    // The SEED is read ONCE, here, and the verdict is carried down. Gate
     // first: an unconfigured deployment has nothing to protect, so nothing is
     // spent on the request before this — not a parse, not a store round trip,
     // and certainly not a socket to Apple.
     //
+    // **THE STORE IS DELIBERATELY NOT CONSULTED HERE, and the reason is not
+    // cost alone.** A deployment whose seed is unusable cannot serve its own
+    // owner, so it is unconfigured whatever the store holds — a store full of
+    // family members on a server the owner himself cannot reach is still a
+    // server nobody should be signing in to. The cost argument comes second and
+    // is also real: this gate runs on every GET, and a store read here would
+    // spend a round trip on rendering a page.
+    //
     // Fail closed above method dispatch, so neither verb can reach the form
-    // while this deployment cannot say who may sign in. A list that is missing,
+    // while this deployment cannot say who may sign in. A seed that is missing,
     // empty, malformed, or holding one unusable entry all mean NOBODY, so all
     // of them answer here.
     //
@@ -944,7 +952,7 @@ async function handleAuthorize(
     // body is `UNCONFIGURED_BODY` unchanged, byte for byte: it names no binding
     // and interpolates nothing, so it is as true of an absent allow list as it
     // was of an absent secret.
-    const allowed = parseAllowList(env.ALLOWED_APPLE_IDS);
+    const allowed = parseAllowList(env.ALLOWED_APPLE_IDS_SEED);
     if (allowed.kind === "nobody") {
       return new Response(UNCONFIGURED_BODY, {
         status: 503,
@@ -1201,8 +1209,40 @@ async function handleAuthorize(
     // must never reach Apple, so no principal is built and no session is opened
     // for one. The folded address is what gets compared and what gets stored,
     // so the comparison and the grant cannot disagree about who this is.
+    //
+    // **Two sources, asked in this order, and the order is a cost argument.**
+    // The seed is synchronous and already parsed, so asking it first costs
+    // nothing; the store is a round trip. Because the seed holds the owner, HIS
+    // OWN SIGN-IN NEVER COSTS A STORE READ, and an address in neither source
+    // costs exactly one. This short-circuits — the store is not read at all
+    // when the seed already said yes.
+    //
+    // **One await, sequentially, and never a combinator.** Convention 3 forbids
+    // one anywhere in `src/auth/`, and there is nothing here to combine anyway:
+    // the first read is not I/O, and the second only happens if the first said
+    // no.
+    //
+    // **The null is refused explicitly, above both questions.** The predicate
+    // would refuse it under either verdict, so this is not the safety net — it
+    // is what lets the fold happen once and be narrowed once, instead of twice
+    // through two calls that could drift.
+    //
+    // **THE STORE READ SITS ABOVE THE PER-TARGET BURST LIMITER**, which means
+    // an unlisted address does buy one store round trip. That is affordable
+    // because of what runs far above it: LAYER 1, the source limiter, caps a
+    // single connecting source at five attempts a minute before the
+    // authorization query is even re-parsed. So the round trip is bounded per
+    // source, not per guess. It cannot move BELOW the limiters either — that
+    // would count an unlisted address against somebody, which is exactly what
+    // GATE-04's "a per-ID trip never reveals list membership" forbids.
     const appleId = normaliseAppleId(submittedAppleId);
-    if (!isAllowed(allowed, appleId)) return refuseCredential();
+    if (appleId === null) return refuseCredential();
+    if (
+      !isAllowed(allowed, appleId) &&
+      !isAllowed(await readStoredAllowList(env.ALLOW_LIST_KV), appleId)
+    ) {
+      return refuseCredential();
+    }
 
     // The user id is DERIVED from the address, never invented and never read
     // back off anything, and it is derived exactly ONCE — here, above the two

@@ -364,27 +364,14 @@ declare global {
        */
       CONFIRM_SECRET: string | undefined;
 
-      /**
-       * BEING RETIRED. The single write-only Secret that used to hold the whole
-       * allow list, superseded by `ALLOWED_APPLE_IDS_SEED` above plus
-       * `ALLOW_LIST_KV`. Its readers move in the next commit of this plan and
-       * this declaration goes with them; nothing new may read it.
-       *
-       * **The argument that put it here is no longer true, and it is replaced
-       * rather than left standing.** It said a Workers Secret was right because
-       * `wrangler.jsonc` is git-ignored while `wrangler.jsonc.example` is
-       * tracked, and a list of real Apple IDs should not sit next to a tracked
-       * example config even by accident. Two things overturned it on
-       * 2026-09-20. The arrangement that replaces it keeps the real addresses
-       * out of the tracked file anyway — the template carries a placeholder and
-       * only the git-ignored config carries an address. And the owner weighed
-       * the privacy ground against the operational one and found it much the
-       * weaker: these are his own family's addresses, on his own Cloudflare
-       * account, in a config nobody else reads, while a Secret CANNOT BE READ
-       * BACK from anywhere, which made "who is on the allow list?" a question
-       * the administrator could not answer at all.
-       */
-      ALLOWED_APPLE_IDS: string | undefined;
+      // The single write-only Secret that used to hold the whole allow list is
+      // GONE from this type, along with its two readers, in one commit — a
+      // half-removed binding is a name the compiler still accepts and nobody
+      // reads. `ALLOWED_APPLE_IDS_SEED` above plus `ALLOW_LIST_KV` replace it.
+      // The argument that put it here was a privacy one, and it did not
+      // survive: the replacement keeps real addresses out of the tracked
+      // template anyway, and a Secret could not be read back from anywhere,
+      // which made "who is on the allow list?" unanswerable.
     }
   }
 }

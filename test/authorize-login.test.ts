@@ -121,9 +121,20 @@ const ORIGIN = `https://${DEPLOYED_HOSTNAME}`;
  * three older authorize suites use for the bound secret: a value a test asserts
  * against is spelled in one place, with a comment saying where the real one
  * lives. The pool's own binding is in `vitest.config.ts` under
- * `ALLOWED_APPLE_IDS`, and it holds this same address.
+ * `ALLOWED_APPLE_IDS_SEED`, and it holds this same address.
  */
 const STUB_ALLOW_LIST = JSON.stringify([LISTED_APPLE_ID]);
+
+/**
+ * An address the SEED does not hold and the STORE can be made to.
+ *
+ * The store half of the allow list was added on 2026-09-20 and this is the only
+ * address in this file that exercises it. It is deliberately not
+ * `UNLISTED_APPLE_ID`: that one must stay in neither source, because it is what
+ * every refusal case in this file posts, and an address that became listed in
+ * one of them would turn a whole block of refusals green for the wrong reason.
+ */
+const STORE_ONLY_APPLE_ID = "store-listed@example.invalid";
 
 /**
  * The floor almost every case in this file injects, in milliseconds.
@@ -245,9 +256,14 @@ function limiter(success: boolean, keys?: string[]) {
 /**
  * An env whose provider records what the handler reached, and with what.
  *
- * `allowList` is a parameter rather than a constant because the 503 cases need
- * it absent, and because an absent binding is exactly the shape a deployment
- * that forgot to provision the Secret has.
+ * `allowList` is the SEED, and it is a parameter rather than a constant because
+ * the 503 cases need it absent, and because an absent binding is exactly the
+ * shape a live config that never carried the key has.
+ *
+ * `stored` is the STORE, and it defaults to an empty one — the state the
+ * namespace is in on the day this ships, and the state that makes a case about
+ * something else say nothing about the store. `storeThrows` makes the read fail
+ * instead, which is the one thing a real namespace cannot be asked to do.
  *
  * Both limiters default to letting the request through, so a case that says
  * nothing about them is a case about something else.
@@ -256,6 +272,8 @@ function stubEnv(
   record: Recorder,
   options: {
     allowList?: string | undefined;
+    stored?: string | null;
+    storeThrows?: boolean;
     failures?: number;
     kv?: unknown;
     floodRefused?: boolean;
@@ -270,8 +288,17 @@ function stubEnv(
       options.burstRefused !== true,
       options.limiterKeys,
     ),
-    ALLOWED_APPLE_IDS:
+    ALLOWED_APPLE_IDS_SEED:
       "allowList" in options ? options.allowList : STUB_ALLOW_LIST,
+    ALLOW_LIST_KV: {
+      async get(): Promise<string | null> {
+        record.calls.push("readStoredAllowList");
+        if (options.storeThrows === true) {
+          throw new Error("the store is unreachable");
+        }
+        return options.stored ?? null;
+      },
+    },
     OAUTH_PROVIDER: {
       parseAuthRequest: async () => {
         record.calls.push("parseAuthRequest");
@@ -480,6 +507,140 @@ describe("one login, and only one, for a sign-in that works", () => {
   });
 });
 
+describe("two allow-list sources, asked in order", () => {
+  // GATE-01 and GATE-03, at the login page. The allow list split on 2026-09-20
+  // into a synchronous `vars` SEED holding the owner and a KV STORE holding
+  // everybody else. This block is the whole behavioural claim about that split.
+  //
+  // **Every case reads the socket counter and not only the status**, because a
+  // status cannot tell "refused before the socket" from "refused after the
+  // login failed at Apple". Criterion 2 is an assertion about socket count.
+  //
+  // **The store read is recorded as a call**, which is what lets the ordering
+  // cases below assert a short-circuit rather than infer one.
+
+  it("signs in an address the seed names, without reading the store", async () => {
+    // The owner's own sign-in. The seed is asked first and short-circuits, so
+    // this costs no store round trip — the cost argument written at the check
+    // in source, asserted here so it cannot quietly stop being true.
+    const record = recorder();
+    const response = await handlerOver(record.proof).fetch(
+      post(LISTED_APPLE_ID),
+      stubEnv(record),
+    );
+
+    expect(response.status).toBe(302);
+    expect(record.proofCalls()).toBe(1);
+    expect(
+      record.calls,
+      "the seed already said yes and the store was read anyway",
+    ).not.toContain("readStoredAllowList");
+  });
+
+  it("signs in an address only the store names, and reaches Apple once", async () => {
+    // The case the store exists for: a family member the seed does not and
+    // will not name. Without it the whole namespace is unreachable code.
+    const record = recorder();
+    const response = await handlerOver(record.proof).fetch(
+      post(STORE_ONLY_APPLE_ID),
+      stubEnv(record, { stored: JSON.stringify([STORE_ONLY_APPLE_ID]) }),
+    );
+
+    expect(response.status).toBe(302);
+    expect(record.proofCalls(), "a store-listed address did not reach Apple")
+      .toBe(1);
+    expect(record.calls).toContain("readStoredAllowList");
+    expect(record.calls).toContain("completeAuthorization");
+  });
+
+  it("opens nothing for an address in neither source", async () => {
+    // One store read is spent — the seed said no, so the store had to be asked
+    // — and then nothing. No socket, no ceremony. What bounds that round trip
+    // is layer 1, the source limiter, far above this point.
+    const record = recorder();
+    const response = await handlerOver(record.proof).fetch(
+      post(STORE_ONLY_APPLE_ID),
+      stubEnv(record, { stored: JSON.stringify(["somebody@example.invalid"]) }),
+    );
+
+    expect(response.status).toBe(401);
+    expect(record.proofCalls(), "an unlisted address reached Apple").toBe(0);
+    expect(record.calls).toContain("readStoredAllowList");
+    expect(record.calls).not.toContain("completeAuthorization");
+  });
+
+  it("refuses the store-listed address when the store throws, and still signs the seed-listed one in", async () => {
+    // **THE FAIL-CLOSED PAIR, AND BOTH HALVES BELONG IN ONE CASE.** The refusal
+    // alone is satisfied by a server that refuses everybody, which is exactly
+    // what a store outage must NOT cause — the owner has to stay able to reach
+    // his own server. The sign-in alone says nothing about the store at all.
+    const refusedRecord = recorder();
+    const refused = await handlerOver(refusedRecord.proof).fetch(
+      post(STORE_ONLY_APPLE_ID),
+      stubEnv(refusedRecord, { storeThrows: true }),
+    );
+
+    expect(refused.status).toBe(401);
+    expect(
+      refusedRecord.proofCalls(),
+      "a store that threw admitted somebody anyway",
+    ).toBe(0);
+
+    const servedRecord = recorder();
+    const served = await handlerOver(servedRecord.proof).fetch(
+      post(LISTED_APPLE_ID),
+      stubEnv(servedRecord, { storeThrows: true }),
+    );
+
+    expect(
+      served.status,
+      "a store outage locked out an address the seed names",
+    ).toBe(302);
+    expect(servedRecord.proofCalls()).toBe(1);
+  });
+
+  it("means nobody for a stored value that cannot be read", async () => {
+    // The same parse rule the seed goes through, reached through the store. A
+    // value with two readings resolves closed here exactly as it does there.
+    for (const bad of ["not json", '"*"', "[]", '["*", "someone@x.invalid"]']) {
+      const record = recorder();
+      const response = await handlerOver(record.proof).fetch(
+        post(STORE_ONLY_APPLE_ID),
+        stubEnv(record, { stored: bad }),
+      );
+
+      expect(
+        response.status,
+        `a stored value of ${JSON.stringify(bad)} admitted somebody`,
+      ).toBe(401);
+      expect(record.proofCalls()).toBe(0);
+    }
+  });
+
+  it("answers 503 on both verbs when the seed is unusable, whatever the store holds", async () => {
+    // The gate above the method dispatch reads the SEED ONLY. A deployment
+    // whose seed is unusable cannot serve its own owner, so it is unconfigured
+    // however full the store is — and a store read on every GET would spend a
+    // round trip rendering a page.
+    for (const request of [get(), post(STORE_ONLY_APPLE_ID)]) {
+      const record = recorder();
+      const response = await handlerOver(record.proof).fetch(
+        request,
+        stubEnv(record, {
+          allowList: undefined,
+          stored: JSON.stringify([STORE_ONLY_APPLE_ID, LISTED_APPLE_ID, "*"]),
+        }),
+      );
+
+      expect(response.status, `${request.method} did not answer 503`).toBe(503);
+      expect(record.proofCalls()).toBe(0);
+      // Above everything: the provider was never consulted, and neither was
+      // the store.
+      expect(record.calls).toHaveLength(0);
+    }
+  });
+});
+
 describe("the props the ceremony is completed with", () => {
   // Titled so `-t "props"` matches — 11-VALIDATION.md's LOGIN-06 command.
 
@@ -679,7 +840,8 @@ describe("a deployment with no usable allow list refuses to authorize", () => {
       .fetch(get(), stubEnv(record, { allowList: undefined }))
       .then((response) => response.text());
 
-    expect(body).not.toContain("ALLOWED_APPLE_IDS");
+    expect(body).not.toContain("ALLOWED_APPLE_IDS_SEED");
+    expect(body).not.toContain("ALLOW_LIST_KV");
     expect(body).not.toContain("AUTH_SECRET");
   });
 

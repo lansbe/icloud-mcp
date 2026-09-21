@@ -60,27 +60,9 @@ export default defineConfig({
                 R2_SECRET_ACCESS_KEY: "test-secret-key-not-real",
                 CONFIRM_SECRET: "test-confirm-secret-not-real",
 
-                // Who may sign in, as the JSON array string the real Secret
-                // holds. WITHOUT THIS BINDING EVERY EXISTING /authorize TEST
-                // GETS THE NEW 503: an absent list parses as nobody, and the
-                // gate that answers 503 sits above the method dispatch, so
-                // neither verb reaches the form.
-                //
-                // Two addresses, because two different suites need one. The
-                // first is what the authorize tests sign in as. The second is
-                // user A from test/fixtures/two-users.ts, so the door test can
-                // prove a listed grant is SERVED — without it that positive
-                // control could not exist and every refusal beside it would be
-                // vacuous. Both sit under the reserved `.invalid` domain, which
-                // can never resolve, following the habit the fakes above set.
-                ALLOWED_APPLE_IDS:
-                  '["listed-user@example.invalid","user-a@example.invalid"]',
-
-                // The SEED half of the allow list, holding the same two
-                // addresses for the same two reasons. It replaces the binding
-                // directly above, which is being retired in this same plan;
-                // both are bound while the readers move, so the suite is green
-                // at every commit rather than only at the end.
+                // The SEED half of the allow list, as the JSON array string the
+                // real `vars` entry holds. The single write-only Secret this
+                // replaces is gone from every file in this repository.
                 //
                 // Two addresses, because two different suites need one. The
                 // first is what the authorize tests sign in as. The second is

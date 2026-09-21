@@ -125,7 +125,8 @@ describe("/authorize is unaffected", () => {
     // to show /authorize answers something OTHER than the unknown-path body.
     const response = await loginHandler.fetch(
       new Request(`${ORIGIN}/authorize?response_type=code&client_id=abc`),
-      { ALLOWED_APPLE_IDS: undefined } as unknown as Env & LoginGateSecret,
+      { ALLOWED_APPLE_IDS_SEED: undefined } as unknown as Env &
+        LoginGateSecret,
     );
 
     expect(response.status).toBe(503);

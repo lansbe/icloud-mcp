@@ -187,7 +187,11 @@ function stubEnv(options: {
     LOGIN_ID_LIMITER: openLimiter(),
     // Without this the allow-list gate answers 503 above the method dispatch
     // and not one case in this file reaches the refusal it was written for.
-    ALLOWED_APPLE_IDS: JSON.stringify([LISTED_APPLE_ID]),
+    ALLOWED_APPLE_IDS_SEED: JSON.stringify([LISTED_APPLE_ID]),
+    // The store half, answering "nobody is in here". A case in this file is
+    // never about the store, so it says nothing about it — and a binding that
+    // said something would make every case in the file quietly depend on it.
+    ALLOW_LIST_KV: { get: async () => null },
     OAUTH_PROVIDER: {
       parseAuthRequest:
         options.parseAuthRequest ??

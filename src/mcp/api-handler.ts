@@ -7,7 +7,11 @@ import { createMcpHandler } from "agents/mcp/server";
 import type { EntryEnv } from "../env";
 import { DEPLOYED_HOSTNAME } from "../deployed-hostname.generated";
 import type { AllowList } from "../auth/allow-list";
-import { isAllowed, parseAllowList } from "../auth/allow-list";
+// `isAllowed` is deliberately NOT imported. The door stopped asking the
+// membership question, and a leftover import of it here would be a dead
+// reference of exactly the kind `test/door.test.ts`'s source tripwire exists to
+// catch — the behavioural cases would stay green with one sitting unused.
+import { parseAllowList } from "../auth/allow-list";
 import type { Principal } from "../principal";
 import { normaliseAppleId, principalFromProps } from "../principal";
 import { createServerFactory } from "./server";
@@ -185,18 +189,44 @@ const HANDLER_OPTIONS: HandlerOptions = {
  * Is this a grant this server will still serve (D-07, GATE-03, GATE-05)?
  *
  * Yes only for a plain object with exactly three own keys, one of them a string
- * `appleId` whose folded form is on the allow list. That is the shape the login
- * page mints. Everything else is a no: the OLD single-key owner grant (GATE-05
- * — those are what this replaces, and they must be refused rather than
- * honoured), a grant whose address has since been removed from the list
- * (GATE-03), an address this server cannot fold, null, an array, and no props
- * at all. The handler library only builds an auth context when the props hold a
- * key, so "nothing there" has to read as a bad grant and not as a crash.
+ * `appleId` this server can fold, on a deployment whose SEED is usable. That is
+ * the shape the login page mints. Everything else is a no: the OLD single-key
+ * owner grant (GATE-05 — those are what this replaces, and they must be refused
+ * rather than honoured), any grant at all on a deployment whose seed is
+ * missing, empty or malformed (GATE-03), an address this server cannot fold,
+ * null, an array, and no props at all. The handler library only builds an auth
+ * context when the props hold a key, so "nothing there" has to read as a bad
+ * grant and not as a crash.
  *
- * **The list is re-read and re-compared on EVERY request, with no cache.** That
- * is what makes removal take effect on the person's very next call rather than
- * whenever some token expires. It costs one parse of a small string and one set
- * lookup, and no I/O at all.
+ * **The seed is re-read on EVERY request, with no cache**, and that half of the
+ * old claim survives intact: it costs one parse of a small string and no I/O at
+ * all.
+ *
+ * **What this no longer does, stated bluntly rather than softened.** It used to
+ * compare the grant's address against the whole allow list, which made removing
+ * somebody take effect on their very next call. It cannot do that any more for
+ * a STORE-LISTED address. The store is a KV namespace and there is no way to
+ * read one synchronously; making this path async would break the never-awaits
+ * contract on `createMcpApiHandler` below, and that contract is what makes an
+ * unusable stored credential surface as a tool error rather than as a 401
+ * telling the client to sign in again — advice that cannot help when the
+ * password died at Apple.
+ *
+ * So a well-shaped grant carrying an address the seed does not name is SERVED.
+ * The grant is itself the evidence that a login passed the store check when it
+ * was minted.
+ *
+ * **What covers the gap.** Removal is two steps: take the person out of the
+ * store so they cannot sign in again, then revoke their grants to end a live
+ * session. Phase 12's LIFE-05 revoke script is that second half; until it ships
+ * the stopgap is deleting the grant record from `OAUTH_KV` by hand.
+ *
+ * **What still holds today.** The allow list holds exactly one address — the
+ * owner's — for the whole of this phase, and the store starts empty, so the
+ * only grant that can exist is the owner's. Removing the owner leaves the seed
+ * unusable, and an unusable seed still refuses every grant here on the next
+ * request. The weakening becomes real with the first store entry, which is a
+ * later phase, after LIFE-05 exists.
  *
  * **It checks the address and never the password.** A grant whose password
  * Apple has since revoked still passes here, and that is correct: the tool then
@@ -242,7 +272,14 @@ function servesThisGrant(props: unknown, allowed: AllowList): boolean {
     if (!Object.hasOwn(props, "appleId")) return false;
     const appleId = props.appleId;
     if (typeof appleId !== "string") return false;
-    return isAllowed(allowed, normaliseAppleId(appleId));
+    // The fold is kept even though nothing is compared against it any more: an
+    // address this server cannot read is not one it can act for, and that is
+    // the fail-closed edge for a grant carrying a mangled address.
+    if (normaliseAppleId(appleId) === null) return false;
+    // The seed's own usability test, which is the same expression the login
+    // gate uses one module over. Anything other than "nobody" means this
+    // deployment serves somebody, so it serves this grant.
+    return allowed.kind !== "nobody";
   } catch {
     // Never read the caught value. A grant we cannot inspect is not one to
     // serve, so this answers the same way every other bad grant is answered.
@@ -342,10 +379,13 @@ export function buildRequestHandler(
  *   function does not wait to find out. Each tool callback awaits the promise
  *   as the first line of its own `try`, and its own `catch` maps a refusal to
  *   the category.
- * - The allow list is parsed HERE, synchronously, on every request. The parse
- *   does no I/O — it reads a string off the environment and answers a verdict —
- *   so it costs nothing against the no-await rule above, and re-reading it per
- *   request is what makes removing someone take effect on their next call.
+ * - The allow list's SEED is parsed HERE, synchronously, on every request. The
+ *   parse does no I/O — it reads a string off the environment and answers a
+ *   verdict — so it costs nothing against the no-await rule above. The seed is
+ *   the only one of the two allow-list sources this path can read at all: the
+ *   store is a KV namespace, reading one is an await, and an await here is the
+ *   one thing this function may not do. `servesThisGrant` above carries what
+ *   that costs, what covers it, and why nothing regresses this phase.
  */
 export function createMcpApiHandler(extraTools: ExtraTool[] = []): {
   fetch(
@@ -361,7 +401,9 @@ export function createMcpApiHandler(extraTools: ExtraTool[] = []): {
       ctx: ExecutionContext,
     ): Promise<Response> {
       // The one read of the grant's props in this codebase (D-08).
-      if (!servesThisGrant(ctx.props, parseAllowList(env.ALLOWED_APPLE_IDS))) {
+      if (
+        !servesThisGrant(ctx.props, parseAllowList(env.ALLOWED_APPLE_IDS_SEED))
+      ) {
         return Promise.resolve(unauthorized(request));
       }
 

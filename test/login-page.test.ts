@@ -194,7 +194,11 @@ function stubEnv(
     LOGIN_ID_LIMITER: limiter(true),
     // Without this the allow-list gate answers 503 above the method dispatch
     // and no case here reaches the response it was written for.
-    ALLOWED_APPLE_IDS: JSON.stringify([LISTED_APPLE_ID]),
+    ALLOWED_APPLE_IDS_SEED: JSON.stringify([LISTED_APPLE_ID]),
+    // The store half, answering "nobody is in here". A case in this file is
+    // never about the store, so it says nothing about it — and a binding that
+    // said something would make every case in the file quietly depend on it.
+    ALLOW_LIST_KV: { get: async () => null },
     OAUTH_PROVIDER: {
       parseAuthRequest:
         options.parseAuthRequest ??
@@ -418,7 +422,7 @@ describe("the security headers are on every response", () => {
       status: 503,
       serve: () =>
         loginHandler.fetch(new Request(`${ORIGIN}/authorize?${STUB_QUERY}`), {
-          ALLOWED_APPLE_IDS: undefined,
+          ALLOWED_APPLE_IDS_SEED: undefined,
         } as unknown as Env & LoginGateSecret),
     },
     {

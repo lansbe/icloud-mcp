@@ -32,7 +32,7 @@ import type { Principal } from "../../src/principal";
  * Named here and imported by the suites, rather than retyped in each of them,
  * so a change to `vitest.config.ts` breaks one line instead of silently
  * un-listing an address three files still believe is listed. The bound value
- * lives in `vitest.config.ts` under `ALLOWED_APPLE_IDS`.
+ * lives in `vitest.config.ts` under `ALLOWED_APPLE_IDS_SEED`.
  */
 export const LISTED_APPLE_ID = "listed-user@example.invalid";
 
