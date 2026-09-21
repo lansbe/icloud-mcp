@@ -1412,6 +1412,22 @@ async function handleAuthorize(
     // across addresses would be counted as a guesser and never as a threat to
     // any one account, while Apple would see every attempt.
     //
+    // A SECOND ACCEPTED COST: THIS LAYER COUNTS SUCCESSES TOO. Recorded after
+    // the phase review of 2026-09-21. The binding is asked before the login
+    // runs, and it has no way to give a slot back, so a correct password spends
+    // a slot exactly as a wrong one does. The client is known to submit a
+    // successful form twice (see `revokeExistingGrants` below). So a person who
+    // mistypes twice and then types the right password spends slots one to
+    // three, and the client's repeat submission is refused. The browser shows
+    // the LAST response, so they read "check the address and the password"
+    // even though the first correct submission already signed them in. Trying
+    // again after a minute works.
+    //
+    // Why it is left alone. Counting only failures is not possible with this
+    // binding. Raising the limit to make room would loosen the only brake on a
+    // parallel burst, which is already weaker than it looks (see the file
+    // header). A confusing message once in a while is the cheaper of the two.
+    //
     // THE LAYER THAT IS NOT HERE. A fourth layer was considered and declined
     // for this milestone: a ceiling on total sign-in attempts across every
     // listed address at once. Recorded as a decision rather than left as an
