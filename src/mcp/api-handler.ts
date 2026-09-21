@@ -367,11 +367,19 @@ export function createMcpApiHandler(extraTools: ExtraTool[] = []): {
 
       // Identity comes from the grant, never from the environment. That is the
       // whole of the Phase 11 switch at this line: the per-user principal is
-      // the only live identity path from here on, and `principalFromEnv` is a
-      // retiring variant that Phase 13 deletes along with the three secrets.
+      // the only live identity path from here on, and the environment-backed
+      // constructor one module over is a retiring variant that Phase 13 deletes
+      // along with the three secrets.
       // Adding this path ALONGSIDE the environment one is the shape that would
       // silently contradict the change — a second person could be stored and
       // never served, because the environment identity would still win here.
+      //
+      // **The retiring constructor is named here by ROLE and never by name, and
+      // that is load-bearing rather than tidy.** `test/door.test.ts` carries a
+      // source-text tripwire asserting this file spells its name nowhere, which
+      // is what catches a later phase reintroducing the singular identity by
+      // leaving a dead reference behind — the behavioural case one block over
+      // would still pass with one sitting here unused. Describe it by role.
       const principal = principalFromProps(ctx.props);
       // A request that calls no tool never awaits this promise. If the stored
       // credential is unusable it rejects, and a rejection nobody handles is an

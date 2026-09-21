@@ -54,7 +54,7 @@
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { EntryEnv } from "../src/env";
-import { entryEnv } from "./fixtures/bound-secrets";
+import { assertMailSecretsBound, entryEnv } from "./fixtures/bound-secrets";
 import { DEPLOYED_HOSTNAME, createMcpApiHandler } from "../src/mcp/api-handler";
 import { USER_A } from "./fixtures/two-users";
 import worker, {
@@ -64,6 +64,17 @@ import worker, {
 
 const HOSTNAME = DEPLOYED_HOSTNAME;
 const ORIGIN = `https://${HOSTNAME}`;
+
+// @ts-expect-error — Vite's `import.meta.glob` has no ambient declaration here;
+// `test/dav-home-containment.test.ts` carries the full argument for it. `?raw`
+// inlines the file's text at build time, which is how a Workers isolate with no
+// filesystem reads source.
+const DOOR_SOURCE_GLOB: Record<string, string> = import.meta.glob(
+  "../src/mcp/api-handler.ts",
+  { query: "?raw", import: "default", eager: true },
+);
+
+const DOOR_SOURCE: string = Object.values(DOOR_SOURCE_GLOB)[0] ?? "";
 
 /** The mail diagnostic. The one tool that awaits the principal in this plan. */
 const MAIL_DIAGNOSTIC = "mail_imap_diagnose";
@@ -656,5 +667,160 @@ describe("an unusable stored credential is not a 401 (D-09)", () => {
       result?.tools?.some((tool) => tool.name === MAIL_DIAGNOSTIC),
       "the tools/list answer does not list the mail diagnostic",
     ).toBe(true);
+  });
+});
+
+describe("identity comes from the grant and from nowhere else (the promotion)", () => {
+  // **What this block is for.** Phase 11 did not ADD a per-user identity beside
+  // the environment one. It PROMOTED it: the per-user principal is now the only
+  // live identity path, and the environment-backed constructor is a retiring
+  // variant that the next milestone's cutover requirement deletes along with
+  // the three secrets. Adding alongside is the shape that silently contradicts
+  // a promotion — a second person could be stored and never served, because the
+  // environment identity would still win somewhere — so the invariant is worth
+  // its own proof rather than being inferred from the switch having been made.
+  //
+  // **Two cases, and they are not the same claim.**
+  //
+  // The FIRST is the claim. It is behavioural: a grant carrying a listed
+  // address and a usable password is SERVED, and the request reaches the tool
+  // layer, while the two mail secrets are absent from the environment the door
+  // was called with. Before the switch that request failed on the way to the
+  // tool, because identity came from those secrets. It succeeds now because
+  // identity comes from the props. Nothing about a file's text is asserted.
+  //
+  // The SECOND is a tripwire, and it exists because the first has a blind spot
+  // that is worth stating rather than glossing. **The recording tool never
+  // AWAITS the principal** — it flips a flag and returns, exactly as its own
+  // fixture says. So "the request reached the tool layer" proves the door
+  // served the grant; it does not prove which object the promise it handed down
+  // was built from. Two shapes would pass the behavioural case and should not:
+  //
+  //   1. A door that keeps a DEAD reference to the retiring constructor — an
+  //      import it no longer calls, a branch nothing reaches. That is how a
+  //      later phase reintroduces the singular assumption by accident: the name
+  //      comes back first, the call site comes back second, and the gap between
+  //      them is where nothing is watching.
+  //   2. The add-ALONGSIDE shape the context file names as the thing a promote
+  //      must not become: the address checked against the props, the credential
+  //      still taken from the environment. With the recording tool, a rejected
+  //      environment principal is indistinguishable from a resolved props one.
+  //
+  // The source-text case closes both, and it closes them the same way: the door
+  // cannot build a principal from the environment without naming the one
+  // constructor that does it, and it names it nowhere. That is why the pair is
+  // the proof and neither half is.
+  //
+  // **Why there is no third case awaiting a real principal.** Only a tool that
+  // awaits it can observe what it resolved to, and every such tool opens a
+  // socket to Apple the moment the principal is usable. D-09 forbids that from
+  // any test in this repository, and the props here are fakes, so the socket
+  // would be a real connection attempt against a real Apple host with a made-up
+  // address. The existing block above takes the other branch — a props password
+  // the constructor REFUSES, which reaches no network — and that branch cannot
+  // tell the two sources apart, because an absent environment secret is refused
+  // by the same constructor with the same answer.
+  //
+  // **The constructor itself is NOT deleted here, and that is deliberate.** Its
+  // definition stays in the principal module, `test/fixtures/bound-secrets.ts`
+  // still calls it, and a dozen suites still drive it. The next milestone's
+  // cutover requirement deletes it together with the three secrets. What this
+  // phase owns is making the per-user principal the only LIVE path, which is
+  // what these two cases hold.
+
+  /**
+   * The pool's environment with the two mail secrets taken away.
+   *
+   * A fresh spread COPY, never a write onto the object `entryEnv()` hands back.
+   * That object is shared by every test in the isolate, so an in-place override
+   * would leak into every later case in the run — and the environment-assignment
+   * scan rule refuses that form outright, in every scanned directory.
+   */
+  function envWithoutMailSecrets(): EntryEnv {
+    return {
+      ...entryEnv(),
+      APPLE_ID: undefined,
+      APPLE_APP_PASSWORD: undefined,
+    };
+  }
+
+  it.each(LANES)(
+    "serves a listed grant with the environment's mail secrets absent, %s",
+    async (_lane, build) => {
+      // Non-vacuity first, and it is the same positive control every refusal in
+      // this file leans on: the identical request with the identical props IS
+      // served under the ordinary environment. Without that, "served with the
+      // secrets absent" could be satisfied by a door that serves anything.
+      const control = await callDoor(build("/mcp"), LISTED);
+      expect(control.status, "the control was not served").toBe(200);
+      await control.text();
+      expect(
+        await canaryWasInvoked(),
+        "the control did not reach the tool layer",
+      ).toBe(true);
+
+      await callWorker(new Request(`${ORIGIN}/__canary/reset`, { method: "POST" }));
+      expect(await canaryWasInvoked()).toBe(false);
+
+      // The second non-vacuity guard, and the one specific to this case: the
+      // pool really does bind both secrets, and the copy below really has
+      // neither. Without this pair, a `?? ""` slipped into the fixture or a
+      // pool that stopped binding them would leave the case asserting that a
+      // request is served with two things absent that were never there.
+      const ambient = entryEnv();
+      assertMailSecretsBound(ambient);
+      const withoutSecrets = envWithoutMailSecrets();
+      expect(
+        withoutSecrets.APPLE_ID,
+        "the override did not remove the Apple ID binding",
+      ).toBeUndefined();
+      expect(
+        withoutSecrets.APPLE_APP_PASSWORD,
+        "the override did not remove the app-password binding",
+      ).toBeUndefined();
+
+      const response = await callDoor(build("/mcp"), LISTED, withoutSecrets);
+
+      expect(
+        response.status,
+        "a grant carrying its own credentials was refused because the environment had none",
+      ).toBe(200);
+      expect(
+        response.headers.get("WWW-Authenticate"),
+        "a grant carrying its own credentials was sent a sign-in challenge",
+      ).toBeNull();
+
+      // The claim-less lane answers over a stream and the tool runs as the
+      // stream is pulled. Drain before reading the flag, on both lanes.
+      await response.text();
+
+      expect(
+        await canaryWasInvoked(),
+        "a request whose identity is in its grant did not reach the tool layer with the environment's mail secrets absent",
+      ).toBe(true);
+    },
+  );
+
+  it("the door's source names the retiring environment constructor nowhere", () => {
+    // Non-vacuity first. A `?raw` import that resolved to nothing would make
+    // the assertion below pass while reading an empty string, which is the
+    // failure this whole mechanism is most prone to.
+    expect(
+      DOOR_SOURCE.length,
+      "the ?raw import of src/mcp/api-handler.ts loaded nothing",
+    ).toBeGreaterThan(1000);
+    expect(
+      DOOR_SOURCE,
+      "the ?raw import did not load the door's source",
+    ).toContain("createMcpApiHandler");
+
+    // Comments count, and on purpose. The door DOES discuss the retiring
+    // constructor — it has to, because the switch is the interesting thing
+    // about that line — and it does so by ROLE. A file that starts spelling
+    // the name again is a file where somebody is thinking about it as code.
+    expect(
+      DOOR_SOURCE,
+      "the door names the environment-backed principal constructor; identity must come from the grant, and even a dead reference is how the singular assumption comes back",
+    ).not.toContain("principalFromEnv");
   });
 });
