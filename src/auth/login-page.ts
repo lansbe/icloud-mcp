@@ -171,12 +171,34 @@ export const APPLE_THROTTLE_BODY: readonly string[] = [
  * exists to leak anything. That is why it is the one refusal allowed a status
  * of its own.
  *
- * The design contract gives this surface a longer sentence, and the same
- * contract's list of responses that are NOT restyled includes this one with its
- * wording kept. The wording is kept, because plan 11-05 replaces this limiter
- * outright and rewording a body that is about to be rewritten buys nothing.
+ * **The design contract contradicted itself here, and this is where that was
+ * resolved.** Its failure-states table gives this surface a longer sentence,
+ * while its list of responses that are NOT restyled names this one with "same
+ * wording, same status". Plan 11-02 kept the old sentence and said why: the
+ * limiter behind it was about to be replaced, so rewording a body that was
+ * about to be rewritten bought nothing. Plan 11-05 is that replacement, so the
+ * deferral is over and the table wins.
+ *
+ * The table wins on two grounds. It is the SPECIFIC instruction — it quotes the
+ * exact string for exactly this response — while the not-restyled list is about
+ * STYLING, and its point is that this answer stays plain text at the same
+ * status rather than becoming a designed page. Both of those still hold. And
+ * the longer sentence says the thing that matters: the refusal is about the
+ * CONNECTION, not about what was typed. Somebody who sees "too many attempts"
+ * straight after typing a password reasonably concludes their password was
+ * counted and goes to Apple to make a new one. Naming the connection is the
+ * correction.
+ *
+ * **The wait deliberately over-states the window.** The binding's window is
+ * sixty seconds, and this says a few minutes. The counter is per Cloudflare
+ * location and its epochs are wall-clock aligned, so "sixty seconds from now"
+ * is not a promise this server can keep; somebody who comes back too early
+ * spends another attempt for nothing. The machine-readable answer is the
+ * `retry-after` header, which carries the real figure. Rounding up in prose and
+ * being exact in the header is the honest pair.
  */
-export const SOURCE_REFUSAL_BODY = "Too many attempts. Try again shortly.";
+export const SOURCE_REFUSAL_BODY =
+  "Too many sign-in attempts from this connection. Try again in a few minutes.";
 
 /** Which failure the page came back with, or `null` for a first load. */
 export type LoginFailure = "credentials" | "throttled" | null;

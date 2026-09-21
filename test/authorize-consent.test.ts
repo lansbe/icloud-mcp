@@ -53,6 +53,7 @@ import {
 } from "../src/auth/login-handler";
 import { CREDENTIAL_FAILURE_BODY } from "../src/auth/login-page";
 import type { Env, LoginGateSecret } from "../src/env";
+import { ImapAuthError } from "../src/errors";
 import { entryEnv } from "./fixtures/bound-secrets";
 import worker, {
   FAKE_APP_PASSWORD,
@@ -171,10 +172,28 @@ function stubEnv(options: {
   client?: { clientId: string; clientName?: string } | null;
   kv?: unknown;
   calls?: string[];
+  limiterKeys?: string[];
+  floodRefused?: boolean;
 }): Env & LoginGateSecret {
   const calls = options.calls ?? [];
   return {
     OAUTH_KV: options.kv ?? recordingKv().kv,
+    // The source-connection limiter, stubbed. `limiterKeys` records what it was
+    // asked about, which is where the per-source keying this file has always
+    // asserted now lives: the key used to be built into a store key and is now
+    // built into this call.
+    LOGIN_IP_LIMITER: {
+      async limit({ key }: { key: string }) {
+        options.limiterKeys?.push(key);
+        return { success: options.floodRefused !== true };
+      },
+    },
+    // The per-target limiter, stubbed open. No case in this file is about it.
+    LOGIN_ID_LIMITER: {
+      async limit() {
+        return { success: true };
+      },
+    },
     // Without this the allow-list gate answers 503 above the method dispatch
     // and not one case in this file reaches the behaviour it was written for.
     ALLOWED_APPLE_IDS: JSON.stringify([LISTED_APPLE_ID]),
@@ -375,14 +394,14 @@ describe("resolution sits below the cap check and above the comparison", () => {
     expect(await response.text()).not.toContain(SECRET_FIELD);
   });
 
-  it("refuses an over-cap source without consulting the provider at all", async () => {
-    // The cap check must stay above the lookup: otherwise an unauthenticated
+  it("refuses a flooding source without consulting the provider at all", async () => {
+    // The flood brake must stay above the lookup: otherwise an unauthenticated
     // flood buys a provider round trip per request, precisely when the limiter
     // is trying to make requests cheap.
     const calls: string[] = [];
     const response = await loginHandler.fetch(
       post(UNLISTED_APPLE_ID, "response_type=code&client_id=stub-client"),
-      stubEnv({ calls, kv: recordingKv({ value: () => "10" }).kv }),
+      stubEnv({ calls, floodRefused: true }),
     );
 
     expect(response.status).toBe(429);
@@ -414,58 +433,81 @@ const fastLogin = createLoginHandler(async () => {
 describe("one party's failures are not everyone's", () => {
   const QUERY = "response_type=code&client_id=stub-client";
 
+  // WHAT MOVED HERE IN PLAN 11-05, because these three cases read as if they
+  // had been rewritten for no reason otherwise.
+  //
+  // The per-source count used to be a store key carrying a time bucket and the
+  // connecting address, and these cases asserted on the KEYS that store was
+  // asked about. The count is now a platform rate-limit binding, so the same
+  // property — one party's failures are their own — lives in the KEY THAT
+  // BINDING IS ASKED ABOUT. The assertion moved from one recorder to another;
+  // the claim did not change.
+  //
+  // What DID change is that a refusal no longer writes to the store at all. The
+  // store counter is now keyed by the address being tried rather than by who is
+  // trying, and it is bumped only when Apple has actually turned a password
+  // down. Every case here posts an address that is not on the list, so none of
+  // them should reach it — which is why two of them assert the store was never
+  // touched, a claim these cases could not have made before.
+
   it("counts two different sources against two different keys", async () => {
     // WR-02. Pre-fix the key was the time bucket and nothing else, so ten
     // failed POSTs from anyone who knew the hostname put the owner's own
     // /authorize POST behind a 429 with a five-minute retry-after — for the
     // price of ten HTTP requests, sustainable indefinitely.
+    const limiterKeys: string[] = [];
     const kv = recordingKv();
 
     await fastLogin.fetch(
       post(UNLISTED_APPLE_ID, QUERY, { "cf-connecting-ip": "203.0.113.1" }),
-      stubEnv({ kv: kv.kv }),
+      stubEnv({ kv: kv.kv, limiterKeys }),
     );
     await fastLogin.fetch(
       post(UNLISTED_APPLE_ID, QUERY, { "cf-connecting-ip": "198.51.100.2" }),
-      stubEnv({ kv: kv.kv }),
+      stubEnv({ kv: kv.kv, limiterKeys }),
     );
 
-    expect(new Set(kv.gets).size).toBe(2);
-    expect(new Set(kv.puts).size).toBe(2);
+    expect(limiterKeys).toHaveLength(2);
+    expect(new Set(limiterKeys).size).toBe(2);
+    // An unlisted address is refused before either per-target layer, so the
+    // store is never consulted and never written.
+    expect(kv.gets).toHaveLength(0);
+    expect(kv.puts).toHaveLength(0);
   });
 
   it("still counts a request that arrives with no address header", async () => {
     // An absent header must not disable the limiter — otherwise the cheapest
     // way past the counter is to send one fewer header.
-    const kv = recordingKv();
+    const limiterKeys: string[] = [];
 
     const response = await fastLogin.fetch(
       post(UNLISTED_APPLE_ID, QUERY),
-      stubEnv({ kv: kv.kv }),
+      stubEnv({ limiterKeys }),
     );
 
     expect(response.status).toBe(401);
-    expect(kv.gets).toHaveLength(1);
-    expect(kv.puts).toHaveLength(1);
-    expect(kv.gets[0]).toBe(kv.puts[0]);
+    expect(limiterKeys).toHaveLength(1);
+    expect(limiterKeys[0]!.length).toBeGreaterThan(0);
   });
 
   it("caps one source without capping another", async () => {
-    const overCap = recordingKv({
-      value: (key) => (key.includes("203.0.113.9") ? "10" : null),
-    });
-
+    // Two envs rather than one, because the binding's verdict is now a property
+    // of the binding and not of a value read back out of a store. The pair is
+    // still what makes the case mean something: a refusal with no second
+    // request beside it would be satisfied by a limiter that refused everybody.
     const capped = await fastLogin.fetch(
       post(UNLISTED_APPLE_ID, QUERY, { "cf-connecting-ip": "203.0.113.9" }),
-      stubEnv({ kv: overCap.kv }),
+      stubEnv({ floodRefused: true }),
     );
     const other = await fastLogin.fetch(
       post(UNLISTED_APPLE_ID, QUERY, { "cf-connecting-ip": "198.51.100.9" }),
-      stubEnv({ kv: overCap.kv }),
+      stubEnv({}),
     );
 
     expect(capped.status).toBe(429);
-    expect(capped.headers.get("retry-after")).toBe("300");
+    // Sixty, not the three hundred the store bucket used to advertise: the
+    // binding's window is sixty seconds and this header carries the real one.
+    expect(capped.headers.get("retry-after")).toBe("60");
     expect(other.status).toBe(401);
   });
 });
@@ -476,10 +518,20 @@ describe("the counter's write cannot change the response", () => {
     // write reject; pre-fix that rejection was unhandled and turned a 401 into
     // a 500 for identical input — an observable oracle distinguishing a burst
     // from a quiet request.
+    //
+    // This case now has to reach the write, and the write moved: it happens
+    // only after Apple has turned a password down. So the address is a LISTED
+    // one and the proof rejects with the type the handler reads as a credential
+    // refusal — which is what a real wrong password looks like from here. That
+    // is also why this case builds its own handler instead of taking the shared
+    // one above, whose proof throws to prove it was never reached.
     const kv = recordingKv({ putRejects: true });
+    const reachesApple = createLoginHandler(async () => {
+      throw new ImapAuthError();
+    }, 120);
 
-    const response = await fastLogin.fetch(
-      post(UNLISTED_APPLE_ID, "response_type=code&client_id=stub-client", {
+    const response = await reachesApple.fetch(
+      post(LISTED_APPLE_ID, "response_type=code&client_id=stub-client", {
         "cf-connecting-ip": "203.0.113.55",
       }),
       stubEnv({ kv: kv.kv }),

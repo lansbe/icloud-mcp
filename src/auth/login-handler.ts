@@ -46,36 +46,34 @@
 // on the page when they expected the remote origin.
 //
 // ---------------------------------------------------------------------------
-// One thing this file deliberately does NOT do. It is tracked, it was neither
-// dropped nor half-implemented, and anyone tempted to add it should read the
-// reason first — the omission is the decision.
+// An omission stood here until plan 11-05, and it was CLOSED rather than
+// quietly erased — the same treatment the redirect-origin paragraph below
+// records, and for the same reason: a reader who finds the fix has to be able
+// to find what it replaced.
 //
-// The failure counter is not atomic, and is not made atomic here.
-// `get` -> compare -> `put` is a read-modify-write over an
-// eventually-consistent store, so concurrent attempts all read the same
-// value and the cap does not engage under parallel load. That is real and
-// it remains for now.
+// This file used to record that its failure counter was not atomic and was not
+// being made atomic. `get` -> compare -> `put` is a read-modify-write over an
+// eventually-consistent store, so concurrent attempts all read the same value
+// and the cap does not engage under parallel load. The omission was accepted
+// while the thing behind the form was a high-entropy shared secret compared in
+// constant time, against which two hundred parallel guesses a round is nothing.
+// That argument left with the secret. What sits behind the form now is a real
+// Apple app-specific password, and the cost of a guess is no longer this
+// server's alone: every attempt lands at Apple, whose own lockout threshold is
+// unpublished and must be assumed small.
 //
-// **This omission is being RETIRED rather than defended, and it is worth
-// knowing which.** It was accepted while the thing behind the form was a
-// high-entropy shared secret compared in constant time, against which two
-// hundred parallel guesses a round is nothing. That argument left with the
-// secret. What sits behind the form now is a person's real Apple app-
-// specific password, and the cost of a guess is no longer this server's
-// alone: attempts land at Apple, whose own lockout threshold is unpublished
-// and must be assumed small.
+// **What closed it is not an atomic counter.** The burst is now caught by a
+// platform rate-limit binding, which is atomic and needs no read-modify-write
+// at all, and the store counter was kept only for the hour that binding's
+// window cannot reach. So the read-modify-write is still here, still
+// non-atomic, and no longer load-bearing for the case it was weak at: a
+// parallel burst is refused one layer above it. Three layers now stand in front
+// of Apple — the connecting source, the target address in a minute, the target
+// address across an hour — and each of them is argued where it is wired below.
 //
-// So the counter is being REPLACED, not made atomic. Plan 11-05 is where,
-// and it takes one of the two fixes this paragraph used to say the phase
-// had declined: a platform rate-limit binding, alongside a per-Apple-ID
-// counter keyed by the hashed address rather than by the connecting
-// source. A Durable Object was compared and declined for v2.0 on deploy
-// risk; 11-CONTEXT.md records that comparison in full so a later phase
-// does not have to re-derive it.
-//
-// Until that lands, what remains is unchanged: per-source keying (WR-02,
-// above) means a stranger's failures do not lock the owner out, and the cap
-// UNDER-COUNTS a parallel attacker rather than denying service.
+// A Durable Object was compared against that design and declined for v2.0 on
+// deploy risk. 11-CONTEXT.md records the comparison in full, deliberately, so a
+// later phase that wants one does not have to re-derive it.
 //
 // A second omission stood here until 2026-08-14, and it was closed rather than
 // quietly erased: this file used to record that it carried no allowlist of
@@ -352,11 +350,59 @@ async function holdFloor(started: number, floorMs: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, remaining));
 }
 
-/** Width of the brute-force counter's time bucket. */
-const BUCKET_SECONDS = 300;
+/**
+ * The source-connection limiter's window, in seconds.
+ *
+ * It is NOT the thing that enforces the window — the binding is, and the
+ * binding's own window is declared in `wrangler.jsonc`. This constant exists
+ * only so the refusal can say when to come back, and it is therefore a COPY of
+ * a value that lives somewhere this module cannot read. Nothing makes the two
+ * agree: no test can see the deployed config, and a mismatch is silent in both
+ * directions — too small and the reader comes back early for nothing, too large
+ * and they wait longer than they had to. The config carries the same figure
+ * with a comment pointing back here.
+ *
+ * Sixty because the binding's window accepts only ten or sixty.
+ */
+const SOURCE_WINDOW_SECONDS = 60;
 
-/** Failed attempts tolerated within one bucket before the form stops trying. */
-const MAX_FAILURES_PER_BUCKET = 10;
+/**
+ * Width of the per-target failure counter's window, in seconds.
+ *
+ * An hour, which is where this counter earns its place: the platform limiter
+ * above it tops out at a sixty-second window, so an hour is not something a
+ * binding can express. The two layers are therefore not redundant — one bounds
+ * a burst and this one bounds a day's worth of patient guessing.
+ *
+ * Sized as if Apple's own lockout threshold is small, because Apple publishes
+ * none. The thing that breaks if the guess is wrong in the generous direction
+ * is the owner's own Mail app on their own devices.
+ */
+const FAILURE_WINDOW_SECONDS = 3600;
+
+/** Failed guesses tolerated against one address within one window. */
+const MAX_FAILURES_PER_WINDOW = 5;
+
+/**
+ * The per-target failure counter's key prefix.
+ *
+ * **The user id must be interpolated with NOTHING between it and this
+ * constant**, not even a space. The store-key rule in
+ * `scripts/forbidden-tokens.mjs` anchors on a prefix constant spelled like this
+ * one and requires the id on the very next character; its lookahead used to
+ * tolerate whitespace and was tightened deliberately, because a key with a
+ * space in it is not the key the rule claims to require. Until this constant
+ * existed the rule did not see this counter at all — the old key was built from
+ * plain literals — and the rule's own comment names that gap as this phase's to
+ * close.
+ *
+ * The version segment is the same hedge `confirm:v2:` and `dav:v1:` carry: a
+ * later change to the shape becomes detectable rather than silently misread as
+ * the current one. It matters immediately here, because the keys this replaces
+ * are still in the store until their own TTL runs out, and they were keyed by
+ * source rather than by target.
+ */
+const LOGIN_FAILURE_KEY_PREFIX = "authorize-failures:v2:";
 
 /**
  * The exact origins this server will deliver an authorization code to.
@@ -481,24 +527,84 @@ Point your MCP client at that full URL, including the /mcp path. Authorization i
 export { isConfiguredSecret };
 
 /**
- * The counter's key: the time bucket AND the connecting client's address.
+ * The source-connection limiter's key: who is connecting, and nothing else.
  *
- * The bucket alone used to be the whole key, which made every failure
- * everyone's failure. Ten failed POSTs a bucket — from anyone who knew the
- * hostname, at a cost of ten HTTP requests, sustainable indefinitely — put
- * every subsequent /authorize POST behind a 429 with a five-minute
- * retry-after, the owner's own included. The MCP endpoint then stops being
- * usable the moment the current access token expires, and no secret is ever
- * guessed: the denial is the whole attack (WR-02).
+ * No time bucket, because the binding owns the window. This used to build a
+ * store key carrying a bucket as well as the address, and both halves of that
+ * are now somebody else's job.
+ *
+ * Keying on the connecting party is WR-02 and it still matters. The key was
+ * once the time bucket alone, which made every failure everyone's failure: ten
+ * failed POSTs a bucket, from anyone who knew the hostname, at a cost of ten
+ * HTTP requests and sustainable indefinitely, put every later `/authorize` POST
+ * behind a 429 — the owner's own included. No secret was ever guessed; the
+ * denial was the whole attack.
  *
  * The fallback literal is load-bearing. A request arriving without the header
- * must still be counted, or the cheapest way past the counter would be to send
+ * must still be counted, or the cheapest way past the limiter would be to send
  * one fewer header.
  */
-function failureKey(request: Request): string {
-  const bucket = Math.floor(Date.now() / 1000 / BUCKET_SECONDS);
-  const source = request.headers.get("cf-connecting-ip") ?? "unknown-source";
-  return `authorize-failures:${bucket}:${source}`;
+function sourceLimiterKey(request: Request): string {
+  return request.headers.get("cf-connecting-ip") ?? "unknown-source";
+}
+
+/**
+ * The per-target failure counter's key: who is being guessed at, and when.
+ *
+ * The derived user id and never the address. This key name is stored in plain
+ * text — `props` is the only field this server writes that is encrypted — so an
+ * address here would put a real person's Apple ID in a store listing, which is
+ * the same rule audit row S6 holds the OAuth library's own key names to.
+ *
+ * **The id sits immediately after the prefix constant with nothing between
+ * them.** See the constant's own note: the scan rule that enforces that starts
+ * its lookahead on the very next character, and a key that fails it does not
+ * fail one commit, it fails every commit in the repository.
+ *
+ * The bucket follows the id rather than preceding it, so every key belonging to
+ * one person sorts together in a listing — which is what makes the owner's
+ * escape in the phase runbook a prefix match rather than a guess at an hour
+ * number.
+ */
+function failureCounterKey(userId: string): string {
+  const bucket = Math.floor(Date.now() / 1000 / FAILURE_WINDOW_SECONDS);
+  return `${LOGIN_FAILURE_KEY_PREFIX}${userId}:${bucket}`;
+}
+
+/**
+ * Record one failed guess against one address. Never throws.
+ *
+ * **Swallowed deliberately and swallowed silently.** The store throttles writes
+ * to a single key, so a burst makes this write reject. Unhandled, that
+ * rejection turned a 401 into a 500 for identical input — an observable oracle
+ * telling an attacker their burst landed, which is precisely the signal a
+ * brute-force counter must not hand out (WR-01). Convention 4 forbids logging
+ * anywhere under `src/`, and there is nothing here worth a response field
+ * either: the time floor is the limiter that does not depend on this write
+ * succeeding, and it is applied outside this function.
+ *
+ * Non-atomic, and that is now a bounded cost rather than an open one. Read,
+ * compare and write over an eventually-consistent store means concurrent
+ * attempts all read the same value, so this layer UNDER-counts a parallel
+ * burst. The platform limiter one layer up is atomic and is what actually
+ * catches a burst; this layer exists for the hour the platform's window cannot
+ * reach, over which a patient attacker's attempts are not concurrent.
+ *
+ * The record outlives its own window, so a read taken near a boundary still
+ * finds the bucket it is asking about.
+ */
+async function countFailedGuess(
+  store: KVNamespace,
+  key: string,
+  failures: number,
+): Promise<void> {
+  try {
+    await store.put(key, String(failures + 1), {
+      expirationTtl: FAILURE_WINDOW_SECONDS * 2,
+    });
+  } catch {
+    /* See the paragraph above: this rejection must not change the response. */
+  }
 }
 
 /**
@@ -876,17 +982,32 @@ async function handleAuthorize(
       });
     }
 
-    const form = await request.formData();
-    const submittedAppleId = String(form.get(APPLE_ID_FIELD) ?? "");
-    const submittedPassword = String(form.get(APP_PASSWORD_FIELD) ?? "");
-    const query = String(form.get("oauth_request") ?? "");
-
-    // Brute-force mitigation, deliberately kept this small: a coarse
-    // time-bucketed counter in the KV namespace that already exists, and a
-    // fixed delay. Not a rate-limiting subsystem.
-    const key = failureKey(request);
-    const failures = Number((await env.OAUTH_KV.get(key)) ?? "0");
-    if (failures >= MAX_FAILURES_PER_BUCKET) {
+    // LAYER 1, the connecting source. The first of the three, and the only one
+    // that answers with a status of its own.
+    //
+    // It runs here, above the form read and above everything below it, so a
+    // flood buys no round trip: not the provider's parse, not the client
+    // lookup, not a store read. An atomic platform counter, which is what makes
+    // it the right layer for a burst — the store counter further down cannot
+    // be, and no longer has to be.
+    //
+    // The allow-list gate still runs ABOVE this, up at the top of the handler,
+    // and that ordering is deliberate too: a deployment with no configured list
+    // has nothing to protect, and spending a binding call to protect it would
+    // be spending something on a request that can never succeed.
+    //
+    // Keyed by the connecting party and never by the address being tried, which
+    // is the whole reason this refusal is allowed a status of its own. It
+    // carries no information about who is on the list, because it is decided
+    // before any address has been read.
+    //
+    // A key and nothing else. The limit and the window live on the binding, and
+    // the local simulator's per-call overrides would pass every test here and
+    // fail the typecheck.
+    const flood = await env.LOGIN_IP_LIMITER.limit({
+      key: sourceLimiterKey(request),
+    });
+    if (!flood.success) {
       // The floor applies HERE too, and that is decided rather than incidental.
       // A floor applied only after the allow-list check would let a stopwatch
       // sort listed addresses from unlisted ones, which is the exact leak the
@@ -901,28 +1022,32 @@ async function handleAuthorize(
       // already slept before the very same refusal — so it is a change of
       // degree and not of kind.
       await holdFloor(started, floorMs);
-      // The other site that carried no caching header. The body is the same
-      // sentence it has always been, now named where the rest of this surface's
-      // copy lives.
       return new Response(SOURCE_REFUSAL_BODY, {
         status: 429,
         headers: {
           ...RESPONSE_HEADERS,
-          "retry-after": String(BUCKET_SECONDS),
+          // A copy of a figure that really lives in `wrangler.jsonc`. Nothing
+          // makes the two agree; see the constant.
+          "retry-after": String(SOURCE_WINDOW_SECONDS),
         },
       });
     }
 
-    // Resolution sits BELOW the cap check and ABOVE the comparison, and both
-    // edges are deliberate.
+    const form = await request.formData();
+    const submittedAppleId = String(form.get(APPLE_ID_FIELD) ?? "");
+    const submittedPassword = String(form.get(APP_PASSWORD_FIELD) ?? "");
+    const query = String(form.get("oauth_request") ?? "");
+
+    // Resolution sits BELOW the flood brake and ABOVE the credential checks,
+    // and both edges are deliberate.
     //
-    // Below the cap check, because an over-cap source must not buy a provider
+    // Below the flood brake, because a flooding source must not buy a provider
     // round trip per request — that is free amplification precisely when the
     // limiter is trying to make requests cheap.
     //
-    // Above the comparison, because the failure re-render has to carry the
-    // same identity the first render did; a second attempt should be no less
-    // informed than the first.
+    // Above the credential checks, because the failure re-render has to carry
+    // the same identity the first render did; a second attempt should be no
+    // less informed than the first.
     const rebuilt = new Request(`${url.origin}/authorize?${query}`);
     let oauthRequest;
     try {
@@ -954,28 +1079,45 @@ async function handleAuthorize(
     const identity = identityOf(client, oauthRequest.redirectUri);
 
     /**
-     * The ONE place a credential-path response is built. Count it, wait the
-     * floor, re-render.
+     * The ONE place a credential-path response is built. Wait the floor,
+     * re-render.
      *
      * One helper for every refusal on this path, because they are the SAME
      * answer. A stopwatch, a status code and a body must not sort the causes
      * apart, and the cheapest way to hold all three true is for there to be one
      * place the answer is written.
      *
-     * **The mapping, in full.** The last column describes the per-Apple-ID
-     * hourly counter plan 11-05 introduces; the counter this helper bumps today
-     * is the per-SOURCE one above, which every caller bumps alike.
+     * **It no longer counts anything.** The counter it used to bump was keyed
+     * by the connecting source and was bumped by every caller alike — which
+     * meant a shape refusal, which never touches Apple, spent the same budget a
+     * wrong password did. The counter is now keyed by the TARGET and is bumped
+     * at exactly one call site: the one that has just found out Apple turned a
+     * password down. The last column below is the whole of that rule.
      *
-     * | Cause                               | Error class        | Renders     | Status | Bumps the per-Apple-ID hourly counter (11-05) |
-     * |-------------------------------------|--------------------|-------------|--------|-----------------------------------------------|
-     * | Badly-shaped app password           | — (Apple untouched)| the string  | 401    | No                                            |
-     * | Address not on the list             | — (Apple untouched)| the string  | 401    | No                                            |
-     * | Address unparseable or empty        | —                  | the string  | 401    | No                                            |
-     * | Per-Apple-ID burst trip (layer 2)   | —                  | the string  | 401    | No                                            |
-     * | Per-Apple-ID hourly cap (layer 3)   | —                  | the string  | 401    | No                                            |
-     * | Wrong password                      | `ImapAuthError`    | the string  | 401    | Yes                                           |
-     * | Apple refusing on availability      | `ImapThrottleError`| the throttle| 401    | No                                            |
-     * | Connect, TLS or read failure        | `ImapConnectError` | the throttle| 401    | No                                            |
+     * | Cause                               | Error class        | Renders     | Status | Bumps the per-target hourly counter |
+     * |-------------------------------------|--------------------|-------------|--------|-------------------------------------|
+     * | Badly-shaped app password           | — (Apple untouched)| the string  | 401    | No                                  |
+     * | Address not on the list             | — (Apple untouched)| the string  | 401    | No                                  |
+     * | Address unparseable or empty        | —                  | the string  | 401    | No                                  |
+     * | Per-target burst trip (layer 2)     | —                  | the string  | 401    | No                                  |
+     * | Per-target hourly cap (layer 3)     | —                  | the string  | 401    | No                                  |
+     * | Wrong password                      | `ImapAuthError`    | the string  | 401    | Yes                                 |
+     * | Apple refusing on availability      | `ImapThrottleError`| the throttle| 401    | No                                  |
+     * | Connect, TLS or read failure        | `ImapConnectError` | the throttle| 401    | No                                  |
+     *
+     * **Why the four "No" rows above the wrong-password row are not an
+     * oversight.** The counter bounds what APPLE sees. A refusal that happened
+     * before the proof ran cost Apple nothing, so counting it would spend a
+     * real person's budget on something that never reached Apple — and since
+     * layers 2 and 3 are keyed by target, the person whose budget was spent is
+     * not the person who spent it. Counting a limiter trip would be worse
+     * still: the cap would refill itself, and an address that tripped once
+     * could never come back inside the window.
+     *
+     * A throttle and a connect failure are both excluded for the same reason
+     * read the other way: Apple either declined to answer or was never reached,
+     * so neither is a guess. That is the same rule the dead-password marker is
+     * given in the next phase.
      *
      * **The last row is decided here, and research left it open.** The throttle
      * wording — Apple is not answering right now, wait a few minutes — is
@@ -998,20 +1140,6 @@ async function handleAuthorize(
     async function refuseCredential(
       failure: "credentials" | "throttled" = "credentials",
     ): Promise<Response> {
-      try {
-        await env.OAUTH_KV.put(key, String(failures + 1), {
-          expirationTtl: BUCKET_SECONDS * 2,
-        });
-      } catch {
-        // The store throttles writes to the same key, so a burst makes this
-        // write reject. Unhandled, that rejection turned a 401 into a 500 for
-        // identical input — an observable oracle telling an attacker their
-        // burst landed, which is precisely the signal a brute-force counter
-        // should not hand out (WR-01). Swallowed deliberately and swallowed
-        // silently: Convention 4 forbids logging anywhere under src/, and
-        // there is nothing here worth a response field either. The floor
-        // below is the limiter that does not depend on this write succeeding.
-      }
       await holdFloor(started, floorMs);
 
       // Where the single failure string is built: a per-target limiter trip
@@ -1052,6 +1180,87 @@ async function handleAuthorize(
     const appleId = normaliseAppleId(submittedAppleId);
     if (!isAllowed(allowed, appleId)) return refuseCredential();
 
+    // The user id is DERIVED from the address, never invented and never read
+    // back off anything, and it is derived exactly ONCE — here, above the two
+    // per-target layers, and carried all the way down to the grant. It is the
+    // same folded string the allow-list check just accepted, so the id that
+    // keys this person's counter, the id that names their stored objects and
+    // the address in their grant cannot disagree.
+    //
+    // Derived through the shared function rather than hashed here. A second
+    // hashing site under `src/` is exactly what the previous phase closed, and
+    // the scan counts that ownership in both directions.
+    //
+    // It cannot be null at this point: the folding already answered a string,
+    // and this refuses exactly what the folding refuses. The check is kept
+    // rather than asserted away, because a null would otherwise become the
+    // literal string "null" in a key name.
+    const userId = await userIdOf(appleId);
+    if (userId === null) return refuseCredential();
+
+    // LAYER 2, the target address in a minute. Three attempts against one
+    // address, atomic, and answered with the SAME body at the SAME status as
+    // every other credential-path failure — never this surface's 429. A status
+    // that only ever appeared for a listed address would tell a stranger who is
+    // on the list, which is precisely what success criterion 3 forbids.
+    //
+    // It runs below the shape check and the allow-list check so an unlisted
+    // address is never counted against anybody, and above the store counter
+    // because it is the cheaper of the two: a burst should be refused before it
+    // buys a store read.
+    //
+    // ---------------------------------------------------------------------
+    // THE ACCEPTED COST, AND WHOSE IT IS.
+    //
+    // This layer and the one below it count by TARGET rather than by attacker.
+    // So a stranger who knows a listed address can spend that person's login
+    // attempts: enough POSTs carrying somebody else's Apple ID and a wrong
+    // password, and that person cannot sign in until the window rolls.
+    //
+    // That is accepted by the owner, on 2026-09-20, and the bound is what makes
+    // it acceptable. It blocks NEW sign-ins only. An existing grant never
+    // touches this path — it is served by the token endpoint and the API
+    // handler, neither of which consults a limiter — so nobody already signed
+    // in loses anything, and the person locked out is locked out for an hour
+    // rather than indefinitely. The owner's own escape from a counter they
+    // tripped themselves is in the phase runbook.
+    //
+    // Re-keying by attacker instead would not bound Apple attempts at all,
+    // which is the one thing these layers exist to do: a guesser spread thin
+    // across addresses would be counted as a guesser and never as a threat to
+    // any one account, while Apple would see every attempt.
+    //
+    // THE LAYER THAT IS NOT HERE. A fourth layer was considered and declined
+    // for this milestone: a ceiling on total sign-in attempts across every
+    // listed address at once. Recorded as a decision rather than left as an
+    // absence, because an absence reads as an oversight. The allow list holds
+    // exactly one address for the whole of this milestone, so a ceiling across
+    // several has nothing to bind that the per-target layer does not already
+    // bind. Revisit when the list grows past one.
+    // ---------------------------------------------------------------------
+    const burst = await env.LOGIN_ID_LIMITER.limit({ key: userId });
+    if (!burst.success) return refuseCredential();
+
+    // LAYER 3, the target address across an hour. Five failed guesses, and the
+    // sixth is refused.
+    //
+    // This is the layer the platform cannot supply: a rate-limit binding's
+    // window accepts ten seconds or sixty and nothing longer, so an hour has to
+    // be a counter in a store. It is read AFTER the binding above, deliberately
+    // — the binding costs no round trip and this does.
+    //
+    // Non-atomic, and now bounded rather than load-bearing. A parallel burst is
+    // refused one layer up by something that is atomic; what is left for this
+    // counter is a patient attacker's serial attempts, which it counts
+    // correctly.
+    const counterKey = failureCounterKey(userId);
+    const failures = Number((await env.OAUTH_KV.get(counterKey)) ?? "0");
+    if (failures >= MAX_FAILURES_PER_WINDOW) return refuseCredential();
+
+    // Whether a real attempt was spent at Apple. It decides, and is the only
+    // thing that decides, whether the counter above moves.
+    let askedApple = false;
+
     try {
       // `principalFromProps` is the ONE constructor, and it refuses before any
       // socket exists: an unusable password — empty, whitespace-only, or
@@ -1064,6 +1273,12 @@ async function handleAuthorize(
         appleId,
         appPassword,
       });
+
+      // Set BEFORE the call rather than after it, because the moment the call
+      // is made the attempt is in flight and the answer cannot un-spend it.
+      // The constructor above is excluded on purpose: a password it refuses
+      // never reaches Apple, so it is a local refusal wearing a throw.
+      askedApple = true;
 
       // One login, at Apple. This is the only place in the whole flow that
       // talks to Apple, and it is reached only for an address already on the
@@ -1084,6 +1299,25 @@ async function handleAuthorize(
       // specification rather than from evidence.
       const throttled =
         error instanceof ImapThrottleError || error instanceof ImapConnectError;
+
+      // The ONE site that moves the per-target counter, and the two conditions
+      // are different claims. `askedApple` says an attempt was really spent —
+      // a password the constructor refused never left this Worker. `throttled`
+      // says Apple declined to answer or was never reached, which is not a
+      // guess either way.
+      //
+      // An unfamiliar error type DOES count. It falls through to the silent
+      // body above for a disclosure reason, and that reason does not apply
+      // here: the proof ran, so whatever came back, this person's budget at
+      // Apple was spent and the counter should say so.
+      //
+      // Awaited rather than left floating. The write is allowed to fail and
+      // swallows its own rejection; what it must not do is settle after the
+      // response has gone.
+      if (askedApple && !throttled) {
+        await countFailedGuess(env.OAUTH_KV, counterKey, failures);
+      }
+
       return refuseCredential(throttled ? "throttled" : "credentials");
     }
 
@@ -1102,18 +1336,11 @@ async function handleAuthorize(
     );
     const granted = requested.length > 0 ? requested : [...SUPPORTED_SCOPES];
 
-    // The user id is DERIVED from the address, never invented and never read
-    // back off anything. It is the same folded string the allow-list check just
-    // accepted, so the id that names this person's stored objects and the
-    // address in their grant cannot disagree.
-    //
-    // It cannot be null here: the folding already answered a string, and
-    // `userIdOf` refuses exactly what the folding refuses. The check is kept
-    // anyway rather than asserted away, because a null would otherwise become
-    // the literal string "null" in a key name.
-    const userId = await userIdOf(appleId);
-    if (userId === null) return refuseCredential();
-
+    // The user id is the one derived above the limiter layers, not a second
+    // derivation. It used to be computed here, which was harmless while it had
+    // one reader; with three readers a second derivation is how the id that
+    // keys somebody's counter and the id that names their grant come to be
+    // different strings.
     const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
       request: oauthRequest,
       userId,

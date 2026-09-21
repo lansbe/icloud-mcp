@@ -133,7 +133,7 @@ function expectSecurityHeaders(response: Response): void {
   }
 }
 
-/** A KV stub. `value` decides whether this source is over the cap. */
+/** A KV stub. `value` is what the per-target hourly counter reads back. */
 function quietKv(value: string | null = null) {
   return {
     async get() {
@@ -141,6 +141,23 @@ function quietKv(value: string | null = null) {
     },
     async put() {
       // Nothing in this file asserts on the counter.
+    },
+  };
+}
+
+/**
+ * A rate-limit binding stub with a fixed answer. Takes only a key.
+ *
+ * Stubbed rather than real for every case here, including the one that wants a
+ * refusal. The real bindings are counters the pool persists to disk with
+ * wall-clock windows and no reset between tests or between runs, so a case that
+ * spent one would leave the next run of this file to live with it — and these
+ * cases are about the HEADERS on a response, not about counting.
+ */
+function limiter(success: boolean) {
+  return {
+    async limit() {
+      return { success };
     },
   };
 }
@@ -158,10 +175,13 @@ function stubEnv(
     client?: { clientId: string; clientName?: string } | null;
     redirectUri?: string;
     kv?: unknown;
+    floodRefused?: boolean;
   } = {},
 ): Env & LoginGateSecret {
   return {
     OAUTH_KV: options.kv ?? quietKv(),
+    LOGIN_IP_LIMITER: limiter(options.floodRefused !== true),
+    LOGIN_ID_LIMITER: limiter(true),
     // Without this the allow-list gate answers 503 above the method dispatch
     // and no case here reaches the response it was written for.
     ALLOWED_APPLE_IDS: JSON.stringify([LISTED_APPLE_ID]),
@@ -436,9 +456,9 @@ describe("the security headers are on every response", () => {
         ),
     },
     {
-      label: "the over-cap 429",
+      label: "the source-connection 429",
       status: 429,
-      serve: () => postForm({ kv: quietKv("10") }, "203.0.113.201"),
+      serve: () => postForm({ floodRefused: true }, "203.0.113.201"),
     },
     {
       label: "the form at 200",
@@ -548,8 +568,12 @@ describe("the security headers are on every response", () => {
     );
     expect(notAllowed.headers.get("allow")).toBe("GET, POST");
 
-    const overCap = await postForm({ kv: quietKv("10") }, "203.0.113.204");
-    expect(overCap.headers.get("retry-after")).toBe("300");
+    // Sixty rather than the three hundred this asserted before. The source
+    // limiter is now a platform binding whose window is sixty seconds, and the
+    // header carries the real figure even though the body rounds up to "a few
+    // minutes" — see the body constant for why the pair is deliberate.
+    const refused = await postForm({ floodRefused: true }, "203.0.113.204");
+    expect(refused.headers.get("retry-after")).toBe("60");
   });
 });
 

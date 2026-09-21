@@ -154,6 +154,15 @@ function quietKv() {
   };
 }
 
+/** A rate-limit binding that lets everything through. Takes only a key. */
+function openLimiter() {
+  return {
+    async limit() {
+      return { success: true };
+    },
+  };
+}
+
 /**
  * An env whose provider records what the handler reached.
  *
@@ -170,6 +179,12 @@ function stubEnv(options: {
   const calls = options.calls ?? [];
   return {
     OAUTH_KV: quietKv(),
+    // Both sign-in limiters, stubbed open. No case here is about a limiter, and
+    // the real bindings are counters the pool persists to disk with no reset
+    // between tests or between runs — so a case that touched one would spend a
+    // window the next run has to live with.
+    LOGIN_IP_LIMITER: openLimiter(),
+    LOGIN_ID_LIMITER: openLimiter(),
     // Without this the allow-list gate answers 503 above the method dispatch
     // and not one case in this file reaches the refusal it was written for.
     ALLOWED_APPLE_IDS: JSON.stringify([LISTED_APPLE_ID]),

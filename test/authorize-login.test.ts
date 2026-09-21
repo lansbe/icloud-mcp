@@ -200,9 +200,8 @@ function recorder(
 /**
  * A KV stub: no real namespace, and nothing over the cap unless asked.
  *
- * `failures` exists so one case can drive the SOURCE-connection refusal, which
- * is the one refusal on this surface with a status of its own and therefore the
- * one most easily left out of a floor table.
+ * `failures` is what the per-target hourly counter reads back, so one case can
+ * drive the third layer without making five real attempts first.
  */
 function quietKv(failures?: number) {
   return {
@@ -216,18 +215,58 @@ function quietKv(failures?: number) {
 }
 
 /**
+ * A rate-limit binding stub that always answers the same way.
+ *
+ * Every case in this file that is not specifically about a limiter takes one of
+ * these, and that is the point rather than a shortcut. The real bindings are
+ * SQLite-backed counters the pool persists to disk with wall-clock-aligned
+ * windows, and nothing resets them between tests or between runs — so a case
+ * that touched a real one would spend a window that the next case, or the next
+ * run of this suite, then has to live with. A stub touches nothing.
+ *
+ * `keys` records what the binding was asked about, for the cases that care
+ * which key a layer is counting by.
+ *
+ * It takes `{ key }` and ignores nothing else, because `{ key }` is all the
+ * shipped options type accepts.
+ */
+function limiter(success: boolean, keys?: string[]) {
+  return {
+    async limit({ key }: { key: string }) {
+      keys?.push(key);
+      return { success };
+    },
+  };
+}
+
+/**
  * An env whose provider records what the handler reached, and with what.
  *
  * `allowList` is a parameter rather than a constant because the 503 cases need
  * it absent, and because an absent binding is exactly the shape a deployment
  * that forgot to provision the Secret has.
+ *
+ * Both limiters default to letting the request through, so a case that says
+ * nothing about them is a case about something else.
  */
 function stubEnv(
   record: Recorder,
-  options: { allowList?: string | undefined; failures?: number } = {},
+  options: {
+    allowList?: string | undefined;
+    failures?: number;
+    kv?: unknown;
+    floodRefused?: boolean;
+    burstRefused?: boolean;
+    limiterKeys?: string[];
+  } = {},
 ): Env & LoginGateSecret {
   return {
-    OAUTH_KV: quietKv(options.failures),
+    OAUTH_KV: options.kv ?? quietKv(options.failures),
+    LOGIN_IP_LIMITER: limiter(options.floodRefused !== true),
+    LOGIN_ID_LIMITER: limiter(
+      options.burstRefused !== true,
+      options.limiterKeys,
+    ),
     ALLOWED_APPLE_IDS:
       "allowList" in options ? options.allowList : STUB_ALLOW_LIST,
     OAUTH_PROVIDER: {
@@ -963,7 +1002,7 @@ describe("the time floor, on every failing path", () => {
     const { response, elapsed } = await timed(() =>
       handlerOver(record.proof).fetch(
         post(LISTED_APPLE_ID),
-        stubEnv(record, { failures: 10 }),
+        stubEnv(record, { floodRefused: true }),
       ),
     );
 
