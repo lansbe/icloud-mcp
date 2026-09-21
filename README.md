@@ -45,8 +45,9 @@ you supply. See [Deploy](#deploy).
 - **Cache your content.** iCloud is the system of record; only discovery
   metadata (which server holds your account) is cached, for 24 hours.
 - **Let anyone in.** Who may sign in is an allow list you set. Everyone else is
-  refused before Apple is ever contacted, and taking somebody off the list ends
-  their access on their next request. See [Removing someone](#removing-someone).
+  refused before Apple is ever contacted. Taking somebody off the list stops
+  them signing in again; ending a session they already have is a second step.
+  See [Removing someone](#removing-someone).
 - **Support other iCloud services** (Reminders, Notes, Photos).
 
 ---
@@ -74,8 +75,10 @@ MCP handler (/mcp)  ──  builds a fresh server per request
   single request.
 - CalDAV/CardDAV use [`tsdav`](https://github.com/natelindev/tsdav); resolved
   server locations are cached in KV.
-- Your Apple credentials live only in Cloudflare Secrets. They are never
-  logged, never returned in a response, and never placed in an error message.
+- Each person's Apple credentials live only in their own OAuth grant, encrypted
+  by the provider, written there when they sign in. The server holds no Apple
+  credential of its own. They are never logged, never returned in a response,
+  and never placed in an error message.
 
 For the full design — request flow, transport internals, the safety
 enforcement, and the module map — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
@@ -169,6 +172,7 @@ Each command prints an id. Paste it into the matching entry in `wrangler.jsonc`.
 npx wrangler kv namespace create OAUTH_KV
 npx wrangler kv namespace create DAV_CACHE
 npx wrangler kv namespace create CONFIRM_KV
+npx wrangler kv namespace create ALLOW_LIST
 
 npx wrangler r2 bucket create icloud-mcp-attachments
 ```
@@ -184,17 +188,42 @@ Edit these values in your git-ignored `wrangler.jsonc`:
 
 - `routes[0].pattern` → your custom domain (e.g. `icloud-mcp.your-domain.example`)
 - `vars.R2_ACCOUNT_ID` → your Cloudflare account id
-- `kv_namespaces[].id` → the three ids from step 2
+- `vars.ALLOWED_APPLE_IDS_SEED` → your own Apple ID, as a one-element JSON array
+  string: `"[\"you@example.com\"]"`
+- `kv_namespaces[].id` → the four ids from step 2
 
 The hostname is baked into the build automatically from `routes[0].pattern`;
 you never edit it in code.
 
-### 4. Set the secrets
+**Why your own address is in the config rather than in a secret.** The allow
+list has two halves, and they are split because the two readers ask different
+questions. `ALLOWED_APPLE_IDS_SEED` holds you, and it is read on **every API
+request** — which has to be synchronous, and a config value is. The KV list in
+step 4 holds everyone else and is read **only at sign-in**, which is already
+slow enough to afford a lookup. Keeping your own address in the config means a
+bad KV write can never lock you out of your own server.
+
+### 4. Write the allow list
+
+Everyone who may sign in, apart from you, goes in one KV document.
 
 ```bash
-npx wrangler secret put AUTH_SECRET            # your login password for /authorize
-npx wrangler secret put APPLE_ID               # the account's Apple ID (email)
-npx wrangler secret put APPLE_APP_PASSWORD     # app-specific password, not the real one
+npx wrangler kv key put --namespace-id=YOUR_ALLOW_LIST_ID --remote \
+  "allow-list:v1" '["someone@example.com"]'
+```
+
+An **empty list is valid** and is the right starting point — write `'[]'`, or
+skip this step entirely, and only you can sign in. A missing, empty or malformed
+document means nobody beyond the seed, never everybody. Only the exact value
+`["*"]` opens it to anyone.
+
+Read it back at any time with `wrangler kv key get`. That is the whole reason it
+is a KV document and not a Workers Secret: a secret cannot be read back, so
+"who is on the list?" would be a question you could not answer.
+
+### 5. Set the secrets
+
+```bash
 npx wrangler secret put CONFIRM_SECRET         # e.g. `openssl rand -base64 32`
 npx wrangler secret put R2_ACCESS_KEY_ID       # from an R2 S3 API token,
 npx wrangler secret put R2_SECRET_ACCESS_KEY   #   Object Read & Write, scoped to the bucket
@@ -202,7 +231,13 @@ npx wrangler secret put R2_SECRET_ACCESS_KEY   #   Object Read & Write, scoped t
 
 See [`.dev.vars.example`](.dev.vars.example) for what each secret is.
 
-### 5. Deploy and verify
+**There is no `AUTH_SECRET`, `APPLE_ID` or `APPLE_APP_PASSWORD` any more.** Each
+person now signs in with their own Apple ID and their own app-specific password,
+and those live in their own grant rather than in the server's environment. If
+you are upgrading an older deployment, those three secrets are inert after the
+switch and can be deleted.
+
+### 6. Deploy and verify
 
 ```bash
 npm test          # optional: full suite against a local workerd (no live account needed)
@@ -219,7 +254,17 @@ Dynamic Client Registration.
 
 1. Add the connector URL (`https://your-domain.example/mcp`) in your MCP client.
 2. The client sends you to the `/authorize` page.
-3. Enter your `AUTH_SECRET` and approve.
+3. Check that the page names your client and the address it will send you back
+   to, and that it says it is not an Apple page.
+4. Enter your Apple ID and your app-specific password, and approve.
+
+Paste the app-specific password exactly as Apple showed it to you. The server
+passes it to Apple unchanged, so whatever Apple gave you is what works.
+
+Every sign-in failure looks the same on purpose — a wrong password, an address
+that is not on the list and a badly-shaped value all give the same message.
+That is deliberate: a message that varied would tell a stranger who is on the
+list. If you are stuck, check the address and re-copy the password.
 
 The redirect-origin allowlist is `https://claude.ai` plus loopback. To authorize
 a client on a different origin, add it in `src/auth/login-handler.ts`.
@@ -228,29 +273,61 @@ a client on a different origin, add it in `src/auth/login-handler.ts`.
 
 ## Removing someone
 
-Take their address out of the `ALLOWED_APPLE_IDS` secret and deploy. Their
-access ends on their next request.
+**It is two steps, and doing only the first leaves them signed in.**
+
+### Step 1 — take them off the list, so they cannot sign in again
 
 ```bash
-npx wrangler secret put ALLOWED_APPLE_IDS   # the remaining addresses, as a JSON array
-npm run deploy
+npx wrangler kv key put --namespace-id=YOUR_ALLOW_LIST_ID --remote \
+  "allow-list:v1" '["the-remaining-addresses@example.com"]'
 ```
 
-Three things worth knowing.
+No deploy needed. The list is read fresh at every sign-in, so the next one they
+attempt is refused.
 
-**It takes effect on the next request, not at the end of the hour.** The list is
-read on every single request. There is no cache to wait out.
+### Step 2 — end the session they already have
 
-**Their existing token stops working. It does not expire.** They hold a token
-that was valid a moment ago and is now refused. Nothing needs to be revoked by
-hand, and nothing needs to time out first.
+Step 1 stops new sign-ins. It does **not** end a session already running: their
+existing token keeps working, because the token itself is the evidence that they
+passed the list check when they signed in.
+
+To end it, delete their grant:
+
+```bash
+npx wrangler kv key list --namespace-id=YOUR_OAUTH_KV_ID --remote --prefix "grant:"
+npx wrangler kv key delete --namespace-id=YOUR_OAUTH_KV_ID --remote "<their grant key>"
+```
+
+Their next request is then refused and their client shows a sign-in page.
+
+A script that does this by address is planned and does not exist yet. Until it
+does, this is the way.
+
+### Why it works like this
+
+The per-request check has to be synchronous, and a KV read is not. So the check
+on every request asks whether the **seed** — your own address, from the config —
+is usable, and serves any well-shaped grant. The full list is consulted at
+sign-in, which is already an async path.
+
+The alternative was checking every request against the seed alone, which sounds
+stricter and is actually broken: the seed holds only you, so somebody you had
+just added to the list would sign in successfully and be refused on their very
+next request. They would never get a working session at all.
+
+### Three more things worth knowing
 
 **They are not told they were removed.** Their client sees a sign-in page again,
 the same one anybody who was never on the list sees. If you want them to know,
 tell them yourself.
 
-An empty or unreadable list means nobody, including you. The server refuses
-every sign-in rather than guessing.
+**Removing yourself is different.** Your address is the seed in `wrangler.jsonc`,
+so taking it out means editing the config and deploying. An unusable seed
+refuses every request from everybody, immediately — that is the fail-closed
+edge, and it is why your own address does not live in KV.
+
+**An empty or unreadable list means nobody beyond the seed.** The server refuses
+rather than guessing. Only the exact value `["*"]` opens it to anyone.
 
 ---
 
