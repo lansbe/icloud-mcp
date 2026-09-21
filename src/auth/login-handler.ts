@@ -1,15 +1,29 @@
-// The /authorize surface: one password field checked against a Workers
-// Secret (D-01).
+// The /authorize surface: a person signs in with their OWN Apple ID and app-
+// specific password, and the credentials go into the grant's encrypted props.
+//
+// **Phase 11 replaced what this file asks for.** It used to ask for one shared
+// secret and compare it against a Workers Secret (D-01), which is how a
+// single-user server against one Apple ID identified its one user. The server
+// now has N users, and identity moved out of the environment and into the
+// grant. So the form asks for an Apple ID and an app-specific password, the
+// address is checked against an allow list before anything else is spent on it,
+// one IMAP login proves the pair, and `completeAuthorization` stores both in
+// props that only this server can decrypt. `src/principal.ts` is where they
+// come back out.
 //
 // The full OAuth 2.1 ceremony still happens around this — dynamic client
 // registration, PKCE-protected code exchange, refresh rotation, revocation —
-// all owned by the provider. Only the identity step is minimal, because this
-// is a single-user server against one Apple ID and the goal is gating the
-// endpoint, not building an identity system.
+// all owned by the provider. Only the identity step is ours.
 //
-// The submitted secret is compared and nothing else: never echoed, never
-// reflected into the rendered page, never logged, never included in an error.
-// It is NOT, however, the only untrusted input in the flow. The redirect URI
+// **The submitted credentials are spent and nothing else**: never echoed, never
+// reflected into the rendered page, never logged, never included in an error,
+// and never put in any store but the grant's own props. No object holding the
+// password is constructed here — `principalFromProps` builds the one principal
+// and keeps the password in its own holder, and this file never asks for it
+// back. The password reader is not imported here and must never be.
+//
+// The credentials are NOT, however, the only untrusted input in the flow. The
+// redirect URI
 // is attacker-chosen too — client registration is unauthenticated by spec —
 // and it decides where the authorization code is delivered. That is why the
 // page names the client and the destination before it asks for anything
@@ -32,15 +46,28 @@
 // `get` -> compare -> `put` is a read-modify-write over an
 // eventually-consistent store, so concurrent attempts all read the same
 // value and the cap does not engage under parallel load. That is real and
-// it remains. It is accepted because the counter is a tripwire, not the
-// defence: the defence is a high-entropy secret compared in constant time,
-// against which two hundred parallel guesses a round is nothing. Both fixes
-// that would close it properly — a Durable Object, or a platform
-// rate-limit binding — are new platform surface in a phase that
-// deliberately took neither. Per-source keying (WR-02, above) already
-// removed the harm that made this urgent: a stranger's failures no longer
-// lock the owner out. What remains is that the cap UNDER-COUNTS a parallel
-// attacker, not that the owner is denied service.
+// it remains for now.
+//
+// **This omission is being RETIRED rather than defended, and it is worth
+// knowing which.** It was accepted while the thing behind the form was a
+// high-entropy shared secret compared in constant time, against which two
+// hundred parallel guesses a round is nothing. That argument left with the
+// secret. What sits behind the form now is a person's real Apple app-
+// specific password, and the cost of a guess is no longer this server's
+// alone: attempts land at Apple, whose own lockout threshold is unpublished
+// and must be assumed small.
+//
+// So the counter is being REPLACED, not made atomic. Plan 11-05 is where,
+// and it takes one of the two fixes this paragraph used to say the phase
+// had declined: a platform rate-limit binding, alongside a per-Apple-ID
+// counter keyed by the hashed address rather than by the connecting
+// source. A Durable Object was compared and declined for v2.0 on deploy
+// risk; 11-CONTEXT.md records that comparison in full so a later phase
+// does not have to re-derive it.
+//
+// Until that lands, what remains is unchanged: per-source keying (WR-02,
+// above) means a stranger's failures do not lock the owner out, and the cap
+// UNDER-COUNTS a parallel attacker rather than denying service.
 //
 // A second omission stood here until 2026-08-14, and it was closed rather than
 // quietly erased: this file used to record that it carried no allowlist of
@@ -58,9 +85,76 @@ import { AuthorizationError } from "@cloudflare/workers-oauth-provider";
 import type { ClientInfo } from "@cloudflare/workers-oauth-provider";
 import { isConfiguredSecret } from "../configured-secret";
 import type { Env, LoginGateSecret } from "../env";
+import type { SessionGate } from "../mail/service";
+import { createSessionGate, withMailSession } from "../mail/service";
+import type { Principal } from "../principal";
+import { normaliseAppleId, principalFromProps, userIdOf } from "../principal";
+import type { AllowList } from "./allow-list";
+import { isAllowed, parseAllowList } from "./allow-list";
 
 /** The only scope this server issues. */
 const SUPPORTED_SCOPES = ["mcp"];
+
+/** The version every props object this server writes carries. */
+const PROPS_VERSION = 1;
+
+/** The form field carrying the Apple ID. */
+const APPLE_ID_FIELD = "apple_id";
+
+/** The form field carrying the app-specific password. */
+const APP_PASSWORD_FIELD = "app_password";
+
+/**
+ * What it takes to prove a credential pair is real: one login, at Apple.
+ *
+ * Resolves to nothing on success and REJECTS on failure, so the caller branches
+ * on the error's type and never on a returned flag. There is no value here to
+ * carry a credential out on: the principal goes in, the session spends it, and
+ * what comes back is either nothing or a throw built with no argument.
+ *
+ * It exists as a type so the one call can be INJECTED. D-09 forbids any
+ * automated login to a real Apple ID — no test, CI job, pre-commit hook or
+ * post-deploy check ever authenticates against one — so the tests that drive
+ * this whole path substitute a counting stub here. That substitution is also
+ * what makes "an unlisted address opened zero sockets" an assertion a test can
+ * actually make, rather than an inference from a status code.
+ */
+export type LoginProof = (
+  principal: Principal,
+  gate: SessionGate,
+) => Promise<void>;
+
+/**
+ * The production proof: open one session, authenticate, close it.
+ *
+ * `withMailSession` is named literally at this one call site, and that is
+ * deliberate rather than incidental. The `concurrent-session` scan rule matches
+ * a concurrency combinator within a bounded distance of that exact name, so
+ * naming it here puts this call under the existing rule with no alternation to
+ * extend — and a rule whose entry points are enumerated by name is invisible to
+ * every other assertion in the suite for a name it does not list.
+ *
+ * A fresh gate per call, from `createSessionGate()`. The gate is a closure over
+ * one local boolean, so two sign-ins get two gates because they get two
+ * construction sites, with no bookkeeping to reason about.
+ *
+ * `null` for the mailbox and `null` for the expected validity, together. That
+ * skips the mailbox open and its validity gate entirely: this is
+ * authenticated-state-only work, and opening a mailbox would be a second round
+ * trip that proves nothing the login did not already prove.
+ *
+ * The callback does nothing and returns nothing. Reaching it at all IS the
+ * proof — the session only exists once the server answered the login with OK.
+ *
+ * **No second session helper.** Convention 3 permits exactly one orchestrator
+ * and this calls it. Nothing here opens a socket, holds one, or fans out.
+ */
+async function proveWithApple(
+  principal: Principal,
+  gate: SessionGate,
+): Promise<void> {
+  await withMailSession(principal, gate, null, null, async () => {});
+}
 
 /**
  * Fixed penalty on a failed attempt, before any response is written.
@@ -398,42 +492,21 @@ function escapeHtml(value: string): string {
 }
 
 /**
- * Compare a submitted value against the configured secret in constant time.
+ * The form.
  *
- * Both sides are SHA-256 digested first and the two 32-byte digests compared.
- * Digesting first is not decoration: the runtime's comparison throws on
- * inputs of unequal length, and a throw that only happens for the wrong
- * length is itself an oracle for the secret's length. Digests are always 32
- * bytes, so the comparison is reached unconditionally.
+ * **This is a minimal field swap and nothing more.** The one secret field
+ * became two credential fields, and every other property of the page is
+ * untouched: the hidden `oauth_request` field still round-trips the raw query,
+ * the `.client` and `.dest` marked elements still carry the consent screen's
+ * two values, `escapeHtml` still wraps every interpolation, and neither
+ * credential field carries a `value` attribute on any path, so nothing the
+ * reader typed comes back to them.
  *
- * A plain `===` here would be a timing oracle, and no comparison loop is
- * hand-rolled anywhere in this repository — all cryptography is the
- * runtime's or the OAuth library's.
- *
- * A missing or empty configured value is refused rather than compared: it is
- * not a secret, and digesting it would make the empty submission match (CR-01).
- * That short-circuit reads only a server-side configuration fact, never a
- * property of the submitted value, so it adds no timing signal an attacker can
- * influence.
+ * Plan 11-02 moves the rendering out to `src/auth/login-page.ts` and rewrites
+ * it against the UI design contract — the explainer copy, the security headers
+ * on every response, and the single failure string all land there. Doing any of
+ * that here would be work thrown away one plan later.
  */
-async function secretMatches(
-  submitted: string,
-  expected: string | undefined,
-): Promise<boolean> {
-  if (!isConfiguredSecret(expected)) return false;
-
-  const encoder = new TextEncoder();
-  const submittedDigest = await crypto.subtle.digest(
-    "SHA-256",
-    encoder.encode(submitted),
-  );
-  const expectedDigest = await crypto.subtle.digest(
-    "SHA-256",
-    encoder.encode(expected),
-  );
-  return crypto.subtle.timingSafeEqual(submittedDigest, expectedDigest);
-}
-
 function renderForm(
   query: string,
   failed: boolean,
@@ -462,6 +535,7 @@ function renderForm(
   .client { overflow-wrap: anywhere; }
   .dest { overflow-wrap: anywhere; }
   label { display: block; font-size: .8125rem; margin-bottom: .375rem; }
+  input + label { margin-top: .75rem; }
   input { width: 100%; box-sizing: border-box; padding: .625rem .75rem;
           font: inherit; border: 1px solid currentColor; border-radius: .5rem;
           background: transparent; color: inherit; }
@@ -480,9 +554,13 @@ function renderForm(
   ${notice}
   <form method="post" action="/authorize">
     <input type="hidden" name="oauth_request" value="${escapeHtml(query)}">
-    <label for="secret">Access secret</label>
-    <input id="secret" name="secret" type="password" autocomplete="off"
+    <label for="apple-id">Apple ID</label>
+    <input id="apple-id" name="${APPLE_ID_FIELD}" type="email"
+           autocomplete="off" autocapitalize="off" spellcheck="false"
            autofocus required>
+    <label for="app-password">App-specific password</label>
+    <input id="app-password" name="${APP_PASSWORD_FIELD}" type="password"
+           autocomplete="off" required>
     <button type="submit">Authorize</button>
   </form>
 </main>
@@ -515,16 +593,56 @@ function authorizationErrorResponse(error: AuthorizationError): Response {
 }
 
 /**
- * The provider's `defaultHandler`: everything that is not an API request.
+ * Build the provider's `defaultHandler`: everything that is not an API request.
  *
  * Only `/authorize` is ours. The token, registration, and metadata endpoints
  * are implemented by the provider itself and never reach this handler.
+ *
+ * `proof` is the one injection seam, and it defaults to the production one, so
+ * production calls this factory with no argument at all — the same shape
+ * `createMcpApiHandler(extraTools)` already has one tree over. A test hands in
+ * a counting stub instead, which is how D-09 is kept (no automated login to a
+ * real Apple ID, ever) and how "zero sockets were opened for that request"
+ * becomes something a test can assert rather than infer.
  */
-export const loginHandler = {
-  async fetch(
-    request: Request,
-    env: Env & LoginGateSecret,
-  ): Promise<Response> {
+export function createLoginHandler(proof: LoginProof = proveWithApple): {
+  fetch(request: Request, env: Env & LoginGateSecret): Promise<Response>;
+} {
+  return {
+    async fetch(
+      request: Request,
+      env: Env & LoginGateSecret,
+    ): Promise<Response> {
+      return handleAuthorize(request, env, proof);
+    },
+  };
+}
+
+/**
+ * The production handler, built from the factory above with no argument.
+ *
+ * Kept as a named export because `src/auth/oauth.ts` wires this exact value as
+ * the provider's `defaultHandler`, and several tests drive it directly.
+ */
+export const loginHandler = createLoginHandler();
+
+/**
+ * One `/authorize` request, from the pathname check to the redirect.
+ *
+ * A plain function rather than a method so the factory above is the only thing
+ * that closes over `proof`, and so the whole flow reads top to bottom in one
+ * place. The environment parameter keeps its current type: the login gate's own
+ * secret is no longer read anywhere in this file, but `test/env-narrowing.test.ts`
+ * and `test/authorize-not-found.test.ts` both spell that type, and Phase 13
+ * (CUT-01) removes the binding, the interface and every mention of it together
+ * rather than leaving a half-removed name behind.
+ */
+async function handleAuthorize(
+  request: Request,
+  env: Env & LoginGateSecret,
+  proof: LoginProof,
+): Promise<Response> {
+  {
     const url = new URL(request.url);
 
     // Still a 404 — the path genuinely does not exist — but one that says where
@@ -542,15 +660,28 @@ export const loginHandler = {
       });
     }
 
-    // Fail closed before method dispatch, so neither verb can reach the form
-    // or the comparison while this deployment has nothing to compare against
-    // (CR-01). 503 rather than 401 is deliberate: 401 would tell the owner
-    // they mistyped a value that is in fact absent, sending them hunting for a
-    // typo instead of a missing binding, and the distinction gives nothing
+    // The allow list is read ONCE, here, and the verdict is carried down. Gate
+    // first: an unconfigured deployment has nothing to protect, so nothing is
+    // spent on the request before this — not a parse, not a store round trip,
+    // and certainly not a socket to Apple.
+    //
+    // Fail closed above method dispatch, so neither verb can reach the form
+    // while this deployment cannot say who may sign in. A list that is missing,
+    // empty, malformed, or holding one unusable entry all mean NOBODY, so all
+    // of them answer here.
+    //
+    // 503 rather than 401 is deliberate, and it matters more now than it did
+    // under the shared secret: 401 would tell the owner they mistyped their own
+    // Apple password, sending them to Apple to make a new one, when what is
+    // actually wrong is a binding on this server. The distinction gives nothing
     // exploitable to a party who cannot authenticate either way. It has to be
     // the status code carrying that signal — Convention 4 forbids logging on
-    // this path, so a self-describing response is the only channel left.
-    if (!isConfiguredSecret(env.AUTH_SECRET)) {
+    // this path, so a self-describing response is the only channel left. The
+    // body is `UNCONFIGURED_BODY` unchanged, byte for byte: it names no binding
+    // and interpolates nothing, so it is as true of an absent allow list as it
+    // was of an absent secret.
+    const allowed = parseAllowList(env.ALLOWED_APPLE_IDS);
+    if (allowed.kind === "nobody") {
       return new Response(UNCONFIGURED_BODY, {
         status: 503,
         headers: {
@@ -603,7 +734,8 @@ export const loginHandler = {
     }
 
     const form = await request.formData();
-    const submitted = String(form.get("secret") ?? "");
+    const submittedAppleId = String(form.get(APPLE_ID_FIELD) ?? "");
+    const submittedPassword = String(form.get(APP_PASSWORD_FIELD) ?? "");
     const query = String(form.get("oauth_request") ?? "");
 
     // Brute-force mitigation, deliberately kept this small: a coarse
@@ -659,7 +791,18 @@ export const loginHandler = {
 
     const identity = identityOf(client, oauthRequest.redirectUri);
 
-    if (!(await secretMatches(submitted, env.AUTH_SECRET))) {
+    /**
+     * Everything a failed credential answers with: count it, wait, re-render.
+     *
+     * One helper for every refusal on the credential path, because in this plan
+     * they are the SAME answer — a badly-shaped password, an address that is
+     * not on the list, and a password Apple turned down all come back as the
+     * 401 form. A stopwatch or a status code must not sort those three apart,
+     * and the cheapest way to hold that true is for there to be one place the
+     * answer is written. The single failure string, the Apple-throttle message
+     * and the ~3s floor land in plans 11-02 and 11-04, all of them here.
+     */
+    async function refuseCredential(): Promise<Response> {
       try {
         await env.OAUTH_KV.put(key, String(failures + 1), {
           expirationTtl: BUCKET_SECONDS * 2,
@@ -679,6 +822,50 @@ export const loginHandler = {
       return renderForm(query, true, identity);
     }
 
+    // The allow-list check sits ABOVE every use of the credentials, and that
+    // placement is the whole of GATE-02: an address that is not on the list
+    // must never reach Apple, so no principal is built and no session is opened
+    // for one. The folded address is what gets compared and what gets stored,
+    // so the comparison and the grant cannot disagree about who this is.
+    const appleId = normaliseAppleId(submittedAppleId);
+    if (!isAllowed(allowed, appleId)) return refuseCredential();
+
+    try {
+      // `principalFromProps` is the ONE constructor, and it refuses before any
+      // socket exists: an unusable password — empty, whitespace-only, or
+      // carrying a control character — throws here (D-19). The password is
+      // passed exactly as typed. Canonicalising it is LOGIN-04, owned by plan
+      // 11-04 and gated on spike S5; until then a person must type it the way
+      // Apple gave it to them. That is a functionality gap, not an
+      // architectural one — the shape of this call does not change when it
+      // lands.
+      const principal = await principalFromProps({
+        v: PROPS_VERSION,
+        appleId,
+        appPassword: submittedPassword,
+      });
+
+      // One login, at Apple. This is the only place in the whole flow that
+      // talks to Apple, and it is reached only for an address already on the
+      // list carrying a password already judged usable.
+      await proof(principal, createSessionGate());
+    } catch {
+      // NEVER read the caught value. The mail tree already dispatches on error
+      // TYPE rather than on any string, and here not even the type is consulted
+      // yet: in this plan a rejected password, a refused shape and an iCloud
+      // throttle are one answer. Plan 11-04 adds the one branch D-07 allows —
+      // a distinct message when Apple is throttling — and it will branch on
+      // `instanceof`, never on a message.
+      return refuseCredential();
+    }
+
+    // The session is already closed. `withMailSession` runs teardown and
+    // releases its gate in its own `finally` BEFORE it returns, so reaching
+    // this line means the socket is gone. The trap this avoids is completing
+    // the ceremony inside the session callback, which would hold a connection
+    // open against iCloud's low, undocumented per-account ceiling while a store
+    // write and a redirect were built.
+
     // Grant what was asked for, narrowed to what this server supports. A
     // client that asks for nothing gets the one scope that exists, because a
     // single-user single-scope server has nothing meaningful to withhold.
@@ -687,14 +874,43 @@ export const loginHandler = {
     );
     const granted = requested.length > 0 ? requested : [...SUPPORTED_SCOPES];
 
+    // The user id is DERIVED from the address, never invented and never read
+    // back off anything. It is the same folded string the allow-list check just
+    // accepted, so the id that names this person's stored objects and the
+    // address in their grant cannot disagree.
+    //
+    // It cannot be null here: the folding already answered a string, and
+    // `userIdOf` refuses exactly what the folding refuses. The check is kept
+    // anyway rather than asserted away, because a null would otherwise become
+    // the literal string "null" in a key name.
+    const userId = await userIdOf(appleId);
+    if (userId === null) return refuseCredential();
+
     const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
       request: oauthRequest,
-      userId: "owner",
+      userId,
+      // Only the client's name, and nothing else. Metadata is not encrypted
+      // the way props are, so nothing about the person goes in it — not the
+      // address, not the id derived from it.
       metadata: { clientName: client.clientName },
       scope: granted,
-      props: { userId: "owner" },
+      // Exactly the three keys `principalFromProps` accepts, and no fourth. It
+      // derives the user id from the address every time, so a props object
+      // carrying one of its own is refused for having an extra key.
+      props: {
+        v: PROPS_VERSION,
+        appleId,
+        appPassword: submittedPassword,
+      },
+      // `revokeExistingGrants` is left at its default, which is TRUE. A second
+      // sign-in from the same client therefore replaces the first rather than
+      // adding to it. That is the dead-password recovery path and not a bug:
+      // when someone revokes their app-specific password at Apple, signing in
+      // again with a fresh one is what fixes it, and the stale grant holding
+      // the dead password goes away in the same step. Phase 12 owns the rest of
+      // the grant lifetime (LIFE-01 through LIFE-06).
     });
 
     return Response.redirect(redirectTo, 302);
-  },
-};
+  }
+}

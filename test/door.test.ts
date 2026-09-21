@@ -3,40 +3,53 @@
 // **What this file proves.** The OAuth provider checks the bearer token, and
 // then hands the API handler whatever props were stored with the grant. It does
 // not check their shape. Spike S1 showed that, with no check of our own, a
-// grant holding ANY props reaches the tool layer with a 200. While credentials
-// still come from the Worker secrets, whoever gets past is served as the owner.
-// So the API handler is a door: only the owner's grant goes through, and every
+// grant holding ANY props reaches the tool layer with a 200. So the API handler
+// is a door: only a grant this server will still serve goes through, and every
 // other grant gets a real HTTP 401 with a challenge header, before any MCP code
 // runs.
 //
+// **Phase 11 inverted what "will still serve" means, and the inversion is the
+// point.** It used to mean the one fixed owner grant, minted by a login gate
+// that compared a shared secret. It now means a grant carrying a person's own
+// Apple ID, checked against the allow list ON EVERY REQUEST. Two consequences,
+// both deliberate:
+//
+//   GATE-05. The OLD owner grant is refused. Everyone holding one must sign in
+//   again, and a real 401 with a challenge is what tells their client to.
+//
+//   GATE-03. Removing an address from the list refuses that person's very next
+//   request. There is no cache and no token expiry to wait out.
+//
 // Three things are shown, each on both serving lanes:
 //
-// 1. The owner's grant reaches a tool. Status 200, and the recording tool ran.
-// 2. Seven other shapes of props are refused. Status 401, a challenge that names
+// 1. A listed grant reaches a tool. Status 200, and the recording tool ran.
+// 2. Every other shape of props is refused. Status 401, a challenge that names
 //    the protected-resource metadata document, a fixed JSON body, and the
 //    recording tool did NOT run. Nothing from the props is echoed back.
-// 3. A missing Worker secret is NOT a 401. The owner's grant still gets a 200,
-//    and the mail diagnostic answers `auth_failed`. Signing in again cannot fix
-//    a missing secret, so the client must not be told to sign in again.
+// 3. An unusable stored credential is NOT a 401. The grant still gets a 200 and
+//    the mail diagnostic answers `auth_failed`. Signing in again is exactly
+//    what fixes that one, but the client is told by the TOOL rather than by a
+//    challenge, because the door cannot see a password Apple has revoked and
+//    must not pretend to.
 //
 // **Why the positive control matters.** A recording tool that can never fire
 // reports "never ran" whatever the door does. Every refusal below sends the
-// SAME well-formed request that the owner cases prove does reach the tool. The
+// SAME well-formed request that the served case proves does reach the tool. The
 // only thing that differs is the props on the context. That is what makes
 // "still false" mean "the door stopped it".
 //
 // **How the props get onto the context.** The OAuth provider sets them at run
 // time. Here the test sets them, on the pool's own execution context, and
 // drives the door's three-argument fetch directly. No OAuth grant is completed,
-// so there are never two live owner grants (the library revokes the earlier
-// one).
+// so nothing here revokes anything.
 //
 // **This file holds no real value.** The Apple ID and the app password in the
-// table are user A's fakes from the two-user fixture. No test here reads,
-// prints or asserts on the pool's ambient identity. The two cases that unset
-// the mail secrets build a fresh copy of the environment and never assign onto
-// the ambient one. With the secrets unset the principal is refused before any
-// socket opens, so nothing here reaches the network.
+// table are user A's fakes from the two-user fixture, and user A's address is
+// on the allow list the pool binds (see vitest.config.ts) for exactly that
+// reason. No test here reads, prints or asserts on the pool's ambient identity,
+// and nothing here reaches the network: a grant that is refused never builds a
+// principal at all, and a grant whose password is unusable is refused by the
+// constructor before any socket opens.
 
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -64,8 +77,21 @@ const door = createMcpApiHandler([registerCanary]);
 /** Props for one case. `absent` means the context carries no props at all. */
 type CaseProps = { absent: true } | { absent: false; props: unknown };
 
-/** The one grant the login gate mints today. */
-const OWNER: CaseProps = { absent: false, props: { userId: "owner" } };
+/**
+ * The grant the login page mints, for a person who is on the allow list.
+ *
+ * User A's address is bound into `ALLOWED_APPLE_IDS` in `vitest.config.ts`
+ * precisely so this positive control can exist. Without a grant the door
+ * actually serves, every refusal below is vacuous.
+ */
+const LISTED: CaseProps = {
+  absent: false,
+  props: {
+    v: 1,
+    appleId: USER_A.appleId,
+    appPassword: USER_A.appPassword,
+  },
+};
 
 /**
  * Drive the door with a context that carries the props under test.
@@ -235,12 +261,16 @@ const REFUSED_PROPS: ReadonlyArray<{
   readonly marks: readonly string[];
 }> = [
   {
-    label: "the new v 1 shape, which Phase 11 owns and this phase does not accept",
-    caseProps: {
-      absent: false,
-      props: { v: 1, appleId: USER_A.appleId, appPassword: USER_A.appPassword },
-    },
-    marks: [USER_A.appleId, USER_A.appPassword],
+    // GATE-05. THE row this phase exists to add. Every grant minted before the
+    // switch has exactly this shape, and each one holds no credential at all —
+    // it named the owner and the credentials came from the Worker secrets. A
+    // server that honoured these would be serving the owner's mail to whoever
+    // still holds one of those tokens, out of secrets Phase 13 is about to
+    // delete. The 401 and its challenge are what send those clients to sign in
+    // again, which is the only thing that can fix it.
+    label: "the OLD single-key owner grant, which this phase stops honouring",
+    caseProps: { absent: false, props: { userId: "owner" } },
+    marks: [],
   },
   {
     label: "a user id that is not the owner's",
@@ -283,16 +313,17 @@ beforeEach(async () => {
   expect(await canaryWasInvoked()).toBe(false);
 });
 
-describe.each(LANES)("the owner's grant goes through the door, %s", (_lane, build) => {
+describe.each(LANES)("a listed grant goes through the door, %s", (_lane, build) => {
   it("reaches the tool layer with a 200", async () => {
     // The positive control. Without this passing, every refusal below is
-    // vacuous: the same request, with the owner's props, must reach the tool.
-    const response = await callDoor(build("/mcp"), OWNER);
+    // vacuous: the same request, with a listed person's props, must reach the
+    // tool.
+    const response = await callDoor(build("/mcp"), LISTED);
 
-    expect(response.status, "the owner's grant was not served").toBe(200);
+    expect(response.status, "a listed grant was not served").toBe(200);
     expect(
       response.headers.get("WWW-Authenticate"),
-      "the owner's grant was sent a challenge",
+      "a listed grant was sent a challenge",
     ).toBeNull();
 
     // The claim-less lane answers over a stream and the tool runs as the
@@ -301,7 +332,7 @@ describe.each(LANES)("the owner's grant goes through the door, %s", (_lane, buil
 
     expect(
       await canaryWasInvoked(),
-      "the owner's grant did not reach the tool layer",
+      "a listed grant did not reach the tool layer",
     ).toBe(true);
   });
 });
@@ -319,7 +350,7 @@ describe.each(LANES)("every other grant is refused at the door, %s", (_lane, bui
   it.each(REFUSED_PROPS)("refuses $label", async ({ caseProps, marks }) => {
     const response = await callDoor(build("/mcp"), caseProps);
 
-    expect(response.status, "props that are not the owner's grant were served").toBe(401);
+    expect(response.status, "props this server must not serve were served").toBe(401);
 
     const challenge = response.headers.get("WWW-Authenticate");
     expect(challenge, "the 401 carries no challenge").not.toBeNull();
@@ -356,7 +387,7 @@ describe.each(LANES)("every other grant is refused at the door, %s", (_lane, bui
     // The assertion this table exists for.
     expect(
       await canaryWasInvoked(),
-      "the tool layer was reached by a grant that is not the owner's",
+      "the tool layer was reached by a grant the door must refuse",
     ).toBe(false);
   });
 });
@@ -364,19 +395,29 @@ describe.each(LANES)("every other grant is refused at the door, %s", (_lane, bui
 describe.each(LANES)(
   "a grant the door cannot inspect is refused, not a 500, %s",
   (_lane, build) => {
-    // Code review WR-01. The guard reads three things off the props, and each
+    // Code review WR-01. The guard reads several things off the props, and each
     // read can run code the props brought with them. A throw out of the guard
     // is a 500 with no challenge, which tells the client nothing about signing
     // in again. So the guard fails closed and these get the ordinary 401.
     //
     // Neither shape is reachable today: props reach the context only through a
-    // parse of the decrypted grant. These are the Phase 11 shapes, pinned now.
+    // parse of the decrypted grant, which builds plain objects with data
+    // properties. They are pinned anyway, because the guarantee is meant to be
+    // a property of the guard rather than of what currently feeds it.
+    //
+    // **Both shapes had to move with the switch, and the accessor one is the
+    // reason why.** The guard now reads `appleId` rather than `userId`, so an
+    // accessor on the OLD key would never be reached — the case would still
+    // answer 401, for the entirely different reason that the key is absent, and
+    // would look green while proving nothing about the catch. The shape below
+    // carries THREE own keys so the count passes, with `appleId` the one that
+    // throws when it is read.
     const UNINSPECTABLE: ReadonlyArray<readonly [string, () => unknown]> = [
       [
-        "props whose user id is an accessor that throws",
+        "props whose Apple ID is an accessor that throws",
         () => {
-          const props = {};
-          Object.defineProperty(props, "userId", {
+          const props = { v: 1, appPassword: "irrelevant-to-this-case" };
+          Object.defineProperty(props, "appleId", {
             enumerable: true,
             get(): string {
               throw new Error("the accessor ran");
@@ -389,7 +430,7 @@ describe.each(LANES)(
         "props that are a proxy whose membership trap throws",
         () =>
           new Proxy(
-            { userId: "owner" },
+            { v: 1, appleId: USER_A.appleId, appPassword: USER_A.appPassword },
             {
               has(): boolean {
                 throw new Error("the trap ran");
@@ -426,32 +467,49 @@ describe.each(LANES)(
   },
 );
 
-describe("a missing Worker secret is not a 401 (D-09)", () => {
-  /** A fresh copy of the environment with both mail secrets unset. */
-  function envWithoutMailSecrets(): EntryEnv {
-    return {
-      ...entryEnv(),
-      APPLE_ID: undefined,
-      APPLE_APP_PASSWORD: undefined,
-    };
-  }
+describe("an unusable stored credential is not a 401 (D-09)", () => {
+  // **The claim is unchanged; what carries it moved with identity itself.**
+  //
+  // This block used to unset the two Worker secrets, because that was where a
+  // credential came from. Since the switch the credential lives in the grant,
+  // so the equivalent shape is a grant whose PASSWORD is unusable. Everything
+  // the block asserts is the same, and so is the reason it matters: the door
+  // must not answer 401 for this. A 401 tells the client to drop its token and
+  // sign in again, and that advice is wrong here — the address is still listed
+  // and the grant is still well-formed. The tool's `auth_failed` is the honest
+  // answer, and it is the one a model can act on.
+  //
+  // The door lets this through ON PURPOSE. It checks the address and never the
+  // password, because it cannot see whether Apple would accept one without
+  // asking Apple, and asking Apple on every request is exactly what this
+  // server must not do.
+
+  /**
+   * A grant on the list whose password can never be used.
+   *
+   * An empty string, which `principalFromProps` refuses (D-19) before any
+   * socket exists — so this case reaches no network either.
+   */
+  const UNUSABLE_PASSWORD: CaseProps = {
+    absent: false,
+    props: { v: 1, appleId: USER_A.appleId, appPassword: "" },
+  };
 
   it.each(LANES)(
     "answers 200 and the mail diagnostic says auth_failed, %s",
     async (_lane, build) => {
       const response = await callDoor(
         build("/mcp", MAIL_DIAGNOSTIC),
-        OWNER,
-        envWithoutMailSecrets(),
+        UNUSABLE_PASSWORD,
       );
 
       expect(
         response.status,
-        "a missing secret was answered with something other than a served request",
+        "an unusable credential was answered with something other than a served request",
       ).toBe(200);
       expect(
         response.headers.get("WWW-Authenticate"),
-        "a missing secret was answered with a sign-in challenge",
+        "an unusable credential was answered with a sign-in challenge",
       ).toBeNull();
 
       const message = rpcMessageIn(await response.text());
@@ -486,10 +544,10 @@ describe("a missing Worker secret is not a 401 (D-09)", () => {
 
   it("answers a tools/list with 200, though no tool ever awaits the principal", async () => {
     // The door makes the promise of the principal for every request. A request
-    // that calls no tool never awaits it. With a missing secret that promise
-    // rejects, and the door's no-op handler is what keeps it from being an
-    // unhandled rejection.
-    const response = await callDoor(toolsList("/mcp"), OWNER, envWithoutMailSecrets());
+    // that calls no tool never awaits it. With an unusable stored credential
+    // that promise rejects, and the door's no-op handler is what keeps it from
+    // being an unhandled rejection.
+    const response = await callDoor(toolsList("/mcp"), UNUSABLE_PASSWORD);
 
     expect(response.status).toBe(200);
     const message = rpcMessageIn(await response.text());

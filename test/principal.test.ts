@@ -422,10 +422,19 @@ describe("the length cap counts UTF-16 code units, not bytes", () => {
 });
 
 describe("module shape", () => {
-  it("exports the one id function, the one password reader and the two constructors, nothing else", () => {
+  it("exports the two halves of the id rule, the one password reader and the two constructors, nothing else", () => {
     // The design made checkable. There is no export that hands out the holder
-    // itself, and no form constructor yet: that one waits for the login page.
+    // itself.
+    //
+    // `normaliseAppleId` joined this list in Phase 11, and it is an ADDITION to
+    // the id rule rather than a second copy of it: `userIdOf` calls it and
+    // repeats not one of its steps, so there is still exactly one place the
+    // folding is written down. It is exported because the door needs the
+    // comparison synchronously and Web Crypto has no synchronous digest. A
+    // list that quietly grew a second FOLDING function would be the drift this
+    // assertion is here to catch.
     expect(Object.keys(principalModule).sort()).toEqual([
+      "normaliseAppleId",
       "passwordOf",
       "principalFromEnv",
       "principalFromProps",

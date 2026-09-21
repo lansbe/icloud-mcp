@@ -59,6 +59,22 @@ export default defineConfig({
                 R2_ACCESS_KEY_ID: "test-access-key-not-real",
                 R2_SECRET_ACCESS_KEY: "test-secret-key-not-real",
                 CONFIRM_SECRET: "test-confirm-secret-not-real",
+
+                // Who may sign in, as the JSON array string the real Secret
+                // holds. WITHOUT THIS BINDING EVERY EXISTING /authorize TEST
+                // GETS THE NEW 503: an absent list parses as nobody, and the
+                // gate that answers 503 sits above the method dispatch, so
+                // neither verb reaches the form.
+                //
+                // Two addresses, because two different suites need one. The
+                // first is what the authorize tests sign in as. The second is
+                // user A from test/fixtures/two-users.ts, so the door test can
+                // prove a listed grant is SERVED — without it that positive
+                // control could not exist and every refusal beside it would be
+                // vacuous. Both sit under the reserved `.invalid` domain, which
+                // can never resolve, following the habit the fakes above set.
+                ALLOWED_APPLE_IDS:
+                  '["listed-user@example.invalid","user-a@example.invalid"]',
               },
             },
           }),

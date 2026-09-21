@@ -6,8 +6,10 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import type { EntryEnv } from "../env";
 import { DEPLOYED_HOSTNAME } from "../deployed-hostname.generated";
+import type { AllowList } from "../auth/allow-list";
+import { isAllowed, parseAllowList } from "../auth/allow-list";
 import type { Principal } from "../principal";
-import { principalFromEnv } from "../principal";
+import { normaliseAppleId, principalFromProps } from "../principal";
 import { createServerFactory } from "./server";
 
 /**
@@ -180,52 +182,70 @@ const HANDLER_OPTIONS: HandlerOptions = {
 };
 
 /**
- * Is this the owner's grant (D-07)?
+ * Is this a grant this server will still serve (D-07, GATE-03, GATE-05)?
  *
- * Yes only for a plain object whose own keys, symbol keys included, are exactly
- * `userId`, with the string value `owner`. That is the one grant the login gate
- * mints today. Everything else is a no: the newer versioned shape (Phase 11
- * owns it), another user id, the owner's id beside an extra key, a different
- * letter case, null, an array, and no props at all. The handler library only
- * builds an auth context when the props hold a key, so "nothing there" has to
- * read as a bad grant and not as a crash.
+ * Yes only for a plain object with exactly three own keys, one of them a string
+ * `appleId` whose folded form is on the allow list. That is the shape the login
+ * page mints. Everything else is a no: the OLD single-key owner grant (GATE-05
+ * — those are what this replaces, and they must be refused rather than
+ * honoured), a grant whose address has since been removed from the list
+ * (GATE-03), an address this server cannot fold, null, an array, and no props
+ * at all. The handler library only builds an auth context when the props hold a
+ * key, so "nothing there" has to read as a bad grant and not as a crash.
+ *
+ * **The list is re-read and re-compared on EVERY request, with no cache.** That
+ * is what makes removal take effect on the person's very next call rather than
+ * whenever some token expires. It costs one parse of a small string and one set
+ * lookup, and no I/O at all.
+ *
+ * **It checks the address and never the password.** A grant whose password
+ * Apple has since revoked still passes here, and that is correct: the tool then
+ * reports an authentication failure, which is the honest answer, where a 401
+ * would tell the client to sign in again — advice that cannot help when the
+ * problem is at Apple rather than here.
  *
  * It returns a boolean and never throws. A throw on this path becomes a 500
  * with no challenge (spike S1), and a client that gets a 500 has no way to know
  * it should sign in again. The narrowing is the cast-free idiom the principal
  * module uses.
  *
+ * **`Reflect.ownKeys` rather than `Object.keys`, and the standard is chosen
+ * deliberately.** `Object.keys` counts enumerable STRING keys only, so props
+ * carrying a symbol key, or a non-enumerable one, would pass a count of three
+ * while holding a fourth thing. `Reflect.ownKeys` counts every own key of
+ * either kind. `principalFromProps` makes the same choice one module over, and
+ * the two must agree: a grant this function admitted and that constructor then
+ * refused would read to the caller as an authentication failure rather than as
+ * the bad grant it is.
+ *
  * THE CATCH IS WHAT MAKES "NEVER THROWS" TRUE (code review WR-01). Three of the
  * lines below run code this function did not write. The membership test and the
  * own-keys read go through a Proxy's traps if the value is a Proxy, and reading
- * the id runs an accessor if the key is one. Today none of that is reachable:
- * props reach the context only through a parse of the decrypted grant, which
- * builds plain objects with data properties, and the external-token resolver is
- * not configured. So the catch costs nothing today and the claim above is a
- * claim about the code rather than about what currently feeds it. Phase 11
- * changes what fills the props, and a guarantee that rests on the caller is the
- * kind that leaves without anything failing.
+ * the address runs an accessor if the key is one. Today none of that is
+ * reachable: props reach the context only through a parse of the decrypted
+ * grant, which builds plain objects with data properties, and the external-token
+ * resolver is not configured. So the catch costs nothing today and the claim
+ * above is a claim about the code rather than about what currently feeds it.
  *
- * IT FAILS CLOSED. A grant this function cannot inspect is not the owner's, so
- * the catch returns false and the request gets the 401 every other bad grant
- * gets. The caught value is never read, never logged and never echoed: it can
- * carry text a stranger wrote.
- *
- * The guard stays until Phase 13. While credentials still come from the Worker
- * secrets, whoever gets past it is served as the owner.
+ * IT FAILS CLOSED. A grant this function cannot inspect is not one it will
+ * serve, so the catch returns false and the request gets the 401 every other
+ * bad grant gets. The caught value is never read, never logged and never
+ * echoed: it can carry text a stranger wrote.
  */
-function isOwnerGrant(props: unknown): boolean {
+function servesThisGrant(props: unknown, allowed: AllowList): boolean {
   try {
     if (typeof props !== "object" || props === null || Array.isArray(props)) {
       return false;
     }
-    if (!("userId" in props)) return false;
-    if (Reflect.ownKeys(props).length !== 1) return false;
-    if (!Object.hasOwn(props, "userId")) return false;
-    return props.userId === "owner";
+    if (!("appleId" in props)) return false;
+    if (Reflect.ownKeys(props).length !== 3) return false;
+    if (!Object.hasOwn(props, "appleId")) return false;
+    const appleId = props.appleId;
+    if (typeof appleId !== "string") return false;
+    return isAllowed(allowed, normaliseAppleId(appleId));
   } catch {
-    // Never read the caught value. A grant we cannot inspect is not the
-    // owner's, so this answers the same way every other bad grant is answered.
+    // Never read the caught value. A grant we cannot inspect is not one to
+    // serve, so this answers the same way every other bad grant is answered.
     return false;
   }
 }
@@ -315,12 +335,17 @@ export function buildRequestHandler(
  *   what holds that up against props this code did not build (code review
  *   WR-01): it inspects the grant, and inspecting is the part that can run
  *   someone else's code.
- * - The principal is handed on as a PROMISE (D-09, D-27). An unset or bad
- *   Worker secret must read `auth_failed` from the tool, exactly as it does
- *   today, and never a 401: a 401 tells the client to sign in again, and
- *   signing in cannot fix a missing secret. So this function does not wait to
- *   find out. Each tool callback awaits the promise as the first line of its
- *   own `try`, and its own `catch` maps a refusal to the category.
+ * - The principal is handed on as a PROMISE (D-09, D-27). An unusable stored
+ *   credential must read `auth_failed` from the tool and never a 401: a 401
+ *   tells the client to sign in again, and signing in again cannot fix a
+ *   password Apple has revoked — only making a new one at Apple can. So this
+ *   function does not wait to find out. Each tool callback awaits the promise
+ *   as the first line of its own `try`, and its own `catch` maps a refusal to
+ *   the category.
+ * - The allow list is parsed HERE, synchronously, on every request. The parse
+ *   does no I/O — it reads a string off the environment and answers a verdict —
+ *   so it costs nothing against the no-await rule above, and re-reading it per
+ *   request is what makes removing someone take effect on their next call.
  */
 export function createMcpApiHandler(extraTools: ExtraTool[] = []): {
   fetch(
@@ -336,15 +361,22 @@ export function createMcpApiHandler(extraTools: ExtraTool[] = []): {
       ctx: ExecutionContext,
     ): Promise<Response> {
       // The one read of the grant's props in this codebase (D-08).
-      if (!isOwnerGrant(ctx.props)) {
+      if (!servesThisGrant(ctx.props, parseAllowList(env.ALLOWED_APPLE_IDS))) {
         return Promise.resolve(unauthorized(request));
       }
 
-      const principal = principalFromEnv(env);
-      // A request that calls no tool never awaits this promise. If a secret is
-      // unset it rejects, and a rejection nobody handles is an unhandled
-      // rejection. This one no-op handler prevents that. Everyone who awaits
-      // `principal` itself still sees the rejection.
+      // Identity comes from the grant, never from the environment. That is the
+      // whole of the Phase 11 switch at this line: the per-user principal is
+      // the only live identity path from here on, and `principalFromEnv` is a
+      // retiring variant that Phase 13 deletes along with the three secrets.
+      // Adding this path ALONGSIDE the environment one is the shape that would
+      // silently contradict the change — a second person could be stored and
+      // never served, because the environment identity would still win here.
+      const principal = principalFromProps(ctx.props);
+      // A request that calls no tool never awaits this promise. If the stored
+      // credential is unusable it rejects, and a rejection nobody handles is an
+      // unhandled rejection. This one no-op handler prevents that. Everyone who
+      // awaits `principal` itself still sees the rejection.
       principal.catch(() => {});
 
       return buildRequestHandler(principal, extraTools)(request, env, ctx);

@@ -118,9 +118,14 @@ describe("/authorize is unaffected", () => {
     // had been placed above the pathname check, /authorize would answer it too
     // and the login surface would disappear behind a signpost pointing at the
     // MCP endpoint.
+    //
+    // Since Phase 11 the 503 this drives comes from an absent ALLOW LIST rather
+    // than an absent shared secret — the gate in that position changed subject,
+    // not position. What this case is about did not change at all: it is here
+    // to show /authorize answers something OTHER than the unknown-path body.
     const response = await loginHandler.fetch(
       new Request(`${ORIGIN}/authorize?response_type=code&client_id=abc`),
-      { AUTH_SECRET: undefined } as unknown as Env & LoginGateSecret,
+      { ALLOWED_APPLE_IDS: undefined } as unknown as Env & LoginGateSecret,
     );
 
     expect(response.status).toBe(503);

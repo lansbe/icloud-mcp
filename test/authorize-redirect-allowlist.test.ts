@@ -25,17 +25,23 @@
 //   handler-level cases below exist too.
 //
 //   Stubbed provider. Anything about ORDERING — that the refusal beats the
-//   client lookup, and beats the secret comparison even when the secret is
-//   right — cannot be observed from outside a real provider. Those drive
-//   `loginHandler.fetch` directly with a recording stub.
+//   client lookup, and beats the credential check even when the credential is
+//   one that works — cannot be observed from outside a real provider. Those
+//   drive `loginHandler.fetch` directly with a recording stub.
 //
 //   Real registration. The lockout controls — the cases that would catch this
 //   change locking the OWNER out — register a genuinely observed callback
 //   through the real registration endpoint and complete the whole ceremony.
 //   Without them every case here is satisfied by a handler that refuses
 //   everything.
+//
+//   Since Phase 11 those end-to-end cases go through
+//   test/fixtures/worker-with-login-proof.ts rather than src/index.ts. The
+//   ceremony now ends in a real IMAP login, and D-09 forbids any automated
+//   login to a real Apple ID, so the fixture composes the very same provider
+//   options and substitutes exactly one thing: the proof. The registration, the
+//   provider, the allowlist check and the redirect are all the production ones.
 
-import { env } from "cloudflare:workers";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
@@ -45,16 +51,17 @@ import {
 } from "../src/auth/login-handler";
 import type { Env, LoginGateSecret } from "../src/env";
 import { entryEnv } from "./fixtures/bound-secrets";
-import worker from "../src/index";
+import worker, {
+  FAKE_APP_PASSWORD,
+  LISTED_APPLE_ID,
+  UNLISTED_APPLE_ID,
+} from "./fixtures/worker-with-login-proof";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 
 const ORIGIN = `https://${DEPLOYED_HOSTNAME}`;
 
-/** The value the workers pool binds AUTH_SECRET to (see vitest.config.ts). */
-const BOUND_SECRET = "test-secret-not-real";
-
 /** The password field's input name. Its absence is how "no form" is asserted. */
-const SECRET_FIELD = 'name="secret"';
+const SECRET_FIELD = `name="app_password"`;
 
 /** The observed Claude Desktop callback — read off the live registration store. */
 const OBSERVED_REMOTE_CALLBACK = "https://claude.ai/api/mcp/auth_callback";
@@ -163,7 +170,9 @@ function stubEnv(options: {
   const calls = options.calls ?? [];
   return {
     OAUTH_KV: quietKv(),
-    AUTH_SECRET: BOUND_SECRET,
+    // Without this the allow-list gate answers 503 above the method dispatch
+    // and not one case in this file reaches the refusal it was written for.
+    ALLOWED_APPLE_IDS: JSON.stringify([LISTED_APPLE_ID]),
     OAUTH_PROVIDER: {
       parseAuthRequest:
         options.parseAuthRequest ??
@@ -193,15 +202,29 @@ function get(query: string): Request {
   return new Request(`${ORIGIN}/authorize?${query}`);
 }
 
+/**
+ * A POST carrying credentials. The FIRST argument is now the Apple ID.
+ *
+ * That is the mechanical shape of the switch in this file. `LISTED_APPLE_ID` is
+ * a credential that WOULD complete the ceremony, which is what makes the
+ * "refuses a POST carrying a credential that works" case below mean anything;
+ * `UNLISTED_APPLE_ID` is one that would not. Neither reaches Apple: the
+ * redirect refusal sits above the credential path entirely, and the end-to-end
+ * cases go through the injected proof.
+ */
 function post(
-  secret: string,
+  appleId: string,
   query: string,
   headers: Record<string, string> = {},
 ): Request {
   return new Request(`${ORIGIN}/authorize`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", ...headers },
-    body: new URLSearchParams({ secret, oauth_request: query }).toString(),
+    body: new URLSearchParams({
+      apple_id: appleId,
+      app_password: FAKE_APP_PASSWORD,
+      oauth_request: query,
+    }).toString(),
   });
 }
 
@@ -266,13 +289,15 @@ describe("a disallowed destination is refused on BOTH verbs", () => {
     expect(calls).not.toContain("lookupClient");
   });
 
-  it("refuses a POST carrying the CORRECT secret", async () => {
-    // The case that matters most. A correct secret must not purchase a code for
-    // a destination this server will not send to, so the check sits ABOVE the
-    // comparison rather than after it.
+  it("refuses a POST carrying a credential that works", async () => {
+    // The case that matters most. A credential that would complete the ceremony
+    // must not purchase a code for a destination this server will not send to,
+    // so the check sits ABOVE the credential path rather than after it. The
+    // address posted here is the listed one, which is what makes that claim
+    // non-vacuous: it is refused despite being a credential this server accepts.
     const calls: string[] = [];
     const response = await loginHandler.fetch(
-      post(BOUND_SECRET, STUB_QUERY, { "cf-connecting-ip": "203.0.113.21" }),
+      post(LISTED_APPLE_ID, STUB_QUERY, { "cf-connecting-ip": "203.0.113.21" }),
       stubEnv({ calls }),
     );
 
@@ -283,13 +308,14 @@ describe("a disallowed destination is refused on BOTH verbs", () => {
     expect(calls).not.toContain("lookupClient");
   });
 
-  it("answers a POST with a WRONG secret 403 rather than the 401 form", async () => {
+  it("answers a POST with an UNLISTED address 403 rather than the 401 form", async () => {
     // Deliberate, and pinned here so a later reader cannot read it as a
-    // regression: the refusal is above the comparison, so the destination is
-    // what answers, not the secret. This discloses nothing — the answer is a
-    // pure function of the requester's own redirect URI, which they chose.
+    // regression: the refusal is above the credential path, so the destination
+    // is what answers, not the address. This discloses nothing — the answer is
+    // a pure function of the requester's own redirect URI, which they chose —
+    // and it is precisely why list membership cannot be read off this status.
     const response = await loginHandler.fetch(
-      post("definitely-not-the-secret", STUB_QUERY, {
+      post(UNLISTED_APPLE_ID, STUB_QUERY, {
         "cf-connecting-ip": "203.0.113.22",
       }),
       stubEnv({}),
@@ -388,7 +414,7 @@ describe("the observed origins still authorize end to end", () => {
     expect(body).toContain(SECRET_FIELD);
 
     const authorized = await call(
-      post(BOUND_SECRET, query, { "cf-connecting-ip": "203.0.113.31" }),
+      post(LISTED_APPLE_ID, query, { "cf-connecting-ip": "203.0.113.31" }),
     );
 
     expect(authorized.status).toBe(302);
@@ -414,7 +440,7 @@ describe("the observed origins still authorize end to end", () => {
     expect(destinationFrom(body)).toBe("http://localhost:51877");
 
     const authorized = await call(
-      post(BOUND_SECRET, query, { "cf-connecting-ip": "203.0.113.32" }),
+      post(LISTED_APPLE_ID, query, { "cf-connecting-ip": "203.0.113.32" }),
     );
 
     expect(authorized.status).toBe(302);

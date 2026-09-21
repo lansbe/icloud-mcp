@@ -231,6 +231,42 @@ declare global {
        * `CryptoKey` even by code that holds it.
        */
       CONFIRM_SECRET: string | undefined;
+
+      /**
+       * Who may sign in, as a JSON array of Apple IDs. Workers Secret.
+       *
+       * **On the shared type rather than a narrow interface, and deliberately
+       * so.** The three names below this block were moved off the shared type
+       * precisely so the compiler would refuse a new reader. This one has TWO
+       * legitimate readers by design — the login page, which decides whether a
+       * person may sign in at all, and the door, which decides on every served
+       * request whether the person in the grant is still permitted — so a
+       * narrow interface would have to name both and would say nothing the
+       * shared type does not.
+       *
+       * A Workers Secret rather than a `vars` entry, because `wrangler.jsonc`
+       * is git-ignored while `wrangler.jsonc.example` is tracked, and a list of
+       * real people's Apple IDs is personal data that should not sit next to a
+       * tracked example config even by accident.
+       *
+       * Admits `undefined` for the reason every Secret above it does: unset,
+       * deleted and failed-to-provision all arrive absent, and nothing at
+       * runtime tells that apart from a configured value until something reads
+       * it. The specific silent failure the widening exists to surface is worth
+       * naming, because it is the one that hurts the OWNER rather than a
+       * stranger: an absent secret parses as NOBODY, so the login page stops
+       * issuing authorizations for everyone including the person who would fix
+       * it. `src/auth/allow-list.ts` fails closed on purpose — the other
+       * direction would open a server that reaches real personal mail to
+       * anyone who can authenticate at Apple — and the 503 body is the channel
+       * that says so, because Convention 4 forbids logging anywhere under
+       * `src/` and the response is the only diagnostic a locked-out owner has.
+       *
+       * Consumed only through `parseAllowList` in `src/auth/allow-list.ts`,
+       * which reads it, answers a three-member verdict, and hands back nothing
+       * that carries the raw value.
+       */
+      ALLOWED_APPLE_IDS: string | undefined;
     }
   }
 }

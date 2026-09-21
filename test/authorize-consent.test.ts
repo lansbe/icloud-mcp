@@ -13,13 +13,20 @@
 //
 // Two test shapes, deliberately:
 //
-//   Real registration. Cases that assert what the owner *sees* drive the
-//   production entry (src/index.ts, the OAuth provider itself) through
-//   POST /oauth/register and then GET /authorize. The client is a genuinely
-//   registered one, its name and redirect URI travel the same path they do in
-//   production, and nothing about the identity on the page is supplied by the
-//   test. This was tried first and works inside the workers pool, so the
-//   stubbed-provider fallback the plan allowed was not needed for these.
+//   Real registration. Cases that assert what the owner *sees* drive a real
+//   OAuth provider through POST /oauth/register and then GET /authorize. The
+//   client is a genuinely registered one, its name and redirect URI travel the
+//   same path they do in production, and nothing about the identity on the page
+//   is supplied by the test. This was tried first and works inside the workers
+//   pool, so the stubbed-provider fallback the plan allowed was not needed for
+//   these.
+//
+//   Since Phase 11 that entry is test/fixtures/worker-with-login-proof.ts
+//   rather than src/index.ts. It composes the very same provider options and
+//   substitutes exactly one thing, the login proof, because the positive
+//   control below completes the whole ceremony and D-09 forbids any automated
+//   login to a real Apple ID. Nothing in this file asserts anything about the
+//   proof; every case here is about what the page NAMES.
 //
 //   Note on the redirect URIs below: they are not arbitrary. Since window 8 the
 //   handler carries an origin allowlist, so every URI in this file has to sit on
@@ -37,24 +44,24 @@
 //   takes its env as a parameter, so this needs no real namespace and no
 //   registered client.
 
-import { env } from "cloudflare:workers";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { loginHandler } from "../src/auth/login-handler";
 import type { Env, LoginGateSecret } from "../src/env";
 import { entryEnv } from "./fixtures/bound-secrets";
-import worker from "../src/index";
+import worker, {
+  FAKE_APP_PASSWORD,
+  LISTED_APPLE_ID,
+  UNLISTED_APPLE_ID,
+} from "./fixtures/worker-with-login-proof";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 
 const ORIGIN = `https://${DEPLOYED_HOSTNAME}`;
 
-/** The value the workers pool binds AUTH_SECRET to (see vitest.config.ts). */
-const BOUND_SECRET = "test-secret-not-real";
-
 /** The password field's input name. Its absence is how "no form" is asserted. */
-const SECRET_FIELD = 'name="secret"';
+const SECRET_FIELD = `name="app_password"`;
 
-/** Drive the production entry — the real provider — through its real fetch. */
+/** Drive the real provider, over the injected proof, through its real fetch. */
 async function call(request: Request): Promise<Response> {
   const ctx = createExecutionContext();
   const response = await worker.fetch(request, entryEnv(), ctx);
@@ -163,7 +170,9 @@ function stubEnv(options: {
   const calls = options.calls ?? [];
   return {
     OAUTH_KV: options.kv ?? recordingKv().kv,
-    AUTH_SECRET: BOUND_SECRET,
+    // Without this the allow-list gate answers 503 above the method dispatch
+    // and not one case in this file reaches the behaviour it was written for.
+    ALLOWED_APPLE_IDS: JSON.stringify([LISTED_APPLE_ID]),
     OAUTH_PROVIDER: {
       parseAuthRequest:
         options.parseAuthRequest ??
@@ -189,11 +198,28 @@ function stubEnv(options: {
   } as unknown as Env & LoginGateSecret;
 }
 
-function post(secret: string, query: string, headers: Record<string, string> = {}): Request {
+/**
+ * A POST carrying credentials. The FIRST argument is now the Apple ID.
+ *
+ * That is the mechanical shape of the switch in this file: the form used to
+ * carry one shared secret and now carries an address and a password, and under
+ * the new rule it is the ADDRESS that decides whether a refusal happens at all.
+ * A case that wants a refusal posts `UNLISTED_APPLE_ID`, which is turned away
+ * by the allow-list check before a principal is built or the proof is called;
+ * a case that wants the ceremony to complete posts `LISTED_APPLE_ID`.
+ *
+ * The password is the same fake every time, because no case in this file is
+ * about the password.
+ */
+function post(appleId: string, query: string, headers: Record<string, string> = {}): Request {
   return new Request(`${ORIGIN}/authorize`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", ...headers },
-    body: new URLSearchParams({ secret, oauth_request: query }).toString(),
+    body: new URLSearchParams({
+      apple_id: appleId,
+      app_password: FAKE_APP_PASSWORD,
+      oauth_request: query,
+    }).toString(),
   });
 }
 
@@ -295,7 +321,7 @@ describe("the consent screen names what it is authorizing", () => {
     const clientId = await register(redirectUri, "Legit Client");
     const query = authorizeQuery(clientId, redirectUri);
 
-    const response = await call(post(BOUND_SECRET, query, { "cf-connecting-ip": "203.0.113.7" }));
+    const response = await call(post(LISTED_APPLE_ID, query, { "cf-connecting-ip": "203.0.113.7" }));
 
     expect(response.status).toBe(302);
     expect(response.headers.get("location") ?? "").toContain(`${redirectUri}?code=`);
@@ -305,7 +331,7 @@ describe("the consent screen names what it is authorizing", () => {
 describe("a second attempt is no less informed than the first", () => {
   it("still names the client on the 401 re-render after a wrong secret", async () => {
     const response = await loginHandler.fetch(
-      post("definitely-not-the-secret", "response_type=code&client_id=stub-client"),
+      post(UNLISTED_APPLE_ID, "response_type=code&client_id=stub-client"),
       stubEnv({}),
     );
     const body = await response.text();
@@ -327,7 +353,7 @@ describe("resolution sits below the cap check and above the comparison", () => {
     // the sender already knows.
     const { AuthorizationError } = await import("@cloudflare/workers-oauth-provider");
     const response = await loginHandler.fetch(
-      post("definitely-not-the-secret", "not-a-valid-authorization-request"),
+      post(UNLISTED_APPLE_ID, "not-a-valid-authorization-request"),
       stubEnv({
         parseAuthRequest: async () => {
           throw new AuthorizationError("invalid_request", {
@@ -347,7 +373,7 @@ describe("resolution sits below the cap check and above the comparison", () => {
     // is trying to make requests cheap.
     const calls: string[] = [];
     const response = await loginHandler.fetch(
-      post("definitely-not-the-secret", "response_type=code&client_id=stub-client"),
+      post(UNLISTED_APPLE_ID, "response_type=code&client_id=stub-client"),
       stubEnv({ calls, kv: recordingKv({ value: () => "10" }).kv }),
     );
 
@@ -369,11 +395,11 @@ describe("one party's failures are not everyone's", () => {
     const kv = recordingKv();
 
     await loginHandler.fetch(
-      post("wrong", QUERY, { "cf-connecting-ip": "203.0.113.1" }),
+      post(UNLISTED_APPLE_ID, QUERY, { "cf-connecting-ip": "203.0.113.1" }),
       stubEnv({ kv: kv.kv }),
     );
     await loginHandler.fetch(
-      post("wrong", QUERY, { "cf-connecting-ip": "198.51.100.2" }),
+      post(UNLISTED_APPLE_ID, QUERY, { "cf-connecting-ip": "198.51.100.2" }),
       stubEnv({ kv: kv.kv }),
     );
 
@@ -387,7 +413,7 @@ describe("one party's failures are not everyone's", () => {
     const kv = recordingKv();
 
     const response = await loginHandler.fetch(
-      post("wrong", QUERY),
+      post(UNLISTED_APPLE_ID, QUERY),
       stubEnv({ kv: kv.kv }),
     );
 
@@ -403,11 +429,11 @@ describe("one party's failures are not everyone's", () => {
     });
 
     const capped = await loginHandler.fetch(
-      post("wrong", QUERY, { "cf-connecting-ip": "203.0.113.9" }),
+      post(UNLISTED_APPLE_ID, QUERY, { "cf-connecting-ip": "203.0.113.9" }),
       stubEnv({ kv: overCap.kv }),
     );
     const other = await loginHandler.fetch(
-      post("wrong", QUERY, { "cf-connecting-ip": "198.51.100.9" }),
+      post(UNLISTED_APPLE_ID, QUERY, { "cf-connecting-ip": "198.51.100.9" }),
       stubEnv({ kv: overCap.kv }),
     );
 
@@ -426,7 +452,7 @@ describe("the counter's write cannot change the response", () => {
     const kv = recordingKv({ putRejects: true });
 
     const response = await loginHandler.fetch(
-      post("wrong", "response_type=code&client_id=stub-client", {
+      post(UNLISTED_APPLE_ID, "response_type=code&client_id=stub-client", {
         "cf-connecting-ip": "203.0.113.55",
       }),
       stubEnv({ kv: kv.kv }),
@@ -442,7 +468,7 @@ describe("the counter's write cannot change the response", () => {
     // succeeding, which is why its value is asserted rather than assumed.
     const started = Date.now();
     await loginHandler.fetch(
-      post("wrong", "response_type=code&client_id=stub-client", {
+      post(UNLISTED_APPLE_ID, "response_type=code&client_id=stub-client", {
         "cf-connecting-ip": "203.0.113.56",
       }),
       stubEnv({}),

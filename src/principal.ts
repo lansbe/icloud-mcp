@@ -43,13 +43,32 @@
 // either reaching into the other. For the same reason this module imports no
 // protocol tree itself.
 //
-// **One function, not one per tree.** `userIdOf` is meant to be the only place
-// in the repository that turns an address into a user id. Two functions that do
+// **One rule, not one per tree.** `userIdOf` is meant to be the only place in
+// the repository that turns an address into a user id. Two functions that do
 // that job are two rules, and two rules drift: the day they disagree about one
 // input, one person becomes two users, or two people become one. Tests hold no
 // second copy either. They compare a result with a literal from
 // `test/fixtures/user-id-vectors.ts`, which is the spec this function is built
 // from.
+//
+// Since Phase 11 that one rule is spread over TWO exported functions, and the
+// split is what keeps it one rule rather than making it two.
+// `normaliseAppleId` folds an address; `userIdOf` folds it and then digests the
+// folded string. `userIdOf` does not repeat a single step — it calls the other
+// one — so there is still exactly one place the folding is written down.
+//
+// The second function exists because the door needs the comparison to be
+// SYNCHRONOUS. It decides on every served request whether the address in the
+// grant is still on the allow list, and `src/mcp/api-handler.ts` neither throws
+// nor awaits inside `fetch`: an await there would put a gap in front of the
+// 401. Web Crypto has no synchronous digest, so a comparison that went through
+// `userIdOf` would have to await one. Comparing folded addresses instead needs
+// no digest at all.
+//
+// The alternative — a second, sync folding function for the door — is the
+// drift this paragraph exists to prevent. The day it disagreed with this one
+// about a single input, an address on the list would stop matching the grant
+// built from it, or worse, one that was removed would keep matching.
 //
 // That "only place" is not yet true, and the gap is known and dated. The cache
 // key hash in the DAV tree's discovery module is a second site: it hashes the
@@ -81,13 +100,17 @@ function hex(buffer: ArrayBuffer): string {
 }
 
 /**
- * Turn an Apple ID, exactly as typed, into a user id. Or refuse it.
+ * Fold an Apple ID into the one spelling this server compares and hashes. Or
+ * refuse it.
  *
- * The user id is the full SHA-256 of the trimmed, lowercased address, as 64
- * lowercase hex characters. It is never shortened. A refusal is `null`.
+ * The folded form is the trimmed, lowercased address. A refusal is `null`.
  *
- * **It returns a Promise.** The platform's digest has no synchronous form, so
- * every caller awaits. A call that is not awaited holds a Promise, not an id.
+ * **It is synchronous, and that is the reason it exists apart from `userIdOf`**
+ * rather than a convenience. The door compares the address in a grant against
+ * the allow list on every served request, inside a `fetch` that must neither
+ * throw nor await. There is no synchronous digest on the platform, so a
+ * comparison routed through `userIdOf` would have to await one. Comparing
+ * folded addresses needs no digest at all.
  *
  * **It never throws, and it builds no message.** Every refusal is a plain
  * `null`, a value that is not a string included. No error is constructed
@@ -108,24 +131,25 @@ function hex(buffer: ArrayBuffer): string {
  *   would be accepted and would share a user id with the plain spelling, so two
  *   different typed strings would become one user.
  *
- * Nothing is folded. A `+tag` address is its own user, and the same name at
- * each of Apple's three mail domains is three users. Folding would make two
- * people one user. No Unicode normalisation is applied either, because no
- * input outside ASCII is accepted in the first place.
+ * Nothing else is folded. A `+tag` address is its own user, and the same name
+ * at each of Apple's three mail domains is three users. Folding those would
+ * make two people one user. No Unicode normalisation is applied either, because
+ * no input outside ASCII is accepted in the first place.
  *
  * Changing any of this for an input that is already accepted re-keys that
- * user's stores. Refusing more later is safe. Accepting more, or accepting
- * differently, is not.
+ * user's stores, because the digest below is taken over what this returns.
+ * Refusing more later is safe. Accepting more, or accepting differently, is
+ * not. `test/fixtures/user-id-vectors.ts` is the spec both halves are held to.
  */
-export async function userIdOf(appleId: string): Promise<string | null> {
+export function normaliseAppleId(value: unknown): string | null {
   // A caller may hand over anything at runtime, whatever the type says.
-  if (typeof appleId !== "string") return null;
+  if (typeof value !== "string") return null;
 
   // 1. The cap, on the input as typed, in UTF-16 code units. Before the trim.
-  if (appleId.length > MAX_TYPED_LENGTH) return null;
+  if (value.length > MAX_TYPED_LENGTH) return null;
 
   // 2. Trim the ends only. Nothing is ever removed from the middle.
-  const trimmed = appleId.trim();
+  const trimmed = value.trim();
 
   // 3. Printable ASCII only, 0x21 to 0x7E. BEFORE lowercasing.
   for (let index = 0; index < trimmed.length; index += 1) {
@@ -146,6 +170,30 @@ export async function userIdOf(appleId: string): Promise<string | null> {
   if (at <= 0) return null;
   if (at !== folded.lastIndexOf("@")) return null;
   if (at === folded.length - 1) return null;
+
+  return folded;
+}
+
+/**
+ * Turn an Apple ID, exactly as typed, into a user id. Or refuse it.
+ *
+ * The user id is the full SHA-256 of the folded address, as 64 lowercase hex
+ * characters. It is never shortened. A refusal is `null`.
+ *
+ * **It returns a Promise.** The platform's digest has no synchronous form, so
+ * every caller awaits. A call that is not awaited holds a Promise, not an id.
+ *
+ * **Every rule about which addresses are accepted lives one function up**, in
+ * `normaliseAppleId`, and this one adds none of its own. It refuses exactly
+ * what that refuses, for exactly the reasons written there, and then digests
+ * what it returns. Step 7 is the only step that lives here.
+ *
+ * It never throws and builds no message, for the same reason the folding does
+ * not: there is nothing the typed address could ride out on.
+ */
+export async function userIdOf(appleId: string): Promise<string | null> {
+  const folded = normaliseAppleId(appleId);
+  if (folded === null) return null;
 
   // 7. The full SHA-256 of the UTF-8 bytes, as 64 lowercase hex characters.
   const digest = await crypto.subtle.digest("SHA-256", ENCODER.encode(folded));
