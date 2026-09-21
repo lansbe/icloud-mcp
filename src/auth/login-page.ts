@@ -563,6 +563,31 @@ function renderSection(section: ExplainerSection): string {
  *
  * Every failed render is 401, the throttle case included. One status for both
  * removes any need to prove a second one does not leak.
+ *
+ * The Apple ID field is `type="text"`, NOT `type="email"`, and it is deliberate.
+ * A browser refuses to submit a form whose `email` field it does not like, and
+ * does it silently as far as the reader is concerned — the tooltip is easy to
+ * miss, and nothing reaches the server, so there is no error body, no status and
+ * no log line. The symptom would be a Sign in button that does nothing at all.
+ *
+ * Provenance, stated because the first version of this note got it wrong: this
+ * was written while chasing a reported "Sign in does nothing" on 2026-09-21, and
+ * claimed to have fixed it. It did not. The Worker logs showed the whole flow
+ * succeeding twice over, with no 4xx anywhere; the real problem was a client
+ * holding a stale connection. Nothing here was ever broken. So this is a
+ * hardening, and the failure above is one it forecloses rather than one it fixed.
+ *
+ * Keeping it is still right, because it is the same mistake this phase already
+ * declined to make about the password. Apple publishes no app-specific password
+ * format, so the shape check refuses only what cannot be one under any grammar;
+ * an Apple ID is a format this project controls just as little. Letting the
+ * BROWSER enforce a rule nobody here wrote, over a value Apple defines, is that
+ * rule arriving by the back door.
+ *
+ * `inputmode="email"` stays, so a phone still offers the @ key. `required`
+ * stays, because an empty box is refusable without claiming to know the format.
+ * The real gate is the server, which refuses before opening any socket to
+ * Apple. Do not put `type="email"` back.
  */
 export function renderForm(
   query: string,
@@ -612,7 +637,7 @@ export function renderForm(
   <form method="post" action="/authorize">
     <input type="hidden" name="oauth_request" value="${escapeHtml(query)}">
     <label for="apple-id">Apple ID</label>
-    <input id="apple-id" name="${APPLE_ID_FIELD}" type="email" autocomplete="username" inputmode="email" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="${describes("apple-id-help")}"${invalid} autofocus required>
+    <input id="apple-id" name="${APPLE_ID_FIELD}" type="text" autocomplete="username" inputmode="email" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="${describes("apple-id-help")}"${invalid} autofocus required>
     <p class="help" id="apple-id-help">The iCloud Mail address you sign in to Apple with.</p>
     <label for="app-password">App-specific password</label>
     <input id="app-password" name="${APP_PASSWORD_FIELD}" type="password" autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="${describes("app-password-help")}"${invalid} required>

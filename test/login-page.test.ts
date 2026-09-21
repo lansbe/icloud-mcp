@@ -337,6 +337,52 @@ describe("the explainer is on the page, always", () => {
   });
 });
 
+describe("the browser is not given a format rule nobody here wrote", () => {
+  // Hardening, 2026-09-21 — NOT a regression test, and the difference matters.
+  // These cases were written while chasing a reported "Sign in does nothing".
+  // That report turned out to have nothing to do with this field: the Worker
+  // logs showed the whole OAuth flow succeeding twice over with no 4xx, and the
+  // real cause was a client holding a stale connection. No failing behaviour was
+  // ever observed here, so nothing below was seen red against a real symptom.
+  //
+  // What they DO foreclose is real. A browser refuses to submit a form whose
+  // email field it dislikes, and does it silently as far as the reader is
+  // concerned: nothing reaches the server, so there is no failure body, no
+  // status and no log line to find afterwards.
+  //
+  // It is also the same mistake this phase declined to make about the password.
+  // Apple publishes no app-specific password format, so the shape check refuses
+  // only what cannot be one under any grammar. An Apple ID is a format this
+  // project controls just as little, and letting the browser enforce a rule
+  // nobody here wrote is that rule arriving by the back door.
+
+  it("does not let the browser validate the Apple ID's format", async () => {
+    const [appleId] = credentialInputs(await (await getForm()).text());
+
+    expect(appleId).toContain(`type="text"`);
+    expect(appleId).not.toContain(`type="email"`);
+  });
+
+  it("keeps the phone keyboard hint and the empty-box refusal", async () => {
+    // Neither of these claims to know the format. `inputmode` only picks a
+    // keyboard, and `required` only refuses an empty box — which is refusable
+    // without asserting anything about what a valid value looks like.
+    const [appleId] = credentialInputs(await (await getForm()).text());
+
+    expect(appleId).toContain(`inputmode="email"`);
+    expect(appleId).toMatch(/\srequired\b/);
+  });
+
+  it("puts no pattern or maxlength on either credential field", async () => {
+    // The two other ways a browser-side format rule gets reintroduced. The real
+    // gate is the server, which refuses before opening any socket to Apple.
+    for (const tag of credentialInputs(await (await getForm()).text())) {
+      expect(tag).not.toMatch(/\spattern=/);
+      expect(tag).not.toMatch(/\smaxlength=/);
+    }
+  });
+});
+
 describe("what was typed is never echoed", () => {
   /** The page must not carry a value attribute on either credential field. */
   function expectNoPrefilledValues(body: string): void {
