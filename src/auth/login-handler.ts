@@ -121,6 +121,115 @@ export const APPLE_ID_FIELD = "apple_id";
 export const APP_PASSWORD_FIELD = "app_password";
 
 /**
+ * The shortest a submitted value may be, once dashes are stripped.
+ *
+ * This bound exists to refuse a FRAGMENT: a paste that caught half the value,
+ * a couple of characters typed into the wrong box, a value that was cut short
+ * by a copy that ended early. Eight is well under the one length anyone here
+ * has ever seen from Apple, so it refuses nothing plausible.
+ */
+const MIN_CANONICAL_APP_PASSWORD = 8;
+
+/**
+ * The longest a submitted value may be, once dashes are stripped.
+ *
+ * This bound exists for an entirely different reason from the one above, and
+ * the pair is deliberately not one rule with two ends. It refuses a
+ * PASSPHRASE — a sentence, a paragraph, a whole paste of something that was
+ * never a credential. Sixty-four is four times the one observed length, so an
+ * Apple grammar with twice the groups, or twice the characters per group,
+ * still passes.
+ *
+ * Neither bound tries to tell an app-specific password from a real Apple ID
+ * password. It cannot be done by length — Apple's account password is eight or
+ * more characters and can be sixteen too — and pretending otherwise is exactly
+ * the over-tight rule the locked decision refuses.
+ */
+const MAX_CANONICAL_APP_PASSWORD = 64;
+
+/**
+ * The submitted app-specific password, reduced to the one form this server
+ * uses.
+ *
+ * **One function, one place, and the direction is a decision rather than a
+ * detail.** It strips the separators Apple displays and trims the ends, and
+ * what it returns is BOTH what goes to Apple and what goes into the grant's
+ * props. That is the point: the value the login proves and the value every
+ * later request replays are the same bytes by construction, so they cannot
+ * drift apart.
+ *
+ * Whitespace is trimmed at the ends only. Anything left in the middle is not
+ * repaired here — `couldBeAppPassword` refuses it, because a value with a space
+ * inside is far more likely to be a sentence than a credential, and silently
+ * removing it would send a guess to Apple on the person's behalf.
+ *
+ * **The direction is gated on spike S5**, which is a manual check on the
+ * owner's own account: no automated job in this repository may authenticate
+ * against a real Apple ID, so nothing here can settle whether iCloud wants the
+ * dashed form or the dashless one. Plan 11-07 runs S5 before the single deploy.
+ * If it shows iCloud wants the dashes, the inversion is THIS FUNCTION and
+ * nothing else — the caller, the props and the wire all follow whatever it
+ * answers. The person typing may use either form either way.
+ */
+function canonicalAppPassword(submitted: string): string {
+  return submitted.trim().replaceAll("-", "");
+}
+
+/**
+ * Could this be an app-specific password at all? (LOGIN-03)
+ *
+ * It takes the ALREADY-CANONICAL value, never the raw one, and that is the same
+ * habit `refusedRedirectBody` follows in taking an already-reduced destination:
+ * the check and the thing that gets used are then provably the same value,
+ * rather than two derivations that could disagree.
+ *
+ * **This check is LOOSE on purpose, and this is the rule a later session will
+ * be most tempted to tighten.** The argument, written here because a planning
+ * file is not where the tempted reader will be looking:
+ *
+ * - **Apple publishes no format.** Its own support page for app-specific
+ *   passwords covers creating, managing and revoking them and says nothing
+ *   about length, character set or grouping. The four-groups-of-four shape is
+ *   training knowledge plus exactly one observed sample — the owner's own.
+ * - **The question it answers is "is this clearly not an app-specific
+ *   password", never "is this exactly the grammar I remember".** A strict rule
+ *   that is wrong refuses a legitimate family member behind a failure message
+ *   that deliberately will not say why, and they have no way to learn the
+ *   reason.
+ * - **The requirement is still satisfied.** A clearly-wrong value is refused
+ *   before any socket opens, because this function does no I/O and sits above
+ *   the one proof call site.
+ * - **The cost accepted:** a typo inside the band costs one attempt at Apple
+ *   and one tick of the per-target counter, instead of being caught locally.
+ * - **Do not tighten this into the observed grammar to catch more typos.** That
+ *   reverses a decision made on 2026-09-20 with the silent-failure cost in
+ *   view. Refusing more is safe for a user id, where a refusal is a fresh start;
+ *   it is not safe here, where a refusal is a person locked out of a page that
+ *   will not tell them why.
+ *
+ * Exactly three classes are refused and there is no fourth: an empty value; a
+ * value still carrying white space once the dashes are gone; and a length
+ * outside the band the two constants above describe.
+ *
+ * **It does not duplicate `isUsablePassword`**, which lives in
+ * `src/principal.ts` and refuses a whitespace-only value and any control
+ * character. That one runs SECOND, inside the principal constructor, and it is
+ * the deeper of the two: it guards every construction site, including the
+ * props read at the door on a later request, where no form was ever submitted.
+ * This one runs FIRST because it is the only one of the two that can refuse
+ * before a principal is built at all — which is what makes "nothing was opened
+ * to Apple" true of the shape refusal rather than merely likely.
+ */
+function couldBeAppPassword(canonical: string): boolean {
+  if (canonical.length === 0) return false;
+  if (/\s/.test(canonical)) return false;
+  return (
+    canonical.length >= MIN_CANONICAL_APP_PASSWORD &&
+    canonical.length <= MAX_CANONICAL_APP_PASSWORD
+  );
+}
+
+/**
  * What it takes to prove a credential pair is real: one login, at Apple.
  *
  * Resolves to nothing on success and REJECTS on failure, so the caller branches
@@ -796,6 +905,23 @@ async function handleAuthorize(
       return renderForm(query, "credentials", identity);
     }
 
+    // The shape check sits ABOVE the allow-list check, and the placement is
+    // argued rather than assumed, the way the redirect refusal argues its own
+    // three edges.
+    //
+    // It is the cheapest refusal in the chain: a pure function of ONE submitted
+    // field that consults no configuration, reads no stored state and does no
+    // I/O. Neither this nor the allow-list check can open a socket, so the
+    // ordering is a question of cost and not of safety — and because every
+    // refusal below answers with the same body at the same status under the
+    // same floor, the order is not observable from outside either.
+    //
+    // The canonical form is derived ONCE, here, and carried down to both the
+    // principal and the props. Deriving it twice is how the value Apple is told
+    // and the value the grant stores come to disagree.
+    const appPassword = canonicalAppPassword(submittedPassword);
+    if (!couldBeAppPassword(appPassword)) return refuseCredential();
+
     // The allow-list check sits ABOVE every use of the credentials, and that
     // placement is the whole of GATE-02: an address that is not on the list
     // must never reach Apple, so no principal is built and no session is opened
@@ -807,16 +933,14 @@ async function handleAuthorize(
     try {
       // `principalFromProps` is the ONE constructor, and it refuses before any
       // socket exists: an unusable password — empty, whitespace-only, or
-      // carrying a control character — throws here (D-19). The password is
-      // passed exactly as typed. Canonicalising it is LOGIN-04, owned by plan
-      // 11-04 and gated on spike S5; until then a person must type it the way
-      // Apple gave it to them. That is a functionality gap, not an
-      // architectural one — the shape of this call does not change when it
-      // lands.
+      // carrying a control character — throws here (D-19). What it is handed is
+      // the CANONICAL form derived above, which is the same value the props
+      // below carry, so the login this proves and every later request replay
+      // the identical bytes.
       const principal = await principalFromProps({
         v: PROPS_VERSION,
         appleId,
-        appPassword: submittedPassword,
+        appPassword,
       });
 
       // One login, at Apple. This is the only place in the whole flow that
@@ -874,7 +998,7 @@ async function handleAuthorize(
       props: {
         v: PROPS_VERSION,
         appleId,
-        appPassword: submittedPassword,
+        appPassword,
       },
       // `revokeExistingGrants` is left at its default, which is TRUE. A second
       // sign-in from the same client therefore replaces the first rather than

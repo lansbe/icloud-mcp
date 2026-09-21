@@ -302,7 +302,13 @@ describe("the props the ceremony is completed with", () => {
     expect(Object.keys(props).sort()).toEqual(["appPassword", "appleId", "v"]);
     expect(props.v).toBe(1);
     expect(props.appleId).toBe(LISTED_APPLE_ID);
-    expect(props.appPassword).toBe(FAKE_APP_PASSWORD);
+    // The CANONICAL form, not the form that was typed. LOGIN-04 strips the
+    // separators Apple displays, and the stored value is the one that goes to
+    // Apple, so a props object holding the typed form would mean the grant and
+    // the wire disagreed from the moment it was written. The block titled
+    // "the dashes a person may or may not type" is where that is the subject;
+    // this line is here so this case cannot go stale against it.
+    expect(props.appPassword).toBe(FAKE_APP_PASSWORD.replaceAll("-", ""));
   });
 
   it("names the user by a derived id, not by the address and not by owner", async () => {

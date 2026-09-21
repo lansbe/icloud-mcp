@@ -249,9 +249,22 @@ const PASSWORDS = new WeakMap<Principal, string>();
  *
  * The test is on code units and uses no pattern, so this file needs no escape
  * sequence for a control character. It answers yes or no and builds nothing
- * from the password. The full four-groups-of-four shape check is NOT here: it
- * belongs to the login page in Phase 11. A real app password holds no control
- * character, so for valid credentials nothing changes.
+ * from the password. A real app password holds no control character, so for
+ * valid credentials nothing changes.
+ *
+ * **No shape check is here, and the one that exists is deliberately not the
+ * four-groups-of-four rule.** `couldBeAppPassword` in
+ * `src/auth/login-handler.ts` is where a submitted value's plausibility is
+ * judged, and it refuses only what cannot be an app-specific password under any
+ * grammar — Apple publishes no format, so affirming the remembered one would
+ * lock out a legitimate person behind a message that will not say why. Read its
+ * docstring before adding anything here.
+ *
+ * The two are ordered and the order matters. That one runs FIRST and only on
+ * the login path, where a form was submitted and a refusal can be answered with
+ * a page. This one runs SECOND and guards EVERY construction site, including
+ * the props read at the door on a later request where there is no form and no
+ * reader to tell.
  */
 function isUsablePassword(appPassword: string): boolean {
   if (appPassword.trim().length === 0) return false;
