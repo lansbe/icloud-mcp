@@ -120,17 +120,20 @@ export const APPLE_ID_FIELD = "apple_id";
 export const APP_PASSWORD_FIELD = "app_password";
 
 /**
- * The shortest a submitted value may be, once dashes are stripped.
+ * The shortest a submitted value may MEASURE, once dashes are stripped.
  *
  * This bound exists to refuse a FRAGMENT: a paste that caught half the value,
  * a couple of characters typed into the wrong box, a value that was cut short
  * by a copy that ended early. Eight is well under the one length anyone here
  * has ever seen from Apple, so it refuses nothing plausible.
+ *
+ * "Measure" rather than "canonical", because this project no longer has a
+ * canonical form. See `couldBeAppPassword` for what changed and why.
  */
-const MIN_CANONICAL_APP_PASSWORD = 8;
+const MIN_MEASURED_APP_PASSWORD = 8;
 
 /**
- * The longest a submitted value may be, once dashes are stripped.
+ * The longest a submitted value may MEASURE, once dashes are stripped.
  *
  * This bound exists for an entirely different reason from the one above, and
  * the pair is deliberately not one rule with two ends. It refuses a
@@ -144,43 +147,54 @@ const MIN_CANONICAL_APP_PASSWORD = 8;
  * more characters and can be sixteen too — and pretending otherwise is exactly
  * the over-tight rule the locked decision refuses.
  */
-const MAX_CANONICAL_APP_PASSWORD = 64;
-
-/**
- * The submitted app-specific password, reduced to the one form this server
- * uses.
- *
- * **One function, one place, and the direction is a decision rather than a
- * detail.** It strips the separators Apple displays and trims the ends, and
- * what it returns is BOTH what goes to Apple and what goes into the grant's
- * props. That is the point: the value the login proves and the value every
- * later request replays are the same bytes by construction, so they cannot
- * drift apart.
- *
- * Whitespace is trimmed at the ends only. Anything left in the middle is not
- * repaired here — `couldBeAppPassword` refuses it, because a value with a space
- * inside is far more likely to be a sentence than a credential, and silently
- * removing it would send a guess to Apple on the person's behalf.
- *
- * **The direction is gated on spike S5**, which is a manual check on the
- * owner's own account: no automated job in this repository may authenticate
- * against a real Apple ID, so nothing here can settle whether iCloud wants the
- * dashed form or the dashless one. Plan 11-07 runs S5 before the single deploy.
- * If it shows iCloud wants the dashes, the inversion is THIS FUNCTION and
- * nothing else — the caller, the props and the wire all follow whatever it
- * answers. The person typing may use either form either way.
- */
-function canonicalAppPassword(submitted: string): string {
-  return submitted.trim().replaceAll("-", "");
-}
+const MAX_MEASURED_APP_PASSWORD = 64;
 
 /**
  * Could this be an app-specific password at all? (LOGIN-03)
  *
- * It takes the ALREADY-CANONICAL value, never the raw one, and that is the same
- * habit `refusedRedirectBody` follows in taking an already-reduced destination:
- * the check and the thing that gets used are then provably the same value,
- * rather than two derivations that could disagree.
+ * **This server no longer transforms the password, and that is a decision
+ * rather than an omission.** What the person types is what reaches Apple, byte
+ * for byte, and it is the same bytes the grant stores. There is no canonical
+ * form, no stripping and no inserting.
+ *
+ * **Why there is nothing to invert here any more.** The value used to be
+ * reduced — separators dropped, ends trimmed — on the way to Apple, and the
+ * direction of that reduction was gated on spike S5: a manual check of whether
+ * iCloud accepts the dashless form, which no automated job in this repository
+ * may run (D-09). S5 was NOT RUN. The owner declined it on 2026-09-20, after
+ * finding that the planned procedure could not work: it said to re-enter the
+ * password in Mail.app, and Mail.app signs in through the Mac's system iCloud
+ * account and never sees an app-specific password at all.
+ *
+ * Rather than measure it, the transformation was removed. Apple publishes no
+ * format for these values — its own support page covers creating, managing and
+ * revoking them and says nothing about length, character set or grouping — so
+ * a server that edits the value is guessing at a grammar on the person's
+ * behalf. Passing it through is the honest position when the measurement is
+ * absent: Apple decides, because Apple is the only party that knows.
+ *
+ * **How to get the measurement later**, if somebody is refused at sign-in and
+ * suspects the dash form is why: swap the live `APPLE_APP_PASSWORD` secret to
+ * the dashless form, call `mail_imap_diagnose` for the IMAP half and
+ * `dav_diagnose` for the DAV half, then swap the secret back. Nothing in this
+ * file has to change first — the person can simply try the other form, because
+ * both now reach Apple as typed.
+ *
+ * **What this function still does, and why it is not the same act.** It derives
+ * its own MEASUREMENT form — trim the ends, drop the separators — purely to
+ * count characters, and that derived string never leaves this function. That
+ * containment is the one structural property worth protecting: no variable
+ * anywhere in this handler holds a transformed password, so there is nothing
+ * for a later session to pick up and send onward by accident. Stripping
+ * separators to COUNT and stripping them before SENDING are different acts, and
+ * they were separated on purpose. Do not fold them back together.
+ *
+ * The cost of passing through, accepted: a value carrying a stray leading or
+ * trailing space measures fine and reaches Apple with the space still on it,
+ * where it is refused. The page's help copy is what pays that down — it tells
+ * the reader to paste the value exactly as Apple showed it, and it is the only
+ * place they can learn that, because every credential failure answers with the
+ * same silent string.
  *
  * **This check is LOOSE on purpose, and this is the rule a later session will
  * be most tempted to tighten.** The argument, written here because a planning
@@ -219,12 +233,16 @@ function canonicalAppPassword(submitted: string): string {
  * before a principal is built at all — which is what makes "nothing was opened
  * to Apple" true of the shape refusal rather than merely likely.
  */
-function couldBeAppPassword(canonical: string): boolean {
-  if (canonical.length === 0) return false;
-  if (/\s/.test(canonical)) return false;
+function couldBeAppPassword(submitted: string): boolean {
+  // The measurement form, and it is a `const` inside this function on purpose:
+  // it is not in scope anywhere a credential could be sent from.
+  const measured = submitted.trim().replaceAll("-", "");
+
+  if (measured.length === 0) return false;
+  if (/\s/.test(measured)) return false;
   return (
-    canonical.length >= MIN_CANONICAL_APP_PASSWORD &&
-    canonical.length <= MAX_CANONICAL_APP_PASSWORD
+    measured.length >= MIN_MEASURED_APP_PASSWORD &&
+    measured.length <= MAX_MEASURED_APP_PASSWORD
   );
 }
 
@@ -1166,11 +1184,17 @@ async function handleAuthorize(
     // refusal below answers with the same body at the same status under the
     // same floor, the order is not observable from outside either.
     //
-    // The canonical form is derived ONCE, here, and carried down to both the
-    // principal and the props. Deriving it twice is how the value Apple is told
-    // and the value the grant stores come to disagree.
-    const appPassword = canonicalAppPassword(submittedPassword);
-    if (!couldBeAppPassword(appPassword)) return refuseCredential();
+    // Nothing is derived here, and the absence is the point. What the person
+    // typed is what reaches Apple and what the grant stores, so the two cannot
+    // disagree — there is no second derivation for them to disagree about.
+    // `couldBeAppPassword` carries the argument for why this server stopped
+    // transforming the value, and how to take the measurement that would be
+    // needed before transforming it again.
+    //
+    // The shape check is handed the RAW value and measures inside itself. That
+    // keeps every transformed form out of scope on this line, which is what
+    // stops a later session reaching for one.
+    if (!couldBeAppPassword(submittedPassword)) return refuseCredential();
 
     // The allow-list check sits ABOVE every use of the credentials, and that
     // placement is the whole of GATE-02: an address that is not on the list
@@ -1265,13 +1289,14 @@ async function handleAuthorize(
       // `principalFromProps` is the ONE constructor, and it refuses before any
       // socket exists: an unusable password — empty, whitespace-only, or
       // carrying a control character — throws here (D-19). What it is handed is
-      // the CANONICAL form derived above, which is the same value the props
-      // below carry, so the login this proves and every later request replay
-      // the identical bytes.
+      // the SUBMITTED value itself, which is also what the props below carry,
+      // so the login this proves and every later request replay the identical
+      // bytes. They are the same expression, not two derivations that happen to
+      // agree.
       const principal = await principalFromProps({
         v: PROPS_VERSION,
         appleId,
-        appPassword,
+        appPassword: submittedPassword,
       });
 
       // Set BEFORE the call rather than after it, because the moment the call
@@ -1352,10 +1377,15 @@ async function handleAuthorize(
       // Exactly the three keys `principalFromProps` accepts, and no fourth. It
       // derives the user id from the address every time, so a props object
       // carrying one of its own is refused for having an extra key.
+      //
+      // `submittedPassword` is named here for the SECOND and last time — the
+      // proof above named it once. Both sites name the same expression rather
+      // than a derived variable, which is what makes "the grant replays exactly
+      // what Apple accepted" true by construction instead of by inspection.
       props: {
         v: PROPS_VERSION,
         appleId,
-        appPassword,
+        appPassword: submittedPassword,
       },
       // `revokeExistingGrants` is left at its default, which is TRUE. A second
       // sign-in from the same client therefore replaces the first rather than

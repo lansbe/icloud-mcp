@@ -27,10 +27,20 @@
 // ---------------------------------------------------------------------------
 // The one claim in this contract that a HUMAN confirms, not this file.
 //
-// No copy line may force horizontal scrolling at 320px width. The longest
-// unbreakable token on the page is the example app-specific password in the
-// password field's help text, `abcd-efgh-ijkl-mnop`, and it must wrap rather
-// than overflow.
+// No copy line may force horizontal scrolling at 320px width.
+//
+// The longest unbreakable token USED to be the example app-specific password
+// in the password field's help text, `abcd-efgh-ijkl-mnop`. That example is
+// gone: spike S5 was declined on 2026-09-20, the handler stopped transforming
+// the submitted value, and the copy now tells the reader to paste it exactly as
+// Apple showed it rather than naming a shape the project cannot stand behind.
+//
+// So the risk this backstop covers went DOWN rather than away. The longest
+// remaining token on the page is a rendered destination origin, which already
+// has its own `overflow-wrap` treatment and its own row in the UI spec. The
+// note is kept rather than deleted because the claim is still the claim — no
+// copy line may force horizontal scrolling — and because a backstop that
+// silently loses its worst case looks exactly like one that was never needed.
 //
 // Nothing here can check that. This project has no browser in its test
 // environment — the suite runs inside the workers runtime, which lays nothing

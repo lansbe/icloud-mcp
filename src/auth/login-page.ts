@@ -39,6 +39,22 @@
 // error" — that reverses the decision. The Apple-throttle message is the sole
 // exception and it can only be built after Apple has already answered.
 //
+// **Which is why the password field's help copy is load-bearing.** With every
+// credential failure answering the same silent string, that one line is the
+// only place on the page a reader learns what to type. It used to name a shape
+// — sixteen letters, an example with dashes, and a claim that the dashes were
+// optional. That claim was only ever true if Apple said so, and Apple has never
+// published a format for these values; the shape came from one observed sample.
+// Spike S5, which would have measured it, was declined by the owner on
+// 2026-09-20, and the handler stopped editing the submitted value in the same
+// change. So the copy now tells the reader to paste the value exactly as Apple
+// showed it, which is advice this project can actually stand behind.
+//
+// Keep it above the field, where it is read before typing rather than after
+// submitting, and do not shorten it. If a future session reinstates a shape
+// claim here, it owes the measurement first — `couldBeAppPassword` in
+// `./login-handler` says how to take it.
+//
 // **The page must be recognisably NOT Apple's.** No Apple logo, no wordmark, no
 // Apple system blue, no imitation of Apple's own sign-in page. A page that asks
 // for an Apple credential while dressed as Apple teaches the reader that
@@ -600,7 +616,7 @@ export function renderForm(
     <p class="help" id="apple-id-help">The iCloud Mail address you sign in to Apple with.</p>
     <label for="app-password">App-specific password</label>
     <input id="app-password" name="${APP_PASSWORD_FIELD}" type="password" autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="${describes("app-password-help")}"${invalid} required>
-    <p class="help" id="app-password-help">Sixteen letters, like abcd-efgh-ijkl-mnop. Dashes are optional. Do not type your normal Apple ID password here.</p>
+    <p class="help" id="app-password-help">Paste it exactly as Apple showed it to you, dashes and all. Do not type your normal Apple ID password here.</p>
     <button type="submit" aria-describedby="submit-help">Sign in</button>
     <p class="help" id="submit-help">This takes a few seconds while Apple checks the password. Press it once.</p>
   </form>

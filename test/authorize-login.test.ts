@@ -502,13 +502,18 @@ describe("the props the ceremony is completed with", () => {
     expect(Object.keys(props).sort()).toEqual(["appPassword", "appleId", "v"]);
     expect(props.v).toBe(1);
     expect(props.appleId).toBe(LISTED_APPLE_ID);
-    // The CANONICAL form, not the form that was typed. LOGIN-04 strips the
-    // separators Apple displays, and the stored value is the one that goes to
-    // Apple, so a props object holding the typed form would mean the grant and
-    // the wire disagreed from the moment it was written. The block titled
-    // "the dashes a person may or may not type" is where that is the subject;
-    // this line is here so this case cannot go stale against it.
-    expect(props.appPassword).toBe(FAKE_APP_PASSWORD.replaceAll("-", ""));
+    // The form that was TYPED, unchanged. This line used to assert the
+    // opposite — the separators stripped — and the reversal is LOGIN-04's
+    // amendment: spike S5 was declined on 2026-09-20 and the handler stopped
+    // transforming the submitted value rather than guessing at a format Apple
+    // has never published.
+    //
+    // The claim underneath is unchanged and is the one that matters: the stored
+    // value is the value that went to Apple, so the grant and the wire cannot
+    // disagree from the moment it is written. The block titled "the dashes a
+    // person may or may not type" is where that is the subject; this line is
+    // here so this case cannot go stale against it.
+    expect(props.appPassword).toBe(FAKE_APP_PASSWORD);
   });
 
   it("names the user by a derived id, not by the address and not by owner", async () => {
@@ -783,7 +788,14 @@ const FAST_BOUNDS = {
 /** The observed shape, as a person is most likely to paste it. */
 const DASHED_PASSWORD = "dddd-eeee-ffff-gggg";
 
-/** The very same password, typed without the separators Apple showed. */
+/**
+ * The same characters, typed without the separators Apple showed.
+ *
+ * Deliberately NOT described as "the same password" any more. Whether iCloud
+ * treats these two as one credential is unmeasured — spike S5 was declined —
+ * and this server no longer takes a position on it. They are two different byte
+ * strings and they reach Apple as two different byte strings.
+ */
 const DASHLESS_PASSWORD = "ddddeeeeffffgggg";
 
 /**
@@ -792,8 +804,9 @@ const DASHLESS_PASSWORD = "ddddeeeeffffgggg";
  * The proof handed to the handler is the production one in every respect but
  * the socket: it calls `withMailSessionOver`, so the command line this reads
  * back is built by the code that builds the real one. Asserting a helper's
- * return value instead would prove that something canonicalises, not that the
- * canonical form is what Apple is actually told.
+ * return value instead would prove what some function answered, not what Apple
+ * is actually told — and "what Apple is actually told" is the entire claim now
+ * that the handler transforms nothing on the way there.
  *
  * Both passwords driven through here are declared in this file and are plainly
  * fake, so a failed assertion that prints the line discloses nothing. That is
@@ -899,31 +912,61 @@ describe("the app-password shape check, and what it deliberately does not check"
 
 describe("the dashes a person may or may not type", () => {
   // Titled so `-t "dashes"` matches — 11-VALIDATION.md's LOGIN-04 command.
+  //
+  // This block used to assert the opposite of what it asserts now, and the
+  // reversal is the whole of LOGIN-04's amendment. It used to hold that both
+  // forms reach Apple as the SAME bytes, because the handler stripped the
+  // separators on the way out. That behaviour was gated on spike S5 — a manual
+  // check of whether iCloud accepts the dashless form — and S5 was NOT RUN. The
+  // owner declined it on 2026-09-20 after finding the planned procedure could
+  // not work: it said to re-enter the password in Mail.app, which signs in
+  // through the Mac's system iCloud account and never sees an app-specific
+  // password at all.
+  //
+  // With no measurement, the transformation was removed rather than guessed at.
+  // Apple publishes no format for these values, so a server that edits one is
+  // inventing a grammar on the person's behalf. What ships is pass-through, and
+  // what these two cases pin is that pass-through is real in BOTH directions:
+  // nothing is stripped, and nothing is inserted.
 
-  it("reach Apple as the same bytes on the wire either way", async () => {
-    // Titled so `-t "wire"` matches as well, and the word is literal: this is
-    // the recorded outbound command line, not a value a helper handed back.
+  it("reach Apple as the bytes the person typed, on the wire", async () => {
+    // Titled so `-t "wire"` matches as well, and the word is literal: these are
+    // the recorded outbound command lines, not values a helper handed back.
     const dashed = await loginLineFor(DASHED_PASSWORD);
     const dashless = await loginLineFor(DASHLESS_PASSWORD);
 
-    expect(dashed).toBe(dashless);
-    expect(dashed).toBe(
+    // Each form arrives as itself. Asserting the full command line rather than
+    // a substring is what makes this a byte claim.
+    expect(dashed).toBe(`a2 LOGIN "${LISTED_APPLE_ID}" "${DASHED_PASSWORD}"`);
+    expect(dashless).toBe(
       `a2 LOGIN "${LISTED_APPLE_ID}" "${DASHLESS_PASSWORD}"`,
     );
+
+    // And they DIFFER. Without this row the pair above would still pass against
+    // a handler that stripped separators, on the day someone made the two
+    // constants equal — which is exactly how a pass-through claim rots back
+    // into a transformation nobody noticed.
+    expect(dashed).not.toBe(dashless);
   });
 
-  it("are stripped before the grant is written, so the grant and the wire agree", async () => {
-    // The other half of LOGIN-04, and the reason there is ONE canonicaliser: a
-    // grant holding the typed form while Apple was told the canonical one would
-    // work on the day it was written and fail on every request afterwards.
-    const record = recorder();
-    await handlerOver(record.proof).fetch(
-      post(LISTED_APPLE_ID, DASHED_PASSWORD),
-      stubEnv(record),
-    );
+  it("are written into the grant unchanged, so the grant and the wire agree", async () => {
+    // The other half of LOGIN-04. The wire value and the props value are now
+    // the same EXPRESSION in the handler rather than two derivations, so this
+    // case is pinning that nothing re-derives one of them on the way past.
+    //
+    // A grant holding a different form from the one Apple was told would work
+    // on the day it was written and fail on every request afterwards, because
+    // every later request replays the stored bytes and never the typed ones.
+    for (const password of [DASHED_PASSWORD, DASHLESS_PASSWORD]) {
+      const record = recorder();
+      await handlerOver(record.proof).fetch(
+        post(LISTED_APPLE_ID, password),
+        stubEnv(record),
+      );
 
-    const props = record.completed[0]?.props as Record<string, unknown>;
-    expect(props.appPassword).toBe(DASHLESS_PASSWORD);
+      const props = record.completed[0]?.props as Record<string, unknown>;
+      expect(props.appPassword).toBe(password);
+    }
   });
 });
 
