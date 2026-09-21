@@ -20,7 +20,8 @@
 //   unlisted address never reaches the proof, that the 503 gate beats the
 //   method dispatch, that `completeAuthorization` received exactly these
 //   arguments — cannot be observed from outside a real provider. Those drive
-//   `createLoginHandler(proof).fetch` directly with a recording stub.
+//   `createLoginHandler(proof).fetch` directly with a recording stub, through
+//   the `handlerOver` helper below.
 //
 //   An INJECTED PROOF. D-09 forbids any automated login to a real Apple ID:
 //   no test, CI job, pre-commit hook or post-deploy check ever authenticates
@@ -49,8 +50,21 @@
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { LoginProof } from "../src/auth/login-handler";
-import { UNCONFIGURED_BODY, createLoginHandler } from "../src/auth/login-handler";
+import {
+  FAILURE_FLOOR_MS,
+  UNCONFIGURED_BODY,
+  createLoginHandler,
+} from "../src/auth/login-handler";
+import {
+  APPLE_THROTTLE_BODY,
+  CREDENTIAL_FAILURE_BODY,
+} from "../src/auth/login-page";
 import type { Env, LoginGateSecret } from "../src/env";
+import {
+  ImapAuthError,
+  ImapConnectError,
+  ImapThrottleError,
+} from "../src/errors";
 import { withMailSessionOver } from "../src/mail/service";
 import { entryEnv } from "./fixtures/bound-secrets";
 import { createFakeDuplex } from "./fixtures/fake-duplex";
@@ -82,6 +96,27 @@ const ORIGIN = `https://${DEPLOYED_HOSTNAME}`;
  */
 const STUB_ALLOW_LIST = JSON.stringify([LISTED_APPLE_ID]);
 
+/**
+ * The floor almost every case in this file injects, in milliseconds.
+ *
+ * Small on purpose. The production figure is three seconds, and every failing
+ * path sleeps whatever is left of it — so a suite that took the default would
+ * pay three seconds for each of roughly twenty refusals, for a property each
+ * case demonstrates just as well in a tenth of that. The injectable floor
+ * exists for exactly this and defaults to the exported constant, so production
+ * behaviour is unchanged.
+ *
+ * Exactly ONE case declines this helper and builds the handler the way
+ * production does, and that case is what stops the injection from hiding a
+ * default that had quietly become a tenth of a second.
+ */
+const TEST_FLOOR_MS = 120;
+
+/** The handler under test, with the floor injected small. */
+function handlerOver(proof: LoginProof, floorMs: number = TEST_FLOOR_MS) {
+  return createLoginHandler(proof, floorMs);
+}
+
 /** A query the stub provider is happy to parse. */
 const STUB_QUERY = "response_type=code&client_id=stub-client";
 
@@ -112,8 +147,15 @@ interface Recorder {
  * rejects out of `withMailSession`, and the handler branches on the error's
  * type and never on a returned flag. A stub answering `false` instead would be
  * exercising control flow this server does not have.
+ *
+ * `rejectWith` builds the error to throw, so a case can pick the TYPE the
+ * handler's mapping branches on. It is a factory rather than an instance
+ * because a shared error object reused across cases would carry one stack into
+ * all of them.
  */
-function recorder(options: { refuse?: boolean } = {}): Recorder {
+function recorder(
+  options: { refuse?: boolean; rejectWith?: () => Error } = {},
+): Recorder {
   const calls: string[] = [];
   const completed: CompleteArgs[] = [];
   let proofCalls = 0;
@@ -122,17 +164,24 @@ function recorder(options: { refuse?: boolean } = {}): Recorder {
     completed,
     proof: async () => {
       proofCalls += 1;
+      if (options.rejectWith) throw options.rejectWith();
       if (options.refuse) throw new Error("the injected proof refused");
     },
     proofCalls: () => proofCalls,
   };
 }
 
-/** A KV stub: no real namespace, nothing over the cap. */
-function quietKv() {
+/**
+ * A KV stub: no real namespace, and nothing over the cap unless asked.
+ *
+ * `failures` exists so one case can drive the SOURCE-connection refusal, which
+ * is the one refusal on this surface with a status of its own and therefore the
+ * one most easily left out of a floor table.
+ */
+function quietKv(failures?: number) {
   return {
     async get() {
-      return null;
+      return failures === undefined ? null : String(failures);
     },
     async put() {
       /* nothing here asserts on the counter. */
@@ -149,10 +198,10 @@ function quietKv() {
  */
 function stubEnv(
   record: Recorder,
-  options: { allowList?: string | undefined } = {},
+  options: { allowList?: string | undefined; failures?: number } = {},
 ): Env & LoginGateSecret {
   return {
-    OAUTH_KV: quietKv(),
+    OAUTH_KV: quietKv(options.failures),
     ALLOWED_APPLE_IDS:
       "allowList" in options ? options.allowList : STUB_ALLOW_LIST,
     OAUTH_PROVIDER: {
@@ -210,7 +259,7 @@ describe("the method dispatch", () => {
 
   it("renders the form on a GET, asking for an Apple ID and a password", async () => {
     const record = recorder();
-    const response = await createLoginHandler(record.proof).fetch(
+    const response = await handlerOver(record.proof).fetch(
       get(),
       stubEnv(record),
     );
@@ -232,7 +281,7 @@ describe("the method dispatch", () => {
 
   it("refuses a method that is neither GET nor POST", async () => {
     const record = recorder();
-    const handler = createLoginHandler(record.proof);
+    const handler = handlerOver(record.proof);
 
     for (const name of ["PUT", "DELETE", "PATCH"]) {
       const response = await handler.fetch(verb(name), stubEnv(record));
@@ -250,7 +299,7 @@ describe("one login, and only one, for a sign-in that works", () => {
 
   it("ends in a 302 and calls the proof exactly once", async () => {
     const record = recorder();
-    const response = await createLoginHandler(record.proof).fetch(
+    const response = await handlerOver(record.proof).fetch(
       post(LISTED_APPLE_ID),
       stubEnv(record),
     );
@@ -268,7 +317,7 @@ describe("one login, and only one, for a sign-in that works", () => {
     // The proof still ran — the address was listed, so asking Apple was the
     // right thing to do — but nothing was stored and nothing was redirected.
     const record = recorder({ refuse: true });
-    const response = await createLoginHandler(record.proof).fetch(
+    const response = await handlerOver(record.proof).fetch(
       post(LISTED_APPLE_ID),
       stubEnv(record),
     );
@@ -285,7 +334,7 @@ describe("the props the ceremony is completed with", () => {
 
   it("holds exactly the version, the address and the password", async () => {
     const record = recorder();
-    await createLoginHandler(record.proof).fetch(
+    await handlerOver(record.proof).fetch(
       post(LISTED_APPLE_ID),
       stubEnv(record),
     );
@@ -313,7 +362,7 @@ describe("the props the ceremony is completed with", () => {
 
   it("names the user by a derived id, not by the address and not by owner", async () => {
     const record = recorder();
-    await createLoginHandler(record.proof).fetch(
+    await handlerOver(record.proof).fetch(
       post(LISTED_APPLE_ID),
       stubEnv(record),
     );
@@ -335,7 +384,7 @@ describe("the props the ceremony is completed with", () => {
     // Metadata is not encrypted the way props are. Nothing about the person
     // goes in it — not the address, not the id derived from it.
     const record = recorder();
-    await createLoginHandler(record.proof).fetch(
+    await handlerOver(record.proof).fetch(
       post(LISTED_APPLE_ID),
       stubEnv(record),
     );
@@ -353,7 +402,7 @@ describe("an address that is not on the list", () => {
     // cannot tell "refused before the socket" from "refused after the login
     // failed" — both are a 401. Only the counter can.
     const record = recorder();
-    const response = await createLoginHandler(record.proof).fetch(
+    const response = await handlerOver(record.proof).fetch(
       post(UNLISTED_APPLE_ID),
       stubEnv(record),
     );
@@ -372,11 +421,11 @@ describe("an address that is not on the list", () => {
     const unlisted = recorder();
     const refused = recorder({ refuse: true });
 
-    const a = await createLoginHandler(unlisted.proof).fetch(
+    const a = await handlerOver(unlisted.proof).fetch(
       post(UNLISTED_APPLE_ID),
       stubEnv(unlisted),
     );
-    const b = await createLoginHandler(refused.proof).fetch(
+    const b = await handlerOver(refused.proof).fetch(
       post(LISTED_APPLE_ID),
       stubEnv(refused),
     );
@@ -390,7 +439,7 @@ describe("an address that is not on the list", () => {
     // against the list, it is refused — and it is refused here rather than by
     // the principal constructor, so nothing is built for it either.
     const record = recorder();
-    const response = await createLoginHandler(record.proof).fetch(
+    const response = await handlerOver(record.proof).fetch(
       post("no-at-sign-at-all"),
       stubEnv(record),
     );
@@ -406,7 +455,7 @@ describe("an address that is not on the list", () => {
     // plan 11-04's, deliberately, because a strict rule that is wrong refuses a
     // legitimate person with a silent failure.
     const record = recorder();
-    const response = await createLoginHandler(record.proof).fetch(
+    const response = await handlerOver(record.proof).fetch(
       post(LISTED_APPLE_ID, ""),
       stubEnv(record),
     );
@@ -436,7 +485,7 @@ describe("a deployment with no usable allow list refuses to authorize", () => {
     // by a deployment that cannot say who may sign in invites a submission
     // nobody can act on.
     const record = recorder();
-    const response = await createLoginHandler(record.proof).fetch(
+    const response = await handlerOver(record.proof).fetch(
       get(),
       stubEnv(record, { allowList: list }),
     );
@@ -455,7 +504,7 @@ describe("a deployment with no usable allow list refuses to authorize", () => {
 
   it.each(UNUSABLE)("answers 503 to a POST when the list is %s", async (_label, list) => {
     const record = recorder();
-    const response = await createLoginHandler(record.proof).fetch(
+    const response = await handlerOver(record.proof).fetch(
       post(LISTED_APPLE_ID),
       stubEnv(record, { allowList: list }),
     );
@@ -470,7 +519,7 @@ describe("a deployment with no usable allow list refuses to authorize", () => {
     // The body is a fixed constant that interpolates nothing, which is what
     // lets it stay true for an allow list after being written for a secret.
     const record = recorder();
-    const body = await createLoginHandler(record.proof)
+    const body = await handlerOver(record.proof)
       .fetch(get(), stubEnv(record, { allowList: undefined }))
       .then((response) => response.text());
 
@@ -483,7 +532,7 @@ describe("a deployment with no usable allow list refuses to authorize", () => {
     // pathname check it would answer 503 here too, and `defaultHandler` would
     // become a second reachable surface.
     const record = recorder();
-    const response = await createLoginHandler(record.proof).fetch(
+    const response = await handlerOver(record.proof).fetch(
       new Request(`${ORIGIN}/anything-else`),
       stubEnv(record, { allowList: undefined }),
     );
@@ -535,7 +584,7 @@ describe("the round trip: what the page stores is what the door serves", () => {
 
   it("serves the very props the login page recorded", async () => {
     const record = recorder();
-    const response = await createLoginHandler(record.proof).fetch(
+    const response = await handlerOver(record.proof).fetch(
       post(LISTED_APPLE_ID),
       stubEnv(record),
     );
@@ -621,7 +670,7 @@ async function loginLineFor(typed: string): Promise<string | undefined> {
       FAST_BOUNDS,
     );
 
-  const response = await createLoginHandler(overTheWire).fetch(
+  const response = await handlerOver(overTheWire).fetch(
     post(LISTED_APPLE_ID, typed),
     stubEnv(record),
   );
@@ -654,7 +703,7 @@ describe("the app-password shape check, and what it deliberately does not check"
     "refuses a password that is %s, with nothing opened to Apple",
     async (_label, password) => {
       const record = recorder();
-      const response = await createLoginHandler(record.proof).fetch(
+      const response = await handlerOver(record.proof).fetch(
         post(LISTED_APPLE_ID, password),
         stubEnv(record),
       );
@@ -686,7 +735,7 @@ describe("the app-password shape check, and what it deliberately does not check"
       // rule would refuse it behind a message that deliberately will not say
       // why — locking out a legitimate person with no way to learn the reason.
       const record = recorder();
-      const response = await createLoginHandler(record.proof).fetch(
+      const response = await handlerOver(record.proof).fetch(
         post(LISTED_APPLE_ID, password),
         stubEnv(record),
       );
@@ -717,12 +766,270 @@ describe("the dashes a person may or may not type", () => {
     // grant holding the typed form while Apple was told the canonical one would
     // work on the day it was written and fail on every request afterwards.
     const record = recorder();
-    await createLoginHandler(record.proof).fetch(
+    await handlerOver(record.proof).fetch(
       post(LISTED_APPLE_ID, DASHED_PASSWORD),
       stubEnv(record),
     );
 
     const props = record.completed[0]?.props as Record<string, unknown>;
     expect(props.appPassword).toBe(DASHLESS_PASSWORD);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LOGIN-05. Every credential-path failure takes the same wall-clock and says
+// the same thing, apart from the one message that can only be built after Apple
+// has already answered.
+// ---------------------------------------------------------------------------
+
+/** How long one call to the handler took, wall-clock, from outside it. */
+async function timed(call: () => Promise<Response>): Promise<{
+  response: Response;
+  elapsed: number;
+}> {
+  const started = Date.now();
+  const response = await call();
+  return { response, elapsed: Date.now() - started };
+}
+
+describe("every failed sign-in answers with the same body", () => {
+  // Titled so `-t "same body"` matches — 11-VALIDATION.md's LOGIN-05 command.
+
+  it("gives an unlisted address and a wrong password the same body and the same status", async () => {
+    // The case criterion 3 lives or dies on. One of these two answers happened
+    // without Apple ever being contacted and the other happened after Apple
+    // turned the password down, and a reader must not be able to tell which.
+    const unlisted = recorder();
+    const wrong = recorder({ refuse: true });
+
+    const a = await handlerOver(unlisted.proof).fetch(
+      post(UNLISTED_APPLE_ID),
+      stubEnv(unlisted),
+    );
+    const b = await handlerOver(wrong.proof).fetch(
+      post(LISTED_APPLE_ID),
+      stubEnv(wrong),
+    );
+
+    expect(unlisted.proofCalls()).toBe(0);
+    expect(wrong.proofCalls()).toBe(1);
+    expect(a.status).toBe(401);
+    expect(b.status).toBe(a.status);
+
+    const bodyA = await a.text();
+    expect(bodyA).toBe(await b.text());
+
+    // Against the exported constant, never a retyped sentence: a copy of the
+    // wording in this file could drift from the page's and leave the equality
+    // above passing while both answers said something nobody approved.
+    for (const line of CREDENTIAL_FAILURE_BODY) {
+      expect(bodyA).toContain(line);
+    }
+  });
+
+  it("gives a badly-shaped password the same body as a wrong one", async () => {
+    // The member the owner most recently declined to split out. The UI
+    // researcher argued a shape failure is a pure function of what the reader
+    // typed and therefore leaks nothing; the owner declined, to remove the last
+    // place a credential-path message varies at all.
+    const shape = recorder();
+    const wrong = recorder({ refuse: true });
+
+    const a = await handlerOver(shape.proof).fetch(
+      post(LISTED_APPLE_ID, "abcd"),
+      stubEnv(shape),
+    );
+    const b = await handlerOver(wrong.proof).fetch(
+      post(LISTED_APPLE_ID),
+      stubEnv(wrong),
+    );
+
+    expect(shape.proofCalls()).toBe(0);
+    expect(a.status).toBe(b.status);
+    expect(await a.text()).toBe(await b.text());
+  });
+});
+
+describe("the time floor, on every failing path", () => {
+  // Titled so `-t "floor"` matches — 11-VALIDATION.md's second LOGIN-05
+  // command. A floor applied only after the allow-list check would let a
+  // stopwatch sort listed addresses from unlisted ones, which is the exact leak
+  // it exists to close — so every path gets its own row rather than one row
+  // standing in for the rest.
+
+  it("holds a shape refusal, which opened nothing at all", async () => {
+    // The path with no I/O between the handler's entry and the refusal. In this
+    // runtime the clock does not advance during code execution, so the elapsed
+    // time reads as zero here and the whole floor is slept. That is the correct
+    // answer for a path that did no work.
+    const record = recorder();
+    const { response, elapsed } = await timed(() =>
+      handlerOver(record.proof).fetch(
+        post(LISTED_APPLE_ID, "abcd"),
+        stubEnv(record),
+      ),
+    );
+
+    expect(record.proofCalls()).toBe(0);
+    expect(response.status).toBe(401);
+    expect(elapsed).toBeGreaterThanOrEqual(TEST_FLOOR_MS);
+  });
+
+  it("holds an address that is not on the list", async () => {
+    const record = recorder();
+    const { response, elapsed } = await timed(() =>
+      handlerOver(record.proof).fetch(
+        post(UNLISTED_APPLE_ID),
+        stubEnv(record),
+      ),
+    );
+
+    expect(record.proofCalls()).toBe(0);
+    expect(response.status).toBe(401);
+    expect(elapsed).toBeGreaterThanOrEqual(TEST_FLOOR_MS);
+  });
+
+  it("holds an address this server cannot read at all", async () => {
+    const record = recorder();
+    const { response, elapsed } = await timed(() =>
+      handlerOver(record.proof).fetch(
+        post("no-at-sign-at-all"),
+        stubEnv(record),
+      ),
+    );
+
+    expect(response.status).toBe(401);
+    expect(elapsed).toBeGreaterThanOrEqual(TEST_FLOOR_MS);
+  });
+
+  it("holds a password Apple turned down", async () => {
+    const record = recorder({ rejectWith: () => new ImapAuthError() });
+    const { response, elapsed } = await timed(() =>
+      handlerOver(record.proof).fetch(
+        post(LISTED_APPLE_ID),
+        stubEnv(record),
+      ),
+    );
+
+    expect(record.proofCalls()).toBe(1);
+    expect(response.status).toBe(401);
+    expect(elapsed).toBeGreaterThanOrEqual(TEST_FLOOR_MS);
+  });
+
+  it("holds an Apple that is refusing on availability grounds", async () => {
+    const record = recorder({ rejectWith: () => new ImapThrottleError() });
+    const { response, elapsed } = await timed(() =>
+      handlerOver(record.proof).fetch(
+        post(LISTED_APPLE_ID),
+        stubEnv(record),
+      ),
+    );
+
+    expect(response.status).toBe(401);
+    expect(elapsed).toBeGreaterThanOrEqual(TEST_FLOOR_MS);
+  });
+
+  it("holds the source-connection refusal too, which costs wall-clock knowingly", async () => {
+    // The row most easily left out, because it is the one refusal with a status
+    // of its own. Skipping it would be the leak: a 429 that returned instantly
+    // while every other answer took the floor is a signal in itself.
+    const record = recorder();
+    const { response, elapsed } = await timed(() =>
+      handlerOver(record.proof).fetch(
+        post(LISTED_APPLE_ID),
+        stubEnv(record, { failures: 10 }),
+      ),
+    );
+
+    expect(response.status).toBe(429);
+    expect(record.proofCalls()).toBe(0);
+    expect(elapsed).toBeGreaterThanOrEqual(TEST_FLOOR_MS);
+  });
+
+  it(
+    "defaults to the production floor when nothing injects one",
+    async () => {
+      // The case that proves the default is the real figure rather than the
+      // injected one. Without it every row above would hold against a handler
+      // whose production default had quietly become a tenth of a second.
+      expect(FAILURE_FLOOR_MS).toBe(3000);
+
+      // The one call in this file that does NOT go through `handlerOver`. It
+      // builds the handler the way `src/auth/oauth.ts` builds it — with no
+      // second argument at all — which is the only way the default can be the
+      // thing under test rather than the thing being bypassed.
+      const record = recorder();
+      const { response, elapsed } = await timed(() =>
+        createLoginHandler(record.proof).fetch(
+          post(UNLISTED_APPLE_ID),
+          stubEnv(record),
+        ),
+      );
+
+      expect(response.status).toBe(401);
+      expect(elapsed).toBeGreaterThanOrEqual(FAILURE_FLOOR_MS);
+    },
+    10_000,
+  );
+});
+
+describe("what the page says depends on the error's type and on nothing else", () => {
+  it("renders the throttle message when Apple refused on availability grounds", async () => {
+    const record = recorder({ rejectWith: () => new ImapThrottleError() });
+    const response = await handlerOver(record.proof).fetch(post(LISTED_APPLE_ID), stubEnv(record));
+    const body = await response.text();
+
+    expect(response.status).toBe(401);
+    for (const line of APPLE_THROTTLE_BODY) {
+      expect(body).toContain(line);
+    }
+    // And not the other one. A page carrying both would be a page that told a
+    // reader to check a password AND to wait, which is two instructions for one
+    // event.
+    expect(body).not.toContain(CREDENTIAL_FAILURE_BODY[0]);
+  });
+
+  it("renders the throttle message for a connect or read failure as well", async () => {
+    // The row research left open and this plan decided. The throttle wording is
+    // literally true of a connect failure; the single failure string is false
+    // of it, and would send a family member hunting for a typo that is not
+    // there. It can only fire after the allow-list check passed, so it leaks
+    // nothing the throttle message did not already leak.
+    const record = recorder({ rejectWith: () => new ImapConnectError() });
+    const body = await handlerOver(record.proof)
+      .fetch(post(LISTED_APPLE_ID), stubEnv(record))
+      .then((response) => response.text());
+
+    for (const line of APPLE_THROTTLE_BODY) {
+      expect(body).toContain(line);
+    }
+  });
+
+  it("renders the single failure string when Apple turned the password down", async () => {
+    const record = recorder({ rejectWith: () => new ImapAuthError() });
+    const body = await handlerOver(record.proof)
+      .fetch(post(LISTED_APPLE_ID), stubEnv(record))
+      .then((response) => response.text());
+
+    for (const line of CREDENTIAL_FAILURE_BODY) {
+      expect(body).toContain(line);
+    }
+    expect(body).not.toContain(APPLE_THROTTLE_BODY[0]);
+  });
+
+  it("renders the single failure string for an error it has never seen", async () => {
+    // Failing toward the SILENT answer, deliberately. No live refusal has ever
+    // been observed from iCloud, so every code the classifier matches comes
+    // from the specification rather than from evidence; an unfamiliar error
+    // must not be promoted into the one message that discloses list membership.
+    const record = recorder({ rejectWith: () => new Error("something else") });
+    const body = await handlerOver(record.proof)
+      .fetch(post(LISTED_APPLE_ID), stubEnv(record))
+      .then((response) => response.text());
+
+    for (const line of CREDENTIAL_FAILURE_BODY) {
+      expect(body).toContain(line);
+    }
+    expect(body).not.toContain(APPLE_THROTTLE_BODY[0]);
   });
 });

@@ -46,7 +46,11 @@
 
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { loginHandler } from "../src/auth/login-handler";
+import {
+  FAILURE_FLOOR_MS,
+  createLoginHandler,
+  loginHandler,
+} from "../src/auth/login-handler";
 import { CREDENTIAL_FAILURE_BODY } from "../src/auth/login-page";
 import type { Env, LoginGateSecret } from "../src/env";
 import { entryEnv } from "./fixtures/bound-secrets";
@@ -388,6 +392,25 @@ describe("resolution sits below the cap check and above the comparison", () => {
   });
 });
 
+/**
+ * The same handler with the failure floor injected small.
+ *
+ * The two blocks below are about the counter's KEY and about the counter's
+ * WRITE, and about nothing else — but every case in them drives a failing
+ * path, which since Phase 11 sleeps whatever is left of a three-second floor.
+ * Two of them make two calls each, so at the production figure they exceed the
+ * default test timeout while proving nothing extra. The one case that IS about
+ * the floor keeps the production handler, which is what stops this injection
+ * hiding a default that had quietly changed.
+ *
+ * The proof THROWS rather than counting. No case here posts a listed address,
+ * so reaching it at all would mean the allow-list check had stopped running —
+ * and a throw says that loudly instead of passing quietly.
+ */
+const fastLogin = createLoginHandler(async () => {
+  throw new Error("the login proof must not be reached by these cases");
+}, 120);
+
 describe("one party's failures are not everyone's", () => {
   const QUERY = "response_type=code&client_id=stub-client";
 
@@ -398,11 +421,11 @@ describe("one party's failures are not everyone's", () => {
     // price of ten HTTP requests, sustainable indefinitely.
     const kv = recordingKv();
 
-    await loginHandler.fetch(
+    await fastLogin.fetch(
       post(UNLISTED_APPLE_ID, QUERY, { "cf-connecting-ip": "203.0.113.1" }),
       stubEnv({ kv: kv.kv }),
     );
-    await loginHandler.fetch(
+    await fastLogin.fetch(
       post(UNLISTED_APPLE_ID, QUERY, { "cf-connecting-ip": "198.51.100.2" }),
       stubEnv({ kv: kv.kv }),
     );
@@ -416,7 +439,7 @@ describe("one party's failures are not everyone's", () => {
     // way past the counter is to send one fewer header.
     const kv = recordingKv();
 
-    const response = await loginHandler.fetch(
+    const response = await fastLogin.fetch(
       post(UNLISTED_APPLE_ID, QUERY),
       stubEnv({ kv: kv.kv }),
     );
@@ -432,11 +455,11 @@ describe("one party's failures are not everyone's", () => {
       value: (key) => (key.includes("203.0.113.9") ? "10" : null),
     });
 
-    const capped = await loginHandler.fetch(
+    const capped = await fastLogin.fetch(
       post(UNLISTED_APPLE_ID, QUERY, { "cf-connecting-ip": "203.0.113.9" }),
       stubEnv({ kv: overCap.kv }),
     );
-    const other = await loginHandler.fetch(
+    const other = await fastLogin.fetch(
       post(UNLISTED_APPLE_ID, QUERY, { "cf-connecting-ip": "198.51.100.9" }),
       stubEnv({ kv: overCap.kv }),
     );
@@ -455,7 +478,7 @@ describe("the counter's write cannot change the response", () => {
     // from a quiet request.
     const kv = recordingKv({ putRejects: true });
 
-    const response = await loginHandler.fetch(
+    const response = await fastLogin.fetch(
       post(UNLISTED_APPLE_ID, "response_type=code&client_id=stub-client", {
         "cf-connecting-ip": "203.0.113.55",
       }),
@@ -467,17 +490,29 @@ describe("the counter's write cannot change the response", () => {
     expect(await response.text()).toContain(CREDENTIAL_FAILURE_BODY[0]);
   });
 
-  it("pays a delay a human does not notice and a parallel guesser is not slowed by", async () => {
-    // The delay is the limiter that does not depend on a durable counter
-    // succeeding, which is why its value is asserted rather than assumed.
-    const started = Date.now();
-    await loginHandler.fetch(
-      post(UNLISTED_APPLE_ID, "response_type=code&client_id=stub-client", {
-        "cf-connecting-ip": "203.0.113.56",
-      }),
-      stubEnv({}),
-    );
+  it(
+    "pays a delay a human does not notice and a parallel guesser is not slowed by",
+    async () => {
+      // The delay is the limiter that does not depend on a durable counter
+      // succeeding, which is why its value is asserted rather than assumed.
+      //
+      // Phase 11 turned it from a fixed penalty into a FLOOR measured from the
+      // handler's entry, and this is the one case in this file that still
+      // drives the production handler with no floor injected — so the figure
+      // below is the deployed one. It is compared against the exported
+      // constant rather than a number typed here: a retyped figure would go
+      // stale the day spike S6 resizes the floor, and it would go stale
+      // silently, in the direction that keeps the case green.
+      const started = Date.now();
+      await loginHandler.fetch(
+        post(UNLISTED_APPLE_ID, "response_type=code&client_id=stub-client", {
+          "cf-connecting-ip": "203.0.113.56",
+        }),
+        stubEnv({}),
+      );
 
-    expect(Date.now() - started).toBeGreaterThanOrEqual(900);
-  });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(FAILURE_FLOOR_MS);
+    },
+    10_000,
+  );
 });

@@ -93,6 +93,7 @@ import { AuthorizationError } from "@cloudflare/workers-oauth-provider";
 import type { ClientInfo } from "@cloudflare/workers-oauth-provider";
 import { isConfiguredSecret } from "../configured-secret";
 import type { Env, LoginGateSecret } from "../env";
+import { ImapConnectError, ImapThrottleError } from "../errors";
 import type { SessionGate } from "../mail/service";
 import { createSessionGate, withMailSession } from "../mail/service";
 import type { Principal } from "../principal";
@@ -271,6 +272,14 @@ export type LoginProof = (
  * The callback does nothing and returns nothing. Reaching it at all IS the
  * proof — the session only exists once the server answered the login with OK.
  *
+ * `oneAttemptPerGuess` is the login-path option plan 11-03 added, and THIS is
+ * the one call site that passes it. A wrong password costs Apple two attempts
+ * by default, because the session falls back to a second mechanism when the
+ * first is refused; on this path that fallback buys nothing — the caller
+ * already treats both refusals as the same answer — and it doubles what Apple
+ * sees per guess against an account whose lockout threshold Apple does not
+ * publish. The tools keep both mechanisms: a tool call is not a guess.
+ *
  * **No second session helper.** Convention 3 permits exactly one orchestrator
  * and this calls it. Nothing here opens a socket, holds one, or fans out.
  */
@@ -278,24 +287,70 @@ async function proveWithApple(
   principal: Principal,
   gate: SessionGate,
 ): Promise<void> {
-  await withMailSession(principal, gate, null, null, async () => {});
+  await withMailSession(principal, gate, null, null, async () => {}, {
+    oneAttemptPerGuess: true,
+  });
 }
 
 /**
- * Fixed penalty on a failed attempt, before any response is written.
+ * How long a failed sign-in takes, at minimum, measured from the handler's
+ * entry.
  *
- * One second, not the quarter second this started at, because the asymmetry
- * runs entirely one way: a human typing a password does not notice a second,
- * and a parallel guesser is not slowed by a quarter second either way — 200
- * concurrent guesses pay the delay in parallel, so the round costs whatever
- * one request costs. The only party a short delay was gentle to was the one it
- * was aimed at.
+ * A FLOOR rather than the fixed penalty this replaces, and the difference is
+ * the whole of what it buys. A fixed delay added to whatever the work already
+ * cost leaves the work's own duration visible: an allow-list refusal returns
+ * almost instantly plus the delay, a real login returns after a round trip to
+ * Apple plus the delay, and a stopwatch sorts listed addresses from unlisted
+ * ones by the gap. A floor measured from entry makes every failing answer take
+ * the same wall-clock no matter which branch produced it.
+ *
+ * Three seconds, not the one it replaces, and the asymmetry argument carries
+ * forward unchanged: a person typing a password does not notice three seconds,
+ * and a parallel guesser is not slowed by a shorter one either way — two
+ * hundred concurrent guesses pay the delay in parallel, so the round costs
+ * whatever one request costs. The only party a short delay was ever gentle to
+ * was the one it was aimed at.
+ *
+ * **The figure is sized by spike S6 in plan 11-07**, which measures a real IMAP
+ * login from the deployed Worker. If a real login turns out to exceed this, the
+ * leftover leak is accepted IN WRITING rather than the floor being raised
+ * indefinitely: a floor that chases the slowest observed login grows without
+ * bound and makes the page unusable to defend against a stopwatch nobody has
+ * been observed holding.
+ *
+ * Exported so a test asserts the production default against the value the
+ * handler actually sleeps rather than a retyped number, and so the injected
+ * floor below has something to default to.
  *
  * This is also the limiter that does not depend on a durable counter
  * succeeding, which is why the counter's write is allowed to fail below and
  * this is not.
  */
-const FAILURE_DELAY_MS = 1000;
+export const FAILURE_FLOOR_MS = 3000;
+
+/**
+ * Sleep whatever is left of the floor, counted from ONE timestamp.
+ *
+ * **The arithmetic looks wrong without the runtime fact beside it.** In this
+ * runtime the clock returns the time of the last input or output and does not
+ * advance during code execution. On the shape-refusal path there is no I/O at
+ * all between the handler's entry and the refusal, so the elapsed time reads as
+ * exactly zero and this sleeps the whole floor. That is the correct answer for
+ * a path that did no work, and it is the direction the arithmetic fails in:
+ * safe, not leaky.
+ *
+ * The remainder is computed from `started` at each failing return and is NEVER
+ * accumulated per step. A running total would drift with every branch that
+ * forgot to add to it, and the branch that forgot would be the fast one — the
+ * refusal — which is precisely the one the floor exists to slow down.
+ *
+ * The sleep idiom is the one this file already used twice before the floor
+ * replaced them.
+ */
+async function holdFloor(started: number, floorMs: number): Promise<void> {
+  const remaining = Math.max(0, floorMs - (Date.now() - started));
+  await new Promise((resolve) => setTimeout(resolve, remaining));
+}
 
 /** Width of the brute-force counter's time bucket. */
 const BUCKET_SECONDS = 300;
@@ -672,8 +727,17 @@ function authorizationErrorResponse(error: AuthorizationError): Response {
  * a counting stub instead, which is how D-09 is kept (no automated login to a
  * real Apple ID, ever) and how "zero sockets were opened for that request"
  * becomes something a test can assert rather than infer.
+ *
+ * `floorMs` is the second seam, and it has the same default-to-the-exported-
+ * value property the mail session options already have: production passes
+ * nothing and behaves exactly as the constant says. A test can then exercise
+ * every failure path for a few milliseconds each instead of three seconds each,
+ * while one case still drives the default and asserts the real figure.
  */
-export function createLoginHandler(proof: LoginProof = proveWithApple): {
+export function createLoginHandler(
+  proof: LoginProof = proveWithApple,
+  floorMs: number = FAILURE_FLOOR_MS,
+): {
   fetch(request: Request, env: Env & LoginGateSecret): Promise<Response>;
 } {
   return {
@@ -681,7 +745,13 @@ export function createLoginHandler(proof: LoginProof = proveWithApple): {
       request: Request,
       env: Env & LoginGateSecret,
     ): Promise<Response> {
-      return handleAuthorize(request, env, proof);
+      // The floor's clock starts HERE, as the first statement of the request
+      // handler, before the pathname is read and before any branch exists to
+      // be timed. Anything taken later would start the clock after some of the
+      // work, and the amount of work already done is exactly what the floor is
+      // hiding.
+      const started = Date.now();
+      return handleAuthorize(request, env, proof, floorMs, started);
     },
   };
 }
@@ -709,6 +779,8 @@ async function handleAuthorize(
   request: Request,
   env: Env & LoginGateSecret,
   proof: LoginProof,
+  floorMs: number,
+  started: number,
 ): Promise<Response> {
   {
     const url = new URL(request.url);
@@ -815,7 +887,20 @@ async function handleAuthorize(
     const key = failureKey(request);
     const failures = Number((await env.OAUTH_KV.get(key)) ?? "0");
     if (failures >= MAX_FAILURES_PER_BUCKET) {
-      await new Promise((resolve) => setTimeout(resolve, FAILURE_DELAY_MS));
+      // The floor applies HERE too, and that is decided rather than incidental.
+      // A floor applied only after the allow-list check would let a stopwatch
+      // sort listed addresses from unlisted ones, which is the exact leak the
+      // floor exists to close, and a refusal that returned early would be the
+      // fastest answer this surface has.
+      //
+      // The cost is real and is recorded so the next reader does not optimise
+      // it away: during a flood this holds N requests open for the floor each,
+      // consuming concurrent-request capacity precisely when the limiter is
+      // trying to make requests cheap. It is wall-clock rather than processor
+      // time, this runtime bills processor time, and the code this replaces
+      // already slept before the very same refusal — so it is a change of
+      // degree and not of kind.
+      await holdFloor(started, floorMs);
       // The other site that carried no caching header. The body is the same
       // sentence it has always been, now named where the rest of this surface's
       // copy lives.
@@ -869,23 +954,50 @@ async function handleAuthorize(
     const identity = identityOf(client, oauthRequest.redirectUri);
 
     /**
-     * Everything a failed credential answers with: count it, wait, re-render.
+     * The ONE place a credential-path response is built. Count it, wait the
+     * floor, re-render.
      *
-     * One helper for every refusal on the credential path, because in this plan
-     * they are the SAME answer — a badly-shaped password, an address that is
-     * not on the list, and a password Apple turned down all come back as the
-     * 401 form. A stopwatch or a status code must not sort those three apart,
-     * and the cheapest way to hold that true is for there to be one place the
-     * answer is written. The single failure string, the Apple-throttle message
-     * and the ~3s floor land in plans 11-02 and 11-04, all of them here.
+     * One helper for every refusal on this path, because they are the SAME
+     * answer. A stopwatch, a status code and a body must not sort the causes
+     * apart, and the cheapest way to hold all three true is for there to be one
+     * place the answer is written.
      *
-     * The single failure string has now landed: every caller of this helper
-     * renders the `credentials` state, which is one body for all of its causes.
-     * The Apple-throttle state exists on the page and is NOT built here yet —
-     * branching on the throttle error's type is plan 11-04's, and it is the one
-     * branch this helper will ever grow.
+     * **The mapping, in full.** The last column describes the per-Apple-ID
+     * hourly counter plan 11-05 introduces; the counter this helper bumps today
+     * is the per-SOURCE one above, which every caller bumps alike.
+     *
+     * | Cause                               | Error class        | Renders     | Status | Bumps the per-Apple-ID hourly counter (11-05) |
+     * |-------------------------------------|--------------------|-------------|--------|-----------------------------------------------|
+     * | Badly-shaped app password           | — (Apple untouched)| the string  | 401    | No                                            |
+     * | Address not on the list             | — (Apple untouched)| the string  | 401    | No                                            |
+     * | Address unparseable or empty        | —                  | the string  | 401    | No                                            |
+     * | Per-Apple-ID burst trip (layer 2)   | —                  | the string  | 401    | No                                            |
+     * | Per-Apple-ID hourly cap (layer 3)   | —                  | the string  | 401    | No                                            |
+     * | Wrong password                      | `ImapAuthError`    | the string  | 401    | Yes                                           |
+     * | Apple refusing on availability      | `ImapThrottleError`| the throttle| 401    | No                                            |
+     * | Connect, TLS or read failure        | `ImapConnectError` | the throttle| 401    | No                                            |
+     *
+     * **The last row is decided here, and research left it open.** The throttle
+     * wording — Apple is not answering right now, wait a few minutes — is
+     * LITERALLY TRUE of a connect failure. The single failure string tells the
+     * reader to check the address and the password, which is false on that path
+     * and sends a family member hunting for a typo that does not exist. It
+     * leaks no more than the throttle message already does, because a connect
+     * failure can only happen after the allow-list check has passed.
+     *
+     * The branch reads the error's TYPE and never a caught value's text. The
+     * mail tree classifies from the parsed reply, response codes before prose
+     * hints, and this handler consumes that classification rather than
+     * repeating it.
+     *
+     * The source-connection refusal is NOT built here. It is keyed by the
+     * connecting source rather than by the address being tried, so it carries
+     * no information about who is on the list, and it is answered above — before
+     * any credential check exists to leak anything.
      */
-    async function refuseCredential(): Promise<Response> {
+    async function refuseCredential(
+      failure: "credentials" | "throttled" = "credentials",
+    ): Promise<Response> {
       try {
         await env.OAUTH_KV.put(key, String(failures + 1), {
           expirationTtl: BUCKET_SECONDS * 2,
@@ -897,12 +1009,22 @@ async function handleAuthorize(
         // burst landed, which is precisely the signal a brute-force counter
         // should not hand out (WR-01). Swallowed deliberately and swallowed
         // silently: Convention 4 forbids logging anywhere under src/, and
-        // there is nothing here worth a response field either. The fixed
-        // delay below is the limiter that does not depend on this write
-        // succeeding.
+        // there is nothing here worth a response field either. The floor
+        // below is the limiter that does not depend on this write succeeding.
       }
-      await new Promise((resolve) => setTimeout(resolve, FAILURE_DELAY_MS));
-      return renderForm(query, "credentials", identity);
+      await holdFloor(started, floorMs);
+
+      // Where the single failure string is built: a per-target limiter trip
+      // renders this string and never a source-connection refusal status. A
+      // refusal status that only ever appears for a listed address is a
+      // membership oracle, which is exactly what success criterion 3 forbids.
+      //
+      // Where the throttle message is built: criterion 3 binds this server's
+      // own limiter, not Apple's reply. The throttle message does reveal that
+      // the address passed the allow list, and that is accepted, because it can
+      // only be built after Apple has already answered — which already means
+      // the address was listed.
+      return renderForm(query, failure, identity);
     }
 
     // The shape check sits ABOVE the allow-list check, and the placement is
@@ -947,14 +1069,22 @@ async function handleAuthorize(
       // talks to Apple, and it is reached only for an address already on the
       // list carrying a password already judged usable.
       await proof(principal, createSessionGate());
-    } catch {
-      // NEVER read the caught value. The mail tree already dispatches on error
-      // TYPE rather than on any string, and here not even the type is consulted
-      // yet: in this plan a rejected password, a refused shape and an iCloud
-      // throttle are one answer. Plan 11-04 adds the one branch D-07 allows —
-      // a distinct message when Apple is throttling — and it will branch on
-      // `instanceof`, never on a message.
-      return refuseCredential();
+    } catch (error) {
+      // NEVER read the caught value's TEXT. The type is all that is consulted,
+      // and `instanceof` is the whole of the test — no `.message`, no `.stack`,
+      // no prose hint re-derived here. The mail tree already decided a throttle
+      // from a credential refusal by reading the parsed tagged reply, response
+      // codes before prose hints, and this handler consumes that decision
+      // rather than making a second one that could disagree with it.
+      //
+      // Anything that is not one of these two named types falls through to the
+      // single failure string, which is the silent answer. Failing toward the
+      // silent one is deliberate: no live refusal has ever been observed from
+      // iCloud, so every code the classifier matches is taken from the
+      // specification rather than from evidence.
+      const throttled =
+        error instanceof ImapThrottleError || error instanceof ImapConnectError;
+      return refuseCredential(throttled ? "throttled" : "credentials");
     }
 
     // The session is already closed. `withMailSession` runs teardown and
