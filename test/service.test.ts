@@ -13,7 +13,12 @@
 // have produced.
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { ImapConnectError, ImapNotFoundError, ImapThrottleError } from "../src/errors";
+import {
+  ImapAuthError,
+  ImapConnectError,
+  ImapNotFoundError,
+  ImapThrottleError,
+} from "../src/errors";
 import {
   decodeCursor,
   decodeFolderId,
@@ -28,6 +33,7 @@ import {
 import type {
   FolderListing,
   FolderSummary,
+  MailSessionOptions,
   SearchCriteria,
 } from "../src/mail/service";
 import {
@@ -43,6 +49,9 @@ import {
   withMailSessionOver,
 } from "../src/mail/service";
 import {
+  AUTH_REJECTED_LEGACY_TEXT,
+  AUTH_REJECTED_TEXT,
+  CONNECTION_LIMIT_TEXT,
   GREETING,
   MUTF7_DISPLAY_NAME,
   MUTF7_WIRE_NAME,
@@ -4167,6 +4176,121 @@ describe("paging unread across a message that becomes read", () => {
     // ...and no skip among the identifiers that were still unread. 4803 is
     // absent because it stopped being unread, which is the correct answer.
     expect(seen).toEqual([4805, 4804, 4802, 4801]);
+  });
+});
+
+describe("one attempt per guess, on the login path only (D6)", () => {
+  // Every assertion in this block is a COUNT, never a line. Both authentication
+  // command lines carry the pool's ambient credential — the first one inline,
+  // the fallback inside its base64 initial response — and a failed assertion on
+  // the lines themselves would print them. The gate block above counts for
+  // exactly this reason.
+  const firstAttempts = (lines: string[]): number =>
+    lines.filter((line) => /^\S+ LOGIN /.test(line)).length;
+  const fallbackAttempts = (lines: string[]): number =>
+    lines.filter((line) => /^\S+ AUTHENTICATE /.test(line)).length;
+
+  /**
+   * A conversation that refuses the first authentication attempt.
+   *
+   * `fallbackText` is the reply to the fallback attempt, and is left out for
+   * the cases that must never make one. Leaving it out is load-bearing: a
+   * script that answered anyway would let an unwanted second attempt pass on a
+   * reply the fixture happened to provide, and the count below is the only
+   * thing that would have noticed.
+   */
+  function refusedAuth(firstText: string, fallbackText?: string): FakeDuplex {
+    const fallback =
+      fallbackText === undefined ? [] : [taggedNo("a3", fallbackText)];
+    return createFakeDuplex([
+      GREETING,
+      capabilityResponse("a1", PRE_AUTH_CAPABILITY),
+      taggedNo("a2", firstText),
+      ...fallback,
+      logoutExchange(fallbackText === undefined ? "a3" : "a4"),
+    ]);
+  }
+
+  /** The login proof's own shape: no mailbox, so nothing but the credential. */
+  function proveOver(
+    duplex: FakeDuplex,
+    options: MailSessionOptions,
+  ): Promise<string> {
+    return withMailSessionOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      null,
+      null,
+      async () => "unreached",
+      options,
+    );
+  }
+
+  it("falls back a second time when nothing asked it not to", async () => {
+    // The default, and the half of the pair that pins today's behaviour. Every
+    // tool call takes this path: a tool call is not a guess, so it keeps both
+    // mechanisms.
+    const duplex = refusedAuth(AUTH_REJECTED_LEGACY_TEXT, AUTH_REJECTED_TEXT);
+
+    await expect(proveOver(duplex, FAST_BOUNDS)).rejects.toBeInstanceOf(
+      ImapAuthError,
+    );
+
+    expect(firstAttempts(duplex.writtenLines())).toBe(1);
+    expect(fallbackAttempts(duplex.writtenLines())).toBe(1);
+  });
+
+  it("spends one attempt at Apple when the login path asks for one", async () => {
+    // The other half. A wrong password costs Apple two attempts by default and
+    // one here, which is the whole of what D6 buys — and the error the caller
+    // sees is the same one either way, so the page's message mapping does not
+    // have to know which path it was on.
+    const duplex = refusedAuth(AUTH_REJECTED_LEGACY_TEXT);
+
+    await expect(
+      proveOver(duplex, { ...FAST_BOUNDS, oneAttemptPerGuess: true }),
+    ).rejects.toBeInstanceOf(ImapAuthError);
+
+    expect(firstAttempts(duplex.writtenLines())).toBe(1);
+    expect(fallbackAttempts(duplex.writtenLines())).toBe(0);
+  });
+
+  it("still raises the throttle error, and still writes no second line", async () => {
+    // The classification is unchanged by the flag, and it still reads the
+    // parsed tagged reply rather than a caught value. A server refusing on
+    // availability grounds must not be reported as a bad password: the login
+    // page branches on the error type, and this is the type it branches on.
+    const duplex = refusedAuth(CONNECTION_LIMIT_TEXT);
+
+    await expect(
+      proveOver(duplex, { ...FAST_BOUNDS, oneAttemptPerGuess: true }),
+    ).rejects.toBeInstanceOf(ImapThrottleError);
+
+    expect(firstAttempts(duplex.writtenLines())).toBe(1);
+    expect(fallbackAttempts(duplex.writtenLines())).toBe(0);
+  });
+
+  it("changes nothing on a conversation that authenticates first time", async () => {
+    // Non-vacuity for the flag itself: it suppresses a fallback and nothing
+    // else. An implementation that skipped the fallback by refusing earlier
+    // would pass all three cases above and fail this one.
+    const duplex = happyPathDuplex();
+
+    await expect(
+      withMailSessionOver(
+        duplex,
+        principal,
+        createSessionGate(),
+        MAILBOX,
+        null,
+        async () => "done",
+        { ...FAST_BOUNDS, oneAttemptPerGuess: true },
+      ),
+    ).resolves.toBe("done");
+
+    expect(firstAttempts(duplex.writtenLines())).toBe(1);
+    expect(fallbackAttempts(duplex.writtenLines())).toBe(0);
   });
 });
 
