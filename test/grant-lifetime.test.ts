@@ -1,0 +1,539 @@
+// A login lasts until someone revokes it (LIFE-01, LIFE-02, LIFE-03).
+//
+// **What this file proves that its neighbours do not.** Every other authorize
+// suite stops at the 302. This one carries on: it redeems the code at the token
+// endpoint, refreshes, and then reads the records the provider actually wrote.
+// That is the only place the two lifetimes are visible. A test that stopped at
+// the redirect would pass identically with both expiries back in place, because
+// nothing about a 302 says how long the grant behind it lives.
+//
+// It is also the first file in this repository to perform a code exchange or a
+// refresh at all. Later plans in this phase copy the helpers below rather than
+// importing them, which is this repo's habit for test helpers.
+//
+// Three groups:
+//
+//   LIFE-01. Both lifetime keys are present and undefined, and one real
+//   sign-in leaves a client record and a grant with no expiry. Plus the
+//   CONTROL: the same flow with both keys deleted from a copy of the options
+//   writes both records WITH an expiry. That control is the whole reason the
+//   two undefined assertions mean anything — an absent key and an explicitly
+//   undefined one do not behave the same, and the control is what can tell
+//   them apart.
+//
+//   LIFE-02. A registration whose redirect addresses are not all on the origin
+//   allowlist is refused before anything is stored, by the same predicate the
+//   authorize page uses.
+//
+//   LIFE-03. Several Claude apps signed in as one Apple ID all stay signed in,
+//   including one app that signs in twice.
+//
+// ---------------------------------------------------------------------------
+// **Four hygiene rules, each with its reason. Do not undo them.**
+//
+// 1. EVERY sign-in runs against a SPREAD COPY of `entryEnv()` whose
+//    `LOGIN_IP_LIMITER` and `LOGIN_ID_LIMITER` are allow-all stubs. The pool's
+//    real per-target binding refuses a fourth sign-in per address per minute,
+//    its windows are aligned to the wall clock, and nothing clears them between
+//    files or between runs. This file signs the one listed address in many
+//    times, so a real binding here would spend windows that the next case, the
+//    next file, or the next run then has to live with.
+//
+// 2. NEVER write onto the shared environment object. The `env-assignment` scan
+//    rule refuses it, and the reason the rule exists is that the object is
+//    shared by every test in a file and every request in an isolate — a write
+//    onto it leaks into every case beside this one. Overrides go on a copy.
+//
+// 3. Check keys by the grant id THIS case minted, never by a total. Sibling
+//    test files read and write the same namespaces at the same time, so any
+//    assertion on how many grants, tokens or clients the store holds is an
+//    assertion about what the rest of the suite happened to be doing.
+//
+// 4. CLEAN UP. Grants and client records no longer expire, so nothing sweeps
+//    them any more. Each case deletes the `grant:` key and every `token:` key
+//    for every grant it minted, plus the client records it registered, in a
+//    `finally`.
+// ---------------------------------------------------------------------------
+//
+// **No real Apple ID is ever authenticated (D-09).** Every sign-in below goes
+// through `test/fixtures/worker-with-login-proof.ts`, whose proof is a counter.
+// The address is under the reserved `.invalid` domain and the password is
+// plainly fake.
+
+import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
+import type { OAuthProviderOptions } from "@cloudflare/workers-oauth-provider";
+import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { describe, expect, it } from "vitest";
+import { createLoginHandler } from "../src/auth/login-handler";
+import { oauthProviderOptions } from "../src/auth/oauth";
+import type { EntryEnv } from "../src/env";
+import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
+import { userIdOf } from "../src/principal";
+import { entryEnv } from "./fixtures/bound-secrets";
+import worker, {
+  FAKE_APP_PASSWORD,
+  LISTED_APPLE_ID,
+} from "./fixtures/worker-with-login-proof";
+
+const ORIGIN = `https://${DEPLOYED_HOSTNAME}`;
+
+/**
+ * The PKCE verifier this file redeems codes with.
+ *
+ * The challenge below is its real SHA-256, base64url-encoded, and the pair was
+ * COMPUTED rather than copied. That matters: the challenge the older authorize
+ * suites send is a different string, and it pairs with no verifier anybody
+ * holds. It never mattered there, because no test in this repository redeemed a
+ * code until this one — the provider only checks the pair at the exchange.
+ *
+ * Recompute either value with:
+ *
+ *   printf '<verifier>' | openssl dgst -sha256 -binary \
+ *     | openssl base64 | tr '+/' '-_' | tr -d '='
+ *
+ * A mismatched pair is a 400 `invalid_grant` at the token endpoint, "Invalid
+ * PKCE code_verifier", which is exactly what a copied-and-assumed pair produced
+ * here first time.
+ */
+const CODE_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW-gFWFOEjXk";
+
+/** `BASE64URL(SHA256(ASCII(CODE_VERIFIER)))`, computed. See above. */
+const CODE_CHALLENGE = "90EpwHQr_xi9uDtjYyz5mq9Z4RekugHRqg5ijpXC3FQ";
+
+/** One day, in the seconds a KV `expiration` is reported in. */
+const DAY_SECONDS = 86400;
+
+/** A Worker entry: the fixture by default, a locally built provider otherwise. */
+type WorkerEntry = {
+  fetch(
+    request: Request,
+    env: EntryEnv,
+    ctx: ExecutionContext,
+  ): Promise<Response>;
+};
+
+/**
+ * A rate-limit binding stub that always lets the request through.
+ *
+ * Hygiene rule 1. The shape is copied from `test/authorize-login.test.ts`: it
+ * takes `{ key }` and reads nothing else, because `{ key }` is all the shipped
+ * options type accepts. It touches nothing, which is the point.
+ */
+function limiter(success: boolean) {
+  return {
+    async limit(_options: { key: string }): Promise<{ success: boolean }> {
+      return { success };
+    },
+  };
+}
+
+/**
+ * The pool's environment with both limiters replaced, as a COPY.
+ *
+ * A spread, never a write onto the object `entryEnv()` hands back — hygiene
+ * rule 2. Extra overrides are spread last so a case can also swap the store.
+ */
+function allowAllEnv(overrides: Record<string, unknown> = {}): EntryEnv {
+  return {
+    ...entryEnv(),
+    LOGIN_IP_LIMITER: limiter(true),
+    LOGIN_ID_LIMITER: limiter(true),
+    ...overrides,
+  } as unknown as EntryEnv;
+}
+
+/** Drive a Worker entry through its real fetch, on a real execution context. */
+async function callWorker(
+  request: Request,
+  env: EntryEnv,
+  entry: WorkerEntry = worker,
+): Promise<Response> {
+  const ctx = createExecutionContext();
+  const response = await entry.fetch(request, env, ctx);
+  await waitOnExecutionContext(ctx);
+  return response;
+}
+
+/** A registration request carrying exactly the metadata it is handed. */
+function registerRequest(metadata: Record<string, unknown>): Request {
+  return new Request(`${ORIGIN}/oauth/register`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(metadata),
+  });
+}
+
+/** The metadata a public client registers with, which is how Claude registers. */
+function publicClientMetadata(
+  clientName: string,
+  redirectUri: string,
+): Record<string, unknown> {
+  return {
+    client_name: clientName,
+    redirect_uris: [redirectUri],
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+  };
+}
+
+/** Register a real public client through the real registration endpoint. */
+async function register(
+  env: EntryEnv,
+  clientName: string,
+  redirectUri: string,
+  entry: WorkerEntry = worker,
+): Promise<string> {
+  const response = await callWorker(
+    registerRequest(publicClientMetadata(clientName, redirectUri)),
+    env,
+    entry,
+  );
+
+  expect(response.status).toBeLessThan(300);
+  const body = (await response.json()) as { client_id: string };
+  return body.client_id;
+}
+
+/** An authorization query the real provider parses and re-validates. */
+function authorizeQuery(
+  clientId: string,
+  redirectUri: string,
+  state: string,
+): string {
+  return new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    code_challenge: CODE_CHALLENGE,
+    code_challenge_method: "S256",
+    state,
+  }).toString();
+}
+
+/** A sign-in POST at the real Worker, from a named source connection. */
+function postFrom(source: string, appleId: string, query: string): Request {
+  return new Request(`${ORIGIN}/authorize`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "cf-connecting-ip": source,
+    },
+    body: new URLSearchParams({
+      apple_id: appleId,
+      app_password: FAKE_APP_PASSWORD,
+      oauth_request: query,
+    }).toString(),
+  });
+}
+
+/**
+ * A source key this invocation owns and nothing else in the repository uses.
+ *
+ * Not an address shape, and it does not need to be: the binding keys on the
+ * string it is handed and never parses it. Minting a fresh one per sign-in is
+ * belt and braces beside the allow-all stubs — it means a case still spends
+ * nobody else's window if someone later removes a stub.
+ */
+function freshSource(): string {
+  return `test-source-${crypto.randomUUID()}`;
+}
+
+/** Sign the listed address in, and hand back the authorization code. */
+async function signIn(
+  env: EntryEnv,
+  clientId: string,
+  redirectUri: string,
+  state: string,
+  entry: WorkerEntry = worker,
+): Promise<string> {
+  const response = await callWorker(
+    postFrom(
+      freshSource(),
+      LISTED_APPLE_ID,
+      authorizeQuery(clientId, redirectUri, state),
+    ),
+    env,
+    entry,
+  );
+
+  expect(response.status).toBe(302);
+  const location = response.headers.get("location");
+  expect(location).not.toBeNull();
+  const code = new URL(location as string).searchParams.get("code");
+  expect(code).not.toBeNull();
+  return code as string;
+}
+
+/** Redeem an authorization code at the real token endpoint. */
+async function exchangeCode(
+  env: EntryEnv,
+  clientId: string,
+  redirectUri: string,
+  code: string,
+  entry: WorkerEntry = worker,
+): Promise<{ accessToken: string; refreshToken: string }> {
+  const response = await callWorker(
+    new Request(`${ORIGIN}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        code_verifier: CODE_VERIFIER,
+      }).toString(),
+    }),
+    env,
+    entry,
+  );
+
+  // The body is read FIRST and named in the assertion, because a 400 here is
+  // otherwise a bare status with no clue which of the exchange's six inputs the
+  // provider disliked.
+  const text = await response.text();
+  expect(`${response.status} ${text}`).toBe(`200 ${text}`);
+  const body = JSON.parse(text) as {
+    access_token: string;
+    refresh_token: string;
+  };
+  expect(typeof body.access_token).toBe("string");
+  expect(typeof body.refresh_token).toBe("string");
+  return { accessToken: body.access_token, refreshToken: body.refresh_token };
+}
+
+/** Refresh a login at the real token endpoint. The response, not an assertion. */
+async function refreshWith(
+  env: EntryEnv,
+  clientId: string,
+  refreshToken: string,
+  entry: WorkerEntry = worker,
+): Promise<Response> {
+  return callWorker(
+    new Request(`${ORIGIN}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: clientId,
+      }).toString(),
+    }),
+    env,
+    entry,
+  );
+}
+
+/**
+ * The grant id inside a token this library issued.
+ *
+ * Both token kinds have the shape `userId:grantId:secret`, so the middle
+ * segment is the grant. Read from the token rather than from a listing, because
+ * a listing is shared with every sibling file (hygiene rule 3).
+ */
+function grantIdOf(token: string): string {
+  const segments = token.split(":");
+  expect(segments).toHaveLength(3);
+  return segments[1] as string;
+}
+
+/** Every key listed under a prefix, with the expiry the store reports. */
+async function keysUnder(
+  prefix: string,
+): Promise<Array<{ name: string; expiration?: number }>> {
+  const listed = await entryEnv().OAUTH_KV.list({ prefix });
+  return listed.keys;
+}
+
+/**
+ * Delete a grant and every access token under it (hygiene rule 4).
+ *
+ * Serial, one delete at a time. Nothing here needs to be fast, and a fan-out
+ * over a store is the shape two scan rules exist to refuse elsewhere.
+ */
+async function forgetGrant(userId: string, grantId: string): Promise<void> {
+  const kv = entryEnv().OAUTH_KV;
+  for (const key of await keysUnder(`token:${userId}:${grantId}:`)) {
+    await kv.delete(key.name);
+  }
+  await kv.delete(`grant:${userId}:${grantId}`);
+}
+
+/** Delete a client record this file registered (hygiene rule 4). */
+async function forgetClient(clientId: string): Promise<void> {
+  await entryEnv().OAUTH_KV.delete(`client:${clientId}`);
+}
+
+/** The listed address's user id, derived by the real function. Never hashed here. */
+async function listedUserId(): Promise<string> {
+  const userId = await userIdOf(LISTED_APPLE_ID);
+  expect(userId).not.toBeNull();
+  return userId as string;
+}
+
+const CLAUDE_WEB_REDIRECT = "https://claude.ai/api/mcp/auth_callback";
+
+describe("LIFE-01: a login lasts until someone revokes it", () => {
+  // Titled so `-t "LIFE-01"` matches. A name filter that matches nothing passes
+  // SILENTLY, which would leave the requirement looking covered while measuring
+  // nothing, so 12-VALIDATION.md's command and this title move together.
+
+  it("both lifetime keys are present, and both are undefined", () => {
+    // PRESENCE, not absence, and the distinction is the whole assertion. The
+    // library spreads our options over its defaults, so an own key holding
+    // `undefined` replaces the default while an ABSENT key keeps it — 30 days
+    // for a refresh token, 90 for a client record. Deleting either line is the
+    // forced logout coming back with nothing failing on the way out.
+    expect(Object.hasOwn(oauthProviderOptions, "refreshTokenTTL")).toBe(true);
+    expect(Object.hasOwn(oauthProviderOptions, "clientRegistrationTTL")).toBe(
+      true,
+    );
+    expect(oauthProviderOptions.refreshTokenTTL).toBeUndefined();
+    expect(oauthProviderOptions.clientRegistrationTTL).toBeUndefined();
+
+    // Access tokens still expire in an hour. Only the two lifetimes that end a
+    // LOGIN moved; the short-lived credential the client re-mints is unchanged.
+    expect(oauthProviderOptions.accessTokenTTL).toBe(3600);
+  });
+
+  it("a real sign-in leaves a client record and a grant with no expiry, and refresh still works", async () => {
+    const env = allowAllEnv();
+    const userId = await listedUserId();
+    const clientId = await register(
+      env,
+      "LIFE-01 web client",
+      CLAUDE_WEB_REDIRECT,
+    );
+    let grantId: string | null = null;
+
+    try {
+      const code = await signIn(
+        env,
+        clientId,
+        CLAUDE_WEB_REDIRECT,
+        "life-01-lifetimes",
+      );
+      const { accessToken, refreshToken } = await exchangeCode(
+        env,
+        clientId,
+        CLAUDE_WEB_REDIRECT,
+        code,
+      );
+      grantId = grantIdOf(accessToken);
+
+      const clientKeys = await keysUnder(`client:${clientId}`);
+      expect(clientKeys).toHaveLength(1);
+      expect(clientKeys[0]?.expiration).toBeUndefined();
+
+      const grantKeys = await keysUnder(`grant:${userId}:${grantId}`);
+      expect(grantKeys).toHaveLength(1);
+      expect(grantKeys[0]?.expiration).toBeUndefined();
+
+      // THE NON-VACUITY CHECK. Without it, both assertions above are satisfied
+      // by a listing that never reports an expiry at all — a store binding that
+      // dropped the field, or a pool that stopped surfacing it, would read as a
+      // pass. The access token is written with a one-hour expiry by the same
+      // call, through the same binding, so its key is the positive control.
+      const tokenKeys = await keysUnder(`token:${userId}:${grantId}:`);
+      expect(tokenKeys.length).toBeGreaterThan(0);
+      expect(tokenKeys.some((key) => key.expiration !== undefined)).toBe(true);
+
+      // Spike S2's failure, from the other side: with the client record gone
+      // this answers 401 `invalid_client` even though the grant is fine. Both
+      // records are kept now, so it answers 200.
+      const refreshed = await refreshWith(env, clientId, refreshToken);
+      expect(refreshed.status).toBe(200);
+      const refreshedBody = (await refreshed.json()) as {
+        access_token?: unknown;
+      };
+      expect(typeof refreshedBody.access_token).toBe("string");
+
+      // A refresh does not rewrite the grant's expiry either way — it is fixed
+      // at the code exchange — so this is the check that a rotation did not
+      // quietly reintroduce one.
+      const grantAfterRefresh = await keysUnder(`grant:${userId}:${grantId}`);
+      expect(grantAfterRefresh).toHaveLength(1);
+      expect(grantAfterRefresh[0]?.expiration).toBeUndefined();
+    } finally {
+      if (grantId !== null) await forgetGrant(userId, grantId);
+      await forgetClient(clientId);
+    }
+  });
+
+  it("the control: with both keys absent, the same flow writes both with an expiry", async () => {
+    // WHY THIS CASE EXISTS. CONTEXT.md originally said a deleted key and an
+    // explicitly-undefined one behave identically. They do not, and the
+    // correction of 2026-09-21 is what this case holds: absent keeps the
+    // library's 30-day and 90-day defaults, explicit `undefined` means never.
+    // Without this case the two assertions above are consistent with a library
+    // that ignores both keys, and the "tidy-up" that deletes the two lines
+    // would leave the whole suite green while restoring the forced logout.
+    const options: OAuthProviderOptions<EntryEnv> = {
+      ...oauthProviderOptions,
+      // The proof, injected as always (D-09). It does nothing and resolves.
+      defaultHandler: createLoginHandler(async () => {}),
+    };
+    // Deleted from the COPY. Never from the imported object, which every other
+    // case in this file and the real Worker both read.
+    delete options.refreshTokenTTL;
+    delete options.clientRegistrationTTL;
+
+    const control = new OAuthProvider<EntryEnv>(options);
+    const entry: WorkerEntry = {
+      fetch(request, env, ctx) {
+        return control.fetch(request, env, ctx);
+      },
+    };
+
+    const env = allowAllEnv();
+    const userId = await listedUserId();
+    const before = Math.floor(Date.now() / 1000);
+    const clientId = await register(
+      env,
+      "LIFE-01 control client",
+      CLAUDE_WEB_REDIRECT,
+      entry,
+    );
+    let grantId: string | null = null;
+
+    try {
+      const code = await signIn(
+        env,
+        clientId,
+        CLAUDE_WEB_REDIRECT,
+        "life-01-control",
+        entry,
+      );
+      const { accessToken } = await exchangeCode(
+        env,
+        clientId,
+        CLAUDE_WEB_REDIRECT,
+        code,
+        entry,
+      );
+      grantId = grantIdOf(accessToken);
+
+      // 90 days by default. Asserted loosely at 80, because the exact default
+      // is the library's to change and this case is about there being an expiry
+      // at all rather than about its value.
+      const clientKeys = await keysUnder(`client:${clientId}`);
+      expect(clientKeys).toHaveLength(1);
+      expect(clientKeys[0]?.expiration).toBeGreaterThan(
+        before + 80 * DAY_SECONDS,
+      );
+
+      // 30 days by default, bounded on both sides so the case cannot be
+      // satisfied by the 90-day value landing on the wrong record.
+      const grantKeys = await keysUnder(`grant:${userId}:${grantId}`);
+      expect(grantKeys).toHaveLength(1);
+      expect(grantKeys[0]?.expiration).toBeGreaterThan(
+        before + 25 * DAY_SECONDS,
+      );
+      expect(grantKeys[0]?.expiration).toBeLessThan(before + 31 * DAY_SECONDS);
+    } finally {
+      if (grantId !== null) await forgetGrant(userId, grantId);
+      await forgetClient(clientId);
+    }
+  });
+});

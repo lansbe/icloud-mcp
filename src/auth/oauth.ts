@@ -33,12 +33,41 @@ export const oauthProviderOptions: OAuthProviderOptions<EntryEnv> = {
   // reasoning and the escape hatch if a client cannot register dynamically.
   clientRegistrationEndpoint: "/oauth/register",
 
-  // D-05. Both values are also the library defaults, stated explicitly so a
-  // future change is a visible diff. Refresh-token rotation is automatic and
-  // not configurable in this library; see 01-02-SUMMARY.md for the one way
-  // D-05's stated properties turned out weaker than assumed.
+  // D-05. An access token lasts an hour. That is still the library default,
+  // stated here so a change to it is a visible diff. Refresh-token rotation is
+  // automatic and not configurable in this library; see 01-02-SUMMARY.md for
+  // the one way D-05's stated properties turned out weaker than assumed.
   accessTokenTTL: 3600,
-  refreshTokenTTL: 2592000,
+
+  // LIFE-01. A login lasts until someone revokes it. Both lifetimes below are
+  // PRESENT with the value `undefined`, and that is not the same as leaving
+  // them out.
+  //
+  // The library builds its own options by spreading ours over its defaults
+  // (oauth-provider.js lines 1348-1353). A spread copies an own key even when
+  // its value is `undefined`, so `undefined` here REPLACES the default. An
+  // absent key KEEPS it: 30 days for a refresh token, 90 days for a client
+  // record. So deleting either line brings the forced logout back, and nothing
+  // fails on the way out.
+  //
+  // Never set either one to zero. A zero refresh lifetime turns refresh tokens
+  // off entirely (oauth-provider.js line 1955). Zero is not "no expiry".
+  //
+  // The two move together because of spike S2. With the client record gone the
+  // token endpoint refuses the refresh as an unknown client, even though the
+  // grant and the refresh token are both fine. Setting only the refresh token
+  // moves the logout from day 30 to day 90; it does not remove it.
+  //
+  // Grants made before this change keep the expiry they were written with. A
+  // refresh does not extend it — the expiry is fixed at the code exchange. There
+  // is no migration. The owner reconnects each Claude app once after the deploy.
+  //
+  // The library also ships a helper that deletes expired records, and its
+  // default sweeps up grants whose client record has gone. That is this same
+  // logout by another road, so it is called nowhere in this project and a scan
+  // gate checks for a call.
+  refreshTokenTTL: undefined,
+  clientRegistrationTTL: undefined,
 
   scopesSupported: ["mcp"],
 
