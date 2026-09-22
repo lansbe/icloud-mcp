@@ -803,3 +803,229 @@ describe("LIFE-02: a registration off the allowlist is refused at the door", () 
     }
   });
 });
+
+/**
+ * A well-formed 2026-07-28 `tools/list`, carrying a bearer token.
+ *
+ * Copied from `test/door.test.ts`, with the authorization header added. It calls
+ * no tool, so it opens no socket to Apple — what it proves is that the door
+ * still serves the grant behind the token.
+ */
+function toolsList(accessToken: string): Request {
+  return new Request(`${ORIGIN}/mcp`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      host: DEPLOYED_HOSTNAME,
+      "Mcp-Method": "tools/list",
+      authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/list",
+      params: {
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+          "io.modelcontextprotocol/clientCapabilities": {},
+        },
+      },
+    }),
+  });
+}
+
+/**
+ * The JSON-RPC message in a response body, on either lane.
+ *
+ * Copied from `test/door.test.ts`. The modern lane answers with a JSON body;
+ * an event stream carries the message after `data:`. Null when it holds neither.
+ */
+function rpcMessageIn(bodyText: string): Record<string, unknown> | null {
+  const trimmed = bodyText.trim();
+  const candidates = trimmed.startsWith("{")
+    ? [trimmed]
+    : trimmed
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice("data:".length).trim());
+  for (const candidate of candidates) {
+    try {
+      const parsed: unknown = JSON.parse(candidate);
+      if (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        !Array.isArray(parsed)
+      ) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Not this line. Try the next one.
+    }
+  }
+  return null;
+}
+
+/** Assert an access token still gets served a tool list at `/mcp`. */
+async function expectStillServed(
+  env: EntryEnv,
+  accessToken: string,
+): Promise<void> {
+  const response = await callWorker(toolsList(accessToken), env);
+  expect(response.status).toBe(200);
+  const message = rpcMessageIn(await response.text());
+  expect(message).not.toBeNull();
+  const result = (message as { result?: { tools?: unknown } }).result;
+  expect(Array.isArray(result?.tools)).toBe(true);
+  expect((result?.tools as unknown[]).length).toBeGreaterThan(0);
+}
+
+describe("LIFE-03: several Claude apps signed in as one Apple ID", () => {
+  // Titled so `-t "LIFE-03"` matches, for the same reason the two titles above
+  // are pinned.
+  //
+  // `test/authorize-login.test.ts` already pins `revokeExistingGrants: false` on
+  // a STUB recorder — it proves the argument is passed. These two prove what
+  // that argument BUYS, through the real provider and the real store: the grants
+  // coexist, and the older app is still served afterwards. The failure they
+  // guard against is the one a family member reports as "it keeps signing me
+  // out", and it happened for real on 2026-09-21.
+
+  it("two different Claude apps stay signed in as one Apple ID", async () => {
+    const env = allowAllEnv();
+    const userId = await listedUserId();
+    const secondRedirect = "http://localhost:51877/callback";
+
+    const firstClient = await register(env, "Claude", CLAUDE_WEB_REDIRECT);
+    const secondClient = await register(
+      env,
+      "Claude Code (icloud-mcp)",
+      secondRedirect,
+    );
+    let firstGrant: string | null = null;
+    let secondGrant: string | null = null;
+
+    try {
+      const firstCode = await signIn(
+        env,
+        firstClient,
+        CLAUDE_WEB_REDIRECT,
+        "life-03-first",
+      );
+      const first = await exchangeCode(
+        env,
+        firstClient,
+        CLAUDE_WEB_REDIRECT,
+        firstCode,
+      );
+      firstGrant = grantIdOf(first.accessToken);
+
+      const secondCode = await signIn(
+        env,
+        secondClient,
+        secondRedirect,
+        "life-03-second",
+      );
+      const second = await exchangeCode(
+        env,
+        secondClient,
+        secondRedirect,
+        secondCode,
+      );
+      secondGrant = grantIdOf(second.accessToken);
+
+      // Two distinct grants, found by the ids THESE sign-ins minted rather than
+      // by counting what the shared store holds (hygiene rule 3).
+      expect(firstGrant).not.toBe(secondGrant);
+      expect(await keysUnder(`grant:${userId}:${firstGrant}`)).toHaveLength(1);
+      expect(await keysUnder(`grant:${userId}:${secondGrant}`)).toHaveLength(1);
+
+      // Both refreshes work AFTER the second sign-in. The first is the one that
+      // matters: under the revoking default it is the grant that loses.
+      const firstRefresh = await refreshWith(
+        env,
+        firstClient,
+        first.refreshToken,
+      );
+      expect(firstRefresh.status).toBe(200);
+      const secondRefresh = await refreshWith(
+        env,
+        secondClient,
+        second.refreshToken,
+      );
+      expect(secondRefresh.status).toBe(200);
+
+      // And the first app's ACCESS token still serves. This is the half a
+      // refresh cannot show: the store is eventually consistent, so a revoked
+      // grant kept serving for about sixty seconds on 2026-09-21 before the
+      // delete caught up. A served tool list is the door's own answer.
+      await expectStillServed(env, first.accessToken);
+    } finally {
+      if (firstGrant !== null) await forgetGrant(userId, firstGrant);
+      if (secondGrant !== null) await forgetGrant(userId, secondGrant);
+      await forgetClient(firstClient);
+      await forgetClient(secondClient);
+    }
+  });
+
+  it("one app signing in twice keeps both grants", async () => {
+    // WHY THIS CASE EXISTS BESIDE THE ONE ABOVE. The library revokes earlier
+    // grants for the same user id AND the same client id. Two different apps
+    // register two different client ids, so they coexist even under the revoking
+    // default — the case above would pass with the lockout fully restored. This
+    // is the case that can see it.
+    //
+    // It is also the shape a real Claude client actually produces: it submits
+    // the sign-in form TWICE, about 1.4 seconds apart, and both submissions
+    // succeed (commit 3043361). One client, two authorizations, two codes, two
+    // exchanges.
+    const env = allowAllEnv();
+    const userId = await listedUserId();
+    const clientId = await register(env, "Claude", CLAUDE_WEB_REDIRECT);
+    let firstGrant: string | null = null;
+    let secondGrant: string | null = null;
+
+    try {
+      const firstCode = await signIn(
+        env,
+        clientId,
+        CLAUDE_WEB_REDIRECT,
+        "life-03-twice-a",
+      );
+      const first = await exchangeCode(
+        env,
+        clientId,
+        CLAUDE_WEB_REDIRECT,
+        firstCode,
+      );
+      firstGrant = grantIdOf(first.accessToken);
+
+      const secondCode = await signIn(
+        env,
+        clientId,
+        CLAUDE_WEB_REDIRECT,
+        "life-03-twice-b",
+      );
+      const second = await exchangeCode(
+        env,
+        clientId,
+        CLAUDE_WEB_REDIRECT,
+        secondCode,
+      );
+      secondGrant = grantIdOf(second.accessToken);
+
+      expect(firstGrant).not.toBe(secondGrant);
+      expect(await keysUnder(`grant:${userId}:${firstGrant}`)).toHaveLength(1);
+      expect(await keysUnder(`grant:${userId}:${secondGrant}`)).toHaveLength(1);
+
+      // The FIRST of the two, on both paths. That is the one the default kills.
+      await expectStillServed(env, first.accessToken);
+      const firstRefresh = await refreshWith(env, clientId, first.refreshToken);
+      expect(firstRefresh.status).toBe(200);
+    } finally {
+      if (firstGrant !== null) await forgetGrant(userId, firstGrant);
+      if (secondGrant !== null) await forgetGrant(userId, secondGrant);
+      await forgetClient(clientId);
+    }
+  });
+});
