@@ -64,7 +64,15 @@ import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import type { OAuthProviderOptions } from "@cloudflare/workers-oauth-provider";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { createLoginHandler } from "../src/auth/login-handler";
+import type {
+  ClientRegistrationCallbackOptions,
+  ClientRegistrationCallbackResult,
+} from "@cloudflare/workers-oauth-provider";
+import {
+  REGISTRATION_REFUSED_DESCRIPTION,
+  createLoginHandler,
+  refuseUnlistedRedirects,
+} from "../src/auth/login-handler";
 import { oauthProviderOptions } from "../src/auth/oauth";
 import type { EntryEnv } from "../src/env";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
@@ -365,6 +373,40 @@ async function forgetClient(clientId: string): Promise<void> {
   await entryEnv().OAUTH_KV.delete(`client:${clientId}`);
 }
 
+/**
+ * The pool's store, wrapped so every key it is asked to WRITE is recorded.
+ *
+ * It delegates all four methods the library uses and changes nothing about what
+ * is stored — the point is to see a write that does not happen. A refusal at
+ * registration leaves no key behind, so there is nothing for a listing to fail
+ * to find, and "no key exists" is true of a store the request never reached at
+ * all. The wrapper can tell those apart; a listing cannot.
+ */
+function recordingKv(puts: string[]): Record<string, unknown> {
+  const store = entryEnv().OAUTH_KV as unknown as {
+    get(key: string, options?: unknown): Promise<unknown>;
+    put(key: string, value: unknown, options?: unknown): Promise<void>;
+    delete(key: string): Promise<void>;
+    list(options?: unknown): Promise<unknown>;
+  };
+
+  return {
+    get(key: string, options?: unknown) {
+      return store.get(key, options);
+    },
+    put(key: string, value: unknown, options?: unknown) {
+      puts.push(key);
+      return store.put(key, value, options);
+    },
+    delete(key: string) {
+      return store.delete(key);
+    },
+    list(options?: unknown) {
+      return store.list(options);
+    },
+  };
+}
+
 /** The listed address's user id, derived by the real function. Never hashed here. */
 async function listedUserId(): Promise<string> {
   const userId = await userIdOf(LISTED_APPLE_ID);
@@ -534,6 +576,230 @@ describe("LIFE-01: a login lasts until someone revokes it", () => {
     } finally {
       if (grantId !== null) await forgetGrant(userId, grantId);
       await forgetClient(clientId);
+    }
+  });
+});
+
+/**
+ * Registration callback options carrying exactly the metadata handed in.
+ *
+ * The request is built from a fixed benign body rather than from the metadata,
+ * and that is load-bearing for one row: a metadata object whose `redirect_uris`
+ * getter throws cannot be serialized, so building the request from it would
+ * throw in the test helper instead of in the predicate under test.
+ *
+ * The predicate reads no part of the request. It is present because the
+ * library's own options type carries it.
+ */
+function registrationOptions(
+  clientMetadata: Record<string, unknown>,
+): ClientRegistrationCallbackOptions {
+  return {
+    clientMetadata,
+    request: new Request(`${ORIGIN}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    }),
+  };
+}
+
+/** What every refusal must be, byte for byte, carrying nothing from the input. */
+const REGISTRATION_REFUSAL: ClientRegistrationCallbackResult = {
+  description: REGISTRATION_REFUSED_DESCRIPTION,
+};
+
+/** Drive the predicate over one redirect list. */
+function judge(
+  uris: unknown,
+): ClientRegistrationCallbackResult | undefined | void {
+  return refuseUnlistedRedirects(
+    registrationOptions({
+      client_name: "a client",
+      redirect_uris: uris,
+      token_endpoint_auth_method: "none",
+    }),
+  );
+}
+
+describe("LIFE-02: a registration off the allowlist is refused at the door", () => {
+  // Titled so `-t "LIFE-02"` matches. Same reason the LIFE-01 title is pinned:
+  // a name filter that matches nothing passes silently.
+  //
+  // The table below drives the predicate DIRECTLY, in the style of
+  // `test/authorize-redirect-allowlist.test.ts`. That is both cheaper and far
+  // more exhaustive than routing every shape through the endpoint; the endpoint
+  // cases further down are what prove the predicate is wired to anything.
+
+  it("allows every redirect shape the allowlist already admits", () => {
+    // The exact entry, and the shape all 16 live Claude web registrations hold.
+    expect(judge(["https://claude.ai/api/mcp/auth_callback"])).toBeUndefined();
+    // Claude Code. A local client binds an ephemeral port and re-binds a
+    // different one next session, so the port is deliberately unpinned.
+    expect(judge(["http://localhost:51877/callback"])).toBeUndefined();
+    // Hermes. The IPv4 literal form of the same carve-out.
+    expect(judge(["http://127.0.0.1:8976/callback"])).toBeUndefined();
+    // The bracketed IPv6 form, which is how URL.origin renders ::1.
+    expect(judge(["http://[::1]:8976/cb"])).toBeUndefined();
+  });
+
+  it("refuses every shape the allowlist does not admit", () => {
+    // Suffix: a substring test would admit this. Matching is equality on the
+    // whole origin, which is why it does not.
+    expect(judge(["https://claude.ai.evil.example/cb"])).toEqual(
+      REGISTRATION_REFUSAL,
+    );
+    // Scheme downgrade. Cleartext is admitted for loopback and nowhere else.
+    expect(judge(["http://claude.ai/cb"])).toEqual(REGISTRATION_REFUSAL);
+    // TLS loopback was never observed, so the rule stays the observed shape.
+    expect(judge(["https://localhost/cb"])).toEqual(REGISTRATION_REFUSAL);
+  });
+
+  it("refuses a mixed list: EVERY address must pass, not merely one", () => {
+    // Why `every` and not `some`. A client can only ever authorize to an
+    // address it registered, so a mixed list buys it nothing it could use — and
+    // now that client records never expire, the junk half would be stored
+    // forever. The allowed entry is first, so a predicate that stopped at the
+    // first pass would go green here.
+    expect(
+      judge([
+        "https://claude.ai/api/mcp/auth_callback",
+        "https://claude.ai.evil.example/cb",
+      ]),
+    ).toEqual(REGISTRATION_REFUSAL);
+  });
+
+  it("refuses malformed metadata rather than reading past it", () => {
+    // `clientMetadata` is the RAW JSON body, not the library's validated form,
+    // so each of these is a shape a stranger can actually post.
+    expect(judge([])).toEqual(REGISTRATION_REFUSAL);
+    expect(
+      refuseUnlistedRedirects(
+        registrationOptions({ client_name: "no redirects at all" }),
+      ),
+    ).toEqual(REGISTRATION_REFUSAL);
+    expect(judge("https://claude.ai/api/mcp/auth_callback")).toEqual(
+      REGISTRATION_REFUSAL,
+    );
+    expect(judge(["https://claude.ai/api/mcp/auth_callback", 7])).toEqual(
+      REGISTRATION_REFUSAL,
+    );
+  });
+
+  it("refuses a metadata object whose getter throws, and does not throw itself", () => {
+    // A throw in this callback is a 500 whose description is the ERROR'S OWN
+    // MESSAGE — text a stranger wrote, served back out. That is why the whole
+    // body sits in a try/catch and the caught value is never read.
+    const hostile: Record<string, unknown> = {};
+    Object.defineProperty(hostile, "redirect_uris", {
+      enumerable: true,
+      get() {
+        throw new Error("a message a stranger chose");
+      },
+    });
+
+    let outcome: ClientRegistrationCallbackResult | undefined | void;
+    expect(() => {
+      outcome = refuseUnlistedRedirects(registrationOptions(hostile));
+    }).not.toThrow();
+    expect(outcome).toEqual(REGISTRATION_REFUSAL);
+  });
+
+  // -------------------------------------------------------------------------
+  // Through the REAL registration endpoint. The table above proves the rule;
+  // these prove it is wired to the endpoint, and that a refusal happens BEFORE
+  // anything is written.
+  // -------------------------------------------------------------------------
+
+  it("registers all three client shapes seen in production", async () => {
+    const env = allowAllEnv();
+    const registered: string[] = [];
+
+    try {
+      // Claude on the web: confidential, 16 of the 21 live records.
+      const web = await callWorker(
+        registerRequest({
+          client_name: "Claude",
+          redirect_uris: [CLAUDE_WEB_REDIRECT],
+          token_endpoint_auth_method: "client_secret_post",
+          grant_types: ["authorization_code", "refresh_token"],
+          response_types: ["code"],
+        }),
+        env,
+      );
+      expect(web.status).toBeLessThan(300);
+      const webBody = (await web.json()) as {
+        client_id: string;
+        client_secret_expires_at?: unknown;
+      };
+      registered.push(webBody.client_id);
+
+      // LIFE-01 reaching the SECRET too. RFC 7591 reads zero as "never", and
+      // the library serves zero precisely because the client lifetime is unset.
+      // A number here instead would mean the 90-day clock came back.
+      expect(webBody.client_secret_expires_at).toBe(0);
+
+      // Claude Code and Hermes: public, loopback, ephemeral ports.
+      registered.push(
+        await register(env, "Claude Code (icloud-mcp)", "http://localhost:51877/callback"),
+      );
+      registered.push(
+        await register(env, "Hermes Agent", "http://127.0.0.1:8976/callback"),
+      );
+    } finally {
+      for (const clientId of registered) await forgetClient(clientId);
+    }
+  });
+
+  it("refuses an off-list registration with a 400 and stores nothing", async () => {
+    const puts: string[] = [];
+    const env = allowAllEnv({ OAUTH_KV: recordingKv(puts) });
+
+    const response = await callWorker(
+      registerRequest({
+        client_name: "a client this server will not send a code to",
+        redirect_uris: ["https://claude.ai.evil.example/cb"],
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as {
+      error?: unknown;
+      error_description?: unknown;
+    };
+    expect(body.error).toBe("invalid_client_metadata");
+    // Compared against the EXPORT, not a second copy of the sentence. And the
+    // served value carries nothing from the request that was refused.
+    expect(body.error_description).toBe(REGISTRATION_REFUSED_DESCRIPTION);
+    expect(body.error_description).not.toContain("evil.example");
+
+    // NOTHING WAS STORED. The refusal runs before the library's write, so no
+    // client record exists to clean up — and there is no key to delete, which
+    // is why this is observed through a recording wrapper rather than by
+    // listing the store (hygiene rule 3: a listing is shared).
+    expect(puts.filter((key) => key.startsWith("client:"))).toEqual([]);
+  });
+
+  it("the positive control: an allowed registration records exactly one client write", async () => {
+    // Without this, the assertion above is satisfied by a wrapper that records
+    // nothing at all — a delegating `put` that forgot to push, or a library that
+    // writes client records through some other method. Same wrapper shape, same
+    // endpoint, one character of difference in the redirect address.
+    const puts: string[] = [];
+    const env = allowAllEnv({ OAUTH_KV: recordingKv(puts) });
+    let clientId: string | null = null;
+
+    try {
+      clientId = await register(env, "LIFE-02 control client", CLAUDE_WEB_REDIRECT);
+      expect(puts.filter((key) => key.startsWith("client:"))).toEqual([
+        `client:${clientId}`,
+      ]);
+    } finally {
+      if (clientId !== null) await forgetClient(clientId);
     }
   });
 });

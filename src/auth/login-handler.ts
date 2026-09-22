@@ -112,7 +112,11 @@
 // ---------------------------------------------------------------------------
 
 import { AuthorizationError } from "@cloudflare/workers-oauth-provider";
-import type { ClientInfo } from "@cloudflare/workers-oauth-provider";
+import type {
+  ClientInfo,
+  ClientRegistrationCallbackOptions,
+  ClientRegistrationCallbackResult,
+} from "@cloudflare/workers-oauth-provider";
 import { isConfiguredSecret } from "../configured-secret";
 import type { Env, LoginGateSecret } from "../env";
 import { ImapConnectError, ImapThrottleError } from "../errors";
@@ -910,6 +914,78 @@ export function isAllowedRedirectOrigin(origin: string | null): boolean {
     ALLOWED_REDIRECT_ORIGINS.includes(origin) ||
     LOOPBACK_REDIRECT_ORIGIN.test(origin)
   );
+}
+
+/**
+ * The entire description served when a registration is refused (LIFE-02).
+ *
+ * Exported for the reason `UNCONFIGURED_BODY` is: so the test asserts the value
+ * the server actually serves rather than a second copy of the sentence, which
+ * could drift from it.
+ *
+ * It is a CONSTANT and it interpolates nothing. Two reasons. The caller supplied
+ * the redirect address, so echoing it back would put a stranger's own text into
+ * a response — and the library's default error handler prints this description,
+ * so anything interpolated here is also printed. A fixed string has nothing to
+ * carry.
+ */
+export const REGISTRATION_REFUSED_DESCRIPTION =
+  "This server does not accept a client registration for that redirect address.";
+
+/**
+ * Refuse a registration whose redirect addresses are not all on the allowlist.
+ *
+ * ONE RULE, TWO CALL SITES. The authorize page and the registration endpoint
+ * ask the same question — will this server ever send a code to that address —
+ * so this reuses the same `isAllowedRedirectOrigin(originOf(uri))` expression
+ * `refusedRedirectResponse` uses. A second junk heuristic written here would
+ * drift from the first, and then one of the two would be wrong.
+ *
+ * WHY EVERY AND NOT SOME. A client can only ever authorize to an address it
+ * registered, so a list with one good entry and one junk entry buys the client
+ * nothing it could use. And now that client records never expire, the junk half
+ * would be stored forever. So every address must pass.
+ *
+ * THE EVIDENCE THAT THIS REFUSES NOTHING REAL. On 2026-09-21 all 21 live client
+ * records held exactly ONE redirect address each, in three shapes: the Claude
+ * web callback, a Claude Code loopback port, and a Hermes loopback port. All
+ * three pass (12-RESEARCH.md § Finding 2).
+ *
+ * THE RECOVERY IF A REAL CLIENT IS EVER REFUSED. Add its origin to
+ * `ALLOWED_REDIRECT_ORIGINS` above and deploy. That is the same fix the
+ * authorize refusal already documents, and nothing stored has to change.
+ *
+ * IT NEVER THROWS. `clientMetadata` is the RAW JSON body a stranger posted, and
+ * a throw here becomes a 500 whose description is the error's own message —
+ * text that stranger wrote, served back out. So the whole body sits in a
+ * try/catch, the caught value is never read, and anything malformed is refused.
+ * That is the same never-throw shape `servesThisGrant` uses in
+ * `src/mcp/api-handler.ts`, for the same reason.
+ *
+ * The callback is handed no environment, so it cannot reach a store or a
+ * limiter. That is fine for a question about an origin.
+ */
+export function refuseUnlistedRedirects({
+  clientMetadata,
+}: ClientRegistrationCallbackOptions): ClientRegistrationCallbackResult | undefined {
+  try {
+    const uris: unknown = clientMetadata.redirect_uris;
+    const allowed =
+      Array.isArray(uris) &&
+      uris.length > 0 &&
+      uris.every(
+        (uri: unknown) =>
+          typeof uri === "string" && isAllowedRedirectOrigin(originOf(uri)),
+      );
+
+    return allowed
+      ? undefined
+      : { description: REGISTRATION_REFUSED_DESCRIPTION };
+  } catch {
+    // Never read the caught value. A registration this cannot inspect is not
+    // one to store, so it is answered exactly as every other refusal is.
+    return { description: REGISTRATION_REFUSED_DESCRIPTION };
+  }
 }
 
 /**

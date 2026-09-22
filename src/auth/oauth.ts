@@ -9,7 +9,7 @@
 import type { OAuthProviderOptions } from "@cloudflare/workers-oauth-provider";
 import type { EntryEnv } from "../env";
 import { DEPLOYED_HOSTNAME, mcpApiHandler } from "../mcp/api-handler";
-import { loginHandler } from "./login-handler";
+import { loginHandler, refuseUnlistedRedirects } from "./login-handler";
 
 export const oauthProviderOptions: OAuthProviderOptions<EntryEnv> = {
   apiRoute: "/mcp",
@@ -32,6 +32,11 @@ export const oauthProviderOptions: OAuthProviderOptions<EntryEnv> = {
   // is proving that transport works. 01-02-SUMMARY.md records the full
   // reasoning and the escape hatch if a client cannot register dynamically.
   clientRegistrationEndpoint: "/oauth/register",
+
+  // LIFE-02. Junk is refused at registration rather than swept up later. The
+  // predicate's docstring in ./login-handler.ts carries the reasoning, the live
+  // evidence that it refuses nothing real, and the recovery.
+  clientRegistrationCallback: refuseUnlistedRedirects,
 
   // D-05. An access token lasts an hour. That is still the library default,
   // stated here so a change to it is a visible diff. Refresh-token rotation is
