@@ -136,10 +136,57 @@ function clientFrom(body: string): string | null {
   return /<strong class="client">([^<]*)<\/strong>/.exec(body)?.[1] ?? null;
 }
 
-/** Every value in the exported header constant, on the response as served. */
-function expectSecurityHeaders(response: Response): void {
+/**
+ * The whole policy string, written out THREE TIMES rather than derived.
+ *
+ * Everywhere else this file asserts against the constant the handler serves,
+ * because a retyped copy can drift from the source. Here the retyped copy IS
+ * the assertion, and the drift is the thing being caught: `form-action` now
+ * varies per destination, so a test that built its expectation by substituting
+ * into whatever the source currently says would go green for `form-action *` and
+ * for a directive that had quietly lost its origin again.
+ *
+ * So these are literals, complete, in order, including the three directives that
+ * do not vary. Asserted with `toBe` on the whole header value — never `toContain`
+ * — because a substring match on `form-action 'self'` is satisfied by
+ * `form-action 'self' *` and by the bare directive this work exists to replace.
+ */
+const POLICY_SELF =
+  "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+/** The claude.ai form of it: the shape a real Claude sign-in is served. */
+const POLICY_CLAUDE =
+  "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://claude.ai; frame-ancestors 'none'; base-uri 'none'";
+
+/** The loopback form of it, for a locally-bound client on its own port. */
+const POLICY_LOOPBACK =
+  "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' http://127.0.0.1:27890; frame-ancestors 'none'; base-uri 'none'";
+
+/**
+ * A loopback callback of the shape this account really registers.
+ *
+ * `test/authorize-redirect-allowlist.test.ts` owns whether the allowlist admits
+ * the class; this is about what the admitted origin does to the directive.
+ */
+const LOOPBACK_REDIRECT = "http://127.0.0.1:27890/callback";
+
+/**
+ * Every value in the exported header constant, on the response as served.
+ *
+ * The loop still iterates `RESPONSE_HEADERS`, which is what keeps every case
+ * below non-vacuous — an emptied constant asserts nothing. The policy is the one
+ * value taken from the caller instead, because it varies with the destination,
+ * and it defaults to the bare form so a case that forgets to say is asserting
+ * the narrow directive rather than accepting whatever it finds.
+ */
+function expectSecurityHeaders(
+  response: Response,
+  policy: string = POLICY_SELF,
+): void {
   for (const [name, value] of Object.entries(RESPONSE_HEADERS)) {
-    expect(response.headers.get(name)).toBe(value);
+    expect(response.headers.get(name)).toBe(
+      name === "content-security-policy" ? policy : value,
+    );
   }
 }
 
@@ -457,6 +504,11 @@ describe("the security headers are on every response", () => {
     label: string;
     status: number;
     serve: () => Promise<Response>;
+    /**
+     * The whole policy this case must carry. Omitted means the bare directive,
+     * which is the right answer for every response with no destination.
+     */
+    policy?: string;
   }[] = [
     {
       label: "the unknown-path 404",
@@ -496,6 +548,11 @@ describe("the security headers are on every response", () => {
     {
       label: "the authorization-error redirect",
       status: 302,
+      // On the POST path this is itself a form-submission redirect, so a
+      // directive forbidding its own destination refuses it in WebKit exactly as
+      // it refused the success redirect. The destination here is on the
+      // allowlist, so it is named.
+      policy: POLICY_CLAUDE,
       serve: () =>
         getForm({
           parseAuthRequest: async () => {
@@ -523,11 +580,18 @@ describe("the security headers are on every response", () => {
     {
       label: "the form at 200",
       status: 200,
+      // The document that submits the form, so this is the one the browser
+      // actually enforces `form-action` from.
+      policy: POLICY_CLAUDE,
       serve: () => getForm(),
     },
     {
       label: "the form at 401",
       status: 401,
+      // The re-render has to permit the destination too. A directive that
+      // widened only on a first load would break every sign-in that took two
+      // attempts, which is the attempt a person is most likely to make.
+      policy: POLICY_CLAUDE,
       serve: () => postForm({}, "203.0.113.202"),
     },
   ];
@@ -537,12 +601,10 @@ describe("the security headers are on every response", () => {
     // iterates this constant, so an emptied constant would make all of them
     // pass while asserting nothing at all.
     expect(Object.keys(RESPONSE_HEADERS)).toHaveLength(4);
-    expect(RESPONSE_HEADERS["content-security-policy"]).toContain(
-      "frame-ancestors 'none'",
-    );
-    expect(RESPONSE_HEADERS["content-security-policy"]).toContain(
-      "form-action 'self'",
-    );
+    // The whole string, so the constant and the literal this file asserts with
+    // are pinned to each other in one place. Every case below then compares a
+    // served header against one of the three complete literals.
+    expect(RESPONSE_HEADERS["content-security-policy"]).toBe(POLICY_SELF);
   });
 
   for (const enumerated of RESPONSES) {
@@ -550,7 +612,7 @@ describe("the security headers are on every response", () => {
       const response = await enumerated.serve();
 
       expect(response.status).toBe(enumerated.status);
-      expectSecurityHeaders(response);
+      expectSecurityHeaders(response, enumerated.policy);
     });
   }
 
@@ -607,7 +669,11 @@ describe("the security headers are on every response", () => {
     expect(response.headers.get("location") ?? "").toContain(
       `${redirectUri}?code=`,
     );
-    expectSecurityHeaders(response);
+    // The redirect at the centre of the 2026-09-23 defect. It carries the same
+    // widened directive the page that submitted the form carries, so this whole
+    // surface answers with one policy value per destination rather than two that
+    // have to be kept in step.
+    expectSecurityHeaders(response, POLICY_CLAUDE);
   });
 
   it("keeps each site's own headers alongside the four", async () => {
@@ -634,6 +700,123 @@ describe("the security headers are on every response", () => {
     // minutes" — see the body constant for why the pair is deliberate.
     const refused = await postForm({ floodRefused: true }, "203.0.113.204");
     expect(refused.headers.get("retry-after")).toBe("60");
+  });
+});
+
+describe("form-action names the destination the flow is about to redirect to", () => {
+  /**
+   * The table the 2026-09-23 defect earns.
+   *
+   * `form-action 'self'` alone blocked this flow's OWN success redirect in
+   * Safari: WebKit still checks a form submission's redirect against the
+   * submitting document's directive, Chromium stopped, and the code was issued
+   * and never exchanged with no error anywhere. Phase 11's review predicted it as
+   * WR-05 and it was skipped on evidence from the one browser that cannot
+   * reproduce it.
+   *
+   * So every case here asserts the WHOLE header value with `toBe`. A
+   * `toContain("form-action 'self'")` would be satisfied by the bare directive
+   * this replaces AND by `form-action 'self' *`, which is to say by both of the
+   * two failures worth catching.
+   */
+  const policyOf = (response: Response): string =>
+    response.headers.get("content-security-policy") ?? "";
+
+  it("the three literals differ only in the directive under test", () => {
+    // Non-vacuity. If these three strings were ever edited into agreement, every
+    // case below would pass while distinguishing nothing.
+    expect(POLICY_CLAUDE).not.toBe(POLICY_SELF);
+    expect(POLICY_LOOPBACK).not.toBe(POLICY_SELF);
+    expect(POLICY_LOOPBACK).not.toBe(POLICY_CLAUDE);
+    expect(POLICY_CLAUDE.replace(" https://claude.ai", "")).toBe(POLICY_SELF);
+    expect(POLICY_LOOPBACK.replace(" http://127.0.0.1:27890", "")).toBe(
+      POLICY_SELF,
+    );
+  });
+
+  it("permits exactly claude.ai on the page a Claude sign-in is served", async () => {
+    const response = await getForm({ redirectUri: ALLOWED_REDIRECT });
+
+    expect(response.status).toBe(200);
+    expect(policyOf(response)).toBe(POLICY_CLAUDE);
+
+    // Named separately so a regression that reached for a wildcard instead of
+    // the origin fails on its own assertion rather than inside a diff of two
+    // long strings.
+    expect(policyOf(response)).not.toContain("*");
+    expect(policyOf(response)).toContain(
+      "form-action 'self' https://claude.ai;",
+    );
+  });
+
+  it("permits the same origin the consent block names, not a second derivation", async () => {
+    // The tie that stops the page saying one thing and the browser being told
+    // another. Both come from `originOf`, and this is what proves it: the origin
+    // inside the directive is byte-identical to the one in the marked element
+    // the reader is asked to check.
+    const response = await getForm({ redirectUri: ALLOWED_REDIRECT });
+    const shown = /<code class="dest">([^<]*)<\/code>/.exec(
+      await response.text(),
+    )?.[1];
+
+    expect(shown).toBe("https://claude.ai");
+    expect(policyOf(response)).toBe(
+      POLICY_SELF.replace("form-action 'self'", `form-action 'self' ${shown}`),
+    );
+  });
+
+  it("permits a loopback client's own origin, port and all", async () => {
+    // A real registered shape in this account: a locally-bound client on an
+    // ephemeral port. The allowlist admits the class with any port, so the
+    // directive has to carry whichever port this request actually holds.
+    const response = await getForm({ redirectUri: LOOPBACK_REDIRECT });
+
+    expect(response.status).toBe(200);
+    expect(policyOf(response)).toBe(POLICY_LOOPBACK);
+    expect(await response.text()).toContain(
+      '<code class="dest">http://127.0.0.1:27890</code>',
+    );
+  });
+
+  it("widens the re-render after a failed attempt too", async () => {
+    const response = await postForm(
+      { redirectUri: LOOPBACK_REDIRECT },
+      "203.0.113.205",
+    );
+
+    expect(response.status).toBe(401);
+    expect(policyOf(response)).toBe(POLICY_LOOPBACK);
+  });
+
+  it("never lets an off-list origin reach the directive, because no page is rendered", async () => {
+    // The refusal happens above the render, so there is no path on which an
+    // unvalidated origin could be interpolated into a policy. Asserted three
+    // ways: the status, the absence of a form, and the bare directive.
+    const response = await getForm({
+      redirectUri: "https://attacker.example/cb",
+    });
+    const body = await response.text();
+
+    expect(response.status).toBe(403);
+    expect(body).not.toContain("<form");
+    expect(policyOf(response)).toBe(POLICY_SELF);
+    expect(policyOf(response)).not.toContain("attacker.example");
+  });
+
+  it("keeps the bare directive for a destination it cannot reduce to an allowed origin", async () => {
+    // The fail-closed edge, driven straight at the renderer because the handler
+    // refuses these above it. A custom-scheme callback and an unparseable string
+    // both answer the narrow directive rather than interpolating whatever came
+    // in.
+    for (const redirectUri of ["myapp:/cb", "not a url at all"]) {
+      const response = renderForm(STUB_QUERY, null, {
+        name: "Native Client",
+        redirectUri,
+      });
+
+      expect(response.status).toBe(200);
+      expect(policyOf(response)).toBe(POLICY_SELF);
+    }
   });
 });
 

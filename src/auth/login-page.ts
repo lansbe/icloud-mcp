@@ -69,20 +69,29 @@
 // ---------------------------------------------------------------------------
 // On the import cycle with `./login-handler`, which is deliberate and safe.
 //
-// This module imports the destination display helper and the two field names
-// from the handler; the handler imports the renderer, the header constant and
-// the refusal bodies from here. That cycle exists ON PURPOSE. The allowlist
-// check and the consent line must read the SAME derived origin — a second
-// derivation would let the page name an origin the check never looked at, which
-// is a mitigation lying about what it mitigated — and the field names must be
-// the same strings the form writes and the handler reads.
+// This module imports the destination display helper, the origin derivation,
+// the allowlist predicate and the two field names from the handler; the handler
+// imports the renderer, the header constant, the per-destination header builder
+// and the refusal bodies from here. That cycle exists ON PURPOSE. The allowlist
+// check, the consent line and the `form-action` directive must read the SAME
+// derived origin — a second derivation would let the page name one origin,
+// permit another and check a third, which is a mitigation lying about what it
+// mitigated — and the field names must be the same strings the form writes and
+// the handler reads.
 //
 // It resolves because nothing crosses the cycle at module-evaluation time. Every
-// imported binding here is used inside `renderForm`'s body, and every binding
-// the handler imports from here is used inside a request. Neither module calls
-// into the other while it is still initialising, so the load order does not
-// matter. Keep it that way: a top-level call across this boundary would turn a
-// working cycle into an undefined binding at cold start.
+// binding imported here is used inside a function body — `renderForm`'s or
+// `responseHeadersFor`'s — and every binding the handler imports from here is
+// used inside a request. Neither module calls into the other while it is still
+// initialising, so the load order does not matter. Keep it that way: a top-level
+// call across this boundary would turn a working cycle into an undefined binding
+// at cold start.
+//
+// `RESPONSE_HEADERS` is the one value here built by a call at module-evaluation
+// time, and that is safe for exactly one reason: `contentSecurityPolicy` is
+// declared in THIS file and calls nothing outside it. Do not reach across the
+// cycle from that initialiser — building the constant from `originOf` or from
+// the allowlist would be the cold-start failure this note is about.
 // ---------------------------------------------------------------------------
 
 import type { ClientIdentity } from "./login-handler";
@@ -90,7 +99,36 @@ import {
   APP_PASSWORD_FIELD,
   APPLE_ID_FIELD,
   displayDestination,
+  isAllowedRedirectOrigin,
+  originOf,
 } from "./login-handler";
+
+/**
+ * The policy string, with `form-action` widened by one origin or left bare.
+ *
+ * A local pure function, and both of those words are load-bearing. LOCAL
+ * because `RESPONSE_HEADERS` below is built by calling it at module-evaluation
+ * time, and this module's import cycle with `./login-handler` only resolves
+ * while nothing crosses that boundary during initialisation — see the note at
+ * the top of this file. PURE because the widened form is then derived by one
+ * function from one already-validated origin, so there is no second spelling of
+ * the four directives that could drift from this one.
+ *
+ * Null means the bare form. Anything else is interpolated verbatim, which is
+ * safe only because of where the value comes from: `responseHeadersFor` is the
+ * one caller that passes a non-null one, and it passes nothing that has not
+ * already satisfied `isAllowedRedirectOrigin`. That predicate is exact equality
+ * against a source constant plus an anchored loopback pattern, so the set of
+ * strings that can reach this parameter is small, finite, and contains no
+ * space, no semicolon and no line break. Header injection is not possible here,
+ * and it is not possible because of the validation rather than because of any
+ * escaping done on this line.
+ */
+function contentSecurityPolicy(formActionOrigin: string | null): string {
+  const formAction =
+    formActionOrigin === null ? "'self'" : `'self' ${formActionOrigin}`;
+  return `default-src 'none'; style-src 'unsafe-inline'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`;
+}
 
 /**
  * The security headers every response this handler serves must carry.
@@ -106,26 +144,108 @@ import {
  * `default-src 'none'` closes everything, including scripts, which is why the
  * no-script rule above is worth keeping. `style-src 'unsafe-inline'` is safe
  * precisely because that default stands in front of it: CSS-based exfiltration
- * needs an outbound request and no directive permits one. `form-action 'self'`
- * is the quiet one that matters — it stops an injected form from posting these
- * two fields anywhere else. `frame-ancestors 'none'` and the legacy framing
- * header are the clickjacking pair, and they are on EVERY response rather than
- * only the form. `no-referrer` keeps the authorization query out of an outbound
- * request's referrer. `no-store` is the one that matters most on the two
- * redirects: the success redirect's location header carries the authorization
- * code, and a cached copy of that redirect is a cached copy of a
- * credential-equivalent.
+ * needs an outbound request and no directive permits one. `frame-ancestors
+ * 'none'` and the legacy framing header are the clickjacking pair, and they are
+ * on EVERY response rather than only the form. `no-referrer` keeps the
+ * authorization query out of an outbound request's referrer. `no-store` is the
+ * one that matters most on the two redirects: the success redirect's location
+ * header carries the authorization code, and a cached copy of that redirect is
+ * a cached copy of a credential-equivalent.
+ *
+ * ---------------------------------------------------------------------------
+ * `form-action` is the one that is NOT fixed, and this is why.
+ *
+ * This constant carries the bare `'self'` form. That is the right answer for
+ * every response that has no destination — the 404, the 503, the 405, the
+ * per-source 429, the unknown-client 400, and the refused-destination 403. It
+ * was the WRONG answer for the sign-in page itself, and it broke the flow in a
+ * way nobody could see.
+ *
+ * What `'self'` alone does is not only stop an injected form posting these two
+ * fields elsewhere. It also decides where a form submission may END UP, and a
+ * submission that ends up somewhere is a submission that followed a redirect.
+ * Our own flow ends in one: the POST to `/authorize` answers 302 to the
+ * client's callback, and that callback is `https://claude.ai/...`, which is not
+ * `'self'`. WebKit still checks the redirect against the submitting document's
+ * `form-action`, so Safari refused to follow our own 302. Chromium stopped
+ * checking redirects against this directive, which is why the identical flow
+ * works in Chrome.
+ *
+ * MEASURED IN SAFARI ON 2026-09-23, not theorised. `wrangler tail` showed
+ * `POST /oauth/register 201` twice, `GET /authorize 200`, `POST /authorize 302`
+ * — and then nothing at all. No `POST /oauth/token` ever arrived. The live
+ * store held the resulting grants with no token record under them, so the code
+ * was issued and never exchanged. Safari's own network panel showed no 302
+ * being followed. What the person saw was Claude saying they started connecting
+ * and did not finish. There is no error anywhere, because the browser refused
+ * the navigation silently and this server's side of it succeeded.
+ *
+ * PHASE 11'S CODE REVIEW PREDICTED THIS AND IT WAS SKIPPED. Finding WR-05 said
+ * `form-action 'self'` may block the success redirect. It was skipped on the
+ * strength of one real sign-in whose logs showed the token exchange happening —
+ * true, and taken in a Chromium browser, which is the one browser this directive
+ * no longer breaks. The finding also named Chromium as the browser at risk,
+ * which is backwards. Evidence from the browser that cannot reproduce a bug is
+ * not evidence the bug is absent.
+ *
+ * So `responseHeadersFor` widens the directive by exactly one origin: the
+ * destination this very request is about to be sent to. That is not a new
+ * permission. `isAllowedRedirectOrigin(originOf(uri))` has already decided this
+ * server will deliver an authorization code there, and the page has already
+ * NAMED it to the reader in the consent block. Letting the form reach the one
+ * origin the form is about is narrower than the reader has already been told.
+ *
+ * Nothing else widens. No wildcard, no scheme-only source, no second origin,
+ * and no value that has not passed the allowlist — a refused destination never
+ * renders a page at all, so there is no path on which an unvalidated origin
+ * could reach the directive.
+ * ---------------------------------------------------------------------------
  *
  * Spread this FIRST at every construction site and let the site's own headers
  * follow, so a site can never silently drop one of the four.
  */
 export const RESPONSE_HEADERS: Readonly<Record<string, string>> = {
-  "content-security-policy":
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+  "content-security-policy": contentSecurityPolicy(null),
   "x-frame-options": "DENY",
   "referrer-policy": "no-referrer",
   "cache-control": "no-store",
 };
+
+/**
+ * The same four headers, with `form-action` permitting one validated origin.
+ *
+ * Takes the RAW redirect URI and validates inside itself, deliberately. A caller
+ * cannot hand this an origin it derived on its own, so there is no call site at
+ * which somebody could widen the directive by something the allowlist never
+ * saw. An off-list, unparseable or custom-scheme URI answers `RESPONSE_HEADERS`
+ * unchanged, which is the fail-closed direction: the bare directive.
+ *
+ * It reuses the ONE derivation and the ONE predicate rather than a second copy
+ * of either. The consent block on the page names the origin this computes from,
+ * so the origin the reader is shown and the origin the browser is permitted to
+ * submit to cannot come apart.
+ *
+ * Three call sites, and they are the three responses that a form submission can
+ * be judged against: the page itself, the 302 that hands over the authorization
+ * code, and the 302 that carries an authorization error back to the client. The
+ * page's own header is the one the browser actually enforces — the policy
+ * consulted for a form submission is the submitting DOCUMENT's — and the two
+ * redirects carry it as well so that the header set on this surface is one set
+ * with one value per destination rather than two sets that have to be kept in
+ * step.
+ */
+export function responseHeadersFor(
+  redirectUri: string,
+): Readonly<Record<string, string>> {
+  const origin = originOf(redirectUri);
+  if (origin === null || !isAllowedRedirectOrigin(origin)) {
+    return RESPONSE_HEADERS;
+  }
+  return {
+    ...RESPONSE_HEADERS,
+    "content-security-policy": contentSecurityPolicy(origin),
+  };
+}
 
 /**
  * The ONE body for every failure on the credential path, both of its lines.
@@ -651,8 +771,13 @@ export function renderForm(
 </html>`,
     {
       status: failed ? 401 : 200,
+      // The ONE response whose `form-action` the browser actually enforces: the
+      // policy consulted for a form submission is the submitting document's,
+      // and this is that document. The widening is by the destination named in
+      // the consent block three lines up, so the origin the reader is shown and
+      // the origin the browser will let the form reach are the same string.
       headers: {
-        ...RESPONSE_HEADERS,
+        ...responseHeadersFor(identity.redirectUri),
         "content-type": "text/html; charset=utf-8",
       },
     },

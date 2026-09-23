@@ -127,7 +127,12 @@ import type { Principal } from "../principal";
 import { normaliseAppleId, principalFromProps, userIdOf } from "../principal";
 import type { AllowList } from "./allow-list";
 import { isAllowed, parseAllowList, readStoredAllowList } from "./allow-list";
-import { RESPONSE_HEADERS, SOURCE_REFUSAL_BODY, renderForm } from "./login-page";
+import {
+  RESPONSE_HEADERS,
+  SOURCE_REFUSAL_BODY,
+  renderForm,
+  responseHeadersFor,
+} from "./login-page";
 
 /** The only scope this server issues. */
 const SUPPORTED_SCOPES = ["mcp"];
@@ -1229,9 +1234,19 @@ function authorizationErrorResponse(error: AuthorizationError): Response {
   // The location header is set by hand and the body is empty, which is what the
   // helper produces anyway — a caller reading `location` off this response sees
   // the identical value.
+  //
+  // `responseHeadersFor` rather than the bare constant, because on the POST path
+  // this IS a form-submission redirect and a directive that forbids its own
+  // destination refuses it silently in WebKit — the same defect measured on
+  // 2026-09-23 and argued at the constant. The URI is handed over RAW and
+  // validated inside that helper, so an error redirect to an origin the
+  // allowlist has never seen gets the bare directive rather than a widened one.
   return new Response(null, {
     status: 302,
-    headers: { ...RESPONSE_HEADERS, location: redirect.toString() },
+    headers: {
+      ...responseHeadersFor(error.redirectUri),
+      location: redirect.toString(),
+    },
   });
 }
 
@@ -1979,9 +1994,20 @@ async function handleAuthorize(
     // cached copy of a credential-equivalent. The helper builds a response
     // nothing can put a caching header on. A caller reading `location` off this
     // response sees the same value the helper would have set.
+    //
+    // This is the redirect that was being blocked. `form-action 'self'` on the
+    // page that submitted the form made Safari refuse to follow this 302 to
+    // claude.ai, silently, so the code was issued and never exchanged
+    // (measured 2026-09-23; the argument is at `RESPONSE_HEADERS`). The page is
+    // where the fix has to land, and this response carries the matching
+    // directive so the whole surface answers with one value per destination.
+    // The URI is the one the allowlist already accepted twice on this path.
     return new Response(null, {
       status: 302,
-      headers: { ...RESPONSE_HEADERS, location: redirectTo },
+      headers: {
+        ...responseHeadersFor(oauthRequest.redirectUri),
+        location: redirectTo,
+      },
     });
   }
 }
