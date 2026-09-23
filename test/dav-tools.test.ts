@@ -70,9 +70,8 @@ import type { CommitOutcome, EventPreview } from "../src/mcp/tools/calendar";
 import { registerContactsTools } from "../src/mcp/tools/contacts";
 import { registerDavDiagnoseTool } from "../src/mcp/tools/dav-diagnose";
 import { UNTRUSTED_PREAMBLE } from "../src/mcp/untrusted";
-import { entryEnv, ownerPrincipal } from "./fixtures/bound-secrets";
+import { ownerPrincipal, refusedPrincipal } from "./fixtures/bound-secrets";
 import type { Principal } from "../src/principal";
-import { principalFromEnv } from "../src/principal";
 
 // The owner's principal, as the PROMISE the real env constructor returns over
 // the pool's ambient environment. The DAV fetch builder and the registrars take
@@ -6976,10 +6975,15 @@ describe("calendar_find_free_slots returns an unfenced, trusted-only response", 
 // ---------------------------------------------------------------------------
 // A principal that was refused (Phase 9, D-09, D-27)
 //
-// With a mail secret unset, the promise of the principal rejects. Every DAV
-// callback awaits that promise as the FIRST line of its `try`, so every one of
-// them answers `auth_failed` before it looks at an argument, reads the cache or
-// sends a request.
+// When a grant's credentials do not check out, the promise of the principal
+// rejects. Every DAV callback awaits that promise as the FIRST line of its
+// `try`, so every one of them answers `auth_failed` before it looks at an
+// argument, reads the cache or sends a request.
+//
+// The promise comes from the fixture's helper, which builds it through the REAL
+// constructor. A local helper used to build it by handing a patched environment
+// to the constructor Phase 13 deletes; the fixture's is the replacement, and it
+// takes which half of the credential pair is bad.
 // ---------------------------------------------------------------------------
 
 describe("a principal that was refused reaches no DAV tool", () => {
@@ -6987,18 +6991,18 @@ describe("a principal that was refused reaches no DAV tool", () => {
     vi.unstubAllGlobals();
   });
 
-  /** The promise the door hands over when the Apple ID secret is unset. */
-  function refusedPrincipal(): Promise<Principal> {
-    const refused = principalFromEnv({ ...entryEnv(), APPLE_ID: undefined });
-    refused.catch(() => {});
-    return refused;
+  /** The promise the door hands over when the grant's address does not check out. */
+  function refused(): Promise<Principal> {
+    const promise = refusedPrincipal("appleId");
+    promise.catch(() => {});
+    return promise;
   }
 
   it("covers every DAV registration, and the count is pinned", () => {
     // One diagnostic, nine calendar tools, two contacts tools. A tool added
     // later lands in the loop below by itself. This pin is what makes a tool
     // REMOVED from the loop show up.
-    expect(registeredDav(refusedPrincipal()).length).toBe(12);
+    expect(registeredDav(refused()).length).toBe(12);
   });
 
   it("answers auth_failed from EVERY tool, with the unchanged message and zero requests", async () => {
@@ -7012,7 +7016,7 @@ describe("a principal that was refused reaches no DAV tool", () => {
     // first would throw on a missing field or answer `not_found` for a bad id.
     // `auth_failed` from all of them proves the await is ahead of everything.
     // One at a time: this project does not fan tool calls out.
-    for (const tool of registeredDav(refusedPrincipal())) {
+    for (const tool of registeredDav(refused())) {
       const result = await tool.callback({});
       expect(result.isError, `${tool.name} did not fail`).toBe(true);
       const body = JSON.parse(result.content[0].text) as {

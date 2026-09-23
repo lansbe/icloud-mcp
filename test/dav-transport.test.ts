@@ -26,17 +26,17 @@ import {
 import { createDavFetch, davAuthHeader } from "../src/dav/transport";
 import { SAFE_MESSAGES } from "../src/errors";
 import type { Principal } from "../src/principal";
-import { principalFromEnv, principalFromProps } from "../src/principal";
+import { principalFromProps } from "../src/principal";
 import {
   FAKE_APP_PASSWORD,
   FAKE_APPLE_ID,
-  entryEnv,
   ownerPrincipal,
+  refusedPrincipal,
 } from "./fixtures/bound-secrets";
 
-// The owner's principal, as the PROMISE the real env constructor returns over
-// the pool's ambient environment. The DAV fetch builder and the registrars take
-// the promise. The no-op handler means a file that builds it and awaits it
+// The owner's principal, as the PROMISE the real constructor returns over the
+// fixture's own two fake credentials. The DAV fetch builder and the registrars
+// take the promise. The no-op handler means a file that builds it and awaits it
 // nowhere leaves no rejection unheard. Everyone who does await it still sees
 // the refusal.
 const owner = ownerPrincipal();
@@ -208,54 +208,75 @@ describe("davAuthHeader", () => {
   });
 
   it.each([
-    ["APPLE_ID absent", { APPLE_ID: undefined }],
-    ["APPLE_ID empty", { APPLE_ID: "" }],
-    ["APPLE_APP_PASSWORD absent", { APPLE_APP_PASSWORD: undefined }],
-    ["APPLE_APP_PASSWORD empty", { APPLE_APP_PASSWORD: "" }],
-  ])("refuses with DavAuthError and sends nothing when %s", async (_label, patch) => {
-    // An absent secret can no longer be expressed at the header function: only
-    // a real principal reaches it, and none can be built from these values. So
-    // the same claim is made one level up. The promise rejects, the DAV fetch
-    // built over it raises the DAV auth error, and no request leaves.
-    const stub = statusStub(207);
-    vi.stubGlobal("fetch", stub.fetch);
+    ["the Apple ID half is unusable", "appleId"],
+    ["the password half is unusable", "appPassword"],
+  ] as const)(
+    "refuses with DavAuthError and sends nothing when %s",
+    async (_label, which) => {
+      // This case's subject is the SHORT CIRCUIT and not how the principal came
+      // to be refused: a refused principal promise makes the DAV fetch raise its
+      // own auth error, and no request leaves.
+      //
+      // It ran four rows until Phase 13 — one per account binding, absent and
+      // empty — by handing a patched environment to the constructor that phase
+      // deletes. There is no environment to patch now, so what survives is the
+      // two rows the fixture's helper can express: one bad half each. Whether an
+      // unset credential and an empty one are BOTH refused is the constructor's
+      // own claim, and it is held where the constructor is tested.
+      const stub = statusStub(207);
+      vi.stubGlobal("fetch", stub.fetch);
 
-    const refused = principalFromEnv({ ...entryEnv(), ...patch });
-    refused.catch(() => {});
+      const refused = refusedPrincipal(which);
+      refused.catch(() => {});
 
-    expect(await raise(createDavFetch(refused))).toBeInstanceOf(DavAuthError);
-    expect(stub.observed.length).toBe(0);
-  });
+      expect(await raise(createDavFetch(refused))).toBeInstanceOf(DavAuthError);
+      expect(stub.observed.length).toBe(0);
+    },
+  );
 
   it.each([
-    ["a trailing newline", "test-password-not-real\n"],
+    ["a trailing newline", `${FAKE_APP_PASSWORD}\n`],
     ["a carriage return", "test-\rpassword"],
     ["a NUL", "test-\u0000password"],
-  ])("refuses with DavAuthError and sends nothing on a secret carrying %s", async (_label, password) => {
-    // A secret provisioned from a file carries the file's trailing newline, so
-    // this is the mundane case rather than the hostile one. Refusing beats
-    // escaping: an escaped value is rejected by the server, and the user is
-    // told the credential is wrong when only its encoding was.
-    //
-    // The principal module refuses these first now. The header function's own
-    // check is the second layer behind it.
-    const stub = statusStub(207);
-    vi.stubGlobal("fetch", stub.fetch);
+  ])(
+    "refuses with DavAuthError and sends nothing on a password carrying %s",
+    async (_label, password) => {
+      // A password pasted out of another window carries whatever line ending
+      // came with it, so this is the mundane case rather than the hostile one.
+      // Refusing beats escaping: an escaped value is turned down by the server,
+      // and the person is told the credential is wrong when only its encoding
+      // was.
+      //
+      // Built through the REAL constructor rather than the fixture's helper,
+      // because the helper picks which half is bad and this case needs a
+      // SPECIFIC bad value in that half. The principal module refuses these
+      // first; the header function's own check is the second layer behind it.
+      const stub = statusStub(207);
+      vi.stubGlobal("fetch", stub.fetch);
 
-    const refused = principalFromEnv({ ...entryEnv(), APPLE_APP_PASSWORD: password });
-    refused.catch(() => {});
+      const refused = principalFromProps({
+        v: 1,
+        appleId: FAKE_APPLE_ID,
+        appPassword: password,
+      });
+      refused.catch(() => {});
 
-    expect(await raise(createDavFetch(refused))).toBeInstanceOf(DavAuthError);
-    expect(stub.observed.length).toBe(0);
-  });
+      expect(await raise(createDavFetch(refused))).toBeInstanceOf(DavAuthError);
+      expect(stub.observed.length).toBe(0);
+    },
+  );
 
   it("refuses an illegal character in the Apple ID too", async () => {
     const stub = statusStub(207);
     vi.stubGlobal("fetch", stub.fetch);
 
-    const refused = principalFromEnv({
-      ...entryEnv(),
-      APPLE_ID: "a\nb@example.invalid",
+    // The line ending sits in the MIDDLE, so the trim check (D-18) passes it
+    // through and the id function's ASCII rule is what turns it away — the same
+    // refusal this case has always been about.
+    const refused = principalFromProps({
+      v: 1,
+      appleId: "a\nb@example.invalid",
+      appPassword: FAKE_APP_PASSWORD,
     });
     refused.catch(() => {});
 
@@ -270,7 +291,7 @@ describe("davAuthHeader", () => {
     const stub = statusStub(207);
     vi.stubGlobal("fetch", stub.fetch);
 
-    const refused = principalFromEnv({ ...entryEnv(), APPLE_ID: undefined });
+    const refused = refusedPrincipal("appleId");
     refused.catch(() => {});
 
     const raised = await raise(createDavFetch(refused));
@@ -360,13 +381,14 @@ describe("createDavFetch — the credential", () => {
     ).toBe(true);
   });
 
-  it("refuses before the request when a secret is absent", async () => {
+  it("refuses before the request when the principal was refused", async () => {
     const stub = statusStub(207);
     vi.stubGlobal("fetch", stub.fetch);
 
-    // The promise the door would hand over with that secret unset. It rejects,
-    // and the DAV fetch turns the rejection into its own auth error.
-    const refused = principalFromEnv({ ...entryEnv(), APPLE_ID: undefined });
+    // The promise the door hands over when the grant's credentials do not check
+    // out. It rejects, and the DAV fetch turns the rejection into its own auth
+    // error.
+    const refused = refusedPrincipal("appleId");
     refused.catch(() => {});
     await expect(createDavFetch(refused)(TARGET)).rejects.toBeInstanceOf(
       DavAuthError,

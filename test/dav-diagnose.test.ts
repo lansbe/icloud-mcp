@@ -33,12 +33,11 @@ import {
   davDiagnosticResult,
   registerDavDiagnoseTool,
 } from "../src/mcp/tools/dav-diagnose";
-import { principalFromEnv } from "../src/principal";
 import {
   FAKE_APP_PASSWORD,
   FAKE_APPLE_ID,
-  entryEnv,
   ownerPrincipal,
+  refusedPrincipal,
 } from "./fixtures/bound-secrets";
 import type { Principal } from "../src/principal";
 
@@ -417,17 +416,17 @@ describe("dav_diagnose, end to end", () => {
     expect(serialized).not.toContain(FAKE_APP_PASSWORD);
   });
 
-  it("fails with auth_failed BEFORE any request when a secret is absent", async () => {
+  it("fails with auth_failed BEFORE any request when the principal was refused", async () => {
     const stub = davStub();
     vi.stubGlobal("fetch", stub.fetch);
 
-    // An absent secret can no longer be expressed below the door: the
-    // diagnostic takes a principal, and none can be built without both values.
-    // So the REGISTERED callback is driven with the promise the door would hand
-    // over. It rejects, the callback's first await throws, and the callback's
-    // own catch shapes the refusal. Same two assertions as before, on the same
-    // two fields.
-    const refused = principalFromEnv({ ...entryEnv(), APPLE_ID: undefined });
+    // A bad credential cannot be expressed below the door: the diagnostic takes
+    // a principal, and none is built from a credential the constructor turns
+    // away. So the REGISTERED callback is driven with the promise the door hands
+    // over instead. It rejects, the callback's first await throws, and the
+    // callback's own catch shapes the refusal. Same two assertions as before, on
+    // the same two fields.
+    const refused = refusedPrincipal("appleId");
     refused.catch(() => {});
 
     const shaped = await diagnoseHandler(createDavFetch(refused), refused)({});

@@ -47,17 +47,16 @@ import {
   withRediscovery,
 } from "../src/dav/discovery";
 import { createDavFetch } from "../src/dav/transport";
-import { principalFromEnv } from "../src/principal";
 import {
   FAKE_APPLE_ID,
-  entryEnv,
   ownerPrincipal,
+  refusedPrincipal,
 } from "./fixtures/bound-secrets";
 import type { Principal } from "../src/principal";
 
-// The owner's principal, as the PROMISE the real env constructor returns over
-// the pool's ambient environment. The DAV fetch builder and the registrars take
-// the promise. The no-op handler means a file that builds it and awaits it
+// The owner's principal, as the PROMISE the real constructor returns over the
+// fixture's own two fake credentials. The DAV fetch builder and the registrars
+// take the promise. The no-op handler means a file that builds it and awaits it
 // nowhere leaves no rejection unheard. Everyone who does await it still sees
 // the refusal.
 const owner = ownerPrincipal();
@@ -383,20 +382,25 @@ describe("the discovery chain (DAV-02)", () => {
     expect(davToErrorCategory(raised).category).toBe("not_found");
   });
 
-  it("refuses before any request when a secret is absent", async () => {
+  it("refuses before any request when the principal was refused", async () => {
     const stub = davStub();
     vi.stubGlobal("fetch", stub.fetch);
-    const scoped = { ...entryEnv(), APPLE_APP_PASSWORD: undefined };
-    // The promise the door would hand over with that secret unset. An absent
-    // secret can no longer be expressed below the door: discovery takes a
-    // principal, and none can be built from this environment. So the claim is
-    // made one level up, the way a tool callback meets it. The callback awaits
-    // the promise as the first line of its `try`, and that await is what throws.
-    const refused = principalFromEnv(scoped);
+    // The promise the door hands over when the grant's password does not check
+    // out. A bad credential cannot be expressed below the door: discovery takes
+    // a principal, and none is built from one the constructor turns away. So the
+    // claim is made one level up, the way a tool callback meets it. The callback
+    // awaits the promise as the first line of its `try`, and that await is what
+    // throws.
+    //
+    // The environment argument is the plain ambient one. It used to be a copy
+    // with a binding spoiled, because that copy was also what the principal was
+    // built from; the credential no longer travels on the environment, so the
+    // two roles came apart and this one keeps only the bindings.
+    const refused = refusedPrincipal("appPassword");
     refused.catch(() => {});
 
     const raised = await capture(async () =>
-      resolveDavAccount(scoped, await refused, createDavFetch(refused), "caldav"),
+      resolveDavAccount(env, await refused, createDavFetch(refused), "caldav"),
     );
 
     // The raised value is the principal module's refusal, and the DAV
