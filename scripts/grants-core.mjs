@@ -131,6 +131,7 @@ export const USAGE = [
   "  node scripts/grants.mjs",
   "  node scripts/grants.mjs list [--address <a>]...",
   "  node scripts/grants.mjs revoke <grantId>... [--yes]",
+  "  node scripts/grants.mjs revoke [--yes] -- <grantId>...",
   "  node scripts/grants.mjs revoke --address <a> [--yes]",
   "  node scripts/grants.mjs revoke --legacy-owner [--yes]",
   "  node scripts/grants.mjs prune-clients [--yes]",
@@ -143,6 +144,11 @@ export const USAGE = [
   "",
   "Nothing is deleted without --yes. A revoke always prints its targets first.",
   "An --address value is used only to label a group; it is never printed back.",
+  "",
+  "Paste an id exactly as the listing printed it. Ids are base64url, so one in",
+  "sixty-four starts with a dash, and that is fine. The `--` form is only for an",
+  "id that starts with TWO dashes or is spelled exactly like a flag; after `--`",
+  "every remaining word is an id, so put --yes before it.",
 ].join("\n");
 
 /** Fixed refusals. None of them carries anything from the input. */
@@ -769,25 +775,65 @@ function readArguments(argv) {
   let legacyOwner = false;
   let yes = false;
 
+  // A FLAG IS RECOGNISED BY ITS EXACT SPELLING, NEVER BY A LEADING DASH, AND
+  // THE DASH COUNT IS THE WHOLE OF THE FALLBACK TEST.
+  //
+  // A grant id is base64url, and that alphabet contains `-`. So roughly one id
+  // in sixty-four begins with one, and reading a leading dash as "this is a
+  // flag" refused those ids with "Unknown flag." — a message that sends the
+  // reader hunting a typo that is not there, while the id they pasted off the
+  // listing was correct. This tool's own runbook revokes named grants by id, so
+  // the failure landed on the exact path it documents.
+  //
+  // The fix is the pair below, and each half covers what the other cannot:
+  //
+  //   - Every flag this tool has is long-form, so a token starting with `--`
+  //     and matching none of them is still an unknown flag and is still
+  //     refused. That keeps the useful message for the real mistake
+  //     (`list --purge`), which is what a bare "treat anything dashed as an id"
+  //     would have thrown away — it would have turned a typo'd flag into "No
+  //     grant matches that id".
+  //   - A token starting with a SINGLE dash is a positional id. There are no
+  //     short flags here and adding one would have to be decided, not slipped
+  //     in, because it would re-open exactly this defect.
+  //
+  // `--` ends flag parsing, for the two cases the dash count cannot separate:
+  // an id that itself begins with `--`, and an id spelled exactly like a known
+  // flag. Both are legal base64url and neither is reachable any other way.
+  let flagsEnded = false;
+
   while (rest.length > 0) {
     const token = String(rest.shift());
-    if (token === "--yes") {
-      yes = true;
-      continue;
-    }
-    if (token === "--legacy-owner") {
-      legacyOwner = true;
-      continue;
-    }
-    if (token === "--address") {
-      const value = rest.shift();
-      if (typeof value !== "string" || value.length === 0 || value.startsWith("-")) {
-        return { error: ADDRESS_NEEDS_VALUE };
+    if (!flagsEnded) {
+      if (token === "--") {
+        flagsEnded = true;
+        continue;
       }
-      addresses.push(value);
-      continue;
+      if (token === "--yes") {
+        yes = true;
+        continue;
+      }
+      if (token === "--legacy-owner") {
+        legacyOwner = true;
+        continue;
+      }
+      if (token === "--address") {
+        const value = rest.shift();
+        // The guard is on the VALUE being the next flag rather than on it
+        // being dashed at all: it exists so `--address --yes` cannot silently
+        // label a group with a flag. A bare `--` is caught by the same test.
+        if (
+          typeof value !== "string" ||
+          value.length === 0 ||
+          value.startsWith("--")
+        ) {
+          return { error: ADDRESS_NEEDS_VALUE };
+        }
+        addresses.push(value);
+        continue;
+      }
+      if (token.startsWith("--")) return { error: UNKNOWN_FLAG };
     }
-    if (token.startsWith("-")) return { error: UNKNOWN_FLAG };
     ids.push(token);
   }
 

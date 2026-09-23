@@ -1108,6 +1108,146 @@ describe("LIFE-05: the owner lists grants by masked address and revokes them", (
     }
   });
 
+  it("takes a positional id that begins with a dash, rather than calling it a flag", async () => {
+    // THE DEFECT THIS CLOSES. A grant id is base64url and that alphabet
+    // contains "-", so roughly one id in sixty-four begins with one. Reading a
+    // leading dash as "this is a flag" refused those ids with "Unknown flag." —
+    // a message that sends the reader hunting a typo that is not there, while
+    // the id they pasted off the listing was correct. The runbook revokes named
+    // grants by id, so the failure landed on the exact path it documents.
+    //
+    // Reaching the store is the ASSERTION and not an accident: arguments are
+    // validated before any store call, so a recorded call is the only evidence
+    // from out here that the parser accepted the id.
+    const calls: string[] = [];
+    const out = sink();
+    const code = await runGrants(
+      ["revoke", "-bcdefgh12345678", "--yes"],
+      refusingDeps(calls, out),
+    );
+
+    expect(out.text()).not.toContain("Unknown flag");
+    expect(calls, "the id was refused before any store call").not.toEqual([]);
+    // It is not a real grant, so this still fails — on the right grounds.
+    expect(out.text()).toContain("No grant matches that id");
+    expect(code).not.toBe(0);
+  });
+
+  it("takes an id spelled exactly like a known flag, after --", async () => {
+    // The dash count separates a flag from an id for every case but two: an id
+    // beginning with TWO dashes, and an id spelled exactly like a flag. Both
+    // are legal base64url, and `--` is the only way to reach either.
+    const calls: string[] = [];
+    const out = sink();
+    const code = await runGrants(
+      ["revoke", "--yes", "--", "--legacy-owner"],
+      refusingDeps(calls, out),
+    );
+
+    expect(out.text()).not.toContain("Unknown flag");
+    expect(calls, "the id was refused before any store call").not.toEqual([]);
+    // It was read as an ID and not as the flag: the legacy-owner path would
+    // have had a target of its own and would never reach "no grant matches".
+    expect(out.text()).toContain("No grant matches that id");
+    expect(code).not.toBe(0);
+  });
+
+  it("still refuses a genuinely unknown flag, without touching the store", async () => {
+    // The half a bare "treat anything dashed as an id" would have thrown away.
+    // Every flag here is long-form, so a `--` token matching none of them is
+    // still a typo and still gets the message that says so — rather than "No
+    // grant matches that id", which would send the reader looking at the id.
+    for (const argv of [
+      ["list", "--purge"],
+      ["revoke", "--bogus", "--yes"],
+      ["revoke", "--addres", "someone@example.invalid", "--yes"],
+    ]) {
+      const calls: string[] = [];
+      const out = sink();
+      const code = await runGrants(argv, refusingDeps(calls, out));
+
+      expect(code, `${argv.join(" ")} was not refused`).toBe(2);
+      expect(calls, `${argv.join(" ")} reached the store`).toEqual([]);
+      expect(out.text()).toContain("Unknown flag");
+    }
+  });
+
+  it("--address refuses a swallowed FLAG as its value, not merely a dashed one", async () => {
+    // The guard moved with the parser and the reason moved with it: it exists
+    // so `--address --yes` cannot silently label a group with a flag, not to
+    // refuse a dashed value. A single-dash token is not a flag in this tool,
+    // so it cannot be a swallowed one — and the value only ever labels a group.
+    for (const argv of [
+      ["revoke", "--address"],
+      ["revoke", "--address", "--yes"],
+      ["revoke", "--address", "--"],
+    ]) {
+      const calls: string[] = [];
+      const out = sink();
+      const code = await runGrants(argv, refusingDeps(calls, out));
+
+      expect(code, `${argv.join(" ")} was not refused`).toBe(2);
+      expect(calls, `${argv.join(" ")} reached the store`).toEqual([]);
+      expect(out.text()).toContain("--address needs an address after it");
+    }
+
+    // And the other direction, which is what keeps the guard honest: a dashed
+    // value is now taken, so the refusal above is about the flag and not about
+    // the dash.
+    const calls: string[] = [];
+    const out = sink();
+    await runGrants(
+      ["revoke", "--address", "-dashed@example.invalid", "--yes"],
+      refusingDeps(calls, out),
+    );
+    expect(out.text()).not.toContain("--address needs an address after it");
+    expect(calls, "a dashed address was refused before any store call").not.toEqual(
+      [],
+    );
+  });
+
+  it("still requires --yes after --, and --yes after -- is an id rather than the flag", async () => {
+    const env = allowAllEnv();
+    const userKey = await listedUserId();
+    let minted: { clientId: string; grantId: string } | null = null;
+
+    try {
+      minted = await mintGrant(env, "13-04 dash-parse client", "dash-parse");
+      const before = await keysUnder(`grant:${userKey}:${minted.grantId}`);
+      expect(before).toHaveLength(1);
+
+      // `--` reaches a real id, and the delete is still unarmed.
+      const dry = sink();
+      const dryCode = await runGrants(
+        ["revoke", "--", minted.grantId],
+        depsOver([LISTED_APPLE_ID], dry),
+      );
+      expect(dryCode).toBe(0);
+      expect(dry.text()).toContain(minted.grantId);
+      expect(dry.text()).toContain(NOTHING_REVOKED);
+      expect(await keysUnder(`grant:${userKey}:${minted.grantId}`)).toEqual(
+        before,
+      );
+
+      // And `--yes` written AFTER `--` is an id, not the flag — so it cannot be
+      // the accidental way past the gate that `--` would otherwise open.
+      const after = sink();
+      const afterCode = await runGrants(
+        ["revoke", "--", minted.grantId, "--yes"],
+        depsOver([LISTED_APPLE_ID], after),
+      );
+      expect(afterCode).not.toBe(0);
+      expect(await keysUnder(`grant:${userKey}:${minted.grantId}`)).toEqual(
+        before,
+      );
+    } finally {
+      if (minted !== null) {
+        await forgetGrant(userKey, minted.grantId);
+        await forgetClient(minted.clientId);
+      }
+    }
+  });
+
   it("the store adapter always passes the binding and the remote flag", async () => {
     const seen: string[][] = [];
     const replies: string[] = [
