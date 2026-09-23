@@ -266,6 +266,16 @@ const DAV_REQUEST_FUNCTIONS = Object.freeze([
   // additive-only bias above tolerating an under-report is not a reason to
   // leave one in place when the site is right here being written.
   "fetchCalendarUserAddresses",
+  // Phase 14's three, added with the SPIKE-04 collection write probe. The
+  // additive-only bias above would have tolerated leaving them off as an
+  // under-report — but it reads the same way here as it did for phase 5's
+  // writes, and worse: `makeCalendar` CREATES a collection at whatever URL it
+  // is handed, `davRequest` sends a hand-assembled PROPPATCH to one, and
+  // `deleteObject` REMOVES one. An unchecked target on any of the three sends
+  // the account's credential somewhere and changes something there.
+  "makeCalendar",
+  "davRequest",
+  "deleteObject",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -486,23 +496,63 @@ export const HOME_EXEMPT_REQUEST_SITES: readonly ExemptSite[] = Object.freeze([
   },
   // The two sites the three-file list never looked at. Traced during the
   // phase-03 security audit and traced again when this glob was written, both
-  // times to the same answer: `dav_diagnose`'s ENTIRE input is one boolean.
-  // There is no identifier, no cursor and no reference on this path, so there
-  // is nothing a token could aim even in principle — which is a stronger claim
+  // times to the same answer: `dav_diagnose`'s ENTIRE input is booleans. There
+  // is no identifier, no cursor and no reference on this path, so there is
+  // nothing a token could aim even in principle — which is a stronger claim
   // than the derivation arguments above, not a weaker one.
+  //
+  // **The reasons below used to say "a single refresh boolean", and phase 14
+  // made that sentence false rather than merely dated.** `dav_diagnose` now
+  // takes three booleans. Nothing about the claim weakened — booleans still
+  // carry no URL, and the two probes' targets are still built from this
+  // principal's own resolved home set — but an exemption's reason is the thing
+  // a reviewer reads, and a reason that is wrong in a checkable detail is worse
+  // than one that is merely brief. The wording is corrected rather than left to
+  // decay, because nothing in this file fails when prose stops matching code.
   {
     file: DIAGNOSE,
     fn: "probeCalendarHome",
     request: "propfind",
     reason:
-      "the target is the homeUrl parameter, and runOneService is its only caller and passes resolved.homeUrl; the whole dav_diagnose input is a single refresh boolean, so no caller-supplied value reaches this URL at all",
+      "the target is the homeUrl parameter, and every caller passes a resolved.homeUrl: runOneService, and since phase 14 the two probes, which resolve the account themselves through resolveDavAccount. The whole dav_diagnose input is three booleans, so no caller-supplied value reaches this URL at all",
   },
   {
     file: DIAGNOSE,
     fn: "runOneService",
     request: "fetchAddressBooks",
     reason:
-      "the account is davAccountFor(service, resolved), built from the resolved home set and a service name taken from the DAV_SERVICES constant this function loops over; the whole dav_diagnose input is a single refresh boolean, so no caller-supplied value reaches this URL at all",
+      "the account is davAccountFor(service, resolved), built from the resolved home set and a service name taken from the DAV_SERVICES constant this function loops over; the whole dav_diagnose input is three booleans, so no caller-supplied value reaches this URL at all",
+  },
+  // Phase 14's four sites. All of them are reached only behind their own named
+  // boolean, and all four targets are built from the SAME resolved home set the
+  // two sites above are — there is no fifth way into this file.
+  {
+    file: DIAGNOSE,
+    fn: "runTaskCollectionProbe",
+    request: "calendarQuery",
+    reason:
+      "the target is a collection href that probeCalendarHome enumerated from resolveDavAccount's own homeUrl for THIS principal, and the enumeration resolves every href against that home URL and drops one that will not, so a collection this server cannot address never reaches the loop. The probe takes no title, id or name of any kind — its whole input is one boolean saying whether to run",
+  },
+  {
+    file: DIAGNOSE,
+    fn: "runCollectionWriteProbe",
+    request: "makeCalendar",
+    reason:
+      "the target is resolveDavAccount's homeUrl for THIS principal plus one path segment from crypto.randomUUID(), so the only free component of the URL is generated on this line rather than accepted from anywhere. The probe's whole input is one boolean saying whether to run: no host, no path and no identifier crosses the tool boundary, which is why this is exempt rather than checked — there is no caller-supplied URL for assertUnderHome to be checking",
+  },
+  {
+    file: DIAGNOSE,
+    fn: "runCollectionWriteProbe",
+    request: "davRequest",
+    reason:
+      "the PROPPATCH addresses the same generated URL the create above built, held in a local const that nothing between them reassigns; the same argument applies unchanged and for the same reason",
+  },
+  {
+    file: DIAGNOSE,
+    fn: "runCollectionWriteProbe",
+    request: "deleteObject",
+    reason:
+      "the delete addresses the same generated URL, from the same local const. This is the site where being aimed wrongly would cost the most — it REMOVES what it addresses — and it is also the site where the URL is furthest from any caller: nothing reaches this function but a boolean",
   },
 ]);
 

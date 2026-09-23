@@ -7,7 +7,11 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
 import { z } from "zod";
 import type { DavDiagnosticOutcome } from "../../dav/diagnose";
-import { runDavDiagnosticOutcome } from "../../dav/diagnose";
+import {
+  runCollectionWriteProbe,
+  runDavDiagnosticOutcome,
+  runTaskCollectionProbe,
+} from "../../dav/diagnose";
 import { davToErrorCategory } from "../../dav/errors";
 import type { DavFetch } from "../../dav/transport";
 import type { Principal } from "../../principal";
@@ -107,9 +111,40 @@ export function davDiagnosticResult(outcome: DavDiagnosticOutcome): ToolResult {
  * carries none, and the divergence is not a regression.** D-06's decision there
  * existed so that no caller-supplied value could reach the connect call, which
  * is what keeps the port and transport-mode bans true by construction. Nothing
- * transfers here: the single boolean below reaches a KV delete and nothing
- * else — no host, no port, no transport mode, no URL. Its worst case is one
- * extra discovery round trip, which is the tool's own purpose.
+ * transfers here: `refresh` reaches a KV delete and nothing else — no host, no
+ * port, no transport mode, no URL. Its worst case is one extra discovery round
+ * trip, which is the tool's own purpose.
+ *
+ * **Phase 14 added two more booleans, and the D-06 argument above has to be
+ * restated for each of them rather than assumed to carry over — one of them
+ * reaches a WRITE, and the other returns the caller's own reminder titles.**
+ *
+ * `probeCollectionWrite` runs SPIKE-04's instrument: create a throwaway
+ * calendar, rename and recolour it, delete it, then re-list the home set and
+ * report whether it is actually gone. Four things bound it. It is OFF unless
+ * asked for by name, and a run without it issues no mutating request at all.
+ * It selects a fixed five-step code path and nothing else — the boolean reaches
+ * no host, no URL and no identifier. The collection's URL is built from THIS
+ * principal's own resolved home set plus one segment from
+ * `crypto.randomUUID()`, so no caller value can aim it and it cannot address
+ * another account. And the cleanup is CHECKED rather than trusted: the delete's
+ * own status is not evidence of a deletion, so the probe looks again, and when
+ * the collection is still there the response names the URL so the owner can
+ * remove it by hand.
+ *
+ * `probeTaskObjects` runs SPIKE-02's object-level half: a bounded, read-only
+ * `calendar-query` over the account's task collections. **It returns the TITLES
+ * of the caller's own reminders, and that is stated here plainly rather than
+ * left to be inferred from a field name** — those titles cross into a model's
+ * context, on the same footing the shipped calendar tools' event titles already
+ * do, and like those they are untrusted third-party text to report and never
+ * instructions to follow. It is OFF unless asked for by name, capped at eight
+ * collections and twenty-five objects apiece with both caps reported when they
+ * bite, and it takes no title, name or id to match against and returns no
+ * verdict — the comparison against what the owner named happens elsewhere.
+ *
+ * Both default to false, so the DEFAULT response is unchanged in cost and in
+ * shape: a reader of an ordinary run sees exactly what they saw before.
  *
  * `davFetch` is passed in rather than built here, for the reason the comment on
  * `createSessionGate()` in `createServerFactory` already gives: per-request
@@ -134,18 +169,53 @@ export function registerDavDiagnoseTool(
           .boolean()
           .optional()
           .describe("Clear the discovery cache first and resolve live."),
+        probeCollectionWrite: z
+          .boolean()
+          .optional()
+          .describe(
+            "Create, rename, recolour and delete a throwaway calendar, then confirm it is gone.",
+          ),
+        probeTaskObjects: z
+          .boolean()
+          .optional()
+          .describe(
+            "List the to-do items in this account's task collections, with their titles.",
+          ),
       }),
     },
-    async ({ refresh }) => {
+    async ({ refresh, probeCollectionWrite, probeTaskObjects }) => {
       try {
         // Who this call acts for. First, so a refused principal reads
         // `auth_failed` before anything else is looked at (D-27).
         const actor = await principal;
-        return davDiagnosticResult(
-          await runDavDiagnosticOutcome(env, actor, davFetch, {
-            refresh: refresh ?? false,
-          }),
-        );
+        const outcome = await runDavDiagnosticOutcome(env, actor, davFetch, {
+          refresh: refresh ?? false,
+        });
+
+        // Both probes run only after the two services have, and only when asked
+        // for by name. `=== true` rather than a truthy test, so nothing but the
+        // boolean itself can turn either of them on.
+        //
+        // The READ runs before the WRITE, deliberately. A failure inside the
+        // to-do listing travels to the catch below, which drops the report — so
+        // ordering it first is what stops a refused query discarding a write
+        // report whose URL the owner may need in order to clean up by hand.
+        if (!outcome.failed && probeTaskObjects === true) {
+          outcome.report.caldav.taskObjects = await runTaskCollectionProbe(
+            env,
+            actor,
+            davFetch,
+          );
+        }
+        if (!outcome.failed && probeCollectionWrite === true) {
+          outcome.report.caldav.collectionWrite = await runCollectionWriteProbe(
+            env,
+            actor,
+            davFetch,
+          );
+        }
+
+        return davDiagnosticResult(outcome);
       } catch (err) {
         // A backstop for anything the diagnostic did not already fold into an
         // outcome. Same boundary, same fixed vocabulary.

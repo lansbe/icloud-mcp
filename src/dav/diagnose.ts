@@ -14,8 +14,18 @@
 //
 // This module contains no logging calls of any kind and must never acquire any.
 
-import { fetchAddressBooks, propfind } from "tsdav";
+import ICAL from "ical.js";
+import {
+  calendarQuery,
+  davRequest,
+  deleteObject,
+  fetchAddressBooks,
+  makeCalendar,
+  propfind,
+} from "tsdav";
+import type { DAVResponse } from "tsdav";
 import type { Env } from "../env";
+import { davToErrorCategory } from "./errors";
 import type { DavService, ResolvedDavAccount } from "./discovery";
 import {
   DAV_SERVICES,
@@ -101,7 +111,133 @@ export interface DavServiceReport {
    * enumerated and held nothing.
    */
   collections: DavCollectionProbe[] | null;
+  /**
+   * CalDAV only: what the collection write probe did, when it was asked for.
+   *
+   * `null` when `probeCollectionWrite` was absent or false, which is the
+   * ordinary case and the default — a reader of an ordinary `dav_diagnose`
+   * response sees exactly what they saw before this field existed, and the run
+   * issued no mutating request at all.
+   */
+  collectionWrite: CollectionWriteProbe | null;
+  /**
+   * CalDAV only: the to-do objects in this account's task collections.
+   *
+   * `null` when `probeTaskObjects` was absent or false. Same convention, same
+   * reason, and the same default: the ordinary response is unchanged in cost
+   * and in shape.
+   */
+  taskObjects: TaskCollectionProbe | null;
   timings: DavServiceTimings;
+}
+
+/**
+ * One step of the collection write probe, as this server observed it.
+ *
+ * `status` is the HTTP status the step's own response carried. **`null` means
+ * no status was observed**, which happens for exactly two reasons and they are
+ * distinguishable by `ok`: the step issued no request of its own against the
+ * probe collection (the resolve, and the re-listing, which delegates), or the
+ * transport refused before a status could be read.
+ *
+ * `category` is this project's own fixed failure vocabulary, read off the
+ * TYPE of the error the transport raised and never off its `.message` or
+ * `.stack` — the same dispatch `davToErrorCategory` performs at the tool
+ * boundary, for the reason ./.claude/CLAUDE.md §4 gives. It is `null` on a step
+ * that did not fail.
+ *
+ * **The category is here rather than omitted because SPIKE-04's whole question
+ * is HOW a refusal arrived.** `./transport.ts` maps a status number to a typed
+ * error and throws, so a refused mutation reaches this report with its number
+ * already gone. Without the category every refusal would read identically, and
+ * "iCloud refuses collection writes from a third-party client" would be
+ * indistinguishable from "this server sent a request with no credential on it"
+ * — which is exactly the measured-looking wrong verdict this probe exists to
+ * avoid producing.
+ */
+export interface CollectionWriteStep {
+  /** Which step: `resolve`, `create`, `rename-and-recolour`, `delete`, `verify`. */
+  step: string;
+  /** The HTTP status observed, or `null` when none was. */
+  status: number | null;
+  /** Whether this step did what it set out to do. */
+  ok: boolean;
+  /** The failure's category, from the fixed vocabulary. `null` when it did not fail. */
+  category: string | null;
+}
+
+/**
+ * What the collection write probe did, and whether it actually cleaned up.
+ *
+ * **`cleanupVerified` is computed from a FRESH listing of the home set, never
+ * from the delete's own status.** A delete that answered `204` is a statement
+ * by a server about a request; the only evidence a collection is gone is
+ * looking again and not finding it. When the two disagree the report says so,
+ * and `url` is what the owner needs to remove the collection by hand — a
+ * throwaway calendar left on a real account is litter found months later.
+ */
+export interface CollectionWriteProbe {
+  /** The collection this probe addressed. Under the account's own home set. */
+  url: string;
+  /** Every step, in the order it ran. */
+  steps: CollectionWriteStep[];
+  /** True only when the re-listing ran AND no longer showed the collection. */
+  cleanupVerified: boolean;
+  /** Whether the re-listing still showed it. `null` when it did not run. */
+  stillPresent: boolean | null;
+}
+
+/** One to-do object's identity: enough to match a reminder by name, and no more. */
+export interface TaskObjectProbe {
+  /** The object's UID, verbatim. */
+  uid: string;
+  /** The object's SUMMARY — its title, verbatim. UNTRUSTED third-party text. */
+  summary: string;
+}
+
+/** One task collection's contents, bounded. */
+export interface TaskCollectionEntry {
+  /** The collection's href, as the enumeration resolved it. */
+  href: string;
+  /** Its display name, or `""` when the server sent none this run can read. */
+  displayName: string;
+  /** How many object responses the query returned, BEFORE the per-collection cap. */
+  objectCount: number;
+  /** True when the cap bit and this list is shorter than what the server sent. */
+  truncated: boolean;
+  /** How many objects were dropped because no UID and title could be read. */
+  unparsed: number;
+  /** The objects kept, in the order the server returned them. */
+  objects: TaskObjectProbe[];
+}
+
+/**
+ * The to-do objects in this account's task collections.
+ *
+ * **This exists because the collection enumeration answers a narrower question
+ * than SPIKE-02 asks.** That field proves a task list is SERVED over CalDAV. It
+ * cannot carry a reminder's title, and the spike's pass condition is that a
+ * reminder the owner named on his phone appears in the report this server
+ * produced. So this reads enough per-object identity for that comparison to be
+ * made, and nothing else.
+ *
+ * **Nothing here does the comparing.** The probe takes no title to match
+ * against and returns no verdict — it reports what it found. The comparison
+ * happens in plan 14-06, as an exact string match against the full list. A
+ * fuzzy match decided in this file would be this file deciding SPIKE-02.
+ *
+ * `collectionsFound` and `collectionsVisited` differ exactly when the
+ * collection cap bit, which is why both are reported: a cap that returned a
+ * short answer without saying so would let a MISSING reminder look like an
+ * ABSENT one.
+ */
+export interface TaskCollectionProbe {
+  /** How many collections in the home set advertise the to-do component. */
+  collectionsFound: number;
+  /** How many of them this run actually queried, at most `MAX_TASK_COLLECTIONS`. */
+  collectionsVisited: number;
+  /** One entry per visited collection, in home-set order. */
+  collections: TaskCollectionEntry[];
 }
 
 /**
@@ -140,6 +276,8 @@ function emptyServiceReport(): DavServiceReport {
     addressBookCount: null,
     reports: null,
     collections: null,
+    collectionWrite: null,
+    taskObjects: null,
     timings: { discoveryMs: null, collectionsMs: null },
   };
 }
@@ -428,4 +566,375 @@ async function runOneService(
     into.reports = reportNamesOf(books);
   }
   into.timings.collectionsMs = Date.now() - collectionsStart;
+}
+
+// ---------------------------------------------------------------------------
+// The two opt-in probes (Phase 14: SPIKE-04 and SPIKE-02's object-level half).
+//
+// Both are OFF by default, both are reached only through their own named
+// boolean on `dav_diagnose`, and neither takes a URL, an identifier or a name
+// from any caller. Both are strictly SERIAL — a `for ... of` with its own
+// `await`, never a concurrent combinator. `dav-concurrent-request` names both
+// of them and all four library primitives they call, and those names went onto
+// that alternation before either function was written, because a name omitted
+// from it is invisible to every assertion in the suite.
+//
+// **Every tsdav helper below passes `fetch: davFetch` EXPLICITLY.** That
+// parameter is declared `fetch?: typeof fetch` and resolved as
+// `fetchOverride ?? fetch`, so an omitted option silently selects the bare
+// global: no credential header, no `redirect: "manual"`, no serialisation gate,
+// no status-to-error mapping. The source scan cannot see the omission — a
+// helper called without the option is not a bare network call at the call site,
+// and the fetch itself happens inside `node_modules`, which the scanner does not
+// walk. It is the same blind spot `dav-concurrent-request`'s own reason string
+// records for `fetchCalendars`. Against iCloud the omission is a 401 on every
+// mutation, and a 401 on every mutation is indistinguishable at the report
+// level from iCloud refusing collection writes outright — a measured-looking
+// WRONG verdict for SPIKE-04, on a bug in this repository. The property is
+// therefore asserted in `test/dav-diagnose.test.ts` off the RECORDED request's
+// `authorization` header rather than off these call sites.
+// ---------------------------------------------------------------------------
+
+/** What the throwaway collection is called when it is created. */
+const PROBE_DISPLAY_NAME = "iCloud MCP write probe (throwaway)";
+/** And after the property update, so a rename that silently no-ops is visible. */
+const PROBE_RENAMED = "iCloud MCP write probe (renamed)";
+const PROBE_COLOUR = "#7F7F7FFF";
+const PROBE_RECOLOURED = "#1F7F3FFF";
+
+/**
+ * The ceiling on task collections one to-do probe may visit.
+ *
+ * Every collection is a round trip, every round trip counts against the same
+ * budget ./.claude/CLAUDE.md §3 records, and a personal account has fewer than
+ * this. On trip the probe REPORTS the trip rather than quietly answering short.
+ */
+const MAX_TASK_COLLECTIONS = 8;
+
+/** The ceiling on objects reported per collection, for the same reason. */
+const MAX_TASK_OBJECTS = 25;
+
+/**
+ * Run one write step, recording what happened without reading the error's text.
+ *
+ * `run` returns the status it observed, or `null` when the step issues no
+ * request whose status this layer can see. A throw is recorded as a refusal
+ * carrying its CATEGORY — dispatched on the error's type by
+ * `davToErrorCategory`, never read off `.message` or `.stack` — and the caller
+ * decides whether the sequence continues.
+ */
+async function recordWriteStep(
+  steps: CollectionWriteStep[],
+  step: string,
+  run: () => Promise<number | null>,
+): Promise<boolean> {
+  try {
+    const status = await run();
+    const ok = status === null || (status >= 200 && status < 300);
+    steps.push({ step, status, ok, category: null });
+    return ok;
+  } catch (err) {
+    // The TYPE is read; the value never is.
+    steps.push({
+      step,
+      status: null,
+      ok: false,
+      category: davToErrorCategory(err).category,
+    });
+    return false;
+  }
+}
+
+/** The first response's status, narrowed. `null` when the library sent none. */
+function firstStatusOf(responses: DAVResponse[]): number | null {
+  const status = responses[0]?.status;
+  return typeof status === "number" ? status : null;
+}
+
+/**
+ * SPIKE-04's instrument: create a throwaway calendar, change it, remove it, and
+ * then LOOK AGAIN.
+ *
+ * No public source confirms any of the three mutations against iCloud from a
+ * third-party client, so the only way to answer is to ask the server. The
+ * verdict reshapes Phase 17's collection half; getting it wrong means planning
+ * create / rename / recolour / delete against a server that refuses one of them.
+ *
+ * **The URL is not caller-supplied and cannot be.** Host, path root and shard
+ * all come from this principal's own resolved home set, and the only free
+ * component is one segment from `crypto.randomUUID()`. That is what keeps
+ * `registerDavDiagnoseTool`'s docstring true after this function existed: the
+ * boolean that reaches here selects a fixed code path, never a host, a port, a
+ * transport mode or a URL.
+ *
+ * **Five awaits, in this order and no other**, each its own statement:
+ *
+ *   1. resolve the CalDAV account,
+ *   2. create the collection,
+ *   3. rename and recolour it with one PROPPATCH,
+ *   4. delete it,
+ *   5. re-list the home set and check whether it is still there.
+ *
+ * A refused CREATE stops the sequence — there is nothing to rename and nothing
+ * to remove. A refused rename does NOT stop it, and that asymmetry is
+ * deliberate: once the collection exists, the delete and the verification are
+ * how it stops being litter on a real account.
+ *
+ * Statuses are recorded; bodies are not. A body is bytes a server wrote, and
+ * this report carries this server's own observations (T-03-04).
+ *
+ * Nothing here is logged. This module contains no logging calls of any kind.
+ */
+export async function runCollectionWriteProbe(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+): Promise<CollectionWriteProbe> {
+  const steps: CollectionWriteStep[] = [];
+
+  // 1. The account's own home set. Everything below is built from it.
+  const resolved = await resolveDavAccount(env, principal, davFetch, "caldav");
+  steps.push({ step: "resolve", status: null, ok: true, category: null });
+
+  // The one free component, and it is generated here rather than accepted.
+  const url = new URL(`${crypto.randomUUID()}/`, resolved.homeUrl).href;
+
+  // 2. Create.
+  const created = await recordWriteStep(steps, "create", async () =>
+    firstStatusOf(
+      await makeCalendar({
+        url,
+        props: {
+          "d:displayname": PROBE_DISPLAY_NAME,
+          "ca:calendar-color": PROBE_COLOUR,
+        },
+        depth: "0",
+        // Never a credential from here. `./transport.ts` attaches it per call
+        // and is the only place that may.
+        headers: {},
+        fetch: davFetch,
+      }),
+    ),
+  );
+
+  if (!created) {
+    // Nothing exists, so there is nothing to clean up and nothing to look for.
+    // `stillPresent` stays null rather than false: the probe did not look, and
+    // saying "it is gone" without looking is the exact claim this field refuses
+    // to make anywhere else in this function.
+    return { url, steps, cleanupVerified: false, stillPresent: null };
+  }
+
+  // 3. Rename and recolour, in one property update. tsdav ships no PROPPATCH
+  //    helper, so the request is assembled by hand through its raw request
+  //    helper — which is why `davRequest` is named on the fan-out alternation.
+  await recordWriteStep(steps, "rename-and-recolour", async () =>
+    firstStatusOf(
+      await davRequest({
+        url,
+        init: {
+          method: "PROPPATCH",
+          headers: {},
+          namespace: "d",
+          body: {
+            "d:propertyupdate": {
+              _attributes: {
+                "xmlns:d": "DAV:",
+                "xmlns:ca": "http://apple.com/ns/ical/",
+              },
+              "d:set": {
+                "d:prop": {
+                  "d:displayname": PROBE_RENAMED,
+                  "ca:calendar-color": PROBE_RECOLOURED,
+                },
+              },
+            },
+          },
+        },
+        fetch: davFetch,
+      }),
+    ),
+  );
+
+  // 4. Delete. Reached whether or not step 3 was accepted, because a collection
+  //    that exists has to be removed either way.
+  await recordWriteStep(steps, "delete", async () => {
+    const response = await deleteObject({ url, headers: {}, fetch: davFetch });
+    return response.status;
+  });
+
+  // 5. LOOK AGAIN. The delete's own status is not evidence of a deletion.
+  let stillPresent: boolean | null = null;
+  await recordWriteStep(steps, "verify", async () => {
+    const home = await probeCalendarHome(davFetch, resolved.homeUrl);
+    stillPresent = home.collections.some((one) => one.href === url);
+    // The re-listing's own HTTP status is not surfaced by the enumeration, and
+    // this report does not invent one.
+    return null;
+  });
+
+  return {
+    url,
+    steps,
+    cleanupVerified: stillPresent === false,
+    stillPresent,
+  };
+}
+
+/**
+ * Read a to-do object's identity out of a `calendar-data` property.
+ *
+ * `null` when no UID and no title can be read — a body that will not parse, a
+ * response carrying no to-do component, or one whose UID or SUMMARY is absent.
+ * Such an object is COUNTED by the caller and never repaired, and never
+ * reported with an empty title: a to-do with no readable title cannot answer
+ * the question this probe exists to answer, and listing it as though it could
+ * would make an unmatchable reminder look like a matched one.
+ *
+ * Both values are hand-narrowed to non-empty strings for the reason
+ * `supportedReportNamesOf` above already gives: the library types this whole
+ * region `any`, so the compiler is not watching, and an unexpected object
+ * reaching `JSON.stringify` renders as nine characters that read like a real
+ * answer.
+ *
+ * The double read of the raw property is `bodyFor`'s in `./calendar.ts`: the
+ * XML layer hands back either the CDATA wrapper or the bare value depending on
+ * how the element was written.
+ */
+function taskIdentityOf(raw: unknown): TaskObjectProbe | null {
+  const data =
+    raw !== null && typeof raw === "object"
+      ? (raw as { _cdata?: unknown })._cdata
+      : raw;
+  if (typeof data !== "string" || data.length === 0) return null;
+
+  let todo: ReturnType<
+    InstanceType<typeof ICAL.Component>["getFirstSubcomponent"]
+  >;
+  try {
+    todo = new ICAL.Component(ICAL.parse(data)).getFirstSubcomponent("vtodo");
+  } catch {
+    // Nothing is read from the caught value — ./.claude/CLAUDE.md §4.
+    return null;
+  }
+  if (todo === null) return null;
+
+  const uid: unknown = todo.getFirstPropertyValue("uid");
+  const summary: unknown = todo.getFirstPropertyValue("summary");
+  if (typeof uid !== "string" || uid.length === 0) return null;
+  if (typeof summary !== "string" || summary.length === 0) return null;
+  return { uid, summary };
+}
+
+/**
+ * SPIKE-02's object-level half: the to-do items in this account's task
+ * collections, with their titles.
+ *
+ * READ-ONLY. A CalDAV `calendar-query` REPORT writes nothing, and nothing here
+ * goes anywhere near `src/mail/`.
+ *
+ * **It exists because the collection enumeration answers a narrower question
+ * than the spike asks.** That field proves a task list is served over CalDAV;
+ * the spike's pass condition is that a reminder the owner named on his phone
+ * appears in the report this server produced, and no collection-level field can
+ * carry a reminder's title. "The named list is present with to-do components"
+ * is precisely the narrower substitution the phase's success criterion forbids.
+ *
+ * **Bounded in both directions, and both bounds are REPORTED when they bite.**
+ * At most `MAX_TASK_COLLECTIONS` collections, at most `MAX_TASK_OBJECTS`
+ * objects apiece. A cap that answered short without saying so would let a
+ * missing reminder look like an absent one.
+ *
+ * **Strictly serial**: one `calendar-query` per collection, each its own
+ * `await` inside a `for ... of`. This is the exact shape
+ * `dav-concurrent-request` was written for — a loop over collections is where a
+ * combinator gets written, because a combinator is what makes N round trips
+ * fast — and every session is a socket's worth of a budget whose exhaustion
+ * locks the user out of their own mail on their own devices.
+ *
+ * The `calendar-data` request is LIMITED to the VTODO component's UID and
+ * SUMMARY (RFC 4791 §9.6), which is the smallest thing that can answer the
+ * question. A server that honours the limit sends back those two properties; a
+ * server that ignores it sends the whole object and the parse above reads the
+ * same two values out of it either way.
+ *
+ * A collection whose query the server refuses is NOT swallowed: the failure
+ * travels to the tool boundary, which maps it to a category. Suppressing it
+ * here would report a partial answer as a whole one, and a to-do listing that
+ * silently lost a collection is the same pass-but-wrong mode as a silent cap.
+ *
+ * Nothing here is logged. This module contains no logging calls of any kind.
+ */
+export async function runTaskCollectionProbe(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+): Promise<TaskCollectionProbe> {
+  const resolved = await resolveDavAccount(env, principal, davFetch, "caldav");
+  const home = await probeCalendarHome(davFetch, resolved.homeUrl);
+
+  const found = home.collections.filter((one) =>
+    one.components.includes("VTODO"),
+  );
+  const visiting = found.slice(0, MAX_TASK_COLLECTIONS);
+
+  const collections: TaskCollectionEntry[] = [];
+  // One collection at a time, one await each. No combinator, and nothing that
+  // resembles one.
+  for (const collection of visiting) {
+    const responses = await calendarQuery({
+      url: collection.href,
+      props: {
+        "d:getetag": {},
+        "c:calendar-data": {
+          "c:comp": {
+            _attributes: { name: "VCALENDAR" },
+            "c:comp": {
+              _attributes: { name: "VTODO" },
+              "c:prop": [
+                { _attributes: { name: "UID" } },
+                { _attributes: { name: "SUMMARY" } },
+              ],
+            },
+          },
+        },
+      },
+      filters: {
+        "c:comp-filter": {
+          _attributes: { name: "VCALENDAR" },
+          "c:comp-filter": { _attributes: { name: "VTODO" } },
+        },
+      },
+      depth: "1",
+      headers: {},
+      fetch: davFetch,
+    });
+
+    const objects: TaskObjectProbe[] = [];
+    let unparsed = 0;
+    for (const response of responses) {
+      if (objects.length >= MAX_TASK_OBJECTS) break;
+      const identity = taskIdentityOf(response.props?.calendarData);
+      if (identity === null) {
+        unparsed += 1;
+        continue;
+      }
+      objects.push(identity);
+    }
+
+    collections.push({
+      href: collection.href,
+      displayName: collection.displayName,
+      objectCount: responses.length,
+      truncated: responses.length > objects.length + unparsed,
+      unparsed,
+      objects,
+    });
+  }
+
+  return {
+    collectionsFound: found.length,
+    collectionsVisited: visiting.length,
+    collections,
+  };
 }
