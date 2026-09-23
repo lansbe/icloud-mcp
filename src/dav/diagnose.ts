@@ -44,6 +44,32 @@ export interface DavServiceTimings {
  * than both being zero, so a reader can never mistake "not applicable" for
  * "found nothing".
  */
+/**
+ * One collection in a home set, exactly as the server described it.
+ *
+ * Every field is read rather than derived, and nothing is filtered out of the
+ * list this appears in. That is the whole point of it: the listing tool applies
+ * a component filter, and a diagnostic that applied the same filter could not
+ * show that the filter is hiding something. A to-do list has to be visible here
+ * BY NAME rather than inferred from a count that does not add up.
+ */
+export interface DavCollectionProbe {
+  /** The collection's href, resolved against the home URL. */
+  href: string;
+  /** The display name, or `""` when the server sent none this run can read. */
+  displayName: string;
+  /** The `resourcetype` children, as names — `calendar`, `subscribed`, … */
+  resourceTypes: string[];
+  /**
+   * The components this collection advertises — `VEVENT`, `VTODO`, …
+   *
+   * EMPTY means the collection advertised no component set, which is a real
+   * answer and not a missing one: a collection that declares no restriction
+   * accepts every component type.
+   */
+  components: string[];
+}
+
 export interface DavServiceReport {
   /** The principal URL this run resolved. */
   principalUrl: string | null;
@@ -67,6 +93,14 @@ export interface DavServiceReport {
    * the names across their own collections.
    */
   reports: string[] | null;
+  /**
+   * CalDAV only: every collection the home set holds, with its component set.
+   *
+   * `null` on the CardDAV half, per the convention this interface's own
+   * docstring states — not an empty array, which would say the home set was
+   * enumerated and held nothing.
+   */
+  collections: DavCollectionProbe[] | null;
   timings: DavServiceTimings;
 }
 
@@ -105,6 +139,7 @@ function emptyServiceReport(): DavServiceReport {
     calendarCount: null,
     addressBookCount: null,
     reports: null,
+    collections: null,
     timings: { discoveryMs: null, collectionsMs: null },
   };
 }
@@ -174,6 +209,36 @@ function supportedReportNamesOf(value: unknown): string[] {
 }
 
 /**
+ * The `supported-calendar-component-set` children, as component names.
+ *
+ * **A LOCAL twin of the reader in `src/dav/calendar.ts`, deliberately not an
+ * import of it, and the separation is the safety property rather than an
+ * oversight.** That module's reader feeds a filter which admits only collections
+ * carrying the event component, and that filter is why reminder lists do not
+ * appear in `calendar_list_calendars` as calendars with no events — a known
+ * confusing outcome for third-party CalDAV clients (Pitfall 57, second half).
+ * This diagnostic must report a to-do list; the listing must keep not showing
+ * one. Two readers, so an edit to either can never reach the other.
+ *
+ * Hand-narrowed for the same reason everything else here is: the library types
+ * this region `any`, and `_attributes.name` is a value a server chose.
+ */
+function componentNamesOf(value: unknown): string[] {
+  if (value === null || typeof value !== "object") return [];
+  const comp = (value as { comp?: unknown }).comp;
+  const entries = Array.isArray(comp) ? comp : [comp];
+
+  const names: string[] = [];
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== "object") continue;
+    const name = (entry as { _attributes?: { name?: unknown } })._attributes
+      ?.name;
+    if (typeof name === "string" && name.length > 0) names.push(name);
+  }
+  return names;
+}
+
+/**
  * Everything the CalDAV home set can say about itself in ONE request.
  *
  * `propfind` at depth 1 rather than tsdav's `fetchCalendars`, and the reason is
@@ -197,17 +262,30 @@ function supportedReportNamesOf(value: unknown): string[] {
  * component set is `VTODO`, while the listing filters on the event component and
  * drops it. A diagnostic that agreed with the listing could not show that the
  * listing is hiding something.
+ *
+ * `collections` is filtered on NOTHING except addressability. Every response
+ * the home set returns becomes a row, whatever its resource type and whatever
+ * its component set, with two exceptions that are not filters: the home
+ * collection itself, which is the container rather than a member of it, and a
+ * collection whose href will not resolve, which this server cannot address and
+ * so must not claim to have. Filtering on the component is exactly what the
+ * listing does and exactly what this field exists to see past.
  */
 async function probeCalendarHome(
   davFetch: DavFetch,
   homeUrl: string,
-): Promise<{ calendarCount: number; reports: string[] }> {
+): Promise<{
+  calendarCount: number;
+  reports: string[];
+  collections: DavCollectionProbe[];
+}> {
   const responses = await propfind({
     url: homeUrl,
     props: {
       "d:resourcetype": {},
       "d:displayname": {},
       "d:supported-report-set": {},
+      "c:supported-calendar-component-set": {},
     },
     depth: "1",
     headers: {},
@@ -218,17 +296,45 @@ async function probeCalendarHome(
   // A Set, so the union across collections de-duplicates while keeping the
   // order the collections were seen in — symmetric with `reportNamesOf`.
   const reports = new Set<string>();
+  const collections: DavCollectionProbe[] = [];
 
+  // One pass. The count, the report union and the enumeration all read the
+  // same responses, so splitting them into three loops would be three chances
+  // for the three answers to stop describing the same request.
   for (const response of responses) {
     const props = response.props ?? {};
-    if (!Object.keys(props.resourcetype ?? {}).includes("calendar")) continue;
-    calendarCount += 1;
-    for (const name of supportedReportNamesOf(props.supportedReportSet)) {
-      reports.add(name);
+    const resourceTypes = Object.keys(props.resourcetype ?? {});
+
+    if (resourceTypes.includes("calendar")) {
+      calendarCount += 1;
+      for (const name of supportedReportNamesOf(props.supportedReportSet)) {
+        reports.add(name);
+      }
     }
+
+    const rawHref = response.href;
+    if (typeof rawHref !== "string" || rawHref.length === 0) continue;
+
+    let href: string;
+    try {
+      href = new URL(rawHref, homeUrl).href;
+    } catch {
+      // Nothing is read from the caught value — ./.claude/CLAUDE.md §4.
+      continue;
+    }
+    // The container, not a member of it.
+    if (href === homeUrl) continue;
+
+    collections.push({
+      href,
+      displayName:
+        typeof props.displayname === "string" ? props.displayname : "",
+      resourceTypes,
+      components: componentNamesOf(props.supportedCalendarComponentSet),
+    });
   }
 
-  return { calendarCount, reports: [...reports] };
+  return { calendarCount, reports: [...reports], collections };
 }
 
 /**
@@ -311,6 +417,7 @@ async function runOneService(
     const probe = await probeCalendarHome(davFetch, resolved.homeUrl);
     into.calendarCount = probe.calendarCount;
     into.reports = probe.reports;
+    into.collections = probe.collections;
   } else {
     const books = await fetchAddressBooks({
       account: davAccountFor(service, resolved),
