@@ -60,7 +60,7 @@ import {
   RESPONSE_HEADERS,
   renderForm,
 } from "../src/auth/login-page";
-import type { Env, LoginGateSecret } from "../src/env";
+import type { Env } from "../src/env";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 import { entryEnv } from "./fixtures/bound-secrets";
 import worker, {
@@ -234,7 +234,7 @@ function stubEnv(
     kv?: unknown;
     floodRefused?: boolean;
   } = {},
-): Env & LoginGateSecret {
+): Env {
   return {
     OAUTH_KV: options.kv ?? quietKv(),
     LOGIN_IP_LIMITER: limiter(options.floodRefused !== true),
@@ -261,12 +261,12 @@ function stubEnv(
           ? { clientId: "stub-client", clientName: "Stub Client" }
           : options.client,
     },
-  } as unknown as Env & LoginGateSecret;
+  } as unknown as Env;
 }
 
 /** An env carrying nothing, for the answers that read no binding. */
-function emptyEnv(): Env & LoginGateSecret {
-  return {} as unknown as Env & LoginGateSecret;
+function emptyEnv(): Env {
+  return {} as unknown as Env;
 }
 
 const STUB_QUERY = "response_type=code&client_id=stub-client";
@@ -521,7 +521,7 @@ describe("the security headers are on every response", () => {
       serve: () =>
         loginHandler.fetch(new Request(`${ORIGIN}/authorize?${STUB_QUERY}`), {
           ALLOWED_APPLE_IDS_SEED: undefined,
-        } as unknown as Env & LoginGateSecret),
+        } as unknown as Env),
     },
     {
       label: "the refused-destination 403",

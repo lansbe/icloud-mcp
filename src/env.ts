@@ -325,20 +325,26 @@ declare global {
       /**
        * HMAC key for the calendar confirmation token (CALW-04). Workers Secret.
        *
-       * **Its own Secret, deliberately not `AUTH_SECRET`.** Reusing that one
-       * would work and would be one fewer thing to provision, which is exactly
-       * why it needs an argument against it: the two keys have different
-       * rotation consequences. `AUTH_SECRET` gates the authorize form, and
-       * rotating it invalidates nothing that was already granted. This one
-       * signs capabilities to write to a calendar, and rotating it must
-       * invalidate every outstanding preview immediately — that is the point of
-       * rotating it. Sharing one value would couple a routine credential change
-       * on one path to a silent capability revocation on the other, in whichever
-       * direction the rotation happened to come from. It is likewise not
-       * `APPLE_APP_PASSWORD`, which is a credential belonging to Apple rather
-       * than a key belonging to this server.
+       * **Its own Secret, and it OUTLIVED the one it was kept apart from.** The
+       * login gate had a shared secret of its own until Phase 13, and reusing
+       * that one here would have worked and been one fewer thing to provision —
+       * which is exactly why it needed an argument against it: the two keys had
+       * different rotation consequences. That one gated the authorize form, and
+       * rotating it invalidated nothing already granted. This one signs
+       * capabilities to write to a calendar, and rotating it must invalidate
+       * every outstanding preview immediately — that is the point of rotating
+       * it. Sharing one value would have coupled a routine credential change on
+       * one path to a silent capability revocation on the other, in whichever
+       * direction the rotation came from.
        *
-       * Admits `undefined` for the reason `AUTH_SECRET` gives — unset, deleted,
+       * The argument is kept rather than deleted with the secret it argued
+       * against, because it is the reason this key must not be folded into
+       * whatever the NEXT shared secret turns out to be. It is likewise not the
+       * signed-in person's app-specific password, which belongs to Apple rather
+       * than to this server, and which no longer arrives as a binding at all.
+       *
+       * Admits `undefined` for the reason every Workers Secret does — unset,
+       * deleted,
        * and failed-to-provision all arrive absent, and nothing at runtime
        * distinguishes that from a configured value until something reads it.
        * The specific failure the widening exists to surface is worth naming,
@@ -378,76 +384,28 @@ declare global {
 
 export type Env = Cloudflare.Env;
 
-// The three narrow secret types (Phase 9 D-14).
+// The three narrow secret types are GONE, in one commit with the last thing that
+// could spell them (Phase 13, CUT-01).
 //
-// These three names used to sit on the shared type above. They were moved out
-// so the compiler refuses a new reader: code that holds the shared type cannot
-// spell them. They are declared OUTSIDE the global block on purpose. Inside it
-// they would be back on the ambient environment object, on every explicit
-// parameter of the shared type, and on the test environment, all at once.
+// Two of them held the account credentials and the login gate's shared secret,
+// and the third was their union with the shared type above — what the runtime
+// really handed the entry point. They were declared outside the global block on
+// purpose, so that code holding the shared type could not spell the names and a
+// new reader would not compile (Phase 9 D-14). That worked, and then the reason
+// for the names themselves went away: the credentials arrive per person in a
+// grant's encrypted props, and the gate the shared secret guarded was replaced by
+// the login page.
 //
-// Every field is REQUIRED and admits `undefined`. It is not optional. A type
-// whose fields are all optional is a weak type, and handing it the shared type
-// then fails with an unhelpful "no properties in common" error. With required
-// fields the error is the clear "missing the following properties".
+// THE UNION TYPE WAS DELETED RATHER THAN ALIASED to the shared type. The same
+// argument the removed allow-list Secret above settles: a half-removed binding is
+// a name the compiler still accepts and nobody reads. There is no longer an entry
+// environment distinct from the shared one, and keeping the name would say there
+// is — so the entry point, the OAuth provider's options, the door and the login
+// handler all take the plain shared type now.
 //
-// The runtime bindings did not change. This is a type change only.
-
-/**
- * The login gate's secret. Seen only by the login gate and the entry point.
- */
-export interface LoginGateSecret {
-  /**
-   * Shared secret for the /authorize form (D-01). Workers Secret.
-   *
-   * Admits `undefined` because that is what a Workers Secret binding is at
-   * runtime: unset, deleted, or failed-to-provision all arrive absent. The
-   * previous `string` was a claim the platform does not make, and typing it
-   * honestly is what lets the compiler — rather than a reviewer — find the
-   * next consumer that assumes presence.
-   *
-   * The absent case does not announce itself. `TextEncoder.prototype.encode`
-   * is declared `encode(optional USVString input = "")`, so `encode(undefined)`
-   * resolves to the empty string rather than throwing, and a comparison
-   * against an unset secret quietly succeeds against an empty submission
-   * (CR-01).
-   */
-  AUTH_SECRET: string | undefined;
-}
-
-/**
- * The two mail secrets. Seen only by the owner's constructor in
- * `src/principal.ts`, by the door that hands it the environment, and by the
- * entry point. Phase 13 removes them and this interface.
- */
-export interface OwnerMailSecrets {
-  /**
-   * Apple ID used for IMAP authentication. Workers Secret.
-   *
-   * Admits `undefined` for the same reason as `AUTH_SECRET`: an unset,
-   * deleted, or failed-to-provision Secret arrives absent, and nothing at
-   * runtime distinguishes that from a configured value until something reads
-   * it. On the mail path the absent value previously produced a `TypeError`
-   * that surfaced as `connection_failed` — a permanently missing secret
-   * described to the caller as a transient fault worth retrying (CR-01).
-   */
-  APPLE_ID: string | undefined;
-
-  /**
-   * Apple app-specific password. Workers Secret.
-   *
-   * Admits `undefined` for the same reason as the two above. All three are
-   * widened together deliberately: the runtime fact is identical for every
-   * Secret binding, and typing one honestly while leaving the others
-   * claiming more than the platform guarantees would read as an oversight
-   * rather than a decision (CR-01).
-   */
-  APPLE_APP_PASSWORD: string | undefined;
-}
-
-/**
- * What the runtime really hands the entry point: the shared type plus all
- * three secrets. Only the entry point, the OAuth provider's options and the
- * door are typed with it. Everything past them sees the shared type.
- */
-export type EntryEnv = Env & OwnerMailSecrets & LoginGateSecret;
+// The bindings are gone from the platform too, not merely from this file, and the
+// scan refuses a read of either account name under this tree. That rule was a
+// COUNT permitting exactly one reader until the reader was deleted; zero became
+// the correct number, so it became a ban. This file is inside its scope, which is
+// why the paragraph above describes the account bindings by role rather than
+// spelling them.

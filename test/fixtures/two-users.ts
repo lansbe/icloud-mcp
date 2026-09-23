@@ -5,22 +5,17 @@
 // fake. They are shaped like app-specific passwords only so the fixture keeps
 // working once a later phase starts checking that shape at the login page.
 //
-// **There are two carriers of "which user" while Phase 9 is under way.**
+// **There is ONE carrier of "which user", and it is `testPrincipal(user)`.** It
+// is a real principal, built by the real props constructor (Phase 9 D-17).
 //
-// - `envFor(user)` is the old one. Every exported function at the tool layer
-//   that has not been moved yet takes the environment object as its first
-//   argument and reads the account from it, so handing a function a copy with
-//   B's two values in it IS being user B, as far as that code can tell. It
-//   returns a NEW object and never assigns to the ambient one. Assigning would
-//   leak B into every later test in the file, and a scan rule rejects it
-//   outright.
-// - `testPrincipal(user)` is the new one. It is a real principal, built by the
-//   real props constructor (Phase 9 D-17).
-//
-// **Phase 9 swaps `envFor` for the principal, one chain at a time.** The mail
-// chain moves in plan 09-04 and the DAV chain in plan 09-05. Each changes one
-// line of `toolsFor` below. What the cross-user tests ASSERT does not change,
-// which is the point of writing them against the old signatures (D-05).
+// There were two while Phase 9 was under way. The other one handed a function a
+// copy of the environment with that user's account values written into it, which
+// WAS being that user as far as code reading the account off the environment
+// could tell. Phase 9 swapped it out one chain at a time — the mail chain in plan
+// 09-04, the DAV chain in 09-05 — and Phase 13 deleted the bindings it wrote over,
+// which finished the job: with nothing to write over, the copy said nothing about
+// who. The note below where it stood records why deleting it weakened no
+// assertion.
 //
 // A and B both differ from the pool's own ambient identity, on purpose. A test
 // user that happened to match it could pass by accident. No test may read,
@@ -33,7 +28,7 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
 import { createDavFetch } from "../../src/dav/transport";
-import type { Env, OwnerMailSecrets } from "../../src/env";
+import type { Env } from "../../src/env";
 import { createSessionGate } from "../../src/mail/service";
 import { registerCalendarTools } from "../../src/mcp/tools/calendar";
 import { registerMailTools } from "../../src/mcp/tools/mail";
@@ -65,20 +60,22 @@ export const USER_B: TestUser = {
   userId: USER_B_VECTOR.expected,
 };
 
-/**
- * The environment as `user` would have it: every real binding, and that user's
- * two account values in place of the ambient ones.
- *
- * Both values are overridden, never one. A copy carrying B's address and the
- * ambient password would be a third identity nobody meant to test.
- */
-export function envFor(user: TestUser): Env & OwnerMailSecrets {
-  return {
-    ...(env as Env),
-    APPLE_ID: user.appleId,
-    APPLE_APP_PASSWORD: user.appPassword,
-  };
-}
+// `envFor(user)` was here until Phase 13 and is DELETED rather than re-typed.
+//
+// It returned a copy of every real binding with that user's two account values
+// written over the ambient ones, and handing a function that copy WAS being that
+// user, as far as code reading the account off the environment could tell. Phase
+// 13 deleted both bindings, so the two overrides had nothing to override: the
+// function would have returned the same value for user A and for user B, which is
+// a parameter that no longer carries what its name says. `src/env.ts`'s own
+// precedent settles it — a half-removed binding is a name the compiler still
+// accepts and nobody reads.
+//
+// Nothing weakened on the way out, and that is worth stating rather than assuming:
+// in every one of its ten remaining call sites the identity actually under test
+// travelled as an explicit user id argument or as `testPrincipal(user)` below, and
+// what the call wanted from `envFor` was the bindings. Those sites take the shared
+// environment directly now. `testPrincipal` is the one carrier of "which user".
 
 /**
  * A real principal for `user`, as a promise (D-17).
@@ -95,9 +92,11 @@ export function envFor(user: TestUser): Env & OwnerMailSecrets {
  * two fields and gets the auth error. Pass the promise on as it is, or await it
  * and pass that one object on.
  *
- * Since plan 09-05 this is the carrier of "which user" on the DAV side as well
- * as the mail side. `envFor` is still exported for the tests that need an
- * environment with a user's values in it. Plan 09-08 decides what is left of it.
+ * Since plan 09-05 this is the carrier of "which user" on the DAV side as well as
+ * the mail side, and since Phase 13 it is the ONLY one: the environment-shaped
+ * carrier it shared the job with is gone, because the bindings it wrote over are.
+ * A test that wants the bindings takes the shared environment; a test that wants
+ * an identity comes here.
  */
 export function testPrincipal(user: TestUser): Promise<Principal> {
   return principalFromProps({

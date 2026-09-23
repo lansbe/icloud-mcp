@@ -4,7 +4,7 @@
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
-import type { EntryEnv } from "../env";
+import type { Env } from "../env";
 import { DEPLOYED_HOSTNAME } from "../deployed-hostname.generated";
 import type { AllowList } from "../auth/allow-list";
 // `isAllowed` is deliberately NOT imported. The door stopped asking the
@@ -413,14 +413,14 @@ export function buildRequestHandler(
 export function createMcpApiHandler(extraTools: ExtraTool[] = []): {
   fetch(
     request: Request,
-    env: EntryEnv,
+    env: Env,
     ctx: ExecutionContext,
   ): Promise<Response>;
 } {
   return {
     fetch(
       request: Request,
-      env: EntryEnv,
+      env: Env,
       ctx: ExecutionContext,
     ): Promise<Response> {
       // The one read of the grant's props in this codebase (D-08).

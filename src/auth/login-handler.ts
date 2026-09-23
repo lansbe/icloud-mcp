@@ -118,7 +118,7 @@ import type {
   ClientRegistrationCallbackResult,
 } from "@cloudflare/workers-oauth-provider";
 import { isConfiguredSecret } from "../configured-secret";
-import type { Env, LoginGateSecret } from "../env";
+import type { Env } from "../env";
 import { ImapConnectError, ImapThrottleError } from "../errors";
 import type { SessionGate } from "../mail/service";
 import { createSessionGate, withMailSession } from "../mail/service";
@@ -1282,12 +1282,12 @@ export function createLoginHandler(
   floorMs: number = FAILURE_FLOOR_MS,
   clock: () => number = () => Date.now(),
 ): {
-  fetch(request: Request, env: Env & LoginGateSecret): Promise<Response>;
+  fetch(request: Request, env: Env): Promise<Response>;
 } {
   return {
     async fetch(
       request: Request,
-      env: Env & LoginGateSecret,
+      env: Env,
     ): Promise<Response> {
       // The floor's clock starts HERE, as the first statement of the request
       // handler, before the pathname is read and before any branch exists to
@@ -1321,7 +1321,7 @@ export const loginHandler = createLoginHandler();
  */
 async function handleAuthorize(
   request: Request,
-  env: Env & LoginGateSecret,
+  env: Env,
   proof: LoginProof,
   floorMs: number,
   started: number,

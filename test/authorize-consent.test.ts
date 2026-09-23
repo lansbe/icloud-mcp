@@ -52,7 +52,7 @@ import {
   loginHandler,
 } from "../src/auth/login-handler";
 import { CREDENTIAL_FAILURE_BODY } from "../src/auth/login-page";
-import type { Env, LoginGateSecret } from "../src/env";
+import type { Env } from "../src/env";
 import { ImapAuthError } from "../src/errors";
 import { entryEnv } from "./fixtures/bound-secrets";
 import worker, {
@@ -174,7 +174,7 @@ function stubEnv(options: {
   calls?: string[];
   limiterKeys?: string[];
   floodRefused?: boolean;
-}): Env & LoginGateSecret {
+}): Env {
   const calls = options.calls ?? [];
   return {
     OAUTH_KV: options.kv ?? recordingKv().kv,
@@ -223,7 +223,7 @@ function stubEnv(options: {
           : options.client;
       },
     },
-  } as unknown as Env & LoginGateSecret;
+  } as unknown as Env;
 }
 
 /**

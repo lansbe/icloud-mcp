@@ -28,7 +28,7 @@ import {
   loginHandler,
   notFoundBody,
 } from "../src/auth/login-handler";
-import type { Env, LoginGateSecret } from "../src/env";
+import type { Env } from "../src/env";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 
 const ORIGIN = `https://${DEPLOYED_HOSTNAME}`;
@@ -40,8 +40,8 @@ const ORIGIN = `https://${DEPLOYED_HOSTNAME}`;
  * shortcut — it is a second, structural assertion that the unknown-path refusal
  * reads no configuration, consults no store, and cannot depend on one.
  */
-function emptyEnv(): Env & LoginGateSecret {
-  return {} as unknown as Env & LoginGateSecret;
+function emptyEnv(): Env {
+  return {} as unknown as Env;
 }
 
 function get(url: string): Promise<Response> {
@@ -125,8 +125,7 @@ describe("/authorize is unaffected", () => {
     // to show /authorize answers something OTHER than the unknown-path body.
     const response = await loginHandler.fetch(
       new Request(`${ORIGIN}/authorize?response_type=code&client_id=abc`),
-      { ALLOWED_APPLE_IDS_SEED: undefined } as unknown as Env &
-        LoginGateSecret,
+      { ALLOWED_APPLE_IDS_SEED: undefined } as unknown as Env,
     );
 
     expect(response.status).toBe(503);

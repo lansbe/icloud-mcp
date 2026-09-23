@@ -53,7 +53,7 @@
 
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import type { EntryEnv } from "../src/env";
+import type { Env } from "../src/env";
 import { entryEnv } from "./fixtures/bound-secrets";
 import { DEPLOYED_HOSTNAME, createMcpApiHandler } from "../src/mcp/api-handler";
 import { USER_A } from "./fixtures/two-users";
@@ -115,7 +115,7 @@ const LISTED: CaseProps = {
 async function callDoor(
   request: Request,
   caseProps: CaseProps,
-  withEnv: EntryEnv = entryEnv(),
+  withEnv: Env = entryEnv(),
 ): Promise<Response> {
   const ctx = createExecutionContext();
   if (!caseProps.absent) {
@@ -532,7 +532,7 @@ describe.each(LANES)(
     // every later case in the run, and a scan rule rejects it outright.
 
     /** The pool's environment with the seed naming somebody else entirely. */
-    function envNamingSomebodyElse(): EntryEnv {
+    function envNamingSomebodyElse(): Env {
       return {
         ...entryEnv(),
         ALLOWED_APPLE_IDS_SEED: JSON.stringify([

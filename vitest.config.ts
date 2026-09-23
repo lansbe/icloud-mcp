@@ -51,10 +51,20 @@ export default defineConfig({
               // are never present locally, and D-09 forbids any automated login
               // to the real Apple ID — no CI, pre-commit, or post-deploy job
               // ever authenticates against it.
+              //
+              // THREE BINDINGS LEFT THIS BLOCK IN PHASE 13: the two that carried
+              // the account credentials, and the login gate's shared secret. The
+              // platform stops supplying all three, and a test that could still
+              // read one would prove nothing about what shipped — it would assert
+              // against a value only the test runner has. The suite's two fake
+              // credentials are constants in `test/fixtures/bound-secrets.ts`
+              // instead, which is the single source for them.
+              //
+              // The same argument the removed allow-list Secret settles one
+              // directory over: a binding declared in two places with nothing
+              // keeping them in step is a binding that drifts, and this file is
+              // the half nothing fails on.
               bindings: {
-                AUTH_SECRET: "test-secret-not-real",
-                APPLE_ID: "test@example.invalid",
-                APPLE_APP_PASSWORD: "test-password-not-real",
                 R2_ACCOUNT_ID: "test-account-id-not-real",
                 R2_ACCESS_KEY_ID: "test-access-key-not-real",
                 R2_SECRET_ACCESS_KEY: "test-secret-key-not-real",

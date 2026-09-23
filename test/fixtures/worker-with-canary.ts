@@ -20,7 +20,7 @@
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { oauthProviderOptions } from "../../src/auth/oauth";
-import type { EntryEnv } from "../../src/env";
+import type { Env } from "../../src/env";
 import {
   buildRequestHandler,
   createMcpApiHandler,
@@ -55,7 +55,7 @@ export function registerCanary(server: McpServer): void {
 // from production's own options, so the composition under test is the one that
 // ships rather than a convenient copy of it, and there is no option here to
 // drift out of step.
-const provider = new OAuthProvider<EntryEnv>({
+const provider = new OAuthProvider<Env>({
   ...oauthProviderOptions,
   apiHandler: createMcpApiHandler([registerCanary]),
 });
@@ -82,7 +82,7 @@ const CANARY_DISPATCH_ROUTE = "/__canary/dispatch";
 export default {
   async fetch(
     request: Request,
-    env: EntryEnv,
+    env: Env,
     ctx: ExecutionContext,
   ): Promise<Response> {
     const { pathname } = new URL(request.url);

@@ -76,7 +76,8 @@ import type { Env } from "../src/env";
 import { presignedKeyFor } from "../src/staging/presign";
 import { stagingKeyFor } from "../src/staging/r2";
 import { HOME_A, HOME_B, twoUserDavStub } from "./fixtures/two-user-dav";
-import { USER_A, USER_B, envFor, testPrincipal } from "./fixtures/two-users";
+import { USER_A, USER_B, testPrincipal } from "./fixtures/two-users";
+import { entryEnv } from "./fixtures/bound-secrets";
 import type { TestUser } from "./fixtures/two-users";
 
 /** A fixed instant, so the clock segment of a key can be compared exactly. */
@@ -144,7 +145,7 @@ async function davKeyWrittenFor(
   expectedHome: string,
 ): Promise<string> {
   const kv = fakeKv();
-  const scoped: Env = { ...envFor(user), DAV_CACHE: kv.binding };
+  const scoped: Env = { ...entryEnv(), DAV_CACHE: kv.binding };
   // One principal for this user, for the cache key and for the login alike.
   const who = testPrincipal(user);
 

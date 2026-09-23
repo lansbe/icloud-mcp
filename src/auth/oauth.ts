@@ -7,11 +7,11 @@
 // rebuild this object would be testing its own copy.
 
 import type { OAuthProviderOptions } from "@cloudflare/workers-oauth-provider";
-import type { EntryEnv } from "../env";
+import type { Env } from "../env";
 import { DEPLOYED_HOSTNAME, mcpApiHandler } from "../mcp/api-handler";
 import { loginHandler, refuseUnlistedRedirects } from "./login-handler";
 
-export const oauthProviderOptions: OAuthProviderOptions<EntryEnv> = {
+export const oauthProviderOptions: OAuthProviderOptions<Env> = {
   apiRoute: "/mcp",
 
   // The adapter, never the raw handler. See src/mcp/api-handler.ts for what

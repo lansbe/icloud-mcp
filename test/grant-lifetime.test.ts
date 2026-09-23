@@ -78,7 +78,7 @@ import {
   refuseUnlistedRedirects,
 } from "../src/auth/login-handler";
 import { oauthProviderOptions } from "../src/auth/oauth";
-import type { EntryEnv } from "../src/env";
+import type { Env } from "../src/env";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 import { userIdOf } from "../src/principal";
 import { entryEnv } from "./fixtures/bound-secrets";
@@ -119,7 +119,7 @@ const DAY_SECONDS = 86400;
 type WorkerEntry = {
   fetch(
     request: Request,
-    env: EntryEnv,
+    env: Env,
     ctx: ExecutionContext,
   ): Promise<Response>;
 };
@@ -145,19 +145,19 @@ function limiter(success: boolean) {
  * A spread, never a write onto the object `entryEnv()` hands back — hygiene
  * rule 2. Extra overrides are spread last so a case can also swap the store.
  */
-function allowAllEnv(overrides: Record<string, unknown> = {}): EntryEnv {
+function allowAllEnv(overrides: Record<string, unknown> = {}): Env {
   return {
     ...entryEnv(),
     LOGIN_IP_LIMITER: limiter(true),
     LOGIN_ID_LIMITER: limiter(true),
     ...overrides,
-  } as unknown as EntryEnv;
+  } as unknown as Env;
 }
 
 /** Drive a Worker entry through its real fetch, on a real execution context. */
 async function callWorker(
   request: Request,
-  env: EntryEnv,
+  env: Env,
   entry: WorkerEntry = worker,
 ): Promise<Response> {
   const ctx = createExecutionContext();
@@ -191,7 +191,7 @@ function publicClientMetadata(
 
 /** Register a real public client through the real registration endpoint. */
 async function register(
-  env: EntryEnv,
+  env: Env,
   clientName: string,
   redirectUri: string,
   entry: WorkerEntry = worker,
@@ -253,7 +253,7 @@ function freshSource(): string {
 
 /** Sign the listed address in, and hand back the authorization code. */
 async function signIn(
-  env: EntryEnv,
+  env: Env,
   clientId: string,
   redirectUri: string,
   state: string,
@@ -279,7 +279,7 @@ async function signIn(
 
 /** Redeem an authorization code at the real token endpoint. */
 async function exchangeCode(
-  env: EntryEnv,
+  env: Env,
   clientId: string,
   redirectUri: string,
   code: string,
@@ -317,7 +317,7 @@ async function exchangeCode(
 
 /** Refresh a login at the real token endpoint. The response, not an assertion. */
 async function refreshWith(
-  env: EntryEnv,
+  env: Env,
   clientId: string,
   refreshToken: string,
   entry: WorkerEntry = worker,
@@ -515,7 +515,7 @@ describe("LIFE-01: a login lasts until someone revokes it", () => {
     // Without this case the two assertions above are consistent with a library
     // that ignores both keys, and the "tidy-up" that deletes the two lines
     // would leave the whole suite green while restoring the forced logout.
-    const options: OAuthProviderOptions<EntryEnv> = {
+    const options: OAuthProviderOptions<Env> = {
       ...oauthProviderOptions,
       // The proof, injected as always (D-09). It does nothing and resolves.
       defaultHandler: createLoginHandler(async () => {}),
@@ -525,7 +525,7 @@ describe("LIFE-01: a login lasts until someone revokes it", () => {
     delete options.refreshTokenTTL;
     delete options.clientRegistrationTTL;
 
-    const control = new OAuthProvider<EntryEnv>(options);
+    const control = new OAuthProvider<Env>(options);
     const entry: WorkerEntry = {
       fetch(request, env, ctx) {
         return control.fetch(request, env, ctx);
@@ -1004,7 +1004,7 @@ function rpcMessageIn(bodyText: string): Record<string, unknown> | null {
 
 /** Assert an access token still gets served a tool list at `/mcp`. */
 async function expectStillServed(
-  env: EntryEnv,
+  env: Env,
   accessToken: string,
 ): Promise<void> {
   const response = await callWorker(toolsList(accessToken), env);

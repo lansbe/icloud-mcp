@@ -49,7 +49,7 @@ import {
   DavConnectError,
   DavThrottleError,
 } from "../src/dav/errors";
-import type { Env, EntryEnv, LoginGateSecret } from "../src/env";
+import type { Env } from "../src/env";
 import {
   ImapAuthError,
   ImapConnectError,
@@ -285,7 +285,7 @@ function loginRecorder(): LoginRecorder {
 function loginStubEnv(
   record: LoginRecorder,
   appleId: string,
-): Env & LoginGateSecret {
+): Env {
   return {
     OAUTH_KV: {
       async get(): Promise<string | null> {
@@ -333,7 +333,7 @@ function loginStubEnv(
         return { redirectTo: `${STUB_REDIRECT}?code=stub-code` };
       },
     },
-  } as unknown as Env & LoginGateSecret;
+  } as unknown as Env;
 }
 
 /** Where the stub provider says the code would go. On an allowed origin. */
@@ -415,18 +415,18 @@ function allowAllLimiter() {
  * test in a file. The real per-target binding refuses a fourth sign-in per
  * address per minute and nothing clears its windows between runs.
  */
-function allowAllEnv(): EntryEnv {
+function allowAllEnv(): Env {
   return {
     ...entryEnv(),
     LOGIN_IP_LIMITER: allowAllLimiter(),
     LOGIN_ID_LIMITER: allowAllLimiter(),
-  } as unknown as EntryEnv;
+  } as unknown as Env;
 }
 
 /** Drive the fixture Worker through its real fetch, on a real execution context. */
 async function callFixtureWorker(
   request: Request,
-  env: EntryEnv,
+  env: Env,
 ): Promise<Response> {
   const ctx = createExecutionContext();
   const response = await worker.fetch(request, env, ctx);
@@ -436,7 +436,7 @@ async function callFixtureWorker(
 
 /** Register a real public client through the real registration endpoint. */
 async function register(
-  env: EntryEnv,
+  env: Env,
   clientName: string,
   redirectUri: string,
 ): Promise<string> {
@@ -462,7 +462,7 @@ async function register(
 
 /** Sign the LISTED address in through the real provider, and hand back the code. */
 async function signInForReal(
-  env: EntryEnv,
+  env: Env,
   clientId: string,
   redirectUri: string,
 ): Promise<string> {
@@ -501,7 +501,7 @@ async function signInForReal(
 
 /** Redeem a code at the real token endpoint, for the grant id inside the token. */
 async function grantIdFromCode(
-  env: EntryEnv,
+  env: Env,
   clientId: string,
   redirectUri: string,
   code: string,

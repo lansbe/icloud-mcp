@@ -54,7 +54,7 @@
 
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { EntryEnv } from "../src/env";
+import type { Env } from "../src/env";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 import { maskAppleId, userIdOf } from "../src/principal";
 import {
@@ -96,16 +96,16 @@ function limiter(success: boolean) {
 }
 
 /** Hygiene rule 2: the pool's environment with both limiters replaced, as a COPY. */
-function allowAllEnv(): EntryEnv {
+function allowAllEnv(): Env {
   return {
     ...entryEnv(),
     LOGIN_IP_LIMITER: limiter(true),
     LOGIN_ID_LIMITER: limiter(true),
-  } as unknown as EntryEnv;
+  } as unknown as Env;
 }
 
 /** Drive the fixture Worker through its real fetch, on a real execution context. */
-async function callWorker(request: Request, env: EntryEnv): Promise<Response> {
+async function callWorker(request: Request, env: Env): Promise<Response> {
   const ctx = createExecutionContext();
   const response = await worker.fetch(request, env, ctx);
   await waitOnExecutionContext(ctx);
@@ -114,7 +114,7 @@ async function callWorker(request: Request, env: EntryEnv): Promise<Response> {
 
 /** Register a real public client through the real registration endpoint. */
 async function register(
-  env: EntryEnv,
+  env: Env,
   clientName: string,
   redirectUri = CLAUDE_WEB_REDIRECT,
 ): Promise<string> {
@@ -145,7 +145,7 @@ function freshSource(): string {
 
 /** Sign the listed address in, and hand back the authorization code. */
 async function signIn(
-  env: EntryEnv,
+  env: Env,
   clientId: string,
   redirectUri: string,
   state: string,
@@ -185,7 +185,7 @@ async function signIn(
 
 /** Redeem an authorization code at the real token endpoint. */
 async function exchangeCode(
-  env: EntryEnv,
+  env: Env,
   clientId: string,
   redirectUri: string,
   code: string,
@@ -223,7 +223,7 @@ function grantIdOf(token: string): string {
 
 /** Mint one real grant: register, sign in, exchange. */
 async function mintGrant(
-  env: EntryEnv,
+  env: Env,
   clientName: string,
   state: string,
 ): Promise<{ clientId: string; grantId: string; accessToken: string }> {
@@ -317,7 +317,7 @@ function toolsList(accessToken: string): Request {
 }
 
 /** The status the door answers an access token with. */
-async function doorStatus(env: EntryEnv, accessToken: string): Promise<number> {
+async function doorStatus(env: Env, accessToken: string): Promise<number> {
   const response = await callWorker(toolsList(accessToken), env);
   return response.status;
 }

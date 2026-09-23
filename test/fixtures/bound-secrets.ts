@@ -37,7 +37,7 @@
 // reports nothing.
 
 import { env as ambientEnv } from "cloudflare:workers";
-import type { EntryEnv } from "../../src/env";
+import type { Env } from "../../src/env";
 import type { Principal } from "../../src/principal";
 import { principalFromProps } from "../../src/principal";
 
@@ -58,24 +58,25 @@ export const FAKE_APPLE_ID = "test@example.invalid";
 export const FAKE_APP_PASSWORD = "test-password-not-real";
 
 /**
- * The pool's environment, typed the way the runtime really hands it to the
- * entry point (Phase 9 D-15).
+ * The pool's environment, as the shared type.
  *
- * **This is the ONE cast in `test/`.** The three secret names left the shared
- * type in Phase 9, so the ambient environment no longer admits them, but the
- * test runner does bind all three — `vitest.config.ts` still carries them. The
- * cast states that fact in one place instead of in nineteen files.
+ * **The cast this used to carry is gone.** It existed because three secret names
+ * had been moved off the shared type while the test runner still bound all three,
+ * so the cast stated that mismatch in one place instead of in nineteen files.
+ * Phase 13 deleted the three names and stopped the pool binding them, so there is
+ * nothing left to state: the ambient environment and the shared type now agree,
+ * and the cast is the compiler's own narrowing of the ambient value rather than a
+ * claim about missing fields.
  *
- * Plan 13-03 deletes the secrets and this function with them. It survives 13-02
- * because callers of its own remain; the constants above are what a test that
- * wants a CREDENTIAL uses, and no caller of this one reads a secret off it any
- * more.
+ * The function survives the deletion because thirty files call it and what they
+ * want is the binding surface. A test that wants a CREDENTIAL uses the two
+ * constants above.
  *
  * It reads no value and reports none. It hands back the binding surface, not a
  * credential.
  */
-export function entryEnv(): EntryEnv {
-  return ambientEnv as EntryEnv;
+export function entryEnv(): Env {
+  return ambientEnv as Env;
 }
 
 /**

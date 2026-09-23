@@ -27,7 +27,7 @@
 
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { EntryEnv } from "../src/env";
+import type { Env } from "../src/env";
 import { SAFE_MESSAGES } from "../src/errors";
 import { DEPLOYED_HOSTNAME, createMcpApiHandler } from "../src/mcp/api-handler";
 import { signedInAsResult } from "../src/mcp/tools/account";
@@ -314,7 +314,7 @@ const REFUSED_CREDENTIAL: CaseProps = {
 async function callDoor(
   request: Request,
   caseProps: CaseProps,
-  withEnv: EntryEnv = entryEnv(),
+  withEnv: Env = entryEnv(),
 ): Promise<Response> {
   const ctx = createExecutionContext();
   if (!caseProps.absent) {

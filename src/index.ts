@@ -9,6 +9,6 @@
 
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { oauthProviderOptions } from "./auth/oauth";
-import type { EntryEnv } from "./env";
+import type { Env } from "./env";
 
-export default new OAuthProvider<EntryEnv>(oauthProviderOptions);
+export default new OAuthProvider<Env>(oauthProviderOptions);

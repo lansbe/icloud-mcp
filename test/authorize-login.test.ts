@@ -86,7 +86,7 @@ import {
   CREDENTIAL_FAILURE_BODY,
   SOURCE_REFUSAL_BODY,
 } from "../src/auth/login-page";
-import type { Env, LoginGateSecret } from "../src/env";
+import type { Env } from "../src/env";
 import {
   ImapAuthError,
   ImapConnectError,
@@ -317,7 +317,7 @@ function stubEnv(
     limiterKeys?: string[];
     sourceKeys?: string[];
   } = {},
-): Env & LoginGateSecret {
+): Env {
   return {
     OAUTH_KV: options.kv ?? quietKv(options.failures),
     LOGIN_IP_LIMITER: limiter(options.floodRefused !== true, options.sourceKeys),
@@ -357,7 +357,7 @@ function stubEnv(
         return { redirectTo: `${STUB_REDIRECT}?code=stub-code` };
       },
     },
-  } as unknown as Env & LoginGateSecret;
+  } as unknown as Env;
 }
 
 function get(query = STUB_QUERY): Request {

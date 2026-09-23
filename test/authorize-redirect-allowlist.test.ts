@@ -49,7 +49,7 @@ import {
   loginHandler,
   refusedRedirectBody,
 } from "../src/auth/login-handler";
-import type { Env, LoginGateSecret } from "../src/env";
+import type { Env } from "../src/env";
 import { entryEnv } from "./fixtures/bound-secrets";
 import worker, {
   FAKE_APP_PASSWORD,
@@ -175,7 +175,7 @@ function stubEnv(options: {
   redirectUri?: string;
   parseAuthRequest?: () => Promise<unknown>;
   calls?: string[];
-}): Env & LoginGateSecret {
+}): Env {
   const calls = options.calls ?? [];
   return {
     OAUTH_KV: quietKv(),
@@ -214,7 +214,7 @@ function stubEnv(options: {
         return { redirectTo: "https://attacker.example/cb?code=leaked" };
       },
     },
-  } as unknown as Env & LoginGateSecret;
+  } as unknown as Env;
 }
 
 function get(query: string): Request {

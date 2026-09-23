@@ -23,7 +23,7 @@
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { createLoginHandler } from "../../src/auth/login-handler";
 import { oauthProviderOptions } from "../../src/auth/oauth";
-import type { EntryEnv } from "../../src/env";
+import type { Env } from "../../src/env";
 import type { Principal } from "../../src/principal";
 
 /**
@@ -98,7 +98,7 @@ async function countingProof(principal: Principal): Promise<void> {
   }
 }
 
-const provider = new OAuthProvider<EntryEnv>({
+const provider = new OAuthProvider<Env>({
   ...oauthProviderOptions,
   defaultHandler: createLoginHandler(countingProof),
 });
@@ -106,7 +106,7 @@ const provider = new OAuthProvider<EntryEnv>({
 export default {
   fetch(
     request: Request,
-    env: EntryEnv,
+    env: Env,
     ctx: ExecutionContext,
   ): Promise<Response> {
     return provider.fetch(request, env, ctx);
