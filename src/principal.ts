@@ -191,7 +191,7 @@ export function normaliseAppleId(value: unknown): string | null {
  * turn it into three middle dots or three full stops without the change being
  * visible. One of those is not a mask.
  */
-const MASK_BODY = "•••";
+const MASK_BODY = "\u2022\u2022\u2022";
 
 /**
  * The masked form of an Apple ID: first character, three bullets, the domain.
