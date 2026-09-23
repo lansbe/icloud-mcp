@@ -83,6 +83,12 @@ export function signedInAsResult(principal: Principal): ToolResult {
  * refuses — answers `auth_failed` with the same fixed message every other tool
  * gives, because the recovery is the same one: sign in again. The caught value
  * is never read; `toErrorCategory` dispatches on its type.
+ *
+ * **A dead-password pause is one of those rejections, and this tool is NOT
+ * exempt from it** (owner decision, 2026-09-22). The two diagnostics are, because
+ * their job is explaining a failure; this one's is naming an account. So a paused
+ * user reads `auth_failed` here and runs `mail_imap_diagnose` or `dav_diagnose`
+ * to find out why. See `answersDuringPause` in `src/password-pause.ts`.
  */
 export function registerAccountTool(
   server: McpServer,

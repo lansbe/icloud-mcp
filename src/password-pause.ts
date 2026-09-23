@@ -36,6 +36,15 @@
 // `guardAgainstPause` for the argument. In short: the pause limits attempts at
 // Apple. It is not access control.
 //
+// **Two tools answer THROUGH a pause: `mail_imap_diagnose` and `dav_diagnose`.**
+// Owner decision, 2026-09-22, reversing `12-02-SUMMARY.md`'s "no tool bypasses
+// the pause". A user who is paused must be able to find out why, and those two
+// are the only tools that can tell them. The exemption is granted at
+// registration by `answersDuringPause`, which is the sole way to obtain an
+// unguarded principal and cannot be reached with anything the guard did not
+// build. The marker is still read in exactly one place. `account_whoami` stays
+// subject to the pause.
+//
 // This module contains no logging calls of any kind and must never acquire any.
 
 import { ImapAuthError } from "./errors";
@@ -98,6 +107,19 @@ function pauseKey(userId: string): string {
 const ARMED = new WeakMap<Principal, KVNamespace>();
 
 /**
+ * For each promise `guardAgainstPause` returned, the same principal WITHOUT the
+ * pause check in front of it.
+ *
+ * Never exported, and keyed by the very promise object the guard handed back —
+ * the same object-identity trick `ARMED` above uses, and for the same reason. A
+ * caller cannot construct a key: it can only hand back a promise it was given.
+ * `answersDuringPause` reads it, and anything that did not come out of the guard
+ * gets itself back unchanged, so the default is "still guarded" and an exemption
+ * has to be granted rather than assumed.
+ */
+const UNPAUSED = new WeakMap<Promise<Principal>, Promise<Principal>>();
+
+/**
  * Check the pause, then arm the principal. The door's one call.
  *
  * It takes the PROMISE the props constructor returned and hands back a promise,
@@ -124,7 +146,16 @@ export function guardAgainstPause(
   principal: Promise<Principal>,
   kv: KVNamespace,
 ): Promise<Principal> {
-  return principal.then(async (actor) => {
+  // Arming is separated from the refusal so that `answersDuringPause` has
+  // something to hand a diagnostic: a principal that is armed to report, with
+  // no pause check in front of it. The marker is still read in exactly one
+  // place, below.
+  const armed = principal.then((actor) => {
+    ARMED.set(actor, kv);
+    return actor;
+  });
+
+  const guarded = armed.then(async (actor) => {
     let paused = false;
     try {
       paused = (await kv.get(pauseKey(actor.userId))) !== null;
@@ -134,9 +165,48 @@ export function guardAgainstPause(
     }
     if (paused) throw new ImapAuthError();
 
-    ARMED.set(actor, kv);
     return actor;
   });
+
+  UNPAUSED.set(guarded, armed);
+  return guarded;
+}
+
+/**
+ * The same principal, answerable while a pause is in force. For the two
+ * diagnostics and nothing else.
+ *
+ * **OWNER DECISION, 2026-09-22. This reverses the decision recorded in
+ * `12-02-SUMMARY.md` that no tool bypasses the pause.** The reason is the one
+ * code review WR-04 gave: a pause silences the only two tools whose job is
+ * explaining why a call failed, so the user is told to reconnect and given no
+ * way to find out whether reconnecting is the right answer. That cost grew when
+ * `indicatesCredentialRefusal` moved to classifying by exclusion on the same
+ * day — a server-side fault Apple spells without a response code now starts a
+ * pause, and the diagnostics are how that gets diagnosed.
+ *
+ * `account_whoami` is deliberately NOT exempt. It answers which Apple ID the
+ * connection is signed in as; it does not explain a failure, so it has no part
+ * in the reason above. The pause is meant to be visible.
+ *
+ * **What it does and does not remove.** It removes the refusal, not the arming:
+ * a diagnostic that reaches Apple and is refused still reports, which is what
+ * keeps the pause fresh rather than letting a diagnostic call extend a user's
+ * access to a dead password indefinitely. And it removes nothing at all for a
+ * promise it was not given — the default is the guarded promise itself, so a
+ * future caller that wires this up wrongly gets today's behaviour rather than an
+ * accidental hole.
+ *
+ * **The residual cost, written down rather than discovered later.** A user who
+ * calls a diagnostic repeatedly during a pause does spend repeated attempts at
+ * Apple, which is the thing the pause exists to limit. Two diagnostics called by
+ * hand is a different order of traffic from every tool in a conversation
+ * retrying, and the alternative — a pause nobody can see into — was judged worse.
+ */
+export function answersDuringPause(
+  principal: Promise<Principal>,
+): Promise<Principal> {
+  return UNPAUSED.get(principal) ?? principal;
 }
 
 /**

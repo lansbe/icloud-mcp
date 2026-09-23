@@ -399,9 +399,16 @@ export function buildRequestHandler(
  *   before it opens a socket or sends a DAV request, so the read never overlaps
  *   one and never spends a connection the request also wants.
  * - A paused user gets the same auth error an unusable stored credential gets,
- *   so every tool answers `auth_failed` — which is already the text telling them
+ *   so the tool answers `auth_failed` — which is already the text telling them
  *   to reconnect and that retrying will not help. This is deliberately NOT a
  *   401: the address is still listed and the grant is still well-formed.
+ * - TWO TOOLS ANSWER THROUGH A PAUSE: `mail_imap_diagnose` and `dav_diagnose`
+ *   (owner decision, 2026-09-22 — code review WR-04). The exemption is granted in
+ *   `src/mcp/server.ts`, at the registrations themselves, and not here: this
+ *   function still builds ONE principal promise and still hands on ONE. A second
+ *   promise threaded through `buildRequestHandler` was the shape declined, because
+ *   the door would then be the place a reader has to look to find out which tools
+ *   are gated, and the registrations are where that belongs.
  */
 export function createMcpApiHandler(extraTools: ExtraTool[] = []): {
   fetch(

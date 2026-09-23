@@ -8,6 +8,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import type { McpServerFactory } from "@modelcontextprotocol/server";
 import { createDavFetch } from "../dav/transport";
 import { createSessionGate } from "../mail/service";
+import { answersDuringPause } from "../password-pause";
 import type { Principal } from "../principal";
 import { registerAccountTool } from "./tools/account";
 import { registerCalendarTools } from "./tools/calendar";
@@ -58,22 +59,45 @@ export function createServerFactory(
     // whole isolate into a single-file line. Both belong here; neither belongs
     // at module scope.
     const gate = createSessionGate();
+    // **The per-tool opt-out from the dead-password pause, and the ONLY place it
+    // is granted (owner decision, 2026-09-22 — code review WR-04).** The same
+    // principal, armed exactly as `principal` is, with the pause check removed.
+    // Handed to the two diagnostics below and to nothing else, so a user who is
+    // paused can always find out why. `answersDuringPause` returns its argument
+    // unchanged for anything the door's guard did not build, so mis-wiring this
+    // line degrades to today's behaviour rather than to an open door.
+    //
+    // It is deliberately NOT a second promise threaded through
+    // `buildRequestHandler`: it is derived here, one line above the two
+    // registrations it serves, where a reader can see which tools have it.
+    const unpaused = answersDuringPause(principal);
     // The DAV fetch takes the PROMISE and awaits it inside each request it
     // sends, so this body stays synchronous. It was this file's only use of the
     // ambient environment, which is why that import is gone.
-    const davFetch = createDavFetch(principal);
-    // Every registrar below gets the SAME promise of the principal. Each tool
-    // callback awaits it as the first line of its own `try`. The DAV fetch
-    // above awaits it too, at the top of every request it sends, so the login
-    // and the cache key always belong to one identity (D-13).
-    registerDiagnoseTool(server, principal);
+    //
+    // **It takes the UNPAUSED promise, and the pause is still enforced for every
+    // DAV tool.** `dav_diagnose` and the calendar and contacts tools share ONE
+    // fetch on purpose (see the comment below), so a fetch that refused a paused
+    // user would make the diagnostic's exemption unreachable, and a second fetch
+    // would be a second request queue. The gate for the other DAV tools is their
+    // own `await principal` — the first line of every one of their callbacks,
+    // which runs before any request is sent — and `test/password-pause.test.ts`
+    // pins that a paused calendar call still reaches the network zero times.
+    const davFetch = createDavFetch(unpaused);
+    // Every registrar below gets the SAME promise of the principal, apart from
+    // the two diagnostics. Each tool callback awaits it as the first line of its
+    // own `try`. The DAV fetch above awaits it too, at the top of every request
+    // it sends, so the login and the cache key always belong to one identity
+    // (D-13) — it is the same person either way, since the two promises differ
+    // only in whether the pause refuses.
+    registerDiagnoseTool(server, unpaused);
     // The masked "which Apple ID is this connection signed in as" answer
     // (LIFE-06, D4). It takes the principal and nothing else: no gate, no DAV
     // fetch, no environment. It cannot reach a socket or a DAV host, which is
     // exactly why it needs neither.
     registerAccountTool(server, principal);
     registerMailTools(server, gate, principal);
-    registerDavDiagnoseTool(server, davFetch, principal);
+    registerDavDiagnoseTool(server, davFetch, unpaused);
     // The same `davFetch` the diagnostic takes, deliberately: one queue per
     // request means a calendar call and a diagnosis issued in the same request
     // serialise against each other rather than racing for the connection

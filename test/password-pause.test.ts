@@ -64,6 +64,7 @@ import { maskAppleId, principalFromProps, userIdOf } from "../src/principal";
 import {
   PASSWORD_PAUSE_KEY_PREFIX,
   PASSWORD_PAUSE_SECONDS,
+  answersDuringPause,
   guardAgainstPause,
 } from "../src/password-pause";
 import { mintUploadUrl } from "../src/staging/presign";
@@ -92,6 +93,18 @@ import worker, {
 
 const ORIGIN = `https://${DEPLOYED_HOSTNAME}`;
 
+// @ts-expect-error — Vite's `import.meta.glob` has no ambient declaration here;
+// `test/door.test.ts` carries the same comment for the same reason. `?raw`
+// inlines the file's text at build time, which is how a Workers isolate with no
+// filesystem reads source.
+const SERVER_SOURCE_GLOB: Record<string, string> = import.meta.glob(
+  "../src/mcp/server.ts",
+  { query: "?raw", import: "default", eager: true },
+);
+
+/** The per-request server factory's source, for the WR-04 wiring assertion. */
+const SERVER_SOURCE: string = Object.values(SERVER_SOURCE_GLOB)[0] ?? "";
+
 /**
  * This file's own address, used by nothing else in the repository.
  *
@@ -118,6 +131,15 @@ const MAIL_DIAGNOSTIC = "mail_imap_diagnose";
 
 /** The account tool from plan 12-03. It opens no socket at all. */
 const ACCOUNT_TOOL = "account_whoami";
+
+/** The DAV diagnostic. Like the mail one, exempt from the pause (WR-04). */
+const DAV_DIAGNOSTIC = "dav_diagnose";
+
+/** An ordinary mail tool: it opens a socket, and the pause is what stops it. */
+const MAIL_TOOL = "mail_list_folders";
+
+/** An ordinary DAV tool: it sends a DAV request, and the pause stops that too. */
+const CALENDAR_TOOL = "calendar_list_calendars";
 
 /** The door as production builds it, with no injected tools. */
 const door = createMcpApiHandler();
@@ -909,23 +931,23 @@ describe("LIFE-04: the dead-password pause", () => {
       }
     });
 
-    it("answers the diagnostic with the refused-here field, so no socket opened", async () => {
+    it("answers a mail tool with the reconnect message, so no socket opened", async () => {
+      // The mail tools are the reason the pause exists: each one opens a socket
+      // and spends an attempt at Apple. A paused one answers before that. The
+      // mail DIAGNOSTIC is deliberately not the tool used here — it is exempt
+      // from the pause (WR-04, owner decision 2026-09-22) and has its own block
+      // below.
       try {
         await setMarker();
-        const answer = await callTool(MAIL_DIAGNOSTIC);
+        const answer = await callTool(MAIL_TOOL);
 
         expect(answer.status).toBe(200);
         expect(answer.isError).toBe(true);
         expect(answer.body.category).toBe("auth_failed");
-        // This field appears ONLY when the principal was refused before the
-        // diagnostic ran — which is before any socket. Its presence is the
-        // assertion that Apple was never asked; a refusal that reached Apple
-        // carries `authFailureDetail` instead and never this.
-        expect(
-          answer.body.authRefusedBy,
-          "the refusal did not happen before iCloud was asked",
-        ).toBe("this server");
-        expect(answer.body.authFailureDetail).toBeUndefined();
+        expect(answer.body.message).toBe(SAFE_MESSAGES.auth_failed);
+        // A mail tool's answer carries the folder listing on success. Its
+        // absence is what says the session never ran.
+        expect(answer.body.folders).toBeUndefined();
       } finally {
         await forgetMarker();
       }
@@ -938,7 +960,7 @@ describe("LIFE-04: the dead-password pause", () => {
         expect(before).not.toBeNull();
 
         await callTool(ACCOUNT_TOOL);
-        await callTool(MAIL_DIAGNOSTIC);
+        await callTool(MAIL_TOOL);
 
         expect((await readMarker()).expiration).toBe(before);
       } finally {
@@ -988,6 +1010,188 @@ describe("LIFE-04: the dead-password pause", () => {
       } finally {
         await forgetMarker();
       }
+    });
+  });
+
+  describe("the two diagnostics answer THROUGH a pause", () => {
+    // WR-04, and an owner decision of 2026-09-22 that reverses
+    // `12-02-SUMMARY.md`'s "`account_whoami` does not bypass the pause. Same
+    // principal, same answer, same recovery." It does not bypass it and still
+    // does not; the two DIAGNOSTICS do, because a user who is told to reconnect
+    // must have some way of finding out whether reconnecting is the answer.
+    //
+    // The mail diagnostic is not driven end to end anywhere in this block, and
+    // that is deliberate rather than an omission: past the exemption it calls
+    // the real `connectImap()`, and no automated job in this repository may open
+    // a socket to Apple (D-09). What is driven instead is the exemption itself,
+    // which is the entire behavioural difference for that tool — its first line
+    // is `await principal` — plus a source-text assertion that it is one of the
+    // two registrations wired to it. `dav_diagnose` IS driven end to end through
+    // the real door, over a stubbed transport, so the mechanism has a full
+    // behavioural proof at the far end of the same wire.
+
+    it("hands the diagnostics the very principal the guarded promise refuses", async () => {
+      try {
+        await setMarker();
+        const source = unarmedPrincipal();
+        const guarded = guardAgainstPause(source, entryEnv().OAUTH_KV);
+
+        // The refusal every other tool gets, unchanged.
+        expect(await raise(() => guarded)).toBeInstanceOf(ImapAuthError);
+
+        // The same object, not a copy. `src/principal.ts`'s password reader
+        // answers only the one object a constructor returned (D-16), so a clone
+        // here would reach no credential at all.
+        expect(await answersDuringPause(guarded)).toBe(await source);
+      } finally {
+        await forgetMarker();
+      }
+    });
+
+    it("exempts ONLY the promise the guard itself returned", async () => {
+      // The fail-closed half. The exemption is keyed by the very promise object
+      // the guard handed back, so there is no value a caller can construct that
+      // buys one — it can only hand back something it was given. Anything else
+      // comes back unchanged, which means still guarded.
+      try {
+        await setMarker();
+        const guarded = guardAgainstPause(
+          unarmedPrincipal(),
+          entryEnv().OAUTH_KV,
+        );
+
+        // A promise DERIVED from the guarded one is a different object, and a
+        // look-alike is not a key. It gets itself back, so it still rejects.
+        const derived = guarded.then((actor) => actor);
+        expect(answersDuringPause(derived)).toBe(derived);
+        expect(await raise(() => derived)).toBeInstanceOf(ImapAuthError);
+
+        // And a promise that never went near the guard is handed straight back.
+        const never = unarmedPrincipal();
+        expect(answersDuringPause(never)).toBe(never);
+      } finally {
+        await forgetMarker();
+      }
+    });
+
+    it("still ARMS the exempt principal, so a diagnostic refusal keeps the pause", async () => {
+      // The exemption removes the refusal, not the arming. A diagnostic that
+      // reaches Apple and is refused still reports — otherwise a user could hold
+      // a dead password open indefinitely by running a diagnostic.
+      try {
+        const exempt = await answersDuringPause(armedPrincipal());
+        const { failed, error } = await runDiagnosticOver(
+          refusedAuth(AUTH_REJECTED_LEGACY_TEXT, AUTH_REJECTED_TEXT),
+          exempt,
+          1,
+        );
+
+        expect(failed).toBe(true);
+        expect(error).toBeInstanceOf(ImapAuthError);
+        expect(
+          (await readMarker()).value,
+          "an exempt principal reported nothing, so the pause never starts",
+        ).toBe("1");
+      } finally {
+        await forgetMarker();
+      }
+    });
+
+    it("lets dav_diagnose reach the network while every other DAV tool cannot", async () => {
+      // The end-to-end half, through the REAL door with a live marker. The
+      // assertion is a COUNT at the transport seam, which is the mirror image of
+      // "sends ZERO DAV requests while paused" above — and the two together are
+      // what say the exemption is narrow rather than a hole.
+      try {
+        await setMarker();
+        const stub = statusStub(207);
+        vi.stubGlobal("fetch", stub.fetch);
+
+        const diagnosed = await callTool(DAV_DIAGNOSTIC);
+        expect(
+          stub.calls.length,
+          "the pause silenced the tool that would explain the pause",
+        ).toBeGreaterThan(0);
+        // It got past the door's gate; what the stubbed transport then makes of
+        // the discovery is not this file's business. What IS this file's
+        // business is that the answer is not the pause's own refusal.
+        expect(diagnosed.body.category).not.toBe("auth_failed");
+
+        const reached = stub.calls.length;
+        const refused = await callTool(CALENDAR_TOOL);
+
+        expect(refused.isError, "a paused calendar call was served").toBe(true);
+        expect(refused.body.category).toBe("auth_failed");
+        expect(refused.body.message).toBe(SAFE_MESSAGES.auth_failed);
+        expect(
+          stub.calls.length,
+          "a paused calendar call still reached the network",
+        ).toBe(reached);
+      } finally {
+        await forgetMarker();
+      }
+    });
+
+    it("the control: the account tool is still refused by the same marker", async () => {
+      // Without this the case above is vacuous in the direction that matters —
+      // a door that had stopped checking the pause at all would pass it. This is
+      // also the decision itself, pinned: `account_whoami` names an account, it
+      // does not explain a failure, so it is NOT exempt.
+      try {
+        await setMarker();
+        const answer = await callTool(ACCOUNT_TOOL);
+
+        expect(answer.isError).toBe(true);
+        expect(answer.body.category).toBe("auth_failed");
+        expect(answer.body.signedInAs).toBeUndefined();
+      } finally {
+        await forgetMarker();
+      }
+    });
+
+    it("wires the exemption to exactly the two diagnostics and nothing else", () => {
+      // The mail diagnostic's half of the proof, in the idiom `test/door.test.ts`
+      // uses for a claim about wiring that cannot be driven — see the block
+      // comment above for why driving it would open a socket to Apple.
+      expect(
+        SERVER_SOURCE.length,
+        "the ?raw import of src/mcp/server.ts loaded nothing",
+      ).toBeGreaterThan(1000);
+      expect(SERVER_SOURCE).toContain("createServerFactory");
+
+      // Granted once, from the guarded promise, and by the only function that
+      // can grant it.
+      const grants = SERVER_SOURCE.match(/answersDuringPause\(/g) ?? [];
+      expect(
+        grants.length,
+        "the exemption is granted somewhere other than the one derivation",
+      ).toBe(1);
+      expect(SERVER_SOURCE).toContain(
+        "const unpaused = answersDuringPause(principal);",
+      );
+
+      // Every registration that receives it, by name. A registrar added to this
+      // list is a tool that answers while a user is paused, which is a change to
+      // the safety boundary rather than a refactor.
+      expect(SERVER_SOURCE).toContain("registerDiagnoseTool(server, unpaused)");
+      expect(SERVER_SOURCE).toContain(
+        "registerDavDiagnoseTool(server, davFetch, unpaused)",
+      );
+      // The shared DAV fetch takes it too, because one queue per request is
+      // deliberate and a second fetch would be a second queue.
+      expect(SERVER_SOURCE).toContain("createDavFetch(unpaused)");
+
+      // And the count, which is what catches a THIRD tool quietly acquiring it.
+      // Comments are stripped first: the file discusses `unpaused` at length
+      // above the code, and a prose mention is not a registration.
+      const code = SERVER_SOURCE.split("\n")
+        .filter((line) => !line.trim().startsWith("//"))
+        .join("\n");
+      const uses = code.match(/\bunpaused\b/g) ?? [];
+      expect(
+        uses.length,
+        "a tool other than the two diagnostics and their shared DAV fetch takes the unpaused principal",
+      ).toBe(4);
     });
   });
 
