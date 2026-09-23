@@ -87,7 +87,7 @@ enforcement, and the module map — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ## Tools
 
-23 tools in five groups. Every tool description carries an untrusted-content
+24 tools in four groups. Every tool description carries an untrusted-content
 notice; event titles, message bodies, and contact fields are treated as data,
 never as instructions.
 
@@ -97,6 +97,7 @@ never as instructions.
 |------|--------------|
 | `mail_imap_diagnose` | Check iCloud IMAP connectivity, auth, and capabilities. |
 | `dav_diagnose` | Check CalDAV/CardDAV discovery: resolved URLs, shard host, cache hit, timings. |
+| `account_whoami` | Show which Apple ID this connection is signed in as, masked. |
 
 ### Mail
 

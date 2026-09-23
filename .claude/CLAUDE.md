@@ -371,6 +371,54 @@ Three habits follow, and all three are already established in `src/`:
   `.stack` from a caught value, and maps to a fixed four-value vocabulary.
 - No diagnostic field echoes the last command sent.
 
+#### A masked "which account" answer is not this rule's subject
+
+Phase 12 adds a tool, `account_whoami`, that answers which Apple ID the
+connection is signed in as. The answer is masked. That is LIFE-06, decided as D4
+on 2026-09-21. It looks like the thing this rule forbids and it is not, so the
+argument is recorded here rather than left to be re-derived.
+
+1. **The address does fall under this rule.** It is the login half of the
+   credential pair, so it belongs with the password and not with the ordinary
+   fields of an answer. And a tool response is worse than a log line in one
+   respect: it is text the model reads, and may quote back into a draft, an
+   event, or a later message. An address reaching a response is the harm here,
+   not merely untidiness.
+
+2. **The full address is never returned.** The tool returns only the form
+   `maskAppleId` in `src/principal.ts` builds: the first character of the local
+   part, three bullets, then the domain — `u•••@icloud.com`. Input that the
+   folding rule refuses comes back as the three bullets alone, with nothing
+   around them. No flag and no argument widens that, because the tool takes no
+   arguments at all.
+
+3. **`maskAppleId` is the only masking function.** The owner's grants script
+   calls that same one, so the listing the owner reads before cutting off a
+   connection is masked by the same rule as the answer the model reads. A mask
+   written inline at either call site is the breach. This tool is not.
+
+4. **The answer comes from the grant.** It is built from the principal the door
+   made out of the stored props, and from nothing else. No socket is opened, no
+   request is sent, and no environment secret is read. The tool module imports
+   nothing from the mail tree, nothing from the DAV tree, and nothing from the
+   environment types.
+
+5. **The unmasked answer was declined.** It answers the same question and puts a
+   whole address into a response, which is the one thing this subsection exists
+   to keep out of one. Widening the tool to return the full address is a new
+   decision, not a refactor.
+
+6. **This adds no rule to the list, and no scan rule.** Two tests hold it
+   instead. A table runs the mask over every row of the address spec, in both
+   directions, so an accepted address must come back masked and a refused one
+   must come back as bullets. And a second test drives the real door and asserts
+   that the whole response body never holds the address.
+
+This reconciliation lives on the safety boundary itself, and not only in a phase
+artifact, because a session reading § 4 alone would read the tool as a leak and
+delete it — and deleting it would break a requirement the developer decided on
+2026-09-21 rather than fix a breach.
+
 ### 5. Reading mail does not mark it read
 
 Claude reading your mail is not you reading your mail. Read status is a field
