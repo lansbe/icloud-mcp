@@ -213,6 +213,12 @@ npx wrangler kv key put --namespace-id=YOUR_ALLOW_LIST_ID --remote \
   "allow-list:v1" '["someone@example.com"]'
 ```
 
+This pastes the namespace id, while the phase runbooks use `--binding
+ALLOW_LIST_KV`. Both forms are correct and they stay different on purpose: the
+binding name is the better habit once your config exists, because the id is then
+written down in exactly one place, but you are reading this before you have
+written that config, so the id is the only handle you have.
+
 An **empty list is valid** and is the right starting point — write `'[]'`, or
 skip this step entirely, and only you can sign in. A missing, empty or malformed
 document means nobody beyond the seed, never everybody. Only the exact value

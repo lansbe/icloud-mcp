@@ -6,9 +6,12 @@
 // marked YOUR_* below are placeholders. `npm install` copies this template to
 // `wrangler.jsonc` (git-ignored) if you don't have one yet; edit THAT file and
 // fill in your own Cloudflare account id, KV namespace ids, and custom-domain
-// hostname before deploying. The real secrets (AUTH_SECRET, APPLE_ID, the
-// app-specific password, and the R2 S3 key pair) are Workers Secrets set with
-// `wrangler secret put` and never live in this file at all.
+// hostname before deploying. The real secrets — the calendar confirmation key
+// and the R2 S3 key pair — are Workers Secrets set with `wrangler secret put`
+// and never live in this file at all. There is no account credential among
+// them: each person signs in with their own Apple ID and their own
+// app-specific password, and that password lives only inside their own
+// encrypted grant.
 //
 // The KV namespaces and R2 bucket are account state you create out of band —
 // `wrangler kv namespace create` and `wrangler r2 bucket create` print the ids

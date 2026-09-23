@@ -16,6 +16,13 @@ by service. Mail tools speak IMAP over a raw TLS socket; calendar and contact
 tools speak CalDAV/CardDAV over HTTPS via `tsdav`. Nothing is held between
 requests except OAuth records and a short-lived discovery cache, both in KV.
 
+**Several people can sign in, each reaching only their own account.** Identity
+is per person, not per deployment: each one signs in at `/authorize` with their
+own Apple ID and their own Apple app-specific password, which is proved against
+Apple once and then lives only inside that person's own encrypted grant. The
+server holds no account credential of its own, and every store key carries the
+person's derived id.
+
 ```
                          Cloudflare Worker (src/index.ts)
                                      │
@@ -102,7 +109,8 @@ requests except OAuth records and a short-lived discovery cache, both in KV.
 | File | Role |
 |------|------|
 | `oauth.ts` | The `OAuthProviderOptions` object. |
-| `login-handler.ts` | The `/authorize` surface: consent, constant-time compare, brute-force counter, redirect allowlist. |
+| `login-handler.ts` | The `/authorize` surface: consent, the Apple ID and app-password form, the two-source allow-list check, the refusal floor and limiter layers, redirect allowlist. |
+| `allow-list.ts` | The one store read, the parse rule shared with the seed, and what an absent or malformed document means. |
 
 ### `mcp/` — protocol layer
 
@@ -227,8 +235,10 @@ to apply the change.
 - KV's eventual consistency is backstopped by an `If-Match` ETag precondition on
   the DAV write, which returns 412 on a race.
 
-`CONFIRM_SECRET` is deliberately separate from `AUTH_SECRET` — different rotation
-semantics.
+`CONFIRM_SECRET` exists only to sign and verify these tokens, and it is kept to
+that one job. Rotating it invalidates every token in flight and nothing else —
+no sign-in breaks, no stored credential is touched. A key that also did
+something else could not be rotated that cheaply.
 
 ---
 
@@ -385,7 +395,6 @@ but cannot fully explain — the reasons matter.
 - **No SMTP / sending.** A safety boundary (see rule 2).
 - **No autonomous behavior.** No cron, no watchers, no digests. Proactive work
   belongs in a separate, stateful project.
-- **No multi-user support.** Single account, single Apple ID.
 - **No other iCloud services.** No Reminders, Notes, or Photos.
 - **No local content cache.** iCloud is the system of record; only discovery
   metadata is cached, for 24 hours.

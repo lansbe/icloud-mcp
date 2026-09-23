@@ -8,23 +8,16 @@
 # so it lives only in Cloudflare Secrets. See README.md → Deploy.
 #
 # Note: R2_ACCOUNT_ID is NOT here — it is a non-secret `var` in wrangler.jsonc,
-# not a secret.
+# not a secret. Nor is the allow-list seed, for the same reason.
+#
+# Note: there is no account credential here either. Each person signs in at
+# /authorize with their own Apple ID and their own Apple app-specific password,
+# and that password lives only inside their own encrypted grant. The server
+# holds no Apple identity of its own.
 
-# Shared secret for the /authorize login form (D-01). This is the password you
-# type to authorize an MCP client. Use a long random string.
-AUTH_SECRET=
-
-# The iCloud account's Apple ID (its email address). Used for IMAP LOGIN,
-# CalDAV/CardDAV Basic auth, and as the From address on drafts.
-APPLE_ID=
-
-# An Apple APP-SPECIFIC password — NOT your Apple ID password. iCloud requires
-# one because the account has two-factor auth. Create it at
-# https://account.apple.com → Sign-In and Security → App-Specific Passwords.
-APPLE_APP_PASSWORD=
-
-# HMAC key for calendar confirmation tokens (CALW-04). Independent from
-# AUTH_SECRET on purpose. Generate a fresh random value, e.g.
+# HMAC key for calendar confirmation tokens (CALW-04). It signs and verifies
+# those tokens and does nothing else, so rotating it invalidates every token in
+# flight and breaks nothing else. Generate a fresh random value, e.g.
 #   openssl rand -base64 32
 CONFIRM_SECRET=
 
