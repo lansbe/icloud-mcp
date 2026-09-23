@@ -213,9 +213,18 @@ function printable(value, max) {
       code < 0x20 ||
       code === 0x7f ||
       (code >= 0x80 && code <= 0x9f) ||
+      // U+061C ARABIC LETTER MARK: a bidi control of the same family as the
+      // U+200E/200F marks below, and the one the first pass missed because it
+      // sits nowhere near them in the code space (IN-02, iteration 2).
+      code === 0x061c ||
       (code >= 0x200b && code <= 0x200f) ||
       (code >= 0x2028 && code <= 0x202e) ||
       (code >= 0x2060 && code <= 0x2069) ||
+      // U+206A–U+206F, the deprecated Unicode format controls. A separate clause
+      // from the range above rather than an extension of it, because they are a
+      // different family with a different reason — and because each of the six is
+      // asserted individually, so a range typed one short still reddens a case.
+      (code >= 0x206a && code <= 0x206f) ||
       code === 0xfeff;
     out += dangerous ? "?" : character;
     kept += 1;
@@ -898,13 +907,23 @@ async function targetsFor(groups, asked) {
  * whatever the deletes did, which is why running it always is the fix rather
  * than a nicety.
  *
+ * It reports TWO counts, not one (IN-04). `left` is what the verification pass
+ * found, and it is the authority on the state. `threw` is how many deletes
+ * reported a failure, and it exists because the two can disagree: a delete that
+ * threw on a key that had already vanished leaves `left` at zero, so the caller
+ * printed `Revoked 3 grants and every token under them.` on stdout while stderr
+ * had already said one of the three could not be revoked. Both streams were
+ * telling the truth and they interleave in a terminal, which reads as the command
+ * contradicting itself.
+ *
  * @param {import("./grants-core.d.mts").GrantStore} kv
  * @param {readonly import("./grants-core.d.mts").GrantGroup[]} targets
  * @param {(text: string) => void} writeError
- * @returns {Promise<number>}
+ * @returns {Promise<{ left: number, threw: number }>}
  */
 async function revokeTargets(kv, targets, writeError) {
   const helpers = helpersOver(kv);
+  let threw = 0;
   for (const group of targets) {
     for (const grant of group.grants) {
       // EACH ONE INDEPENDENT (WR-08). Under the wrangler adapter a delete is a
@@ -921,6 +940,7 @@ async function revokeTargets(kv, targets, writeError) {
         await helpers.revokeGrant(grant.id, group.userKey);
       } catch {
         // Never read the caught value: it carries wrangler's own output.
+        threw += 1;
         writeError(
           `Grant ${printable(grant.id, 64)} could not be revoked. ` +
             "Run the list again.\n",
@@ -945,7 +965,7 @@ async function revokeTargets(kv, targets, writeError) {
       }
     }
   }
-  return left;
+  return { left, threw };
 }
 
 /**
@@ -1116,15 +1136,27 @@ export async function runGrants(argv, deps) {
     return EXIT_OK;
   }
 
-  const left = await revokeTargets(deps.kv, aimed.targets, writeError);
+  const outcome = await revokeTargets(deps.kv, aimed.targets, writeError);
   const count = aimed.targets.reduce(
     (running, group) => running + group.grants.length,
     0,
   );
-  if (left > 0) return EXIT_FAILED;
+  if (outcome.left > 0) return EXIT_FAILED;
   write(
     `Revoked ${count} ${count === 1 ? "grant" : "grants"} and every token ` +
       "under them. Allow about a minute for the deletes to be seen everywhere.\n",
   );
+  // IN-04. The count above is the number of grants asked for, and the
+  // verification pass has just confirmed no records are left under any of them —
+  // so it is true. But a delete that threw on a key which had already vanished
+  // printed a refusal on stderr, and the two streams interleave in a terminal.
+  // Without this sentence the command appears to contradict itself.
+  if (outcome.threw > 0) {
+    write(
+      `${outcome.threw} of those deletes reported a failure, named above. The ` +
+        "count is what the store says is gone, checked after the fact, so it is " +
+        "the one to believe.\n",
+    );
+  }
   return EXIT_OK;
 }

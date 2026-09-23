@@ -726,6 +726,57 @@ describe("LIFE-05: the owner lists grants by masked address and revokes them", (
     }
   });
 
+  it("neutralises the Arabic letter mark and the deprecated format controls", async () => {
+    // IN-02, iteration 2. The first pass covered C0, C1, the U+200B–200F marks,
+    // U+2028–202E, U+2060–2069 and the byte-order mark, and missed two things:
+    // U+061C ARABIC LETTER MARK, a bidi control of the same family as the marks
+    // it did cover but nowhere near them in the code space, and U+206A–206F, the
+    // deprecated Unicode format controls.
+    //
+    // Written as ESCAPES rather than as literal characters, unlike the case
+    // above: these are invisible by definition, so a literal in the source is a
+    // value nobody can proof-read and a diff nobody can review.
+    const deprecated = [
+      "\u206a",
+      "\u206b",
+      "\u206c",
+      "\u206d",
+      "\u206e",
+      "\u206f",
+    ];
+    const hostileKey = Array.from({ length: 64 }, () => "f").join("");
+    const hostileId = `marks-${crypto.randomUUID().replaceAll("-", "")}`;
+    // U+2070 SUPERSCRIPT ZERO rides along on the end: it is the code point one
+    // above the new range and an ordinary visible character, so it pins that the
+    // range was not typed one too wide at the top.
+    const hostileName = `A\u061cB${deprecated.join("")}C\u2070D`;
+
+    try {
+      await writeGrantByHand(hostileKey, hostileId, {
+        clientId: "an-absent-client-record",
+        clientName: hostileName,
+        createdAt: 1_755_000_000,
+      });
+
+      const text = renderGrants(await listGrants(store(), []));
+
+      // Each one named individually, so a range typed one short leaves exactly
+      // one of them in and a case still goes red.
+      for (const control of ["\u061c", ...deprecated]) {
+        expect(
+          text,
+          `U+${control.codePointAt(0)?.toString(16).toUpperCase()} reached the terminal`,
+        ).not.toContain(control);
+      }
+      // The visible neighbour one code point above the range SURVIVES, which is
+      // what stops the range being widened at the top. Asserted as part of the
+      // whole rendered name, so the two facts cannot drift apart.
+      expect(text).toContain("A?B??????C\u2070D");
+    } finally {
+      await forgetGrant(hostileKey, hostileId);
+    }
+  });
+
   it("cuts a surrogate pair whole rather than in half", async () => {
     // IN-02. The loop used to index UTF-16 code units and stop at a length in
     // code units, so a cut landing between a high and a low surrogate emitted a
@@ -1144,6 +1195,53 @@ describe("LIFE-05: the owner lists grants by masked address and revokes them", (
     // And the verification pass ran at all, which is the half that used to be
     // skipped entirely.
     expect(out.text()).toContain("still has records in the store");
+  });
+
+  it("a revoke whose delete threw on an already-gone key does not contradict itself", async () => {
+    // IN-04. The case the WR-08 fix left behind: a delete THROWS but the
+    // verification pass finds nothing left, because the key had already vanished.
+    // `left` is 0, so stdout said `Revoked 3 grants and every token under them.`
+    // while stderr had already said one of the three could not be revoked. Both
+    // were true and they interleave in a terminal.
+    const base = ownStore({
+      "grant:u1:g1": grantRecord("u1", "g1", "c1"),
+      "grant:u1:g2": grantRecord("u1", "g2", "c1"),
+      "grant:u1:g3": grantRecord("u1", "g3", "c1"),
+      "client:c1": { clientId: "c1" },
+    });
+    const kv: GrantStore = {
+      list: base.list.bind(base),
+      get: base.get.bind(base),
+      async delete(name: string) {
+        // Gone, AND the command reports a failure — which is exactly what
+        // wrangler does when it is asked to delete a key that is not there.
+        await base.delete(name);
+        if (name === "grant:u1:g2") throw new Error("wrangler said no");
+      },
+    };
+    const out = sink();
+
+    const code = await runGrants(["revoke", "g1", "g2", "g3", "--yes"], {
+      kv,
+      async knownAddresses() {
+        return [];
+      },
+      write: out.write,
+      writeError: out.write,
+    });
+
+    // Zero, because the store really is clean. The verification pass is the
+    // authority and it found nothing left.
+    expect(code).toBe(0);
+    expect(await namesIn(kv)).toEqual(["client:c1"]);
+
+    // Both halves of the account are present, and the second one is what stops
+    // them reading as a contradiction.
+    expect(out.text()).toContain("could not be revoked");
+    expect(out.text()).toContain("Revoked 3 grants");
+    expect(out.text()).toContain("1 of those deletes reported a failure");
+    // The verification pass found nothing, so it says nothing.
+    expect(out.text()).not.toContain("still has records in the store");
   });
 
   it("orphanClientIds reads no store and never names a record a grant claims", () => {

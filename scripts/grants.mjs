@@ -89,14 +89,34 @@ import { fileURLToPath } from "node:url";
 /** The floor, as major/minor. Matches `engines.node` in package.json. */
 const MIN_NODE = [22, 18];
 
+/**
+ * The minor floor for each major that has one, because the two features this
+ * script needs did NOT land in the same release on every line (IN-01).
+ *
+ * `module.registerHooks` landed in 22.15 and 23.5; unflagged TypeScript type
+ * stripping landed in 22.18 and 23.6. A gate that compared majors first and
+ * short-circuited passed Node 23.0 through 23.5 and then died with exactly the
+ * raw stack trace it exists to prevent — `registerHooks` undefined, or the
+ * `../src/principal` import failing on an unstripped `.ts`.
+ *
+ * Node 23 is out of support, so the practical reach is small; it costs one map
+ * entry to be right about it. Any major above the highest key here is assumed to
+ * carry both features, which is true of 24 and of everything after it.
+ */
+const MIN_MINOR_BY_MAJOR = new Map([
+  [MIN_NODE[0], MIN_NODE[1]],
+  [23, 6],
+]);
+
 /** One fixed sentence. It names the version it found, which is not sensitive. */
 const NODE_TOO_OLD =
-  `This needs Node ${MIN_NODE[0]}.${MIN_NODE[1]} or later and this is ` +
-  `Node ${process.versions.node}. It uses two things no earlier version has: ` +
-  "the synchronous module resolve hook, and built-in TypeScript type stripping " +
-  "so it can call the Worker's own masking and user-id functions rather than " +
-  "keeping second copies of them. Install a newer Node and run this again. " +
-  "Nothing was read and nothing was revoked.";
+  `This needs Node ${MIN_NODE[0]}.${MIN_NODE[1]} or later on the ` +
+  `${MIN_NODE[0]}.x line, Node 23.6 or later on 23.x, or any Node 24 or ` +
+  `newer — and this is Node ${process.versions.node}. It uses two things no ` +
+  "earlier version has: the synchronous module resolve hook, and built-in " +
+  "TypeScript type stripping so it can call the Worker's own masking and " +
+  "user-id functions rather than keeping second copies of them. Install a " +
+  "newer Node and run this again. Nothing was read and nothing was revoked.";
 
 const parts = String(process.versions.node)
   .split(".")
@@ -108,7 +128,7 @@ if (
   Number.isInteger(parts[0]) &&
   Number.isInteger(parts[1]) &&
   (parts[0] < MIN_NODE[0] ||
-    (parts[0] === MIN_NODE[0] && parts[1] < MIN_NODE[1]))
+    parts[1] < (MIN_MINOR_BY_MAJOR.get(parts[0]) ?? 0))
 ) {
   process.stderr.write(`${NODE_TOO_OLD}\n`);
   process.exit(1);
