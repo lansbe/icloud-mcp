@@ -949,6 +949,48 @@ async function revokeTargets(kv, targets, writeError) {
 }
 
 /**
+ * The whole closing report of a `prune-clients --yes` run.
+ *
+ * ONE function builds all of it, so `Deleted 0 client records.` can never be the
+ * entire story (code review WR-03). The two extra sentences appear only when they
+ * have something to say, and each one names the count rather than the ids: an id
+ * here would be an id the command decided NOT to touch, and the owner's action —
+ * run it again — is the same either way.
+ *
+ * Exported so `test/grants-script.test.ts` compares against the sentences the
+ * command actually prints rather than against a second copy of them.
+ *
+ * @param {number} deleted
+ * @param {number} gained
+ * @param {number} vanished
+ * @returns {string}
+ */
+export function prunedSummary(deleted, gained, vanished) {
+  const lines = [
+    `Deleted ${deleted} client ${deleted === 1 ? "record" : "records"}. ` +
+      "No grant named any of them, so no connection was cut. Allow about a " +
+      "minute for the deletes to be seen everywhere.",
+  ];
+  if (gained > 0) {
+    lines.push(
+      `${gained} ${gained === 1 ? "record was" : "records were"} KEPT: a grant ` +
+        "named " +
+        `${gained === 1 ? "it" : "them"} between the list above and the ` +
+        "delete, so deleting would have signed somebody out. Run the command " +
+        "again to see what is left.",
+    );
+  }
+  if (vanished > 0) {
+    lines.push(
+      `${vanished} ${vanished === 1 ? "record was" : "records were"} already ` +
+        "gone from the store by the time the delete ran, so there was nothing " +
+        "to delete.",
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/**
  * Parse, then act. Returns the exit code the caller should use.
  *
  * `deps.knownAddresses` is a FUNCTION rather than a list, so nothing is read
@@ -1030,15 +1072,26 @@ export async function runGrants(argv, deps) {
       }
     }
     const going = orphans.filter((id) => stillOrphan.has(id));
+    // WHY A CANDIDATE DROPPED OUT, counted so the closing line can say it. A
+    // filtered-out id produced no message at all, so the second read — the whole
+    // of this command's race protection — could save somebody from being signed
+    // out and report it as `Deleted 0 client records.` with nothing to explain
+    // the zero (code review WR-03). There are exactly two ways to drop out, and
+    // the owner's next action differs, so they are counted apart:
+    //
+    //   - GAINED a grant. Somebody signed in during the seconds between the two
+    //     reads. Deleting the record would have signed them straight back out.
+    //     This is the case the second read exists for.
+    //   - VANISHED. The record is no longer in the store, so there is nothing to
+    //     delete and nothing was at risk.
+    const gained = orphans.filter((id) => claimed.has(id));
+    const vanished = orphans.filter(
+      (id) => !claimed.has(id) && !freshClients.has(id),
+    );
 
     const left = await pruneClients(deps.kv, going, claimed, writeError);
     if (left > 0) return EXIT_FAILED;
-    write(
-      `Deleted ${going.length} client ` +
-        `${going.length === 1 ? "record" : "records"}. No grant named any of ` +
-        "them, so no connection was cut. Allow about a minute for the deletes " +
-        "to be seen everywhere.\n",
-    );
+    write(prunedSummary(going.length, gained.length, vanished.length));
     return EXIT_OK;
   }
 

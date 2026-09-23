@@ -63,6 +63,7 @@ import {
   createWranglerKv,
   listGrants,
   orphanClientIds,
+  prunedSummary,
   renderGrants,
   runGrants,
 } from "../scripts/grants-core.mjs";
@@ -401,6 +402,53 @@ function ownStore(records: Record<string, unknown>): GrantStore {
   return {
     async list(options?: { prefix?: string }) {
       const prefix = options?.prefix ?? "";
+      return {
+        keys: [...data.keys()]
+          .filter((name) => name.startsWith(prefix))
+          .sort()
+          .map((name) => ({ name })),
+        list_complete: true,
+      };
+    },
+    async get(name: string) {
+      return data.has(name) ? data.get(name) : null;
+    },
+    async delete(name: string) {
+      data.delete(name);
+    },
+  };
+}
+
+/**
+ * A store this case owns that CHANGES between the prune's two views.
+ *
+ * WHY THIS EXISTS (code review WR-03). `prune-clients --yes` reads both prefixes
+ * a SECOND time and deletes only the ids orphaned in both views. That one branch
+ * is the whole of its race protection — it is what stands between a delete and
+ * signing somebody out — and against `ownStore` it cannot fail: a deterministic
+ * store answers both reads identically, so `orphans.filter(stillOrphan.has)` is
+ * always exactly `orphans` and the second read is computable but unobservable.
+ * Deleting the entire second read left every test in the suite green.
+ *
+ * `shift` runs once, at the START of the second `client:` listing, which is the
+ * first read of the fresh view. Hooking it there rather than on a grant listing
+ * is deliberate: the fresh view reads the clients first and the grants second, so
+ * a change applied here is seen by BOTH halves of that view, which is what a real
+ * sign-in completing in that window would look like.
+ */
+function shiftingStore(
+  records: Record<string, unknown>,
+  shift: (data: Map<string, unknown>) => void,
+): GrantStore {
+  const data = new Map(Object.entries(records));
+  let clientListings = 0;
+  return {
+    async list(options?: { prefix?: string }) {
+      const prefix = options?.prefix ?? "";
+      if (prefix === "client:") {
+        clientListings += 1;
+        if (clientListings === 2) shift(data);
+      }
       return {
         keys: [...data.keys()]
           .filter((name) => name.startsWith(prefix))
@@ -1206,6 +1254,88 @@ describe("LIFE-05: the owner lists grants by masked address and revokes them", (
       "grant:u1:g1",
     ]);
     expect(out.text()).toContain("Deleted 1 client record");
+  });
+
+  it("prune-clients --yes KEEPS a record a grant claimed between the two reads", async () => {
+    // WR-03. The window is real: somebody registers a client and completes a
+    // sign-in in the seconds between the owner reading the list and re-running
+    // with --yes. Deleting that record makes their next refresh answer
+    // `invalid_client` and signs them out of a connection that is perfectly fine.
+    const kv = shiftingStore(
+      {
+        "grant:u1:g1": grantRecord("u1", "g1", "claimed-client-id"),
+        "client:claimed-client-id": { clientId: "claimed-client-id" },
+        "client:orphan-client-id": { clientId: "orphan-client-id" },
+      },
+      (data) => {
+        // The late sign-in, landing between the two views.
+        data.set(
+          "grant:u2:g2",
+          grantRecord("u2", "g2", "orphan-client-id"),
+        );
+      },
+    );
+    const out = sink();
+
+    const code = await runGrants(["prune-clients", "--yes"], {
+      kv,
+      async knownAddresses() {
+        return [];
+      },
+      write: out.write,
+      writeError: out.write,
+    });
+
+    expect(code).toBe(0);
+    // The record the first view called an orphan is still there, and so is the
+    // grant that now names it.
+    expect((await namesIn(kv)).sort()).toEqual([
+      "client:claimed-client-id",
+      "client:orphan-client-id",
+      "grant:u1:g1",
+      "grant:u2:g2",
+    ]);
+    // And the run EXPLAINS the zero rather than printing it bare. Compared
+    // against the real renderer, not a second copy of the sentences.
+    expect(out.text()).toContain(prunedSummary(0, 1, 0));
+    expect(out.text()).toContain("KEPT");
+  });
+
+  it("prune-clients --yes explains a candidate that VANISHED between the two reads", async () => {
+    // The other way a candidate drops out. Nothing was at risk here, but a bare
+    // `Deleted 0 client records.` would leave the owner unable to tell this from
+    // the case above — and from a command that had stopped working.
+    const kv = shiftingStore(
+      {
+        "grant:u1:g1": grantRecord("u1", "g1", "claimed-client-id"),
+        "client:claimed-client-id": { clientId: "claimed-client-id" },
+        "client:orphan-client-id": { clientId: "orphan-client-id" },
+      },
+      (data) => {
+        data.delete("client:orphan-client-id");
+      },
+    );
+    const out = sink();
+
+    const code = await runGrants(["prune-clients", "--yes"], {
+      kv,
+      async knownAddresses() {
+        return [];
+      },
+      write: out.write,
+      writeError: out.write,
+    });
+
+    expect(code).toBe(0);
+    expect((await namesIn(kv)).sort()).toEqual([
+      "client:claimed-client-id",
+      "grant:u1:g1",
+    ]);
+    expect(out.text()).toContain(prunedSummary(0, 0, 1));
+    expect(out.text()).toContain("already gone");
+    // NOT the other sentence. The two reasons are counted apart because the
+    // owner's reading of them differs.
+    expect(out.text()).not.toContain("KEPT");
   });
 
   it("prune-clients says so when there is nothing to prune, and deletes nothing", async () => {

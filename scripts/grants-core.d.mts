@@ -162,6 +162,20 @@ export declare function orphanClientIds(
 /** The groups as text. Returns lines; prints nothing. */
 export declare function renderGrants(groups: readonly GrantGroup[]): string;
 
+/**
+ * The whole closing report of a `prune-clients --yes` run.
+ *
+ * `gained` is how many candidates a grant claimed between the command's two
+ * reads — the case the second read exists for, and the one that must never be
+ * reported as a bare `Deleted 0 client records.` `vanished` is how many were
+ * already gone. Both sentences are omitted when their count is zero.
+ */
+export declare function prunedSummary(
+  deleted: number,
+  gained: number,
+  vanished: number,
+): string;
+
 /** Parse, then act. Returns the process exit code. */
 export declare function runGrants(
   argv: readonly string[],
