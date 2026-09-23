@@ -614,6 +614,111 @@ describe("LIFE-05: the owner lists grants by masked address and revokes them", (
     }
   });
 
+  it("neutralises bidi controls, and cuts on a code-point boundary", async () => {
+    // WR-02. A trailing right-to-left override REVERSES the display order of
+    // everything after it on the row — and the client name is printed one column
+    // to the LEFT of the grant id the owner is about to type into a revoke, with
+    // `created`, `expires` and the client marker after it. The file's own rule 2
+    // says an escape printed raw "would drive the owner's terminal"; the same
+    // argument reaches these, and they are not in the C0/C1 blocks the original
+    // replacement set covered.
+    //
+    // IN-02 rides along: the cut counts CODE POINTS now, so a surrogate pair is
+    // kept or dropped whole rather than being sliced into a lone surrogate.
+    const hostileKey = Array.from({ length: 64 }, () => "d").join("");
+    const hostileId = `bidi-${crypto.randomUUID().replaceAll("-", "")}`;
+    const hostileName =
+      "Claude‮Code⁦x⁩y​z w﻿q⁠r";
+
+    try {
+      await writeGrantByHand(hostileKey, hostileId, {
+        clientId: "an-absent-client-record",
+        clientName: hostileName,
+        createdAt: 1_755_000_000,
+      });
+
+      const groups = await listGrants(store(), []);
+      const text = renderGrants(groups);
+
+      // Every one of them, named individually: a range typed one character short
+      // leaves exactly one of these in and nothing else fails.
+      for (const control of [
+        "‪",
+        "‫",
+        "‬",
+        "‭",
+        "‮",
+        "⁦",
+        "⁧",
+        "⁨",
+        "⁩",
+        "​",
+        "‌",
+        "‍",
+        "‎",
+        "‏",
+        " ",
+        " ",
+        "⁠",
+        "﻿",
+      ]) {
+        expect(
+          text,
+          `U+${control.codePointAt(0)?.toString(16)} reached the terminal`,
+        ).not.toContain(control);
+      }
+      expect(text).toContain("Claude?Code?x?y?z?w?q?r");
+
+      // The ellipsis the renderer appends to a cut id is NOT in the replaced
+      // set, and it sits one code point below the first banned range — so this
+      // also pins that the range does not start one character too low.
+      expect(text).toContain("…");
+    } finally {
+      await forgetGrant(hostileKey, hostileId);
+    }
+  });
+
+  it("cuts a surrogate pair whole rather than in half", async () => {
+    // IN-02. The loop used to index UTF-16 code units and stop at a length in
+    // code units, so a cut landing between a high and a low surrogate emitted a
+    // lone surrogate — which renders as a replacement character and means `max`
+    // did not mean what it says.
+    const hostileKey = Array.from({ length: 64 }, () => "e").join("");
+    const hostileId = `pair-${crypto.randomUUID().replaceAll("-", "")}`;
+    // One BMP character then 40 astral ones: 81 code units, 41 code points. The
+    // odd leading character is what made the old loop's 60-code-unit cut land
+    // BETWEEN a high and a low surrogate rather than on a pair boundary.
+    const hostileName = `x${"\u{1f600}".repeat(40)}`;
+
+    try {
+      await writeGrantByHand(hostileKey, hostileId, {
+        clientId: "an-absent-client-record",
+        clientName: hostileName,
+        createdAt: 1_755_000_000,
+      });
+
+      const text = renderGrants(await listGrants(store(), []));
+      const rendered = text.split("\n").find((line) => line.includes(hostileId));
+      expect(rendered).toBeDefined();
+      const quoted = /client "([^"]*)"/.exec(rendered as string);
+      expect(quoted).not.toBeNull();
+      const name = (quoted as RegExpExecArray)[1] as string;
+
+      // No UNPAIRED surrogate anywhere in it: a high one with no low one after,
+      // or a low one with no high one before. A paired one is a perfectly ordinary
+      // astral character and must not be reported.
+      const lone =
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+      expect(lone.test(name), "a lone surrogate reached the terminal").toBe(false);
+
+      // All 41 fit, because the cut now counts characters rather than code units.
+      expect([...name]).toHaveLength(41);
+      expect(name).toBe(hostileName);
+    } finally {
+      await forgetGrant(hostileKey, hostileId);
+    }
+  });
+
   it("revoke without --yes prints the target, says so, and deletes nothing", async () => {
     const env = allowAllEnv();
     const userKey = await listedUserId();

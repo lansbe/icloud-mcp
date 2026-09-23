@@ -176,8 +176,25 @@ const READS_INCOMPLETE =
  * forge a whole extra row of output, and the upper block carries the eight-bit
  * forms of the same sequences.
  *
+ * **The bidirectional and invisible controls go the same way, and for the same
+ * reason (WR-02).** U+202A-U+202E are the embedding and override codes,
+ * U+2066-U+2069 the isolates, and U+200B-U+200F and U+2060 are zero-width marks
+ * and joiners; U+2028 and U+2029 are line and paragraph separators, which is the
+ * forged-row problem again in a different block, and U+FEFF is the byte-order
+ * mark. A trailing override REVERSES the display order of everything after it on
+ * the row — and this string is printed one column to the left of the grant id the
+ * owner is about to type into a `revoke`, with `created`, `expires` and the
+ * client marker after it. A client name is chosen by whoever registered, so it
+ * is exactly as untrusted as an escape sequence and deserves no more trust.
+ *
  * The cut is applied as characters are kept, so a name made entirely of escapes
  * cannot push past the limit on its way through.
+ *
+ * **It iterates CODE POINTS, not UTF-16 code units (IN-02).** A cut landing
+ * between a high and a low surrogate used to emit a lone surrogate, which renders
+ * as a replacement character — and it meant the rendered length was in code units
+ * rather than in characters, so `max` did not mean what it says. A surrogate pair
+ * now counts as one and is kept or dropped whole.
  *
  * @param {unknown} value
  * @param {number} max
@@ -186,10 +203,20 @@ const READS_INCOMPLETE =
 function printable(value, max) {
   if (typeof value !== "string") return "";
   let out = "";
-  for (let index = 0; index < value.length && out.length < max; index += 1) {
-    const code = value.charCodeAt(index);
-    const dangerous = code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f);
-    out += dangerous ? "?" : value[index];
+  let kept = 0;
+  for (const character of value) {
+    if (kept >= max) break;
+    const code = character.codePointAt(0);
+    const dangerous =
+      code < 0x20 ||
+      code === 0x7f ||
+      (code >= 0x80 && code <= 0x9f) ||
+      (code >= 0x200b && code <= 0x200f) ||
+      (code >= 0x2028 && code <= 0x202e) ||
+      (code >= 0x2060 && code <= 0x2069) ||
+      code === 0xfeff;
+    out += dangerous ? "?" : character;
+    kept += 1;
   }
   return out;
 }
