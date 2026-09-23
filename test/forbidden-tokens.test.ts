@@ -27,9 +27,6 @@ import {
   EXCLUDED,
   FORBIDDEN,
   OWNERSHIP_VIOLATION_IDS,
-  MAIL_SECRET_READ,
-  MAIL_SECRET_READ_OWNER,
-  MAIL_SECRET_READ_SCOPE,
   PASSWORD_READER_IMPORT,
   PASSWORD_READER_OWNERS,
   PASSWORD_READER_SCOPE,
@@ -48,7 +45,6 @@ import {
   checkCommitHook,
   checkDavFetchOwnership,
   checkDavHostOwnership,
-  checkMailSecretReaderOwnership,
   checkPasswordReaderOwnership,
   checkPrincipalConstructorOwnership,
   checkPropsReaderOwnership,
@@ -348,6 +344,12 @@ describe("the patterns have teeth", () => {
     // record has gone — the forced logout LIFE-01 removed.
     "expired-record-sweeper":
       "await purgeExpiredData(env.OAUTH_KV, { gracePeriodSeconds: 0 });",
+    // Phase 13, CUT-01. Spelled verbatim here, which is safe for the same
+    // reason the props and password samples below are: this file is skipped by
+    // path for every rule. The rule it samples was a COUNT until the binding it
+    // counted the readers of was deleted; zero became the correct number, so the
+    // missing arm could never fire and the count became a ban.
+    "mail-secret-read": "  const appleId = env.APPLE_ID;",
   };
 
   it("covers every rule with a known-violating sample", () => {
@@ -1412,11 +1414,22 @@ describe("the patterns have teeth", () => {
   ];
 
   /** Reads, comparisons, declarations and copies. None is a write onto the
-   *  shared object, so NO rule on the list may fire on any of them. */
+   *  shared object, so NO rule on the list may fire on any of them.
+   *
+   *  THE BINDING NAMES HERE ARE INCIDENTAL, and several of them changed in
+   *  Phase 13. These rows exist to prove the environment-WRITE rule stays off
+   *  the read side of every form it sees on the write side, so what matters is
+   *  the shape of each line and not which binding it happens to name. Four rows
+   *  used to name an account binding, and once a read of one became a plain ban
+   *  they stopped being permitted lines at all — so they name a live binding
+   *  instead. Swapping the name keeps every claim these rows make; leaving it
+   *  and loosening the ban to suit them would not, and exclusion is by path
+   *  here as everywhere. The ban's own firing on a plain read is recorded as a
+   *  deliberate choice in its own block further down. */
   const ENV_READS_AND_COPIES: ReadonlyArray<readonly [string, string]> = [
-    ["strict equality", "if (env.APPLE_ID === expected) return;"],
+    ["strict equality", "if (env.MODE === expected) return;"],
     ["loose equality", "if (env.MODE == expected) return;"],
-    ["inequality", "if (env.APPLE_ID !== expected) return;"],
+    ["inequality", "if (env.LIMIT !== expected) return;"],
     [
       "less-or-equal and greater-or-equal",
       "const inRange = env.LIMIT <= ceiling && env.LIMIT >= floor;",
@@ -1424,15 +1437,20 @@ describe("the patterns have teeth", () => {
     ["a declaration of a local with this name", "const env = makeEnv();"],
     ["a typed let declaration", "let env: Env = makeEnv();"],
     ["an arrow parameter", "const run = (env: Env) => handle(env);"],
-    // What `envFor` in test/fixtures/two-users.ts does. A new object, with both
-    // account fields overridden. The rule must leave the permitted form alone,
-    // or it bans the fix it points people to.
+    // A new object with fields overridden, which is the form the env-write rule
+    // points people at instead of writing onto the shared object. It must leave
+    // the permitted form alone, or it bans the fix it recommends. A fixture in
+    // test/ built exactly this shape over the two account bindings until Phase 13
+    // deleted them; the shape is what is being pinned, so the row outlived the
+    // caller and keeps the old names to prove the OBJECT-LITERAL KEY form is
+    // still not a read — a key is not a member access, which is why the account
+    // -binding ban is silent here too.
     [
       "a spread copy with fields overridden",
       "return { ...(env as Env), APPLE_ID: user.appleId, APPLE_APP_PASSWORD: user.appPassword };",
     ],
     ["an assignment on a differently named object", "testEnv.APPLE_ID = userB.appleId;"],
-    ["a ternary that reads it", "const id = env.APPLE_ID ? env.APPLE_ID : fallback;"],
+    ["a ternary that reads it", "const id = env.MODE ? env.MODE : fallback;"],
     [
       "an object merge INTO an empty object",
       "const copy = Object.assign({}, env, { APPLE_ID: userB.appleId });",
@@ -1442,7 +1460,7 @@ describe("the patterns have teeth", () => {
     ["a read through a type cast", "const appleId = (env as Env).APPLE_ID;"],
     ["a comparison through a type cast", "const inRange = (env as Env).LIMIT >= floor;"],
     ["a call through a type cast", "const out = (env as Env).handler(() => 1);"],
-    ["a read after a non-null mark", "const appleId = env!.APPLE_ID;"],
+    ["a read after a non-null mark", "const secret = env!.CONFIRM_SECRET;"],
     ["a read through a computed key", "const value = env[keys[0]];"],
     // The non-null mark and the loose inequality share a character. A mark
     // allowed right before the operator would turn this comparison into a hit.
@@ -2251,19 +2269,25 @@ describe("the single reader of the grant's props is a count constraint too (Phas
     }
   });
 
-  it("agrees with the mail-secret count about the member access (code review WR-03)", () => {
+  it("agrees with the account-binding ban about the member access (code review WR-03)", () => {
     // The two were written in the same phase and disagreed for no reason. A
     // difference between them is a difference nobody decided, so it is pinned
     // here rather than left to be noticed. The text is written out, so this
     // cannot pass by reading one pattern twice.
+    //
+    // The other one was a COUNT beside this one until phase 13 deleted the
+    // binding it counted the readers of. The member access outlived the count,
+    // so the agreement is still worth pinning — but the pattern now lives in the
+    // rule list rather than in an exported constant, and it is read back by id.
     const SHARED_MEMBER_ACCESS = "\\s*(?:[?!]\\s*)?\\.\\s*";
+    const bindingBan = FORBIDDEN.find((one) => one.id === "mail-secret-read")!;
     expect(
       PROPS_READER.source.includes(SHARED_MEMBER_ACCESS),
       "the props count no longer spells the shared member access",
     ).toBe(true);
     expect(
-      MAIL_SECRET_READ.source.includes(SHARED_MEMBER_ACCESS),
-      "the mail-secret count no longer spells the shared member access",
+      bindingBan.pattern.source.includes(SHARED_MEMBER_ACCESS),
+      "the account-binding ban no longer spells the shared member access",
     ).toBe(true);
   });
 
@@ -2452,6 +2476,12 @@ describe("the two readers of the password are a count constraint with two owners
     for (const sample of [
       // Another name from the principal module.
       'import { appleIdOf } from "../principal";',
+      // A RETIRED name, kept on purpose. This was the environment-backed
+      // constructor until phase 13 deleted it, so no import of it can exist in
+      // the tree any more — which is exactly what makes it a good control here:
+      // the pattern must fire on the password reader's name and on nothing else
+      // that could sit beside it in the same braces, whether or not that other
+      // name still resolves to anything.
       'import { type Principal, principalFromEnv } from "../principal";',
       // A longer identifier that merely contains the reader's name.
       'import { passwordOfTheDay } from "../principal";',
@@ -2515,46 +2545,49 @@ describe("the two readers of the password are a count constraint with two owners
   });
 });
 
-describe("the one reader of the two mail secrets is a count constraint too (Phase 9 D-28)", () => {
+describe("a read of either deleted account binding is banned outright (CUT-01)", () => {
   // The spelled read IS written literally here, as the props read and the
-  // password import are in the blocks above. The pattern is collected from src/
-  // only, and this file is skipped by path for every rule, so nothing here can
-  // trip the count. No sample below sits inside a logging call: that would fire
-  // four other rules and prove none of this one.
-  const owner = { file: MAIL_SECRET_READ_OWNER, line: 262, column: 22 };
-  const elsewhere = { file: "src/dav/transport.ts", line: 134, column: 20 };
+  // password import are in the blocks above. The rule is scoped to src/ and this
+  // file is skipped by path for every rule, so nothing here can trip it. No
+  // sample below sits inside a logging call: that would fire four other rules
+  // and prove none of this one.
+  //
+  // THIS WAS A COUNT UNTIL PHASE 13, with the principal module named as its one
+  // permitted reader. That reader is deleted, so zero became the correct number
+  // and the count's missing arm could never fire again — which this project
+  // treats as indistinguishable from a constraint that was never added. The
+  // pattern moved across unchanged, so every sample row below is the same row it
+  // was; what changed is the shape of the rule around it.
+  //
+  // The pattern is read back out of the list BY ID rather than off an exported
+  // constant, because the ban has no constant of its own. That is also what
+  // keeps the member-access assertion further up this file honest.
+  const rule = FORBIDDEN.find((one) => one.id === "mail-secret-read")!;
 
   /** A fresh copy per probe, so no state can carry between samples. */
   const fires = (sample: string): boolean =>
-    new RegExp(MAIL_SECRET_READ.source, MAIL_SECRET_READ.flags).test(sample);
+    new RegExp(rule.pattern.source, rule.pattern.flags.replace("g", "")).test(
+      sample,
+    );
 
-  it("passes when the owner's constructor is the only file that reads them", () => {
-    expect(checkMailSecretReaderOwnership([owner])).toEqual([]);
+  it("exists, is scoped to the source tree, and is global", () => {
+    // Scoped, because tests bind their own fakes and a test is not a credential
+    // path. Global, because every other entry in the list is: `scan()` walks a
+    // rule with `matchAll`, and a rule without the flag would loop forever.
+    expect(rule).toBeDefined();
+    expect(rule.scope).toBe("src/");
+    expect(rule.pattern.flags).toContain("g");
   });
 
-  it("reports a violation naming the second file when another module reads one", () => {
-    const violations = checkMailSecretReaderOwnership([owner, elsewhere]);
-    expect(violations.map((v) => v.pattern)).toEqual([
-      "mail-secret-reader-outside-owner",
-    ]);
-    expect(violations[0]!.file).toBe(elsewhere.file);
-    expect(violations[0]!.line).toBe(elsewhere.line);
+  it("says in its reason why a read of a DELETED binding is refused at all", () => {
+    // The one thing a reader of this rule cannot work out for themselves. The
+    // binding is gone, so the obvious question is what there is left to protect,
+    // and the answer is in the reason rather than in a planning file.
+    expect(rule.why).toContain("deleted");
+    expect(rule.why.length).toBeGreaterThan(400);
   });
 
-  it("reports a violation naming the owner when no file reads them", () => {
-    // The direction a negative cannot see: a constructor that stopped reading
-    // the secrets was deleted or renamed, and nothing fails on the way out.
-    const violations = checkMailSecretReaderOwnership([]);
-    expect(violations.map((v) => v.pattern)).toEqual(["mail-secret-reader-missing"]);
-    expect(violations[0]!.file).toBe(MAIL_SECRET_READ_OWNER);
-  });
-
-  it("names the owner's constructor, and collects from the source tree only", () => {
-    expect(MAIL_SECRET_READ_OWNER).toBe("src/principal.ts");
-    expect(MAIL_SECRET_READ_SCOPE).toBe("src/");
-  });
-
-  it("matches a read of either mail secret off the environment object", () => {
+  it("matches a read of either deleted binding off the environment object", () => {
     for (const sample of [
       "  const appleId = env.APPLE_ID;",
       "  const appPassword = env.APPLE_APP_PASSWORD;",
@@ -2562,8 +2595,7 @@ describe("the one reader of the two mail secrets is a count constraint too (Phas
       "if (!isConfiguredSecret(env.APPLE_APP_PASSWORD)) return;",
       " * reads `env.APPLE_ID` before anything else.",
       // Code review WR-03. The shapes the bare-dot text missed, and the reason
-      // this count and the props count now spell the member access the same
-      // way.
+      // this rule and the props count spell the member access the same way.
       "const appleId = env?.APPLE_ID;",
       "const appleId = env!.APPLE_ID;",
       "const appleId = env\n  .APPLE_ID;",
@@ -2574,9 +2606,11 @@ describe("the one reader of the two mail secrets is a count constraint too (Phas
   });
 
   it("does not match the login gate's own secret (D-28)", () => {
-    // It is not an Apple credential and it has its own single reader in the
-    // login gate. If this ever starts matching, the count has been widened to
-    // answer a second question and the docstring is no longer true.
+    // It was never an Apple credential and it had its own single reader in the
+    // login gate. It was out of the count for that reason and it is out of the
+    // ban for the same one. If this ever starts matching, the rule has been
+    // widened to answer a second question and its comment block is no longer
+    // true.
     for (const sample of [
       "if (!isConfiguredSecret(env.AUTH_SECRET)) {",
       "await secretMatches(submitted, env.AUTH_SECRET)",
@@ -2587,12 +2621,14 @@ describe("the one reader of the two mail secrets is a count constraint too (Phas
 
   it("does not match a look-alike, a field declaration, or a principal's field", () => {
     for (const sample of [
-      // A longer identifier that merely starts with a secret name.
+      // A longer identifier that merely starts with a binding name.
       "const cached = env.APPLE_ID_CACHE;",
       "const legacy = env.APPLE_APP_PASSWORD_V1;",
-      // A field on the principal, which is the shape everything else now uses.
+      // A field on the principal, which is the shape everything now uses.
       "const address = principal.appleId;",
-      // A type field declaration. The narrow interfaces spell both names.
+      // A type field declaration. No type in the repository spells either name
+      // any more, but a pattern that fired on one would fire on a planning
+      // artifact quoted into a comment.
       "  APPLE_ID: string | undefined;",
       "  APPLE_APP_PASSWORD: string | undefined;",
       // The bare name in prose, with no environment object in front of it.
@@ -2605,10 +2641,10 @@ describe("the one reader of the two mail secrets is a count constraint too (Phas
   });
 
   it("pins the known evasions as unseen, so nobody believes they are covered", () => {
-    // Each of these DOES read a mail secret. The docstring lists them, and says
-    // the compiler is the first check for all of them (D-14). If the pattern
-    // later starts to see one, this goes red: move the row out and update the
-    // docstring.
+    // Each of these DOES read a deleted binding. The rule's comment block lists
+    // them, and says the compiler is the first check for all of them (D-14). If
+    // the pattern later starts to see one, this goes red: move the row out and
+    // update the comment block.
     for (const sample of [
       "const { APPLE_ID } = env;",
       'const value = env["APPLE_ID"];',
@@ -2620,23 +2656,65 @@ describe("the one reader of the two mail secrets is a count constraint too (Phas
     }
   });
 
-  it("carries no global flag, because scan() takes the first match with search()", () => {
-    expect(MAIL_SECRET_READ.flags).toBe("");
+  it("is wired into scan(): it is in the list scan() walks, and its global form matches", () => {
+    // The count it replaced proved its wiring by scanning a tree with no owner
+    // file, which a ban has no equivalent of. So the wiring is proved the way
+    // every other ban in this file is: the rule is reached by id out of the very
+    // array `scan()` iterates — `FORBIDDEN.find` above would have thrown on a
+    // missing id — and its GLOBAL form is exercised here, because `scan()` walks
+    // a rule with `matchAll` and a rule whose flag went missing would loop for
+    // ever rather than fail.
+    //
+    // Its known-violating sample is held by the set-equality in "the patterns
+    // have teeth" further up, which is absolute in both directions: a rule
+    // without a sample fails that test by construction. Nothing is asserted twice
+    // here.
+    expect(FORBIDDEN.some((one) => one.id === "mail-secret-read")).toBe(true);
+    expect([
+      ..."  const appleId = env.APPLE_ID;".matchAll(rule.pattern),
+    ]).toHaveLength(1);
   });
 
-  it("is wired into scan(): a tree with no owner file fails", () => {
-    // scripts/ is outside MAIL_SECRET_READ_SCOPE, so scanning it alone
-    // exercises the deleted direction against a real tree rather than a
-    // synthetic list.
-    expect(scan("scripts").map((v) => v.pattern)).toContain(
-      "mail-secret-reader-missing",
-    );
+  it("fires on a comment and on a string that spell the read, and that is a recorded choice", () => {
+    // Every line here is INNOCENT: not one performs a read. The rule fires on
+    // all of them anyway, because it is anchored on the words and reads text
+    // rather than syntax. That over-match is kept on purpose, and this case is
+    // what makes it a known limit rather than a surprise on somebody's commit.
+    //
+    // It is also the whole reason `src/principal.ts` and `src/env.ts` describe
+    // the read by ROLE. Those two files used to spell both names in their
+    // headers; a header that still did would fail the check it was explaining,
+    // which is the same trap the banned-transport and write rules set.
+    //
+    // If this goes red, someone narrowed the rule. The fix for an innocent hit
+    // is to describe the read by role in the prose. Never make the rule see
+    // less.
+    const innocentButRefused: ReadonlyArray<readonly [string, string]> = [
+      ["a comment that spells the read", " * it used to read env.APPLE_ID here."],
+      [
+        "a string that spells the read",
+        'const hint = "nothing may read env.APPLE_APP_PASSWORD";',
+      ],
+    ];
+    expect(innocentButRefused.length).toBe(2);
+    for (const [shape, line] of innocentButRefused) {
+      expect(fires(line), `the rule no longer fires on ${shape}: it was narrowed`).toBe(
+        true,
+      );
+    }
+
+    // The hook prints the reason text, so it has to tell the author what to do
+    // about an innocent hit rather than leaving them to guess.
+    expect(rule.why).toContain("by role");
+    expect(rule.why).toContain("Do not narrow the pattern");
   });
 
-  it("passes on the real tree: the owner's constructor is the one reader", () => {
-    const patterns = scan().map((v) => v.pattern);
-    expect(patterns).not.toContain("mail-secret-reader-missing");
-    expect(patterns).not.toContain("mail-secret-reader-outside-owner");
+  it("passes on the real tree: nothing under the source tree reads either", () => {
+    // The measured-zero claim in the rule's comment block, measured rather than
+    // asserted. This is the assertion that would have gone red before phase 13
+    // deleted the reader, and it is why the rule could not have been added
+    // earlier.
+    expect(scan().map((v) => v.pattern)).not.toContain("mail-secret-read");
   });
 });
 
@@ -2866,8 +2944,8 @@ describe("the two sites that mint a principal are a count constraint with two ow
     const missing = violations.find(
       (v) => v.pattern === "principal-constructor-missing",
     )!;
-    expect(outside.patternIndex).toBe(FORBIDDEN.length + 18);
-    expect(missing.patternIndex).toBe(FORBIDDEN.length + 19);
+    expect(outside.patternIndex).toBe(FORBIDDEN.length + 16);
+    expect(missing.patternIndex).toBe(FORBIDDEN.length + 17);
   });
 
   it("matches the real call lines of both owners, and the other ways to write one", () => {
@@ -2910,8 +2988,15 @@ describe("the two sites that mint a principal are a count constraint with two ow
       " * `principalFromProps` makes the same choice one module over.",
       // A longer name that merely starts with it.
       "principalFromPropsUnchecked(props);",
-      // The environment constructor, which is a different function and a
-      // different count's business.
+      // A name that merely RESEMBLES the constructor. It was the
+      // environment-backed constructor until phase 13 deleted it, and the
+      // comment here used to say it was "a different count's business" — there
+      // is no other count now, so what this row proves has changed rather than
+      // gone. It proves the pattern is anchored on the constructor's whole name
+      // and does not fire on a longer or differently-suffixed one that starts
+      // the same way. The row is kept because that claim is still worth holding,
+      // and because a call to a function that cannot exist is the cheapest
+      // possible way to hold it.
       "const principal = principalFromEnv(env);",
     ]) {
       expect(fires(sample), `false-positived on ${sample}`).toBe(false);
@@ -2996,8 +3081,6 @@ describe("the count constraints as a set", () => {
       ...checkPasswordReaderOwnership([...bothPasswordOwners, nonOwner]).map((v) => v.pattern),
       ...checkPasswordReaderOwnership(bothPasswordOwners.slice(0, 1)).map((v) => v.pattern),
       // One owner, so the same two lists the props count is fed.
-      ...checkMailSecretReaderOwnership([nonOwner]).map((v) => v.pattern),
-      ...checkMailSecretReaderOwnership([]).map((v) => v.pattern),
       // One owner again, so the same pair once more.
       ...checkAddressHashOwnership([nonOwner]).map((v) => v.pattern),
       ...checkAddressHashOwnership([]).map((v) => v.pattern),
@@ -3036,8 +3119,6 @@ describe("the count constraints as a set", () => {
       ...checkPasswordReaderOwnership([...bothPasswordOwners, nonOwner]),
       ...checkPasswordReaderOwnership(bothPasswordOwners.slice(0, 1)),
       // One owner, so a lone non-owner and an empty list give one of each.
-      ...checkMailSecretReaderOwnership([nonOwner]),
-      ...checkMailSecretReaderOwnership([]),
       // Same again for the one address-hashing producer.
       ...checkAddressHashOwnership([nonOwner]),
       ...checkAddressHashOwnership([]),

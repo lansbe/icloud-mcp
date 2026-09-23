@@ -1,5 +1,5 @@
 // The principal module: the one user id function run over the spec, the
-// password holder, and the two constructors that build a principal.
+// password holder, and the one constructor that builds a principal.
 //
 // **What this file proves.** Six things.
 //
@@ -18,20 +18,28 @@
 //    the principal module. The door in `src/mcp/api-handler.ts` is now the
 //    first importer, so that test is gone (Phase 9 D-03). Who may read a
 //    password and who may read the grant's props are count rules in the scan.
+//    A third count guarded who could read the account bindings; Phase 13
+//    deleted the bindings, so that one became a plain ban.
 // 4. The password does not travel with the principal. A built principal is a
 //    frozen object with two fields, and neither is a secret. Turning it into
 //    JSON, spreading it, cloning it or turning it into a string gives no
 //    password. The one password reader answers only the very object that was
 //    built. A copy with the same two fields gets the auth error.
-// 5. The props constructor fails closed. It accepts exactly one shape: `v` as
+// 5. The constructor fails closed. It accepts exactly one shape: `v` as
 //    the number 1, an Apple ID and an app password, and no other key. Every
 //    other shape in the table below is refused with the existing auth error,
 //    the old owner grant included. The refusal carries nothing from the input:
 //    not in the message, not in the stack, not in a property. It takes one
 //    argument, so there is no second place for a credential to come from.
-// 6. The env constructor gives user A and user B the ids the vectors file
-//    gives them, and refuses a missing or empty secret. For both users the two
-//    constructors and the one function agree on the id.
+// 6. The one constructor gives user A and user B the ids the vectors file gives
+//    them, their own passwords, and a frozen object with exactly two keys. For
+//    both users the constructor and the one id function agree on the id.
+//
+// A SECOND constructor was proved here until Phase 13. It built a principal from
+// the deployment's own configuration, which is how the one owner used to be
+// identified, and the milestone that lets anybody sign in is the milestone that
+// deletes it. What went with it, and where each surviving half now lives, is
+// written out at the block that replaced it rather than only in a commit message.
 //
 // **What this file cannot prove, and why.** It cannot show that a hex value in
 // the vectors file is right. It only shows that the function and the file
@@ -47,7 +55,7 @@
 // compares a Promise with a string, and a not-equal check then passes for
 // ever. Every call below is awaited inside an async body.
 //
-// Four more for the holder and the constructors. A props constructor that
+// Four more for the holder and the constructor. A constructor that
 // refused everything would pass the whole bad-props table: the good shape is
 // shown to resolve, for A and for B, before the table runs. A leak check on an
 // input that held no values would find none: each leak check first asserts
@@ -64,16 +72,10 @@
 // real Apple ID. Every address sits under `example.invalid`.
 
 import { describe, expect, it } from "vitest";
-import type { OwnerMailSecrets } from "../src/env";
 import { ImapAuthError, toErrorCategory } from "../src/errors";
 import * as principalModule from "../src/principal";
-import {
-  passwordOf,
-  principalFromEnv,
-  principalFromProps,
-  userIdOf,
-} from "../src/principal";
-import { USER_A, USER_B, envFor, testPrincipal } from "./fixtures/two-users";
+import { passwordOf, principalFromProps, userIdOf } from "../src/principal";
+import { USER_A, USER_B, testPrincipal } from "./fixtures/two-users";
 import type { TestUser } from "./fixtures/two-users";
 import { REFUSED, USER_ID_VECTORS } from "./fixtures/user-id-vectors";
 
@@ -85,24 +87,6 @@ const HEX_ROWS = USER_ID_VECTORS.filter((row) => row.expected !== REFUSED);
 
 /** The rows the spec turns away. */
 const REFUSED_ROWS = USER_ID_VECTORS.filter((row) => row.expected === REFUSED);
-
-/**
- * A minimal environment carrying only the two account bindings.
- *
- * Built in one expression, and nothing is written onto it afterwards. Both
- * parameters admit `undefined` because a Workers Secret binding does: an unset
- * or deleted Secret arrives absent, and the refusal cases have to be able to
- * say so.
- */
-function fakeEnv(
-  appleId: string | undefined,
-  password: string | undefined,
-): OwnerMailSecrets {
-  return {
-    APPLE_ID: appleId,
-    APPLE_APP_PASSWORD: password,
-  };
-}
 
 /** The one props shape that is accepted, for `user`. A fresh object each call. */
 function goodPropsFor(user: TestUser): {
@@ -422,7 +406,7 @@ describe("the length cap counts UTF-16 code units, not bytes", () => {
 });
 
 describe("module shape", () => {
-  it("exports the two halves of the id rule, the one mask, the one password reader and the two constructors, nothing else", () => {
+  it("exports the two halves of the id rule, the one mask, the one password reader and the ONE constructor, nothing else", () => {
     // The design made checkable. There is no export that hands out the holder
     // itself.
     //
@@ -441,11 +425,20 @@ describe("module shape", () => {
     // grants script must both build the same masked form, and a list that
     // quietly grew a second MASKING function would be that drift — two masks
     // that agree until the day one of them stops masking.
+    //
+    // A second CONSTRUCTOR left this list in Phase 13. It built a principal from
+    // the deployment's own configuration, which is how the one owner used to be
+    // identified, and it is gone because the server now serves whoever signed
+    // in. That is the one entry here whose absence is the point: a list that
+    // grew a second constructor would mean a second answer to "who is this
+    // request for", and the whole of this milestone is that there is one answer
+    // and it comes from the grant. The retired name is not written here, because
+    // a scan rule under `src/` refuses the read it made and this file's habit is
+    // to describe such a thing by role.
     expect(Object.keys(principalModule).sort()).toEqual([
       "maskAppleId",
       "normaliseAppleId",
       "passwordOf",
-      "principalFromEnv",
       "principalFromProps",
       "userIdOf",
     ]);
@@ -701,16 +694,14 @@ describe("the props constructor fails closed (D-02, D-04)", () => {
     expect(UNTRIMMED_ADDRESSES[4]![1].charCodeAt(0)).toBe(0xa0);
   });
 
-  it.each(UNTRIMMED_ADDRESSES)(
-    "leaves the env constructor alone: it still accepts %s, untouched (D-18)",
-    async (_name, address) => {
-      // D-18 changes the props path only. The env constructor must carry the
-      // binding exactly as before, so today's wire bytes do not change.
-      const principal = await principalFromEnv(fakeEnv(address, ROW_PASSWORD));
-      expect(principal.appleId).toBe(address);
-      expect(principal.userId).toBe(USER_A.userId);
-    },
-  );
+  // A five-row table sat here until Phase 13 and asserted that the RETIRED
+  // constructor still accepted each of these untrimmed addresses untouched,
+  // padding included — D-18 narrowed the props path only, and the other path had
+  // to keep the wire bytes of the day. That claim died with the constructor: with
+  // one constructor there is no "only". The half that survives is that each of
+  // the five IS refused, and it is held two ways above and below — the case just
+  // above asserts every row appears in the bad-props table, and the bad-props
+  // table is driven through the real constructor further down.
 
   it("builds the unusable passwords so that only the password check can refuse them (D-19)", () => {
     // Code review WR-07. Each is a non-empty string, which is all the older
@@ -902,11 +893,57 @@ describe("the props constructor fails closed (D-02, D-04)", () => {
   );
 });
 
-describe("the env constructor, temporary until the secrets are removed (D-03)", () => {
+// ---------------------------------------------------------------------------
+// The RETIRED constructor's own describe block stood here until Phase 13.
+//
+// It built a principal from the deployment's own configuration, which is how the
+// one owner used to be identified. Seven cases went with it. Five died, and each
+// death is recorded with where the surviving half lives, because a reader six
+// months from now needs to know a claim went away for a REASON and not because
+// somebody got tired of it:
+//
+//  1. "gives each user their id and their own password" — MOVED, not deleted.
+//     Its subject was validation both constructors shared, so it lives on just
+//     below, driven through the one that remains. It gained a user on the way:
+//     the frozen-and-two-fields case near the top of this file only ever ran for
+//     user A, and the moved case runs for both.
+//  2. "carries the address untouched, so no byte changes on the wire" — DIED.
+//     Its subject was that the retired path did NOT trim. There is nothing to
+//     move it to: the surviving constructor REFUSES an address the trim would
+//     change (D-18), which is the opposite claim, and that one is already held by
+//     the untrimmed rows of the bad-props table.
+//  3. Seven refusal rows — DIED. Three were "a binding arrived absent", which is
+//     a shape that no longer exists to assert about. The other four — an empty
+//     address, an empty password, an address with no at sign, an address holding
+//     a non-ASCII letter — are every one of them already a row in `BAD_PROPS`,
+//     so nothing was lost by deleting rather than moving them.
+//  4. Nine unusable-password rows, titled "the same as the props constructor"
+//     — DIED. Their subject was the PARITY between two constructors. With one
+//     constructor there is no parity to assert. D-19 itself is untouched: the
+//     table above pins every unusable password as present in `BAD_PROPS`, and
+//     `BAD_PROPS` is driven through the real constructor.
+//  5. Usable-password rows, "still accepts %s and hands it back unchanged"
+//     — DIED as a duplicate. A case with the identical title and the identical
+//     assertions already runs against the surviving constructor in this file.
+//  6. "carries no fragment of either binding when it refuses" — DIED.
+//     `LEAKY_SHAPES` holds exactly this claim, including the row for an address
+//     the id function turns away, and it holds it against the constructor that
+//     still exists.
+//
+// The retired name is written nowhere above, because a scan rule under `src/`
+// refuses the read it made and a comment that spelled it would fail the check it
+// was explaining.
+// ---------------------------------------------------------------------------
+
+describe("the one constructor gives each user their own id and password", () => {
   it.each([USER_A, USER_B].map((user) => [user.label, user] as const))(
     "gives user %s the id the vectors file gives them, and their own password",
     async (_label, user) => {
-      const principal = await principalFromEnv(envFor(user));
+      // Moved here from the retired constructor's block in Phase 13. Its subject
+      // is validation the two shared — the id derivation, the password holder,
+      // the frozen object and its exactly two keys — so it kept its subject and
+      // changed its constructor.
+      const principal = await principalFromProps(goodPropsFor(user));
 
       expect(principal.userId).toBe(user.userId);
       expect(principal.appleId).toBe(user.appleId);
@@ -915,81 +952,27 @@ describe("the env constructor, temporary until the secrets are removed (D-03)", 
       expect(Object.keys(principal).sort()).toEqual(["appleId", "userId"]);
     },
   );
-
-  it("carries the Apple ID binding untouched, so no byte changes on the wire", async () => {
-    const typed = ` ${USER_A.appleId.toUpperCase()}  `;
-    const principal = await principalFromEnv(fakeEnv(typed, ROW_PASSWORD));
-
-    expect(principal.appleId).toBe(typed);
-    expect(principal.userId).toBe(USER_A.userId);
-  });
-
-  it.each([
-    ["the Apple ID is not set", undefined, ROW_PASSWORD],
-    ["the password is not set", USER_A.appleId, undefined],
-    ["neither is set", undefined, undefined],
-    ["the Apple ID is empty", "", ROW_PASSWORD],
-    ["the password is empty", USER_A.appleId, ""],
-    ["the Apple ID has no at sign", "user-a.example.invalid", ROW_PASSWORD],
-    ["the Apple ID holds a non-ASCII letter", NON_ASCII_ADDRESS, ROW_PASSWORD],
-  ] as const)("refuses with the auth error when %s", async (_name, appleId, password) => {
-    await expect(
-      principalFromEnv(fakeEnv(appleId, password)),
-    ).rejects.toBeInstanceOf(ImapAuthError);
-  });
-
-  it.each(UNUSABLE_PASSWORDS)(
-    "refuses %s with the auth error, the same as the props constructor (D-19)",
-    async (_name, password) => {
-      // The Apple ID is user A's good one, so the password is the only reason.
-      const raised = await principalFromEnv(fakeEnv(USER_A.appleId, password)).then(
-        () => null,
-        (err: unknown) => err,
-      );
-      expect(raised).toBeInstanceOf(ImapAuthError);
-      expect(toErrorCategory(raised).category).toBe("auth_failed");
-    },
-  );
-
-  it.each(USABLE_PASSWORDS)(
-    "still accepts %s, and hands it back unchanged (D-19)",
-    async (_name, password) => {
-      const principal = await principalFromEnv(fakeEnv(USER_A.appleId, password));
-      expect(principal.userId).toBe(USER_A.userId);
-      expect(passwordOf(principal)).toBe(password);
-    },
-  );
-
-  it("carries no fragment of either binding when it refuses", async () => {
-    const address = "leaky-binding.example.invalid";
-    const password = "leaky-binding-password";
-
-    const raised = await principalFromEnv(fakeEnv(address, password)).then(
-      () => null,
-      (err: unknown) => err,
-    );
-
-    expect(raised).toBeInstanceOf(ImapAuthError);
-    expect(toErrorCategory(raised).category).toBe("auth_failed");
-    expect(everythingOn(raised)).not.toContain(address);
-    expect(everythingOn(raised)).not.toContain(password);
-    expect((raised as Error).message).toBe("imap-credentials-rejected");
-  });
 });
 
-describe("the invariant: three ways to an id, one answer", () => {
+describe("the invariant: two ways to an id, one answer", () => {
   it.each([USER_A, USER_B].map((user) => [user.label, user] as const))(
     "user %s gets the id from the vectors file, whichever way it is asked for",
     async (_label, user) => {
       // Every value compared here is a result of the one function, reached by
-      // three roads, held against a literal from the vectors file. There is no
+      // two roads, held against a literal from the vectors file. There is no
       // second fingerprint anywhere in this test.
-      const fromEnv = await principalFromEnv(envFor(user));
+      //
+      // It was THREE roads until Phase 13. The third went through the retired
+      // constructor, and it was the road that could disagree: two constructors
+      // are two places an address becomes an id, and the day they disagreed about
+      // one input, one person would have become two users. That risk is gone with
+      // the second constructor, so the invariant is smaller and the thing it
+      // guarded against is now structurally impossible rather than merely
+      // untrue.
       const fromProps = await principalFromProps(goodPropsFor(user));
       const direct = await userIdOf(user.appleId);
 
       expect(FULL_HEX.test(user.userId), "the vectors id is not 64 hex").toBe(true);
-      expect(fromEnv.userId).toBe(user.userId);
       expect(fromProps.userId).toBe(user.userId);
       expect(direct).toBe(user.userId);
     },

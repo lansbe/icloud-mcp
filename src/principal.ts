@@ -27,16 +27,25 @@
 // files allowed to import it.
 //
 // **Every refusal is the same error with nothing in it.** A bad grant, a
-// missing secret, an address the id function turns away and a copied principal
-// all raise the existing auth error, built with no argument. No message is put
+// credential that is absent or unusable, an address the id function turns away
+// and a copied principal all raise the existing auth error, built with no
+// argument. No message is put
 // together from the input anywhere in this module, so there is nothing the
 // address or the password could ride out on.
 //
-// `principalFromEnv` is temporary. It reads the two Worker secrets, which is
-// how the one owner is identified today. Phase 13 removes the secrets and this
-// function with them. The form constructor exists now: `principalFromProps`,
-// added with the login page in Phase 11, is how a signed-in person's grant
-// becomes a principal (code review IN-01).
+// **There is ONE constructor, and it is fed by a grant's encrypted props.**
+// `principalFromProps`, added with the login page in Phase 11, turns a signed-in
+// person's stored grant into a principal. Nothing here reads the deployment's
+// own configuration to decide who a request is for.
+//
+// A second constructor stood beside it until Phase 13 and read the account's
+// credentials off the Worker's environment, which is how the one owner used to
+// be identified. Both it and the two bindings behind it are gone: the server
+// serves whoever signed in, so the deployment cannot be the answer to "who".
+// That path is described here by ROLE and never by name, because a scan rule
+// under `src/` refuses the read it used to make, and a comment spelling it out
+// would fail the very check it was trying to explain — the same habit
+// `.claude/CLAUDE.md` § 1 keeps for the banned transport paths.
 //
 // It lives at the root rather than inside one of the protocol trees because
 // both the mail tree and the DAV tree will need it, and those two trees must
@@ -92,7 +101,6 @@
 // This module contains no logging calls of any kind and must never acquire any.
 
 import { isConfiguredSecret } from "./configured-secret";
-import type { OwnerMailSecrets } from "./env";
 import { ImapAuthError } from "./errors";
 
 const ENCODER = new TextEncoder();
@@ -298,11 +306,16 @@ export async function userIdOf(appleId: string): Promise<string | null> {
  * it would change bytes on the wire. `userIdOf` trims and lowercases its own
  * copy, so the id comes out the same either way.
  *
- * The two constructors differ on padding, on purpose (D-18). The env
- * constructor carries the binding untouched, padding included, so today's wire
- * bytes do not change. The props constructor REFUSES an address the trim would
- * change, so a principal built from props never carries padding. Neither one
- * ever changes the address it was given.
+ * **No principal carries padding (D-18).** The one constructor REFUSES an
+ * address the trim would change, so this field is always already trimmed — and
+ * it is still never CHANGED by the constructor, which is why the sentence above
+ * says "exactly as it was given" rather than "trimmed". The two are the same
+ * thing only because the untrimmed case is refused rather than cleaned up.
+ *
+ * There were two constructors until Phase 13, and they differed here on purpose:
+ * the retired one carried its value untouched, padding included, so the wire
+ * bytes of the day did not change. That difference retired with it, and the
+ * stricter of the two rules is the one that survived.
  *
  * The object is frozen, so `readonly` holds at run time too. The password is
  * not here. See `passwordOf`.
@@ -367,11 +380,14 @@ function isUsablePassword(appPassword: string): boolean {
 /**
  * Build one principal and put its password in the holder.
  *
- * The one place a principal is made, so both constructors refuse every address
- * the id function refuses, for the same reason. The props constructor refuses
- * an untrimmed address on top of that, before it gets here (D-18). Both refuse
- * the same passwords too, because that check is here (D-19). A new object
- * every call, never a shared one.
+ * The one place a principal is made, so every address the id function refuses is
+ * refused here too, for the same reason. The constructor refuses an untrimmed
+ * address on top of that, before it gets here (D-18). The password check is here
+ * rather than up there (D-19), which is what makes it unskippable by a future
+ * second constructor: a new one would have to go through this function to reach
+ * the holder at all, and going through it means taking both checks.
+ *
+ * A new object every call, never a shared one.
  */
 async function build(appleId: string, appPassword: string): Promise<Principal> {
   if (!isUsablePassword(appPassword)) throw new ImapAuthError();
@@ -393,34 +409,12 @@ async function build(appleId: string, appPassword: string): Promise<Principal> {
  * returns `undefined` and never returns an empty string: a caller that got
  * either would send an empty password to Apple.
  *
- * It is sync. The constructors are async only because the id function is.
+ * It is sync. The constructor is async only because the id function is.
  */
 export function passwordOf(principal: Principal): string {
   const password = PASSWORDS.get(principal);
   if (password === undefined) throw new ImapAuthError();
   return password;
-}
-
-/**
- * The principal for the one owner, read from the two Worker secrets.
- *
- * **Temporary.** Phase 13 removes the secrets and this function. Until then it
- * is how code that still runs as the owner gets a principal.
- *
- * A secret that is unset or empty is refused with the auth error, and so is an
- * Apple ID the id function turns away. So is a password that is only white
- * space or holds a control character (D-19). The check is also what narrows
- * each binding from "string or undefined" to a string.
- */
-export async function principalFromEnv(
-  env: OwnerMailSecrets,
-): Promise<Principal> {
-  const appleId = env.APPLE_ID;
-  const appPassword = env.APPLE_APP_PASSWORD;
-  if (!isConfiguredSecret(appleId)) throw new ImapAuthError();
-  if (!isConfiguredSecret(appPassword)) throw new ImapAuthError();
-
-  return build(appleId, appPassword);
 }
 
 /**
@@ -435,14 +429,16 @@ export async function principalFromEnv(
  * **The Apple ID must already be trimmed (D-18).** An address with a space, a
  * line ending or any other white space at either end is refused, even though
  * the id function would accept it. The login page stores the trimmed address,
- * so nothing this server wrote looks like that. The env constructor does not
- * share this check: see `Principal`.
+ * so nothing this server wrote looks like that. The constructor retired in
+ * Phase 13 did not share this check: see `Principal` for why the two differed
+ * and why the stricter rule is the one left standing.
  *
  * **The password must be usable (D-19).** One that is only white space, or that
- * holds a control character, is refused. Both constructors share that check.
+ * holds a control character, is refused. That check lives in `build`, so it
+ * guards every construction site there will ever be and not only this one.
  *
- * **One argument, and no environment.** There is no fallback to the Worker
- * secrets for a grant that does not check out. A fallback would turn a broken
+ * **One argument, and no environment.** There is no fallback to the deployment's
+ * own configuration for a grant that does not check out. A fallback would turn a broken
  * grant from anyone into the owner's session.
  *
  * **The user id is never read from the props.** It is derived from the Apple

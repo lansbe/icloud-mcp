@@ -858,10 +858,23 @@ describe("identity comes from the grant and from nowhere else (the promotion)", 
     },
   );
 
-  it("the door's source names the retiring environment constructor nowhere", () => {
-    // Non-vacuity first. A `?raw` import that resolved to nothing would make
-    // the assertion below pass while reading an empty string, which is the
-    // failure this whole mechanism is most prone to.
+  it("the door builds its principal from the grant's props and from nothing else", () => {
+    // RETIRED AND REPLACED in Phase 13, in the commit that deleted the thing it
+    // watched. This case used to assert that the door's source did not name the
+    // environment-backed constructor. That constructor now exists nowhere in the
+    // repository, so the assertion could never fail again — and this project
+    // treats a test that cannot go red as worth less than no test at all. The
+    // scan took over the negative half: a ban under `src/` refuses a read of
+    // either deleted binding, with a known-violating sample behind it.
+    //
+    // What is asserted instead is the POSITIVE, which is the claim that was
+    // always the point: the door builds its principal from the grant. That still
+    // fails if somebody threads identity in from anywhere else.
+    //
+    // Non-vacuity first, carried across from the retired case unchanged. A `?raw`
+    // import that resolved to nothing would make every assertion below pass
+    // while reading an empty string, which is the failure this whole mechanism is
+    // most prone to.
     expect(
       DOOR_SOURCE.length,
       "the ?raw import of src/mcp/api-handler.ts loaded nothing",
@@ -871,13 +884,12 @@ describe("identity comes from the grant and from nowhere else (the promotion)", 
       "the ?raw import did not load the door's source",
     ).toContain("createMcpApiHandler");
 
-    // Comments count, and on purpose. The door DOES discuss the retiring
-    // constructor — it has to, because the switch is the interesting thing
-    // about that line — and it does so by ROLE. A file that starts spelling
-    // the name again is a file where somebody is thinking about it as code.
+    // The one constructor, named in the door's source. If this goes red the door
+    // is getting its principal some other way, which is the failure the retired
+    // negative was circling.
     expect(
       DOOR_SOURCE,
-      "the door names the environment-backed principal constructor; identity must come from the grant, and even a dead reference is how the singular assumption comes back",
-    ).not.toContain("principalFromEnv");
+      "the door no longer builds its principal from the grant's props; identity must come from the grant and from nothing the deployment knows",
+    ).toContain("principalFromProps");
   });
 });

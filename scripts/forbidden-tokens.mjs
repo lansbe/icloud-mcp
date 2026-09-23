@@ -121,7 +121,7 @@ export const FORBIDDEN = [
     id: "secret-binding-in-log-call",
     pattern:
       /\b(?:console|logger)\s*\??\.\s*[A-Za-z_$][\w$]*\s*\([^)]*\b(?:APPLE_APP_PASSWORD|APPLE_ID|AUTH_SECRET|appPassword|appleId)\b/g,
-    why: "A logging call whose arguments mention a secret binding name, or one of the two credential field names the grant's props carry. A log line naming either field leaks the Apple ID or the app-specific password. Credentials must never reach a log, an error, or a tool response.",
+    why: "A logging call whose arguments mention a secret binding name, or one of the two credential field names the grant's props carry. A log line naming either field leaks the Apple ID or the app-specific password. Credentials must never reach a log, an error, or a tool response. THREE OF THE FIVE NAMES ARE DEAD BINDINGS and they stay on purpose: phase 13 deleted the account bindings and the login gate's secret from the platform, so nothing supplies those three now, but the rule only refuses MORE by keeping them -- and what it catches is a future session re-introducing a binding under one of those exact names, which is the singular-owner assumption coming back. Do not tidy them out. The two live names are the grant-props fields, and they are why this rule still has work to do.",
   },
   // Phase 9 (D-02). Widened together with the blanket src/ rule below, so the
   // two cannot drift: both listed the same six method names, and both now
@@ -169,7 +169,7 @@ export const FORBIDDEN = [
     id: "logging-anywhere-under-src",
     scope: "src/",
     pattern: /\b(?:console|logger)\s*\??\.\s*[A-Za-z_$][\w$]*\s*\(/g,
-    why: "No logging call of any kind may exist under src/, not only under src/mail/. The environment binding carries AUTH_SECRET, the Apple ID, and the app-specific password, so one debug line that passes it names no secret and leaks all three -- and observability logging is enabled, so 'a log' means retained Cloudflare storage, not a terminal.",
+    why: "No logging call of any kind may exist under src/, not only under src/mail/. The environment binding carries the confirmation-signing secret and the attachment bucket's credentials, and the signed-in person's Apple ID and app-specific password ride in the grant's props one argument away from any of it, so one debug line that passes the environment or the props names no secret and leaks whatever it was handed -- and observability logging is enabled, so 'a log' means retained Cloudflare storage, not a terminal. The rule was written when the environment carried the account credentials directly; it is blunt for the same reason now that they arrive per person instead.",
   },
   {
     // No `scope`, on purpose: this one holds in every scanned directory. A
@@ -194,7 +194,7 @@ export const FORBIDDEN = [
     // exact line this rule exists for, and it used to commit cleanly.
     id: "env-object-in-log-call",
     pattern: /\b(?:console|logger)\s*\??\.\s*[A-Za-z_$][\w$]*\s*\([^)]*\benv\b/g,
-    why: "A logging call whose arguments mention the bare environment object. It carries APPLE_ID and APPLE_APP_PASSWORD, so nothing needs to name a secret for the credentials to reach the log -- which is exactly the shape the secret-binding rule cannot see.",
+    why: "A logging call whose arguments mention the bare environment object. It carries the confirmation-signing secret and the attachment bucket's credentials, so nothing needs to name a secret for something that must not be retained to reach the log -- which is exactly the shape the secret-binding rule cannot see. It carried the account credentials directly until phase 13 moved those into the grant's props; the rule is unchanged, because a bare environment object is still a bag of secrets whose contents nobody reads at the call site.",
   },
   // Phase 8, CRED-05 (D-07). The rule above, moved to where the credentials
   // live next. Once each user signs in with their own account, the Apple ID and
@@ -815,6 +815,69 @@ export const FORBIDDEN = [
     pattern: /\bpurgeExpiredData\s*\(/g,
     why: "The OAuth library's expired-record sweeper is being called. Its grant sweep deletes grants whose client record has gone, which is the forced logout LIFE-01 removed, arriving by another road -- and it is worse than the original, because a registration can be restored while a swept grant cannot. LIFE-01 rests on three lines in src/auth/oauth.ts and every one of them fails silently when edited: the two never-expiring lifetimes are held only by a spread copying an own key whose value is undefined, so deleting either line restores the default expiry with nothing failing on the way out, and this call restores the logout without touching either. If the reason for reaching for this was client records accumulating, the answer is prune-clients in scripts/grants-core.mjs, which deletes a client record only when NO grant names it and so cannot sign anybody out. If a sweep is genuinely wanted, that is a change to the project's login lifetime and needs a decision, not a call.",
   },
+
+  // ------------------------------------------- the read of a deleted binding
+  // CUT-01, phase 13. This was a COUNT until 2026-09-23, with `src/principal.ts`
+  // named as its one permitted owner: the constructor that turned the account
+  // holder's two Worker secrets into a principal. That constructor is gone,
+  // deleted in the same commit as this entry, and the platform stops supplying
+  // the two bindings behind it.
+  //
+  // WHY A BAN AND NOT A COUNT ANY MORE. Zero is now the correct number of
+  // readers, so the count's `missing` arm could never fire again -- and this
+  // project's own enforcement rule is that a constraint whose missing arm
+  // cannot fire looks exactly like a constraint that was never added. The count
+  // had to become a ban or become a lie about itself. The two are not
+  // interchangeable and the direction of the change is one-way: a count asks
+  // "exactly these files", a ban asks "no file", and only the second is true
+  // once the thing being counted has been deleted.
+  //
+  // WHY A READ OF A DELETED BINDING IS REFUSED AT ALL. Because the name coming
+  // back is the singular identity coming back. Nothing supplies these two
+  // values now, so a read of one resolves to nothing and would fail at run
+  // time -- but the failure worth preventing is the quiet one, a session
+  // reasoning about a single owner again on a server that serves whoever signed
+  // in. The compiler is the FIRST check (Phase 9 D-14): the three names left the
+  // shared binding type, so a stray reader does not compile, and
+  // `test/env-narrowing.test.ts` pins that with expect-error lines. This is the
+  // SECOND, and it exists because the compiler sees types while this sees TEXT.
+  // A cast, a comment, or a file the typecheck never reaches gets past one and
+  // not the other. Neither sees everything.
+  //
+  // WHY THIS SCOPE. The source tree only. The sentence carries over from the
+  // count's docstring unchanged in substance: tests are not a credential path,
+  // and the scanner's own test file spells the read verbatim as a sample and is
+  // skipped by path for every rule.
+  //
+  // WHY THE LOGIN GATE'S SECRET IS LEFT OUT (Phase 9 D-28). It is not an Apple
+  // credential and it gates the authorize form rather than an account. It was
+  // out of the count for that reason and it stays out of the ban for the same
+  // one; a row in the scanner's test pins it as a miss so nobody folds it in.
+  //
+  // WHAT IT DOES NOT SEE, unchanged from the count it replaces: a destructuring
+  // of the environment object; an index access with the name written as a
+  // string; an alias of the environment object under another name; a
+  // narrow-typed parameter under another name; and a cast in parentheses around
+  // the environment object, which puts the cast keyword between the name and
+  // the dot.
+  //
+  // THE MEMBER ACCESS MATCHES WHAT `PROPS_READER` MATCHES (code review WR-03),
+  // and the scanner's own test file pins the two as equal by reading this
+  // pattern back out of the list by id. Keep them identical: a difference
+  // between them is a difference nobody decided.
+  //
+  // MEASURED ON THE REAL TREE, not asserted: 0 hits under `src/` when it was
+  // added, so it is armed on a tree it refuses nothing on. One consequence, the
+  // same one the transport, write and sweeper rules carry -- `src/principal.ts`
+  // and `src/env.ts` are both inside the scope and both used to spell these
+  // names, so both now describe the read by ROLE, or they would fail the check
+  // they exist to explain.
+  {
+    id: "mail-secret-read",
+    scope: "src/",
+    pattern: /\benv\s*(?:[?!]\s*)?\.\s*(?:APPLE_ID|APPLE_APP_PASSWORD)\b/g,
+    why: "A read of one of the two deleted account bindings off the environment object, under src/. Phase 13 removed both from the platform and removed the constructor that read them, so nothing supplies either value any more -- this rule replaced the count that used to permit exactly one reader, because with the reader gone that count's missing arm could never fire, and a constraint whose missing arm cannot fire looks exactly like one that was never added. A read here means somebody is identifying the caller from the deployment again instead of from the grant they signed in with, on a server that now serves more than one person. Take the signed-in principal the door already built and read its Apple ID field, or hand the principal to one of the two password owners. If this fired on a comment, describe the read by role -- write \"the account bindings\" and not the spelled read -- which is what src/principal.ts and src/env.ts both do. Do not narrow the pattern, do not rename the environment object to hide the read, and do not fold the login gate's own secret in: that one is not an Apple credential and has its own reader.",
+  },
 ];
 
 /**
@@ -1047,8 +1110,11 @@ export const SUBSCRIPTION_FEED_FETCH_SCOPE = "src/feed/";
  * when it was added. To drop it, delete that one arm here and its two rows in
  * the test.
  *
- * THE MEMBER ACCESS MATCHES WHAT `MAIL_SECRET_READ` MATCHES (code review
- * WR-03). The two counts were written in the same phase and disagreed for no
+ * THE MEMBER ACCESS MATCHES WHAT THE ACCOUNT-BINDING BAN MATCHES (code review
+ * WR-03, and see `mail-secret-read` in the list above -- that one was a count
+ * beside this one until phase 13 deleted the binding it counted the readers of,
+ * and the shared member access outlived the count). The two were written in the
+ * same phase and disagreed for no
  * reason: this one allowed white space around the dot and an optional question
  * mark, that one allowed neither. Both now allow white space, a new line, an
  * optional question mark and an optional non-null mark on either side of the
@@ -1175,79 +1241,6 @@ export const PASSWORD_READER_OWNERS = Object.freeze([
 /** The tree `PASSWORD_READER_IMPORT` is collected from. Tests build principals
  *  and may read one back, and a test is not a login path. */
 export const PASSWORD_READER_SCOPE = "src/";
-
-/**
- * A read of one of the two mail secrets off the environment object, permitted
- * in exactly one file of the source tree.
- *
- * THE RULE. Exactly one file under `src/` reads either mail secret off the
- * environment object, and it is `src/principal.ts` — the one constructor that
- * turns the owner's two Worker secrets into a principal. Phase 13 removes the
- * secrets and that constructor together. Until then, everything else that acts
- * for the owner is handed the principal and never sees a secret name.
- *
- * WHY A COUNT RATHER THAN A NEGATIVE. A second reader is a second place a
- * password enters the program without a principal around it, arriving without a
- * decision. Zero is the other failure and the quieter one: it means the owner's
- * constructor was deleted, renamed, or stopped spelling the read this way, and
- * nothing fails on the way out — the tests that covered the deleted code leave
- * with it. "No second reader" is trivially true of a tree with no reader at all.
- *
- * WHY THE LOGIN GATE'S SECRET IS LEFT OUT (Phase 9 D-28). The gate's own secret
- * is not an Apple credential: it gates the authorize form and reaches no
- * account. It has its own single reader in the login gate, and folding it in
- * here would make one count answer two different questions. The pattern names
- * the two mail secrets only, and a row in the test pins the gate's secret as a
- * miss so nobody adds it later by accident.
- *
- * THE MEMBER ACCESS MATCHES WHAT `PROPS_READER` MATCHES (code review WR-03).
- * The two counts were written in the same phase and disagreed for no reason:
- * that one allowed white space around the dot and an optional question mark,
- * this one allowed neither, so the optional-chaining form, the non-null mark
- * and a read broken across two lines by the formatter all fired nothing. Both
- * now allow white space, a new line, an optional question mark and an optional
- * non-null mark on either side of the dot, with the mark owning the white space
- * behind it as one optional group (see `PROPS_READER` for why that grouping is
- * not a style choice). Keep the two identical. A difference between them is a
- * difference nobody decided.
- *
- * WHAT IT DOES NOT SEE. Each of these reads a mail secret and fires nothing:
- *
- *   1. a destructuring of the environment object (`const { APPLE_ID } = env`);
- *   2. an index access with the name as a string (`env["APPLE_ID"]`);
- *   3. an alias of the environment object under another name (`e.APPLE_ID`);
- *   4. a narrow-typed parameter under another name (`secrets.APPLE_ID`);
- *   5. a type cast in parentheses around the environment object, which puts
- *      the cast keyword between the name and the dot.
- *
- * The compiler is the FIRST check for all five (Phase 9 D-14). The three secret
- * names left the shared binding type, so a stray reader does not compile at all,
- * and `test/env-narrowing.test.ts` pins that with expect-error lines. This count
- * is the SECOND check, and it exists because the compiler sees types while this
- * sees text: a cast, a comment or a file the typecheck never reaches gets past
- * one and not the other. Neither sees everything.
- *
- * THE OWNER IS FOUND BY THE SPELLING. The pattern anchors on an identifier
- * named `env`, so the owner's parameter must keep that name. Rename it and this
- * count reports the owner as missing, which is the point: a renamed parameter is
- * how the read would quietly stop being seen.
- *
- * Comments count. In every file under `src/` except the owner, write "the two
- * mail secrets" or "the Apple ID secret" and never the spelled read. A comment
- * that spells it fails the commit hook in the middle of unrelated work. No `g`
- * flag: `scan()` uses `String.prototype.search`, which takes the first match
- * only.
- */
-export const MAIL_SECRET_READ =
-  /\benv\s*(?:[?!]\s*)?\.\s*(?:APPLE_ID|APPLE_APP_PASSWORD)\b/;
-
-/** The one file under `MAIL_SECRET_READ_SCOPE` permitted to match
- *  `MAIL_SECRET_READ`. */
-export const MAIL_SECRET_READ_OWNER = "src/principal.ts";
-
-/** The tree `MAIL_SECRET_READ` is collected from. Tests bind all three secrets
- *  and must be able to spell them, and a test is not a credential path. */
-export const MAIL_SECRET_READ_SCOPE = "src/";
 
 /**
  * The one function that turns an address into a user id, permitted in exactly
@@ -1468,8 +1461,6 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "props-reader-missing",
   "password-reader-outside-owners",
   "password-reader-missing",
-  "mail-secret-reader-outside-owner",
-  "mail-secret-reader-missing",
   "address-hashing-site-outside-owner",
   "address-hashing-site-missing",
   "principal-constructor-outside-owners",
@@ -1666,7 +1657,6 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const subscriptionFeedFetchCallers = [];
   const propsReaders = [];
   const passwordReaderImporters = [];
-  const mailSecretReaders = [];
   const addressHashers = [];
   const principalConstructors = [];
 
@@ -1737,15 +1727,6 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
         });
       }
     }
-    if (relativePath.startsWith(MAIL_SECRET_READ_SCOPE)) {
-      const mailSecretReadIndex = contents.search(MAIL_SECRET_READ);
-      if (mailSecretReadIndex !== -1) {
-        mailSecretReaders.push({
-          file: relativePath,
-          ...positionOf(contents, mailSecretReadIndex),
-        });
-      }
-    }
     if (relativePath.startsWith(ADDRESS_HASH_SCOPE)) {
       const addressHashIndex = contents.search(ADDRESS_HASH);
       if (addressHashIndex !== -1) {
@@ -1778,7 +1759,6 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   );
   violations.push(...checkPropsReaderOwnership(propsReaders));
   violations.push(...checkPasswordReaderOwnership(passwordReaderImporters));
-  violations.push(...checkMailSecretReaderOwnership(mailSecretReaders));
   violations.push(...checkAddressHashOwnership(addressHashers));
   violations.push(...checkPrincipalConstructorOwnership(principalConstructors));
 
@@ -2043,43 +2023,6 @@ export function checkPasswordReaderOwnership(importers) {
 }
 
 /**
- * The one reader of the two mail secrets, as a pure function over a list of
- * readers.
- *
- * Same split and same shape as the props count: one owner, both failure
- * directions exercised against a list rather than a fixture tree on disk. See
- * the `MAIL_SECRET_READ` docstring for why this is a count at all, why the
- * login gate's secret is left out, and what it does not see.
- *
- * @param {Array<{file: string, line: number, column: number}>} readers
- */
-export function checkMailSecretReaderOwnership(readers) {
-  const violations = [];
-  for (const reader of readers) {
-    if (reader.file === MAIL_SECRET_READ_OWNER) continue;
-    violations.push({
-      file: reader.file,
-      line: reader.line,
-      column: reader.column,
-      pattern: "mail-secret-reader-outside-owner",
-      patternIndex: FORBIDDEN.length + 14,
-      why: `A read of one of the two mail secrets off the environment object under ${MAIL_SECRET_READ_SCOPE} outside ${MAIL_SECRET_READ_OWNER}. That file is the one constructor that turns the owner's Worker secrets into a principal, and Phase 13 removes it. A second reader is a second place a password enters the program with no principal around it. Thread the principal to this code instead and read its Apple ID field, or hand it to one of the two password owners. If this fired on a comment, write "the two mail secrets" and not the spelled read. Do not narrow the pattern, do not rename the environment object to hide the read, and do not fold the login gate's secret into this count.`,
-    });
-  }
-  if (readers.length === 0) {
-    violations.push({
-      file: MAIL_SECRET_READ_OWNER,
-      line: 0,
-      column: 0,
-      pattern: "mail-secret-reader-missing",
-      patternIndex: FORBIDDEN.length + 15,
-      why: `No file under ${MAIL_SECRET_READ_SCOPE} reads the two mail secrets off the environment object, which means the owner's constructor in ${MAIL_SECRET_READ_OWNER} was deleted, renamed, or rewritten into a form this count cannot see. Nothing fails on the way out when a constructor leaves: the tests that covered it leave with it. Restore the read in that constructor, and keep its parameter named as it is — this count finds its owner by that spelling. If the constructor really moved, that is a change to the safety boundary: get a decision, then change the owner, never the pattern.`,
-    });
-  }
-  return violations;
-}
-
-/**
  * The one site that turns an address into a user id, as a pure function over a
  * list of hashing sites.
  *
@@ -2100,7 +2043,7 @@ export function checkAddressHashOwnership(hashers) {
       line: hasher.line,
       column: hasher.column,
       pattern: "address-hashing-site-outside-owner",
-      patternIndex: FORBIDDEN.length + 16,
+      patternIndex: FORBIDDEN.length + 14,
       why: `A second site under ${ADDRESS_HASH_SCOPE} turns an address into a user id, outside ${ADDRESS_HASH_OWNER}. That file holds the one producer of the id every store key in this project is scoped by (ISO-05 rule 10, D-14, D-18). Two producers drift, and the day they disagree one person becomes two users or two people become one: a user whose id moved loses every staged attachment and every pending confirmation in a single deploy, and two users who collapsed onto one id read each other's. Delete this hashing and read the id off the signed-in principal instead, which is what every other caller in the tree does. Do not narrow the pattern and do not rename the encoder to hide the site.`,
     });
   }
@@ -2110,7 +2053,7 @@ export function checkAddressHashOwnership(hashers) {
       line: 0,
       column: 0,
       pattern: "address-hashing-site-missing",
-      patternIndex: FORBIDDEN.length + 17,
+      patternIndex: FORBIDDEN.length + 15,
       why: `No site under ${ADDRESS_HASH_SCOPE} turns an address into a user id, which means the one producer in ${ADDRESS_HASH_OWNER} was deleted, renamed, or rewritten into a form this count cannot see. Zero producers is as much a violation as two, and it is the quieter of the pair: nothing goes red on the way out, because the tests that covered the deleted code leave with it. Restore the hashing in that file, and keep the module-scope encoder named as it is — this count finds its owner by that spelling, and the tell of a rename is a digest call still present while this count reads zero. If the producer really moved, that is a change to the safety boundary: get a decision, then change the owner, never the pattern.`,
     });
   }
@@ -2139,7 +2082,7 @@ export function checkPrincipalConstructorOwnership(callers) {
       line: caller.line,
       column: caller.column,
       pattern: "principal-constructor-outside-owners",
-      patternIndex: FORBIDDEN.length + 18,
+      patternIndex: FORBIDDEN.length + 16,
       why: `A call to the props-backed principal constructor under ${PRINCIPAL_CONSTRUCTOR_SCOPE} outside ${owners}. Those two files are the only places a principal is minted: the first builds one from a stored grant's props, which the door has already checked against the allow list, and the second builds one from values a person just typed, because no grant exists yet and the password reader answers only the very object this constructor built. A third minting site is a third place in this project that can turn a props object into a live session, and the props it is handed need not be the props the door checked — so it can act for somebody the door would have refused. Do not mint a principal here. Take the one the door passed down, or hand your props to the door. If a third site genuinely belongs, that is a change to the safety boundary and not a refactor: get a decision, then change the owner list, never the pattern. If this fired on a comment, describe the construction in plain words or name the constructor without a parenthesis after it.`,
     });
   }
@@ -2153,7 +2096,7 @@ export function checkPrincipalConstructorOwnership(callers) {
       line: 0,
       column: 0,
       pattern: "principal-constructor-missing",
-      patternIndex: FORBIDDEN.length + 19,
+      patternIndex: FORBIDDEN.length + 17,
       why: `${owner} no longer calls the props-backed principal constructor, which means that identity path was deleted, moved, or rewritten to get identity some other way this count cannot see. Zero callers is as much a violation as three, and it is the quieter of the pair: nothing goes red on the way out, because the tests that covered the deleted code leave with it. The specific regression this arm exists to catch is the one Phase 11 spent a whole phase making impossible — identity read back out of the Worker environment instead of out of the grant, which serves the wrong person's mail to whoever still holds a token. Restore the plain named call in ${owner}. If the identity path really moved, that is a change to the safety boundary: get a decision, then change the owner list, never the pattern.`,
     });
   }
