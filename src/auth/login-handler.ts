@@ -586,11 +586,12 @@ Point your MCP client at that full URL, including the /mcp path. Authorization i
  *
  * This is a compatibility surface and nothing else — no wrapper, no second
  * implementation. The definition now lives in the root module
- * `src/configured-secret.ts`. The five source importers (`src/confirm.ts`,
- * `src/staging/presign.ts`, `src/mail/credentials.ts`, `src/dav/transport.ts`
- * and `src/dav/discovery.ts`) and `test/authorize-secret.test.ts` resolve the
+ * `src/configured-secret.ts`. The four source importers (`src/confirm.ts`,
+ * `src/staging/presign.ts`, `src/mail/credentials.ts` and
+ * `src/dav/transport.ts`) and `test/authorize-secret.test.ts` resolve the
  * name from this module, and keeping them unedited is the evidence that the
- * move was mechanical. This handler also calls the function itself, which is
+ * move was mechanical. It was five until Phase 10: `src/dav/discovery.ts`
+ * stopped importing it when its cache key moved to the user id. This handler also calls the function itself, which is
  * why it holds an import above as well as this statement.
  */
 export { isConfiguredSecret };

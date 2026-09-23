@@ -88,10 +88,12 @@
 // about a single input, an address on the list would stop matching the grant
 // built from it, or worse, one that was removed would keep matching.
 //
-// That "only place" is not yet true, and the gap is known and dated. The cache
-// key hash in the DAV tree's discovery module is a second site: it hashes the
-// Apple ID as given, with no trim and no lowercasing. It is left alone on
-// purpose in this phase. Phase 10 replaces it with the user id from here.
+// That "only place" IS true as of Phase 10. It was not when this paragraph was
+// first written: the cache key hash in the DAV tree's discovery module was a
+// second site, hashing the Apple ID as given with no trim and no lowercasing.
+// Phase 10 replaced it, and that module's key builder now takes the user id
+// derived here rather than hashing an address of its own. One address digest
+// under the source tree, which is what ISO-05 promises.
 //
 // This module ships. The door in `src/mcp/api-handler.ts` builds a principal
 // from the grant's props on every served request, and the login page builds one

@@ -103,10 +103,18 @@ export function createServerFactory(
     // (D-13) — it is the same person either way, since the two promises differ
     // only in whether the pause refuses.
     registerDiagnoseTool(server, unpaused);
-    // The masked "which Apple ID is this connection signed in as" answer
-    // (LIFE-06, D4). It takes the principal and nothing else: no gate, no DAV
-    // fetch, no environment. It cannot reach a socket or a DAV host, which is
-    // exactly why it needs neither.
+    // The "which Apple ID is this connection signed in as" answer (LIFE-06).
+    // It returns the WHOLE address, not a mask. D4 chose the mask on
+    // 2026-09-21 and the owner REVERSED it on 2026-09-23, because the masked
+    // answer made the model report the mask and then say it could not confirm
+    // which account it was on -- which is the tool's only question. The cost of
+    // returning the address was accepted, not argued away; the reasoning and
+    // its limits are on the safety boundary in `.claude/CLAUDE.md` § 4, and
+    // that section is the place to read before widening this.
+    //
+    // It takes the principal and nothing else: no gate, no DAV fetch, no
+    // environment. It cannot reach a socket or a DAV host, which is exactly why
+    // it needs neither.
     registerAccountTool(server, principal);
     registerMailTools(server, gate, principal);
     registerDavDiagnoseTool(server, davFetch, unpaused);

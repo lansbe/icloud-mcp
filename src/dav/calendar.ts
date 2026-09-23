@@ -3413,6 +3413,17 @@ export async function resolveOrganizerAddress(
     // the same identity the DAV fetch logs in as and the cache is keyed by. It
     // is always a string: a principal cannot be built without one, so the old
     // branch for an unset login is gone.
+    // `fold` here lowercases and nothing else -- no trim, no ASCII gate, unlike
+    // the one folding function the door and the login share. That is SAFE ONLY
+    // BECAUSE of something invisible at this line: a principal cannot exist
+    // carrying an untrimmed or non-ASCII address, because its constructor
+    // refuses one (D-18). This match is leaning on that refusal. If the
+    // constructor is ever widened to accept more, this comparison starts
+    // silently selecting a different address rather than failing, so widening
+    // it is a decision that has to come back here.
+    //
+    // Nothing folded here reaches a key, a token or a store, which is why this
+    // is a second folding of the same field without being an ISO-05 breach.
     const folded = fold(principal.appleId);
     const own = addresses.find((one) => fold(one) === folded);
     if (own !== undefined) return own;
