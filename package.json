@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "MCP server on Cloudflare Workers proxying iCloud Mail (IMAP), Calendar (CalDAV), and Contacts (CardDAV)",
+  "engines": {
+    "node": ">=22.18"
+  },
   "scripts": {
     "gen:hostname": "node scripts/write-hostname.mjs",
     "pretypecheck": "node scripts/write-hostname.mjs",

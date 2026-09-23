@@ -147,7 +147,7 @@ in [ARCHITECTURE.md](ARCHITECTURE.md).
 | **Cloudflare account, Workers Paid plan** | The free tier's 10 ms CPU budget cannot parse MIME bodies and PDF attachments. |
 | **A domain on Cloudflare** | `workers.dev` and preview URLs are disabled by design, so a custom-domain route is required. |
 | **An Apple ID with an app-specific password** | iCloud requires an app-specific password for IMAP/DAV when the account has two-factor auth (it does). |
-| **Node.js 20+ and npm** | For the Wrangler and Vitest toolchain. |
+| **Node.js 22.18+ and npm** | Wrangler and Vitest need 20+, but `scripts/grants.mjs` — the command that cuts off a connection — needs 22.18: it uses the synchronous module resolve hook (22.15) and built-in TypeScript type stripping (22.18) so it can call the Worker's own masking and user-id functions instead of keeping second copies. `package.json` declares the floor in `engines`, and the script says so and stops if the runtime is older. |
 
 ---
 

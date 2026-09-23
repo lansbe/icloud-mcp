@@ -40,8 +40,24 @@
 // It never touches the allow list, which is step 1 of removing somebody and is a
 // separate decision.
 //
+// **IT NEEDS NODE 22.18 OR LATER**, and the requirement is not cosmetic. Two
+// things below exist only from that version. `module.registerHooks` — the
+// synchronous resolve hook in step 1 — landed in 22.15, and unflagged TypeScript
+// type stripping, which is what lets step 2 import `../src/principal` at all,
+// landed in 22.18. Both are load-bearing rather than convenient: without the
+// hook the Worker's extensionless imports do not resolve, and without type
+// stripping the one masking rule and the one user-id rule cannot be reached, so
+// this script would have to keep second copies of both — which is the exact
+// drift its rule 1 exists to prevent.
+//
+// `package.json` declares the floor in `engines` and step 0 below checks it
+// before anything version-dependent is touched, so an older runtime gets one
+// sentence rather than a stack trace. That matters here more than anywhere: this
+// is the command that ends a session after a lost laptop.
+//
 // Layout below, and the ORDER is load-bearing:
 //
+//   0. the runtime check, before any version-dependent import;
 //   1. the resolve hook, registered before anything else is imported;
 //   2. the imports, which only work once the hook is in place;
 //   3. the wrangler runner, whose stdout is always captured;
@@ -49,8 +65,56 @@
 //   5. the call, and the exit status.
 
 import { execFileSync } from "node:child_process";
-import { registerHooks } from "node:module";
 import { fileURLToPath } from "node:url";
+
+// ---------------------------------------------------------------------------
+// 0. The runtime check.
+//
+// It comes first, and `node:module` is imported DYNAMICALLY below rather than at
+// the top of this file, because that is the whole point: a named static import of
+// a member the runtime does not have fails at LINK time, before any line of this
+// file runs. On Node 20 that is a raw `SyntaxError` naming the member, with no
+// hint that the version is the problem and nothing this file can say about it.
+// So the check has to sit above the import that would fail.
+//
+// The same reasoning covers the three dynamic imports in step 2: they are all
+// above the top-level try in step 5, so a failure there is also a raw stack
+// trace. This check is what they are protected by.
+//
+// It fails OPEN on a version string it cannot read. A false refusal here would
+// deny the owner their only revoke command over a formatting surprise, and an
+// ugly stack trace is the lesser harm.
+// ---------------------------------------------------------------------------
+
+/** The floor, as major/minor. Matches `engines.node` in package.json. */
+const MIN_NODE = [22, 18];
+
+/** One fixed sentence. It names the version it found, which is not sensitive. */
+const NODE_TOO_OLD =
+  `This needs Node ${MIN_NODE[0]}.${MIN_NODE[1]} or later and this is ` +
+  `Node ${process.versions.node}. It uses two things no earlier version has: ` +
+  "the synchronous module resolve hook, and built-in TypeScript type stripping " +
+  "so it can call the Worker's own masking and user-id functions rather than " +
+  "keeping second copies of them. Install a newer Node and run this again. " +
+  "Nothing was read and nothing was revoked.";
+
+const parts = String(process.versions.node)
+  .split(".")
+  .slice(0, 2)
+  .map((part) => Number.parseInt(part, 10));
+
+if (
+  parts.length === 2 &&
+  Number.isInteger(parts[0]) &&
+  Number.isInteger(parts[1]) &&
+  (parts[0] < MIN_NODE[0] ||
+    (parts[0] === MIN_NODE[0] && parts[1] < MIN_NODE[1]))
+) {
+  process.stderr.write(`${NODE_TOO_OLD}\n`);
+  process.exit(1);
+}
+
+const { registerHooks } = await import("node:module");
 
 // ---------------------------------------------------------------------------
 // 1. The resolve hook.
