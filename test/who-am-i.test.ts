@@ -18,8 +18,15 @@
 // **No real value appears here.** Every address is user A's fake from the
 // two-user fixture or a row from the spec vectors.
 
+import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import type { EntryEnv } from "../src/env";
+import { SAFE_MESSAGES } from "../src/errors";
+import { DEPLOYED_HOSTNAME, createMcpApiHandler } from "../src/mcp/api-handler";
+import { signedInAsResult } from "../src/mcp/tools/account";
 import { maskAppleId } from "../src/principal";
+import { entryEnv } from "./fixtures/bound-secrets";
+import { USER_A, testPrincipal } from "./fixtures/two-users";
 import { REFUSED, USER_ID_VECTORS } from "./fixtures/user-id-vectors";
 
 /**
@@ -29,7 +36,7 @@ import { REFUSED, USER_ID_VECTORS } from "./fixtures/user-id-vectors";
  * literals that must agree prove something; one literal compared with itself
  * proves nothing.
  */
-const BULLETS = "•••";
+const BULLETS = "\u2022\u2022\u2022";
 
 /** What a refused input gets back. The body alone, with nothing around it. */
 const REFUSED_MASK = BULLETS;
@@ -75,7 +82,7 @@ const MASK_ROWS: readonly MaskRow[] = [
   { name: "an empty domain", input: "user-a@", expected: REFUSED_MASK },
   {
     name: "a character outside printable ASCII",
-    input: "rüssell@example.invalid",
+    input: "caf\u00e9@example.invalid",
     expected: REFUSED_MASK,
   },
   {
@@ -156,5 +163,277 @@ describe("maskAppleId: the one masking rule (LIFE-06, D4)", () => {
       expect(() => maskAppleId(value)).not.toThrow();
       expect(maskAppleId(value)).toBe(REFUSED_MASK);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The tool, through the real door.
+//
+// The block below drives `createMcpApiHandler()` — the very handler the Worker
+// serves — with the props a stored grant carries. No fake server, no recorded
+// callback: the claim is that a signed-in person asking this question over the
+// real transport gets the masked answer back, and that the address does not
+// appear anywhere in the response body.
+//
+// The helpers are copied from `test/door.test.ts` rather than exported from it,
+// which is how every other suite here drives the door.
+// ---------------------------------------------------------------------------
+
+const HOSTNAME = DEPLOYED_HOSTNAME;
+const ORIGIN = `https://${HOSTNAME}`;
+
+/** The tool under test. */
+const ACCOUNT_TOOL = "account_whoami";
+
+/** The door, with nothing injected. Exactly what production builds. */
+const door = createMcpApiHandler();
+
+/** Props for one case. `absent` means the context carries no props at all. */
+type CaseProps = { absent: true } | { absent: false; props: unknown };
+
+/**
+ * The grant the login page mints for someone on the allow list.
+ *
+ * User A's address is bound into `ALLOWED_APPLE_IDS_SEED` in `vitest.config.ts`
+ * precisely so a served case can exist. Both values are user A's fakes from the
+ * two-user fixture; no real credential appears in this file.
+ */
+const LISTED: CaseProps = {
+  absent: false,
+  props: {
+    v: 1,
+    appleId: USER_A.appleId,
+    appPassword: USER_A.appPassword,
+  },
+};
+
+/**
+ * A listed grant whose stored password this server itself refuses (D-19).
+ *
+ * The password holds a NUL, written as an escape. `principalFromProps` turns it
+ * away before any socket exists, so this case reaches no network either. The
+ * door serves it: the door checks the address and never the password.
+ */
+const REFUSED_CREDENTIAL: CaseProps = {
+  absent: false,
+  props: {
+    v: 1,
+    appleId: USER_A.appleId,
+    appPassword: "aaaa-aaaa\u0000aaaa-aaaa",
+  },
+};
+
+/**
+ * Drive the door with a context that carries the props under test.
+ *
+ * Copied from `test/door.test.ts`. The pool's execution context has no props
+ * field of its own and the installed type marks it read-only, so the value is
+ * defined onto the real context and the MCP handler downstream sees the very
+ * same context the door saw.
+ */
+async function callDoor(
+  request: Request,
+  caseProps: CaseProps,
+  withEnv: EntryEnv = entryEnv(),
+): Promise<Response> {
+  const ctx = createExecutionContext();
+  if (!caseProps.absent) {
+    Object.defineProperty(ctx, "props", {
+      value: caseProps.props,
+      enumerable: true,
+    });
+  }
+  const response = await door.fetch(request, withEnv, ctx);
+  await waitOnExecutionContext(ctx);
+  return response;
+}
+
+/** A fully well-formed 2026-07-28 `tools/call`. */
+function toolCall(path: string, name: string = ACCOUNT_TOOL): Request {
+  return new Request(`${ORIGIN}${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      host: HOSTNAME,
+      "Mcp-Method": "tools/call",
+      "Mcp-Name": name,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name,
+        arguments: {},
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+          "io.modelcontextprotocol/clientCapabilities": {},
+        },
+      },
+    }),
+  });
+}
+
+/** A well-formed 2026-07-28 `tools/list`. It calls no tool at all. */
+function toolsList(path: string): Request {
+  return new Request(`${ORIGIN}${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      host: HOSTNAME,
+      "Mcp-Method": "tools/list",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/list",
+      params: {
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+          "io.modelcontextprotocol/clientCapabilities": {},
+        },
+      },
+    }),
+  });
+}
+
+/**
+ * The JSON-RPC message in a response body, on either lane.
+ *
+ * The modern lane answers with a JSON body. Null when the body holds no message.
+ */
+function rpcMessageIn(bodyText: string): Record<string, unknown> | null {
+  const trimmed = bodyText.trim();
+  const candidates = trimmed.startsWith("{")
+    ? [trimmed]
+    : trimmed
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice("data:".length).trim());
+  for (const candidate of candidates) {
+    try {
+      const parsed: unknown = JSON.parse(candidate);
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Not this line. Try the next one.
+    }
+  }
+  return null;
+}
+
+/** The one text item a tool result carries, or null. */
+function firstText(message: Record<string, unknown> | null): string | null {
+  const result = message?.result as
+    | { isError?: boolean; content?: { text?: string }[] }
+    | undefined;
+  return result?.content?.[0]?.text ?? null;
+}
+
+describe("account_whoami: the shaper (LIFE-06)", () => {
+  it("answers exactly one field, holding the masked address", async () => {
+    const principal = await testPrincipal(USER_A);
+    const result = signedInAsResult(principal);
+
+    expect(result.isError, "a success result carries no error flag").toBeUndefined();
+    expect(result.content.length, "more than one content item").toBe(1);
+    expect(result.content[0]?.type).toBe("text");
+
+    const answer: unknown = JSON.parse(result.content[0]?.text ?? "null");
+    expect(answer).toEqual({ signedInAs: `u${BULLETS}@example.invalid` });
+  });
+
+  it("carries the address nowhere in its serialized form", async () => {
+    const principal = await testPrincipal(USER_A);
+    const serialized = JSON.stringify(signedInAsResult(principal));
+
+    // The whole result, not just the field this test named above. A second
+    // field added later that happened to hold the address would fail here.
+    expect(serialized).not.toContain(USER_A.appleId);
+    expect(serialized).toContain(`u${BULLETS}@example.invalid`);
+  });
+
+  it("carries no user id, and no field but the one", async () => {
+    const principal = await testPrincipal(USER_A);
+    const answer = JSON.parse(
+      signedInAsResult(principal).content[0]?.text ?? "null",
+    ) as Record<string, unknown>;
+
+    expect(Object.keys(answer)).toEqual(["signedInAs"]);
+    expect(JSON.stringify(answer)).not.toContain(USER_A.userId);
+  });
+});
+
+describe("account_whoami: through the real door (LIFE-06)", () => {
+  it("is listed on the tool list a signed-in client asks for", async () => {
+    const response = await callDoor(toolsList("/mcp"), LISTED);
+
+    expect(response.status).toBe(200);
+    const message = rpcMessageIn(await response.text());
+    const result = message?.result as { tools?: { name: string }[] } | undefined;
+    expect(
+      result?.tools?.some((tool) => tool.name === ACCOUNT_TOOL),
+      "the tools/list answer does not list the account tool",
+    ).toBe(true);
+  });
+
+  it("answers the masked address, and the body never holds the real one", async () => {
+    const response = await callDoor(toolCall("/mcp"), LISTED);
+
+    expect(response.status, "a listed grant was not served").toBe(200);
+    expect(
+      response.headers.get("WWW-Authenticate"),
+      "a listed grant was sent a challenge",
+    ).toBeNull();
+
+    const body = await response.text();
+    const message = rpcMessageIn(body);
+    expect(message, "the response holds no JSON-RPC message").not.toBeNull();
+
+    const result = message?.result as { isError?: boolean } | undefined;
+    expect(result, "the tool call has no result").toBeDefined();
+    expect(result?.isError, "the tool reported a failure").not.toBe(true);
+
+    const answer: unknown = JSON.parse(firstText(message) ?? "null");
+    expect(answer).toEqual({ signedInAs: `u${BULLETS}@example.invalid` });
+
+    // The end-to-end claim. Not the field, not the result — the WHOLE body the
+    // client receives, headers' worth of envelope included.
+    expect(body, "the response body holds the full address").not.toContain(
+      USER_A.appleId,
+    );
+    expect(body, "the response body does not hold the mask").toContain(
+      `u${BULLETS}@example.invalid`,
+    );
+  });
+
+  it("answers auth_failed when this server refuses the stored credential", async () => {
+    const response = await callDoor(toolCall("/mcp"), REFUSED_CREDENTIAL);
+
+    // The door serves it. It checks the address, never the password, because it
+    // cannot know whether Apple would accept one without asking Apple.
+    expect(response.status).toBe(200);
+
+    const body = await response.text();
+    const message = rpcMessageIn(body);
+    const result = message?.result as { isError?: boolean } | undefined;
+    expect(result?.isError, "a refused credential did not report a failure").toBe(
+      true,
+    );
+
+    const answer = JSON.parse(firstText(message) ?? "null") as {
+      category?: string;
+      message?: string;
+    } | null;
+    expect(answer?.category).toBe("auth_failed");
+    expect(answer?.message).toBe(SAFE_MESSAGES.auth_failed);
+
+    expect(body, "a refusal echoed the address").not.toContain(USER_A.appleId);
+    expect(body, "a refusal echoed a mask it should not have built").not.toContain(
+      BULLETS,
+    );
   });
 });

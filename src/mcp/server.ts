@@ -9,6 +9,7 @@ import type { McpServerFactory } from "@modelcontextprotocol/server";
 import { createDavFetch } from "../dav/transport";
 import { createSessionGate } from "../mail/service";
 import type { Principal } from "../principal";
+import { registerAccountTool } from "./tools/account";
 import { registerCalendarTools } from "./tools/calendar";
 import { registerContactsTools } from "./tools/contacts";
 import { registerDavDiagnoseTool } from "./tools/dav-diagnose";
@@ -20,8 +21,8 @@ import { registerMailTools } from "./tools/mail";
  *
  * `extraTools` is the test-injection seam. Production passes nothing, so the
  * shipped tool surface is exactly the tools registered below — two
- * diagnostics, Phase 2's five mail tools, and Phase 3's calendar tools — and
- * nothing that deliberately
+ * diagnostics, Phase 12's masked account answer, Phase 2's mail tools, and
+ * Phase 3's calendar and contacts tools — and nothing that deliberately
  * misbehaves reaches the deployed bundle. A later plan's ordering proof needs
  * a tool that records its own invocation in order to assert the tool layer
  * was never reached on an unauthenticated request; it registers that through
@@ -66,6 +67,11 @@ export function createServerFactory(
     // above awaits it too, at the top of every request it sends, so the login
     // and the cache key always belong to one identity (D-13).
     registerDiagnoseTool(server, principal);
+    // The masked "which Apple ID is this connection signed in as" answer
+    // (LIFE-06, D4). It takes the principal and nothing else: no gate, no DAV
+    // fetch, no environment. It cannot reach a socket or a DAV host, which is
+    // exactly why it needs neither.
+    registerAccountTool(server, principal);
     registerMailTools(server, gate, principal);
     registerDavDiagnoseTool(server, davFetch, principal);
     // The same `davFetch` the diagnostic takes, deliberately: one queue per
