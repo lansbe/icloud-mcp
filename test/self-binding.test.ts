@@ -37,6 +37,81 @@
 // is reachable. The Worker's reachable surface is unchanged and the question
 // still gets answered.
 //
+// ---------------------------------------------------------------------------
+// **SPIKE-08's VERDICT, recorded here rather than only in a planning document.**
+//
+// `.planning/` is git-ignored in this repository. This verdict has to survive
+// into Phase 27, so it lives in a file that is actually tracked.
+//
+// The CODE half is answered and it PASSES. The five findings below were
+// measured by the cases in this file on 2026-09-23, not reasoned about:
+//
+// FINDING: A caller-built `Request` delivered straight to the Worker's fetch
+//   handler — the exact shape a service binding produces — is served a tool
+//   list by the real provider and the real MCP handler. Route matching, the
+//   door and the tool layer all behave the same on that path.
+// FINDING: The caller must construct the deployed hostname itself. Nothing in a
+//   service binding does it. Proved in both directions, and TWO independent
+//   gates stand behind it: the token is bound to the resource
+//   `https://<deployed>/mcp`, so a wrong URL is refused on audience first, and
+//   a wrong Host header alone is refused by the handler's own host validation.
+// FINDING: The path must be EXACTLY `/mcp`. The provider matches its API route
+//   by prefix, so a near miss such as `/mcp/extra` validates the bearer token
+//   and decrypts the grant onto the context before the handler — which matches
+//   exactly — answers 404. A Phase 27 caller that appends anything gets a 404
+//   that explains nothing.
+// FINDING: The absence of an Origin header does not refuse the call. A binding
+//   call originates in a Worker, not a browsing context, so there is no Origin
+//   to send, and the handler treats an absent Origin as permitted.
+// FINDING: A service binding supplies NO identity. The execution context
+//   arrives carrying nothing and stays empty when no token is presented; the
+//   principal comes out of the grant behind the bearer token. So the alarm job
+//   still has to hold a real access token for the user it acts for, and the
+//   binding does not shrink the credential-custody problem by one byte.
+//
+// The PLATFORM half cannot be answered from this repository and is NOT decided
+// here. Cloudflare's documentation was read on 2026-09-23 and answers two of
+// the three questions; the third is unstated, and an unstated answer is
+// recorded as unstated rather than inferred from an adjacent sentence.
+//
+// FINDING: (a) May a Worker declare a service binding naming ITSELF? UNSTATED.
+//   No page found says a `services` entry may name its own Worker
+//   (workers/runtime-apis/bindings/service-bindings/, read 2026-09-23). What IS
+//   documented is a different mechanism for the same goal: `ctx.exports`
+//   supplies "automatically-configured loopback bindings for your Worker's
+//   top-level exports", behind the `enable_ctx_exports` compatibility flag
+//   (workers/runtime-apis/context/#exports and the 2025-09-26 changelog, both
+//   read 2026-09-23). Note the shape it binds — each top-level export
+//   EXTENDING `WorkerEntrypoint`. This Worker's default export is an
+//   `OAuthProvider` instance and not a `WorkerEntrypoint` subclass, so whether
+//   `ctx.exports` reaches it at all is itself unstated.
+// FINDING: (b) Does the call spend a subrequest? YES. Cloudflare describes a
+//   service-binding call as "a subrequest from one Worker to another"
+//   (workers/versions-and-deployments/version-overrides/, read 2026-09-23). The
+//   per-invocation ceiling on Workers Paid is 10,000, configurable up to 10M
+//   (workers/platform/limits/#subrequests, read 2026-09-23). Which of that
+//   page's two rows an in-process binding call lands in — external, or the
+//   separate internal-services row — is UNSTATED.
+// FINDING: (c) Is there a recursion or depth guard on a Worker invoking itself?
+//   UNSTATED. Nothing found on the service-bindings, limits or RPC pages states
+//   a maximum chain length or depth (all read 2026-09-23). The RPC page's stated
+//   limitations are about Smart Placement and a 32 MiB serialized payload, and
+//   neither is a depth guard.
+//
+// So (a) still needs the owner and a real deploy. It goes to plan 14-05's
+// consolidated checkpoint, not to an executor's judgement.
+//
+// FALLBACK: a public `fetch()` to the custom domain instead of a binding — and
+//   it is written down here whether the spike passed or not, because the owner
+//   asked on 2026-09-23 to know it was on the table before Phase 27 is planned
+//   rather than during it. What it costs: the call leaves the edge, re-enters
+//   through DNS and the portal, spends a subrequest, and becomes subject to the
+//   Zero Trust policies SEED-010 adds — which is "the portal is never the gate"
+//   being crossed from the inside. NOTHING IN THIS PLAN ADOPTS IT. Adopting it
+//   reopens a decision the owner made on 2026-09-23, and reopening it is his
+//   call.
+// ---------------------------------------------------------------------------
+//
 // **No real Apple ID is ever authenticated (D-09).** Every sign-in below goes
 // through `test/fixtures/worker-with-login-proof.ts`, whose proof is a counter.
 // The address is under the reserved `.invalid` domain and the password is
