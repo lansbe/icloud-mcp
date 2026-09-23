@@ -492,7 +492,7 @@ export const HOME_EXEMPT_REQUEST_SITES: readonly ExemptSite[] = Object.freeze([
   // than the derivation arguments above, not a weaker one.
   {
     file: DIAGNOSE,
-    fn: "countCalendars",
+    fn: "probeCalendarHome",
     request: "propfind",
     reason:
       "the target is the homeUrl parameter, and runOneService is its only caller and passes resolved.homeUrl; the whole dav_diagnose input is a single refresh boolean, so no caller-supplied value reaches this URL at all",
