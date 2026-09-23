@@ -5,6 +5,7 @@
 //   node scripts/grants.mjs revoke <grantId>... [--yes]
 //   node scripts/grants.mjs revoke --address <a> [--yes]
 //   node scripts/grants.mjs revoke --legacy-owner [--yes]
+//   node scripts/grants.mjs prune-clients [--yes]
 //   node scripts/grants.mjs --help
 //
 // **It runs as YOU, through wrangler's own login, and there is no web endpoint
@@ -27,9 +28,17 @@
 // namespace ids, so the binding names used here resolve through it. On a fresh
 // clone, copy the example config and fill it in first.
 //
-// **What it can delete.** Only a grant and the tokens under it, and only after
-// printing them and being told --yes. It never touches the allow list, which is
-// step 1 of removing somebody and is a separate decision.
+// **What it can delete.** Two things, and only after printing them and being
+// told --yes. A grant and the tokens under it. And a client registration that NO
+// grant names — which is a different job with a different reason: registration is
+// unauthenticated by the OAuth spec, a client record never expires, and nothing
+// else in this repository ever removes one, so they accumulate forever in the
+// same namespace as the grants. A record a grant still names is never touched:
+// deleting one makes that grant's next refresh answer `invalid_client` and signs
+// that person out even though their grant is perfect.
+//
+// It never touches the allow list, which is step 1 of removing somebody and is a
+// separate decision.
 //
 // Layout below, and the ORDER is load-bearing:
 //

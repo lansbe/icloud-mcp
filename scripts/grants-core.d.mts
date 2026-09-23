@@ -52,6 +52,14 @@ export interface GrantRow {
   readonly id: string;
   /** The store's user segment this grant sits under. */
   readonly userKey: string;
+  /**
+   * Which `client:` record this grant claims. Empty when the summary had none.
+   *
+   * Carried, not just consulted: the prune's safe set is "every record no grant
+   * names", and that question cannot be answered from `clientPresent`, which
+   * answers the reverse one.
+   */
+  readonly clientId: string;
   /** `metadata.clientName`, neutralised and cut at render time. */
   readonly clientName: string;
   /** ISO day the grant was made, or the unknown marker. */
@@ -87,6 +95,9 @@ export interface GrantDeps {
 /** The first sentence printed when `--yes` was not given. Plan 12-05 greps it. */
 export declare const NOTHING_REVOKED: string;
 
+/** The same sentence for `prune-clients`, so neither can be misread as the other. */
+export declare const NOTHING_PRUNED: string;
+
 /**
  * Every usage form, in one place.
  *
@@ -108,11 +119,34 @@ export declare function createWranglerKv(
   binding: string,
 ): GrantStore;
 
-/** Every grant in the store, grouped by user segment and labelled. */
+/**
+ * Every grant in the store, grouped by user segment and labelled.
+ *
+ * `presentClients` is optional so one run of the program can pay for the client
+ * listing once and hand the set down. Omitting it lists the prefix here.
+ */
 export declare function listGrants(
   kv: GrantStore,
   knownAddresses: readonly string[],
+  presentClients?: ReadonlySet<string>,
 ): Promise<GrantGroup[]>;
+
+/** Every client id that still has a record in the store. */
+export declare function presentClientIds(
+  kv: GrantStore,
+): Promise<Set<string>>;
+
+/**
+ * The client records no grant names any more. Pure — it reads no store.
+ *
+ * A record a grant still claims is never in the result: deleting one makes that
+ * grant's next refresh answer `invalid_client` even though the grant is fine,
+ * which signs the person out (spike S2).
+ */
+export declare function orphanClientIds(
+  presentClients: ReadonlySet<string>,
+  groups: readonly GrantGroup[],
+): string[];
 
 /** The groups as text. Returns lines; prints nothing. */
 export declare function renderGrants(groups: readonly GrantGroup[]): string;

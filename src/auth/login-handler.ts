@@ -934,6 +934,18 @@ export const REGISTRATION_REFUSED_DESCRIPTION =
   "This server does not accept a client registration for that redirect address.";
 
 /**
+ * The longest `client_name` this server will store.
+ *
+ * Exported so a test asserts against the bound the code uses rather than a
+ * second copy of the number.
+ *
+ * 256 is chosen to be obviously above every real value and obviously below the
+ * 1 MiB body the registration endpoint would otherwise accept. It is a cap on
+ * what gets STORED FOREVER, not an opinion about names.
+ */
+export const MAX_CLIENT_NAME_LENGTH = 256;
+
+/**
  * Refuse a registration whose redirect addresses are not all on the allowlist.
  *
  * ONE RULE, TWO CALL SITES. The authorize page and the registration endpoint
@@ -979,7 +991,31 @@ export function refuseUnlistedRedirects({
           typeof uri === "string" && isAllowedRedirectOrigin(originOf(uri)),
       );
 
-    return allowed
+    // A SIZE BOUND, and the redirect gate is not one. The registration endpoint
+    // is unauthenticated by the OAuth spec and accepts a body up to 1 MiB, the
+    // library puts no length cap on `client_name`, and a client record never
+    // expires now — so one accepted registration can park most of a megabyte in
+    // the namespace that holds the grants and the tokens, permanently. The
+    // loopback half of the redirect gate admits any port, so passing it costs a
+    // stranger nothing. `prune-clients` in `scripts/grants.mjs` is the removal;
+    // this is the cheap half that stops the record being that large to begin
+    // with.
+    //
+    // The ceiling is far above anything real. On 2026-09-21 the longest name
+    // among 21 live client records was well under this (12-RESEARCH.md § Finding
+    // 2), and the name is only ever shown on the consent screen and in the
+    // grants listing — which cuts it to 60 characters anyway.
+    //
+    // A name that is present and not a string is refused rather than ignored:
+    // this function's job is deciding whether to store the body, and a field it
+    // cannot measure is one it cannot vouch for.
+    const name: unknown = clientMetadata.client_name;
+    const namedSafely =
+      name === undefined ||
+      name === null ||
+      (typeof name === "string" && name.length <= MAX_CLIENT_NAME_LENGTH);
+
+    return allowed && namedSafely
       ? undefined
       : { description: REGISTRATION_REFUSED_DESCRIPTION };
   } catch {

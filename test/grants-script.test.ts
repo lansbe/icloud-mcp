@@ -58,9 +58,11 @@ import type { EntryEnv } from "../src/env";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 import { maskAppleId, userIdOf } from "../src/principal";
 import {
+  NOTHING_PRUNED,
   NOTHING_REVOKED,
   createWranglerKv,
   listGrants,
+  orphanClientIds,
   renderGrants,
   runGrants,
 } from "../scripts/grants-core.mjs";
@@ -379,6 +381,62 @@ function refusingDeps(
     },
     write: out.write,
     writeError: out.write,
+  };
+}
+
+/**
+ * A store this case OWNS, so a delete cannot reach a sibling file's records.
+ *
+ * Hygiene rule 3 forbids asserting on a total against the pool's shared store,
+ * and `prune-clients --yes` makes that rule sharper than it is anywhere else in
+ * this file: the command's target set is "every client record no grant names",
+ * which against the shared store is every record every OTHER suite registered
+ * and has not yet cleaned up. So the prune runs here and nowhere else.
+ *
+ * Values are stored as parsed objects, which the library's `get` accepts for
+ * every `type` it asks for.
+ */
+function ownStore(records: Record<string, unknown>): GrantStore {
+  const data = new Map(Object.entries(records));
+  return {
+    async list(options?: { prefix?: string }) {
+      const prefix = options?.prefix ?? "";
+      return {
+        keys: [...data.keys()]
+          .filter((name) => name.startsWith(prefix))
+          .sort()
+          .map((name) => ({ name })),
+        list_complete: true,
+      };
+    },
+    async get(name: string) {
+      return data.has(name) ? data.get(name) : null;
+    },
+    async delete(name: string) {
+      data.delete(name);
+    },
+  };
+}
+
+/** Every key in a store this case owns, read through the store's own list. */
+async function namesIn(kv: GrantStore): Promise<string[]> {
+  return (await kv.list({})).keys.map((key) => key.name);
+}
+
+/** A grant record in the library's own summary shape, for a store we own. */
+function grantRecord(
+  userKey: string,
+  grantId: string,
+  clientId: string,
+): Record<string, unknown> {
+  return {
+    id: grantId,
+    clientId,
+    userId: userKey,
+    scope: ["mcp"],
+    metadata: { clientName: "a client" },
+    encryptedProps: "not-real-ciphertext-written-by-a-test",
+    createdAt: 1_780_000_000,
   };
 }
 
@@ -879,6 +937,194 @@ describe("LIFE-05: the owner lists grants by masked address and revokes them", (
     expect(kv.readFailures?.()).toBe(0);
     expect(await kv.get("grant:u1:g1", { type: "json" })).toBeNull();
     expect(kv.readFailures?.()).toBe(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // prune-clients (CR-01). A client registration is unauthenticated, never
+  // expires, and nothing in this repository removed one before this command.
+  // The library's own sweeper has no client sweep, and calling it would perform
+  // the forced logout LIFE-01 exists to remove.
+  // -------------------------------------------------------------------------
+
+  it("orphanClientIds reads no store and never names a record a grant claims", () => {
+    const groups: GrantGroup[] = [
+      {
+        userKey: "u1",
+        label: "somebody",
+        kind: "address",
+        grants: [
+          {
+            id: "g1",
+            userKey: "u1",
+            clientId: "claimed-one",
+            clientName: "",
+            created: "2026-01-01",
+            expires: "never",
+            clientPresent: true,
+          },
+          // An empty client id claims nothing. It must neither make a record
+          // safe nor make one unsafe.
+          {
+            id: "g2",
+            userKey: "u1",
+            clientId: "",
+            clientName: "",
+            created: "2026-01-01",
+            expires: "never",
+            clientPresent: false,
+          },
+        ],
+      },
+    ];
+
+    expect(
+      orphanClientIds(
+        new Set(["claimed-one", "orphan-b", "orphan-a"]),
+        groups,
+      ),
+    ).toEqual(["orphan-a", "orphan-b"]);
+
+    // Every record claimed: nothing to do, and in particular not an empty-string
+    // entry conjured from the second grant.
+    expect(orphanClientIds(new Set(["claimed-one"]), groups)).toEqual([]);
+    // No records at all: a grant naming a record that is gone is already dead
+    // (spike S2) and is not this command's business.
+    expect(orphanClientIds(new Set(), groups)).toEqual([]);
+  });
+
+  it("prune-clients without --yes lists the orphan and deletes nothing", async () => {
+    const kv = ownStore({
+      "grant:u1:g1": grantRecord("u1", "g1", "claimed-client-id"),
+      "client:claimed-client-id": { clientId: "claimed-client-id" },
+      "client:orphan-client-id": { clientId: "orphan-client-id" },
+    });
+    const out = sink();
+
+    const code = await runGrants(["prune-clients"], {
+      kv,
+      async knownAddresses() {
+        return [];
+      },
+      write: out.write,
+      writeError: out.write,
+    });
+
+    expect(code).toBe(0);
+    // Eight characters and an ellipsis, the same cut an unlabelled user segment
+    // gets. The record itself is never READ: a client_name can be most of a MiB,
+    // and pulling that through the owner's terminal is the one thing this must
+    // not do.
+    expect(out.text()).toContain(`orphan-c…`);
+    expect(out.text()).not.toContain("orphan-client-id");
+    expect(out.text()).not.toContain("claimed-c");
+    // Compared against the export, not a second copy of the sentence.
+    expect(out.text()).toContain(NOTHING_PRUNED);
+
+    expect((await namesIn(kv)).sort()).toEqual([
+      "client:claimed-client-id",
+      "client:orphan-client-id",
+      "grant:u1:g1",
+    ]);
+  });
+
+  it("prune-clients --yes deletes only the orphan, and never the claimed record", async () => {
+    const kv = ownStore({
+      "grant:u1:g1": grantRecord("u1", "g1", "claimed-client-id"),
+      "client:claimed-client-id": { clientId: "claimed-client-id" },
+      "client:orphan-client-id": { clientId: "orphan-client-id" },
+    });
+    const out = sink();
+
+    const code = await runGrants(["prune-clients", "--yes"], {
+      kv,
+      async knownAddresses() {
+        return [];
+      },
+      write: out.write,
+      writeError: out.write,
+    });
+
+    expect(code).toBe(0);
+    // The claimed record survives, and so does the grant. Deleting a claimed
+    // record makes that grant's next refresh answer `invalid_client` and signs
+    // the person out even though their grant is perfect (spike S2) — which is
+    // the whole reason this command computes its targets from the grants.
+    expect((await namesIn(kv)).sort()).toEqual([
+      "client:claimed-client-id",
+      "grant:u1:g1",
+    ]);
+    expect(out.text()).toContain("Deleted 1 client record");
+  });
+
+  it("prune-clients says so when there is nothing to prune, and deletes nothing", async () => {
+    const kv = ownStore({
+      "grant:u1:g1": grantRecord("u1", "g1", "claimed-client-id"),
+      "client:claimed-client-id": { clientId: "claimed-client-id" },
+    });
+    const out = sink();
+
+    // With --yes, which is the sharper case: a command told to go ahead with an
+    // empty target set must still delete nothing.
+    const code = await runGrants(["prune-clients", "--yes"], {
+      kv,
+      async knownAddresses() {
+        return [];
+      },
+      write: out.write,
+      writeError: out.write,
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("No orphan client registrations");
+    expect(out.text()).not.toContain("Deleted");
+    expect((await namesIn(kv)).sort()).toEqual([
+      "client:claimed-client-id",
+      "grant:u1:g1",
+    ]);
+  });
+
+  it("list reports the orphan count, so the growth is not silent", async () => {
+    const kv = ownStore({
+      "grant:u1:g1": grantRecord("u1", "g1", "claimed-client-id"),
+      "client:claimed-client-id": { clientId: "claimed-client-id" },
+      "client:orphan-one": { clientId: "orphan-one" },
+      "client:orphan-two": { clientId: "orphan-two" },
+    });
+    const out = sink();
+
+    const code = await runGrants(["list"], {
+      kv,
+      async knownAddresses() {
+        return [];
+      },
+      write: out.write,
+      writeError: out.write,
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("2 client registrations no grant names");
+    expect(out.text()).toContain("prune-clients");
+    // Still no full record id in the listing's note.
+    expect(out.text()).not.toContain("orphan-one");
+  });
+
+  it("prune-clients refuses a target without touching the store", async () => {
+    // It deliberately takes none. The safe set is computed FROM the grants, so
+    // letting the owner name a record would be letting them name the one thing
+    // the computation exists to refuse.
+    for (const argv of [
+      ["prune-clients", "some-client-id"],
+      ["prune-clients", "--address", "someone@example.invalid"],
+      ["prune-clients", "--legacy-owner", "--yes"],
+    ]) {
+      const calls: string[] = [];
+      const out = sink();
+      const code = await runGrants(argv, refusingDeps(calls, out));
+
+      expect(code).toBe(2);
+      expect(calls, `${argv.join(" ")} reached the store`).toEqual([]);
+      expect(out.text()).toContain("prune-clients takes no grant id");
+    }
   });
 
   it("says it read the remote store when it found nothing", async () => {

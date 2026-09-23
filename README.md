@@ -337,6 +337,28 @@ endpoint would be new attack surface on a server that reaches real mail, for a
 job you do a few times a year. Run `node scripts/grants.mjs --help` for every
 form.
 
+### Housekeeping — clearing out old app registrations
+
+Every app that connects registers itself first. That registration is a small
+record in the same store as the connections, **anyone on the internet can make
+one** (the OAuth spec requires the endpoint to be open), and it does not expire.
+Nothing else removes them, so they pile up.
+
+`list` tells you how many are lying around. To see them and clear them out:
+
+```bash
+node scripts/grants.mjs prune-clients          # shows what it would delete
+node scripts/grants.mjs prune-clients --yes    # deletes it
+```
+
+**It only ever touches a registration that no connection is using.** A
+registration still attached to somebody's live connection is never deleted:
+removing one signs that person out, even though their connection itself is
+perfectly fine. So this cannot cut anybody off. It is tidying, not removing.
+
+This does not replace step 2 above. Revoking a connection is how you end
+somebody's session; this just sweeps up the leftovers.
+
 ### Why it works like this
 
 The per-request check has to be synchronous, and a KV read is not. So the check

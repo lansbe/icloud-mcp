@@ -44,6 +44,19 @@
 //      request rather than guessing, because the guess would cut off the wrong
 //      person's connection.
 //
+// **There is a second thing it can delete, and it is a different job.**
+// `prune-clients` removes `client:` records that NO grant names. Registration is
+// unauthenticated by the OAuth spec, a client record never expires, the library's
+// own sweeper has a grant sweep and a token sweep and no client sweep, and
+// calling that sweeper would perform the forced logout LIFE-01 exists to remove.
+// So without this the records accumulate forever in the very namespace holding
+// the grants and the tokens, on a write any stranger can make. The safe set is
+// computed FROM the grants and never from the records, because a record a grant
+// still claims is load-bearing: deleting one makes that grant's next refresh
+// answer `invalid_client` even though the grant is perfect, which signs the
+// person out (spike S2). The records are LISTED and never READ — a `client_name`
+// is chosen by whoever registered and the endpoint accepts a body up to 1 MiB.
+//
 // The full grant id IS printed. It is needed to revoke, and it is not a
 // credential on its own — an access token is `userId:grantId:secret` and the
 // secret is the part that is never stored in the clear anywhere.
@@ -90,6 +103,23 @@ const EXIT_USAGE = 2;
 export const NOTHING_REVOKED =
   "Nothing was revoked. Re-run with --yes to revoke the grants listed above.";
 
+/** The same sentence for the prune, so neither command can be misread as the other. */
+export const NOTHING_PRUNED =
+  "Nothing was deleted. Re-run with --yes to delete the client records above.";
+
+/** What the owner sees when there is nothing to prune. */
+const NO_ORPHAN_CLIENTS =
+  "No orphan client registrations. Every client record still has a grant naming it.";
+
+/**
+ * Printed if a record turned out to be claimed after all.
+ *
+ * It names nothing. The point is that the record was KEPT, and the owner's next
+ * action is the same either way: run the command again.
+ */
+const KEPT_CLAIMED_CLIENT =
+  "A client record gained a grant while this ran, so it was kept. Run the command again.";
+
 /** What the owner sees for an empty listing. It says which store it read. */
 const NOTHING_FOUND =
   "No grants found. This read the REMOTE store, not the local simulator.";
@@ -103,7 +133,13 @@ export const USAGE = [
   "  node scripts/grants.mjs revoke <grantId>... [--yes]",
   "  node scripts/grants.mjs revoke --address <a> [--yes]",
   "  node scripts/grants.mjs revoke --legacy-owner [--yes]",
+  "  node scripts/grants.mjs prune-clients [--yes]",
   "  node scripts/grants.mjs --help",
+  "",
+  "prune-clients deletes client registrations that NO grant names. Registration",
+  "is unauthenticated and a client record never expires, so they accumulate. A",
+  "record a grant still names is never touched: deleting one signs that person",
+  "out even though their grant is fine.",
   "",
   "Nothing is deleted without --yes. A revoke always prints its targets first.",
   "An --address value is used only to label a group; it is never printed back.",
@@ -115,6 +151,9 @@ const UNKNOWN_FLAG = "Unknown flag.";
 const ADDRESS_NEEDS_VALUE = "--address needs an address after it.";
 const LIST_TAKES_NO_IDS = "list takes no grant ids.";
 const LIST_TAKES_NO_YES = "list deletes nothing, so --yes means nothing here.";
+const PRUNE_TAKES_NO_TARGET =
+  "prune-clients takes no grant id, no --address and no --legacy-owner. " +
+  "It acts on every client record no grant names.";
 const REVOKE_NEEDS_TARGET =
   "revoke needs a grant id, --address <a>, or --legacy-owner.";
 const PREFIX_TOO_SHORT =
@@ -227,7 +266,7 @@ async function distinctUserKeys(kv) {
  * @param {import("./grants-core.d.mts").GrantStore} kv
  * @returns {Promise<Set<string>>}
  */
-async function presentClientIds(kv) {
+export async function presentClientIds(kv) {
   const present = new Set();
   for (const name of await allKeysUnder(kv, "client:")) {
     present.add(name.slice("client:".length));
@@ -402,15 +441,22 @@ export function createWranglerKv(run, binding) {
  * No whole stored value ever reaches a row. The library's summary carries no
  * props and no key material, and only its named fields are copied.
  *
+ * `presentClients` is optional and exists so ONE run of the program pays for the
+ * client listing once. `runGrants` reads that set itself — it needs it for the
+ * orphan count too — and hands it down. A caller that passes nothing gets the
+ * old behaviour and the listing happens here.
+ *
  * @param {import("./grants-core.d.mts").GrantStore} kv
  * @param {readonly string[]} knownAddresses
+ * @param {ReadonlySet<string>} [presentClients]
  * @returns {Promise<import("./grants-core.d.mts").GrantGroup[]>}
  */
-export async function listGrants(kv, knownAddresses) {
+export async function listGrants(kv, knownAddresses, presentClients) {
   const helpers = helpersOver(kv);
   const userKeys = await distinctUserKeys(kv);
   const labels = await labelsFor(knownAddresses);
-  const clients = await presentClientIds(kv);
+  const clients =
+    presentClients === undefined ? await presentClientIds(kv) : presentClients;
 
   const groups = [];
   for (const userKey of userKeys) {
@@ -422,9 +468,15 @@ export async function listGrants(kv, knownAddresses) {
         cursor === undefined ? undefined : { cursor },
       );
       for (const item of result?.items ?? []) {
+        const clientId = typeof item?.clientId === "string" ? item.clientId : "";
         grants.push({
           id: typeof item?.id === "string" ? item.id : "",
           userKey,
+          // Carried rather than only consulted. `clientPresent` below answers
+          // "is the record still there"; the prune answers the reverse question
+          // — "is there still a grant naming this record" — and it cannot be
+          // answered without knowing which record each grant claims.
+          clientId,
           // The raw name. It is neutralised at render time, so a caller reading
           // a row still sees what was stored.
           clientName:
@@ -436,9 +488,7 @@ export async function listGrants(kv, knownAddresses) {
             item?.expiresAt === undefined || item?.expiresAt === null
               ? "never"
               : isoDay(item.expiresAt),
-          clientPresent: clients.has(
-            typeof item?.clientId === "string" ? item.clientId : "",
-          ),
+          clientPresent: clients.has(clientId),
         });
       }
       if (typeof result?.cursor !== "string" || result.cursor.length === 0) break;
@@ -481,6 +531,135 @@ export async function listGrants(kv, knownAddresses) {
       : rank[left.kind] - rank[right.kind],
   );
   return groups;
+}
+
+/**
+ * The client records that no grant names any more. PURE — it reads no store.
+ *
+ * **Why this exists.** Client registration is unauthenticated by the OAuth spec,
+ * it never expires (a TTL would eventually kill a live client — spike S2 — so
+ * restoring one is not the answer), and until now nothing in this repository
+ * ever deleted a `client:` record. The library's own sweeper has a grant sweep
+ * and a token sweep and no client sweep, and calling it would perform the forced
+ * logout LIFE-01 exists to remove. So without this the namespace holding the
+ * grants and the tokens grew forever, on a write any stranger could make.
+ *
+ * **The safe set is defined by the grants, not by the records.** A record is
+ * only a candidate when NO grant claims it. That is the whole of spike S2's
+ * lesson: a client whose record is gone answers `invalid_client` on its next
+ * refresh even though the grant itself is perfect, so deleting a claimed record
+ * silently signs that person out.
+ *
+ * A grant whose row carries an empty client id claims nothing and is ignored —
+ * it cannot make a record safe and it cannot make one unsafe.
+ *
+ * @param {ReadonlySet<string>} presentClients
+ * @param {readonly import("./grants-core.d.mts").GrantGroup[]} groups
+ * @returns {string[]}
+ */
+export function orphanClientIds(presentClients, groups) {
+  const claimed = new Set();
+  for (const group of groups) {
+    for (const grant of group.grants) {
+      if (grant.clientId.length > 0) claimed.add(grant.clientId);
+    }
+  }
+  const orphans = [];
+  for (const id of presentClients) {
+    if (!claimed.has(id)) orphans.push(id);
+  }
+  // Stable, so two runs read the same and a diff of two captures means the store
+  // changed rather than the iteration order.
+  orphans.sort((left, right) => left.localeCompare(right));
+  return orphans;
+}
+
+/**
+ * The orphan records as text, each id cut to the same eight characters an
+ * unlabelled user segment is cut to.
+ *
+ * **The record is never READ, only listed.** A `client_name` is chosen by
+ * whoever registered and the registration endpoint accepts a body up to 1 MiB,
+ * so fetching these to print a nicer label is the one thing this command must
+ * not do — it would pull an attacker's chosen megabyte through the owner's
+ * terminal. Eight characters is enough to count them and to diff two runs.
+ *
+ * @param {readonly string[]} orphans
+ * @returns {string}
+ */
+function renderOrphans(orphans) {
+  if (orphans.length === 0) return `${NO_ORPHAN_CLIENTS}\n`;
+
+  const lines = [
+    "Client registrations in the REMOTE store that NO grant names.",
+    "",
+  ];
+  for (const id of orphans) {
+    lines.push(`  ${printable(id, UNKNOWN_ID_CHARACTERS)}${ELLIPSIS}`);
+  }
+  lines.push("");
+  lines.push(
+    `${orphans.length} ${orphans.length === 1 ? "record" : "records"}, ` +
+      "none of them holding a live connection.",
+  );
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Delete the orphan records, then check the store agrees.
+ *
+ * `kv.delete` on the key directly, and NEVER the library's `deleteClient`: that
+ * helper revokes every grant under the client as well, which is the forced
+ * logout this whole phase exists to remove, arriving by another road.
+ *
+ * `claimed` is passed in and checked HERE rather than trusted from the caller.
+ * The caller has already excluded these, so this branch should be unreachable —
+ * which is exactly why it is worth having at the one line that does the damage.
+ * A future edit that widens the candidate set still cannot delete a record
+ * somebody's grant depends on.
+ *
+ * Serial, one delete at a time, and each one independent: a key that vanished
+ * between the listing and the delete must not abort the rest.
+ *
+ * @param {import("./grants-core.d.mts").GrantStore} kv
+ * @param {readonly string[]} orphans
+ * @param {ReadonlySet<string>} claimed
+ * @param {(text: string) => void} writeError
+ * @returns {Promise<number>}
+ */
+async function pruneClients(kv, orphans, claimed, writeError) {
+  for (const id of orphans) {
+    if (claimed.has(id)) {
+      writeError(`${KEPT_CLAIMED_CLIENT}\n`);
+      continue;
+    }
+    try {
+      await kv.delete(`client:${id}`);
+    } catch {
+      // Never read the caught value: under the wrangler adapter it carries that
+      // command's own output.
+      writeError(
+        `Client record ${printable(id, UNKNOWN_ID_CHARACTERS)}${ELLIPSIS} ` +
+          "could not be deleted. Run the command again.\n",
+      );
+    }
+  }
+
+  // The check, in the same shape the revoke's verification takes: a delete that
+  // reported success and left the key behind is what this exists to catch.
+  const still = await presentClientIds(kv);
+  let left = 0;
+  for (const id of orphans) {
+    if (claimed.has(id)) continue;
+    if (still.has(id)) {
+      left += 1;
+      writeError(
+        `Client record ${printable(id, UNKNOWN_ID_CHARACTERS)}${ELLIPSIS} ` +
+          "is still in the store after the delete. Run the command again.\n",
+      );
+    }
+  }
+  return left;
 }
 
 /**
@@ -543,7 +722,7 @@ function readArguments(argv) {
   if (rest.length > 0 && !String(rest[0]).startsWith("-")) {
     command = String(rest.shift());
   }
-  if (command !== "list" && command !== "revoke") {
+  if (command !== "list" && command !== "revoke" && command !== "prune-clients") {
     return { error: UNKNOWN_COMMAND };
   }
 
@@ -578,6 +757,15 @@ function readArguments(argv) {
     if (ids.length > 0) return { error: LIST_TAKES_NO_IDS };
     if (yes) return { error: LIST_TAKES_NO_YES };
     if (legacyOwner) return { error: UNKNOWN_FLAG };
+  }
+
+  if (command === "prune-clients") {
+    // It takes NO target, and that is the point rather than an omission: the
+    // safe set is computed from the grants, so letting the owner name a record
+    // would be letting them name the one thing the computation exists to refuse.
+    if (ids.length > 0 || addresses.length > 0 || legacyOwner) {
+      return { error: PRUNE_TAKES_NO_TARGET };
+    }
   }
 
   if (
@@ -734,7 +922,12 @@ export async function runGrants(argv, deps) {
   const addresses = [
     ...new Set([...(await deps.knownAddresses()), ...asked.addresses]),
   ];
-  const groups = await listGrants(deps.kv, addresses);
+  // The client prefix is listed HERE, once, and handed down. Both the listing's
+  // `client present` column and the orphan count need it, and a second listing
+  // would double the slowest part of the owner's wait for nothing.
+  const clients = await presentClientIds(deps.kv);
+  const groups = await listGrants(deps.kv, addresses, clients);
+  const orphans = orphanClientIds(clients, groups);
 
   /** Say so when a record could not be read, rather than showing a short list. */
   const noteIncompleteReads = () => {
@@ -745,7 +938,53 @@ export async function runGrants(argv, deps) {
 
   if (asked.command === "list") {
     write(renderGrants(groups));
+    // The growth is stated rather than left silent. Nothing in this repository
+    // deleted a client record before this command existed, so an owner who never
+    // sees the count has no way to know the namespace is filling up.
+    if (orphans.length > 0) {
+      write(
+        `${orphans.length} client ` +
+          `${orphans.length === 1 ? "registration" : "registrations"} ` +
+          "no grant names. Run prune-clients to see them.\n",
+      );
+    }
     noteIncompleteReads();
+    return EXIT_OK;
+  }
+
+  if (asked.command === "prune-clients") {
+    write(renderOrphans(orphans));
+    noteIncompleteReads();
+    if (orphans.length === 0) return EXIT_OK;
+    if (!asked.yes) {
+      write(`${NOTHING_PRUNED}\n`);
+      return EXIT_OK;
+    }
+
+    // A SECOND read of both prefixes, on the --yes path only. Somebody can
+    // register a client and complete a sign-in in the seconds between the owner
+    // reading the list and re-running with --yes, and deleting that record would
+    // sign them straight back out. Only ids orphaned in BOTH views are deleted;
+    // the fresh view's claimed set is then checked again at the delete itself.
+    const freshClients = await presentClientIds(deps.kv);
+    const freshGroups = await listGrants(deps.kv, addresses, freshClients);
+    const stillOrphan = new Set(orphanClientIds(freshClients, freshGroups));
+    const claimed = new Set();
+    for (const group of freshGroups) {
+      for (const grant of group.grants) {
+        if (grant.clientId.length > 0) claimed.add(grant.clientId);
+      }
+    }
+    const going = orphans.filter((id) => stillOrphan.has(id));
+
+    const left = await pruneClients(deps.kv, going, claimed, writeError);
+    if (left > 0) return EXIT_FAILED;
+    write(
+      `Deleted ${going.length} client ` +
+        `${going.length === 1 ? "record" : "records"}. No grant named any of ` +
+        "them, so no connection was cut. Allow about a minute for the deletes " +
+        "to be seen everywhere.\n",
+    );
     return EXIT_OK;
   }
 

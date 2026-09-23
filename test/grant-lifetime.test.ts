@@ -69,6 +69,7 @@ import type {
   ClientRegistrationCallbackResult,
 } from "@cloudflare/workers-oauth-provider";
 import {
+  MAX_CLIENT_NAME_LENGTH,
   REGISTRATION_REFUSED_DESCRIPTION,
   createLoginHandler,
   refuseUnlistedRedirects,
@@ -684,6 +685,43 @@ describe("LIFE-02: a registration off the allowlist is refused at the door", () 
     expect(judge(["https://claude.ai/api/mcp/auth_callback", 7])).toEqual(
       REGISTRATION_REFUSAL,
     );
+  });
+
+  it("caps client_name, because a client record is now stored forever", () => {
+    // CR-01's cheap half. Registration is unauthenticated by the OAuth spec and
+    // accepts a body up to 1 MiB; the library puts no length cap on this field
+    // and a client record no longer expires. So without a bound one accepted
+    // registration parks most of a megabyte, permanently, in the very namespace
+    // that holds the grants and the tokens. The redirect gate does not help: its
+    // loopback half admits any port, so passing it costs a stranger nothing.
+    const good = "https://claude.ai/api/mcp/auth_callback";
+    const nameOf = (
+      client_name: unknown,
+    ): ClientRegistrationCallbackResult | undefined | void =>
+      refuseUnlistedRedirects(
+        registrationOptions({
+          client_name,
+          redirect_uris: [good],
+          token_endpoint_auth_method: "none",
+        }),
+      );
+
+    // Compared against the exported bound, not a second copy of the number.
+    expect(nameOf("n".repeat(MAX_CLIENT_NAME_LENGTH))).toBeUndefined();
+    expect(nameOf("n".repeat(MAX_CLIENT_NAME_LENGTH + 1))).toEqual(
+      REGISTRATION_REFUSAL,
+    );
+
+    // Absent is fine — the field is optional in the spec and the consent screen
+    // already has a fallback for it.
+    expect(nameOf(undefined)).toBeUndefined();
+    expect(nameOf(null)).toBeUndefined();
+
+    // Present but not a string is REFUSED rather than ignored. This callback
+    // decides whether to store the body, and a field it cannot measure is one it
+    // cannot vouch for.
+    expect(nameOf(7)).toEqual(REGISTRATION_REFUSAL);
+    expect(nameOf({ toString: () => "short" })).toEqual(REGISTRATION_REFUSAL);
   });
 
   it("refuses a metadata object whose getter throws, and does not throw itself", () => {
