@@ -341,6 +341,19 @@ export async function withMailSessionOver<T>(
 ): Promise<T> {
   gate.acquire();
 
+  /**
+   * Whether Apple named a credential condition — recorded, not acted on yet.
+   *
+   * The report is a store write, and a store write made while the socket is
+   * still open is a second concurrent connection at the worst possible moment
+   * (WR-03). CLAUDE.md § 3 is explicit that the six-simultaneous-connection
+   * budget counts store reads alongside sockets, and that the OAuth provider has
+   * already spent one before any mail code runs. It also extends the socket's
+   * life by a store round trip on the one path that is already failing, and the
+   * write throttles per key, so a burst makes it slow rather than instant.
+   */
+  let credentialRefused = false;
+
   const channel = new ImapChannel(duplex, {
     readTimeoutMs: options.readTimeoutMs,
     // The second bound on D-51's seam, threaded exactly as the first is. This
@@ -376,7 +389,10 @@ export async function withMailSessionOver<T>(
       // `mail_imap_diagnose` for fifteen minutes, which is the tool that would
       // have explained it. The throw is unconditional either way: the call
       // still fails fast, exactly as the DAV site's 403 exclusion leaves it.
-      if (auth.credentialRefused) await reportRefusal(principal);
+      //
+      // The need is RECORDED here and the store write happens after teardown
+      // (WR-03). See the `finally` below for why.
+      credentialRefused = auth.credentialRefused;
       throw new ImapAuthError();
     }
 
@@ -461,6 +477,14 @@ export async function withMailSessionOver<T>(
       // always the more informative of the two.
     }
     gate.release();
+
+    // LAST, with the socket gone and the gate released, so the store write is
+    // never a second concurrent connection (WR-03). `reportRefusal` is written
+    // not to throw, so it cannot replace the error the conversation raised; and
+    // it does nothing at all unless the door armed this principal, which is what
+    // keeps the sign-in page — which runs this very function — from pausing
+    // anybody.
+    if (credentialRefused) await reportRefusal(principal);
   }
 }
 

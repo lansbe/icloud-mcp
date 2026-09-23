@@ -254,6 +254,16 @@ export async function runDiagnosticOver(
   let failed = false;
   let error: unknown = null;
 
+  /**
+   * Whether Apple named a credential condition — recorded, not acted on yet.
+   *
+   * Reported after teardown rather than at the refusal, so the store write is
+   * never a second concurrent connection held alongside the open socket (WR-03).
+   * `withMailSessionOver` in ./service.ts carries the same pattern and the full
+   * argument.
+   */
+  let credentialRefused = false;
+
   try {
     const greetingStart = Date.now();
     await readGreeting(channel);
@@ -288,7 +298,9 @@ export async function runDiagnosticOver(
       // than anywhere: this is the tool somebody runs to find out WHY, and a
       // pause set from a server-side reply would make the next run of it answer
       // `auth_failed` instead of the report.
-      if (auth.credentialRefused) await reportRefusal(principal);
+      //
+      // Recorded here, written after teardown (WR-03). See the `finally` below.
+      credentialRefused = auth.credentialRefused;
       throw new ImapAuthError();
     }
 
@@ -388,6 +400,11 @@ export async function runDiagnosticOver(
       // here preserves whichever error the conversation itself raised, which
       // is always the more informative of the two.
     }
+
+    // LAST, with the socket gone, so the store write is never a second
+    // concurrent connection (WR-03). `reportRefusal` is written not to throw,
+    // and does nothing at all unless the door armed this principal.
+    if (credentialRefused) await reportRefusal(principal);
   }
 
   return { report, failed, error };
