@@ -54,9 +54,11 @@
 //
 // The same goes for MASKING. `maskAppleId` is the only place in the repository
 // that builds the masked form of an address, and it calls `normaliseAppleId`
-// rather than folding again. The tool that answers "which account is this
-// connection on" and the owner's grants script both call it. A mask written
+// rather than folding again. The owner's grants script calls it. A mask written
 // inline at a call site is how two forms drift until one of them stops masking.
+// The "which account is this connection on" tool called it too until
+// 2026-09-23, when the owner reversed D4 and had that tool return the whole
+// address; the function did not change, its caller list got shorter.
 //
 // Since Phase 11 that one rule is spread over TWO exported functions, and the
 // split is what keeps it one rule rather than making it two.
@@ -197,21 +199,24 @@ const MASK_BODY = "\u2022\u2022\u2022";
  * The masked form of an Apple ID: first character, three bullets, the domain.
  *
  * `u•••@example.invalid`. This is the ONE masking rule in the repository. The
- * `account_whoami` tool calls it, and so does the owner's grants script. A
- * second mask written inline at either call site is how two forms drift until
- * one of them stops masking.
+ * owner's grants script calls it. A second mask written inline at that call site
+ * is how two forms drift until one of them stops masking.
+ *
+ * **One caller since 2026-09-23, and that is a reversal rather than a
+ * deprecation.** `account_whoami` called this too until the owner reversed D4 and
+ * had it return the whole address, because the mask made the model unable to say
+ * which account a connection was on. This function did not change: it still
+ * governs the grants listing, which prints one line per connection and is read at
+ * a glance, and it keeps its own table of tests. Deleting it because one caller
+ * left would take the grants listing's mask with it. See `.claude/CLAUDE.md` § 4.
  *
  * **It calls `normaliseAppleId` and folds nothing itself.** That is the same
  * habit `userIdOf` keeps, and for the same reason: two places that fold an
  * address are two rules, and two rules drift.
  *
- * **What it reveals, and why that is enough.** The first character of the local
- * part and the whole domain. D4 settled that: the question this answers is
- * "which account is this connection on", asked by someone on a shared laptop,
- * and the first character plus the domain answers it. The full address would
- * also answer it, and would put a whole address into a tool response — text the
- * model reads and may quote back into a draft, an event or a later message.
- * That exception is recorded in `.claude/CLAUDE.md` § 4 (LIFE-06, D4).
+ * **What it reveals.** The first character of the local part and the whole
+ * domain. That is enough for the listing it serves — one row per connection,
+ * scanned by the owner deciding which one to cut off.
  *
  * **A local part of exactly one character keeps NO character.** `a@x.invalid`
  * comes back as `•••@x.invalid`. Keeping "the first character" of a
@@ -227,11 +232,13 @@ const MASK_BODY = "\u2022\u2022\u2022";
  * **It keeps nothing and never throws.** No cache, no memo, no message built
  * from the input. A memo here would hold every address ever typed.
  *
- * **The full address is deliberately not available from this module in any form
- * meant for a response.** `Principal.appleId` carries it because the wire needs
- * it — it is the login and the draft sender address — not because a response
- * may hold it. Widening this function, or adding a second one that returns
- * more, is a decision on the safety boundary rather than a refactor.
+ * **This function hands out no more than the masked form, whatever its callers
+ * do.** `Principal.appleId` carries the whole address because the wire needs it —
+ * it is the login and the draft sender address — and since 2026-09-23 one tool
+ * reads that field and answers with it. That is that tool's recorded decision and
+ * it is not this function's. Widening this one, or adding a second masking
+ * function that reveals more, is a decision on the safety boundary rather than a
+ * refactor.
  */
 export function maskAppleId(value: unknown): string {
   const folded = normaliseAppleId(value);
@@ -244,14 +251,13 @@ export function maskAppleId(value: unknown): string {
   // A ONE-CHARACTER LOCAL PART KEEPS NO CHARACTER AT ALL. Otherwise the "first
   // character" rule hands back the whole address: `a@example.invalid` masked to
   // `a•••@example.invalid` is every byte of the input plus decoration, and the
-  // absolute claim three sites make — this docstring, `.claude/CLAUDE.md` § 4
-  // and `src/mcp/tools/account.ts` — would be false for it. An Apple ID does not
-  // have to be an `@icloud.com` address, and one-character local parts exist on
-  // other domains.
+  // absolute claim two sites make — this docstring and `.claude/CLAUDE.md` § 4 —
+  // would be false for it. An Apple ID does not have to be an `@icloud.com`
+  // address, and one-character local parts exist on other domains.
   //
-  // It costs nothing this function is for. What it answers is "which account is
-  // this connection on", and the domain alone still answers that for the one
-  // person who could ever see this row.
+  // It costs nothing this function is for. What it labels is a row in the owner's
+  // grants listing, and the domain alone still tells two connections apart for
+  // the one person who could ever see that row.
   if (at === 1) return `${MASK_BODY}${folded.slice(at)}`;
 
   return `${folded[0]}${MASK_BODY}${folded.slice(at)}`;

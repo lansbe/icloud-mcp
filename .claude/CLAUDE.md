@@ -371,63 +371,76 @@ Three habits follow, and all three are already established in `src/`:
   `.stack` from a caught value, and maps to a fixed four-value vocabulary.
 - No diagnostic field echoes the last command sent.
 
-#### A masked "which account" answer is not this rule's subject
+#### The "which account" answer holds the whole address, and that is a decision
 
 Phase 12 adds a tool, `account_whoami`, that answers which Apple ID the
-connection is signed in as. The answer is masked. That is LIFE-06, decided as D4
-on 2026-09-21. It looks like the thing this rule forbids and it is not, so the
-argument is recorded here rather than left to be re-derived.
+connection is signed in as. It returns the WHOLE address. That is LIFE-06,
+decided as D4 on 2026-09-21 and REVERSED by the owner on 2026-09-23. It looks
+like the thing this rule forbids and it is not, so the argument is recorded here
+rather than left to be re-derived.
 
-1. **The address does fall under this rule.** It is the login half of the
-   credential pair, so it belongs with the password and not with the ordinary
-   fields of an answer. And a tool response is worse than a log line in one
-   respect: it is text the model reads, and may quote back into a draft, an
-   event, or a later message. An address reaching a response is the harm here,
-   not merely untidiness.
+1. **The address does fall under this rule, and the cost is real.** It is the
+   login half of the credential pair, so it belongs with the password and not
+   with the ordinary fields of an answer. And a tool response is worse than a log
+   line in one respect: it is text the model reads, and may quote back into a
+   draft, an event, or a later message. Not one word of that stopped being true on
+   2026-09-23. The cost was accepted, not argued away.
 
-2. **The full address is never returned.** The tool returns only the form
-   `maskAppleId` in `src/principal.ts` builds: the first character of the local
-   part, three bullets, then the domain — `u•••@icloud.com`. Input that the
-   folding rule refuses comes back as the three bullets alone, with nothing
-   around them. No flag and no argument widens that, because the tool takes no
-   arguments at all.
+2. **What is returned, and to whom.** One address: the account THIS connection is
+   signed in as, read off the principal the door built from THIS connection's own
+   stored props, and handed back to the person holding that connection. Not the
+   owner's address, not another user's, not the one in the Worker secret. The
+   password is not in the answer and cannot be, because it is not on the principal
+   at all. The tool takes no arguments, so there is no value a caller can supply
+   that widens what comes back.
 
-   **The one edge, stated rather than left to be discovered.** A local part of
-   exactly one character keeps NO character: `a@x.invalid` comes back as
-   `•••@x.invalid`. Keeping "the first character" of a one-character local part
-   is keeping all of it, and an Apple ID does not have to be an `@icloud.com`
-   address, so the shape is reachable. That was a real defect until 2026-09-22 —
-   the code returned the whole address for it while this paragraph claimed the
-   absolute — and it was closed in the code rather than by softening the claim
-   here. An absolute on the safety boundary that the code does not hold is the
-   same failure as a claimed scan gate that does not exist.
+3. **The masked form shipped first, and the mask is why it was reversed.** D4
+   chose the mask on 2026-09-21 and it shipped: the first character of the local
+   part, three bullets, then the domain. Asked live against the deployed server on
+   2026-09-23, that answer made the model report the masked string and then say
+   the mask meant it could not confirm the account was that exact one. So the mask
+   defeated the tool's only purpose, which is telling a person WHICH account a
+   connection is on when they hold more than one Apple ID. A tool that cannot
+   answer its one question is not a safety measure, it is a broken tool with a
+   safety story attached. The owner judged the mask not worth its cost and chose
+   the full address. This paragraph argued the other way until that day, and the
+   reversal is recorded rather than the old argument quietly edited into the new
+   one, because a boundary whose history is rewritten cannot be audited.
 
-3. **`maskAppleId` is the only masking function.** The owner's grants script
-   calls that same one, so the listing the owner reads before cutting off a
-   connection is masked by the same rule as the answer the model reads. A mask
-   written inline at either call site is the breach. This tool is not.
+4. **`maskAppleId` stays, and is still the only masking function.** It lost a
+   caller, not its job. The owner's grants script still masks, because that
+   listing prints one line per connection and is read at a glance rather than
+   quoted into anything. Its own table of tests is kept, and so is the
+   one-character-local-part edge recorded in its docstring in `src/principal.ts`.
+   Deleting the function because one caller left would silently unmask the
+   listing, and that is the shape this project's count constraints exist to
+   catch: losing a guarantee is quieter than gaining a duplicate of it. A mask
+   written inline at any call site is still the breach.
 
-4. **The answer comes from the grant.** It is built from the principal the door
-   made out of the stored props, and from nothing else. No socket is opened, no
-   request is sent, and no environment secret is read. The tool module imports
-   nothing from the mail tree, nothing from the DAV tree, and nothing from the
-   environment types.
+5. **The reversal is scoped to this one tool, and widening is a new decision.** No
+   other tool in this project returns an address. Adding an argument to this one
+   is a decision on this boundary rather than a refactor, and so is a second tool
+   that answers with an address, and so is a field on any existing answer that
+   carries one. What was decided on 2026-09-23 is a measured exception for one
+   question, not a licence to put addresses into responses generally.
 
-5. **The unmasked answer was declined.** It answers the same question and puts a
-   whole address into a response, which is the one thing this subsection exists
-   to keep out of one. Widening the tool to return the full address is a new
-   decision, not a refactor.
-
-6. **This adds no rule to the list, and no scan rule.** Two tests hold it
-   instead. A table runs the mask over every row of the address spec, in both
-   directions, so an accepted address must come back masked and a refused one
-   must come back as bullets. And a second test drives the real door and asserts
-   that the whole response body never holds the address.
+6. **This adds no rule to the list, and no scan rule.** Tests hold it instead,
+   and the two claims are now pinned INDEPENDENTLY, which they were not while one
+   function served both. A table runs the mask over every row of the address spec,
+   in both directions, so an accepted address must come back masked and a refused
+   one must come back as bullets. Separately, the real door is driven with two
+   different listed grants, and each must get its own address back with no mask in
+   the body. Reverting the tool to the mask therefore turns the tool cases red
+   while the table stays green, and deleting the table turns the table red while
+   the tool cases stay green. Neither claim can carry the other any more.
 
 This reconciliation lives on the safety boundary itself, and not only in a phase
-artifact, because a session reading § 4 alone would read the tool as a leak and
-delete it — and deleting it would break a requirement the developer decided on
-2026-09-21 rather than fix a breach.
+artifact, for two reasons that pull in opposite directions. A session reading § 4
+alone would read the tool as a leak and delete it, and deleting it breaks a
+requirement the developer decided on 2026-09-21 and settled on 2026-09-23 rather
+than fixing a breach. A session reading the reversal alone would read it as
+permission to put an address into any response, and it is permission for exactly
+one answer to exactly one question.
 
 ### 5. Reading mail does not mark it read
 

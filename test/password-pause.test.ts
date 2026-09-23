@@ -968,7 +968,7 @@ describe("LIFE-04: the dead-password pause", () => {
       }
     });
 
-    it("the control: with no marker, the account tool answers the masked address", async () => {
+    it("the control: with no marker, the account tool answers the address", async () => {
       // Without this the three cases above are vacuous: a door that refused
       // every request would pass all of them.
       await forgetMarker();
@@ -976,10 +976,15 @@ describe("LIFE-04: the dead-password pause", () => {
 
       expect(answer.status).toBe(200);
       expect(answer.isError, "the control was refused").toBe(false);
-      expect(answer.body.signedInAs).toBe(maskAppleId(PAUSED_APPLE_ID));
-      // The standing rule still holds on this path: the full address never
-      // appears in a tool answer.
-      expect(JSON.stringify(answer.body)).not.toContain(PAUSED_APPLE_ID);
+      // The WHOLE address, since the owner reversed D4 on 2026-09-23. The mask
+      // this line used to expect now serves the owner's grants listing only, and
+      // `maskAppleId` is still imported here to say so by difference: an answer
+      // that came back masked would fail the second assertion.
+      expect(answer.body.signedInAs).toBe(PAUSED_APPLE_ID);
+      expect(
+        answer.body.signedInAs,
+        "the account tool went back to masking",
+      ).not.toBe(maskAppleId(PAUSED_APPLE_ID));
     });
 
     it("sends ZERO DAV requests while paused, against one in the control", async () => {

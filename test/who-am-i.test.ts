@@ -1,13 +1,20 @@
 // "Which Apple ID is this connection signed in as?" (LIFE-06, D4).
 //
-// **What this file proves.** The one masking rule, held to a table of inputs and
-// answers, over the same spec rows the folding rule is held to.
+// **Two independent claims live in this file, and they no longer share a
+// caller.** Since the owner reversed D4 on 2026-09-23 the tool answers with the
+// WHOLE address, and `maskAppleId` serves the owner's grants listing instead. So:
 //
-// The answer a user gets is deliberately MASKED: the first character, three
-// bullets, and the domain. It answers the shared-laptop question — which account
-// is this connection on — without putting a full address into a response the
-// model reads and may quote back into a draft, an event or a later message. That
-// exception to the standing rule is recorded in `.claude/CLAUDE.md` § 4.
+// - The first block pins the one masking rule, held to a table of inputs and
+//   answers over the same spec rows the folding rule is held to. It is the grants
+//   listing's mask now. It is kept here, and kept whole, because a function whose
+//   only remaining caller is a script is exactly the kind of thing a later
+//   session deletes as dead.
+// - The second and third blocks pin the tool, whose answer is the address as the
+//   grant stored it — no mask, no fold, no trim.
+//
+// Neither block can now make the other pass. Reverting the tool to the mask
+// leaves the table green and turns the tool blocks red; deleting the table leaves
+// the tool blocks green. That separation is the point.
 //
 // **The expectations here are this file's own literals.** Nothing below imports
 // the masked form from the module under test and compares it with itself. The
@@ -26,7 +33,7 @@ import { DEPLOYED_HOSTNAME, createMcpApiHandler } from "../src/mcp/api-handler";
 import { signedInAsResult } from "../src/mcp/tools/account";
 import { maskAppleId } from "../src/principal";
 import { entryEnv } from "./fixtures/bound-secrets";
-import { USER_A, testPrincipal } from "./fixtures/two-users";
+import { USER_A, USER_B, testPrincipal } from "./fixtures/two-users";
 import { REFUSED, USER_ID_VECTORS } from "./fixtures/user-id-vectors";
 
 /**
@@ -114,7 +121,7 @@ const MASK_ROWS: readonly MaskRow[] = [
   { name: "undefined", input: undefined, expected: REFUSED_MASK },
 ];
 
-describe("maskAppleId: the one masking rule (LIFE-06, D4)", () => {
+describe("maskAppleId: the one masking rule, for the grants listing (LIFE-06)", () => {
   it("masks with three U+2022 bullets, and this file says which character that is", () => {
     // The escape above, checked against the code point it claims. A row that
     // expected three middle dots or three full stops would still read as a
@@ -229,6 +236,29 @@ const LISTED: CaseProps = {
     v: 1,
     appleId: USER_A.appleId,
     appPassword: USER_A.appPassword,
+  },
+};
+
+/**
+ * The OTHER address on the allow-list seed, as a second listed grant.
+ *
+ * `vitest.config.ts` seeds two addresses. This one exists so the provenance claim
+ * can be made by DIFFERENCE: two grants go through the same door, the same
+ * handler and the same tool, and each gets its own address back. An answer built
+ * from anything ambient — a Worker secret, a module-scope value, a remembered
+ * first caller — would give both grants the same one and fail.
+ *
+ * Deliberately NOT the environment's `APPLE_ID`. A local override file may bind a
+ * live value there, and no test in this repository may read or assert on the
+ * ambient identity. A second fake under the reserved `.invalid` domain tells the
+ * two sources apart without touching it.
+ */
+const OTHER_LISTED: CaseProps = {
+  absent: false,
+  props: {
+    v: 1,
+    appleId: "listed-user@example.invalid",
+    appPassword: "cccc-cccc-cccc-cccc",
   },
 };
 
@@ -358,8 +388,8 @@ function firstText(message: Record<string, unknown> | null): string | null {
   return result?.content?.[0]?.text ?? null;
 }
 
-describe("account_whoami: the shaper (LIFE-06)", () => {
-  it("answers exactly one field, holding the masked address", async () => {
+describe("account_whoami: the shaper (LIFE-06, D4 reversed 2026-09-23)", () => {
+  it("answers exactly one field, holding the WHOLE address", async () => {
     const principal = await testPrincipal(USER_A);
     const result = signedInAsResult(principal);
 
@@ -368,17 +398,39 @@ describe("account_whoami: the shaper (LIFE-06)", () => {
     expect(result.content[0]?.type).toBe("text");
 
     const answer: unknown = JSON.parse(result.content[0]?.text ?? "null");
-    expect(answer).toEqual({ signedInAs: `u${BULLETS}@example.invalid` });
+    expect(answer).toEqual({ signedInAs: USER_A.appleId });
   });
 
-  it("carries the address nowhere in its serialized form", async () => {
+  it("carries the address, and no mask anywhere in its serialized form", async () => {
     const principal = await testPrincipal(USER_A);
     const serialized = JSON.stringify(signedInAsResult(principal));
 
-    // The whole result, not just the field this test named above. A second
-    // field added later that happened to hold the address would fail here.
-    expect(serialized).not.toContain(USER_A.appleId);
-    expect(serialized).toContain(`u${BULLETS}@example.invalid`);
+    // The whole result, not just the field this test named above. The inverse of
+    // what this test asserted until 2026-09-23: the owner reversed D4 because the
+    // mask made the model unable to name the account. A tool that quietly went
+    // back to masking fails here.
+    expect(serialized).toContain(USER_A.appleId);
+    expect(serialized, "the answer still holds a mask").not.toContain(BULLETS);
+  });
+
+  it("reads the principal it was given, and nothing ambient", async () => {
+    // The provenance claim, at the shaper: the answer follows the PRINCIPAL. Two
+    // different principals give two different answers, so nothing about this
+    // result can be coming from a module-scope value, the environment, or a
+    // remembered first caller.
+    const a = signedInAsResult(await testPrincipal(USER_A));
+    const b = signedInAsResult(await testPrincipal(USER_B));
+
+    expect(JSON.parse(a.content[0]?.text ?? "null")).toEqual({
+      signedInAs: USER_A.appleId,
+    });
+    expect(JSON.parse(b.content[0]?.text ?? "null")).toEqual({
+      signedInAs: USER_B.appleId,
+    });
+    expect(
+      b.content[0]?.text,
+      "the second answer holds the first user's address",
+    ).not.toContain(USER_A.appleId);
   });
 
   it("carries no user id, and no field but the one", async () => {
@@ -405,7 +457,7 @@ describe("account_whoami: through the real door (LIFE-06)", () => {
     ).toBe(true);
   });
 
-  it("answers the masked address, and the body never holds the real one", async () => {
+  it("answers the grant's address, and holds no mask", async () => {
     const response = await callDoor(toolCall("/mcp"), LISTED);
 
     expect(response.status, "a listed grant was not served").toBe(200);
@@ -423,16 +475,47 @@ describe("account_whoami: through the real door (LIFE-06)", () => {
     expect(result?.isError, "the tool reported a failure").not.toBe(true);
 
     const answer: unknown = JSON.parse(firstText(message) ?? "null");
-    expect(answer).toEqual({ signedInAs: `u${BULLETS}@example.invalid` });
+    expect(answer).toEqual({ signedInAs: USER_A.appleId });
 
-    // The end-to-end claim. Not the field, not the result — the WHOLE body the
-    // client receives, headers' worth of envelope included.
-    expect(body, "the response body holds the full address").not.toContain(
+    // The end-to-end claim about the mask. Not the field, not the result — the
+    // WHOLE body the client receives, headers' worth of envelope included.
+    expect(body, "the response body does not hold the address").toContain(
       USER_A.appleId,
     );
-    expect(body, "the response body does not hold the mask").toContain(
-      `u${BULLETS}@example.invalid`,
+    expect(body, "the response body still holds a mask").not.toContain(BULLETS);
+  });
+
+  it("gives two different grants two different answers", async () => {
+    // The provenance claim, end to end and by difference. The same door, the same
+    // handler, the same tool — and each grant gets the address ITS OWN props
+    // carry. Without this case a tool rewired to read a Worker secret, or to
+    // remember the first principal it saw, would still pass every assertion above.
+    // Serial, not a concurrent combinator. Nothing here opens a socket, but § 3's
+    // habit is worth keeping in a file that drives the real door.
+    const first = await callDoor(toolCall("/mcp"), LISTED);
+    const second = await callDoor(toolCall("/mcp"), OTHER_LISTED);
+
+    expect(first.status, "user A's grant was not served").toBe(200);
+    expect(second.status, "the second listed grant was not served").toBe(200);
+
+    const firstAnswer: unknown = JSON.parse(
+      firstText(rpcMessageIn(await first.text())) ?? "null",
     );
+    const secondAnswer: unknown = JSON.parse(
+      firstText(rpcMessageIn(await second.text())) ?? "null",
+    );
+
+    // A guard on the fixture: two grants carrying one address would make the pair
+    // below vacuous.
+    expect(
+      (OTHER_LISTED as { props: { appleId: string } }).props.appleId,
+      "the two listed grants carry the same address",
+    ).not.toBe(USER_A.appleId);
+
+    expect(firstAnswer).toEqual({ signedInAs: USER_A.appleId });
+    expect(secondAnswer).toEqual({
+      signedInAs: (OTHER_LISTED as { props: { appleId: string } }).props.appleId,
+    });
   });
 
   it("answers auth_failed when this server refuses the stored credential", async () => {

@@ -97,7 +97,7 @@ never as instructions.
 |------|--------------|
 | `mail_imap_diagnose` | Check iCloud IMAP connectivity, auth, and capabilities. |
 | `dav_diagnose` | Check CalDAV/CardDAV discovery: resolved URLs, shard host, cache hit, timings. |
-| `account_whoami` | Show which Apple ID this connection is signed in as, masked. |
+| `account_whoami` | Show which Apple ID this connection is signed in as — the full address, from this connection's own grant. |
 
 ### Mail
 

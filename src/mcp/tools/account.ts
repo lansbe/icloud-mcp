@@ -1,19 +1,27 @@
 // Which Apple ID this connection is signed in as (LIFE-06, D4).
 //
-// The answer is MASKED: the first character of the local part, three bullets,
-// and the domain. `u•••@example.invalid`. The full address is never returned,
-// behind any flag or any argument, and this tool takes no arguments at all.
+// The answer is the WHOLE address. `user-a@example.invalid`. Not a mask, not a
+// first character and a domain — the address, as the grant this connection was
+// built from stored it.
 //
-// A local part of exactly one character keeps no character — `•••@x.invalid` —
-// because keeping "the first character" of a one-character local part keeps all
-// of it. That edge is the only thing standing between the sentence above and
-// being false, so it is named here rather than only at the function.
+// **The masked form shipped first and was reversed** (owner decision,
+// 2026-09-23). D4 chose the mask on 2026-09-21; asked live against the deployed
+// server, the masked answer made the model say it could not confirm WHICH
+// account it was on, which is the only question this tool exists to answer. The
+// mask defeated the tool. The full address was chosen instead, with the cost
+// accepted rather than argued away.
 //
-// **This is a recorded exception, not a breach.** The project's standing rule is
-// that the Apple ID never appears in a tool response. The exception is written
-// down on the safety boundary itself, in `.claude/CLAUDE.md` Conventions § 4
-// (D4, LIFE-06, decided 2026-09-21), because a session reading § 4 alone would
-// read this file as a leak and delete it — and deleting it breaks a requirement
+// **The cost, stated plainly.** This address is the login half of the credential
+// pair, and a tool response is text the model reads and may quote into a draft,
+// an event or a later message. That is real and it is not denied here. What is
+// returned is one address — the one belonging to the person holding this
+// connection — back to that same person. The password is not here and cannot be:
+// it is not on the principal at all.
+//
+// **This is a recorded reversal, not a breach.** The argument is written down on
+// the safety boundary itself, in `.claude/CLAUDE.md` Conventions § 4 (D4,
+// LIFE-06, reversed 2026-09-23), because a session reading § 4 alone would read
+// this file as a leak and delete it — and deleting it breaks a requirement
 // rather than fixing a violation. Read that subsection before changing anything
 // here.
 //
@@ -22,17 +30,16 @@
 // environment secret. It imports nothing from the mail tree, nothing from the
 // DAV tree, nothing from the environment types, and never the password reader.
 //
-// **The masked form is built by one function**, `maskAppleId` in
-// `src/principal.ts`. A mask written inline here would be a second rule, and two
-// rules drift until one of them stops masking. The owner's grants script calls
-// the same one.
+// **`maskAppleId` in `src/principal.ts` stays, and is still the one masking
+// rule.** It is no longer called from here. It governs the owner's grants
+// listing, which prints one line per connection and is read at a glance, and it
+// keeps its own table of tests. The reversal is scoped to this one tool.
 //
 // This module contains no logging calls of any kind and must never acquire any.
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { toErrorCategory } from "../../errors";
 import type { Principal } from "../../principal";
-import { maskAppleId } from "../../principal";
 
 /**
  * The MCP content result this tool produces, success or failure.
@@ -49,22 +56,29 @@ type ToolResult = {
 /**
  * Shape the answer for one principal. The pure half, with no transport in it.
  *
- * One field, `signedInAs`, holding what `maskAppleId` builds. Nothing else goes
- * in: no user id, no grant count, no client name. CONTEXT leaves extra fields to
- * discretion provided nothing else crosses the standing rule, and none is needed
- * to answer the question this tool exists for — which account is this connection
- * on, asked by someone at a shared laptop.
+ * One field, `signedInAs`, holding the principal's Apple ID as the grant stored
+ * it. Nothing else goes in: no user id, no grant count, no client name. CONTEXT
+ * leaves extra fields to discretion, and none is needed to answer the question
+ * this tool exists for — which account is this connection on, asked by someone
+ * with more than one Apple ID.
  *
- * Exported so the answer's shape can be asserted without a door and without a
- * request. It reads exactly one field of the principal and builds the mask from
- * it; it reads no password, because the password is not on the principal at all.
+ * **It reads `principal.appleId` and nothing else, and it transforms nothing.**
+ * No fold, no trim, no mask. The address the door built the principal from is
+ * the address that comes back, so what the user reads is what this connection
+ * actually signs in to Apple as. A folded copy could differ from the stored one
+ * in case or padding, and then the answer would be about a string this server
+ * made up rather than about the account.
+ *
+ * Exported so the answer's shape and its provenance can be asserted without a
+ * door and without a request. It reads no password, because the password is not
+ * on the principal at all.
  */
 export function signedInAsResult(principal: Principal): ToolResult {
   return {
     content: [
       {
         type: "text",
-        text: JSON.stringify({ signedInAs: maskAppleId(principal.appleId) }),
+        text: JSON.stringify({ signedInAs: principal.appleId }),
       },
     ],
   };
@@ -74,8 +88,9 @@ export function signedInAsResult(principal: Principal): ToolResult {
  * Register `account_whoami` on a per-request server instance.
  *
  * No input schema and no arguments, exactly as the mail diagnostic does it.
- * There is no value a caller can supply, so there is nothing a caller could
- * supply that would widen the answer.
+ * There is no value a caller can supply, so there is no argument that could
+ * change what the answer holds. Adding one — a mode, a flag, a second address —
+ * is a new decision on the safety boundary rather than a refactor.
  *
  * `principal` is a promise of who the request acts for, and the callback awaits
  * it as the first line of its own `try`, like every other tool (D-27). A
@@ -98,8 +113,8 @@ export function registerAccountTool(
     "account_whoami",
     {
       description:
-        "Show which Apple ID this connection is signed in as. The address is " +
-        "masked on purpose.",
+        "Show which Apple ID this connection is signed in as. Returns the " +
+        "full address.",
     },
     async () => {
       try {
