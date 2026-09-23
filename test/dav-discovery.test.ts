@@ -49,8 +49,7 @@ import {
 import { createDavFetch } from "../src/dav/transport";
 import { principalFromEnv } from "../src/principal";
 import {
-  assertMailSecretsBound,
-  type BoundMailSecrets,
+  FAKE_APPLE_ID,
   entryEnv,
   ownerPrincipal,
 } from "./fixtures/bound-secrets";
@@ -479,10 +478,7 @@ describe("the discovery cache (DAV-03)", () => {
   });
 
   it("never puts the Apple ID in the key in cleartext (T-03-07)", async () => {
-    const entry = entryEnv();
-  assertMailSecretsBound(entry);
-    const bound: BoundMailSecrets = entry;
-    expect(bound.APPLE_ID.length).toBeGreaterThan(0);
+    expect(FAKE_APPLE_ID.length).toBeGreaterThan(0);
 
     const kv = fakeKv();
     const scoped = envWith(kv);
@@ -490,7 +486,7 @@ describe("the discovery cache (DAV-03)", () => {
     await resolveDavAccount(scoped, principal, createDavFetch(owner), "caldav");
 
     const key = kv.puts[0].key;
-    expect(key).not.toContain(bound.APPLE_ID);
+    expect(key).not.toContain(FAKE_APPLE_ID);
     expect(key).toMatch(/^dav:v1:[0-9a-f]{64}:caldav$/);
   });
 

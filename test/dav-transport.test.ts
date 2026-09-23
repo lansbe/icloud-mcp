@@ -28,8 +28,8 @@ import { SAFE_MESSAGES } from "../src/errors";
 import type { Principal } from "../src/principal";
 import { principalFromEnv, principalFromProps } from "../src/principal";
 import {
-  assertMailSecretsBound,
-  type BoundMailSecrets,
+  FAKE_APP_PASSWORD,
+  FAKE_APPLE_ID,
   entryEnv,
   ownerPrincipal,
 } from "./fixtures/bound-secrets";
@@ -160,19 +160,16 @@ describe("davAuthHeader", () => {
     vi.unstubAllGlobals();
   });
 
-  it("builds a Basic header from the two bound secrets", async () => {
-    const entry = entryEnv();
-  assertMailSecretsBound(entry);
-    const bound: BoundMailSecrets = entry;
-
-    // The owner's principal, from the real env constructor. The two assertions
-    // below still compare against the BOUND values, untouched: they are the
-    // proof that threading the principal did not move one byte of the header.
+  it("builds a Basic header from the owner's two credentials", async () => {
+    // The owner's principal, from the real props constructor. The assertion
+    // below compares against the very two constants that principal was built
+    // from, untouched: it is the proof that threading the principal did not
+    // move one byte of the header.
     const header = davAuthHeader(await owner);
 
     expect(header.startsWith("Basic ")).toBe(true);
     expect(atob(header.slice("Basic ".length))).toBe(
-      `${bound.APPLE_ID}:${bound.APPLE_APP_PASSWORD}`,
+      `${FAKE_APPLE_ID}:${FAKE_APP_PASSWORD}`,
     );
   });
 
@@ -708,17 +705,14 @@ describe("no Dav* error carries anything a server said (T-03-03, T-03-04)", () =
   );
 
   it("never lets a credential reach a thrown error", async () => {
-    const entry = entryEnv();
-  assertMailSecretsBound(entry);
-    const bound: BoundMailSecrets = entry;
-    expect(bound.APPLE_ID.length).toBeGreaterThan(0);
-    expect(bound.APPLE_APP_PASSWORD.length).toBeGreaterThan(0);
+    expect(FAKE_APPLE_ID.length).toBeGreaterThan(0);
+    expect(FAKE_APP_PASSWORD.length).toBeGreaterThan(0);
 
     vi.stubGlobal("fetch", statusStub(401).fetch);
     const raised = (await raise(createDavFetch(owner))) as Error;
     const serialized = `${JSON.stringify(ownFields(raised))}${raised.message}${raised.stack ?? ""}`;
 
-    expect(serialized).not.toContain(bound.APPLE_ID);
-    expect(serialized).not.toContain(bound.APPLE_APP_PASSWORD);
+    expect(serialized).not.toContain(FAKE_APPLE_ID);
+    expect(serialized).not.toContain(FAKE_APP_PASSWORD);
   });
 });

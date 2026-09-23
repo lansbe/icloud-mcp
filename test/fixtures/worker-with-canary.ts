@@ -25,7 +25,7 @@ import {
   buildRequestHandler,
   createMcpApiHandler,
 } from "../../src/mcp/api-handler";
-import { principalFromEnv } from "../../src/principal";
+import { ownerPrincipal } from "./bound-secrets";
 
 /** The name the ordering test calls. Deliberately not a production tool. */
 export const CANARY_TOOL_NAME = "canary";
@@ -102,7 +102,13 @@ export default {
       // The per-request handler production builds, from production's options,
       // given the owner's principal the way the door would give it. The no-op
       // handler is the door's too: the recording tool never awaits the promise.
-      const principal = principalFromEnv(env);
+      //
+      // The principal comes from the FIXTURE's two constants through the real
+      // props constructor, not from the environment. Plan 13-03 deletes the
+      // environment constructor, and this fixture had to stop calling it first.
+      // Nothing about what the ordering test asserts changes: the constants are
+      // the values the pool used to bind, so the principal is the same one.
+      const principal = ownerPrincipal();
       principal.catch(() => {});
       return buildRequestHandler(principal, [registerCanary])(
         new Request(url, request),

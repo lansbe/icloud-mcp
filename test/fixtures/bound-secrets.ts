@@ -138,37 +138,14 @@ export function refusedPrincipal(which: RefusedHalf): Promise<Principal> {
   });
 }
 
-/** An entry environment whose two mail secrets are known present. */
-export type BoundMailSecrets = EntryEnv & {
-  APPLE_ID: string;
-  APPLE_APP_PASSWORD: string;
-};
-
-/**
- * Assert both mail secrets are bound, narrowing them for the whole flow below.
- *
- * An assertion signature rather than a returned pair, so a caller keeps reading
- * the field off the value it was handed and every later access in the same
- * scope is `string` — the narrowing costs one line at the top of a block
- * instead of rewriting each use.
- *
- * It takes the ENTRY type, so a caller passes `entryEnv()` rather than the
- * ambient environment: the shared type cannot spell these two names any more.
- *
- * Throws rather than skipping. A missing binding means the test environment is
- * misconfigured, and a containment suite that quietly downgraded itself to a
- * no-op is worth strictly less than one that fails loudly.
- */
-export function assertMailSecretsBound(
-  env: EntryEnv,
-): asserts env is BoundMailSecrets {
-  if (env.APPLE_ID === undefined || env.APPLE_ID.length === 0) {
-    throw new Error("test environment has no APPLE_ID bound");
-  }
-  if (
-    env.APPLE_APP_PASSWORD === undefined ||
-    env.APPLE_APP_PASSWORD.length === 0
-  ) {
-    throw new Error("test environment has no APPLE_APP_PASSWORD bound");
-  }
-}
+// Two exports used to sit here: a presence assertion over the two mail secret
+// bindings, and the type naming the shape it narrowed them to. Their whole
+// subject was the bindings — one turned absent-or-string into string, the other
+// named the result. With the credentials being the two constants above there is
+// nothing left to narrow, because a literal is already a string, and nine files'
+// worth of callers went with them.
+//
+// Neither is named here, and that is not squeamishness: a plan gate greps every
+// scanned tree for both names and requires no match, so a comment spelling them
+// would fail the very check it was explaining. Same habit as the coalesce above,
+// and as `.claude/CLAUDE.md` § 1 keeps for the banned transport paths.

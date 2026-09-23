@@ -48,10 +48,9 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { createSessionGate, getMessageOver } from "../src/mail/service";
 import { messageToolResult } from "../src/mcp/tools/mail";
 import {
-  assertMailSecretsBound,
-  entryEnv,
+  FAKE_APP_PASSWORD,
+  FAKE_APPLE_ID,
   ownerPrincipal,
-  type BoundMailSecrets,
 } from "./fixtures/bound-secrets";
 import { createFakeDuplex } from "./fixtures/fake-duplex";
 import {
@@ -337,13 +336,10 @@ describe("a message carrying an attachment, driven through the real reader", () 
 // ---------------------------------------------------------------------------
 
 describe("neither shaped result carries a credential", () => {
-  // Narrowed by assertion, never by a coalesce: `?? ""` would typecheck and
-  // keep both cases below green while making `not.toContain("")` trivially
-  // true, which is exactly what the non-zero-length guards prevent.
-  const entry = entryEnv();
-  assertMailSecretsBound(entry);
-  const bound: BoundMailSecrets = entry;
-
+  // The two fake credentials come from the fixture, never off an environment
+  // object, and never through a coalesce onto an empty string — that would
+  // typecheck and keep both cases below green while making `not.toContain("")`
+  // trivially true, which is exactly what the non-zero-length guards prevent.
   const cases: [string, string, Uint8Array, number][] = [
     ["the HTML message", HTML_MESSAGE_STRUCTURE, HTML_MESSAGE_BYTES, HTML_UID],
     [
@@ -356,8 +352,8 @@ describe("neither shaped result carries a credential", () => {
 
   for (const [label, structure, message, uid] of cases) {
     it(`contains neither bound value: ${label}`, async () => {
-      expect(bound.APPLE_ID.length).toBeGreaterThan(0);
-      expect(bound.APPLE_APP_PASSWORD.length).toBeGreaterThan(0);
+      expect(FAKE_APPLE_ID.length).toBeGreaterThan(0);
+      expect(FAKE_APP_PASSWORD.length).toBeGreaterThan(0);
 
       const detail = await getMessageOver(
         conversation(structure, message, uid),
@@ -374,8 +370,8 @@ describe("neither shaped result carries a credential", () => {
         .content.map((block) => block.text)
         .join("\n");
 
-      expect(whole).not.toContain(bound.APPLE_ID);
-      expect(whole).not.toContain(bound.APPLE_APP_PASSWORD);
+      expect(whole).not.toContain(FAKE_APPLE_ID);
+      expect(whole).not.toContain(FAKE_APP_PASSWORD);
     });
   }
 });

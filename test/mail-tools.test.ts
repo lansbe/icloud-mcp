@@ -59,10 +59,9 @@ import {
   uploadUrlToolResult,
 } from "../src/mcp/tools/mail";
 import {
-  assertMailSecretsBound,
-  entryEnv,
+  FAKE_APP_PASSWORD,
+  FAKE_APPLE_ID,
   ownerPrincipal,
-  type BoundMailSecrets,
 } from "./fixtures/bound-secrets";
 
 /** Every stranger-authored value the fixture carries, named once. */
@@ -1848,12 +1847,10 @@ describe("the search and unread registrations", () => {
 });
 
 describe("no mail response carries a credential", () => {
-  // Narrowed by assertion, never by a coalesce: `?? ""` would typecheck and
-  // keep every case below green while making `not.toContain("")` trivially
-  // true, which is exactly what the non-zero-length guards prevent.
-  const entry = entryEnv();
-  assertMailSecretsBound(entry);
-  const bound: BoundMailSecrets = entry;
+  // The two fake credentials come from the fixture, never off an environment
+  // object, and never through a coalesce onto an empty string — that would
+  // typecheck and keep every case below green while making `not.toContain("")`
+  // trivially true, which is exactly what the non-zero-length guards prevent.
 
   const responses: [string, () => { content: { text: string }[] }][] = [
     ["a shaped message", () => shaped()],
@@ -1861,7 +1858,7 @@ describe("no mail response carries a credential", () => {
       "a message whose own text embeds both credentials",
       () =>
         shaped({
-          text: `a1 LOGIN "${bound.APPLE_ID}" "${bound.APPLE_APP_PASSWORD}"`,
+          text: `a1 LOGIN "${FAKE_APPLE_ID}" "${FAKE_APP_PASSWORD}"`,
         }),
     ],
     [
@@ -1869,7 +1866,7 @@ describe("no mail response carries a credential", () => {
       () =>
         mailErrorResult(
           new Error(
-            `a1 LOGIN "${bound.APPLE_ID}" "${bound.APPLE_APP_PASSWORD}"`,
+            `a1 LOGIN "${FAKE_APPLE_ID}" "${FAKE_APP_PASSWORD}"`,
           ),
         ),
     ],
@@ -1877,8 +1874,8 @@ describe("no mail response carries a credential", () => {
 
   for (const [label, build] of responses) {
     it(`contains neither bound value: ${label}`, () => {
-      expect(bound.APPLE_ID.length).toBeGreaterThan(0);
-      expect(bound.APPLE_APP_PASSWORD.length).toBeGreaterThan(0);
+      expect(FAKE_APPLE_ID.length).toBeGreaterThan(0);
+      expect(FAKE_APP_PASSWORD.length).toBeGreaterThan(0);
 
       const result = build();
       // The error path must contain neither. The message path is different and
@@ -1889,8 +1886,8 @@ describe("no mail response carries a credential", () => {
         (block) => !block.text.includes("UNTRUSTED"),
       );
       for (const block of errorBlocks) {
-        expect(block.text).not.toContain(bound.APPLE_ID);
-        expect(block.text).not.toContain(bound.APPLE_APP_PASSWORD);
+        expect(block.text).not.toContain(FAKE_APPLE_ID);
+        expect(block.text).not.toContain(FAKE_APP_PASSWORD);
       }
     });
   }

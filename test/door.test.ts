@@ -54,7 +54,7 @@
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { EntryEnv } from "../src/env";
-import { assertMailSecretsBound, entryEnv } from "./fixtures/bound-secrets";
+import { entryEnv } from "./fixtures/bound-secrets";
 import { DEPLOYED_HOSTNAME, createMcpApiHandler } from "../src/mcp/api-handler";
 import { USER_A } from "./fixtures/two-users";
 import worker, {
@@ -815,62 +815,32 @@ describe("identity comes from the grant and from nowhere else (the promotion)", 
   // phase owns is making the per-user principal the only LIVE path, which is
   // what these two cases hold.
 
-  /**
-   * The pool's environment with the two mail secrets taken away.
-   *
-   * A fresh spread COPY, never a write onto the object `entryEnv()` hands back.
-   * That object is shared by every test in the isolate, so an in-place override
-   * would leak into every later case in the run — and the environment-assignment
-   * scan rule refuses that form outright, in every scanned directory.
-   */
-  function envWithoutMailSecrets(): EntryEnv {
-    return {
-      ...entryEnv(),
-      APPLE_ID: undefined,
-      APPLE_APP_PASSWORD: undefined,
-    };
-  }
-
+  // **The absence half of the case below was retired in plan 13-02, and the
+  // half that can still fail was kept.**
+  //
+  // It used to build a copy of the pool's environment with the two mail secrets
+  // set to undefined, and assert that a listed grant was served anyway. The
+  // guard beside it said what would make that worthless: "a pool that stopped
+  // binding them would leave the case asserting that a request is served with
+  // two things absent that were never there." Phase 13 is the phase that stops
+  // binding them, so that is now the only state there is. A green case that can
+  // never go red is worth less than no case at all.
+  //
+  // What survives is the half whose subject is still real: a listed grant
+  // CARRYING ITS OWN CREDENTIALS is served, is sent no sign-in challenge, and
+  // reaches the tool layer. That still fails if the door regresses.
+  //
+  // The SOURCE tripwire below is deliberately not retired with it. It goes with
+  // the constructor it names, in plan 13-03. Each dies with the thing that made
+  // it able to fail.
   it.each(LANES)(
-    "serves a listed grant with the environment's mail secrets absent, %s",
+    "serves a listed grant carrying its own credentials, %s",
     async (_lane, build) => {
-      // Non-vacuity first, and it is the same positive control every refusal in
-      // this file leans on: the identical request with the identical props IS
-      // served under the ordinary environment. Without that, "served with the
-      // secrets absent" could be satisfied by a door that serves anything.
-      const control = await callDoor(build("/mcp"), LISTED);
-      expect(control.status, "the control was not served").toBe(200);
-      await control.text();
-      expect(
-        await canaryWasInvoked(),
-        "the control did not reach the tool layer",
-      ).toBe(true);
-
-      await callWorker(new Request(`${ORIGIN}/__canary/reset`, { method: "POST" }));
-      expect(await canaryWasInvoked()).toBe(false);
-
-      // The second non-vacuity guard, and the one specific to this case: the
-      // pool really does bind both secrets, and the copy below really has
-      // neither. Without this pair, a `?? ""` slipped into the fixture or a
-      // pool that stopped binding them would leave the case asserting that a
-      // request is served with two things absent that were never there.
-      const ambient = entryEnv();
-      assertMailSecretsBound(ambient);
-      const withoutSecrets = envWithoutMailSecrets();
-      expect(
-        withoutSecrets.APPLE_ID,
-        "the override did not remove the Apple ID binding",
-      ).toBeUndefined();
-      expect(
-        withoutSecrets.APPLE_APP_PASSWORD,
-        "the override did not remove the app-password binding",
-      ).toBeUndefined();
-
-      const response = await callDoor(build("/mcp"), LISTED, withoutSecrets);
+      const response = await callDoor(build("/mcp"), LISTED);
 
       expect(
         response.status,
-        "a grant carrying its own credentials was refused because the environment had none",
+        "a grant carrying its own credentials was refused",
       ).toBe(200);
       expect(
         response.headers.get("WWW-Authenticate"),
@@ -883,7 +853,7 @@ describe("identity comes from the grant and from nowhere else (the promotion)", 
 
       expect(
         await canaryWasInvoked(),
-        "a request whose identity is in its grant did not reach the tool layer with the environment's mail secrets absent",
+        "a request whose identity is in its grant did not reach the tool layer",
       ).toBe(true);
     },
   );

@@ -35,8 +35,8 @@ import {
 } from "../src/mcp/tools/dav-diagnose";
 import { principalFromEnv } from "../src/principal";
 import {
-  type BoundMailSecrets,
-  assertMailSecretsBound,
+  FAKE_APP_PASSWORD,
+  FAKE_APPLE_ID,
   entryEnv,
   ownerPrincipal,
 } from "./fixtures/bound-secrets";
@@ -405,19 +405,16 @@ describe("dav_diagnose, end to end", () => {
   });
 
   it("never lets a credential reach the response", async () => {
-    const entry = entryEnv();
-  assertMailSecretsBound(entry);
-    const bound: BoundMailSecrets = entry;
-    expect(bound.APPLE_ID.length).toBeGreaterThan(0);
-    expect(bound.APPLE_APP_PASSWORD.length).toBeGreaterThan(0);
+    expect(FAKE_APPLE_ID.length).toBeGreaterThan(0);
+    expect(FAKE_APP_PASSWORD.length).toBeGreaterThan(0);
 
     const stub = davStub();
     vi.stubGlobal("fetch", stub.fetch);
     const result = await diagnoseHandler(createDavFetch(owner))({});
     const serialized = JSON.stringify(result);
 
-    expect(serialized).not.toContain(bound.APPLE_ID);
-    expect(serialized).not.toContain(bound.APPLE_APP_PASSWORD);
+    expect(serialized).not.toContain(FAKE_APPLE_ID);
+    expect(serialized).not.toContain(FAKE_APP_PASSWORD);
   });
 
   it("fails with auth_failed BEFORE any request when a secret is absent", async () => {

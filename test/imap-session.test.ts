@@ -50,8 +50,8 @@ import {
   createSilentPeerDuplex,
 } from "./fixtures/fake-duplex";
 import {
-  assertMailSecretsBound,
-  entryEnv,
+  FAKE_APP_PASSWORD,
+  FAKE_APPLE_ID,
   ownerPrincipal,
 } from "./fixtures/bound-secrets";
 import type { Principal } from "../src/principal";
@@ -922,11 +922,16 @@ describe("the authentication fallback", () => {
     expect(report.authFailureDetail).toContain(AUTH_REJECTED_LEGACY_TEXT);
     expect(report.authFailureDetail).toContain(AUTH_REJECTED_TEXT);
 
-    const bound = entryEnv();
-    assertMailSecretsBound(bound);
+    // The non-vacuity guard. It used to be the presence assertion the fixture
+    // ran over the two bindings; with the credentials now being the fixture's
+    // own constants it is stated the same way every other containment case in
+    // this file states it. `not.toContain("")` is true of every string.
+    expect(FAKE_APPLE_ID.length).toBeGreaterThan(0);
+    expect(FAKE_APP_PASSWORD.length).toBeGreaterThan(0);
+
     const serialized = JSON.stringify(report);
-    expect(serialized).not.toContain(bound.APPLE_APP_PASSWORD);
-    expect(serialized).not.toContain(bound.APPLE_ID);
+    expect(serialized).not.toContain(FAKE_APP_PASSWORD);
+    expect(serialized).not.toContain(FAKE_APPLE_ID);
   });
 
   it("bounds the assembled detail, not merely each part of it", async () => {
@@ -1085,17 +1090,15 @@ describe("failure categories, proven by injection", () => {
 
     const outcome = await runDiagnosticOver(duplex, principal, 1);
 
-    const bound = entryEnv();
-    assertMailSecretsBound(bound);
-    expect(bound.APPLE_ID.length).toBeGreaterThan(0);
-    expect(bound.APPLE_APP_PASSWORD.length).toBeGreaterThan(0);
+    expect(FAKE_APPLE_ID.length).toBeGreaterThan(0);
+    expect(FAKE_APP_PASSWORD.length).toBeGreaterThan(0);
 
     for (const serialized of [
       JSON.stringify(diagnosticResult(outcome)),
       JSON.stringify(outcome.report),
     ]) {
-      expect(serialized).not.toContain(bound.APPLE_APP_PASSWORD);
-      expect(serialized).not.toContain(bound.APPLE_ID);
+      expect(serialized).not.toContain(FAKE_APP_PASSWORD);
+      expect(serialized).not.toContain(FAKE_APPLE_ID);
     }
   });
 
@@ -1152,20 +1155,19 @@ describe("failure categories, proven by injection", () => {
 
     const outcome = await runDiagnosticOver(duplex, principal, 1);
 
-    // A case that would pass just as happily against empty bindings is not a
-    // proof of containment; `not.toContain("")` is true of every string.
-    // Narrowed by assertion rather than a coalesce for that exact reason.
-    const bound = entryEnv();
-    assertMailSecretsBound(bound);
-    expect(bound.APPLE_ID.length).toBeGreaterThan(0);
-    expect(bound.APPLE_APP_PASSWORD.length).toBeGreaterThan(0);
+    // A case that would pass just as happily against an empty credential is
+    // not a proof of containment; `not.toContain("")` is true of every string.
+    // The two length assertions are that guard, and they are why the fixture's
+    // constants are never coalesced onto an empty string.
+    expect(FAKE_APPLE_ID.length).toBeGreaterThan(0);
+    expect(FAKE_APP_PASSWORD.length).toBeGreaterThan(0);
 
     for (const serialized of [
       JSON.stringify(diagnosticResult(outcome)),
       JSON.stringify(outcome.report),
     ]) {
-      expect(serialized).not.toContain(bound.APPLE_APP_PASSWORD);
-      expect(serialized).not.toContain(bound.APPLE_ID);
+      expect(serialized).not.toContain(FAKE_APP_PASSWORD);
+      expect(serialized).not.toContain(FAKE_APPLE_ID);
     }
   });
 });

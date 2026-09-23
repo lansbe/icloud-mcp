@@ -22,9 +22,8 @@ import {
 import type { DiagnosticOutcome, DiagnosticReport } from "../src/mail/diagnose";
 import { diagnosticResult } from "../src/mcp/tools/diagnose";
 import {
-  type BoundMailSecrets,
-  assertMailSecretsBound,
-  entryEnv,
+  FAKE_APP_PASSWORD,
+  FAKE_APPLE_ID,
 } from "./fixtures/bound-secrets";
 
 /** Apple's own wording on a refusal, in the shape the session layer records. */
@@ -288,12 +287,10 @@ describe("a connection-limit refusal (WINDOWS.md ledger entry 6)", () => {
 });
 
 describe("no response carries a credential", () => {
-  // Narrowed by assertion, never by a coalesce: `?? ""` would typecheck and
-  // keep every case below green while making `not.toContain("")` trivially
-  // true, which is exactly what the non-zero-length guards prevent.
-  const entry = entryEnv();
-  assertMailSecretsBound(entry);
-  const bound: BoundMailSecrets = entry;
+  // The two fake credentials come from the fixture, never off an environment
+  // object, and never through a coalesce onto an empty string — that would
+  // typecheck and keep every case below green while making `not.toContain("")`
+  // trivially true, which is exactly what the non-zero-length guards prevent.
 
   const outcomes: [string, DiagnosticOutcome][] = [
     [
@@ -325,7 +322,7 @@ describe("no response carries a credential", () => {
         report: report(),
         failed: true,
         error: new Error(
-          `a1 LOGIN "${bound.APPLE_ID}" "${bound.APPLE_APP_PASSWORD}"`,
+          `a1 LOGIN "${FAKE_APPLE_ID}" "${FAKE_APP_PASSWORD}"`,
         ),
       },
     ],
@@ -335,10 +332,10 @@ describe("no response carries a credential", () => {
     it(`contains neither bound value: ${label}`, () => {
       const serialized = JSON.stringify(diagnosticResult(outcome));
 
-      expect(bound.APPLE_ID.length).toBeGreaterThan(0);
-      expect(bound.APPLE_APP_PASSWORD.length).toBeGreaterThan(0);
-      expect(serialized).not.toContain(bound.APPLE_ID);
-      expect(serialized).not.toContain(bound.APPLE_APP_PASSWORD);
+      expect(FAKE_APPLE_ID.length).toBeGreaterThan(0);
+      expect(FAKE_APP_PASSWORD.length).toBeGreaterThan(0);
+      expect(serialized).not.toContain(FAKE_APPLE_ID);
+      expect(serialized).not.toContain(FAKE_APP_PASSWORD);
     });
   }
 });
