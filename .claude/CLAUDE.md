@@ -6,7 +6,7 @@
 
 An MCP server hosted on Cloudflare Workers that proxies iCloud Mail (IMAP), Calendar (CalDAV), and Contacts (CardDAV), giving Claude native tool access to the Apple ecosystem. Claude can read and search mail, draft replies into the iCloud Drafts folder, read and manage calendar events, and look up contacts — all without credentials ever leaving the server.
 
-Built for a single user (Russell) against one Apple ID. The immediate driver is a job search: drafting thank-you notes, replying to recruiters, and finding calendar slots. The longer arc is moving Claude from "a thing you paste context into" toward a genuine personal assistant.
+Several people can sign in, each with their own Apple ID and their own Apple app-specific password, and each reaching only their own account. The immediate driver is a job search: drafting thank-you notes, replying to recruiters, and finding calendar slots. The longer arc is moving Claude from "a thing you paste context into" toward a genuine personal assistant.
 
 **Core Value:** Claude can read your real iCloud mail and calendar, and prepare real work against them — a draft sitting in your Drafts folder, an event on your calendar — without you ever copying and pasting.
 
@@ -32,7 +32,7 @@ Built for a single user (Russell) against one Apple ID. The immediate driver is 
 - Works from a **plain stateless Worker `fetch()` handler** — no Durable Object required. DOs are only needed if you want a socket/connection to *outlive* a single request.
 - **Socket lifetime is tied to the request** in a plain Worker. In a Durable Object, an open socket keeps the DO alive and billing (up to 15 minutes per connection) — relevant only if you later decide to pool IMAP connections across calls (this project's constraints explicitly rule that out for now: "IMAP sessions must be established and torn down within a single request").
 - **Disallowed:** outbound connections to Cloudflare's own IP ranges, `localhost`, private network IPs, and outbound port 25 (SMTP send — irrelevant here since this project explicitly excludes SMTP send). Port 993 is not restricted.
-- Concurrent open sockets count toward a per-Worker connection limit (exact numeric ceiling not published on this page; not a concern at single-user IMAP-then-close scale).
+- Concurrent open sockets count toward a per-Worker connection limit (exact numeric ceiling not published on this page; not a concern at single-user IMAP-then-close scale). *(2026-09-23: this reasoning was made for the single-user design, and the design has since changed — several people now sign in. The conclusion still holds, because each request still connects, acts and closes; what has changed is the number of people who can be doing that at once.)*
 
 ## Recommended Stack
 
@@ -83,6 +83,12 @@ Built for a single user (Russell) against one Apple ID. The immediate driver is 
 
 ## 2. MCP OAuth — minimum viable for a single-user server
 
+*(2026-09-23: this heading and the reasoning under it were written for the
+single-user design, and the design has since changed. The recommendation
+survived the change — the provider still owns the ceremony and only the identity
+step is this project's — but "minimum viable" was decided against a server with
+one account, and that is no longer what this is.)*
+
 ## 3. IMAP over Workers TCP — no viable off-the-shelf client; hand-roll it
 
 | Library | Why it fails on Workers |
@@ -116,7 +122,7 @@ Built for a single user (Russell) against one Apple ID. The immediate driver is 
 |-------------|-------------|--------------------------|
 | Hand-rolled IMAP client over `cloudflare:sockets` | `cf-imap` (npm, v1.0.0) | If a licensing check clears its `Proprietary` terms for personal use and a short spike proves it reliable against `imap.mail.me.com` — could meaningfully cut Phase 1 scope. Not recommended as the default given its 2-day track record at time of writing. |
 | `createMcpHandler` (stateless) | `McpAgent` (Durable-Object-backed, deprecated) | Only if this project later needs true cross-request session state at the MCP layer itself (e.g., long-lived IMAP IDLE push notifications) — and even then, Cloudflare's own migration guidance is to keep the stateless handler as the primary path and add a narrow stateful route alongside it, not to revert wholesale. |
-| `@cloudflare/workers-oauth-provider` with a minimal first-party auth handler | Static bearer token in a `fetch` guard | If OAuth 2.1 compliance is deliberately deprioritized in favor of the simplest possible implementation — acceptable technically for a single-user server never exposed to third-party MCP clients, but forfeits the token lifecycle/revocation properties `PROJECT.md` already committed to. |
+| `@cloudflare/workers-oauth-provider` with a minimal first-party auth handler | Static bearer token in a `fetch` guard | If OAuth 2.1 compliance is deliberately deprioritized in favor of the simplest possible implementation — acceptable technically for a single-user server never exposed to third-party MCP clients, but forfeits the token lifecycle/revocation properties `PROJECT.md` already committed to. *(2026-09-23: this alternative was weighed for the single-user design, and the design has since changed. It is no longer available at all — with several people signing in, a static shared token has nobody to identify, and the revocation properties it forfeits are now the mechanism for removing one of them.)* |
 | `wrangler.jsonc` | `wrangler.toml` | Only relevant if importing/merging config from an existing TOML-based Worker (e.g., the sibling `code-assist`/`engram` servers, if those still use TOML) — check their config format for estate consistency before finalizing. |
 
 ## What NOT to Use
@@ -352,9 +358,11 @@ There are no logging calls anywhere under `src/`. Not "no logging of
 credentials", and not "not on the credential path" — no logging at all,
 anywhere in the source tree. A logging call whose arguments mention the bare
 environment object is banned in every scanned directory, `scripts/` and
-`test/` included, because that object carries `AUTH_SECRET`, `APPLE_ID`, and
-`APPLE_APP_PASSWORD` and naming none of them is exactly how all three reach a
-retained log.
+`test/` included, because that object carries the confirmation key and the R2
+key pair and naming none of them is exactly how all of them reach a retained
+log. A logging call naming a grant's props object is banned the same way and
+for a sharper reason: since the switch to per-person sign-in, that object is
+where the actual Apple credential lives.
 
 IMAP's `LOGIN` command carries the password inline in the command stream, so
 unlike an HTTP `Authorization` header there is no separately-named field a
@@ -501,6 +509,18 @@ actually produce when run in both directions, because a constraint whose
 "missing" arm can never fire looks exactly like a constraint that was never
 added. Every entry also carries a reason longer than a label, because that
 string is what the hook prints when it rejects a commit.
+
+**Phase 13 turned a count constraint into a plain ban, and that is a change to
+the boundary rather than a refactor, so it is recorded here.** The count
+permitted exactly one reader of the account bindings and refused both zero and
+two. Then the cutover deleted the thing being read: identity now comes from the
+grant somebody signed in with, not from the deployment. Zero became the correct
+number of readers, which is the one number the count was written to refuse — so
+the count could either become a ban or become a lie about itself. A constraint
+whose "missing" arm can never fire looks exactly like a constraint that was
+never added, which is the failure the paragraph above describes, and leaving it
+in place would have been that failure on purpose. The rule id is deliberately
+not named here; which entries exist today is a question for the script.
 
 Phase 5 adds no sixth rule. It extends the `dav-concurrent-request` alternation
 with the CalDAV write entry points, because that rule enumerates its entry
