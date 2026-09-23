@@ -57,7 +57,15 @@ export interface DavServiceReport {
   calendarCount: number | null;
   /** CardDAV only: how many address books the home set holds. */
   addressBookCount: number | null;
-  /** CardDAV only: the report names this account's address books advertise. */
+  /**
+   * The report names the collections of THIS service advertise.
+   *
+   * Per-service, not CardDAV-only — it was CardDAV-only, and the asymmetry was
+   * the finding rather than the design: a tool that answered the question for
+   * one service and returned `null` for the other could not be used to answer
+   * it for the other, which cost a spike on 2026-09-23. Both halves now union
+   * the names across their own collections.
+   */
   reports: string[] | null;
   timings: DavServiceTimings;
 }
@@ -135,30 +143,92 @@ function fillResolved(
 }
 
 /**
- * Count the calendar collections in a home set with ONE request.
+ * Read a supported-report-set property into report names.
+ *
+ * The shape is the one tsdav's own `supportedReportSet` helper reads:
+ * `supportedReport` is one element or an array of them, and each element's
+ * `report` member is an object whose FIRST KEY is the report name.
+ *
+ * Hand-narrowed for the reason `reportNamesOf` below already gives — the
+ * library types this whole region `any`, so the compiler is not watching this
+ * boundary, and an unexpected object shape reaching `JSON.stringify` renders as
+ * the nine characters `[object Object]`, which reads like a real answer in a
+ * tool response. A name is kept only when it is a non-empty string; everything
+ * else is dropped rather than coerced.
+ */
+function supportedReportNamesOf(value: unknown): string[] {
+  if (value === null || typeof value !== "object") return [];
+  const supported = (value as { supportedReport?: unknown }).supportedReport;
+  if (supported === null || supported === undefined) return [];
+  const entries = Array.isArray(supported) ? supported : [supported];
+
+  const names: string[] = [];
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== "object") continue;
+    const report = (entry as { report?: unknown }).report;
+    if (report === null || typeof report !== "object") continue;
+    const name = Object.keys(report as Record<string, unknown>)[0];
+    if (typeof name === "string" && name.length > 0) names.push(name);
+  }
+  return names;
+}
+
+/**
+ * Everything the CalDAV home set can say about itself in ONE request.
  *
  * `propfind` at depth 1 rather than tsdav's `fetchCalendars`, and the reason is
  * the connection budget rather than style: `fetchCalendars` wraps a `Promise.all`
  * that issues one ADDITIONAL PROPFIND per calendar to read its supported report
  * set. The gate in `./transport.ts` would serialise that fan-out, so it would
  * be correct — but it would still cost one round trip per calendar to produce a
- * number, and a personal account has half a dozen calendars.
+ * number, and a personal account has nine calendars.
+ *
+ * **The report names ride that same request.** A depth-1 PROPFIND may ask for
+ * the supported-report-set alongside the resource type, and a server that does
+ * not know a property omits it from the response rather than refusing the whole
+ * PROPFIND — which is why `src/dav/calendar.ts`'s listing already free-loads
+ * `cs:source` the same way. So the CalDAV half answers the question the CardDAV
+ * half answers, at no extra round trip and with no per-collection helper.
+ *
+ * `calendarCount` counts the collections carrying the calendar resource type.
+ * **That is deliberately a different number from the length of
+ * `calendar_list_calendars`**, and the difference is the point: this count
+ * includes a to-do list, because a reminder list is a calendar collection whose
+ * component set is `VTODO`, while the listing filters on the event component and
+ * drops it. A diagnostic that agreed with the listing could not show that the
+ * listing is hiding something.
  */
-async function countCalendars(
+async function probeCalendarHome(
   davFetch: DavFetch,
   homeUrl: string,
-): Promise<number> {
+): Promise<{ calendarCount: number; reports: string[] }> {
   const responses = await propfind({
     url: homeUrl,
-    props: { "d:resourcetype": {}, "d:displayname": {} },
+    props: {
+      "d:resourcetype": {},
+      "d:displayname": {},
+      "d:supported-report-set": {},
+    },
     depth: "1",
     headers: {},
     fetch: davFetch,
   });
 
-  return responses.filter((response) =>
-    Object.keys(response.props?.resourcetype ?? {}).includes("calendar"),
-  ).length;
+  let calendarCount = 0;
+  // A Set, so the union across collections de-duplicates while keeping the
+  // order the collections were seen in — symmetric with `reportNamesOf`.
+  const reports = new Set<string>();
+
+  for (const response of responses) {
+    const props = response.props ?? {};
+    if (!Object.keys(props.resourcetype ?? {}).includes("calendar")) continue;
+    calendarCount += 1;
+    for (const name of supportedReportNamesOf(props.supportedReportSet)) {
+      reports.add(name);
+    }
+  }
+
+  return { calendarCount, reports: [...reports] };
 }
 
 /**
@@ -238,7 +308,9 @@ async function runOneService(
 
   const collectionsStart = Date.now();
   if (service === "caldav") {
-    into.calendarCount = await countCalendars(davFetch, resolved.homeUrl);
+    const probe = await probeCalendarHome(davFetch, resolved.homeUrl);
+    into.calendarCount = probe.calendarCount;
+    into.reports = probe.reports;
   } else {
     const books = await fetchAddressBooks({
       account: davAccountFor(service, resolved),

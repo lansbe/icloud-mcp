@@ -95,15 +95,49 @@ function addressBookHomeBody(home: string): string {
   return `<response><href>${PRINCIPAL_PATH}</href><propstat><status>HTTP/1.1 200 OK</status><prop><CARD:addressbook-home-set><href>${home}</href></CARD:addressbook-home-set></prop></propstat></response>`;
 }
 
-/** Three calendars and the home collection itself, which is not one. */
+/**
+ * A supported-report-set property carrying the named reports.
+ *
+ * Spelt the way iCloud spells it — one `supported-report` wrapper per report,
+ * each holding a `report` element whose single child names it. tsdav strips the
+ * namespace and camel-cases the name, so `<C:calendar-query/>` arrives as the
+ * string `calendarQuery`.
+ */
+function reportSetProp(...reports: string[]): string {
+  const entries = reports
+    .map((report) => `<supported-report><report>${report}</report></supported-report>`)
+    .join("");
+  return `<supported-report-set>${entries}</supported-report-set>`;
+}
+
+/**
+ * Three calendars and the home collection itself, which is not one.
+ *
+ * The three advertise OVERLAPPING but not identical report sets, so the union
+ * the diagnostic reports has to de-duplicate to be right — an implementation
+ * that concatenated would pass against a fixture where every collection said
+ * the same thing.
+ */
 function calendarListBody(): string {
-  const calendar = (href: string, name: string) =>
-    `<response><href>${href}</href><propstat><status>HTTP/1.1 200 OK</status><prop><resourcetype><collection/><C:calendar/></resourcetype><displayname>${name}</displayname></prop></propstat></response>`;
+  const calendar = (href: string, name: string, reportSet: string) =>
+    `<response><href>${href}</href><propstat><status>HTTP/1.1 200 OK</status><prop><resourcetype><collection/><C:calendar/></resourcetype><displayname>${name}</displayname>${reportSet}</prop></propstat></response>`;
   return (
     `<response><href>${CALDAV_HOME}</href><propstat><status>HTTP/1.1 200 OK</status><prop><resourcetype><collection/></resourcetype></prop></propstat></response>` +
-    calendar(`${CALDAV_HOME}home/`, "Home") +
-    calendar(`${CALDAV_HOME}work/`, "Work") +
-    calendar(`${CALDAV_HOME}birthdays/`, "Birthdays")
+    calendar(
+      `${CALDAV_HOME}home/`,
+      "Home",
+      reportSetProp("<C:calendar-query/>", "<C:calendar-multiget/>", "<sync-collection/>"),
+    ) +
+    calendar(
+      `${CALDAV_HOME}work/`,
+      "Work",
+      reportSetProp("<C:calendar-query/>", "<sync-collection/>"),
+    ) +
+    calendar(
+      `${CALDAV_HOME}birthdays/`,
+      "Birthdays",
+      reportSetProp("<C:calendar-query/>", "<C:free-busy-query/>"),
+    )
   );
 }
 
@@ -268,6 +302,33 @@ function serviceOf(
   return reportOf(result)[service] as Record<string, unknown>;
 }
 
+/**
+ * The requests this run made against the CalDAV side of the account.
+ *
+ * The two services' hosts share no substring — `caldav.icloud.com` and
+ * `p42-caldav.icloud.com` on one side, `contacts.icloud.com` and
+ * `p61-contacts.icloud.com` on the other, and the CardDAV well-known path
+ * spells `carddav`, which does not contain `caldav`. So this partition is exact
+ * rather than approximate.
+ */
+function caldavRequests(stub: Stub): ObservedRequest[] {
+  return stub.requests.filter((request) => request.url.includes("caldav"));
+}
+
+/**
+ * How many round trips a cold CalDAV half costs: the well-known probe, which
+ * tsdav tries twice (PROPFIND, then GET) against an account that answers it
+ * with a 404; the root PROPFIND that names the principal; the principal
+ * PROPFIND that names the home set; and the one depth-1 listing of that home
+ * set.
+ *
+ * Pinned as a literal on purpose. Everything this phase adds to the CalDAV
+ * report — the supported-report-set, the collection enumeration — rides the
+ * LAST of those five, and the whole claim that it does is this number not
+ * moving.
+ */
+const COLD_CALDAV_REQUESTS = 5;
+
 describe("dav_diagnose, end to end", () => {
   beforeEach(async () => {
     await clearDavCache(env, principal);
@@ -298,6 +359,70 @@ describe("dav_diagnose, end to end", () => {
     expect(carddav.cacheHit).toBe(false);
     expect(carddav.addressBookCount).toBe(2);
     expect(carddav.reports).toContain("addressbookQuery");
+  });
+
+  it("answers the CalDAV supported-report-set, the way it already answers CardDAV's", async () => {
+    // SPIKE-03. Before this, `reports` was `null` for CalDAV and a real list for
+    // CardDAV, and the asymmetry was the finding: the tool never asked.
+    const stub = davStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+
+    const caldav = serviceOf(result, "caldav");
+    expect(caldav.reports).not.toBeNull();
+    // The UNION across the three collections, de-duplicated, in the order the
+    // collections were seen. `syncCollection` appears on two of them and
+    // `calendarQuery` on all three; each appears once.
+    expect(caldav.reports).toEqual([
+      "calendarQuery",
+      "calendarMultiget",
+      "syncCollection",
+      "freeBusyQuery",
+    ]);
+  });
+
+  it("costs the CalDAV half no extra round trip to say so", async () => {
+    const stub = davStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+
+    expect(caldavRequests(stub).length).toBe(COLD_CALDAV_REQUESTS);
+    // Exactly one of those five is the home-set listing, and it is the one
+    // carrying the answer. No per-collection helper ran.
+    expect(
+      caldavRequests(stub).filter((request) => request.url === CALDAV_HOME).length,
+    ).toBe(1);
+    expect(serviceOf(result, "caldav").reports).not.toBeNull();
+    expect(stub.overlapped).toBe(false);
+  });
+
+  it("drops a malformed report element rather than stringifying it", async () => {
+    // `DAVCollection`'s report region is typed `any` by the library, so nothing
+    // upstream of the narrowing is watching this. An object reaching
+    // `JSON.stringify` renders as nine characters that read like a real answer.
+    const malformed =
+      `<response><href>${CALDAV_HOME}</href><propstat><status>HTTP/1.1 200 OK</status><prop><resourcetype><collection/></resourcetype></prop></propstat></response>` +
+      `<response><href>${CALDAV_HOME}odd/</href><propstat><status>HTTP/1.1 200 OK</status><prop><resourcetype><collection/><C:calendar/></resourcetype><displayname>Odd</displayname>` +
+      `<supported-report-set>` +
+      `<supported-report><report/></supported-report>` +
+      `<supported-report/>` +
+      `<supported-report><report><C:calendar-query/></report></supported-report>` +
+      `</supported-report-set>` +
+      `</prop></propstat></response>`;
+
+    const stub = davStub({
+      onRequest: (url) =>
+        url === CALDAV_HOME ? multistatus(malformed) : null,
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+    const caldav = serviceOf(result, "caldav");
+
+    expect(caldav.reports).toEqual(["calendarQuery"]);
+    expect(JSON.stringify(caldav)).not.toContain("[object Object]");
   });
 
   it("reports the two shard hosts as INDEPENDENT fields, never derived", async () => {
