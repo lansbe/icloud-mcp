@@ -942,8 +942,56 @@ export const REGISTRATION_REFUSED_DESCRIPTION =
  * 256 is chosen to be obviously above every real value and obviously below the
  * 1 MiB body the registration endpoint would otherwise accept. It is a cap on
  * what gets STORED FOREVER, not an opinion about names.
+ *
+ * **It bounds one field and nothing else, which is why the three constants
+ * below exist** (code review WR-01, iteration 2). `client_name` was the only
+ * field capped when the cap was added, and the comment at the gate claimed it
+ * stopped the record being large. It did not: `redirect_uris` entries, the
+ * `contacts` array and every `client_name#<lang>` i18n key are stored verbatim
+ * in the same permanent record and were all unbounded.
  */
 export const MAX_CLIENT_NAME_LENGTH = 256;
+
+/**
+ * The longest redirect address this server will store.
+ *
+ * The gate above reduces a URI to its ORIGIN, which discards the path entirely —
+ * `new URL("https://claude.ai/" + "a".repeat(200)).origin` is
+ * `"https://claude.ai"` — so `https://claude.ai/<900 KB of path>` passes the
+ * allowlist and the library only checks the scheme and control characters. This
+ * is the bound on what is left.
+ *
+ * 512 is far above anything real. On 2026-09-21 all 21 live records held one
+ * address each in three known shapes, the longest of them a Claude web callback
+ * well under a hundred characters (12-RESEARCH.md § Finding 2).
+ */
+export const MAX_REDIRECT_URI_LENGTH = 512;
+
+/**
+ * The most redirect addresses one registration may hold.
+ *
+ * Every live record held exactly one. A client can only ever authorize to an
+ * address it registered, so a long list buys a real client nothing; what it buys
+ * a stranger is `MAX_REDIRECT_URI_LENGTH` bytes each, stored forever.
+ */
+export const MAX_REDIRECT_URIS = 8;
+
+/**
+ * The largest registration body this server will store, serialized.
+ *
+ * The backstop, and the only one of the four bounds that cannot be evaded by a
+ * field nobody thought of. The other three name fields; this one measures the
+ * whole shape, so a stored value this gate has never heard of — a new i18n
+ * variant, a `contacts` array of ten thousand strings, some future member of the
+ * metadata schema — is bounded on the day it appears rather than on the day
+ * somebody notices.
+ *
+ * 8 KiB: roughly an order of magnitude above a real registration body, and two
+ * orders below the 1 MiB the endpoint would otherwise accept. Twenty-one records
+ * at this ceiling is under 200 KB, which is a nuisance rather than an incident —
+ * and `prune-clients` removes them.
+ */
+export const MAX_REGISTRATION_BYTES = 8192;
 
 /**
  * Refuse a registration whose redirect addresses are not all on the allowlist.
@@ -1013,7 +1061,7 @@ export function refuseUnlistedRedirects(
 
     // A SIZE BOUND, and the redirect gate is not one. The registration endpoint
     // is unauthenticated by the OAuth spec and accepts a body up to 1 MiB, the
-    // library puts no length cap on `client_name`, and a client record never
+    // library puts no length cap on any stored field, and a client record never
     // expires now — so one accepted registration can park most of a megabyte in
     // the namespace that holds the grants and the tokens, permanently. The
     // loopback half of the redirect gate admits any port, so passing it costs a
@@ -1021,21 +1069,62 @@ export function refuseUnlistedRedirects(
     // this is the cheap half that stops the record being that large to begin
     // with.
     //
-    // The ceiling is far above anything real. On 2026-09-21 the longest name
-    // among 21 live client records was well under this (12-RESEARCH.md § Finding
-    // 2), and the name is only ever shown on the consent screen and in the
-    // grants listing — which cuts it to 60 characters anyway.
+    // **Four bounds, not one (code review WR-01, iteration 2).** The version of
+    // this comment that shipped with iteration 1 said a `client_name` cap
+    // "stops the record being that large to begin with". It did not, and saying
+    // so would have stopped the next reader looking any further: the gate above
+    // reduces each redirect URI to its ORIGIN and throws the path away, so a URI
+    // carrying most of a megabyte of path passed it; and `contacts` and every
+    // `client_name#<lang>` i18n key are stored verbatim with no cap on their
+    // number or their length. Only the one field nobody was abusing was bounded.
     //
-    // A name that is present and not a string is refused rather than ignored:
-    // this function's job is deciding whether to store the body, and a field it
-    // cannot measure is one it cannot vouch for.
+    // Three of the four name a field; the fourth measures the whole body, and
+    // that one is the only one a field nobody thought of cannot walk around.
+    //
+    // NONE OF THEM TOUCHES THE REDIRECT CLASS. The loopback pattern and the
+    // claude.ai origin decide WHERE a code may be sent; these decide HOW MUCH
+    // may be stored. A registration refused here would have been stored, not
+    // redirected to.
+    //
+    // The ceilings are far above anything real. On 2026-09-21 all 21 live client
+    // records held one redirect address each in three known shapes and a name
+    // well under 256 characters (12-RESEARCH.md § Finding 2). If a real client is
+    // ever refused, these four numbers are what to raise, and nothing stored has
+    // to change.
+    //
+    // A field that is present and not the type it should be is refused rather
+    // than ignored: this function's job is deciding whether to store the body,
+    // and a field it cannot measure is one it cannot vouch for. (The non-string
+    // `client_name` branch is unreachable through the endpoint, since the
+    // library's own `optionalString` answers `invalid_client_metadata` above this
+    // callback — IN-05. It is defence in depth, and this is not where that
+    // shape's behaviour is defined.)
     const name: unknown = clientMetadata.client_name;
     const namedSafely =
       name === undefined ||
       name === null ||
       (typeof name === "string" && name.length <= MAX_CLIENT_NAME_LENGTH);
 
-    return allowed && namedSafely
+    // Measured as a LIST and as STRINGS, separately from `allowed` above, which
+    // asks a different question about the same array and must stay readable as
+    // the redirect rule it is.
+    const boundedUris =
+      Array.isArray(uris) &&
+      uris.length <= MAX_REDIRECT_URIS &&
+      uris.every(
+        (uri: unknown) =>
+          typeof uri === "string" && uri.length <= MAX_REDIRECT_URI_LENGTH,
+      );
+
+    // The backstop. `clientMetadata` is parsed JSON, so it has no cycles and
+    // this cannot throw on one — and the try around the whole body is what
+    // covers it if that assumption ever stops holding. It is measured in UTF-16
+    // code units rather than bytes, which under-counts nothing that matters: a
+    // non-ASCII character costs at least as many bytes as units.
+    const boundedWhole =
+      JSON.stringify(clientMetadata).length <= MAX_REGISTRATION_BYTES;
+
+    return allowed && namedSafely && boundedUris && boundedWhole
       ? undefined
       : { description: REGISTRATION_REFUSED_DESCRIPTION };
   } catch {

@@ -344,6 +344,12 @@ record in the same store as the connections, **anyone on the internet can make
 one** (the OAuth spec requires the endpoint to be open), and it does not expire.
 Nothing else removes them, so they pile up.
 
+Small is now enforced rather than hoped for: the server refuses a registration
+over 8 KiB, with more than eight redirect addresses, with any one of them over
+512 characters, or with a name over 256. Every real registration seen on this
+server is an order of magnitude under all four, so this should refuse nothing. If
+a real app ever is refused, those are the four numbers to raise.
+
 `list` tells you how many are lying around. To see them and clear them out:
 
 ```bash
@@ -351,10 +357,20 @@ node scripts/grants.mjs prune-clients          # shows what it would delete
 node scripts/grants.mjs prune-clients --yes    # deletes it
 ```
 
-**It only ever touches a registration that no connection is using.** A
-registration still attached to somebody's live connection is never deleted:
-removing one signs that person out, even though their connection itself is
-perfectly fine. So this cannot cut anybody off. It is tidying, not removing.
+**It only ever deletes a registration that no connection was using in either of
+the two checks it makes.** A registration still attached to somebody's live
+connection is never deleted: removing one signs that person out, even though
+their connection itself is perfectly fine. It checks once to show you the list
+and again immediately before deleting, so an app that connects while you are
+reading the list is safe.
+
+What it cannot do is close the last second. A sign-in that completes between the
+second check and the delete would still be cut off — the store has no
+transactions, so that window cannot be closed, only made small. Run this when
+nobody is connecting, and if it does happen the recovery is one sign-in.
+
+The run tells you if the second check saved anybody, so `Deleted 0 client
+records.` is never the whole story.
 
 This does not replace step 2 above. Revoking a connection is how you end
 somebody's session; this just sweeps up the leftovers.

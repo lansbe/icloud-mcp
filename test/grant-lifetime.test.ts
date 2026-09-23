@@ -70,6 +70,9 @@ import type {
 } from "@cloudflare/workers-oauth-provider";
 import {
   MAX_CLIENT_NAME_LENGTH,
+  MAX_REDIRECT_URIS,
+  MAX_REDIRECT_URI_LENGTH,
+  MAX_REGISTRATION_BYTES,
   REGISTRATION_REFUSED_DESCRIPTION,
   createLoginHandler,
   refuseUnlistedRedirects,
@@ -722,6 +725,85 @@ describe("LIFE-02: a registration off the allowlist is refused at the door", () 
     // cannot vouch for.
     expect(nameOf(7)).toEqual(REGISTRATION_REFUSAL);
     expect(nameOf({ toString: () => "short" })).toEqual(REGISTRATION_REFUSAL);
+  });
+
+  it("caps the redirect addresses too, which the origin gate does not", () => {
+    // WR-01, iteration 2. The gate above reduces each URI to its ORIGIN and
+    // discards the path, so `https://claude.ai/<most of a megabyte>` passed it
+    // and the library only checks the scheme and control characters. The whole
+    // string lands in the permanent record.
+    const good = "https://claude.ai/api/mcp/auth_callback";
+    const padding = MAX_REDIRECT_URI_LENGTH - "https://claude.ai/".length;
+
+    // The reduction itself, pinned, so the reason for this bound is not left as
+    // a claim in a comment. A 200-character path is invisible to the gate.
+    expect(new URL(`https://claude.ai/${"a".repeat(200)}`).origin).toBe(
+      "https://claude.ai",
+    );
+
+    // Exactly at the bound passes; one over is refused. Compared against the
+    // exported constant rather than a second copy of the number.
+    expect(judge([`https://claude.ai/${"a".repeat(padding)}`])).toBeUndefined();
+    expect(
+      judge([`https://claude.ai/${"a".repeat(padding + 1)}`]),
+    ).toEqual(REGISTRATION_REFUSAL);
+
+    // And the COUNT. Every live record held exactly one address; a long list
+    // buys a real client nothing it could use, because it can only authorize to
+    // an address it registered.
+    expect(
+      judge(Array.from({ length: MAX_REDIRECT_URIS }, () => good)),
+    ).toBeUndefined();
+    expect(
+      judge(Array.from({ length: MAX_REDIRECT_URIS + 1 }, () => good)),
+    ).toEqual(REGISTRATION_REFUSAL);
+  });
+
+  it("caps the WHOLE body, so a field this gate never heard of is bounded too", () => {
+    // WR-01's backstop, and the only one of the four bounds that a field nobody
+    // thought of cannot walk around. Each row below is a real stored field the
+    // named caps miss entirely.
+    const good = "https://claude.ai/api/mcp/auth_callback";
+    const base = {
+      client_name: "a client",
+      redirect_uris: [good],
+      token_endpoint_auth_method: "none",
+    };
+    const bodyOf = (
+      extra: Record<string, unknown>,
+    ): ClientRegistrationCallbackResult | undefined | void =>
+      refuseUnlistedRedirects(registrationOptions({ ...base, ...extra }));
+
+    // A real registration is nowhere near the ceiling.
+    expect(JSON.stringify(base).length).toBeLessThan(MAX_REGISTRATION_BYTES / 4);
+    expect(bodyOf({})).toBeUndefined();
+
+    // `contacts` — any number of strings of any length, stored verbatim by the
+    // library at `oauth-provider.js:2586`. Neither the name cap nor the URI cap
+    // sees it.
+    expect(
+      bodyOf({ contacts: ["someone@example.invalid"] }),
+      "a real contacts array was refused",
+    ).toBeUndefined();
+    expect(
+      bodyOf({
+        contacts: Array.from({ length: 400 }, () => "x".repeat(200)),
+      }),
+    ).toEqual(REGISTRATION_REFUSAL);
+
+    // The i18n keys — every key matching `client_name#…` is accepted and stored,
+    // with no cap on how many there are. Each VALUE here is under
+    // MAX_CLIENT_NAME_LENGTH, so only the whole-body bound can refuse this.
+    const i18n: Record<string, unknown> = {};
+    for (let index = 0; index < 200; index += 1) {
+      i18n[`client_name#lang${index}`] = "n".repeat(MAX_CLIENT_NAME_LENGTH);
+    }
+    expect(bodyOf(i18n)).toEqual(REGISTRATION_REFUSAL);
+    // One of them is a real client being polite, and is not refused.
+    expect(
+      bodyOf({ "client_name#fr": "un client" }),
+      "a single translated name was refused",
+    ).toBeUndefined();
   });
 
   it("refuses a non-object argument rather than throwing past its own claim", () => {
