@@ -33,10 +33,15 @@ const TEMPLATE_URL = new URL("../wrangler.jsonc.example", import.meta.url);
  * Newlines inside removed regions are preserved so that any JSON.parse error
  * still reports a line number matching the original file.
  *
+ * Exported so a second script can read a DIFFERENT value out of the same
+ * git-ignored JSONC config without re-typing the scanner. The hostname itself
+ * still has exactly one reader -- `getHostname()` below -- so exporting the
+ * text helpers does not give the hostname a second home.
+ *
  * @param {string} text
  * @returns {string}
  */
-function stripJsonComments(text) {
+export function stripJsonComments(text) {
   let out = "";
   let inString = false;
   let inLineComment = false;
@@ -105,10 +110,12 @@ function stripJsonComments(text) {
  * Remove trailing commas before `}` or `]`. JSONC permits them; JSON.parse
  * does not. String-aware for the same reason as the comment stripper.
  *
+ * Exported for the same reason as `stripJsonComments`.
+ *
  * @param {string} text
  * @returns {string}
  */
-function stripTrailingCommas(text) {
+export function stripTrailingCommas(text) {
   let out = "";
   let inString = false;
 
