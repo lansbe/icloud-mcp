@@ -1044,6 +1044,80 @@ describe("dav_diagnose, the collection write probe (SPIKE-04)", () => {
     const segment = created[0].url.slice(CALDAV_HOME.length);
     expect(segment.endsWith("/")).toBe(true);
     expect(segment.slice(0, -1)).not.toContain("/");
+    expect(stub.overlapped).toBe(false);
+  });
+
+  // ---------------------------------------------------------------------
+  // THE CREDENTIAL CASE. Do not delete this as redundant with the
+  // default-run version further up — it is the only assertion in this
+  // repository that can see the failure it is written against.
+  //
+  // Every tsdav helper declares `fetch?: typeof fetch` as OPTIONAL and
+  // resolves it as `fetchOverride ?? fetch`. Omit the option at any one of
+  // the four call sites the two probes add and that helper silently uses
+  // the bare global instead: no `authorization` header, no
+  // `redirect: "manual"`, no per-request serialisation gate, no
+  // status-to-error mapping.
+  //
+  // `scripts/forbidden-tokens.mjs` CANNOT catch this. `dav-fetch-outside-
+  // transport` fires on a bare network call inside `src/dav/`, and a helper
+  // invoked without the option is not a bare call at that site — the fetch
+  // happens inside `node_modules`, which the scanner does not walk. It is
+  // the same blind spot `dav-concurrent-request`'s own reason string already
+  // records for `fetchCalendars`.
+  //
+  // What it would cost: against iCloud, a 401 on every mutation. At the
+  // report level that is indistinguishable from iCloud refusing collection
+  // writes from a third-party client — a measured-looking WRONG verdict for
+  // SPIKE-04, produced by a bug in this repository, reshaping Phase 17.
+  //
+  // A call-site grep would be the weaker check. This reads what was actually
+  // SENT: `vi.stubGlobal("fetch", stub.fetch)` makes the stub the global, so
+  // a helper that fell back to the global still lands in `stub.requests` —
+  // just without the two properties only `createDavFetch` sets.
+  // ---------------------------------------------------------------------
+  it("sends EVERY request of BOTH probes through this project's own transport", async () => {
+    const { stub } = writeProbeStub({
+      onOther: (url, method) =>
+        method === "REPORT"
+          ? multistatus(todoObject(`${url}1.ics`, "uid-milk", "Buy milk"))
+          : null,
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeCollectionWrite: true,
+      probeTaskObjects: true,
+    });
+
+    // Non-vacuity first, and per probe: a walk over a list that never grew
+    // the probes' own requests would pass while proving nothing about them.
+    expect(methodsOf(stub, "MKCALENDAR").length).toBe(1);
+    expect(methodsOf(stub, "PROPPATCH").length).toBe(1);
+    expect(methodsOf(stub, "DELETE").length).toBe(1);
+    expect(methodsOf(stub, "REPORT").length).toBeGreaterThan(0);
+    expect(writeProbeOf(result)).not.toBeNull();
+    expect(taskProbeOf(result)).not.toBeNull();
+
+    for (const request of stub.requests) {
+      const authorization = new Headers(request.init.headers).get(
+        "authorization",
+      );
+      expect(
+        authorization,
+        `${request.method} ${request.url} carried no credential — a tsdav helper was called without fetch: davFetch`,
+      ).toBeTruthy();
+      expect(authorization!.startsWith("Basic ")).toBe(true);
+      // The other property only `createDavFetch` sets, applied last so no
+      // caller-supplied init can override it. One line, and it fails on the
+      // same omission.
+      expect(
+        request.init.redirect,
+        `${request.method} ${request.url} did not carry redirect: manual`,
+      ).toBe("manual");
+    }
+
+    expect(stub.overlapped).toBe(false);
   });
 
   it("never has two requests in flight while the write probe runs", async () => {
