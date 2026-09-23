@@ -126,8 +126,11 @@ const UNPAUSED = new WeakMap<Promise<Principal>, Promise<Principal>>();
  * so `src/mcp/api-handler.ts`'s `fetch` still neither awaits nor throws: the
  * read happens inside the promise, and every tool already awaits that promise
  * as the first line of its own `try`. A marker present means the promise
- * rejects with the plain auth error, so every tool answers `auth_failed` with
- * the text that already tells the user to reconnect.
+ * rejects with the plain auth error, so every tool EXCEPT the two diagnostics
+ * answers `auth_failed` with the text that already tells the user to reconnect.
+ * `mail_imap_diagnose` and `dav_diagnose` are exempt (owner decision,
+ * 2026-09-22) so a paused user can always find out why; see `answersDuringPause`
+ * below and `src/mcp/api-handler.ts`.
  *
  * **THE READ FAILS OPEN, WHICH IS THE OPPOSITE OF `readStoredAllowList`.** That
  * one treats an unreadable store as "nobody", because a store outage must not
