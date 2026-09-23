@@ -793,19 +793,20 @@ export interface AuthOutcome {
    *
    * A SECOND, NARROWER FACT than `authenticated: false`, and the two must not
    * be confused. Every non-OK reply that is not a connection ceiling lands in
-   * `authenticated: false` — including a `NO [SERVERBUG]`, a `NO [CONTACTADMIN]`
-   * and a `BAD` from a protocol desync, none of which say anything about the
-   * password. Only a reply carrying one of the parser's authentication response
-   * codes sets this.
+   * `authenticated: false`, and some of those say nothing at all about the
+   * password: a `NO [SERVERBUG]`, a `NO [CONTACTADMIN]`, a `BAD` from a
+   * protocol desync. `indicatesCredentialRefusal` is what separates them, and
+   * it does so BY EXCLUSION — see its docstring for the owner decision of
+   * 2026-09-22 that reversed the earlier allow-list and why. A refusal carrying
+   * no bracketed code at all now sets this.
    *
    * Read from the parsed tagged reply, both attempts, never from a caught
    * value — the same sanctioned source the throttle classifier reads.
    *
    * It exists because LIFE-04's pause is evidence ABOUT THE SAVED PASSWORD.
-   * Branching that pause on `authenticated` instead would let a transient
-   * condition at Apple tell a user with a perfectly good password to reconnect,
-   * and silence `mail_imap_diagnose` and `dav_diagnose` for fifteen minutes —
-   * the two tools whose job is explaining exactly that.
+   * Branching that pause on `authenticated` instead would pause on a protocol
+   * desync of our own making, which is neither Apple's verdict nor a thing the
+   * user can act on.
    */
   credentialRefused: boolean;
   /** Which mechanism the server accepted, or `null` if none did. */
@@ -937,8 +938,10 @@ export async function authenticate(
     authenticated: false,
     // EITHER attempt naming a credential condition is enough. A server can
     // answer the two mechanisms differently — a legacy username format refused
-    // on LOGIN and a bare error on the SASL retry — and reading only the last
-    // reply would throw away the more diagnostic of the two.
+    // on LOGIN and a `[SERVERBUG]` on the SASL retry, or the reverse — and
+    // reading only one reply would let the other one's verdict decide. Both
+    // asymmetric shapes are driven in `test/password-pause.test.ts`, so neither
+    // operand can be dropped without a case going red (IN-03).
     credentialRefused:
       indicatesCredentialRefusal(login.tagged.text) ||
       indicatesCredentialRefusal(sasl.tagged.text),

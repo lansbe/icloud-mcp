@@ -962,29 +962,70 @@ export function indicatesConnectionLimit(line: string): boolean {
 }
 
 /**
- * Whether a tagged reply names a credential condition — the server saying the
- * password itself was refused, rather than saying anything else.
+ * Response codes that name a fault at the SERVER rather than a verdict on the
+ * credential.
  *
- * The same list `indicatesConnectionLimit` consults, read for its own sake
- * rather than as an override. That sharing is the point: one place to add a
- * code, and the two functions can never disagree about what a code means.
+ * Lowercase and bracketed for the same reason `AUTH_RESPONSE_CODES` is. These
+ * are the two a server sends when it never got as far as checking the password:
+ * `[SERVERBUG]` says the server broke, `[CONTACTADMIN]` says a human has to fix
+ * something at their end. Neither is evidence about what is saved in the grant.
  *
- * **This is a narrower question than "did authentication succeed".** A reply
- * carrying no code at all — a bare `NO Server busy`, a `NO [SERVERBUG]`, a
- * `NO [CONTACTADMIN]`, a `BAD` from a protocol desync — fails authentication
- * and is NOT a credential refusal. Everything that acts on a refusal as
- * evidence about the SAVED PASSWORD has to ask this question and not that one,
- * because acting on the broader one treats a transient condition at Apple as a
- * dead password and tells the user to reconnect when nothing is wrong.
+ * This list is an EXCLUSION list, and that is the reverse of how
+ * `AUTH_RESPONSE_CODES` is read one function down. Adding a code here makes the
+ * pause fire LESS, so the risk of a wrong entry is a missed pause rather than a
+ * false one — the same direction of caution, pointed the other way.
+ */
+const SERVER_FAULT_RESPONSE_CODES = ["[serverbug]", "[contactadmin]"];
+
+/**
+ * Whether a tagged reply is Apple refusing the password saved in the grant.
  *
- * It fails in the safe direction, deliberately, and it is the same direction
- * the DAV site chose when it excluded 403: if iCloud ever spells a genuine
- * refusal without a code, this answers false, the pause simply does not fire,
- * and every call still fails fast. The opposite error — answering true for a
- * server-side fault — costs the user fifteen minutes of every tool telling them
- * something false, including the two diagnostics that would have explained it.
+ * **Classification is BY EXCLUSION, and that reverses iteration 1 of the phase
+ * 12 code review. Owner decision, 2026-09-22.** A tagged `NO` to a login is
+ * treated as a dead password unless it names one of the two conditions that are
+ * demonstrably not about the password: a server fault response code above, or a
+ * connection ceiling as `indicatesConnectionLimit` reads one. Everything else
+ * pauses, including a refusal carrying no bracketed code at all.
+ *
+ * Why it was reversed. The allow-list version fired only on
+ * `AUTH_RESPONSE_CODES`, and nothing in this repository has ever measured what
+ * `imap.mail.me.com` actually replies to a wrong app-specific password — the
+ * fixtures are labelled "Representative" and the live proof captured no refusal
+ * at all. Plenty of IMAP servers answer a bad password as bare prose
+ * (`a2 NO Authentication failed.`). If Apple is one of them, the allow-list
+ * never fires in production and the account sits in the pre-LIFE-04 position:
+ * every tool call opens a socket and spends another attempt against an
+ * unpublished lockout threshold, which is the exact thing the pause exists to
+ * stop and the thing that locks the user out of Mail.app on their own devices.
+ * A missed pause is the expensive error here; a spurious one costs fifteen
+ * minutes.
+ *
+ * **A `BAD` never pauses**, and neither does an `OK` or a line that is not a
+ * tagged completion at all. `BAD` means this client sent something the server
+ * could not parse — a protocol desync, our bug, and no statement about the
+ * credential. That is why this reads the parsed status rather than the raw
+ * string: the status is the one part of the line that is specified.
+ *
+ * **What the reversal costs, written down rather than left to be discovered.**
+ * A server-side fault Apple spells with no response code now pauses a working
+ * account for fifteen minutes. The compensation is the other half of the same
+ * owner decision: `mail_imap_diagnose` and `dav_diagnose` answer THROUGH a
+ * pause (see `answersDuringPause` in `src/password-pause.ts`), so the user can
+ * always find out why they are paused and read Apple's own reply text while it
+ * is in force. Without that exemption this widening would be the wrong trade.
  */
 export function indicatesCredentialRefusal(line: string): boolean {
+  // Only a tagged `NO`. An `OK`, a `BAD`, an untagged line and an unparseable
+  // one all answer false — see the docstring for why `BAD` is deliberate.
+  if (parseTaggedResponse(line)?.status !== "NO") return false;
+
   const lowered = line.toLowerCase();
-  return AUTH_RESPONSE_CODES.some((code) => lowered.includes(code));
+  if (SERVER_FAULT_RESPONSE_CODES.some((code) => lowered.includes(code))) {
+    return false;
+  }
+  // The throttle classification, reused rather than restated. `authenticate`
+  // raises on a connection ceiling before it ever asks this question, so this
+  // line is a second fence rather than the only one — but the two functions
+  // must not be able to disagree about the same reply.
+  return !indicatesConnectionLimit(line);
 }

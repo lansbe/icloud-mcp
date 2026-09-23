@@ -155,12 +155,40 @@ export const CONNECTION_LIMIT_TEXT =
 export const AUTH_SERVER_FAULT_TEXT = "[SERVERBUG] Internal error";
 
 /**
+ * The other server-side fault code: a human at Apple has to fix something.
+ *
+ * Like `[SERVERBUG]` it is a statement about the server, not a verdict on the
+ * credential, so it is the second entry on `indicatesCredentialRefusal`'s
+ * exclusion list and it does not start a pause.
+ */
+export const AUTH_CONTACTADMIN_TEXT =
+  "[CONTACTADMIN] Contact your administrator";
+
+/**
  * A refusal carrying no response code at all — prose only.
  *
- * The other half of the same problem. There is nothing here to classify, and
- * the safe reading of nothing is "this says nothing about the password".
+ * **This one DOES read as a dead password**, per the owner decision of
+ * 2026-09-22. Nothing in this repository has ever measured what
+ * `imap.mail.me.com` replies to a wrong app-specific password, and plenty of
+ * IMAP servers answer exactly this shape — prose, no bracketed code. Reading it
+ * as "says nothing about the password" is what left the account retrying against
+ * an unpublished lockout threshold on every call. See
+ * `indicatesCredentialRefusal` for the full argument.
+ *
+ * The wording is deliberately availability-flavoured and carries no credential
+ * prose at all, so no test here can pass by accident on a word like "password".
  */
 export const AUTH_UNCLASSIFIED_TEXT = "Server busy, please try again";
+
+/**
+ * A prose-only refusal in the wording a real IMAP server most often uses.
+ *
+ * The shape the allow-list missed, spelled the way it actually arrives. Kept
+ * beside `AUTH_UNCLASSIFIED_TEXT` rather than replacing it: one of the two says
+ * nothing about credentials and the other says everything, and both must pause,
+ * because the classifier does not read the prose at all.
+ */
+export const AUTH_REFUSED_PROSE_TEXT = "Authentication failed.";
 
 /** A capability line carrying two spaces, to prove the parser does not tidy. */
 export const UNTIDY_CAPABILITY_LINE = "* CAPABILITY  IMAP4rev1   liTeRaL+ ";

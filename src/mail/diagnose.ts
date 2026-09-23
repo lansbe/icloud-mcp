@@ -294,10 +294,12 @@ export async function runDiagnosticOver(
       // so it is armed like any other tool; the sign-in page never reaches here.
       //
       // Branched on `credentialRefused` and NOT on `authenticated` — see the
-      // matching site in `service.ts` for the argument. It matters more here
-      // than anywhere: this is the tool somebody runs to find out WHY, and a
-      // pause set from a server-side reply would make the next run of it answer
-      // `auth_failed` instead of the report.
+      // matching site in `service.ts` for the argument, and
+      // `indicatesCredentialRefusal` for the owner decision of 2026-09-22 that
+      // widened it to exclusion. This tool sets the pause and is exempt from
+      // it: `answersDuringPause` in `src/password-pause.ts` is what keeps the
+      // tool somebody runs to find out WHY answerable while a pause it may have
+      // started itself is in force.
       //
       // Recorded here, written after teardown (WR-03). See the `finally` below.
       credentialRefused = auth.credentialRefused;

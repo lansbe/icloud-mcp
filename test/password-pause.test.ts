@@ -71,6 +71,8 @@ import { entryEnv } from "./fixtures/bound-secrets";
 import type { FakeDuplex } from "./fixtures/fake-duplex";
 import { createFailingDuplex, createFakeDuplex } from "./fixtures/fake-duplex";
 import {
+  AUTH_CONTACTADMIN_TEXT,
+  AUTH_REFUSED_PROSE_TEXT,
   AUTH_REJECTED_LEGACY_TEXT,
   AUTH_REJECTED_TEXT,
   AUTH_SERVER_FAULT_TEXT,
@@ -80,6 +82,7 @@ import {
   PRE_AUTH_CAPABILITY,
   capabilityResponse,
   logoutExchange,
+  taggedBad,
   taggedNo,
 } from "./fixtures/icloud-bytes";
 import worker, {
@@ -550,6 +553,25 @@ function refusedAuth(firstText: string, fallbackText?: string): FakeDuplex {
   ]);
 }
 
+/**
+ * A conversation that answers both authentication attempts `BAD`.
+ *
+ * `taggedNo` is what `refusedAuth` scripts, and the status is exactly what
+ * separates these two cases — so this cannot be a parameter on that helper
+ * without the helper's name becoming a lie. Both attempts are answered, because
+ * a tool call does not pass `oneAttemptPerGuess` and a script that ran out of
+ * turns would fail on the read timeout rather than on the classification.
+ */
+function badAuth(text = "syntax error"): FakeDuplex {
+  return createFakeDuplex([
+    GREETING,
+    capabilityResponse("a1", PRE_AUTH_CAPABILITY),
+    taggedBad("a2", text),
+    taggedBad("a3", text),
+    logoutExchange("a4"),
+  ]);
+}
+
 /** The session shape a tool call takes: authenticated state only, no mailbox. */
 function proveOver(duplex: FakeDuplex, principal: Principal): Promise<string> {
   return withMailSessionOver(
@@ -789,6 +811,60 @@ describe("LIFE-04: the dead-password pause", () => {
       }
     });
 
+    it.each([
+      ["prose only, in the wording a real server uses", AUTH_REFUSED_PROSE_TEXT],
+      ["prose that never mentions the credential at all", AUTH_UNCLASSIFIED_TEXT],
+    ])("when Apple refuses with %s and no bracketed code", async (_l, text) => {
+      // WR-02, and the reversal of iteration 1. Owner decision, 2026-09-22.
+      // Classification is by EXCLUSION, so a refusal carrying no response code
+      // is a dead password. The allow-list version answered false to both of
+      // these rows, which — if that is what `imap.mail.me.com` actually sends —
+      // left LIFE-04's mail-path brake never firing in production at all, and
+      // every tool call spending another attempt at an unpublished lockout
+      // threshold. The second row is deliberately availability-flavoured: this
+      // must not pass because the prose happened to say "authentication".
+      try {
+        const principal = await armedPrincipal();
+        await expect(
+          proveOver(refusedAuth(text, text), principal),
+        ).rejects.toBeInstanceOf(ImapAuthError);
+
+        expect(
+          (await readMarker()).value,
+          "a code-less refusal left the account retrying against Apple",
+        ).toBe("1");
+      } finally {
+        await forgetMarker();
+      }
+    });
+
+    it.each([
+      ["the FIRST", AUTH_REJECTED_TEXT, AUTH_SERVER_FAULT_TEXT],
+      ["the SECOND", AUTH_SERVER_FAULT_TEXT, AUTH_REJECTED_TEXT],
+    ])(
+      "when only %s attempt names a credential condition",
+      async (_which, first, second) => {
+        // IN-03. `credentialRefused` is `refusal(login) || refusal(sasl)`, and
+        // until these two rows existed both positive cases carried the same
+        // text twice — so either operand could be deleted and the suite stayed
+        // green. Each row here reds a different deletion, which is the only
+        // reason the comment at that line is worth believing.
+        try {
+          const principal = await armedPrincipal();
+          await expect(
+            proveOver(refusedAuth(first, second), principal),
+          ).rejects.toBeInstanceOf(ImapAuthError);
+
+          expect(
+            (await readMarker()).value,
+            "one attempt named the credential and the other reply won",
+          ).toBe("1");
+        } finally {
+          await forgetMarker();
+        }
+      },
+    );
+
     it("never, for an UN-ARMED principal refused the same way", async () => {
       // The login page's shape. This is the whole defence against a stranger
       // who knows a listed address pausing that person's working apps: only a
@@ -940,12 +1016,14 @@ describe("LIFE-04: the dead-password pause", () => {
 
     it.each([
       ["a [SERVERBUG] fault, which is Apple's problem and not the password", AUTH_SERVER_FAULT_TEXT],
-      ["a refusal carrying no response code at all", AUTH_UNCLASSIFIED_TEXT],
+      ["a [CONTACTADMIN] fault, which needs a human at Apple and not a new password", AUTH_CONTACTADMIN_TEXT],
     ])("on %s", async (_label, text) => {
-      // CR-02. Authentication does NOT succeed on either of these replies, so
-      // both land in the same `authenticated: false` branch a real credential
-      // refusal lands in. Branching the report on that boolean paused a working
-      // account for fifteen minutes on a transient condition at Apple's end.
+      // CR-02, kept and narrowed by WR-02. Authentication does NOT succeed on
+      // either of these replies, so both land in the same `authenticated: false`
+      // branch a real credential refusal lands in. These two are the ENTIRE
+      // exclusion list now — a reply carrying no code at all pauses, and the
+      // matching rows in `sets the pause` above are what stop this list being
+      // widened back out to swallow a genuine refusal.
       try {
         const principal = await armedPrincipal();
         expect(
@@ -954,14 +1032,34 @@ describe("LIFE-04: the dead-password pause", () => {
 
         expect(
           (await readMarker()).value,
-          "a reply that never mentioned the credential paused the account",
+          "a fault at Apple's end paused a working account",
         ).toBeNull();
       } finally {
         await forgetMarker();
       }
     });
 
-    it("on an unclassified refusal inside the mail diagnostic either", async () => {
+    it("on a BAD, which is a protocol error of our own making", async () => {
+      // WR-02's other exclusion, and the one that is not about Apple at all. A
+      // `BAD` says this client sent something the server could not parse. The
+      // password is not the subject, and pausing on it would turn one of our own
+      // bugs into fifteen minutes of telling the user to reconnect.
+      try {
+        const principal = await armedPrincipal();
+        expect(
+          await raise(() => proveOver(badAuth(), principal)),
+        ).toBeInstanceOf(ImapAuthError);
+
+        expect(
+          (await readMarker()).value,
+          "a protocol error told the user their password was dead",
+        ).toBeNull();
+      } finally {
+        await forgetMarker();
+      }
+    });
+
+    it("on a server fault inside the mail diagnostic either", async () => {
       try {
         const principal = await armedPrincipal();
         const { failed, error } = await runDiagnosticOver(

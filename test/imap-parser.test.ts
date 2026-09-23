@@ -23,6 +23,7 @@ import {
   decodeModifiedUtf7,
   hasLiteralPlus,
   indicatesConnectionLimit,
+  indicatesCredentialRefusal,
   isUntagged,
   parseCapabilityLine,
   parseListLine,
@@ -34,8 +35,12 @@ import {
 import { ImapChannel, readUntilTag } from "../src/mail/imap-session";
 import { createFakeDuplex } from "./fixtures/fake-duplex";
 import {
+  AUTH_CONTACTADMIN_TEXT,
+  AUTH_REFUSED_PROSE_TEXT,
   AUTH_REJECTED_LEGACY_TEXT,
   AUTH_REJECTED_TEXT,
+  AUTH_SERVER_FAULT_TEXT,
+  AUTH_UNCLASSIFIED_TEXT,
   CONNECTION_LIMIT_TEXT,
   GREETING_LINE,
   POST_AUTH_CAPABILITY,
@@ -353,6 +358,98 @@ describe("indicatesConnectionLimit", () => {
     expect(
       indicatesConnectionLimit("A2 NO [OVERQUOTA] MAILBOX IS OVER QUOTA"),
     ).toBe(false);
+  });
+});
+
+describe("indicatesCredentialRefusal", () => {
+  // The question LIFE-04's pause is branched on: is this Apple saying the
+  // password saved in the grant is dead? Classification is BY EXCLUSION per the
+  // owner decision of 2026-09-22, which reversed the allow-list this function
+  // shipped with — so the cases below come in two halves, and BOTH halves have
+  // to stay populated. An exclusion list with every entry deleted answers true
+  // to everything; an exclusion list widened to cover a real refusal answers
+  // false to everything that matters.
+
+  it("reads a bracketed authentication refusal as a dead password", () => {
+    expect(indicatesCredentialRefusal(`a2 NO ${AUTH_REJECTED_TEXT}`)).toBe(true);
+    expect(
+      indicatesCredentialRefusal(`a2 NO ${AUTH_REJECTED_LEGACY_TEXT}`),
+    ).toBe(true);
+  });
+
+  it("reads a PROSE-ONLY refusal as a dead password, which is the reversal", () => {
+    // The case the allow-list missed, and the whole reason for the reversal.
+    // Nothing in this repository has measured Apple's actual reply, and a server
+    // that answers in prose left the pause never firing at all.
+    expect(
+      indicatesCredentialRefusal(`a2 NO ${AUTH_REFUSED_PROSE_TEXT}`),
+    ).toBe(true);
+  });
+
+  it("reads a refusal whose prose never mentions the credential as one too", () => {
+    // The classifier does not read the prose. This line says "Server busy" and
+    // still pauses, because the alternative — guessing from free-form English —
+    // is the allow-list problem in a different costume.
+    expect(
+      indicatesCredentialRefusal(`a2 NO ${AUTH_UNCLASSIFIED_TEXT}`),
+    ).toBe(true);
+  });
+
+  it("does NOT read a server fault as a dead password", () => {
+    expect(
+      indicatesCredentialRefusal(`a2 NO ${AUTH_SERVER_FAULT_TEXT}`),
+    ).toBe(false);
+    expect(
+      indicatesCredentialRefusal(`a2 NO ${AUTH_CONTACTADMIN_TEXT}`),
+    ).toBe(false);
+  });
+
+  it("does not read a server fault as one whatever case the code is written in", () => {
+    // Response codes are case-insensitive in IMAP. A server writing one in
+    // lower case must not fall off the exclusion list and into a pause.
+    expect(indicatesCredentialRefusal("a2 no [serverbug] internal error")).toBe(
+      false,
+    );
+    expect(
+      indicatesCredentialRefusal("A2 NO [ContactAdmin] ASK YOUR ADMIN"),
+    ).toBe(false);
+  });
+
+  it("does NOT read a connection ceiling as a dead password", () => {
+    // The classification `indicatesConnectionLimit` already makes, reused. Two
+    // shapes: the bracketed one and a prose-only ceiling.
+    expect(
+      indicatesCredentialRefusal(`a2 NO ${CONNECTION_LIMIT_TEXT}`),
+    ).toBe(false);
+    expect(
+      indicatesCredentialRefusal("a2 NO Too many simultaneous connections"),
+    ).toBe(false);
+  });
+
+  it("still reads a refusal that names a code AND says to retry as a dead password", () => {
+    // The overlap the throttle guard exists for, seen from this side. The
+    // bracketed code outranks the availability prose, so this pauses.
+    expect(
+      indicatesCredentialRefusal(
+        "a2 NO [AUTHENTICATIONFAILED] Account temporarily unavailable, try again later",
+      ),
+    ).toBe(true);
+  });
+
+  it("does NOT read a BAD as a dead password", () => {
+    // A protocol error is this client sending something the server could not
+    // parse — our bug, and no statement at all about the credential.
+    expect(indicatesCredentialRefusal("a2 BAD syntax error")).toBe(false);
+    expect(
+      indicatesCredentialRefusal(`a2 BAD ${AUTH_REFUSED_PROSE_TEXT}`),
+    ).toBe(false);
+  });
+
+  it("does not read a success, an untagged line or an empty line as one", () => {
+    expect(indicatesCredentialRefusal("a1 OK LOGIN completed")).toBe(false);
+    expect(indicatesCredentialRefusal(GREETING_LINE)).toBe(false);
+    expect(indicatesCredentialRefusal("* NO something happened")).toBe(false);
+    expect(indicatesCredentialRefusal("")).toBe(false);
   });
 });
 

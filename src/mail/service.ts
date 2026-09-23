@@ -382,13 +382,14 @@ export async function withMailSessionOver<T>(
       //
       // Branched on `credentialRefused` and NOT on `authenticated`, because
       // those are different questions. Every non-OK reply that is not a
-      // connection ceiling arrives here — a `NO [SERVERBUG]`, a
-      // `NO [CONTACTADMIN]`, a bare `NO Server busy`, a `BAD` from a desync —
-      // and none of those says the password is wrong. Pausing on them would
-      // tell a user with a working password to reconnect and would silence
-      // `mail_imap_diagnose` for fifteen minutes, which is the tool that would
-      // have explained it. The throw is unconditional either way: the call
-      // still fails fast, exactly as the DAV site's 403 exclusion leaves it.
+      // connection ceiling arrives here, and two of them say nothing about the
+      // password: a `NO [SERVERBUG]` or `NO [CONTACTADMIN]` from a server-side
+      // fault, and a `BAD` from a protocol desync of our own making.
+      // `indicatesCredentialRefusal` excludes exactly those; a refusal carrying
+      // no bracketed code DOES pause, per the owner decision of 2026-09-22 that
+      // reversed iteration 1's allow-list. The throw is unconditional either
+      // way: the call still fails fast, exactly as the DAV site's 403 exclusion
+      // leaves it.
       //
       // The need is RECORDED here and the store write happens after teardown
       // (WR-03). See the `finally` below for why.
