@@ -627,10 +627,17 @@ describe("the message id", () => {
     // is credential-adjacent, and a timestamp-plus-local-part id — a shape
     // several clients use — would put it in a second place, including in an
     // echoed tool response. The random value avoids that by construction.
-    const message = messageOf(draft({ from: "russell.moore@mac.com" }));
+    //
+    // The domain is the reserved one (RFC 6761 `.invalid`), like every other
+    // address fixture in this suite. It used to be a real iCloud domain, which
+    // made the whole literal read as a near-miss of the repository owner's own
+    // address on a repository with a public remote. The property under test is
+    // unaffected: what matters is that the local part has structure worth
+    // leaking and that the domain is a domain.
+    const message = messageOf(draft({ from: "russell.moore@example.invalid" }));
     const value = headerValue(message, "Message-ID")!;
 
-    expect(value).toContain("@mac.com>");
+    expect(value).toContain("@example.invalid>");
     expect(value).not.toContain("russell.moore");
   });
 });

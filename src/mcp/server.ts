@@ -10,6 +10,7 @@ import { createDavFetch } from "../dav/transport";
 import { createSessionGate } from "../mail/service";
 import { answersDuringPause } from "../password-pause";
 import type { Principal } from "../principal";
+import { SERVER_INSTRUCTIONS } from "./instructions";
 import { registerAccountTool } from "./tools/account";
 import { registerCalendarTools } from "./tools/calendar";
 import { registerContactsTools } from "./tools/contacts";
@@ -43,7 +44,18 @@ export function createServerFactory(
   extraTools: Array<(server: McpServer) => void> = [],
 ): McpServerFactory {
   return () => {
-    const server = new McpServer({ name: "icloud-mcp", version: "0.1.0" });
+    // The second argument is the SDK's `ServerOptions`, and `instructions` is
+    // the server-level orientation a client hands the model alongside the tool
+    // list. Confirmed against the installed `@modelcontextprotocol/server@2.0.0`
+    // rather than assumed: `ServerOptions.instructions?: string` is spread into
+    // the `initialize` result, and into the 2026-07-28 `server/discover` result,
+    // by `Server._oninitialize` / `Server._ondiscover`. Omitting it is what this
+    // server did until now, and every boundary was being inferred from tool
+    // names -- see `./instructions.ts` for the measurement that prompted it.
+    const server = new McpServer(
+      { name: "icloud-mcp", version: "0.1.0" },
+      { instructions: SERVER_INSTRUCTIONS },
+    );
     // Request-scoped BY CONSTRUCTION. This factory body runs once per request,
     // so the gate below cannot be shared with another caller — no bookkeeping,
     // no isolate-wide counter, and therefore no false refusal of a legitimate
