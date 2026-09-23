@@ -26,6 +26,7 @@
 // This module contains no logging calls of any kind and must never acquire any.
 
 import { isConfiguredSecret } from "../auth/login-handler";
+import { reportRefusal } from "../password-pause";
 import { passwordOf } from "../principal";
 import type { Principal } from "../principal";
 import {
@@ -321,6 +322,19 @@ export function createDavFetch(principal: Promise<Principal>): DavFetch {
         // and the value itself can carry anything at all.
         throw new DavConnectError();
       }
+
+      // LIFE-04, and it sits HERE rather than inside `throwForStatus` because
+      // that function maps 401 and 403 together. A 403 can be a write to a
+      // read-only shared calendar, which is not a dead password — pausing on it
+      // would lock a working account out of its own mail tools.
+      //
+      // That iCloud answers 401 and not 403 for a bad password is research
+      // assumption A1 rather than a measurement. If it ever answers 403,
+      // calendar-only use with a dead password would simply not pause, and every
+      // call still fails fast. The refusal above, where the principal itself
+      // rejected, is deliberately left alone: that is THIS SERVER refusing, not
+      // Apple. Only a door-armed principal reports.
+      if (response.status === 401) await reportRefusal(actor);
 
       throwForStatus(response.status);
       return response;

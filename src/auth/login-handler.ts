@@ -122,6 +122,7 @@ import type { Env, LoginGateSecret } from "../env";
 import { ImapConnectError, ImapThrottleError } from "../errors";
 import type { SessionGate } from "../mail/service";
 import { createSessionGate, withMailSession } from "../mail/service";
+import { clearPause } from "../password-pause";
 import type { Principal } from "../principal";
 import { normaliseAppleId, principalFromProps, userIdOf } from "../principal";
 import type { AllowList } from "./allow-list";
@@ -1738,6 +1739,27 @@ async function handleAuthorize(
     // the ceremony inside the session callback, which would hold a connection
     // open against iCloud's low, undocumented per-account ceiling while a store
     // write and a redirect were built.
+
+    // The dead-password pause ends here, and only here (LIFE-04). Reaching this
+    // line means Apple ACCEPTED the password, so whatever pause an earlier dead
+    // one started no longer describes anything. Without this clear, someone who
+    // has just made a fresh app-specific password still waits out the fifteen
+    // minutes and reasonably concludes the fix did not work.
+    //
+    // The id is the one derived above the limiter layers, never a second
+    // derivation — the paragraph below this block says why, and it applies to
+    // this reader exactly as it applies to the ceremony's.
+    //
+    // Awaited rather than left floating, like the counter write in the branch
+    // above and for the same reason: it may fail, but it must not settle after
+    // the response has gone. It swallows its own failure.
+    //
+    // **The login page never SETS the pause**, and that asymmetry is the whole
+    // defence against a stranger who knows a listed address pausing that
+    // person's working apps from this form. It is structural: the principal
+    // built above is never armed to report, so the refusal branch has nothing to
+    // report through. Do not "balance" this clear with a set in the catch.
+    await clearPause(env.OAUTH_KV, userId);
 
     // Grant what was asked for, narrowed to what this server supports. A
     // client that asks for nothing gets the one scope that exists, because a

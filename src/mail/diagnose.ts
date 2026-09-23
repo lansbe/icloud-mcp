@@ -7,6 +7,7 @@
 // naming the specific combinators here is recorded in 01-02-SUMMARY.md.
 
 import type { Principal } from "../principal";
+import { reportRefusal } from "../password-pause";
 import {
   ImapAuthError,
   ImapConnectError,
@@ -277,7 +278,13 @@ export async function runDiagnosticOver(
     // text lands in the report first. Both facts are needed and an exception
     // can carry only one of them, since our error classes are constructed
     // without context by design.
-    if (!auth.authenticated) throw new ImapAuthError();
+    if (!auth.authenticated) {
+      // The second place on the mail tool path where APPLE ITSELF refused the
+      // saved password (LIFE-04). The diagnostic is handed the door's principal,
+      // so it is armed like any other tool; the sign-in page never reaches here.
+      await reportRefusal(principal);
+      throw new ImapAuthError();
+    }
 
     const postLoginCapability = await sendCommand(
       channel,
