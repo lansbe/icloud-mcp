@@ -27,7 +27,7 @@ import {
   SAFE_MESSAGES,
   toErrorCategory,
 } from "../src/errors";
-import { assertMailSecretsBound, entryEnv } from "./fixtures/bound-secrets";
+import { FAKE_APP_PASSWORD, FAKE_APPLE_ID } from "./fixtures/bound-secrets";
 
 /**
  * The seven values the vocabulary now holds, listed exhaustively.
@@ -318,17 +318,17 @@ describe("the connection-limit detail (WINDOWS.md ledger entry 6)", () => {
 });
 
 describe("credential containment at the error boundary", () => {
-  // The values bound for tests. They are fakes, and the real Secrets are never
-  // present locally — but the assertion is about the mechanism, and the
-  // mechanism cannot tell a fake password from a real one.
+  // The two fake credentials the fixture owns. They are fakes, and the real
+  // Secrets are never present locally — but the assertion is about the
+  // mechanism, and the mechanism cannot tell a fake password from a real one.
   //
-  // Narrowed by assertion, never by a coalesce: `?? ""` would typecheck and
-  // keep every case below green while making `not.toContain("")` trivially
-  // true, which is exactly what the non-zero-length case guards against.
-  const entry = entryEnv();
-  assertMailSecretsBound(entry);
-  const fakeAppleId = entry.APPLE_ID;
-  const fakePassword = entry.APPLE_APP_PASSWORD;
+  // They are read from the fixture, never off an environment object, and never
+  // through a coalesce onto an empty string, which would typecheck and keep
+  // every case below green while making `not.toContain("")` trivially true —
+  // exactly what the non-zero-length case guards against. The fixture's own
+  // header says why, and says it without spelling the operator.
+  const fakeAppleId = FAKE_APPLE_ID;
+  const fakePassword = FAKE_APP_PASSWORD;
 
   it("has fake credentials to test against", () => {
     expect(fakeAppleId.length).toBeGreaterThan(0);
