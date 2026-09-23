@@ -69,8 +69,10 @@ const MASK_ROWS: readonly MaskRow[] = [
   {
     // WR-05. Keeping "the first character" of a one-character local part keeps
     // all of it, and `a•••@example.invalid` is the whole address
-    // plus decoration. Three sites claim the full address is never returned, so
-    // this shape keeps no character at all.
+    // plus decoration. Two sites claim this function never hands back a whole
+    // address — its docstring and `.claude/CLAUDE.md` § 4 — so this shape keeps no
+    // character at all. It was three until 2026-09-23, when the tool stopped
+    // calling this function and stopped making the claim.
     name: "a one-character local part keeps NO character",
     input: "a@example.invalid",
     expected: `${BULLETS}@example.invalid`,
@@ -130,6 +132,29 @@ describe("maskAppleId: the one masking rule, for the grants listing (LIFE-06)", 
     for (const character of BULLETS) {
       expect(character.codePointAt(0)).toBe(0x2022);
     }
+  });
+
+  it("has a table with rows in it, in both directions", () => {
+    // **A guard on the table itself, in the idiom the two loops below already
+    // use.** Without it `MASK_ROWS` can be emptied and this whole block still
+    // reports green: `it.each([])` registers nothing and fails nothing, so the
+    // table is the one assertion here that cannot notice its own deletion. That
+    // was measured on 2026-09-23 — emptying the array left the file passing — and
+    // it matters more now than it did while the tool shared this function, because
+    // the grants listing is the mask's only remaining caller and this table is its
+    // only remaining proof.
+    //
+    // Both counts, not just the total. A table that had lost every refusal row, or
+    // every accepted one, would be half a rule while still looking populated.
+    expect(MASK_ROWS.length, "the mask table is empty").toBeGreaterThan(15);
+    expect(
+      MASK_ROWS.filter((row) => row.expected === REFUSED_MASK).length,
+      "the mask table holds no refused rows",
+    ).toBeGreaterThan(5);
+    expect(
+      MASK_ROWS.filter((row) => row.expected !== REFUSED_MASK).length,
+      "the mask table holds no accepted rows",
+    ).toBeGreaterThan(5);
   });
 
   it.each(MASK_ROWS)("$name", ({ input, expected }) => {
