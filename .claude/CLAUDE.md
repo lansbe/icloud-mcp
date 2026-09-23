@@ -392,6 +392,16 @@ argument is recorded here rather than left to be re-derived.
    around them. No flag and no argument widens that, because the tool takes no
    arguments at all.
 
+   **The one edge, stated rather than left to be discovered.** A local part of
+   exactly one character keeps NO character: `a@x.invalid` comes back as
+   `•••@x.invalid`. Keeping "the first character" of a one-character local part
+   is keeping all of it, and an Apple ID does not have to be an `@icloud.com`
+   address, so the shape is reachable. That was a real defect until 2026-09-22 —
+   the code returned the whole address for it while this paragraph claimed the
+   absolute — and it was closed in the code rather than by softening the claim
+   here. An absolute on the safety boundary that the code does not hold is the
+   same failure as a claimed scan gate that does not exist.
+
 3. **`maskAppleId` is the only masking function.** The owner's grants script
    calls that same one, so the listing the owner reads before cutting off a
    connection is masked by the same rule as the answer the model reads. A mask

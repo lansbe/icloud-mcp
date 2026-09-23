@@ -213,6 +213,12 @@ const MASK_BODY = "\u2022\u2022\u2022";
  * model reads and may quote back into a draft, an event or a later message.
  * That exception is recorded in `.claude/CLAUDE.md` § 4 (LIFE-06, D4).
  *
+ * **A local part of exactly one character keeps NO character.** `a@x.invalid`
+ * comes back as `•••@x.invalid`. Keeping "the first character" of a
+ * one-character local part is keeping all of it, which would make the absolute
+ * claim below false for that one shape — and an Apple ID does not have to be an
+ * `@icloud.com` address, so this shape is reachable.
+ *
  * **A refusal is three bullets and nothing else.** Every input
  * `normaliseAppleId` turns away — a value that is not a string included — comes
  * back as the fixed body with no domain and no first character. What was refused
@@ -234,6 +240,20 @@ export function maskAppleId(value: unknown): string {
   // `normaliseAppleId` already guarantees exactly one at sign with at least one
   // character on each side, so both of these are in range.
   const at = folded.indexOf("@");
+
+  // A ONE-CHARACTER LOCAL PART KEEPS NO CHARACTER AT ALL. Otherwise the "first
+  // character" rule hands back the whole address: `a@example.invalid` masked to
+  // `a•••@example.invalid` is every byte of the input plus decoration, and the
+  // absolute claim three sites make — this docstring, `.claude/CLAUDE.md` § 4
+  // and `src/mcp/tools/account.ts` — would be false for it. An Apple ID does not
+  // have to be an `@icloud.com` address, and one-character local parts exist on
+  // other domains.
+  //
+  // It costs nothing this function is for. What it answers is "which account is
+  // this connection on", and the domain alone still answers that for the one
+  // person who could ever see this row.
+  if (at === 1) return `${MASK_BODY}${folded.slice(at)}`;
+
   return `${folded[0]}${MASK_BODY}${folded.slice(at)}`;
 }
 

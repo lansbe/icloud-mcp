@@ -4,6 +4,11 @@
 // and the domain. `u•••@example.invalid`. The full address is never returned,
 // behind any flag or any argument, and this tool takes no arguments at all.
 //
+// A local part of exactly one character keeps no character — `•••@x.invalid` —
+// because keeping "the first character" of a one-character local part keeps all
+// of it. That edge is the only thing standing between the sentence above and
+// being false, so it is named here rather than only at the function.
+//
 // **This is a recorded exception, not a breach.** The project's standing rule is
 // that the Apple ID never appears in a tool response. The exception is written
 // down on the safety boundary itself, in `.claude/CLAUDE.md` Conventions § 4

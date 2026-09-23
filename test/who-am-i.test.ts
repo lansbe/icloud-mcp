@@ -60,8 +60,27 @@ const MASK_ROWS: readonly MaskRow[] = [
     expected: `u${BULLETS}@example.invalid`,
   },
   {
-    name: "a one-character local part",
+    // WR-05. Keeping "the first character" of a one-character local part keeps
+    // all of it, and `a•••@example.invalid` is the whole address
+    // plus decoration. Three sites claim the full address is never returned, so
+    // this shape keeps no character at all.
+    name: "a one-character local part keeps NO character",
     input: "a@example.invalid",
+    expected: `${BULLETS}@example.invalid`,
+  },
+  {
+    // The same edge after folding, so the rule is measured on the folded length
+    // rather than on what was typed.
+    name: "a one-character local part, padded and upper case",
+    input: "  A@Example.Invalid ",
+    expected: `${BULLETS}@example.invalid`,
+  },
+  {
+    // The boundary on the other side: two characters keeps one, which is the
+    // ordinary rule. Without this row the branch above could be widened to swallow
+    // short local parts generally and nothing would fail.
+    name: "a two-character local part keeps its first character",
+    input: "ab@example.invalid",
     expected: `a${BULLETS}@example.invalid`,
   },
   {
@@ -129,11 +148,17 @@ describe("maskAppleId: the one masking rule (LIFE-06, D4)", () => {
       const masked = maskAppleId(row.input);
       const folded = row.input.trim().toLowerCase();
       const localPart = folded.slice(0, folded.indexOf("@"));
-      // Every accepted row in the spec has a local part longer than one
-      // character, so the first character it keeps cannot be the whole thing.
-      expect(localPart.length, `row ${row.name} has a one-character local part`)
-        .toBeGreaterThan(1);
-      expect(masked, `row ${row.name} leaked its local part`).not.toContain(
+      // Compared against the masked LOCAL PART rather than the whole masked
+      // string, which is what lets this run over a one-character local part at
+      // all: `example.invalid` contains an `a`, so a whole-string search would
+      // report the domain as a leak. It is also the stronger assertion — a leak
+      // the domain happened to spell would previously have hidden in it.
+      //
+      // WR-05 removed the guard that used to sit here excluding one-character
+      // rows from this loop. Those rows now keep no character, so there is
+      // nothing to exclude.
+      const maskedLocal = masked.slice(0, masked.indexOf("@"));
+      expect(maskedLocal, `row ${row.name} leaked its local part`).not.toContain(
         localPart,
       );
       expect(masked, `row ${row.name} came back unchanged`).not.toBe(row.input);
