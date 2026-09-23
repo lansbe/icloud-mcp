@@ -885,9 +885,13 @@ async function targetsFor(groups, asked) {
  * grant and never reads the grant key, so deleting only the grant leaves the
  * token working for up to an hour.
  *
- * Serial, one grant at a time. Then both prefixes are re-listed, because a
+ * Serial, one grant at a time, and each one INDEPENDENT: one failure must not
+ * cost the rest. Then both prefixes are re-listed, unconditionally, because a
  * delete that reported success and left a key behind is the failure this step
- * exists to catch.
+ * exists to catch — and because after a partial failure the re-listing is the
+ * only honest account of what actually happened. It reports the true state
+ * whatever the deletes did, which is why running it always is the fix rather
+ * than a nicety.
  *
  * @param {import("./grants-core.d.mts").GrantStore} kv
  * @param {readonly import("./grants-core.d.mts").GrantGroup[]} targets
@@ -898,7 +902,25 @@ async function revokeTargets(kv, targets, writeError) {
   const helpers = helpersOver(kv);
   for (const group of targets) {
     for (const grant of group.grants) {
-      await helpers.revokeGrant(grant.id, group.userKey);
+      // EACH ONE INDEPENDENT (WR-08). Under the wrangler adapter a delete is a
+      // command that throws on any non-zero exit, and it can legitimately hit a
+      // key that vanished between the listing and the delete — legacy grants
+      // still carry a TTL. Letting that escape aborted the whole run: the
+      // verification pass below never ran, and the owner read "Nothing was
+      // revoked unless a line above says it was" with no line above saying
+      // anything, because the renderer printed the INTENDED targets before any
+      // delete started. On the one command where knowing how far it got matters
+      // most, that left them not knowing whether two connections were cut or
+      // none.
+      try {
+        await helpers.revokeGrant(grant.id, group.userKey);
+      } catch {
+        // Never read the caught value: it carries wrangler's own output.
+        writeError(
+          `Grant ${printable(grant.id, 64)} could not be revoked. ` +
+            "Run the list again.\n",
+        );
+      }
     }
   }
 

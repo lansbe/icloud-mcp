@@ -206,6 +206,10 @@ const WRANGLER_FAILED =
 const SEED_UNREADABLE =
   "Could not read the seed address out of the local Worker config, so a group " +
   "may show as unknown. Pass --address <a> to label it.";
+const STORED_LIST_UNREADABLE =
+  "Could not read the stored allow list, so a group may show as unknown. The " +
+  "listing below is still complete; only the labels are affected. Pass " +
+  "--address <a> to label a group, or run this again.";
 const SOMETHING_WENT_WRONG =
   "This could not finish, so nothing above should be trusted as complete. " +
   "Nothing was revoked unless a line above says it was. Run it again before " +
@@ -299,10 +303,28 @@ async function knownAddresses() {
   // The stored list. LISTED first and read only if the listing returns it: the
   // key may legitimately not exist, and a read of a key that is not there is a
   // failed command rather than an empty answer.
-  const listStore = createWranglerKv(run, "ALLOW_LIST_KV");
-  const listed = await listStore.list({ prefix: ALLOW_LIST_KEY });
-  if (listed.keys.some((key) => key.name === ALLOW_LIST_KEY)) {
-    addNamed(parseAllowList(await listStore.get(ALLOW_LIST_KEY)), addresses);
+  //
+  // WRAPPED, in the same shape the seed above uses, and for a sharper reason
+  // (WR-07). `run` throws on any non-zero exit, and nothing between here and the
+  // top-level catch handled it — so a wrangler hiccup while looking for the
+  // allow-list document aborted the WHOLE command, a plain `list` included, with
+  // the "nothing above should be trusted" sentence and exit 1. This read exists
+  // only to put a nicer label on a group; a listing showing `unknown (id ...)`
+  // is perfectly useful, and refusing to show anything is not.
+  //
+  // Not hypothetical: WRANGLER_FAILED itself records that the first wrangler
+  // call of a session sometimes fails and then works, and this listing IS the
+  // first wrangler call the program makes.
+  try {
+    const listStore = createWranglerKv(run, "ALLOW_LIST_KV");
+    const listed = await listStore.list({ prefix: ALLOW_LIST_KEY });
+    if (listed.keys.some((key) => key.name === ALLOW_LIST_KEY)) {
+      addNamed(parseAllowList(await listStore.get(ALLOW_LIST_KEY)), addresses);
+    }
+  } catch {
+    // Never read the caught value: it carries wrangler's own output, which can
+    // echo a stored record back.
+    process.stderr.write(`${STORED_LIST_UNREADABLE}\n`);
   }
 
   return addresses;

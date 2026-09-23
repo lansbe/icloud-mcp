@@ -1051,6 +1051,53 @@ describe("LIFE-05: the owner lists grants by masked address and revokes them", (
   // the forced logout LIFE-01 exists to remove.
   // -------------------------------------------------------------------------
 
+  it("a revoke that fails on one grant still tries the rest and reports the truth", async () => {
+    // WR-08. `revokeGrant` under the wrangler adapter is a command that throws
+    // on any non-zero exit, and it can legitimately hit a key that vanished
+    // between the listing and the delete — legacy grants still carry a TTL.
+    // Before this, a throw on grant 2 of 3 escaped the whole run: the
+    // verification pass never happened and the owner read "Nothing was revoked
+    // unless a line above says it was", with no line above saying anything.
+    //
+    // Driven over a store this case OWNS, whose delete refuses ONE key. The
+    // pool's shared store cannot express that.
+    const base = ownStore({
+      "grant:u1:g1": grantRecord("u1", "g1", "c1"),
+      "grant:u1:g2": grantRecord("u1", "g2", "c1"),
+      "grant:u1:g3": grantRecord("u1", "g3", "c1"),
+      "client:c1": { clientId: "c1" },
+    });
+    const kv: GrantStore = {
+      list: base.list.bind(base),
+      get: base.get.bind(base),
+      async delete(name: string) {
+        if (name === "grant:u1:g2") throw new Error("wrangler said no");
+        await base.delete(name);
+      },
+    };
+    const out = sink();
+
+    const failed = await runGrants(["revoke", "g1", "g2", "g3", "--yes"], {
+      kv,
+      async knownAddresses() {
+        return [];
+      },
+      write: out.write,
+      writeError: out.write,
+    });
+
+    // Non-zero, because the verification pass found a record still there.
+    expect(failed).toBe(1);
+    // The two that could go, went. The one that refused is named.
+    expect(await namesIn(kv)).toContain("grant:u1:g2");
+    expect(await namesIn(kv)).not.toContain("grant:u1:g1");
+    expect(await namesIn(kv)).not.toContain("grant:u1:g3");
+    expect(out.text()).toContain("could not be revoked");
+    // And the verification pass ran at all, which is the half that used to be
+    // skipped entirely.
+    expect(out.text()).toContain("still has records in the store");
+  });
+
   it("orphanClientIds reads no store and never names a record a grant claims", () => {
     const groups: GrantGroup[] = [
       {
