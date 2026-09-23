@@ -67,7 +67,7 @@ const LEGACY_LABEL = "legacy v1.0 owner grants";
 const UNKNOWN_ID_CHARACTERS = 8;
 
 /** U+2026 HORIZONTAL ELLIPSIS, as an escape so no editor can turn it into three dots. */
-const ELLIPSIS = "…";
+const ELLIPSIS = "\u2026";
 
 /** The longest client name rendered. Chosen by whoever registered, so bounded. */
 const CLIENT_NAME_MAX = 60;

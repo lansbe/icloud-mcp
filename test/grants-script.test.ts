@@ -411,7 +411,7 @@ describe("LIFE-05: the owner lists grants by masked address and revokes them", (
       // The label comes from the ONE masking rule, compared against that
       // function's own output rather than against a second copy of the form.
       expect(group?.label).toBe(maskAppleId(LISTED_APPLE_ID));
-      expect(group?.label).toBe("l•••@example.invalid");
+      expect(group?.label).toBe("l\u2022\u2022\u2022@example.invalid");
 
       // Hygiene rule 3: found by the id THIS case minted, never by a total.
       const row = group?.grants.find((grant) => grant.id === minted?.grantId);
@@ -424,7 +424,7 @@ describe("LIFE-05: the owner lists grants by masked address and revokes them", (
       expect(row?.created).toMatch(/^\d{4}-\d{2}-\d{2}$/);
 
       const text = renderGrants(groups);
-      expect(text).toContain("l•••@example.invalid");
+      expect(text).toContain("l\u2022\u2022\u2022@example.invalid");
       expect(text).toContain(minted.grantId);
       expect(text).toContain("LIFE-05 listing client");
       expect(text).toContain("expires never");
@@ -501,7 +501,7 @@ describe("LIFE-05: the owner lists grants by masked address and revokes them", (
       expect(stranger?.kind).toBe("unknown");
       // Only the first eight characters of an id nobody could label. The whole
       // 64 would be a stable handle on a person this server cannot name.
-      expect(stranger?.label).toBe("unknown (id bbbbbbbb…)");
+      expect(stranger?.label).toBe("unknown (id bbbbbbbb\u2026)");
       expect(stranger?.label).not.toContain(strangerKey);
 
       // Both records name a client that does not exist, which is spike S2's
