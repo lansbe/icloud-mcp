@@ -14,6 +14,7 @@
 import PostalMime from "postal-mime";
 import type { Address } from "postal-mime";
 import type { Principal } from "../principal";
+import { reportRefusal } from "../password-pause";
 import {
   ImapAuthError,
   ImapConnectError,
@@ -361,7 +362,13 @@ export async function withMailSessionOver<T>(
     const auth = await authenticate(channel, principal, {
       oneAttemptPerGuess: options.oneAttemptPerGuess,
     });
-    if (!auth.authenticated) throw new ImapAuthError();
+    if (!auth.authenticated) {
+      // The one place on the mail tool path where APPLE ITSELF refused the
+      // saved password (LIFE-04). Only a principal the door armed reports, so
+      // the sign-in page — which runs this very function — pauses nobody.
+      await reportRefusal(principal);
+      throw new ImapAuthError();
+    }
 
     const postLogin = await sendCommand(channel, channel.nextTag(), "CAPABILITY");
     const capability = firstCapability(postLogin.untagged);

@@ -14,6 +14,7 @@ import type { AllowList } from "../auth/allow-list";
 import { parseAllowList } from "../auth/allow-list";
 import type { Principal } from "../principal";
 import { normaliseAppleId, principalFromProps } from "../principal";
+import { guardAgainstPause } from "../password-pause";
 import { createServerFactory } from "./server";
 
 /**
@@ -390,6 +391,17 @@ export function buildRequestHandler(
  *   store is a KV namespace, reading one is an await, and an await here is the
  *   one thing this function may not do. `servesThisGrant` above carries what
  *   that costs, what covers it, and why nothing regresses this phase.
+ * - THE DEAD-PASSWORD PAUSE RIDES INSIDE THE PRINCIPAL PROMISE (LIFE-04), which
+ *   is the only place it could go without breaking the line above. `fetch` stays
+ *   synchronous because the store read happens after the promise is handed on,
+ *   not before.
+ * - It costs one OAuth-store read per API request. A tool awaits that read
+ *   before it opens a socket or sends a DAV request, so the read never overlaps
+ *   one and never spends a connection the request also wants.
+ * - A paused user gets the same auth error an unusable stored credential gets,
+ *   so every tool answers `auth_failed` — which is already the text telling them
+ *   to reconnect and that retrying will not help. This is deliberately NOT a
+ *   401: the address is still listed and the grant is still well-formed.
  */
 export function createMcpApiHandler(extraTools: ExtraTool[] = []): {
   fetch(
@@ -426,7 +438,17 @@ export function createMcpApiHandler(extraTools: ExtraTool[] = []): {
       // is what catches a later phase reintroducing the singular identity by
       // leaving a dead reference behind — the behavioural case one block over
       // would still pass with one sitting here unused. Describe it by role.
-      const principal = principalFromProps(ctx.props);
+      //
+      // The dead-password pause is checked INSIDE the promise (LIFE-04), and
+      // the principal is armed to report a refusal there too. The guard is
+      // wrapped around the constructor's promise rather than called after an
+      // await, because an await on this line is the one thing this function may
+      // not do. Only a principal that came through here is armed, which is what
+      // stops the sign-in page — which builds its own — from pausing anybody.
+      const principal = guardAgainstPause(
+        principalFromProps(ctx.props),
+        env.OAUTH_KV,
+      );
       // A request that calls no tool never awaits this promise. If the stored
       // credential is unusable it rejects, and a rejection nobody handles is an
       // unhandled rejection. This one no-op handler prevents that. Everyone who
