@@ -366,7 +366,17 @@ export async function withMailSessionOver<T>(
       // The one place on the mail tool path where APPLE ITSELF refused the
       // saved password (LIFE-04). Only a principal the door armed reports, so
       // the sign-in page — which runs this very function — pauses nobody.
-      await reportRefusal(principal);
+      //
+      // Branched on `credentialRefused` and NOT on `authenticated`, because
+      // those are different questions. Every non-OK reply that is not a
+      // connection ceiling arrives here — a `NO [SERVERBUG]`, a
+      // `NO [CONTACTADMIN]`, a bare `NO Server busy`, a `BAD` from a desync —
+      // and none of those says the password is wrong. Pausing on them would
+      // tell a user with a working password to reconnect and would silence
+      // `mail_imap_diagnose` for fifteen minutes, which is the tool that would
+      // have explained it. The throw is unconditional either way: the call
+      // still fails fast, exactly as the DAV site's 403 exclusion leaves it.
+      if (auth.credentialRefused) await reportRefusal(principal);
       throw new ImapAuthError();
     }
 

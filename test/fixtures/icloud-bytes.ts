@@ -142,6 +142,26 @@ export const AUTH_REJECTED_LEGACY_TEXT =
 export const CONNECTION_LIMIT_TEXT =
   "[UNAVAILABLE] Too many simultaneous connections; try again later";
 
+/**
+ * A server-side fault, named by a response code that says nothing at all about
+ * the credential.
+ *
+ * Authentication does not succeed on this reply, and it is not a connection
+ * ceiling either — so it lands in the same `authenticated: false` branch a
+ * genuine credential refusal does. That collision is the whole reason
+ * `credentialRefused` exists as a second, narrower fact: a password the server
+ * never got as far as checking has not been refused.
+ */
+export const AUTH_SERVER_FAULT_TEXT = "[SERVERBUG] Internal error";
+
+/**
+ * A refusal carrying no response code at all — prose only.
+ *
+ * The other half of the same problem. There is nothing here to classify, and
+ * the safe reading of nothing is "this says nothing about the password".
+ */
+export const AUTH_UNCLASSIFIED_TEXT = "Server busy, please try again";
+
 /** A capability line carrying two spaces, to prove the parser does not tidy. */
 export const UNTIDY_CAPABILITY_LINE = "* CAPABILITY  IMAP4rev1   liTeRaL+ ";
 

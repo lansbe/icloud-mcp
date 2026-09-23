@@ -960,3 +960,31 @@ export function indicatesConnectionLimit(line: string): boolean {
   if (AUTH_RESPONSE_CODES.some((code) => lowered.includes(code))) return false;
   return CONNECTION_LIMIT_HINTS.some((hint) => lowered.includes(hint));
 }
+
+/**
+ * Whether a tagged reply names a credential condition — the server saying the
+ * password itself was refused, rather than saying anything else.
+ *
+ * The same list `indicatesConnectionLimit` consults, read for its own sake
+ * rather than as an override. That sharing is the point: one place to add a
+ * code, and the two functions can never disagree about what a code means.
+ *
+ * **This is a narrower question than "did authentication succeed".** A reply
+ * carrying no code at all — a bare `NO Server busy`, a `NO [SERVERBUG]`, a
+ * `NO [CONTACTADMIN]`, a `BAD` from a protocol desync — fails authentication
+ * and is NOT a credential refusal. Everything that acts on a refusal as
+ * evidence about the SAVED PASSWORD has to ask this question and not that one,
+ * because acting on the broader one treats a transient condition at Apple as a
+ * dead password and tells the user to reconnect when nothing is wrong.
+ *
+ * It fails in the safe direction, deliberately, and it is the same direction
+ * the DAV site chose when it excluded 403: if iCloud ever spells a genuine
+ * refusal without a code, this answers false, the pause simply does not fire,
+ * and every call still fails fast. The opposite error — answering true for a
+ * server-side fault — costs the user fifteen minutes of every tool telling them
+ * something false, including the two diagnostics that would have explained it.
+ */
+export function indicatesCredentialRefusal(line: string): boolean {
+  const lowered = line.toLowerCase();
+  return AUTH_RESPONSE_CODES.some((code) => lowered.includes(code));
+}

@@ -282,7 +282,13 @@ export async function runDiagnosticOver(
       // The second place on the mail tool path where APPLE ITSELF refused the
       // saved password (LIFE-04). The diagnostic is handed the door's principal,
       // so it is armed like any other tool; the sign-in page never reaches here.
-      await reportRefusal(principal);
+      //
+      // Branched on `credentialRefused` and NOT on `authenticated` — see the
+      // matching site in `service.ts` for the argument. It matters more here
+      // than anywhere: this is the tool somebody runs to find out WHY, and a
+      // pause set from a server-side reply would make the next run of it answer
+      // `auth_failed` instead of the report.
+      if (auth.credentialRefused) await reportRefusal(principal);
       throw new ImapAuthError();
     }
 

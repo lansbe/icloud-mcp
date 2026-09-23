@@ -24,6 +24,7 @@ import type { ResponseLine } from "./imap-parser";
 import {
   LITERAL_SUFFIX,
   indicatesConnectionLimit,
+  indicatesCredentialRefusal,
   isUntagged,
   literalPlaceholder,
   parseTaggedResponse,
@@ -787,6 +788,26 @@ export interface AuthOptions {
 
 export interface AuthOutcome {
   authenticated: boolean;
+  /**
+   * Whether Apple's own reply named a credential condition.
+   *
+   * A SECOND, NARROWER FACT than `authenticated: false`, and the two must not
+   * be confused. Every non-OK reply that is not a connection ceiling lands in
+   * `authenticated: false` — including a `NO [SERVERBUG]`, a `NO [CONTACTADMIN]`
+   * and a `BAD` from a protocol desync, none of which say anything about the
+   * password. Only a reply carrying one of the parser's authentication response
+   * codes sets this.
+   *
+   * Read from the parsed tagged reply, both attempts, never from a caught
+   * value — the same sanctioned source the throttle classifier reads.
+   *
+   * It exists because LIFE-04's pause is evidence ABOUT THE SAVED PASSWORD.
+   * Branching that pause on `authenticated` instead would let a transient
+   * condition at Apple tell a user with a perfectly good password to reconnect,
+   * and silence `mail_imap_diagnose` and `dav_diagnose` for fifteen minutes —
+   * the two tools whose job is explaining exactly that.
+   */
+  credentialRefused: boolean;
   /** Which mechanism the server accepted, or `null` if none did. */
   mechanism: AuthMechanism | null;
   /**
@@ -851,7 +872,12 @@ export async function authenticate(
   const login = await readUntilTag(channel, loginTag);
 
   if (login.status === "OK") {
-    return { authenticated: true, mechanism: "LOGIN", failureDetail: null };
+    return {
+      authenticated: true,
+      credentialRefused: false,
+      mechanism: "LOGIN",
+      failureDetail: null,
+    };
   }
   // Read from the parsed tagged reply, never from a caught value. See
   // `ImapThrottleError` for why that distinction is the whole safety argument.
@@ -870,6 +896,9 @@ export async function authenticate(
   if (options.oneAttemptPerGuess === true) {
     return {
       authenticated: false,
+      // The one attempt is the only reply there is, so it is the only one to
+      // read. Same parsed source the classification above reads.
+      credentialRefused: indicatesCredentialRefusal(login.tagged.text),
       mechanism: null,
       failureDetail: `LOGIN: ${replyText(login)}`.slice(0, MAX_FAILURE_DETAIL),
     };
@@ -884,6 +913,7 @@ export async function authenticate(
   if (sasl.status === "OK") {
     return {
       authenticated: true,
+      credentialRefused: false,
       mechanism: "AUTHENTICATE PLAIN",
       failureDetail: null,
     };
@@ -903,7 +933,18 @@ export async function authenticate(
     `AUTHENTICATE PLAIN: ${replyText(sasl)}`
   ).slice(0, MAX_FAILURE_DETAIL);
 
-  return { authenticated: false, mechanism: null, failureDetail: detail };
+  return {
+    authenticated: false,
+    // EITHER attempt naming a credential condition is enough. A server can
+    // answer the two mechanisms differently — a legacy username format refused
+    // on LOGIN and a bare error on the SASL retry — and reading only the last
+    // reply would throw away the more diagnostic of the two.
+    credentialRefused:
+      indicatesCredentialRefusal(login.tagged.text) ||
+      indicatesCredentialRefusal(sasl.tagged.text),
+    mechanism: null,
+    failureDetail: detail,
+  };
 }
 
 /**

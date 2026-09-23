@@ -73,6 +73,8 @@ import { createFailingDuplex, createFakeDuplex } from "./fixtures/fake-duplex";
 import {
   AUTH_REJECTED_LEGACY_TEXT,
   AUTH_REJECTED_TEXT,
+  AUTH_SERVER_FAULT_TEXT,
+  AUTH_UNCLASSIFIED_TEXT,
   CONNECTION_LIMIT_TEXT,
   GREETING,
   PRE_AUTH_CAPABILITY,
@@ -931,6 +933,86 @@ describe("LIFE-04: the dead-password pause", () => {
           (await readMarker()).value,
           "a briefly busy server paused a working account",
         ).toBeNull();
+      } finally {
+        await forgetMarker();
+      }
+    });
+
+    it.each([
+      ["a [SERVERBUG] fault, which is Apple's problem and not the password", AUTH_SERVER_FAULT_TEXT],
+      ["a refusal carrying no response code at all", AUTH_UNCLASSIFIED_TEXT],
+    ])("on %s", async (_label, text) => {
+      // CR-02. Authentication does NOT succeed on either of these replies, so
+      // both land in the same `authenticated: false` branch a real credential
+      // refusal lands in. Branching the report on that boolean paused a working
+      // account for fifteen minutes on a transient condition at Apple's end.
+      try {
+        const principal = await armedPrincipal();
+        expect(
+          await raise(() => proveOver(refusedAuth(text, text), principal)),
+        ).toBeInstanceOf(ImapAuthError);
+
+        expect(
+          (await readMarker()).value,
+          "a reply that never mentioned the credential paused the account",
+        ).toBeNull();
+      } finally {
+        await forgetMarker();
+      }
+    });
+
+    it("on an unclassified refusal inside the mail diagnostic either", async () => {
+      try {
+        const principal = await armedPrincipal();
+        const { failed, error } = await runDiagnosticOver(
+          refusedAuth(AUTH_SERVER_FAULT_TEXT, AUTH_SERVER_FAULT_TEXT),
+          principal,
+          1,
+        );
+
+        expect(failed).toBe(true);
+        expect(error).toBeInstanceOf(ImapAuthError);
+        expect((await readMarker()).value).toBeNull();
+      } finally {
+        await forgetMarker();
+      }
+    });
+
+    it("and the diagnostic is still REACHABLE after a server-error reply", async () => {
+      // The cost of getting CR-02 wrong, stated as a behaviour rather than as
+      // an absent key. The pause rides in the principal promise the door hands
+      // every tool, so a marker written by the mail path above would make
+      // `armedPrincipal()` reject and the diagnostic would never open its
+      // socket. That it produces a report at all — with Apple's own reply text
+      // in it — is the assertion that the tool which explains this failure was
+      // not silenced by it.
+      try {
+        const principal = await armedPrincipal();
+        expect(
+          await raise(() =>
+            proveOver(
+              refusedAuth(AUTH_SERVER_FAULT_TEXT, AUTH_SERVER_FAULT_TEXT),
+              principal,
+            ),
+          ),
+        ).toBeInstanceOf(ImapAuthError);
+
+        // A SECOND call, through the same gate the door puts in front of every
+        // tool. Under the old behaviour this line rejects before any socket.
+        const second = await armedPrincipal();
+        const { failed, report } = await runDiagnosticOver(
+          refusedAuth(AUTH_SERVER_FAULT_TEXT, AUTH_SERVER_FAULT_TEXT),
+          second,
+          1,
+        );
+
+        expect(failed).toBe(true);
+        expect(
+          report.tlsEstablished,
+          "the diagnostic never reached the server, so the pause silenced it",
+        ).toBe(true);
+        expect(report.authFailureDetail).toContain("SERVERBUG");
+        expect((await readMarker()).value).toBeNull();
       } finally {
         await forgetMarker();
       }
