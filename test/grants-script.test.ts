@@ -994,6 +994,46 @@ describe("LIFE-05: the owner lists grants by masked address and revokes them", (
     }
   });
 
+  it("revoke --legacy-owner names nothing and deletes nothing when the owner segment is empty", async () => {
+    // **This is the command the cutover runbook runs at step 10**, and it runs
+    // it expecting exactly this answer: after the owner's own grants are gone,
+    // `revoke --legacy-owner` is the preview that evidences there is nothing
+    // left under the legacy segment. The two cases above it are an EMPTY store
+    // and a POPULATED legacy segment; neither is this one, which is a store with
+    // real grants in it that simply has none under `owner`.
+    //
+    // A store holding one grant under a hashed user segment — the shape every
+    // grant written since the login page landed has — and nothing under the
+    // legacy one.
+    const hashedUser = "a".repeat(64);
+    const kv = ownStore({
+      [`grant:${hashedUser}:g1`]: grantRecord(hashedUser, "g1", "a-client"),
+      "client:a-client": { clientId: "a-client" },
+    });
+    const before = (await namesIn(kv)).sort();
+    const out = sink();
+
+    // With --yes, which is the sharper case: a command told to go ahead with an
+    // empty target set must still delete nothing.
+    const code = await runGrants(["revoke", "--legacy-owner", "--yes"], {
+      kv,
+      async knownAddresses() {
+        return [];
+      },
+      write: out.write,
+      writeError: out.write,
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("No grants match that target");
+    // It named no target, so the legacy label never appears. Without this the
+    // case would pass against a run that listed the hashed user's grant and
+    // then declined to delete it, which is a different answer.
+    expect(out.text()).not.toContain("legacy v1.0 owner grants");
+    expect(out.text()).not.toContain("g1");
+    expect((await namesIn(kv)).sort()).toEqual(before);
+  });
+
   it("refuses an unknown id and an ambiguous prefix, and deletes nothing", async () => {
     // Two hand-written ids sharing an eight-character prefix. A real grant id
     // is sixteen random characters, so two that collide on eight cannot be
