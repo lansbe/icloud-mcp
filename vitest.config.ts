@@ -22,10 +22,14 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
 
-/** The only tests that read the repository tree, and so the only ones that
- *  must run under Node. Named once and referenced by both projects, so a file
- *  cannot end up in both or in neither. */
-const FILESYSTEM_TESTS = ["test/forbidden-tokens.test.ts"];
+/** The only tests that read files off disk -- the repository tree for the
+ *  forbidden-token scan, node_modules for the Vectorize shape pins -- and so
+ *  the only ones that must run under Node. Named once and referenced by both
+ *  projects, so a file cannot end up in both or in neither. */
+const FILESYSTEM_TESTS = [
+  "test/forbidden-tokens.test.ts",
+  "test/vectorize-shape.test.ts",
+];
 
 const IGNORED = ["**/node_modules/**", "**/dist/**", "**/.wrangler/**"];
 
