@@ -778,6 +778,43 @@ export const FORBIDDEN = [
     pattern: /reserveConfirmation\s*\([^)]{0,200}\.\s*u\b/g,
     why: "The one-time reservation for a confirmation is being keyed on the id carried inside the confirmation instead of the id of the caller presenting it. Those two values are always equal by the time the reservation runs, because the verifier already refused a mismatch -- which is exactly why this matters: reading the payload here makes the reservation DEPEND on that earlier check instead of standing beside it, and audit row T1 is closed by the two of them standing separately. The reservation keyed on the caller means a caller who ever reached it holding somebody else's confirmation burns a slot under their own id, and the owner's confirmation still spends. Keyed on the token, that caller burns the owner's slot and the owner has to preview their calendar change again -- the original T1 leak, restored by a one-word edit that reads as more correct and that no test in this repository can see. Pass the signed-in principal's user id and nothing else. If this fired on a reservation that genuinely has no caller to key on, that is a change to how confirmations are scoped and needs a decision, not a pattern edit.",
   },
+
+  // ------------------------------------------------------- the record sweeper
+  // LIFE-01, phase 12. The configuration in `src/auth/oauth.ts` claimed a scan
+  // gate stood behind it. It did not, and a claimed gate is worse than an
+  // absent one: the enforcement section of the conventions warns by name that
+  // nothing fails when prose stops matching this script. So here is the gate
+  // the prose described.
+  //
+  // WHY THE HELPER IS BANNED RATHER THAN REVIEWED. Its grant sweep deletes
+  // grants whose client record has gone. That is precisely the forced logout
+  // LIFE-01 removed, arriving by another road: with the client record gone the
+  // token endpoint already refuses the refresh as an unknown client (spike S2),
+  // and sweeping the grant makes the loss permanent rather than repairable by
+  // restoring a registration. The two never-expiring lifetimes above it are
+  // held by nothing but a spread's treatment of an `undefined` own key, so the
+  // whole of LIFE-01 is three lines that fail SILENTLY when edited. One of
+  // those three is now guarded.
+  //
+  // Scoped to `src/` because that is the only tree that can call it: the
+  // library is only constructed there, and `scripts/grants.mjs` reaches the
+  // store through wrangler rather than through the provider. A deliberate
+  // account-wide sweep, if one is ever genuinely wanted, is a decision -- and
+  // the answer to the problem it would be reached for is `prune-clients` in
+  // `scripts/grants-core.mjs`, which deletes a client record ONLY when no grant
+  // names it and therefore cannot sign anybody out.
+  //
+  // MEASURED ON THE REAL TREE. 0 hits under `src/` at the time it was added, so
+  // it is armed on a tree it refuses nothing on. One consequence, the same one
+  // the transport and write rules carry: `src/auth/oauth.ts` must describe this
+  // helper by ROLE and never by name, or it fails the check it exists to
+  // explain.
+  {
+    id: "expired-record-sweeper",
+    scope: "src/",
+    pattern: /\bpurgeExpiredData\s*\(/g,
+    why: "The OAuth library's expired-record sweeper is being called. Its grant sweep deletes grants whose client record has gone, which is the forced logout LIFE-01 removed, arriving by another road -- and it is worse than the original, because a registration can be restored while a swept grant cannot. LIFE-01 rests on three lines in src/auth/oauth.ts and every one of them fails silently when edited: the two never-expiring lifetimes are held only by a spread copying an own key whose value is undefined, so deleting either line restores the default expiry with nothing failing on the way out, and this call restores the logout without touching either. If the reason for reaching for this was client records accumulating, the answer is prune-clients in scripts/grants-core.mjs, which deletes a client record only when NO grant names it and so cannot sign anybody out. If a sweep is genuinely wanted, that is a change to the project's login lifetime and needs a decision, not a call.",
+  },
 ];
 
 /**

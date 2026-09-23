@@ -342,6 +342,12 @@ describe("the patterns have teeth", () => {
     // rule is the only thing that can.
     "confirm-reserve-keyed-on-the-token":
       "await reserveConfirmation(env.CONFIRM_KV, payload.u, payload.j, payload.x);",
+    // The library's record sweeper, called from a scheduled handler. Written as
+    // the housekeeping line a contributor would actually reach for: it reads as
+    // tidying, and the thing it quietly does is delete every grant whose client
+    // record has gone — the forced logout LIFE-01 removed.
+    "expired-record-sweeper":
+      "await purgeExpiredData(env.OAUTH_KV, { gracePeriodSeconds: 0 });",
   };
 
   it("covers every rule with a known-violating sample", () => {

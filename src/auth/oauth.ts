@@ -69,8 +69,16 @@ export const oauthProviderOptions: OAuthProviderOptions<EntryEnv> = {
   //
   // The library also ships a helper that deletes expired records, and its
   // default sweeps up grants whose client record has gone. That is this same
-  // logout by another road, so it is called nowhere in this project and a scan
-  // gate checks for a call.
+  // logout by another road — and worse than the original, because a registration
+  // can be restored while a swept grant cannot. It is called nowhere in this
+  // project, and as of phase 12 a scan rule under `scripts/forbidden-tokens.mjs`
+  // actually refuses a call to it anywhere in `src/`. That rule was claimed here
+  // before it existed; it now exists, which is why this paragraph can no longer
+  // NAME the helper — the rule would fire on this very comment.
+  //
+  // If the reason for reaching for it is client records accumulating, the answer
+  // is `prune-clients` in `scripts/grants-core.mjs`. That deletes a client record
+  // only when no grant names it, so it cannot sign anybody out.
   refreshTokenTTL: undefined,
   clientRegistrationTTL: undefined,
 
