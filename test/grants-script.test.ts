@@ -1260,6 +1260,20 @@ describe("LIFE-05: the owner lists grants by masked address and revokes them", (
     expect(out.text()).not.toContain("orphan-one");
   });
 
+  it("tells the owner what --legacy-owner means for list, not that it is unknown", async () => {
+    // IN-05. The flag IS known; it just has no meaning for `list`, which already
+    // shows every group including the legacy one. "Unknown flag." sent the owner
+    // looking for a typo that was not there.
+    const calls: string[] = [];
+    const out = sink();
+    const code = await runGrants(["list", "--legacy-owner"], refusingDeps(calls, out));
+
+    expect(code).toBe(2);
+    expect(calls, "a usage refusal reached the store").toEqual([]);
+    expect(out.text()).toContain("list shows every group already");
+    expect(out.text()).not.toContain("Unknown flag");
+  });
+
   it("prune-clients refuses a target without touching the store", async () => {
     // It deliberately takes none. The safe set is computed FROM the grants, so
     // letting the owner name a record would be letting them name the one thing

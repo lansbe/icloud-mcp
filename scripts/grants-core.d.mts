@@ -111,8 +111,19 @@ export declare const USAGE: string;
  * Wrap a wrangler runner as a store.
  *
  * `run(args)` must return the command's stdout as a string and throw on
- * failure. The binding name and the remote flag are fixed here, never taken
- * from a caller.
+ * failure.
+ *
+ * The REMOTE FLAG is fixed inside the adapter and cannot be reached by a caller:
+ * there is no value anybody can pass that produces a command without it, which
+ * is what makes the local-simulator trap unspeakable rather than merely
+ * discouraged. Without it wrangler reads the simulator on this machine, the
+ * listing comes back empty, and "no connections" is indistinguishable from a
+ * clean account.
+ *
+ * The BINDING NAME is this parameter, chosen at each call site — `"OAUTH_KV"`
+ * and `"ALLOW_LIST_KV"`. It is fixed at those sites rather than fixed here, and
+ * the distinction is worth keeping straight: this copy used to claim both were
+ * beyond a caller's reach, which the `.mjs` docstring never did.
  */
 export declare function createWranglerKv(
   run: (args: readonly string[]) => string,

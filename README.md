@@ -393,6 +393,19 @@ carrying the dead password can keep pausing the apps you have already fixed.
 `node scripts/grants.mjs list` shows the date each connection was made; the ones
 made before you changed the password are the stale ones.
 
+**Revoke those by id, one at a time — not with `--address`.** `--address` takes
+*every* connection under that person, including the fresh one you just made by
+signing in again, so using it here forces yet another sign-in. Read the ids off
+the `created` column and pass them:
+
+```bash
+node scripts/grants.mjs revoke <old-id> <another-old-id> --yes
+```
+
+This is sharper than it used to be: connections never expire now, and each
+sign-in makes two of them, each holding its own encrypted copy of the
+app-specific password.
+
 ---
 
 ## Local development

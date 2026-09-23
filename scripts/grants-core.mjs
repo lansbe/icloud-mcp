@@ -151,6 +151,8 @@ const UNKNOWN_FLAG = "Unknown flag.";
 const ADDRESS_NEEDS_VALUE = "--address needs an address after it.";
 const LIST_TAKES_NO_IDS = "list takes no grant ids.";
 const LIST_TAKES_NO_YES = "list deletes nothing, so --yes means nothing here.";
+const LIST_TAKES_NO_LEGACY_OWNER =
+  "list shows every group already, so --legacy-owner means nothing here.";
 const PRUNE_TAKES_NO_TARGET =
   "prune-clients takes no grant id, no --address and no --legacy-owner. " +
   "It acts on every client record no grant names.";
@@ -783,7 +785,10 @@ function readArguments(argv) {
   if (command === "list") {
     if (ids.length > 0) return { error: LIST_TAKES_NO_IDS };
     if (yes) return { error: LIST_TAKES_NO_YES };
-    if (legacyOwner) return { error: UNKNOWN_FLAG };
+    // Its OWN sentence (IN-05). The flag is known — it just has no meaning for
+    // `list`, which shows every group including the legacy one. Answering
+    // "Unknown flag." sends the owner looking for a typo that is not there.
+    if (legacyOwner) return { error: LIST_TAKES_NO_LEGACY_OWNER };
   }
 
   if (command === "prune-clients") {

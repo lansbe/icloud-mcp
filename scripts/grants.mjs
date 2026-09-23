@@ -315,8 +315,9 @@ async function knownAddresses() {
   // Not hypothetical: WRANGLER_FAILED itself records that the first wrangler
   // call of a session sometimes fails and then works, and this listing IS the
   // first wrangler call the program makes.
+  const listStore = createWranglerKv(run, "ALLOW_LIST_KV");
+  let unreadable = false;
   try {
-    const listStore = createWranglerKv(run, "ALLOW_LIST_KV");
     const listed = await listStore.list({ prefix: ALLOW_LIST_KEY });
     if (listed.keys.some((key) => key.name === ALLOW_LIST_KEY)) {
       addNamed(parseAllowList(await listStore.get(ALLOW_LIST_KEY)), addresses);
@@ -324,6 +325,21 @@ async function knownAddresses() {
   } catch {
     // Never read the caught value: it carries wrangler's own output, which can
     // echo a stored record back.
+    unreadable = true;
+  }
+
+  // THE OTHER HALF OF THE SAME FAILURE (IN-06). The adapter COUNTS a read it
+  // could not complete rather than throwing, so a failed `get` never reaches the
+  // catch above — it just returns null and the list quietly holds nobody. The
+  // core's own `READS_INCOMPLETE` note cannot see it either: that reads the
+  // OAUTH_KV adapter's counter, and this is a second adapter with a counter of
+  // its own that nothing was reading. The result was a group printing as
+  // `unknown (id ...)` with no note at all, which is exactly the "a row dropped
+  // in silence" outcome that message exists to prevent for the other store.
+  //
+  // One note either way, never two: a run that both threw and counted is still
+  // one thing the owner needs to know.
+  if (unreadable || (listStore.readFailures?.() ?? 0) > 0) {
     process.stderr.write(`${STORED_LIST_UNREADABLE}\n`);
   }
 

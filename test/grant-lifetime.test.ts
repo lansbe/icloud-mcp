@@ -724,6 +724,22 @@ describe("LIFE-02: a registration off the allowlist is refused at the door", () 
     expect(nameOf({ toString: () => "short" })).toEqual(REGISTRATION_REFUSAL);
   });
 
+  it("refuses a non-object argument rather than throwing past its own claim", () => {
+    // IN-03. The parameter used to be destructured in the signature, which runs
+    // BEFORE the try — so a non-object argument threw straight past the
+    // never-throw claim. What held the claim up was the library's own wrapper,
+    // not this function. Now it is this function.
+    for (const argument of [null, undefined, 7, "a string"]) {
+      let outcome: ClientRegistrationCallbackResult | undefined | void;
+      expect(() => {
+        outcome = refuseUnlistedRedirects(
+          argument as unknown as ClientRegistrationCallbackOptions,
+        );
+      }, `threw on ${String(argument)}`).not.toThrow();
+      expect(outcome).toEqual(REGISTRATION_REFUSAL);
+    }
+  });
+
   it("refuses a metadata object whose getter throws, and does not throw itself", () => {
     // A throw in this callback is a 500 whose description is the ERROR'S OWN
     // MESSAGE — text a stranger wrote, served back out. That is why the whole

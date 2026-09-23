@@ -968,6 +968,18 @@ export const MAX_CLIENT_NAME_LENGTH = 256;
  * `ALLOWED_REDIRECT_ORIGINS` above and deploy. That is the same fix the
  * authorize refusal already documents, and nothing stored has to change.
  *
+ * ORIGIN-ONLY MATCHING, AND WHAT THAT DOES NOT BOUND (IN-04). Both this gate and
+ * the consent screen reduce a redirect URI to its origin, deliberately: a long
+ * attacker-chosen path would push the origin itself out of view on the screen
+ * where the user is deciding. The consequence is that `https://claude.ai/anything`
+ * registers successfully and displays on the consent screen identically to the
+ * genuine callback. Harm still requires an open redirect or a code-logging
+ * endpoint ON THAT ORIGIN, so this stays residual and is not a reason to start
+ * matching paths. It is written down because a client record no longer expires,
+ * so such a registration is permanent where it used to age out — and because a
+ * later reader could otherwise conclude the origin gate bounds the destination
+ * exactly. It does not. It bounds the ORIGIN exactly.
+ *
  * IT NEVER THROWS. `clientMetadata` is the RAW JSON body a stranger posted, and
  * a throw here becomes a 500 whose description is the error's own message —
  * text that stranger wrote, served back out. So the whole body sits in a
@@ -978,10 +990,18 @@ export const MAX_CLIENT_NAME_LENGTH = 256;
  * The callback is handed no environment, so it cannot reach a store or a
  * limiter. That is fine for a question about an origin.
  */
-export function refuseUnlistedRedirects({
-  clientMetadata,
-}: ClientRegistrationCallbackOptions): ClientRegistrationCallbackResult | undefined {
+export function refuseUnlistedRedirects(
+  options: ClientRegistrationCallbackOptions,
+): ClientRegistrationCallbackResult | undefined {
   try {
+    // THE ARGUMENT IS TAKEN WHOLE AND READ INSIDE THE TRY (IN-03). Destructuring
+    // in the parameter list happens BEFORE the try runs, so a non-object
+    // argument threw straight past the never-throw claim above. What held that
+    // claim up was the library's own wrapper turning the throw into a 500 whose
+    // description is Node's destructuring message — which carries no caller
+    // text, so the effect was nil. The claim is now held by this function, which
+    // is where it is written.
+    const clientMetadata = options.clientMetadata;
     const uris: unknown = clientMetadata.redirect_uris;
     const allowed =
       Array.isArray(uris) &&
