@@ -25,7 +25,13 @@ import {
 } from "vitest";
 import { SAFE_MESSAGES } from "../src/errors";
 import type { DavDiagnosticOutcome } from "../src/dav/diagnose";
+import type { DavCollectionProbe } from "../src/dav/diagnose";
 import { runDavDiagnosticOutcome } from "../src/dav/diagnose";
+// The listing, driven against the SAME stub as the diagnostic. Pitfall 57's
+// quieter half is that loosening the listing's component filter would make
+// reminder lists show up as calendars with no events; asserting both answers
+// off one fixture is what makes a drift between them visible here.
+import { listCalendars } from "../src/dav/calendar";
 import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
 import { createDavFetch } from "../src/dav/transport";
 import { createServerFactory } from "../src/mcp/server";
@@ -111,32 +117,66 @@ function reportSetProp(...reports: string[]): string {
 }
 
 /**
- * Three calendars and the home collection itself, which is not one.
+ * A supported-calendar-component-set property naming the given components.
  *
- * The three advertise OVERLAPPING but not identical report sets, so the union
- * the diagnostic reports has to de-duplicate to be right — an implementation
- * that concatenated would pass against a fixture where every collection said
- * the same thing.
+ * Same spelling `test/dav-calendar.test.ts` uses, because the two halves are
+ * reading the same property off the same request and a fixture that spelt it
+ * differently would prove nothing about the real one.
+ */
+function componentSetProp(...components: string[]): string {
+  const comps = components
+    .map((component) => `<C:comp name="${component}"/>`)
+    .join("");
+  return `<C:supported-calendar-component-set>${comps}</C:supported-calendar-component-set>`;
+}
+
+/** One `response` element for a collection carrying the calendar resourcetype. */
+function calendarCollection(href: string, name: string, extra: string): string {
+  return `<response><href>${href}</href><propstat><status>HTTP/1.1 200 OK</status><prop><resourcetype><collection/><C:calendar/></resourcetype><displayname>${name}</displayname>${extra}</prop></propstat></response>`;
+}
+
+/** The home collection itself, which is not a member of the home set. */
+function homeSelfResponse(): string {
+  return `<response><href>${CALDAV_HOME}</href><propstat><status>HTTP/1.1 200 OK</status><prop><resourcetype><collection/></resourcetype></prop></propstat></response>`;
+}
+
+/**
+ * Three calendars, a reminder list, and the home collection itself.
+ *
+ * The three calendars advertise OVERLAPPING but not identical report sets, so
+ * the union the diagnostic reports has to de-duplicate to be right — an
+ * implementation that concatenated would pass against a fixture where every
+ * collection said the same thing.
+ *
+ * **The three calendars declare no component set and the reminder list declares
+ * `VTODO`**, which is the shape that makes the three numbers in play here
+ * visibly different from one another: four collections carry the calendar
+ * resourcetype, `calendar_list_calendars` shows three of them, and the
+ * enumeration shows all four. A fixture where those numbers agreed could not
+ * tell a diagnostic that sees the reminder list from one that does not.
  */
 function calendarListBody(): string {
-  const calendar = (href: string, name: string, reportSet: string) =>
-    `<response><href>${href}</href><propstat><status>HTTP/1.1 200 OK</status><prop><resourcetype><collection/><C:calendar/></resourcetype><displayname>${name}</displayname>${reportSet}</prop></propstat></response>`;
   return (
-    `<response><href>${CALDAV_HOME}</href><propstat><status>HTTP/1.1 200 OK</status><prop><resourcetype><collection/></resourcetype></prop></propstat></response>` +
-    calendar(
+    homeSelfResponse() +
+    calendarCollection(
       `${CALDAV_HOME}home/`,
       "Home",
       reportSetProp("<C:calendar-query/>", "<C:calendar-multiget/>", "<sync-collection/>"),
     ) +
-    calendar(
+    calendarCollection(
       `${CALDAV_HOME}work/`,
       "Work",
       reportSetProp("<C:calendar-query/>", "<sync-collection/>"),
     ) +
-    calendar(
+    calendarCollection(
       `${CALDAV_HOME}birthdays/`,
       "Birthdays",
       reportSetProp("<C:calendar-query/>", "<C:free-busy-query/>"),
+    ) +
+    calendarCollection(
+      `${CALDAV_HOME}tasks/`,
+      "Groceries",
+      reportSetProp("<C:calendar-query/>") + componentSetProp("VTODO"),
     )
   );
 }
@@ -352,7 +392,10 @@ describe("dav_diagnose, end to end", () => {
     expect(caldav.principalUrl).toBe(`https://caldav.icloud.com${PRINCIPAL_PATH}`);
     expect(caldav.shardHost).toBe("p42-caldav.icloud.com");
     expect(caldav.cacheHit).toBe(false);
-    expect(caldav.calendarCount).toBe(3);
+    // FOUR, not three: the reminder list is a calendar collection too. This
+    // count and the length of `calendar_list_calendars` are deliberately
+    // different numbers — see the case below that drives both.
+    expect(caldav.calendarCount).toBe(4);
 
     expect(carddav.homeUrl).toBe(CARDDAV_HOME);
     expect(carddav.shardHost).toBe("p61-contacts.icloud.com");
@@ -423,6 +466,130 @@ describe("dav_diagnose, end to end", () => {
 
     expect(caldav.reports).toEqual(["calendarQuery"]);
     expect(JSON.stringify(caldav)).not.toContain("[object Object]");
+  });
+
+  it("enumerates every collection in the calendar home, with its component set", async () => {
+    // HALF of SPIKE-02's instrument, and only half. A collection being SERVED
+    // over CalDAV is not evidence that its CONTENTS are, which is the question
+    // SPIKE-02 actually asks; the object-level query that makes a named
+    // reminder matchable is plan 14-02's. Neither half settles it alone.
+    const stub = davStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+    const collections = serviceOf(result, "caldav")
+      .collections as DavCollectionProbe[];
+
+    expect(collections.map((one) => one.displayName)).toEqual([
+      "Home",
+      "Work",
+      "Birthdays",
+      "Groceries",
+    ]);
+
+    const tasks = collections.find((one) => one.displayName === "Groceries");
+    expect(tasks).toBeDefined();
+    expect(tasks!.href).toBe(`${CALDAV_HOME}tasks/`);
+    expect(tasks!.components).toEqual(["VTODO"]);
+    expect(tasks!.resourceTypes).toContain("calendar");
+  });
+
+  it("gives a collection with no component set an EMPTY list, not a dropped row", async () => {
+    // A server that simply did not answer the property is not a server with no
+    // collections. Dropping the row would make the diagnostic quieter than the
+    // account, which is the one thing it must never be.
+    const stub = davStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+    const collections = serviceOf(result, "caldav")
+      .collections as DavCollectionProbe[];
+
+    const home = collections.find((one) => one.displayName === "Home");
+    expect(home).toBeDefined();
+    expect(home!.components).toEqual([]);
+  });
+
+  it("yields one row per collection: a VEVENT calendar and a VTODO list make TWO", async () => {
+    const body =
+      homeSelfResponse() +
+      calendarCollection(
+        `${CALDAV_HOME}personal/`,
+        "Personal",
+        componentSetProp("VEVENT"),
+      ) +
+      calendarCollection(
+        `${CALDAV_HOME}reminders/`,
+        "Reminders",
+        componentSetProp("VTODO"),
+      );
+
+    const stub = davStub({
+      onRequest: (url) => (url === CALDAV_HOME ? multistatus(body) : null),
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+    const collections = serviceOf(result, "caldav")
+      .collections as DavCollectionProbe[];
+
+    expect(collections.length).toBe(2);
+    expect(collections[0].components).toEqual(["VEVENT"]);
+    expect(collections[1].components).toEqual(["VTODO"]);
+  });
+
+  it("omits a collection whose href will not parse, rather than failing the run", async () => {
+    const body =
+      homeSelfResponse() +
+      calendarCollection(`${CALDAV_HOME}good/`, "Good", componentSetProp("VEVENT")) +
+      // A scheme this URL parser refuses, so it cannot be resolved against the
+      // home URL. A collection this server cannot address is one it must not
+      // pretend to have — but it is also not a reason to lose the rest.
+      calendarCollection("http://[", "Broken", componentSetProp("VEVENT"));
+
+    const stub = davStub({
+      onRequest: (url) => (url === CALDAV_HOME ? multistatus(body) : null),
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+
+    expect(result.isError).toBeUndefined();
+    const collections = serviceOf(result, "caldav")
+      .collections as DavCollectionProbe[];
+    expect(collections.map((one) => one.displayName)).toEqual(["Good"]);
+  });
+
+  it("leaves the collection enumeration NULL on the CardDAV half", async () => {
+    // The per-service `null` convention this module's header states: a reader
+    // must never be able to mistake "not applicable" for "found nothing".
+    const stub = davStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+
+    expect(serviceOf(result, "carddav").collections).toBeNull();
+    expect(serviceOf(result, "caldav").collections).not.toBeNull();
+  });
+
+  it("does not change what calendar_list_calendars shows for the same account", async () => {
+    // Pitfall 57's quieter half. The listing's VEVENT filter at
+    // src/dav/calendar.ts:506 stays exactly as it is: loosening it would make
+    // reminder lists appear as calendars with no events, degrading a shipped
+    // tool. The diagnostic sees the reminder list; the listing still does not.
+    const stub = davStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const listing = await listCalendars(env, principal, createDavFetch(owner));
+
+    expect(listing.calendars.map((one) => one.displayName)).toEqual([
+      "Birthdays",
+      "Home",
+      "Work",
+    ]);
+    expect(listing.calendars.map((one) => one.displayName)).not.toContain(
+      "Groceries",
+    );
   });
 
   it("reports the two shard hosts as INDEPENDENT fields, never derived", async () => {
