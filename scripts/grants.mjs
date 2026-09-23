@@ -1,0 +1,265 @@
+// The owner's command: see every connection to this server, and cut any of them off.
+//
+//   node scripts/grants.mjs
+//   node scripts/grants.mjs list [--address <a>]...
+//   node scripts/grants.mjs revoke <grantId>... [--yes]
+//   node scripts/grants.mjs revoke --address <a> [--yes]
+//   node scripts/grants.mjs revoke --legacy-owner [--yes]
+//   node scripts/grants.mjs --help
+//
+// **It runs as YOU, through wrangler's own login, and there is no web endpoint
+// for this.** That was a decision, not an omission: a revoke endpoint would be
+// new attack surface on a server that reaches real personal mail, for a job one
+// person does a few times a year. Nothing here is reachable from the internet.
+//
+// **It always reads the REMOTE store.** Every command this runs carries the
+// remote flag, fixed inside the store adapter in `grants-core.mjs` rather than
+// passed in from here. Without it wrangler talks to the local simulator on this
+// machine: the listing comes back empty, which looks exactly like "no
+// connections", and a delete succeeds against nothing. The Phase 11 runbook
+// records that trap against a hand-typed command.
+//
+// **It prints masked addresses only.** `u***@example.com` with bullets, from the
+// one masking function in `src/principal.ts`. An address given after --address
+// is used to work out which group to label and is never printed back.
+//
+// **It needs the local `wrangler.jsonc`.** That file is git-ignored and holds the
+// namespace ids, so the binding names used here resolve through it. On a fresh
+// clone, copy the example config and fill it in first.
+//
+// **What it can delete.** Only a grant and the tokens under it, and only after
+// printing them and being told --yes. It never touches the allow list, which is
+// step 1 of removing somebody and is a separate decision.
+//
+// Layout below, and the ORDER is load-bearing:
+//
+//   1. the resolve hook, registered before anything else is imported;
+//   2. the imports, which only work once the hook is in place;
+//   3. the wrangler runner, whose stdout is always captured;
+//   4. the known addresses, read only once the arguments have been accepted;
+//   5. the call, and the exit status.
+
+import { execFileSync } from "node:child_process";
+import { registerHooks } from "node:module";
+import { fileURLToPath } from "node:url";
+
+// ---------------------------------------------------------------------------
+// 1. The resolve hook.
+//
+// Two problems, one hook, and both of them exist because this script imports the
+// Worker's OWN code rather than a copy of it. That is the whole point: the user
+// id and the masked label have to come out of `src/principal.ts`, because a
+// second copy of either rule here is how two rules drift until one address
+// becomes two users, or until one of the two forms stops masking.
+//
+//   a. The Worker's modules import each other without a file extension, which
+//      Node refuses. A relative specifier that fails for that reason is retried
+//      once with the TypeScript extension. Node strips the types itself.
+//   b. The OAuth library imports a class from the Workers runtime namespace,
+//      which does not exist under Node. It is only used for an `instanceof`
+//      check against a handler shape this script does not use, so an empty class
+//      from a data URL satisfies it.
+//
+// Anything else is rethrown. A hook that swallowed a real resolution failure
+// would turn a missing module into a confusing error much further along.
+// ---------------------------------------------------------------------------
+
+const RUNTIME_STUB = `data:text/javascript,${encodeURIComponent(
+  "export class WorkerEntrypoint {}",
+)}`;
+
+registerHooks({
+  resolve(specifier, context, next) {
+    if (specifier === "cloudflare:workers") {
+      return { url: RUNTIME_STUB, shortCircuit: true };
+    }
+    try {
+      return next(specifier, context);
+    } catch (error) {
+      if (error?.code === "ERR_MODULE_NOT_FOUND" && specifier.startsWith(".")) {
+        return next(`${specifier}.ts`, context);
+      }
+      throw error;
+    }
+  },
+});
+
+// ---------------------------------------------------------------------------
+// 2. The imports. Dynamic, because a static import is hoisted above the hook
+//    registration and would fail before the hook existed.
+//
+//    The library prints its own one-line notice about a compatibility flag when
+//    it loads. It is left alone rather than filtered: it carries no data, and it
+//    goes to the error stream, so it never mixes into anything captured here.
+// ---------------------------------------------------------------------------
+
+const { USAGE, createWranglerKv, runGrants } = await import("./grants-core.mjs");
+const { ALLOW_LIST_KEY, parseAllowList } = await import(
+  "../src/auth/allow-list"
+);
+const { unstable_readConfig } = await import("wrangler");
+
+/** The repository root, so a run from any directory behaves the same. */
+const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
+
+/** The Worker config, by absolute path rather than relative to the caller's directory. */
+const CONFIG_PATH = fileURLToPath(new URL("../wrangler.jsonc", import.meta.url));
+
+/**
+ * This repository's OWN wrangler, never a global one.
+ *
+ * The version is pinned in `package.json`, and the flags and output shapes this
+ * script depends on are that version's. A globally installed wrangler of some
+ * other version is the shape that prints a listing this script then misreads.
+ */
+const WRANGLER = fileURLToPath(
+  new URL("../node_modules/.bin/wrangler", import.meta.url),
+);
+
+// Every refusal is one fixed sentence, and none of them carries a caught value:
+// wrangler's own output can echo a stored record back.
+//
+// THE COST OF THAT, SAID PLAINLY, BECAUSE IT IS REAL. A refusal that shows
+// nothing cannot tell you a transient failure from a permanent one, and the
+// first run of this script against the live store failed exactly that way and
+// then worked on a retry with nothing changed. So both sentences tell you to run
+// it again first. Reading the caught value out would be the obvious fix and is
+// the one thing not on offer.
+const WRANGLER_FAILED =
+  "A wrangler command did not complete. Run this again: the first call of a " +
+  "session sometimes fails and then works. If it fails twice, check that you " +
+  "are logged in (npx wrangler whoami) and that the local wrangler.jsonc names " +
+  "the bindings.";
+const SEED_UNREADABLE =
+  "Could not read the seed address out of the local Worker config, so a group " +
+  "may show as unknown. Pass --address <a> to label it.";
+const SOMETHING_WENT_WRONG =
+  "This could not finish, so nothing above should be trusted as complete. " +
+  "Nothing was revoked unless a line above says it was. Run it again before " +
+  "concluding anything: a first call that fails and then works has been seen.";
+
+// ---------------------------------------------------------------------------
+// 3. The runner.
+// ---------------------------------------------------------------------------
+
+/**
+ * Run one wrangler command and hand back its standard output.
+ *
+ * **Output is always CAPTURED, never inherited.** A raw grant record holds
+ * ciphertext and a wrapped key, and a raw token record holds a hash; inheriting
+ * the stream would put whichever one this happened to read straight into the
+ * terminal and from there into the scrollback. Everything printed by this
+ * program goes through the core's renderer, which prints only parsed summary
+ * fields.
+ *
+ * **A failure throws one fixed sentence.** It carries neither wrangler's error
+ * output nor its standard output, because either can echo a stored value back.
+ *
+ * @param {readonly string[]} args
+ * @returns {string}
+ */
+function run(args) {
+  try {
+    return execFileSync(WRANGLER, [...args], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      // A listing of a busy namespace is bigger than the default ceiling, and
+      // hitting it would look like a failed command rather than a truncated one.
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch {
+    throw new Error(WRANGLER_FAILED);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4. The known addresses.
+// ---------------------------------------------------------------------------
+
+/**
+ * Add the named addresses from one parsed allow list.
+ *
+ * A list that admits nobody, and a list that admits everybody, both add no
+ * names — neither one knows who is actually connected. Groups this cannot label
+ * are shown by the first few characters of their id instead, which is the honest
+ * answer rather than a guess.
+ *
+ * @param {{ kind: string, addresses?: ReadonlySet<string> }} list
+ * @param {string[]} into
+ */
+function addNamed(list, into) {
+  if (list.kind !== "some" || list.addresses === undefined) return;
+  for (const address of list.addresses) into.push(address);
+}
+
+/**
+ * Who this server knows about, so a group can be labelled by a masked address.
+ *
+ * Read from the same two places the login page reads: the seed in the Worker
+ * config, and the one stored document. Both go through the real
+ * `parseAllowList`, so this script cannot disagree with the door about what a
+ * list means.
+ *
+ * It is a FUNCTION handed to the core rather than a list computed up front, and
+ * that is the point: nothing below runs for `--help` or for a usage mistake, so
+ * a mistyped command costs no wrangler call at all.
+ *
+ * Any `--address` values on the command line are added by the core, from the
+ * parse it has already done, so the arguments are read exactly once.
+ *
+ * @returns {Promise<string[]>}
+ */
+async function knownAddresses() {
+  const addresses = [];
+
+  // The seed. `unstable_readConfig` is marked unstable by its own package, so a
+  // failure here is survivable by design: say so once and carry on with what is
+  // left, rather than refusing to list anything.
+  try {
+    const config = unstable_readConfig({ config: CONFIG_PATH });
+    addNamed(parseAllowList(config?.vars?.ALLOWED_APPLE_IDS_SEED), addresses);
+  } catch {
+    process.stderr.write(`${SEED_UNREADABLE}\n`);
+  }
+
+  // The stored list. LISTED first and read only if the listing returns it: the
+  // key may legitimately not exist, and a read of a key that is not there is a
+  // failed command rather than an empty answer.
+  const listStore = createWranglerKv(run, "ALLOW_LIST_KV");
+  const listed = await listStore.list({ prefix: ALLOW_LIST_KEY });
+  if (listed.keys.some((key) => key.name === ALLOW_LIST_KEY)) {
+    addNamed(parseAllowList(await listStore.get(ALLOW_LIST_KEY)), addresses);
+  }
+
+  return addresses;
+}
+
+// ---------------------------------------------------------------------------
+// 5. The call, and the exit status.
+// ---------------------------------------------------------------------------
+
+const argv = process.argv.slice(2);
+
+try {
+  if (argv.includes("--help") || argv.includes("-h")) {
+    // Answered AFTER the imports above, deliberately. Reaching this line means
+    // the whole chain loaded under Node — the hook, the Worker's own modules,
+    // and the OAuth library — with no network touched and no store read. That
+    // makes --help the cheapest check that this script still works at all.
+    process.stdout.write(`${USAGE}\n`);
+    process.exitCode = 0;
+  } else {
+    process.exitCode = await runGrants(argv, {
+      kv: createWranglerKv(run, "OAUTH_KV"),
+      knownAddresses,
+      write: (text) => process.stdout.write(text),
+      writeError: (text) => process.stderr.write(text),
+    });
+  }
+} catch {
+  // The caught value is never printed. A thrown error here would carry
+  // wrangler's own output, which can echo a stored value.
+  process.stderr.write(`${SOMETHING_WENT_WRONG}\n`);
+  process.exitCode = 1;
+}

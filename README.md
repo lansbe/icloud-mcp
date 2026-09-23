@@ -292,44 +292,50 @@ Step 1 stops new sign-ins. It does **not** end a session already running: their
 existing token keeps working, because the token itself is the evidence that they
 passed the list check when they signed in.
 
-To end it, delete their grant **and** their tokens. Three commands.
-
-**1. Work out their user id.** Their keys are named by it, not by their
-address. It is the SHA-256 of their address in lower case:
+One command does this. **Look first:**
 
 ```bash
-printf '%s' "their-address@example.com" | tr '[:upper:]' '[:lower:]' | shasum -a 256 | cut -d' ' -f1
+node scripts/grants.mjs list
 ```
 
-Type the address with no spaces around it. The 64-character result is
-`<userId>` below.
+That prints every connection to this server, grouped by person, each person
+shown by a masked address. One line per connection:
 
-**2. List their keys.** Both prefixes end in a colon. Keep it, or you may match
-somebody else.
+| Column | What it means |
+|--------|----------------|
+| the id | The connection's own id. This is what you type to revoke just one. |
+| `client "..."` | Which app it is — Claude on the web, Claude Code, and so on. |
+| `created` | The day somebody signed in to make it. |
+| `expires` | The day it runs out, or `never`. A login made now never expires. |
+| `client present` / `client gone` | Whether the app's registration still exists. `client gone` means that connection is already dead — its next refresh is refused whatever you do. |
+
+**Then cut them off:**
 
 ```bash
-npx wrangler kv key list --namespace-id=YOUR_OAUTH_KV_ID --remote --prefix "grant:<userId>:"
-npx wrangler kv key list --namespace-id=YOUR_OAUTH_KV_ID --remote --prefix "token:<userId>:"
+node scripts/grants.mjs revoke --address "their-address@example.com" --yes
 ```
 
-**3. Delete every key both commands printed**, one at a time:
+**Without `--yes` nothing is deleted.** Leave it off and the command prints
+exactly what it would cut, and says so. That is the safe way to check you have
+the right person before anything happens. You can also revoke one connection
+rather than all of somebody's, by giving its id instead of `--address`.
 
-```bash
-npx wrangler kv key delete --namespace-id=YOUR_OAUTH_KV_ID --remote "<key>"
-```
-
-**Delete the `token:` keys too, not just the `grant:` ones.** The server checks
-an access token against its own `token:` record. That record carries its own
-copy of the grant and never looks at the `grant:` key. So deleting only the
-grant stops their next refresh, but the access token they already hold keeps
-working until it expires, which can be up to one hour.
+**It deletes their tokens as well as their connection**, and that is the part
+that matters. The server checks an access token against its own token record.
+That record carries its own copy of the connection and never looks at the
+connection itself. So deleting only the connection stops their next refresh, but
+the access token they already hold keeps working until it expires, which can be
+up to one hour.
 
 Once both are gone, their next request is refused and their client shows a
 sign-in page. The store is eventually consistent, so allow about a minute for
 the deletes to be seen everywhere.
 
-A script that does this by address is planned and does not exist yet. Until it
-does, this is the way.
+The script runs as you, through wrangler's own login, and reads the live store —
+never a local copy. There is deliberately no web page for this: a revoke
+endpoint would be new attack surface on a server that reaches real mail, for a
+job you do a few times a year. Run `node scripts/grants.mjs --help` for every
+form.
 
 ### Why it works like this
 
@@ -356,6 +362,14 @@ edge, and it is why your own address does not live in KV.
 
 **An empty or unreadable list means nobody beyond the seed.** The server refuses
 rather than guessing. Only the exact value `["*"]` opens it to anyone.
+
+**After you change an app-specific password at Apple, sign in again and then
+revoke the connections that still hold the old one.** They fail at Apple, which
+does no harm on its own — but a failure at Apple pauses that person for fifteen
+minutes, and the pause is per person rather than per connection. So one app still
+carrying the dead password can keep pausing the apps you have already fixed.
+`node scripts/grants.mjs list` shows the date each connection was made; the ones
+made before you changed the password are the stale ones.
 
 ---
 
