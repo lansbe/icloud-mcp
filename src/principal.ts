@@ -34,8 +34,9 @@
 //
 // `principalFromEnv` is temporary. It reads the two Worker secrets, which is
 // how the one owner is identified today. Phase 13 removes the secrets and this
-// function with them. There is no form constructor yet: that one waits for the
-// login page in Phase 11.
+// function with them. The form constructor exists now: `principalFromProps`,
+// added with the login page in Phase 11, is how a signed-in person's grant
+// becomes a principal (code review IN-01).
 //
 // It lives at the root rather than inside one of the protocol trees because
 // both the mail tree and the DAV tree will need it, and those two trees must
@@ -50,6 +51,12 @@
 // second copy either. They compare a result with a literal from
 // `test/fixtures/user-id-vectors.ts`, which is the spec this function is built
 // from.
+//
+// The same goes for MASKING. `maskAppleId` is the only place in the repository
+// that builds the masked form of an address, and it calls `normaliseAppleId`
+// rather than folding again. The tool that answers "which account is this
+// connection on" and the owner's grants script both call it. A mask written
+// inline at a call site is how two forms drift until one of them stops masking.
 //
 // Since Phase 11 that one rule is spread over TWO exported functions, and the
 // split is what keeps it one rule rather than making it two.
@@ -75,7 +82,10 @@
 // Apple ID as given, with no trim and no lowercasing. It is left alone on
 // purpose in this phase. Phase 10 replaces it with the user id from here.
 //
-// Nothing that ships today calls this module. It is groundwork.
+// This module ships. The door in `src/mcp/api-handler.ts` builds a principal
+// from the grant's props on every served request, and the login page builds one
+// when someone signs in. It stopped being groundwork in Phase 11, and this line
+// went on saying otherwise until code review IN-01 named it.
 //
 // This module contains no logging calls of any kind and must never acquire any.
 
@@ -172,6 +182,59 @@ export function normaliseAppleId(value: unknown): string | null {
   if (at === folded.length - 1) return null;
 
   return folded;
+}
+
+/**
+ * The mask body: three U+2022 BULLET characters, written as escapes.
+ *
+ * The escape rather than the character, so nothing in a diff or an editor can
+ * turn it into three middle dots or three full stops without the change being
+ * visible. One of those is not a mask.
+ */
+const MASK_BODY = "•••";
+
+/**
+ * The masked form of an Apple ID: first character, three bullets, the domain.
+ *
+ * `u•••@example.invalid`. This is the ONE masking rule in the repository. The
+ * `account_whoami` tool calls it, and so does the owner's grants script. A
+ * second mask written inline at either call site is how two forms drift until
+ * one of them stops masking.
+ *
+ * **It calls `normaliseAppleId` and folds nothing itself.** That is the same
+ * habit `userIdOf` keeps, and for the same reason: two places that fold an
+ * address are two rules, and two rules drift.
+ *
+ * **What it reveals, and why that is enough.** The first character of the local
+ * part and the whole domain. D4 settled that: the question this answers is
+ * "which account is this connection on", asked by someone on a shared laptop,
+ * and the first character plus the domain answers it. The full address would
+ * also answer it, and would put a whole address into a tool response — text the
+ * model reads and may quote back into a draft, an event or a later message.
+ * That exception is recorded in `.claude/CLAUDE.md` § 4 (LIFE-06, D4).
+ *
+ * **A refusal is three bullets and nothing else.** Every input
+ * `normaliseAppleId` turns away — a value that is not a string included — comes
+ * back as the fixed body with no domain and no first character. What was refused
+ * is never echoed, so there is nothing a typed address could ride out on.
+ *
+ * **It keeps nothing and never throws.** No cache, no memo, no message built
+ * from the input. A memo here would hold every address ever typed.
+ *
+ * **The full address is deliberately not available from this module in any form
+ * meant for a response.** `Principal.appleId` carries it because the wire needs
+ * it — it is the login and the draft sender address — not because a response
+ * may hold it. Widening this function, or adding a second one that returns
+ * more, is a decision on the safety boundary rather than a refactor.
+ */
+export function maskAppleId(value: unknown): string {
+  const folded = normaliseAppleId(value);
+  if (folded === null) return MASK_BODY;
+
+  // `normaliseAppleId` already guarantees exactly one at sign with at least one
+  // character on each side, so both of these are in range.
+  const at = folded.indexOf("@");
+  return `${folded[0]}${MASK_BODY}${folded.slice(at)}`;
 }
 
 /**

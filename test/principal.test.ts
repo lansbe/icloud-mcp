@@ -422,7 +422,7 @@ describe("the length cap counts UTF-16 code units, not bytes", () => {
 });
 
 describe("module shape", () => {
-  it("exports the two halves of the id rule, the one password reader and the two constructors, nothing else", () => {
+  it("exports the two halves of the id rule, the one mask, the one password reader and the two constructors, nothing else", () => {
     // The design made checkable. There is no export that hands out the holder
     // itself.
     //
@@ -433,7 +433,16 @@ describe("module shape", () => {
     // comparison synchronously and Web Crypto has no synchronous digest. A
     // list that quietly grew a second FOLDING function would be the drift this
     // assertion is here to catch.
+    //
+    // `maskAppleId` joined it in Phase 12 (LIFE-06), on exactly the same terms.
+    // It is an addition BESIDE the folding rule, not a second copy of it: it
+    // calls `normaliseAppleId` and repeats not one of its steps. It is here
+    // because the "which account is this connection on" tool and the owner's
+    // grants script must both build the same masked form, and a list that
+    // quietly grew a second MASKING function would be that drift — two masks
+    // that agree until the day one of them stops masking.
     expect(Object.keys(principalModule).sort()).toEqual([
+      "maskAppleId",
       "normaliseAppleId",
       "passwordOf",
       "principalFromEnv",
