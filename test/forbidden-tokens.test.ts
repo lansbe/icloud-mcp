@@ -183,6 +183,30 @@ const DAV_FAN_OUT_SERVICE = [
   // find-slots loop is what makes wrapping it in a combinator a live temptation
   // (06-RESEARCH.md Pitfall 3, WINDOWS.md entry #60's precedent).
   "collectFrom",
+  // Phase 14 (SPIKE-04, SPIKE-02). Both are `dav_diagnose` probes, and both are
+  // named HERE as well as among the primitives they end in, for the reason this
+  // rule's own comment gives about `resolveOrganizerAddress`: covering a name by
+  // accident is how a guarantee quietly leaves when a body is refactored.
+  //
+  // `runCollectionWriteProbe` is the sharper of the two. It creates, renames,
+  // recolours and deletes a throwaway COLLECTION, so a fan-out over it leaves
+  // half-finished collections on a real account — and the probe's own cleanup
+  // verification, a re-listing of the home set, is exactly what a combinator
+  // would race.
+  //
+  // `runTaskCollectionProbe` is the shape this rule was written for outright: a
+  // loop over collections, one `calendar-query` apiece. Both names were added to
+  // the alternation BEFORE either function existed, because a name omitted from
+  // it is invisible to every assertion in this file — the set-equality included,
+  // which operates at the rule level and cannot see inside one.
+  //
+  // Neither is a prefix of the other, and neither contains any existing entry:
+  // they diverge at their fourth character (`runC` / `runT`), and `collectFrom`
+  // is not a substring of `runCollectionWriteProbe` because the capitalisation
+  // differs. So both per-name loops below can genuinely fail, and the
+  // `getEventWithEtag` exception list stays at one.
+  "runCollectionWriteProbe",
+  "runTaskCollectionProbe",
 ];
 
 /** The request primitive and the tsdav standalone helpers: what a "just do them
@@ -209,6 +233,25 @@ const DAV_FAN_OUT_LIBRARY = [
   "createCalendarObject",
   "updateCalendarObject",
   "deleteCalendarObject",
+  // Phase 14's three, added BEFORE the call sites that use them existed.
+  // `makeCalendar` is the collection-creation helper (it issues MKCALENDAR
+  // through `davRequest`), `davRequest` is the raw request helper the
+  // property-update step has to assemble by hand because tsdav ships no
+  // PROPPATCH helper, and `deleteObject` is the collection removal.
+  //
+  // `calendarQuery`, which the to-do probe calls, is deliberately NOT repeated:
+  // it went on this list for the event listing and appears in the alternation
+  // exactly once. A second entry would break the set-equality below, which is
+  // the check that would otherwise catch the name being dropped.
+  //
+  // None of the three is a prefix or a substring of any existing entry, and no
+  // existing entry is a prefix or substring of them — in particular
+  // `deleteCalendarObject` neither contains `deleteObject` nor is contained by
+  // it, because the two words are not contiguous in it. So all three per-name
+  // loops below can genuinely fail.
+  "makeCalendar",
+  "davRequest",
+  "deleteObject",
 ];
 
 /** The names actually present in the shipped rule's final alternation group.
@@ -689,8 +732,8 @@ describe("the patterns have teeth", () => {
     const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
     expect(
       DAV_FAN_OUT_SERVICE.length,
-      "eleven read entry points, phase 5's four writes, the organiser resolution WINDOWS 60 filed, the eight composite tool-layer entry points 05-REVIEW.md WR-04 filed plus 05-14's scopelessBody, and phase 6's findFreeSlots orchestrator and its looped collectFrom",
-    ).toBe(26);
+      "eleven read entry points, phase 5's four writes, the organiser resolution WINDOWS 60 filed, the eight composite tool-layer entry points 05-REVIEW.md WR-04 filed plus 05-14's scopelessBody, phase 6's findFreeSlots orchestrator and its looped collectFrom, and phase 14's two dav_diagnose probes — runCollectionWriteProbe, whose fan-out would leave half-finished collections on a real account and race its own cleanup check, and runTaskCollectionProbe, a loop over collections issuing one calendar-query apiece",
+    ).toBe(28);
     for (const entryPoint of DAV_FAN_OUT_SERVICE) {
       const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
       expect(
@@ -709,8 +752,8 @@ describe("the patterns have teeth", () => {
     const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
     expect(
       DAV_FAN_OUT_LIBRARY.length,
-      "the request primitive and the tsdav helpers, plus phase 5's three writes",
-    ).toBe(15);
+      "the request primitive and the tsdav helpers, plus phase 5's three writes and phase 14's three — makeCalendar, davRequest and deleteObject, the collection create, the hand-assembled property update and the collection removal the SPIKE-04 probe needs. calendarQuery, which phase 14's to-do probe also calls, is NOT among them: it has been on this list since the event listing and must appear exactly once",
+    ).toBe(18);
     for (const entryPoint of DAV_FAN_OUT_LIBRARY) {
       const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
       expect(
