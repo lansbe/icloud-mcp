@@ -228,6 +228,17 @@ function davStub(
     caldavHome?: string;
     carddavHome?: string;
     onRequest?: (url: string, method: string, seq: number) => Response | null;
+    /**
+     * The calendar-home listing body, read FRESH on every listing request.
+     *
+     * A function rather than a string, because the write probe lists the home
+     * set twice — once while the two services run, and once after its own
+     * delete — and the whole point of the second listing is that it can answer
+     * DIFFERENTLY from the first. A fixed string could not express "the
+     * collection was there and is now gone", which is the only shape that
+     * distinguishes a verified cleanup from an assumed one.
+     */
+    caldavHomeBody?: () => string;
   } = {},
 ): Stub {
   const caldavHome = options.caldavHome ?? CALDAV_HOME;
@@ -280,7 +291,9 @@ function davStub(
     } else if (url.endsWith(PRINCIPAL_PATH)) {
       response = multistatus(addressBookHomeBody(carddavHome));
     } else if (url === caldavHome) {
-      response = multistatus(calendarListBody());
+      response = multistatus(
+        (options.caldavHomeBody ?? calendarListBody)(),
+      );
     } else if (url === carddavHome) {
       response = multistatus(addressBookListBody());
     } else {
@@ -295,18 +308,31 @@ function davStub(
   return state;
 }
 
+/**
+ * What the registered `dav_diagnose` callback accepts.
+ *
+ * Three booleans and nothing else. Named once so the two probes phase 14 added
+ * are visible in one place beside `refresh`, and so a fourth input added later
+ * has to be written down here before any case can reach it.
+ */
+interface DiagnoseArgs {
+  refresh?: boolean;
+  probeCollectionWrite?: boolean;
+  probeTaskObjects?: boolean;
+}
+
 /** Pull the one registered `dav_diagnose` callback out, without a real server. */
 function diagnoseHandler(
   davFetch: ReturnType<typeof createDavFetch>,
   // Who the callback acts for. The owner, unless a case hands in a promise of
   // its own, such as one that rejects.
   who: Promise<Principal> = owner,
-): (args: { refresh?: boolean }) => Promise<{
+): (args: DiagnoseArgs) => Promise<{
   isError?: boolean;
   content: { type: "text"; text: string }[];
 }> {
   let captured:
-    | ((args: { refresh?: boolean }) => Promise<{
+    | ((args: DiagnoseArgs) => Promise<{
         isError?: boolean;
         content: { type: "text"; text: string }[];
       }>)
@@ -315,7 +341,7 @@ function diagnoseHandler(
     registerTool(
       _name: string,
       _options: Record<string, unknown>,
-      callback: (args: { refresh?: boolean }) => Promise<{
+      callback: (args: DiagnoseArgs) => Promise<{
         isError?: boolean;
         content: { type: "text"; text: string }[];
       }>,
@@ -739,5 +765,499 @@ describe("dav_diagnose, end to end", () => {
     // this throws rather than silently shipping a server with no DAV surface.
     const factory = createServerFactory(ownerPrincipal());
     expect(() => factory({ era: "modern" })).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 14's two probes: the collection write (SPIKE-04) and the bounded to-do
+// listing (SPIKE-02's object-level half).
+//
+// Both are OFF unless asked for by name, and the two "it did nothing" cases
+// below carry more weight than the rest — they are asserted by filtering the
+// RECORDED request methods, so they read what was actually sent rather than the
+// shape of the code that sends it.
+// ---------------------------------------------------------------------------
+
+/** The methods that change something. A run not asked to write sends none. */
+const MUTATING_METHODS = ["MKCALENDAR", "PROPPATCH", "DELETE", "PUT", "MKCOL"];
+
+function methodsOf(stub: Stub, ...methods: string[]): ObservedRequest[] {
+  return stub.requests.filter((request) => methods.includes(request.method));
+}
+
+/** One write-probe step, as the report carries it. */
+interface WriteStep {
+  step: string;
+  status: number | null;
+  ok: boolean;
+  category: string | null;
+}
+
+interface WriteProbe {
+  url: string;
+  steps: WriteStep[];
+  cleanupVerified: boolean;
+  stillPresent: boolean | null;
+}
+
+interface TaskObject {
+  uid: string;
+  summary: string;
+}
+
+interface TaskEntry {
+  href: string;
+  displayName: string;
+  objectCount: number;
+  truncated: boolean;
+  unparsed: number;
+  objects: TaskObject[];
+}
+
+interface TaskProbe {
+  collectionsFound: number;
+  collectionsVisited: number;
+  collections: TaskEntry[];
+}
+
+function writeProbeOf(result: {
+  content: { type: "text"; text: string }[];
+}): WriteProbe | null {
+  return serviceOf(result, "caldav").collectionWrite as WriteProbe | null;
+}
+
+function taskProbeOf(result: {
+  content: { type: "text"; text: string }[];
+}): TaskProbe | null {
+  return serviceOf(result, "caldav").taskObjects as TaskProbe | null;
+}
+
+function stepNamed(probe: WriteProbe, step: string): WriteStep | undefined {
+  return probe.steps.find((one) => one.step === step);
+}
+
+/** A PROPPATCH answer: one `response`, every property accepted. */
+function propertyUpdateBody(href: string): string {
+  return `<response><href>${href}</href><propstat><status>HTTP/1.1 200 OK</status><prop><displayname/><ca:calendar-color xmlns:ca="http://apple.com/ns/ical/"/></prop></propstat></response>`;
+}
+
+/**
+ * A stub that answers the write probe's three mutations and can be told to
+ * keep showing the probe collection after the delete.
+ *
+ * `lingers` is the case the `cleanupVerified` field exists for: a delete that
+ * answered `204` is not evidence of a deletion, and the only thing that is, is
+ * looking again.
+ */
+function writeProbeStub(
+  options: {
+    createStatus?: number;
+    patchStatus?: number;
+    deleteStatus?: number;
+    lingers?: boolean;
+    /** Extra rows on the calendar-home listing — the to-do collections. */
+    extraHomeRows?: string;
+    onOther?: (url: string, method: string) => Response | null;
+  } = {},
+): { stub: Stub; probeUrl: () => string | null } {
+  let probeUrl: string | null = null;
+
+  const stub = davStub({
+    caldavHomeBody: () =>
+      calendarListBody() +
+      (options.extraHomeRows ?? "") +
+      (options.lingers === true && probeUrl !== null
+        ? calendarCollection(probeUrl, "iCloud MCP write probe", "")
+        : ""),
+    onRequest: (url, method) => {
+      if (method === "MKCALENDAR") {
+        probeUrl = url;
+        return new Response(null, { status: options.createStatus ?? 201 });
+      }
+      if (method === "PROPPATCH") {
+        const status = options.patchStatus ?? 207;
+        return status === 207
+          ? multistatus(propertyUpdateBody(url))
+          : new Response(null, { status });
+      }
+      if (method === "DELETE") {
+        return new Response(null, { status: options.deleteStatus ?? 204 });
+      }
+      return options.onOther?.(url, method) ?? null;
+    },
+  });
+
+  return { stub, probeUrl: () => probeUrl };
+}
+
+const TASKS_A = `${CALDAV_HOME}tasks/`;
+const TASKS_B = `${CALDAV_HOME}worklist/`;
+
+/** A collection row advertising the to-do component and nothing else. */
+function todoCollection(href: string, name: string): string {
+  return calendarCollection(href, name, componentSetProp("VTODO"));
+}
+
+/** One to-do resource, as iCloud serves it inside a `calendar-query` answer. */
+function todoObject(href: string, uid: string, summary: string): string {
+  const ics = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//iCloud MCP test//EN",
+    "BEGIN:VTODO",
+    `UID:${uid}`,
+    `SUMMARY:${summary}`,
+    "END:VTODO",
+    "END:VCALENDAR",
+  ].join("\r\n");
+  return `<response><href>${href}</href><propstat><status>HTTP/1.1 200 OK</status><prop><getetag>"${uid}"</getetag><C:calendar-data><![CDATA[${ics}]]></C:calendar-data></prop></propstat></response>`;
+}
+
+/** A resource whose body is not iCalendar at all. */
+function unreadableObject(href: string): string {
+  return `<response><href>${href}</href><propstat><status>HTTP/1.1 200 OK</status><prop><getetag>"x"</getetag><C:calendar-data><![CDATA[this is not iCalendar]]></C:calendar-data></prop></propstat></response>`;
+}
+
+describe("dav_diagnose, the collection write probe (SPIKE-04)", () => {
+  beforeEach(async () => {
+    await clearDavCache(env, principal);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("issues NO mutating request at all when the probe was not asked for", async () => {
+    // Read off the recorded METHODS, not off the code that sends them. A
+    // permanently-registered tool that can write to the account has to be
+    // provably inert on the ordinary path, and "we only call it behind the
+    // boolean" is a claim about the source rather than about the wire.
+    const { stub } = writeProbeStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+
+    expect(methodsOf(stub, ...MUTATING_METHODS)).toEqual([]);
+    expect(writeProbeOf(result)).toBeNull();
+    expect(stub.overlapped).toBe(false);
+  });
+
+  it("creates, renames, deletes, and confirms the collection is GONE", async () => {
+    const { stub, probeUrl } = writeProbeStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeCollectionWrite: true,
+    });
+
+    const probe = writeProbeOf(result);
+    expect(probe).not.toBeNull();
+    expect(probe!.steps.map((one) => one.step)).toEqual([
+      "resolve",
+      "create",
+      "rename-and-recolour",
+      "delete",
+      "verify",
+    ]);
+    expect(probe!.steps.every((one) => one.ok)).toBe(true);
+    expect(stepNamed(probe!, "create")!.status).toBe(201);
+    expect(stepNamed(probe!, "delete")!.status).toBe(204);
+    expect(probe!.stillPresent).toBe(false);
+    expect(probe!.cleanupVerified).toBe(true);
+    expect(probe!.url).toBe(probeUrl());
+    expect(stub.overlapped).toBe(false);
+  });
+
+  it("reports cleanup NOT verified and names the URL when the delete is refused", async () => {
+    const { stub } = writeProbeStub({ deleteStatus: 403, lingers: true });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeCollectionWrite: true,
+    });
+
+    const probe = writeProbeOf(result)!;
+    expect(stepNamed(probe, "delete")!.ok).toBe(false);
+    expect(stepNamed(probe, "delete")!.category).toBe("auth_failed");
+    expect(probe.cleanupVerified).toBe(false);
+    expect(probe.stillPresent).toBe(true);
+    // The URL the owner has to remove by hand. A throwaway calendar left on the
+    // account is litter found months later.
+    expect(probe.url.startsWith(CALDAV_HOME)).toBe(true);
+    expect(stub.overlapped).toBe(false);
+  });
+
+  it("reports cleanup NOT verified when the delete was ACCEPTED but it is still listed", async () => {
+    // An accepted delete is not evidence of a deletion. This is the case that
+    // makes `cleanupVerified` mean something rather than restate the status.
+    const { stub } = writeProbeStub({ deleteStatus: 204, lingers: true });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeCollectionWrite: true,
+    });
+
+    const probe = writeProbeOf(result)!;
+    expect(stepNamed(probe, "delete")!.ok).toBe(true);
+    expect(stepNamed(probe, "delete")!.status).toBe(204);
+    expect(probe.stillPresent).toBe(true);
+    expect(probe.cleanupVerified).toBe(false);
+    expect(stub.overlapped).toBe(false);
+  });
+
+  it("stops at the CREATE when the create is refused, and says so", async () => {
+    const { stub } = writeProbeStub({ createStatus: 403 });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeCollectionWrite: true,
+    });
+
+    const probe = writeProbeOf(result)!;
+    expect(probe.steps.map((one) => one.step)).toEqual(["resolve", "create"]);
+    expect(stepNamed(probe, "create")!.ok).toBe(false);
+    expect(stepNamed(probe, "create")!.category).toBe("auth_failed");
+    // Nothing was created, so there is nothing to have cleaned up — and the
+    // probe says it did not look, rather than claiming the collection is gone.
+    expect(probe.stillPresent).toBeNull();
+    expect(probe.cleanupVerified).toBe(false);
+    expect(methodsOf(stub, "PROPPATCH", "DELETE")).toEqual([]);
+    expect(stub.overlapped).toBe(false);
+  });
+
+  it("aims the write at the account's OWN home set, with a server-generated segment", async () => {
+    // T-14-08. Read off the recorded request URL rather than off the code that
+    // built it: the tool takes no URL, no id and no name, so the only free
+    // component is the identifier this server minted.
+    const { stub } = writeProbeStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeCollectionWrite: true,
+    });
+
+    const created = methodsOf(stub, "MKCALENDAR");
+    expect(created.length).toBe(1);
+    expect(created[0].url.startsWith(CALDAV_HOME)).toBe(true);
+    expect(writeProbeOf(result)!.url.startsWith(CALDAV_HOME)).toBe(true);
+    // One path segment plus a trailing slash, and nothing else.
+    const segment = created[0].url.slice(CALDAV_HOME.length);
+    expect(segment.endsWith("/")).toBe(true);
+    expect(segment.slice(0, -1)).not.toContain("/");
+  });
+
+  it("never has two requests in flight while the write probe runs", async () => {
+    const { stub } = writeProbeStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    await diagnoseHandler(createDavFetch(owner))({ probeCollectionWrite: true });
+
+    expect(stub.overlapped).toBe(false);
+    for (let index = 1; index < stub.requests.length; index += 1) {
+      expect(stub.requests[index - 1].end).toBeLessThan(
+        stub.requests[index].start,
+      );
+    }
+  });
+});
+
+describe("dav_diagnose, the bounded to-do listing (SPIKE-02, object level)", () => {
+  beforeEach(async () => {
+    await clearDavCache(env, principal);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("sends NO report request when the to-do probe was not asked for", async () => {
+    const stub = davStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+
+    expect(methodsOf(stub, "REPORT")).toEqual([]);
+    expect(taskProbeOf(result)).toBeNull();
+    expect(stub.overlapped).toBe(false);
+  });
+
+  it("lists each to-do collection's OBJECTS, with their titles and UIDs", async () => {
+    // This is the half plan 14-01 could not reach. A collection advertising the
+    // to-do component says a task list is SERVED over CalDAV; success criterion
+    // 2 passes only when a reminder the owner named on his phone appears in the
+    // report this server produced, and no collection-level field can carry a
+    // reminder's title.
+    const stub = davStub({
+      caldavHomeBody: () =>
+        homeSelfResponse() +
+        calendarCollection(`${CALDAV_HOME}home/`, "Home", componentSetProp("VEVENT")) +
+        todoCollection(TASKS_A, "Groceries") +
+        todoCollection(TASKS_B, "Work"),
+      onRequest: (url, method) => {
+        if (method !== "REPORT") return null;
+        if (url === TASKS_A) {
+          return multistatus(
+            todoObject(`${TASKS_A}1.ics`, "uid-milk", "Buy milk") +
+              todoObject(`${TASKS_A}2.ics`, "uid-bread", "Buy bread"),
+          );
+        }
+        return multistatus(todoObject(`${TASKS_B}1.ics`, "uid-slides", "Finish slides"));
+      },
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeTaskObjects: true,
+    });
+
+    const probe = taskProbeOf(result)!;
+    expect(probe.collectionsFound).toBe(2);
+    expect(probe.collectionsVisited).toBe(2);
+    expect(probe.collections.map((one) => one.displayName)).toEqual([
+      "Groceries",
+      "Work",
+    ]);
+    expect(probe.collections[0].objects).toEqual([
+      { uid: "uid-milk", summary: "Buy milk" },
+      { uid: "uid-bread", summary: "Buy bread" },
+    ]);
+    expect(probe.collections[1].objects).toEqual([
+      { uid: "uid-slides", summary: "Finish slides" },
+    ]);
+    expect(probe.collections[0].truncated).toBe(false);
+    expect(stub.overlapped).toBe(false);
+  });
+
+  it("reports TRUNCATED rather than silently returning a short list", async () => {
+    // A cap that returned a short list without saying so would let a MISSING
+    // reminder look like an ABSENT one, which is the pass-but-wrong mode in a
+    // different costume.
+    const many = Array.from({ length: 30 }, (_unused, index) =>
+      todoObject(`${TASKS_A}${index}.ics`, `uid-${index}`, `Task ${index}`),
+    ).join("");
+
+    const stub = davStub({
+      caldavHomeBody: () => homeSelfResponse() + todoCollection(TASKS_A, "Groceries"),
+      onRequest: (url, method) =>
+        method === "REPORT" ? multistatus(many) : null,
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeTaskObjects: true,
+    });
+
+    const entry = taskProbeOf(result)!.collections[0];
+    expect(entry.objects.length).toBe(25);
+    expect(entry.objectCount).toBe(30);
+    expect(entry.truncated).toBe(true);
+  });
+
+  it("visits at most EIGHT to-do collections and reports how many it found", async () => {
+    const lists = Array.from({ length: 11 }, (_unused, index) =>
+      todoCollection(`${CALDAV_HOME}list${index}/`, `List ${index}`),
+    ).join("");
+
+    const stub = davStub({
+      caldavHomeBody: () => homeSelfResponse() + lists,
+      onRequest: (url, method) =>
+        method === "REPORT"
+          ? multistatus(todoObject(`${url}1.ics`, "uid-1", "One"))
+          : null,
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeTaskObjects: true,
+    });
+
+    const probe = taskProbeOf(result)!;
+    expect(probe.collectionsFound).toBe(11);
+    expect(probe.collectionsVisited).toBe(8);
+    expect(probe.collections.length).toBe(8);
+    // Eight REPORTs, not eleven. The cap bit and it is visible rather than
+    // silent.
+    expect(methodsOf(stub, "REPORT").length).toBe(8);
+    expect(stub.overlapped).toBe(false);
+  });
+
+  it("omits an object it cannot read a UID and a title from, and COUNTS it", async () => {
+    const stub = davStub({
+      caldavHomeBody: () => homeSelfResponse() + todoCollection(TASKS_A, "Groceries"),
+      onRequest: (url, method) =>
+        method === "REPORT"
+          ? multistatus(
+              todoObject(`${TASKS_A}1.ics`, "uid-milk", "Buy milk") +
+                unreadableObject(`${TASKS_A}2.ics`),
+            )
+          : null,
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeTaskObjects: true,
+    });
+
+    const entry = taskProbeOf(result)!.collections[0];
+    expect(entry.objects).toEqual([{ uid: "uid-milk", summary: "Buy milk" }]);
+    expect(entry.unparsed).toBe(1);
+    // Never an empty title dressed as a real one.
+    expect(JSON.stringify(entry)).not.toContain("[object Object]");
+    expect(entry.objects.every((one) => one.summary.length > 0)).toBe(true);
+  });
+
+  it("queries every collection in its OWN await, never two at once", async () => {
+    const lists = Array.from({ length: 5 }, (_unused, index) =>
+      todoCollection(`${CALDAV_HOME}list${index}/`, `List ${index}`),
+    ).join("");
+
+    const stub = davStub({
+      caldavHomeBody: () => homeSelfResponse() + lists,
+      onRequest: (url, method) =>
+        method === "REPORT"
+          ? multistatus(todoObject(`${url}1.ics`, "uid-1", "One"))
+          : null,
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    await diagnoseHandler(createDavFetch(owner))({ probeTaskObjects: true });
+
+    expect(methodsOf(stub, "REPORT").length).toBe(5);
+    expect(stub.overlapped).toBe(false);
+    for (let index = 1; index < stub.requests.length; index += 1) {
+      expect(stub.requests[index - 1].end).toBeLessThan(
+        stub.requests[index].start,
+      );
+    }
+  });
+
+  it("accepts no title, id or name to match against, and returns no verdict", async () => {
+    // The tool REPORTS what it found; plan 14-06 compares that against what the
+    // owner names, as an exact string match over the full list. A fuzzy match
+    // decided here would be this code deciding SPIKE-02, which is the thing the
+    // phase exists to stop.
+    const registered: Record<string, unknown>[] = [];
+    const server = {
+      registerTool(
+        _name: string,
+        options: Record<string, unknown>,
+        _callback: unknown,
+      ) {
+        registered.push(options);
+      },
+    };
+    registerDavDiagnoseTool(
+      server as unknown as McpServer,
+      createDavFetch(owner),
+      owner,
+    );
+
+    expect(registered.length).toBe(1);
+    const shape = registered[0].inputSchema as { shape: Record<string, unknown> };
+    expect(Object.keys(shape.shape).sort()).toEqual([
+      "probeCollectionWrite",
+      "probeTaskObjects",
+      "refresh",
+    ]);
   });
 });
