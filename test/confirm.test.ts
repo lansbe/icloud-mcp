@@ -23,14 +23,19 @@ import {
   canonicalChange,
   changeHashMatches,
   changeHashOf,
+  composeConfirmationLine,
   importConfirmationKey,
   mintConfirmation,
   reserveConfirmation,
   verifyConfirmation,
 } from "../src/confirm";
 import type {
+  ConfirmKind,
   ConfirmPayload,
   ConfirmTarget,
+  ConfirmationNoun,
+  ConfirmationSummary,
+  ConfirmationTense,
   DavCollectionConfirmPayload,
   DavObjectConfirmPayload,
   MailConfirmPayload,
@@ -1449,6 +1454,297 @@ describe("a confirmation and an event id cannot be used for one another", () => 
     expect(() => fromBase64Url(token)).toThrow();
     expect(token).toContain(".");
     expect(eventId).not.toContain(".");
+  });
+});
+
+// ===========================================================================
+// The composed human-facing line (CONF-04, PITFALLS #40)
+//
+// The sentence the user reads is written by this server rather than by the
+// model, so a truthful commit cannot be preceded by a misleading summary
+// without the divergence being visible to anyone reading the transcript.
+//
+// Every line the composer can produce is pinned BYTE-EXACTLY below, and that is
+// the point rather than thoroughness for its own sake: five later phases inherit
+// this wording, and a table that merely asserted "names the calendar" would let
+// each of them re-decide the register while staying green.
+//
+// The expectations are LITERALS. A table generated from the same rule the
+// composer applies would agree with the composer by construction and would keep
+// agreeing after the rule changed.
+// ===========================================================================
+
+describe("the server composes the human-facing line", () => {
+  /** A summary with every optional value emptied, per noun and operation. */
+  function bare(
+    kind: ConfirmKind,
+    noun: ConfirmationNoun,
+  ): ConfirmationSummary {
+    return {
+      kind,
+      noun,
+      name: null,
+      alsoRemoved: null,
+      fieldCount: null,
+      recipientCount: null,
+    };
+  }
+
+  /**
+   * Every combination of the six nouns, the three operations and both tenses.
+   *
+   * Thirty-six rows, written out. The `it` below also asserts no two of them are
+   * equal, which is what stops a composer that ignored its noun or its tense
+   * from passing thirty-six identical assertions.
+   */
+  const EVERY_LINE: [ConfirmKind, ConfirmationNoun, ConfirmationTense, string][] =
+    [
+      ["create", "event", "would", "Creating the event. Undoing it is a separate, explicit request."],
+      ["create", "event", "did", "Created the event. Undoing it is a separate, explicit request."],
+      ["create", "calendar", "would", "Creating the calendar. Undoing it is a separate, explicit request."],
+      ["create", "calendar", "did", "Created the calendar. Undoing it is a separate, explicit request."],
+      ["create", "contact", "would", "Creating the contact. Undoing it is a separate, explicit request."],
+      ["create", "contact", "did", "Created the contact. Undoing it is a separate, explicit request."],
+      ["create", "message", "would", "Creating the message. Undoing it is a separate, explicit request."],
+      ["create", "message", "did", "Created the message. Undoing it is a separate, explicit request."],
+      ["create", "draft", "would", "Creating the draft. Undoing it is a separate, explicit request."],
+      ["create", "draft", "did", "Created the draft. Undoing it is a separate, explicit request."],
+      ["create", "reminder", "would", "Creating the reminder. Undoing it is a separate, explicit request."],
+      ["create", "reminder", "did", "Created the reminder. Undoing it is a separate, explicit request."],
+      ["update", "event", "would", "Overwriting the event. The values it held before cannot be recovered."],
+      ["update", "event", "did", "Overwrote the event. The values it held before cannot be recovered."],
+      ["update", "calendar", "would", "Overwriting the calendar. The values it held before cannot be recovered."],
+      ["update", "calendar", "did", "Overwrote the calendar. The values it held before cannot be recovered."],
+      ["update", "contact", "would", "Overwriting the contact. The values it held before cannot be recovered."],
+      ["update", "contact", "did", "Overwrote the contact. The values it held before cannot be recovered."],
+      ["update", "message", "would", "Overwriting the message. The values it held before cannot be recovered."],
+      ["update", "message", "did", "Overwrote the message. The values it held before cannot be recovered."],
+      ["update", "draft", "would", "Overwriting the draft. The values it held before cannot be recovered."],
+      ["update", "draft", "did", "Overwrote the draft. The values it held before cannot be recovered."],
+      ["update", "reminder", "would", "Overwriting the reminder. The values it held before cannot be recovered."],
+      ["update", "reminder", "did", "Overwrote the reminder. The values it held before cannot be recovered."],
+      ["delete", "event", "would", "Deleting the event. This cannot be undone."],
+      ["delete", "event", "did", "Deleted the event. This cannot be undone."],
+      ["delete", "calendar", "would", "Deleting the calendar. This cannot be undone."],
+      ["delete", "calendar", "did", "Deleted the calendar. This cannot be undone."],
+      ["delete", "contact", "would", "Deleting the contact. This cannot be undone."],
+      ["delete", "contact", "did", "Deleted the contact. This cannot be undone."],
+      ["delete", "message", "would", "Deleting the message. This cannot be undone."],
+      ["delete", "message", "did", "Deleted the message. This cannot be undone."],
+      ["delete", "draft", "would", "Deleting the draft. This cannot be undone."],
+      ["delete", "draft", "did", "Deleted the draft. This cannot be undone."],
+      ["delete", "reminder", "would", "Deleting the reminder. This cannot be undone."],
+      ["delete", "reminder", "did", "Deleted the reminder. This cannot be undone."],
+    ];
+
+  it("produces the pinned line for every noun, every operation and both tenses", () => {
+    // Non-vacuity first: a table that lost its rows would pass a loop over
+    // nothing, which is the failure mode every table in this repository is
+    // written against.
+    expect(EVERY_LINE.length).toBe(36);
+
+    for (const [kind, noun, tense, expected] of EVERY_LINE) {
+      expect(
+        composeConfirmationLine(bare(kind, noun), tense),
+        `${kind}/${noun}/${tense}`,
+      ).toBe(expected);
+    }
+  });
+
+  it("produces thirty-six DIFFERENT lines, so neither the noun nor the tense is ignored", () => {
+    const produced = EVERY_LINE.map(([kind, noun, tense]) =>
+      composeConfirmationLine(bare(kind, noun), tense),
+    );
+
+    expect(new Set(produced).size).toBe(EVERY_LINE.length);
+  });
+
+  it("names the calendar AND the count on a collection delete, and says they go with it", () => {
+    // PITFALLS #40's own example, and the reason counts and names are part of
+    // the line rather than decoration: "deleting a calendar" is a sentence a
+    // misleading summary can be written over, and this one is not.
+    expect(
+      composeConfirmationLine(
+        {
+          kind: "delete",
+          noun: "calendar",
+          name: "Job Search",
+          alsoRemoved: { count: 9, noun: "event" },
+          fieldCount: null,
+          recipientCount: null,
+        },
+        "would",
+      ),
+    ).toBe(
+      "Deleting calendar 'Job Search', along with the 9 events in it. This cannot be undone.",
+    );
+  });
+
+  it("names the contact AND how many fields move on a contact update", () => {
+    expect(
+      composeConfirmationLine(
+        {
+          kind: "update",
+          noun: "contact",
+          name: "Jane Doe",
+          alsoRemoved: null,
+          fieldCount: 1,
+          recipientCount: null,
+        },
+        "would",
+      ),
+    ).toBe(
+      "Overwriting contact 'Jane Doe', changing 1 field. The values it held before cannot be recovered.",
+    );
+  });
+
+  it("names the recipient count and says an invitation cannot be unsent", () => {
+    expect(
+      composeConfirmationLine(
+        {
+          kind: "create",
+          noun: "event",
+          name: "Coffee with Priya",
+          alsoRemoved: null,
+          fieldCount: null,
+          recipientCount: 3,
+        },
+        "would",
+      ),
+    ).toBe(
+      "Creating event 'Coffee with Priya', telling 3 people. An invitation cannot be unsent.",
+    );
+  });
+
+  it("agrees with itself about number, for one and for many", () => {
+    // A line that said "1 fields" or "3 person" would be a line a reader stops
+    // trusting, and the count is the half that makes the sentence checkable.
+    const one = composeConfirmationLine(
+      {
+        kind: "update",
+        noun: "event",
+        name: "Standup",
+        alsoRemoved: { count: 1, noun: "event" },
+        fieldCount: 1,
+        recipientCount: 1,
+      },
+      "would",
+    );
+    const many = composeConfirmationLine(
+      {
+        kind: "update",
+        noun: "event",
+        name: "Standup",
+        alsoRemoved: { count: 4, noun: "event" },
+        fieldCount: 2,
+        recipientCount: 3,
+      },
+      "would",
+    );
+
+    expect(one).toBe(
+      "Overwriting event 'Standup', along with the 1 event in it, changing 1 field, telling 1 person. An invitation cannot be unsent.",
+    );
+    expect(many).toBe(
+      "Overwriting event 'Standup', along with the 4 events in it, changing 2 fields, telling 3 people. An invitation cannot be unsent.",
+    );
+  });
+
+  it("confines the difference between the two tenses to the tense, by comparison", () => {
+    // Read by COMPARING the two strings rather than by looking at them. The
+    // composer keeps the whole tense in the leading verb and nowhere else, so
+    // the longest common suffix of the pair is the entire rest of the line —
+    // name, counts and consequence included. A composer that inflected a second
+    // word would shrink that suffix and turn this red.
+    const shaped: ConfirmationSummary = {
+      kind: "delete",
+      noun: "calendar",
+      name: "Job Search",
+      alsoRemoved: { count: 9, noun: "event" },
+      fieldCount: null,
+      recipientCount: null,
+    };
+    const forward = composeConfirmationLine(shaped, "would");
+    const past = composeConfirmationLine(shaped, "did");
+
+    expect(forward).not.toBe(past);
+
+    let shared = 0;
+    while (
+      shared < forward.length &&
+      shared < past.length &&
+      forward[forward.length - 1 - shared] === past[past.length - 1 - shared]
+    ) {
+      shared += 1;
+    }
+    const suffix = forward.slice(forward.length - shared);
+
+    // The shared half carries everything that matters, so the unshared half
+    // cannot be the interesting part of the sentence.
+    expect(suffix).toContain("Job Search");
+    expect(suffix).toContain("9 events");
+    expect(suffix).toContain("This cannot be undone.");
+    // And what is left over is the verb on each side, and nothing else.
+    expect(forward.slice(0, forward.length - shared)).toBe("Deleting");
+    expect(past.slice(0, past.length - shared)).toBe("Deleted");
+  });
+
+  it("omits the name entirely rather than publishing empty quotes", () => {
+    const line = composeConfirmationLine(bare("delete", "calendar"), "would");
+
+    expect(line).toBe("Deleting the calendar. This cannot be undone.");
+    expect(line).not.toContain("''");
+    expect(line).not.toContain("'");
+  });
+
+  it("omits a zero count clause rather than saying zero", () => {
+    // Zero is not a smaller version of nine. "Deleting calendar 'X', along with
+    // the 0 events in it" is a sentence that reads as a warning about nothing.
+    const line = composeConfirmationLine(
+      {
+        kind: "delete",
+        noun: "calendar",
+        name: "Empty",
+        alsoRemoved: { count: 0, noun: "event" },
+        fieldCount: 0,
+        recipientCount: 0,
+      },
+      "would",
+    );
+
+    expect(line).toBe("Deleting calendar 'Empty'. This cannot be undone.");
+    expect(line).not.toContain("0");
+    // And in particular the recipient count of zero must not reach for the
+    // invitation consequence: nobody is being told anything.
+    expect(line).not.toContain("invitation");
+  });
+
+  it("reads nothing from the environment: two calls return identical strings", () => {
+    // A composer that consulted a clock, a locale or a random nonce would
+    // produce a preview line and a commit line that could not be compared, and
+    // comparing them is the whole of what this buys.
+    const shaped: ConfirmationSummary = {
+      kind: "delete",
+      noun: "event",
+      name: "Standup",
+      alsoRemoved: null,
+      fieldCount: null,
+      recipientCount: 2,
+    };
+
+    expect(composeConfirmationLine(shaped, "would")).toBe(
+      composeConfirmationLine(shaped, "would"),
+    );
+  });
+
+  it("adds no error category and no refusal, because there is nothing to refuse", () => {
+    // PITFALLS #40 is explicit: this is a response-shape requirement. A
+    // category invented for it would be a category nothing can produce, and a
+    // composer that threw on a summary it disliked would turn a missing
+    // sentence into a failed preview.
+    expect(() =>
+      composeConfirmationLine(bare("delete", "reminder"), "did"),
+    ).not.toThrow();
   });
 });
 
