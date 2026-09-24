@@ -3288,6 +3288,186 @@ describe("the DAV write modules are a manifested constraint", () => {
     );
   });
 
+  it("keeps the manifest parameter an injection point rather than a back door", () => {
+    // Three assertions, and each closes a different route.
+    //
+    // FIRST, arity. A default parameter does not count toward a function's
+    // arity, so `length === 1` is mechanical proof that the shipped constant is
+    // the default and a one-argument call is the ordinary call.
+    expect(checkDavWriteCoverage.length).toBe(1);
+
+    const stripped = rawSourceOf(SCANNER_PATH)
+      // Block comments and line comments both, so a docstring naming the checker
+      // cannot be mistaken for a call to it.
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+
+    // SECOND, the production call site's argument list, byte-exactly. Collected
+    // with a lookbehind that excludes `function `, so the declaration is not
+    // counted as a call.
+    //
+    // "One argument, no comma" was NOT enough, and that is the whole reason this
+    // assertion reads the identifier: `checkDavWriteCoverage(somethingNarrowed)`
+    // has one argument and no comma, so the weaker form passes while narrowing
+    // what the rule is shown — the one harm this parameter could do. Pinning the
+    // IDENTIFIER closes it. The call cannot take a filter, a derived copy or a
+    // literal, and with arity 1 it cannot take a manifest at all.
+    const calls = [
+      ...stripped.matchAll(/(?<!function\s)\bcheckDavWriteCoverage\s*\(([^)]*)\)/g),
+    ];
+    expect(calls.length, "the sole invocation outside the declaration").toBe(1);
+    expect(calls[0]![1]).toBe("davWriteExports");
+
+    // THIRD, the accumulator itself. `const` closes reassignment at the language
+    // level; the occurrence count closes in-place filtering, because a `delete`
+    // or a reassignment would be a fourth occurrence. The three are the
+    // declaration, the collection block's assignment from the export reader, and
+    // the call above.
+    expect(/\bconst\s+davWriteExports\s*=/.test(stripped)).toBe(true);
+    expect(
+      /davWriteExports\[[A-Za-z]+\]\s*=\s*exportedFunctionNames\(contents\)/.test(stripped),
+    ).toBe(true);
+    expect([...stripped.matchAll(/\bdavWriteExports\b/g)].length).toBe(3);
+
+    // Two things worth saying rather than leaving implied.
+    //
+    // The ALTERNATION is deliberately not a parameter of the checker, so the
+    // MEASURED side of the unguarded arm cannot be substituted at all — there is
+    // nowhere to feed a convenient alternation, which is what makes the manifest
+    // parameter an injection point rather than a way to make the rule see less.
+    //
+    // And where this assertion STOPS. It reads the shipped call site's TEXT, so
+    // it cannot see a narrowing performed inside `exportedFunctionNames`, and it
+    // cannot see a declared module added to the scanner's exclusion set. The
+    // first is held by the export-reader assertions against shipped source above;
+    // the second is loud rather than quiet, because an unwalked module's manifest
+    // names all come back as the stale arm. .claude/CLAUDE.md is explicit both
+    // that a rule is never made to see less and that a rule believed to prove
+    // more than it does is worse than one whose limits are written down — this
+    // does both halves.
+    //
+    // If the comment strip ever over-reaches — a string in the scanner carrying
+    // an unbalanced comment opener would swallow real code — the call site
+    // disappears from the stripped text and this goes RED. It fails closed,
+    // which is the correct direction for a gate.
+  });
+
+  it("is wired into scan(): a tree with no declared module fails, once per manifest name", () => {
+    // scripts/ holds none of the declared modules, so scanning it in isolation
+    // exercises the deleted direction against a real tree rather than a synthetic
+    // map. This proves the WIRING rather than the function — the four wiring
+    // points are where a count constraint half-lands.
+    const inIsolation = scan("scripts").map((v) => v.pattern);
+    const staleCount = inIsolation.filter((p) => p === "dav-write-manifest-stale").length;
+    const manifested = Object.values(DAV_WRITE_MODULES).reduce(
+      (total, entry) => total + Object.keys(entry.exports).length,
+      0,
+    );
+    expect(staleCount).toBe(manifested);
+
+    const whole = scan().map((v) => v.pattern);
+    expect(whole).not.toContain("dav-write-manifest-stale");
+    expect(whole).not.toContain("dav-write-export-unmanifested");
+    expect(whole).not.toContain("dav-write-entry-point-unguarded");
+  });
+
+  it("gives the three ids distinct sort keys, straight after the principal constructor count's", () => {
+    // Read by RUNNING the checker, never by reading the source. The fabricated
+    // manifest is what makes one call produce all three.
+    const violations = checkDavWriteCoverage(FABRICATED_COLLECTED, FABRICATED_MANIFEST);
+    const keyOf = (pattern: string) =>
+      violations.find((v) => v.pattern === pattern)!.patternIndex;
+    expect(keyOf("dav-write-export-unmanifested")).toBe(FORBIDDEN.length + 18);
+    expect(keyOf("dav-write-manifest-stale")).toBe(FORBIDDEN.length + 19);
+    expect(keyOf("dav-write-entry-point-unguarded")).toBe(FORBIDDEN.length + 20);
+  });
+
+  it("carries no shared regex state: a second call over the same contents returns the same names", () => {
+    // The reader needs `matchAll`, which a pattern without the global flag
+    // refuses outright — so unlike every other constraint pattern in the scanner
+    // it cannot simply drop the flag. The pattern is constructed fresh per call
+    // instead, and this is what a carried `lastIndex` would break: the second
+    // call would start part-way through the file and come back short.
+    const sample = "export function first() {}\nexport async function second() {}\n";
+    expect(exportedFunctionNames(sample)).toEqual(["first", "second"]);
+    expect(exportedFunctionNames(sample)).toEqual(["first", "second"]);
+    const shippedText = rawSourceOf(CALENDAR_MODULE);
+    expect(exportedFunctionNames(shippedText)).toEqual(exportedFunctionNames(shippedText));
+    // Source order, not sorted, because the manifest is read in declaration order.
+    expect(exportedFunctionNames(shippedText)[0]).toBe("listCalendars");
+  });
+
+  it("pins the known evasions as unseen, so nobody believes they are covered", () => {
+    // Each of these DOES add an export, and the reader sees none of them. This is
+    // a limit written down rather than a gap being tolerated: the manifest's own
+    // docstring lists all four, and if the reader later starts to see one, this
+    // goes red — move the row out and update the docstring.
+    for (const sample of [
+      // A re-export. No `function` keyword follows the `export`.
+      'export { getEvent } from "./elsewhere";',
+      // A `const` arrow export. The one most likely to arrive by accident,
+      // because it is a style choice rather than an evasion.
+      "export const getEvent = async (env) => {};",
+      // A name bound and exported separately: the two words are never adjacent.
+      "function getEvent() {}\nexport { getEvent };",
+      // A module-local fan-out entry point, which an export list cannot see at
+      // all. The two real ones are named in the manifest's docstring.
+      "async function collectFrom(env, collection) {}",
+    ]) {
+      expect(exportedFunctionNames(sample), `now sees ${sample}`).toEqual([]);
+    }
+  });
+
+  it("compares export names by exact ASCII equality, in both directions at once", () => {
+    // No case folding, no Unicode normalisation, no trimming. A name differing
+    // from a manifest entry only by case is two different names, and the correct
+    // answer is BOTH arms in one run: the export the module actually ships is one
+    // nobody decided about, and the name the manifest lists is not there.
+    const caseManifest = {
+      [FABRICATED_MODULE]: {
+        why: "A fabricated module, declared only to drive the exact-equality assertion.",
+        exports: { getEvent: "guarded" },
+      },
+    };
+    const violations = checkDavWriteCoverage(
+      { [FABRICATED_MODULE]: ["GetEvent"] },
+      caseManifest,
+    );
+    expect(violations.map((v) => v.pattern)).toEqual([
+      "dav-write-export-unmanifested",
+      "dav-write-manifest-stale",
+    ]);
+    expect(violations[0]!.why).toContain("GetEvent");
+    expect(violations[0]!.why).not.toContain(" getEvent");
+    expect(violations[1]!.why).toContain("getEvent");
+  });
+
+  it("pins the prefix-shadow exact list for the manifest's guarded names", () => {
+    // The same defect the alternation's own block records, asked of the manifest:
+    // the alternation carries no leading word boundary, so a guarded name that
+    // CONTAINS another entry is matched through that other entry. `getEventWithEtag`
+    // is exactly that — `getEvent` precedes it and is a prefix of it — and it is
+    // recorded as an EXACT LIST rather than tolerated, so a write export added
+    // later with the same defect fails here and has to be argued for.
+    //
+    // The repair is forbidden: a trailing word boundary on the group would make
+    // the safety rule match strictly LESS than it does today.
+    const names = davAlternationNames();
+    const guarded = Object.values(DAV_WRITE_MODULES).flatMap((entry) =>
+      Object.entries(entry.exports)
+        .filter(([, disposition]) => disposition === "guarded")
+        .map(([name]) => name),
+    );
+    expect(guarded.length, "the guarded set came back empty").toBeGreaterThan(10);
+    const covered = guarded.filter((name) =>
+      names.some((other) => other !== name && name.includes(other)),
+    );
+    expect(
+      covered,
+      "a guarded manifest name is matched through another alternation entry, so its coverage claim cannot fail",
+    ).toEqual(["getEventWithEtag"]);
+  });
+
   it("is deterministic: two runs over the same input return deeply equal arrays", () => {
     // `scan()` sorts by file, line, column then rule index, and every violation
     // this checker emits for one module shares all four — so the checker's own
