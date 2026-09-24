@@ -20,6 +20,9 @@ import {
   APPEND_COMMAND,
   APPEND_OWNER,
   APPEND_SCOPE,
+  CONFIRM_LINE_COMPOSER,
+  CONFIRM_LINE_OWNER,
+  CONFIRM_LINE_SCOPE,
   DAV_FETCH_CALL,
   DAV_FETCH_OWNER,
   DAV_HOST_LITERAL,
@@ -44,6 +47,7 @@ import {
   checkAddressHashOwnership,
   checkAppendOwnership,
   checkCommitHook,
+  checkConfirmLineOwnership,
   checkDavFetchOwnership,
   checkDavHostOwnership,
   checkDavWriteCoverage,
@@ -3484,6 +3488,144 @@ describe("the DAV write modules are a manifested constraint", () => {
   });
 });
 
+describe("one function composes the human-facing line (CONF-04)", () => {
+  const owner = { file: CONFIRM_LINE_OWNER, line: 1108, column: 17 };
+  // The realistic second site, and realistic rather than hypothetical: the tool
+  // layer is where "just phrase it from here" gets written, because that is the
+  // layer holding the response the sentence rides in.
+  const elsewhere = { file: "src/mcp/tools/calendar.ts", line: 1755, column: 23 };
+
+  /** A fresh copy per probe, so no state can carry between samples. */
+  const fires = (sample: string): boolean =>
+    new RegExp(CONFIRM_LINE_COMPOSER.source, CONFIRM_LINE_COMPOSER.flags).test(
+      sample,
+    );
+
+  it("passes when the confirm module is the only file that defines the composer", () => {
+    expect(checkConfirmLineOwnership([owner])).toEqual([]);
+  });
+
+  it("reports a violation naming the second file when another module defines one", () => {
+    const violations = checkConfirmLineOwnership([owner, elsewhere]);
+    expect(violations.map((v) => v.pattern)).toEqual([
+      "confirm-line-composer-duplicated",
+    ]);
+    expect(violations[0]!.file).toBe(elsewhere.file);
+    expect(violations[0]!.line).toBe(elsewhere.line);
+    expect(violations[0]!.column).toBe(elsewhere.column);
+  });
+
+  it("reports a violation naming the owner when nothing defines one", () => {
+    // The direction a negative cannot see, and the one that matters most here:
+    // a composer deleted, renamed or inlined guards nothing, and nothing goes
+    // red on the way out because the tests covering it leave with it. Five
+    // later phases inherit this sentence; losing it is quieter than duplicating
+    // it.
+    const violations = checkConfirmLineOwnership([]);
+    expect(violations.map((v) => v.pattern)).toEqual([
+      "confirm-line-composer-missing",
+    ]);
+    expect(violations[0]!.file).toBe(CONFIRM_LINE_OWNER);
+    expect(violations[0]!.line).toBe(0);
+    expect(violations[0]!.column).toBe(0);
+  });
+
+  it("names the one owner, and collects from the source tree only", () => {
+    expect(CONFIRM_LINE_OWNER).toBe("src/confirm.ts");
+    expect(CONFIRM_LINE_SCOPE).toBe("src/");
+  });
+
+  it("matches the shipped definition, on one line and split across several", () => {
+    for (const sample of [
+      // src/confirm.ts as it is written today.
+      "export function composeConfirmationLine(",
+      // The same after a formatter breaks the signature up.
+      "export function composeConfirmationLine(\n  summary: ConfirmationSummary,\n): string {",
+      // Unexported, which is still a definition.
+      "function composeConfirmationLine(summary, tense) {",
+      // The declaration keyword and the name on separate lines.
+      "function\n  composeConfirmationLine(summary, tense) {",
+    ]) {
+      expect(fires(sample), `missed ${sample}`).toBe(true);
+    }
+  });
+
+  it("does not see a CALL or an IMPORT, only a definition", () => {
+    // These are the rows a pattern anchored on the bare NAME would catch, and
+    // catching them would be fatal rather than untidy: every call site lives
+    // under the collected scope, so the rule would report the very sites it
+    // exists to protect and the pre-commit hook would refuse every commit in
+    // the repository.
+    for (const sample of [
+      'const line = composeConfirmationLine(summary, "would");',
+      "    confirmationLine: composeConfirmationLine(summary, tense),",
+      'import { composeConfirmationLine } from "../../confirm";',
+      "  composeConfirmationLine,",
+      // A mention in prose with no declaration keyword in front of it.
+      " * See `composeConfirmationLine`, which owns the argument.",
+    ]) {
+      expect(fires(sample), `now sees ${sample}`).toBe(false);
+    }
+  });
+
+  it("pins the known evasions as unseen, so nobody believes they are covered", () => {
+    // Each of these DOES produce a second human-facing sentence. The constant's
+    // docstring lists them and names what actually holds them instead -- the
+    // byte-exact line table in test/confirm.test.ts and the fence audit's
+    // key-set comparison. If the pattern later starts to see one, this goes
+    // red: move the row out and update the docstring.
+    for (const sample of [
+      // 1. a second composer bound to a const arrow rather than declared
+      "export const composeConfirmationLine = (summary, tense) => `${tense}`;",
+      // 2. a line assembled inline at a tool shaper as a template literal
+      "  const line = `Deleting event '${title}'. This cannot be undone.`;",
+      // 3. a re-export under an alias
+      'export { composeConfirmationLine as composeLine } from "../../confirm";',
+      // 4. a helper that rewrites the composed line before it reaches the
+      //    response
+      "function tighten(line) {\n  return line.replace(/ in it/, '');\n}",
+    ]) {
+      expect(fires(sample), `now sees ${sample}`).toBe(false);
+    }
+  });
+
+  it("carries no global flag, because scan() takes the first match with search()", () => {
+    expect(CONFIRM_LINE_COMPOSER.flags).toBe("");
+  });
+
+  it("gives the two ids distinct sort keys, straight after the write-coverage count's", () => {
+    // Read off violations the checker PRODUCED rather than off the source, so
+    // an id renamed in one place and not the other cannot pass here.
+    const violations = [
+      ...checkConfirmLineOwnership([owner, elsewhere]),
+      ...checkConfirmLineOwnership([]),
+    ];
+    const duplicated = violations.find(
+      (v) => v.pattern === "confirm-line-composer-duplicated",
+    )!;
+    const missing = violations.find(
+      (v) => v.pattern === "confirm-line-composer-missing",
+    )!;
+
+    expect(duplicated.patternIndex).toBe(FORBIDDEN.length + 21);
+    expect(missing.patternIndex).toBe(FORBIDDEN.length + 22);
+  });
+
+  it("is wired into scan(): a tree with no composer reports the owner as missing", () => {
+    // scripts/ is outside CONFIRM_LINE_SCOPE, so scanning it alone exercises
+    // the deleted direction against a real tree rather than a synthetic list.
+    expect(scan("scripts").map((v) => v.pattern)).toContain(
+      "confirm-line-composer-missing",
+    );
+  });
+
+  it("passes on the real tree: exactly one definition, and it is the owner", () => {
+    const patterns = scan().map((v) => v.pattern);
+    expect(patterns).not.toContain("confirm-line-composer-missing");
+    expect(patterns).not.toContain("confirm-line-composer-duplicated");
+  });
+});
+
 describe("the count constraints as a set", () => {
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
@@ -3524,6 +3666,9 @@ describe("the count constraints as a set", () => {
       // One owner again, so the same pair once more.
       ...checkAddressHashOwnership([nonOwner]).map((v) => v.pattern),
       ...checkAddressHashOwnership([]).map((v) => v.pattern),
+      // One owner, so the same two lists once more.
+      ...checkConfirmLineOwnership([nonOwner]).map((v) => v.pattern),
+      ...checkConfirmLineOwnership([]).map((v) => v.pattern),
       // The second two-owner count, fed the same pair of lists the password
       // count is fed and for the same reason.
       ...checkPrincipalConstructorOwnership([
@@ -3578,6 +3723,9 @@ describe("the count constraints as a set", () => {
       // Same again for the one address-hashing producer.
       ...checkAddressHashOwnership([nonOwner]),
       ...checkAddressHashOwnership([]),
+      // One owner again, so a lone non-owner and an empty list give one of each.
+      ...checkConfirmLineOwnership([nonOwner]),
+      ...checkConfirmLineOwnership([]),
       // TWO owners again, so the same asymmetric pair the password count needs:
       // both owners plus a non-owner is exactly one outside, and one owner
       // alone is exactly one missing.
