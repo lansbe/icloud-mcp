@@ -464,7 +464,7 @@ const MAX_FAILURES_PER_WINDOW = 5;
  * plain literals — and the rule's own comment names that gap as this phase's to
  * close.
  *
- * The version segment is the same hedge `confirm:v2:` and `dav:v1:` carry: a
+ * The version segment is the same hedge `confirm:v3:` and `dav:v1:` carry: a
  * later change to the shape becomes detectable rather than silently misread as
  * the current one. It has been needed twice. The keys before `v2` were
  * keyed by source rather than by target. `v2` keys held a plain count per

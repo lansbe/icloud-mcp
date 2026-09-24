@@ -1598,6 +1598,11 @@ async function buildPreview(
   const confirmToken = await mintConfirmation(
     {
       v: CONFIRM_VERSION,
+      // The kind of resource this confirmation names, placed immediately after
+      // the version so the discriminator reads before the fields it governs.
+      // The commit does not re-check it: `verifyConfirmation` is handed the
+      // same target and refuses a mismatch itself.
+      t: "dav",
       k: "update",
       j: crypto.randomUUID(),
       // The write target, carried in the SIGNED payload and read from there by
@@ -1841,6 +1846,11 @@ async function buildDeletePreview(
   const confirmToken = await mintConfirmation(
     {
       v: CONFIRM_VERSION,
+      // The kind of resource this confirmation names, placed immediately after
+      // the version so the discriminator reads before the fields it governs.
+      // The commit does not re-check it: `verifyConfirmation` is handed the
+      // same target and refuses a mismatch itself.
+      t: "dav",
       k: "delete",
       j: crypto.randomUUID(),
       c: ref.calendarUrl,
@@ -2078,6 +2088,11 @@ async function buildCreatePreview(
   const confirmToken = await mintConfirmation(
     {
       v: CONFIRM_VERSION,
+      // The kind of resource this confirmation names, placed immediately after
+      // the version so the discriminator reads before the fields it governs.
+      // The commit does not re-check it: `verifyConfirmation` is handed the
+      // same target and refuses a mismatch itself.
+      t: "dav",
       k: "create",
       j: crypto.randomUUID(),
       c: ref.calendarUrl,
@@ -2506,6 +2521,11 @@ function isDispatchableScope(scope: string | null): boolean {
  *
  *   1-3. Split, verify the seal, check the expiry — all inside
  *        `verifyConfirmation`, which refuses each identically.
+ *   3a.  The confirmation names a DAV OBJECT and not a mailbox or a collection
+ *        — also inside `verifyConfirmation`, and ahead of 3b for the reason its
+ *        own docstring gives. A token minted for another protocol would
+ *        otherwise have its fields read under this arm's names, which is how a
+ *        mailbox becomes a URL and a write lands somewhere nobody chose.
  *   3b.  The confirmation was minted for the CALLER, not for somebody else —
  *        also inside `verifyConfirmation`, and deliberately there rather than
  *        here. Step six below spends a one-time slot, and a refusal that
@@ -2531,11 +2551,19 @@ async function applyCommit(
   confirmToken: string,
   supplied: SuppliedChange,
 ): Promise<CommitOutcome> {
-  // Steps 1, 2, 3 and 3b.
+  // Steps 1, 2, 3, 3a and 3b.
+  //
+  // The target is supplied here and checked THERE. Nothing below compares
+  // `payload.t` again: the gate owns that check, the payload it returns is
+  // already narrowed to the object arm, and a second comparison at this call
+  // site is the duplicate a later phase copies to a call site that then forgets
+  // it. A mail or collection confirmation presented to this handler is refused
+  // inside `verifyConfirmation`, ahead of the reservation, so it spends nothing.
   const payload = await verifyConfirmation(
     confirmToken,
     env.CONFIRM_SECRET,
     principal.userId,
+    "dav",
   );
 
   // Step 4. Read from the SIGNED payload, never inferred from which tool was

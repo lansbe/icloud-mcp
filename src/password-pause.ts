@@ -60,7 +60,7 @@ import type { Principal } from "./principal";
  * user segment is a key any signed-in caller could name.
  *
  * The version segment is the same hedge the login counter's `authorize-failures:v3:`
- * carries, and `confirm:v2:` and `dav:v1:` before it: a later change to the
+ * carries, and `confirm:v3:` and `dav:v1:` before it: a later change to the
  * shape becomes detectable rather than being silently misread as the current
  * one. No older shape is read, so a leftover key is ignored and expires on its
  * own TTL.

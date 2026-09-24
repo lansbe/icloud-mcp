@@ -123,8 +123,23 @@ export class ConfirmationInvalidError extends Error {
  * one would be admitting a confirmation nobody can say belongs to anyone. The
  * owner accepted this cost by name (D-12); it costs each affected preview one
  * re-preview and nothing else.
+ *
+ * **Bumped to 3 when the payload gained `t`, and the cost is the same cost,
+ * named again rather than assumed to have been paid once.** Every preview in
+ * flight at THAT deploy dies too: its token carries `v: 2`, the check below is
+ * the same strict inequality, and a version this build does not know is refused
+ * outright. That is the correct behaviour rather than a fault — a v2 token says
+ * nothing about which KIND of resource it names, and admitting one would be
+ * admitting a confirmation whose fields a commit would read under whatever
+ * field names that commit happened to expect. The owner priced this in D-12 and
+ * in ARCHITECTURE §7; it costs one re-preview per confirmation alive at the
+ * deploy, and the window in which any are alive is `CONFIRM_TTL_SECONDS` wide.
+ *
+ * No compatibility arm admits a v2 token back. An arm that read the old shape
+ * and filled in a discriminator would be guessing at the one field the guess
+ * was added to remove.
  */
-export const CONFIRM_VERSION = 2;
+export const CONFIRM_VERSION = 3;
 
 /**
  * The operation a confirmation authorises.
@@ -195,8 +210,16 @@ export const CONFIRM_TTL_SECONDS = 300;
  * reasoning: a reader who decides from this paragraph that the id is optional
  * can change both of those to match. That is why the measurement is written
  * down here rather than only in the phase record.
+ *
+ * `v3` because the payload above it now names its own target, and the two
+ * version segments are kept in step deliberately: a stored record and the token
+ * it was written for belong to the same format, and a namespace that lagged
+ * behind the payload would let a v3 token find a v2 slot already spent by a
+ * token of a different shape. The user id still sits immediately after this
+ * prefix and that has not moved — the bump changes the namespace and nothing
+ * about the key's structure.
  */
-export const CONFIRM_KEY_PREFIX = "confirm:v2:";
+export const CONFIRM_KEY_PREFIX = "confirm:v3:";
 
 /**
  * The separator between the sealed payload and its seal.
@@ -220,19 +243,105 @@ export const CONFIRM_KEY_PREFIX = "confirm:v2:";
 const TOKEN_SEPARATOR = ".";
 
 /**
- * What a confirmation carries, sealed.
+ * What every confirmation carries, whatever it names.
+ *
+ * The protocol-neutral half: the version, the operation, the single-use id, the
+ * change hash, the expiry and the user. Nothing here says what kind of resource
+ * the confirmation points at — that is the discriminated half, one arm below
+ * per target, and `ConfirmPayload` is the union of those arms.
  *
  * Single-character field names, for the reason `src/dav/ids.ts` gives about its
  * own tokens: a token is paid for on every response for the life of the server,
  * and this one rides alongside a preview a model must read in full.
  */
-export interface ConfirmPayload {
+export interface ConfirmPayloadBase {
   /** Format version. See `CONFIRM_VERSION`. */
   v: typeof CONFIRM_VERSION;
   /** The operation authorised, read from here and never from the endpoint. */
   k: ConfirmKind;
   /** The jti — `crypto.randomUUID()`, and the single-use key. */
   j: string;
+  /** The canonical change hash. See `changeHashOf`. */
+  h: string;
+  /**
+   * The expiry, as ABSOLUTE seconds since the epoch.
+   *
+   * **Absolute, and never a mint time compared against a TTL constant at verify
+   * time.** This is D-82's rule carried to a second token type, and its
+   * reasoning transfers without alteration: a lifetime held in a constant is a
+   * number a later edit can lengthen, and lengthening it would retroactively
+   * stretch every token already in flight. Shortening is safe; lengthening is
+   * the failure; an absolute field makes the failure unreachable, because the
+   * only thing a later edit can change is how long the NEXT token lives.
+   *
+   * Whole seconds, and expiry is `>=` rather than `>`: the second a token names
+   * belongs to the dead side, so a confirmation can never be spent in the
+   * second it expires.
+   */
+  x: number;
+  /**
+   * The user this confirmation was minted FOR.
+   *
+   * The 64-hex id of the signed-in principal at the preview, taken from
+   * `Principal.userId` and from nothing else. It is never read off a caller's
+   * request, never parsed out of a URL, and never recovered from a key — a
+   * subject a caller could choose is not a subject, it is a field.
+   *
+   * **What it buys, and it is not the obvious thing.** A confirmation is
+   * already tied to one resource by `c` and `o`, so another user presenting it
+   * cannot write to their own calendar with it — the home containment check
+   * turns them away. What they COULD do until this field existed is spend the
+   * one-time slot: the reservation ran before anyone asked who the token
+   * belonged to, so a refused commit still burnt the owner's confirmation and
+   * the owner had to preview again. `verifyConfirmation` compares this field
+   * five checks and one KV round trip ahead of that reservation, so a mismatch
+   * now spends nothing at all.
+   */
+  u: string;
+}
+
+/**
+ * Which kind of resource a confirmation names.
+ *
+ * Three literals, and only the first has a call site today. The other two
+ * arrive with the arms below, and the type carries all three from the start so
+ * that the predicate's arm table and `verifyConfirmation`'s parameter are
+ * written once rather than widened each time a phase lands.
+ *
+ * `"dav"` is one CalDAV or CardDAV OBJECT; `"col"` is a DAV COLLECTION;
+ * `"mail"` is one message in one mailbox.
+ */
+export type ConfirmTarget = "dav" | "col" | "mail";
+
+/** A confirmation naming ONE CalDAV or CardDAV object. */
+export interface DavObjectConfirmPayload extends ConfirmPayloadBase {
+  /**
+   * The kind of resource this confirmation names.
+   *
+   * **The discriminator is load-bearing rather than a label.** Every arm of
+   * this union reuses the same short field letters for entirely different
+   * values, because the letters are paid for on every response and there are
+   * not many of them. `o` is an absolute object URL here and a UID's home
+   * nowhere else; `m` is a mailbox token on the mail arm and absent here.
+   *
+   * The silent failure it forbids is mechanical rather than hypothetical. A
+   * mail confirmation handed to a DAV commit would have its fields read under
+   * the DAV arm's names, so a mailbox token lands in the slot naming a
+   * collection URL and a UID lands in the slot naming an object URL. tsdav
+   * resolves a request URL against the account's own root, so a mailbox name
+   * becomes an absolute-looking URL, the request goes out, and something is
+   * written or removed at a path nobody chose. Nothing raises: every field is a
+   * string of the right type, which is the entire class of failure a structural
+   * predicate alone cannot see.
+   *
+   * A REQUIRED discriminator makes that unreachable rather than merely checked.
+   * `verifyConfirmation` takes the target its caller expects and refuses a
+   * mismatch itself, so there is no call site that can forget the comparison,
+   * and the payload it returns is already narrowed to the matching arm.
+   *
+   * Single-character, for the reason the interface header gives.
+   */
+  t: "dav";
   /** The collection URL, absolute. */
   c: string;
   /** The object URL, absolute. The commit reads its target from HERE. */
@@ -282,44 +391,17 @@ export interface ConfirmPayload {
    * exactly the silent failure the field exists to prevent.
    */
   s: number | null;
-  /** The canonical change hash. See `changeHashOf`. */
-  h: string;
-  /**
-   * The expiry, as ABSOLUTE seconds since the epoch.
-   *
-   * **Absolute, and never a mint time compared against a TTL constant at verify
-   * time.** This is D-82's rule carried to a second token type, and its
-   * reasoning transfers without alteration: a lifetime held in a constant is a
-   * number a later edit can lengthen, and lengthening it would retroactively
-   * stretch every token already in flight. Shortening is safe; lengthening is
-   * the failure; an absolute field makes the failure unreachable, because the
-   * only thing a later edit can change is how long the NEXT token lives.
-   *
-   * Whole seconds, and expiry is `>=` rather than `>`: the second a token names
-   * belongs to the dead side, so a confirmation can never be spent in the
-   * second it expires.
-   */
-  x: number;
-  /**
-   * The user this confirmation was minted FOR.
-   *
-   * The 64-hex id of the signed-in principal at the preview, taken from
-   * `Principal.userId` and from nothing else. It is never read off a caller's
-   * request, never parsed out of a URL, and never recovered from a key — a
-   * subject a caller could choose is not a subject, it is a field.
-   *
-   * **What it buys, and it is not the obvious thing.** A confirmation is
-   * already tied to one resource by `c` and `o`, so another user presenting it
-   * cannot write to their own calendar with it — the home containment check
-   * turns them away. What they COULD do until this field existed is spend the
-   * one-time slot: the reservation ran before anyone asked who the token
-   * belonged to, so a refused commit still burnt the owner's confirmation and
-   * the owner had to preview again. `verifyConfirmation` compares this field
-   * five checks and one KV round trip ahead of that reservation, so a mismatch
-   * now spends nothing at all.
-   */
-  u: string;
 }
+
+/**
+ * What a confirmation carries, sealed — one arm per kind of target.
+ *
+ * A union rather than one interface with optional fields, and the difference is
+ * the whole point: an optional field makes "absent" carry two meanings at once,
+ * which is the failure `e`'s own docstring is built to avoid. On a union, a
+ * field that does not belong to a target is not absent — it does not exist.
+ */
+export type ConfirmPayload = DavObjectConfirmPayload;
 
 /**
  * True only for a signing key this module is willing to use.
@@ -414,10 +496,22 @@ export async function mintConfirmation(
  * Read a confirmation back, or refuse it.
  *
  * **The order is fixed and is not negotiable.** Split into exactly two parts;
- * verify the seal; decode and parse; check the version; check the user; check
- * the expiry. Nothing reads a field out of the payload before the seal has
- * verified, so a caller-authored payload never reaches the field extraction at
- * all — the discipline `decodeDavPayload` records for its own decode.
+ * verify the seal; decode and parse; check the version; check the TARGET; check
+ * the user; check the expiry. Nothing reads a field out of the payload before
+ * the seal has verified, so a caller-authored payload never reaches the field
+ * extraction at all — the discipline `decodeDavPayload` records for its own
+ * decode.
+ *
+ * **The target check sits between the version and the user, and the position is
+ * the point rather than an accident.** It compares two facts this server
+ * already holds — the arm the caller is about to read the payload as, and the
+ * arm this server sealed into it — so it is cheaper than the user comparison
+ * and reaches nothing at all. Below the user check it would mean a token minted
+ * for the wrong protocol had already been measured against a principal before
+ * anyone asked whether it named the right kind of thing, and further down still
+ * it would sit past the reservation and burn a slot. Above the version check it
+ * would be reading a field out of a payload whose format this build has not yet
+ * agreed it understands.
  *
  * `crypto.subtle.verify` and never `crypto.subtle.sign` followed by a
  * comparison. Cloudflare's own signing example says why in a comment: a string
@@ -434,12 +528,22 @@ export async function mintConfirmation(
  * alphabet — from escaping as a neutral error a caller would be told was a
  * network fault.
  */
-export async function verifyConfirmation(
+export async function verifyConfirmation<T extends ConfirmTarget>(
   token: string,
   secret: string | undefined,
   /** The signed-in user. Never read out of the token it is checked against. */
   userId: string,
-): Promise<ConfirmPayload> {
+  /**
+   * The target the CALLER expects, never read out of the token it is checked
+   * against — the same discipline `userId` above it is held to.
+   *
+   * The return type narrows on this parameter, so a caller gets back a payload
+   * already restricted to the matching arm. That is what removes the job from
+   * every call site: there is no cast to write and no `t` comparison to repeat,
+   * and a comparison repeated at N call sites is one a later call site forgets.
+   */
+  expected: T,
+): Promise<Extract<ConfirmPayload, { t: T }>> {
   const key = await importConfirmationKey(secret);
 
   if (typeof token !== "string") throw new ConfirmationInvalidError();
@@ -480,6 +584,16 @@ export async function verifyConfirmation(
   if (!isConfirmPayload(parsed)) throw new ConfirmationInvalidError();
   if (parsed.v !== CONFIRM_VERSION) throw new ConfirmationInvalidError();
 
+  // The target this confirmation names, compared against the target the caller
+  // is about to read it as. The refusal is the SAME single throw every other
+  // cause uses, with no message, no cause and no distinguishable shape: a
+  // caller who could tell "wrong target" from "forged" would have an oracle for
+  // which arms this build knows about.
+  //
+  // See the paragraph in the docstring for why it runs HERE and not one line
+  // lower.
+  if (parsed.t !== expected) throw new ConfirmationInvalidError();
+
   // The user this confirmation was minted for. A plain comparison, not the
   // timing-safe one `changeHashMatches` uses two functions down: that one is
   // timing-safe because the change hash is CALLER-SUPPLIED and a length-
@@ -506,7 +620,13 @@ export async function verifyConfirmation(
     throw new ConfirmationInvalidError();
   }
 
-  return parsed;
+  // The ONE assertion in this module's narrowing story, and it is here so that
+  // no call site needs one. TypeScript narrows a union on a comparison against
+  // a literal, but not on a comparison against a value of a generic parameter,
+  // so the check above cannot teach the compiler what it has just proved at
+  // runtime. Written here, where the proof is three lines up and visible; a
+  // cast at a call site would be the same assertion with the proof missing.
+  return parsed as Extract<ConfirmPayload, { t: T }>;
 }
 
 /**
@@ -752,12 +872,44 @@ function isConfirmPayload(value: unknown): value is ConfirmPayload {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Record<string, unknown>;
 
+  if (!hasConfirmPayloadBase(candidate)) return false;
+
+  // Dispatched on the discriminator with a plain comparison rather than a
+  // `switch`, because there is no `switch` on a union discriminant anywhere
+  // under `src/` and one here would be the first.
+  //
+  // The FALL-THROUGH is the load-bearing line, not the arms. A `t` this build
+  // does not know — a value from a later build, or no `t` at all — reaches the
+  // `false` below and the token is refused. An arm added without a branch here
+  // is therefore refused rather than admitted with nothing checked.
+  if (candidate.t === "dav") return hasDavObjectArm(candidate);
+  return false;
+}
+
+/** The protocol-neutral fields every arm carries. See `ConfirmPayloadBase`. */
+function hasConfirmPayloadBase(candidate: Record<string, unknown>): boolean {
   return (
     typeof candidate.v === "number" &&
     (candidate.k === "create" ||
       candidate.k === "update" ||
       candidate.k === "delete") &&
     typeof candidate.j === "string" &&
+    typeof candidate.h === "string" &&
+    // No `"u" in candidate` companion, and the difference from `s` on the
+    // object arm is deliberate rather than an omission. `s` needs one because
+    // its type ADMITS null, so an absent field and a present null are both
+    // `candidate.s === null` and the predicate cannot tell them apart. `u` is a
+    // plain string, and `undefined` fails a `typeof === "string"` test on its
+    // own — a payload with no user field is already refused by this line.
+    typeof candidate.u === "string" &&
+    typeof candidate.x === "number" &&
+    Number.isInteger(candidate.x)
+  );
+}
+
+/** The fields `DavObjectConfirmPayload` adds, and the ones it must NOT carry. */
+function hasDavObjectArm(candidate: Record<string, unknown>): boolean {
+  return (
     typeof candidate.c === "string" &&
     typeof candidate.o === "string" &&
     (candidate.r === null || typeof candidate.r === "string") &&
@@ -770,16 +922,6 @@ function isConfirmPayload(value: unknown): value is ConfirmPayload {
     // re-preview and the cost of admitting it is a silent lost update.
     (candidate.s === null ||
       (typeof candidate.s === "number" && Number.isInteger(candidate.s))) &&
-    "s" in candidate &&
-    typeof candidate.h === "string" &&
-    // No `"u" in candidate` companion, and the difference from `s` directly
-    // above is deliberate rather than an omission. `s` needs one because its
-    // type ADMITS null, so an absent field and a present null are both
-    // `candidate.s === null` and the predicate cannot tell them apart. `u` is a
-    // plain string, and `undefined` fails a `typeof === "string"` test on its
-    // own — a payload with no user field is already refused by this line.
-    typeof candidate.u === "string" &&
-    typeof candidate.x === "number" &&
-    Number.isInteger(candidate.x)
+    "s" in candidate
   );
 }
