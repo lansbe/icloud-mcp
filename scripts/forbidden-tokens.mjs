@@ -1629,6 +1629,9 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "address-hashing-site-missing",
   "principal-constructor-outside-owners",
   "principal-constructor-missing",
+  "dav-write-export-unmanifested",
+  "dav-write-manifest-stale",
+  "dav-write-entry-point-unguarded",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -1823,6 +1826,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const passwordReaderImporters = [];
   const addressHashers = [];
   const principalConstructors = [];
+  const davWriteExports = {};
 
   for (const absolute of files) {
     const relativePath = toRepoRelative(absolute);
@@ -1912,6 +1916,13 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
         });
       }
     }
+    // The write-module manifest collects NAMES rather than a match position, so
+    // it is the one collector that keys by module instead of appending to a list.
+    // A declared module that is never walked therefore has no key at all, which
+    // is what makes the stale arm fire once per manifest name for it.
+    if (Object.hasOwn(DAV_WRITE_MODULES, relativePath)) {
+      davWriteExports[relativePath] = exportedFunctionNames(contents);
+    }
   }
 
   violations.push(...checkSocketOwnership(socketImporters));
@@ -1925,6 +1936,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   violations.push(...checkPasswordReaderOwnership(passwordReaderImporters));
   violations.push(...checkAddressHashOwnership(addressHashers));
   violations.push(...checkPrincipalConstructorOwnership(principalConstructors));
+  violations.push(...checkDavWriteCoverage(davWriteExports));
 
   return violations.sort(
     (a, b) =>
@@ -2264,6 +2276,141 @@ export function checkPrincipalConstructorOwnership(callers) {
       why: `${owner} no longer calls the props-backed principal constructor, which means that identity path was deleted, moved, or rewritten to get identity some other way this count cannot see. Zero callers is as much a violation as three, and it is the quieter of the pair: nothing goes red on the way out, because the tests that covered the deleted code leave with it. The specific regression this arm exists to catch is the one Phase 11 spent a whole phase making impossible — identity read back out of the Worker environment instead of out of the grant, which serves the wrong person's mail to whoever still holds a token. Restore the plain named call in ${owner}. If the identity path really moved, that is a change to the safety boundary: get a decision, then change the owner list, never the pattern.`,
     });
   }
+  return violations;
+}
+
+/**
+ * The names in the trailing alternation group of the shipped
+ * `dav-concurrent-request` rule.
+ *
+ * Reads the SHIPPED rule out of `FORBIDDEN` rather than a copy of it. That is
+ * what makes the unguarded arm below a MEASUREMENT rather than an agreement: a
+ * list restated beside the checker would agree with the checker by construction,
+ * and dropping a name would drop it from both sides at once.
+ *
+ * Throws rather than returning an empty set when the group is not found, on the
+ * test file's own `alternationNamesOf` precedent. An empty set would mark every
+ * guarded name in the manifest unguarded and freeze the repository, and a
+ * restructured pattern should fail loudly at the extraction instead.
+ *
+ * THE PARAMETER IS FOR THE THROW AND FOR NOTHING ELSE. It exists so a test can
+ * prove the failure arm fires on a pattern with no trailing group.
+ * `checkDavWriteCoverage` calls this with NO argument, so the measured side of
+ * its third arm is never substitutable — there is nowhere to feed a convenient
+ * alternation, which is what keeps that checker's manifest parameter an injection
+ * point rather than a way to make the rule see less.
+ *
+ * @param {{pattern: RegExp}} [rule]
+ * @returns {string[]}
+ */
+export function davAlternationNames(
+  rule = FORBIDDEN.find((entry) => entry.id === "dav-concurrent-request"),
+) {
+  if (rule === undefined) {
+    throw new Error("the dav-concurrent-request rule is not on the ban list");
+  }
+  const source = rule.pattern.source;
+  const open = source.lastIndexOf("(?:");
+  const close = source.lastIndexOf(")");
+  if (open < 0 || close < open) {
+    throw new Error("no trailing alternation group found in the rule's source");
+  }
+  return source.slice(open + "(?:".length, close).split("|");
+}
+
+/**
+ * The write-module manifest, as a pure function over what the walk collected.
+ *
+ * Same split as every count above, and for the same reason: all three failure
+ * directions are exercised against a map rather than against a fixture tree on
+ * disk. See the `DAV_WRITE_MODULES` docstring for why this is a manifest at all,
+ * and for the four shapes the export reader cannot see.
+ *
+ * THE SECOND PARAMETER EXISTS FOR ONE REASON AND IT IS NOT CONVENIENCE. The
+ * third arm compares the MANIFEST against the ALTERNATION. Both are module-level
+ * constants, and every manifest-guarded name is already in the shipped
+ * alternation, so on a clean tree no value of `collected` can produce that arm —
+ * it would be a rule nothing in the suite could ever observe, which is exactly
+ * the failure ./.claude/CLAUDE.md's Enforcement section names: a constraint whose
+ * arm can never fire looks identical to a constraint that was never added.
+ * Substituting the manifest lets a test drive that arm with a fabricated entry
+ * whose guarded name the alternation genuinely does not carry.
+ *
+ * ONLY THE HAND-WRITTEN SIDE IS SUBSTITUTABLE, AND THAT IS THE WHOLE DESIGN.
+ * There is no alternation parameter and none may be added:
+ * `davAlternationNames()` is called below with no argument, so the third arm
+ * always measures the rule that actually ships, even when driven from a
+ * fabricated manifest. Exclusion is by PATH in this project and never by
+ * weakening a pattern; this is the same discipline applied to a checker.
+ *
+ * WHAT THE PRODUCTION CALL SITE'S PINNED TEXT DOES NOT PROVE, written down rather
+ * than left implied. The suite pins `scan()`'s call as byte-exactly
+ * `checkDavWriteCoverage(davWriteExports)` — the accumulator's own identifier, not
+ * merely one argument — and pins that identifier's occurrence count at three. That
+ * cannot see a narrowing performed INSIDE `exportedFunctionNames`, which the
+ * suite's export-reader tests against shipped source hold instead; and it cannot
+ * see a declared module added to `EXCLUDED` before the walk reaches it. The second
+ * of those is loud rather than quiet: an unwalked module has an empty collected
+ * list, so the stale arm fires once per manifest name for it.
+ *
+ * @param {Record<string, readonly string[]>} collected
+ * @param {Record<string, {why: string, exports: Record<string, string>}>} [manifest]
+ * @returns {Array<object>}
+ */
+export function checkDavWriteCoverage(collected, manifest = DAV_WRITE_MODULES) {
+  const alternation = new Set(davAlternationNames());
+  const violations = [];
+
+  for (const [modulePath, entry] of Object.entries(manifest)) {
+    const found = collected[modulePath] ?? [];
+    const declared = Object.keys(entry.exports);
+    // Exact ASCII string equality on both sides, through a plain Set: no case
+    // folding, no Unicode normalisation, no trimming. A name differing from a
+    // manifest entry only by case is two different names, and is reported as
+    // unmanifested AND as stale in the same run — which is the correct answer,
+    // because the export the module actually ships is the one nobody decided
+    // about.
+    const declaredNames = new Set(declared);
+    const foundNames = new Set(found);
+
+    for (const name of found) {
+      if (declaredNames.has(name)) continue;
+      violations.push({
+        file: modulePath,
+        line: 0,
+        column: 0,
+        pattern: "dav-write-export-unmanifested",
+        patternIndex: FORBIDDEN.length + 18,
+        why: `${modulePath} exports ${name}, and no disposition for that name is recorded in the write-module manifest. A new export in a declared write module is a new entry point nobody has decided about, and "write" is not inferable from a name, so nothing will decide it automatically: ${modulePath} is on that manifest because ${entry.why} Record the name with a disposition — either the exact string "guarded", in which case it must also appear in the dav-concurrent-request alternation, or a written reason saying it issues no request at all. Do not guess from the name: read the function.`,
+      });
+    }
+
+    for (const name of declared) {
+      if (foundNames.has(name)) continue;
+      violations.push({
+        file: modulePath,
+        line: 0,
+        column: 0,
+        pattern: "dav-write-manifest-stale",
+        patternIndex: FORBIDDEN.length + 19,
+        why: `The write-module manifest lists ${name} for ${modulePath}, and that module no longer exports it. This is the zero direction, and it is the one a scoped negative cannot see: a module that was moved, renamed, or emptied is never walked at all, its collected export list is empty, and every name the manifest lists for it comes back stale — which is exactly right, because a manifest that matches nothing guards nothing, and that failure is quieter than a duplicate since the tests covering the deleted code leave with it. Either the module moved, in which case change its key, or the export went, in which case drop the name. If the export is still there under a shape the reader cannot see — a re-export, a const arrow, or a name bound and exported separately — that is a gap rather than an alarm, and the manifest's own docstring names all four.`,
+      });
+    }
+
+    for (const name of declared) {
+      if (entry.exports[name] !== "guarded") continue;
+      if (alternation.has(name)) continue;
+      violations.push({
+        file: modulePath,
+        line: 0,
+        column: 0,
+        pattern: "dav-write-entry-point-unguarded",
+        patternIndex: FORBIDDEN.length + 20,
+        why: `The write-module manifest marks ${name} in ${modulePath} as guarded, and that name is absent from the dav-concurrent-request alternation. Pitfall 65, in this file's own register: a name not in that alternation is invisible to every assertion in the suite — the rule-level set-equality guard included, because that guard operates at the RULE level and cannot see inside one — so an unguarded entry point is indistinguishable from a guarded one by any check that exists. Add the name to the alternation. Never narrow the group to make this pass: a trailing word boundary would make the safety rule match strictly less than it does today, and that is the move the Conventions forbid outright.`,
+      });
+    }
+  }
+
   return violations;
 }
 
