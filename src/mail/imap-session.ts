@@ -714,8 +714,8 @@ export type ContinuationOutcome =
  * coming. `READ_TIMEOUT_MS` converts that permanent hang into a ten-second
  * stall raised as `ImapConnectError` — half of the twenty-second call deadline
  * in `./service.ts` spent on a question the server has already answered, and
- * then reported to the caller as a transient transport fault whose safe message
- * says it is worth retrying. The retry sends the identical malformed command and
+ * then reported to the caller as the unclassified floor, whose safe message
+ * still offers a retry. The retry sends the identical malformed command and
  * stalls identically. One branch turns all of that into an immediate, honest
  * answer (T-02-36, PITFALLS #7).
  *

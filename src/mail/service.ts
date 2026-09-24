@@ -118,9 +118,9 @@ export interface SessionGate {
  *
  * The refusal is `ImapThrottleError`. Of the four categories in the closed
  * vocabulary it is the one whose guidance matches — wait, and do not retry in a
- * loop — where `connection_failed` would tell the caller a retry is "safe to
- * retry once", inviting the immediate second attempt that fails again while the
- * first session is still open. The prose names iCloud rather than us, which is
+ * loop — where `connection_failed` is the floor, which still offers a retry,
+ * inviting the immediate second attempt that fails again while the first session
+ * is still open. The prose names iCloud rather than us, which is
  * a small inaccuracy accepted deliberately: the operational guidance is the
  * part a model acts on, and it is correct.
  */

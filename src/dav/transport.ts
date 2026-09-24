@@ -235,9 +235,9 @@ export type DavFetch = typeof globalThis.fetch;
  * identical answer at the cost of a real PROPFIND and a second write, which is
  * why the class it raises deliberately carries no `rediscoverable` field to get
  * wrong. This is the branch that makes CALW-05 executable: without it a raced
- * write falls through to `DavConnectError`, is reported as a transient
- * connection fault, and the model is told the one thing that can never work —
- * retry once.
+ * write falls through to `DavConnectError`, is reported as the unclassified
+ * floor, which offers a retry, and the model is told the one thing that can
+ * never work — try the same write again.
  *
  * Everything else non-2xx is a transport fault this layer cannot classify.
  */

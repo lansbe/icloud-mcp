@@ -548,9 +548,11 @@ export function underStagingPrefix(userId: string, key: string): boolean {
  * throws instead of returning, which breaks its stated contract that every
  * refusal returns before a byte is written — and the throw then escapes to the
  * tool boundary, where `toErrorCategory` maps a class it does not recognise to
- * `connection_failed` and tells the model the failure "may be transient — safe
- * to retry once." It is not transient. The same name fails identically forever,
- * so the model retries a call that can never succeed.
+ * `connection_failed` — the floor, which still offers a retry. The same name
+ * fails identically forever, so the model retries a call that can never
+ * succeed. The floor's own wording is deliberately not quoted here: a string
+ * copied into prose beside the table that holds it is what went stale when the
+ * message was reworded, and this comment was one of the four that went with it.
  *
  * `null` rather than a distinct answer, because a name this module cannot
  * encode is a name it cannot store, which is exactly what the existing
