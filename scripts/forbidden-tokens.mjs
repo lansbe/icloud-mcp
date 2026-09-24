@@ -1434,6 +1434,170 @@ export const PRINCIPAL_CONSTRUCTOR_OWNERS = Object.freeze([
 export const PRINCIPAL_CONSTRUCTOR_SCOPE = "src/";
 
 /**
+ * The DAV write modules, and a recorded disposition for every name each of them
+ * exports.
+ *
+ * THE RULE. Three modules under `src/dav/` are declared here because each of
+ * them exports, or is about to export, a network-reaching entry point the tool
+ * layer can reach. Every name those modules export today carries a disposition:
+ * either the exact string `"guarded"`, meaning the name must appear in the
+ * `dav-concurrent-request` alternation, or a short prose reason saying why it
+ * must not -- which is always the same kind of reason, that the function issues
+ * no request at all. A new export in a declared module fails the scan until
+ * somebody writes one of those two things down. That is the whole point: "write"
+ * is not inferable from a name, so nothing will decide it automatically, and
+ * v3.0 adds contact create and update, collection create, rename and delete,
+ * event alarms and an invitation reply -- many new entry points, added by hand,
+ * across several phases, by several sessions. The probability that every one of
+ * them reaches the alternation unprompted is not high.
+ *
+ * WHY A COUNT RATHER THAN A SCOPED NEGATIVE. The same standing answer every
+ * count in this file gives. The natural spelling would be "ban an unguarded
+ * export under `src/dav/`, except in the modules that legitimately have one",
+ * and this scanner has no per-rule path exemption: `EXCLUDED` skips a file for
+ * EVERY rule. Buying that exemption by path would silently drop the logging
+ * ban, the eager-load ban, the host-literal count and the fan-out rule itself on
+ * the three modules that most need them, since they are the modules holding the
+ * account's write path.
+ *
+ * WHAT THE COUNT SEES THAT A NEGATIVE CANNOT. A manifest that stopped matching
+ * anything is a manifest that guards nothing. A declared module that was moved,
+ * renamed, or emptied is never walked, its collected export list is empty, and
+ * every name here comes back stale -- which is exactly right, and it is the
+ * direction that is easier to miss, because nothing fails on the way out: the
+ * tests that covered the deleted code are deleted with it. Zero is as much a
+ * violation as an unmanifested extra.
+ *
+ * WHAT IT DOES NOT AND CANNOT SEE. `exportedFunctionNames` is a regex over
+ * source text rather than a parser -- the file header forbids a dependency
+ * outright, because the pre-commit hook runs before anything guarantees
+ * `node_modules` is installed -- so four shapes are outside its reach:
+ *
+ *   1. a RE-EXPORT (`export { getEvent } from "./elsewhere";`). No `function`
+ *      keyword follows the `export`, so nothing matches;
+ *   2. a `const` ARROW export (`export const getEvent = async () => {};`). Same
+ *      reason, and this is the one most likely to arrive by accident, because it
+ *      is a style choice rather than an evasion;
+ *   3. a name BOUND AND EXPORTED SEPARATELY (`function getEvent() {}` on one
+ *      line, `export { getEvent };` on another). The `export` and the `function`
+ *      are never adjacent;
+ *   4. a MODULE-LOCAL function that is nonetheless a fan-out entry point. Named
+ *      concretely rather than left abstract: `pagedEvents` and `collectFrom` in
+ *      `src/dav/calendar.ts` are both on the alternation and both invisible
+ *      here, because neither is exported. The alternation covers them; this
+ *      manifest cannot, and an export list is not a call-site list.
+ *
+ * What makes the regex SUFFICIENT rather than merely convenient is a fact about
+ * the tree as it stands: today every export of all three declared modules is a
+ * plain `function` declaration. A `const` arrow export added later would be
+ * invisible to the reader and would therefore never be reported as unmanifested
+ * -- a gap, not an alarm. A rule believed to prove more than it does is worse
+ * than one whose limits are written down.
+ *
+ * TWO ABSENCES, RECORDED AS DECISIONS RATHER THAN LEFT TO BE RE-DERIVED.
+ * `src/dav/discovery.ts` and `src/dav/transport.ts` both export names that ARE
+ * in the `dav-concurrent-request` alternation -- `resolveDavAccount` and
+ * `withRediscovery` in the first, and the transport the second builds -- and
+ * neither is declared here. Neither exports a write entry point: their
+ * alternation names arrived as READ-path round trips, costed for the request
+ * budget rather than for anything they change on the account. Declaring either
+ * is a decision a later phase can take, and finding this paragraph is what tells
+ * that phase it is a decision rather than a gap.
+ *
+ * The module list is a JUDGEMENT and not a derivation. If a later phase adds a
+ * write entry point to a module on neither list, this constraint does not see
+ * it.
+ */
+export const DAV_WRITE_MODULES = Object.freeze({
+  "src/dav/calendar.ts": {
+    why: "The only module in the DAV tree that exports CalDAV write entry points today, and the module a later phase's collection create, rename and delete will be added to.",
+    exports: {
+      listCalendars: "guarded",
+      listEvents: "guarded",
+      nextCivilDate:
+        "A civil-date calculation over a date string. Takes no transport and issues no request.",
+      findFreeSlots: "guarded",
+      getEvent: "guarded",
+      uidFromObjectUrl:
+        "A URL decomposition that reads a uid out of an object path. Parses a string and returns.",
+      getEventWithEtag: "guarded",
+      assertEtag:
+        "An assertion over a header value the caller already holds. Throws or returns; no request.",
+      updateEventBody:
+        "A body builder. Assembles the resource text a write will carry, and does not issue the write.",
+      updateOccurrenceBody:
+        "A body builder over already-fetched resource text. Returns the text or null; no request.",
+      patchEventBody:
+        "A body builder over already-fetched resource text. Returns the text or null; no request.",
+      planScopedDelete:
+        "A plan computation over already-fetched resource text. Decides what a delete would do, and does none of it.",
+      pinnedOccurrencesFor:
+        "A computation over already-fetched resource text. Counts occurrences; issues no request.",
+      updateEvent: "guarded",
+      deleteEvent: "guarded",
+      deliveryReportOf:
+        "A reduction over participants the caller already holds. Returns a report; issues no request.",
+      resolveOrganizerAddress: "guarded",
+      planCreateTarget:
+        "A plan computation that mints a uid and an object URL synchronously. Issues no request.",
+      createEvent: "guarded",
+      matchesKeyword:
+        "A matcher over an occurrence the caller already holds. Returns a boolean; no request.",
+      matchesAttendee:
+        "A matcher over an occurrence the caller already holds. Returns a boolean; no request.",
+      searchEvents: "guarded",
+    },
+  },
+  "src/dav/contacts.ts": {
+    why: "Read-only today, and declared now precisely because a later phase adds contact create, update and delete to it. Declaring a module before its first write arrives is the point of this manifest.",
+    exports: {
+      listAddressBooks: "guarded",
+      contactFilter:
+        "A filter builder. Assembles the report body a query will carry, and does not issue the query.",
+      matchesContact:
+        "A matcher over a parsed contact the caller already holds. Returns a boolean; no request.",
+      searchContacts: "guarded",
+      getContact: "guarded",
+    },
+  },
+  "src/dav/diagnose.ts": {
+    why: "Exports the collection write probe an earlier phase added, which creates, renames, recolours and deletes a real collection on a real account.",
+    exports: {
+      runDavDiagnosticOutcome: "guarded",
+      runCollectionWriteProbe: "guarded",
+      runTaskCollectionProbe: "guarded",
+    },
+  },
+});
+
+/**
+ * Every name a module exports as a `function` declaration, in source order.
+ *
+ * A regex over source text rather than a parser, for the reason the file header
+ * gives: no dependency may be added here, because the pre-commit hook runs
+ * before anything guarantees `node_modules` is installed. See the
+ * `DAV_WRITE_MODULES` docstring above for the four shapes this deliberately
+ * cannot see.
+ *
+ * The pattern is constructed FRESH on every call rather than held at module
+ * scope. The other constraint patterns in this file carry no global flag
+ * because `scan()` reaches them through `String.prototype.search`, which ignores
+ * `lastIndex`; this reader needs `matchAll`, which does not have that property,
+ * so a shared module-level regex would carry `lastIndex` from one file into the
+ * next and start skipping names depending on the order files happened to be
+ * read.
+ *
+ * @param {string} contents
+ * @returns {string[]}
+ */
+export function exportedFunctionNames(contents) {
+  const declaration = /^export\s+(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)/gm;
+  const names = [];
+  for (const match of contents.matchAll(declaration)) names.push(match[1]);
+  return names;
+}
+
+/**
  * Every violation id a count constraint can emit, both directions of each.
  *
  * Named here rather than left implicit so the test can assert set equality
