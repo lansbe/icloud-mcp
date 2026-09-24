@@ -32,6 +32,7 @@ import type {
   ConfirmPayload,
   ConfirmTarget,
   DavCollectionConfirmPayload,
+  DavObjectConfirmPayload,
   NormalizedChange,
 } from "../src/confirm";
 import { DavConfirmationError, davToErrorCategory } from "../src/dav/errors";
@@ -82,7 +83,19 @@ function soon(offsetSeconds = 300): number {
   return Math.floor(Date.now() / 1000) + offsetSeconds;
 }
 
-function payload(overrides: Partial<ConfirmPayload> = {}): ConfirmPayload {
+/**
+ * A DAV-object payload.
+ *
+ * Typed on the ARM rather than on the union, and that is not a tidy-up. A
+ * `Partial<ConfirmPayload>` over a union widens `t` back to the union, so an
+ * override could relabel this factory's output as another arm and the
+ * compiler would have nothing to say about the field set that came with it.
+ * Narrowed here, a case that wants another arm has to build it, which is what
+ * `collectionPayload` below is for.
+ */
+function payload(
+  overrides: Partial<DavObjectConfirmPayload> = {},
+): DavObjectConfirmPayload {
   return {
     v: CONFIRM_VERSION,
     // The target this confirmation names. Every case built on this helper is a

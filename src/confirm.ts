@@ -394,6 +394,67 @@ export interface DavObjectConfirmPayload extends ConfirmPayloadBase {
 }
 
 /**
+ * A confirmation naming ONE DAV collection — a calendar, an address book.
+ *
+ * Deliberately a separate arm rather than the object arm with a nullable ETag.
+ * A collection is not a resource with an entity tag, so there is nothing to put
+ * in `e`; `e`'s own docstring reserves `null` for a create and that reservation
+ * is what stops an unbound update or delete being representable. See `b`.
+ */
+export interface DavCollectionConfirmPayload extends ConfirmPayloadBase {
+  /** The kind of resource this confirmation names. See `DavObjectConfirmPayload.t`. */
+  t: "col";
+  /** The home set the collection lives under, absolute. */
+  c: string;
+  /** The collection URL, absolute. The commit reads its target from HERE. */
+  o: string;
+  /**
+   * What the collection looked like at preview, sealed — its binding.
+   *
+   * **A distinct field rather than a reused `e`, and that is what keeps
+   * "absent" from acquiring a second meaning.** `e` is the ETag the preview
+   * observed, and its docstring reserves `null` for a create precisely so that
+   * "unbound" is a state a type can forbid on an update and a delete.
+   *
+   * The silent failure that forbids: a collection has no entity tag, so the
+   * path of least resistance is to pass `null` in `e` and move on. That turns
+   * the one value reserved for creates into a value that ALSO means "we could
+   * not bind this", and once one field carries both meanings the type can no
+   * longer forbid an unbound delete. The most destructive operation in the
+   * milestone loses its binding and nothing fails — no error, no warning, and a
+   * delete that looks exactly like the one the user approved.
+   *
+   * REQUIRED, `string`, never `string | null` and never optional, on its own
+   * arm. That is what makes unbound unreachable rather than discouraged: there
+   * is no value a caller can put here that means "no binding", and no arm of
+   * this union that omits the field.
+   *
+   * **This arm carries NO `e`, NO `r` and NO `s`, and each is absent rather
+   * than null for its own reason.** A collection is not a resource with an
+   * entity tag, so `e` has nothing to hold. A collection does not recur, so
+   * there is no occurrence for `r` to name. A collection is not an iCalendar
+   * object, so it carries no `SEQUENCE` for `s` to record. A null in any of the
+   * three would be this arm claiming a fact about the resource it does not have.
+   *
+   * **What goes in it.** The collection's `CS:getctag`, or a DAV `sync-token`
+   * from a `sync-collection` report — both move when any member of the
+   * collection changes, and SPIKE-03 confirmed `sync-collection` is advertised.
+   * This module does not care which. It never reads the value: it seals it and
+   * hands it back, byte for byte, and the choice belongs to whichever preview
+   * mints the token.
+   *
+   * **And the limit, said out loud rather than left to be discovered.** Until a
+   * commit RE-READS this binding and refuses a collection that moved, this arm
+   * has the one-time KV slot and nothing else — exactly the position the mail
+   * arm is in, and for the same reason. That re-read is Phase 17's work. A
+   * bound that is quietly false is worse than a narrower one that is true, so
+   * the narrower one is what is claimed here: the field travels, and nothing in
+   * this build yet compares it against anything.
+   */
+  b: string;
+}
+
+/**
  * What a confirmation carries, sealed — one arm per kind of target.
  *
  * A union rather than one interface with optional fields, and the difference is
@@ -401,7 +462,9 @@ export interface DavObjectConfirmPayload extends ConfirmPayloadBase {
  * which is the failure `e`'s own docstring is built to avoid. On a union, a
  * field that does not belong to a target is not absent — it does not exist.
  */
-export type ConfirmPayload = DavObjectConfirmPayload;
+export type ConfirmPayload =
+  | DavObjectConfirmPayload
+  | DavCollectionConfirmPayload;
 
 /**
  * True only for a signing key this module is willing to use.
@@ -883,6 +946,7 @@ function isConfirmPayload(value: unknown): value is ConfirmPayload {
   // `false` below and the token is refused. An arm added without a branch here
   // is therefore refused rather than admitted with nothing checked.
   if (candidate.t === "dav") return hasDavObjectArm(candidate);
+  if (candidate.t === "col") return hasDavCollectionArm(candidate);
   return false;
 }
 
@@ -922,6 +986,36 @@ function hasDavObjectArm(candidate: Record<string, unknown>): boolean {
     // re-preview and the cost of admitting it is a silent lost update.
     (candidate.s === null ||
       (typeof candidate.s === "number" && Number.isInteger(candidate.s))) &&
-    "s" in candidate
+    "s" in candidate &&
+    // And NOT a collection binding. Refusing a field that is PRESENT but does
+    // not belong is the half a structural predicate usually skips, and it is
+    // the half that matters on a union: a payload carrying both an ETag and a
+    // binding satisfies both arms, and the one that reads it is whichever
+    // asked first. See `hasDavCollectionArm` for the mirror of this line.
+    !("b" in candidate)
+  );
+}
+
+/**
+ * The fields `DavCollectionConfirmPayload` adds, and the ones it must NOT carry.
+ *
+ * The three absences are asserted rather than assumed. A collection payload
+ * that also carried an ETag would satisfy the object arm, and the whole point
+ * of `b` is that a collection target cannot be committed as an object one.
+ */
+function hasDavCollectionArm(candidate: Record<string, unknown>): boolean {
+  return (
+    typeof candidate.c === "string" &&
+    typeof candidate.o === "string" &&
+    // Non-empty, and the emptiness check is not fussiness. An empty binding is
+    // the shape a missing header or a blank property answer reaches by
+    // accident, and it is not "no binding" — it is a binding that compares
+    // equal to the next empty one. `b`'s type forbids `null`; this forbids the
+    // value a cast or a malformed payload would reach for instead.
+    typeof candidate.b === "string" &&
+    candidate.b.length > 0 &&
+    !("e" in candidate) &&
+    !("r" in candidate) &&
+    !("s" in candidate)
   );
 }
