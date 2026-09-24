@@ -14,6 +14,13 @@
 // dressed as a transient fault the model is told to retry.
 
 import { describe, expect, it } from "vitest";
+// Namespace imports, used by the reachability set-equality at the foot of this
+// file and by nothing else. Reading the modules' own exports is what makes
+// that assertion capable of failing: a hand-written list of error classes
+// would agree with itself by construction, and a class added without a
+// dispatcher branch would appear on neither side.
+import * as davErrorsModule from "../src/dav/errors";
+import * as imapErrorsModule from "../src/errors";
 import {
   DavAuthError,
   DavConfirmationError,
@@ -694,5 +701,163 @@ describe("the floor, and what it is allowed to promise (CONF-06)", () => {
       expect(toErrorCategory(thrown).category).toBe("connection_failed");
       expect(davToErrorCategory(thrown).category).toBe("connection_failed");
     }
+  });
+});
+
+describe("every error class this repository exports is named in a dispatcher branch", () => {
+  // The other direction of the reachability claim above, and the one that
+  // claim cannot make.
+  //
+  // `REACHABLE_CATEGORIES` proves every CATEGORY is raisable and that every
+  // raisable answer is a category. It says nothing about a CLASS. A new error
+  // class added to either module without a matching branch falls silently to
+  // the default and becomes indistinguishable from an unclassified third-party
+  // error — which is precisely the failure `DavUnsendableError` was added in
+  // Phase 14 to repair, after it had already happened once and the wrong
+  // answer had been read as a measurement of iCloud's behaviour.
+  //
+  // So the equality below is between the classes the two modules EXPORT and
+  // the classes the two dispatchers NAME. The export side is read off the
+  // modules rather than restated, so a class added later lands on one side
+  // only.
+
+  /** Every error class a module exports, read from the module itself. */
+  function exportedErrorClasses(
+    module: unknown,
+  ): Map<string, new () => Error> {
+    const found = new Map<string, new () => Error>();
+    for (const [name, value] of Object.entries(
+      module as Record<string, unknown>,
+    )) {
+      if (typeof value === "function" && value.prototype instanceof Error) {
+        found.set(name, value as new () => Error);
+      }
+    }
+    return found;
+  }
+
+  const EXPORTED_ERROR_CLASSES = new Map<string, new () => Error>([
+    ...exportedErrorClasses(imapErrorsModule),
+    ...exportedErrorClasses(davErrorsModule),
+  ]);
+
+  /**
+   * The category every unrecognised value falls to, read from the code rather
+   * than written down, so this stays true if the default is ever moved.
+   */
+  const DEFAULT_CATEGORY = toErrorCategory(new Error("unclassified")).category;
+
+  /**
+   * The classes whose branch legitimately produces the default category.
+   *
+   * Recorded as an EXACT LIST with a reason each rather than tolerated, on the
+   * precedent of the prefix-shadow exception in
+   * `test/forbidden-tokens.test.ts`. Without the list this equality could not
+   * be written at all: these two ARE branched, and their branch answers with
+   * the default, so "produces something other than the default" would call
+   * them unbranched and the assertion would be red on shipped, correct code.
+   *
+   * With the list, adding an entry is how somebody would silence a genuinely
+   * unbranched class — which is why the case below refuses an entry whose
+   * class a dispatcher gives a category of its own, and pins the list's
+   * contents exactly.
+   */
+  const RESTATES_THE_DEFAULT: Record<string, string> = {
+    ImapConnectError:
+      "the explicit IMAP floor — the transport genuinely failed, which is the same thing the default already says",
+    DavConnectError:
+      "the last branch of the DAV chain by constraint, because it restates the default; nothing is ever appended below it",
+  };
+
+  /** True when either dispatcher gives this value an answer of its own. */
+  function namedByADispatcher(thrown: Error): boolean {
+    return (
+      toErrorCategory(thrown).category !== DEFAULT_CATEGORY ||
+      davToErrorCategory(thrown).category !== DEFAULT_CATEGORY
+    );
+  }
+
+  it("reads both modules' exports, rather than a list that agrees with itself", () => {
+    // The vacuity guard. Set equality between two empty sets passes, so a
+    // namespace read that came back with nothing — a bundler change, a barrel
+    // file, a rename — would turn the case below green for the worst possible
+    // reason.
+    //
+    // The number is pinned rather than bounded, and it is meant to be edited:
+    // adding an error class to either module should be a deliberate act that
+    // fails a test until somebody says so. A number in a test goes stale
+    // LOUDLY, which is the opposite of one written in prose.
+    expect(
+      EXPORTED_ERROR_CLASSES.size,
+      "four Imap* classes and eight Dav* classes ship today",
+    ).toBe(12);
+    expect([...EXPORTED_ERROR_CLASSES.keys()]).toContain("ImapThrottleError");
+    expect([...EXPORTED_ERROR_CLASSES.keys()]).toContain("DavUnsendableError");
+  });
+
+  it("matches the exported classes against the branched ones, in both directions", () => {
+    const branched = [...EXPORTED_ERROR_CLASSES.entries()]
+      .filter(
+        ([name, klass]) =>
+          namedByADispatcher(new klass()) || name in RESTATES_THE_DEFAULT,
+      )
+      .map(([name]) => name);
+
+    // A class on the export side and not the branched side is a class that
+    // falls silently to the floor. A name on the branched side and not the
+    // export side cannot happen while the branched side is filtered from the
+    // export side — asserted anyway, because that filtering is an
+    // implementation detail of this case and not a property of the code.
+    expect(branched.sort()).toEqual([...EXPORTED_ERROR_CLASSES.keys()].sort());
+  });
+
+  it("refuses an exception entry for a class a dispatcher actually answers for", () => {
+    // Guards the guard. The exception list is the one way to make the equality
+    // above pass without adding a branch, so every entry has to earn its place
+    // twice: it must name a class the modules really export, and a dispatcher
+    // must really hand it the default.
+    expect(Object.keys(RESTATES_THE_DEFAULT).sort()).toEqual([
+      "DavConnectError",
+      "ImapConnectError",
+    ]);
+
+    for (const [name, reason] of Object.entries(RESTATES_THE_DEFAULT)) {
+      const klass = EXPORTED_ERROR_CLASSES.get(name);
+      expect(
+        klass,
+        `${name} is on the exception list but is not an exported error class`,
+      ).toBeDefined();
+
+      expect(
+        reason.length,
+        `${name} is on the exception list with no reason worth reading`,
+      ).toBeGreaterThan(30);
+
+      const instance = new klass!();
+      expect(
+        namedByADispatcher(instance),
+        `${name} is on the exception list but a dispatcher gives it a category of its own — take it off`,
+      ).toBe(false);
+    }
+  });
+
+  it("keeps DavConnectError last, so nothing is appended below the floor", () => {
+    // The ORDER constraint `davToErrorCategory`'s docstring states, asserted
+    // from the outside. A branch appended after the connect branch would sit
+    // below the floor while looking like a peer of the others: it could never
+    // be reached, and every case above would stay green, because its class
+    // would still be exported and the equality only asks whether SOME
+    // dispatcher answers for it.
+    //
+    // This is the assertion that would catch it — the appended class would
+    // reach the default instead of its own category, and so would fail the
+    // equality by not being in the exception list. Stated here explicitly so
+    // the constraint is visible at the place it is checked.
+    expect(davToErrorCategory(new DavConnectError()).category).toBe(
+      DEFAULT_CATEGORY,
+    );
+    expect(davToErrorCategory(new DavUnsendableError()).category).not.toBe(
+      DEFAULT_CATEGORY,
+    );
   });
 });
