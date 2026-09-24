@@ -204,7 +204,14 @@ export type DavFetch = typeof globalThis.fetch;
  * devices. The cost of over-asking here falls on the user, not on this server.
  *
  * **429 and 503 are never retried.** A server that has just said it is
- * throttling is the last thing to send a second request to.
+ * throttling is the last thing to send a second request to. That claim is now
+ * proven rather than stated: `test/dav-transport.test.ts` drives each of the
+ * two statuses through this function all the way to the fixed wait sentence in
+ * `SAFE_MESSAGES`, and pins the outbound request count at one, so a retry
+ * inserted anywhere between the status number and the caller's string turns
+ * that case red. A pointer rather than a count, because a number written in
+ * prose beside the code it counts has a silent expiry date — `davToErrorCategory`'s
+ * own docstring records exactly that happening to it.
  *
  * **400, 404, 410 and any 3xx are re-discovery eligible.** All four are what a
  * stale cached shard host looks like from the outside. 3xx is on the list only
