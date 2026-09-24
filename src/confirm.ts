@@ -4,6 +4,9 @@
 // to ONE named resource. Nothing here knows what a calendar is, what a mailbox
 // is, or how a change is eventually written; it mints a payload, seals it,
 // reads it back, hashes a change canonically, and reserves a one-time slot.
+// The payload has an arm per kind of target and that sentence is still true:
+// an arm is a FIELD SHAPE, not protocol knowledge. This module issues no
+// request, reads no resource, and never inspects a value it seals.
 //
 // **Why the source root rather than inside a protocol tree.** `V2-MAIL-02`
 // ("mail delete and move behind the same preview-then-commit safety") is
@@ -41,6 +44,19 @@
 //   - `If-Match` at the DAV server is an entirely independent second layer.
 //     The loser of the race carries an etag the winner's write already
 //     invalidated, and no amount of KV staleness turns that into a success.
+//
+//   - that second layer is a property of ONE protocol, and the mail arm does
+//     not have it. IMAP has no `If-Match`. Its analogue is `UNCHANGEDSINCE`,
+//     from the `CONDSTORE` extension, checked against the MODSEQ this module
+//     sealed at preview — and it is NARROWER in two ways worth stating rather
+//     than discovering. It rides on the command that changes a message's
+//     flags, so it guards the flag change only: neither the command that
+//     copies a message nor the one that removes it is covered, and the
+//     verify-after step is still owed. And the command carrying it is not
+//     written in this phase, which means today the mail arm has the one-time
+//     KV slot and nothing else. The bullet above is not withdrawn — it is true
+//     of the DAV arms — but a bound that is quietly false is worse than a
+//     narrower one that is true, so the narrower one is what is claimed here.
 //
 // Neither layer is sufficient alone. This one refuses BEFORE any request is
 // issued, which is what the requirement asks for; `If-Match` refuses at the
@@ -455,6 +471,119 @@ export interface DavCollectionConfirmPayload extends ConfirmPayloadBase {
 }
 
 /**
+ * A confirmation naming ONE message in ONE mailbox.
+ *
+ * No call site until the mutating mail paths land, so this arm is built against
+ * tests rather than against a caller. That is stated rather than left to be
+ * discovered: a reader looking for the preview that mints one of these will not
+ * find it, and the absence is the schedule rather than a gap.
+ */
+export interface MailConfirmPayload extends ConfirmPayloadBase {
+  /** The kind of resource this confirmation names. See `DavObjectConfirmPayload.t`. */
+  t: "mail";
+  /**
+   * The mailbox the message lives in, as the opaque folder token.
+   *
+   * **The token, never a display name and never a wire name reconstructed
+   * later.** The folder token stores the raw wire name, so reopening the
+   * mailbox from it is byte-exact by construction — which is the established
+   * reason the token exists at all rather than a preference expressed here.
+   *
+   * The silent failure a display name would reach: mailbox names are not ASCII
+   * and not case-normalised, and a name round-tripped through a display form
+   * comes back subtly different. The reopen then selects a mailbox that either
+   * does not exist, or — worse — exists and is not the one the preview read.
+   * A token carried whole cannot do that.
+   */
+  m: string;
+  /**
+   * The mailbox's UIDVALIDITY at preview, a whole number.
+   *
+   * **Two characters rather than one, deliberately.** The message-id and
+   * page-cursor wire formats already spell this value `uv`, and a reader
+   * meeting all three should meet one word for one thing. A second single
+   * letter would have been cheaper by one byte and would have cost a reader
+   * the recognition.
+   *
+   * It is the half of the pair that says whether `i` still means anything: a
+   * server that renumbers a mailbox bumps this, and every UID under the old
+   * value stops naming what it named.
+   */
+  uv: number;
+  /**
+   * The message's UID, a whole number.
+   *
+   * **Not `u`, and the letter is taken rather than free.** ARCHITECTURE §7
+   * sketched this arm with the UID at `u`, and a later reader will find that
+   * sketch first, so the collision is recorded here rather than left to be
+   * rediscovered: `u` is the 64-hex id of the PRINCIPAL the confirmation was
+   * minted for, on every arm, and the user binding is what stops a stranger
+   * spending someone else's single-use slot. It does not move to accommodate a
+   * sketch.
+   */
+  i: number;
+  /**
+   * The message's size in octets.
+   *
+   * Half of the fingerprint that survives a renumber. See `d`.
+   */
+  z: number;
+  /**
+   * The message's internal date, as whole seconds since the epoch.
+   *
+   * Whole seconds on `x`'s own precedent, and the other half of the
+   * fingerprint. **What the pair buys is the case `uv` alone cannot see.** A
+   * UID that names a DIFFERENT message after a renumber is the failure that
+   * matters, and a server is not obliged to make the renumber detectable in
+   * every path a commit might take. A size and an internal date that must BOTH
+   * match are cheap to seal and hard to collide with by accident, so a commit
+   * that finds a message at the expected UID can still tell it is the wrong
+   * one.
+   */
+  d: number;
+  /**
+   * Where the message is GOING, as the same opaque folder token — or `null`
+   * for an operation that has no destination.
+   *
+   * **Nullable and never optional, in `e`'s own register and for `e`'s own
+   * reason.** An absent key and an explicit `null` are different bytes for the
+   * same meaning, and a field that can be ABSENT is a field a later build reads
+   * as `undefined` in the slot naming where a message is about to go. `null`
+   * is a value the predicate can see and a type can require; absent is a state
+   * that looks identical to a field nobody thought about.
+   *
+   * The predicate carries the `"q" in candidate` companion, on the same
+   * footing as `s`: the type ADMITS `null`, so an absent field and a present
+   * null are both `candidate.q === null` and nothing else in the check can
+   * tell them apart.
+   */
+  q: string | null;
+  /**
+   * The MODSEQ the preview observed, as decimal digits in a string.
+   *
+   * **A string and NOT a number, and this is the field's whole reason for
+   * being shaped the way it is.** RFC 7162 permits a 63-bit mod-sequence
+   * value. `JSON.parse` has one numeric type and it silently rounds anything
+   * past 2^53 — no error, no warning, a value that still prints like a number.
+   * A rounded MODSEQ does not fail: it compares unequal to the real one, so the
+   * conditional change is refused forever and the user can never commit; or it
+   * compares equal to a NEIGHBOUR's and stops guarding anything at all. Both
+   * outcomes look like working software.
+   *
+   * Digits only, checked by the structural predicate, so "not a MODSEQ" is
+   * unreachable rather than merely unlikely. A sign, a decimal point, exponent
+   * notation, surrounding space and the empty string are all refused.
+   *
+   * **There is no null.** A preview that could not read a MODSEQ cannot mint a
+   * mail confirmation at all — the same instinct the collection binding is
+   * built on, one arm over. An unbound mail confirmation would be a
+   * confirmation whose second layer silently does not exist, which is exactly
+   * what the module header's mail carve-out is written to stop being claimed.
+   */
+  n: string;
+}
+
+/**
  * What a confirmation carries, sealed — one arm per kind of target.
  *
  * A union rather than one interface with optional fields, and the difference is
@@ -464,7 +593,8 @@ export interface DavCollectionConfirmPayload extends ConfirmPayloadBase {
  */
 export type ConfirmPayload =
   | DavObjectConfirmPayload
-  | DavCollectionConfirmPayload;
+  | DavCollectionConfirmPayload
+  | MailConfirmPayload;
 
 /**
  * True only for a signing key this module is willing to use.
@@ -947,6 +1077,7 @@ function isConfirmPayload(value: unknown): value is ConfirmPayload {
   // is therefore refused rather than admitted with nothing checked.
   if (candidate.t === "dav") return hasDavObjectArm(candidate);
   if (candidate.t === "col") return hasDavCollectionArm(candidate);
+  if (candidate.t === "mail") return hasMailArm(candidate);
   return false;
 }
 
@@ -1017,5 +1148,48 @@ function hasDavCollectionArm(candidate: Record<string, unknown>): boolean {
     !("e" in candidate) &&
     !("r" in candidate) &&
     !("s" in candidate)
+  );
+}
+
+/**
+ * Decimal digits and nothing else — at least one, and no sign, point, exponent,
+ * space or prefix.
+ *
+ * Anchored at both ends and carrying no `g` flag: a `g` regular expression
+ * reused across calls carries `lastIndex` between them, so the SECOND call
+ * against an identical string answers differently from the first.
+ */
+const DECIMAL_DIGITS = /^[0-9]+$/;
+
+/** The fields `MailConfirmPayload` adds, and the ones it must NOT carry. */
+function hasMailArm(candidate: Record<string, unknown>): boolean {
+  return (
+    typeof candidate.m === "string" &&
+    typeof candidate.uv === "number" &&
+    Number.isInteger(candidate.uv) &&
+    typeof candidate.i === "number" &&
+    Number.isInteger(candidate.i) &&
+    typeof candidate.z === "number" &&
+    Number.isInteger(candidate.z) &&
+    typeof candidate.d === "number" &&
+    Number.isInteger(candidate.d) &&
+    (candidate.q === null || typeof candidate.q === "string") &&
+    // The companion `q` needs and `m` does not, for the reason the base
+    // predicate's `u` comment gives: `q`'s type ADMITS null, so an absent key
+    // and a present null both read as `candidate.q === null`.
+    "q" in candidate &&
+    // Digits, never a number. See `MailConfirmPayload.n` for what a value that
+    // went through a JSON number does instead of failing.
+    typeof candidate.n === "string" &&
+    DECIMAL_DIGITS.test(candidate.n) &&
+    // And none of the DAV arms' fields. The mail arm shares no field with
+    // either of them, so a payload carrying one is a payload that could be read
+    // under two arms, which is the thing the discriminator exists to forbid.
+    !("c" in candidate) &&
+    !("o" in candidate) &&
+    !("r" in candidate) &&
+    !("e" in candidate) &&
+    !("s" in candidate) &&
+    !("b" in candidate)
   );
 }

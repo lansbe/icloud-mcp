@@ -722,7 +722,15 @@ describe("a mail confirmation carries a MODSEQ a JSON number would round", () =>
     // it passes through a JSON number, and a rounded MODSEQ does not fail — it
     // compares unequal to the real one forever, or equal to a neighbour's.
     expect(read.n).toBe(BIG_MODSEQ);
-    expect(Number(read.n)).not.toBe(Number(BIG_MODSEQ) + 1);
+
+    // And the reason the digit string is not a cosmetic choice, asserted rather
+    // than described. In this project's only numeric type the sealed value and
+    // its NEIGHBOUR are the same number — so a MODSEQ that travelled as one
+    // would come back comparing equal to a value it is not, which is the half
+    // of the failure that stops guarding anything rather than the half that
+    // refuses forever. Neither half raises.
+    expect(Number(BIG_MODSEQ)).toBe(Number(BIG_MODSEQ) + 1);
+    expect(String(Number(BIG_MODSEQ))).not.toBe(BIG_MODSEQ);
   });
 
   it("refuses a MODSEQ carried as a JSON number rather than a digit string", async () => {
