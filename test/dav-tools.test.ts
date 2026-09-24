@@ -3057,6 +3057,67 @@ describe("the calendar_commit delete", () => {
     expect(stub.observed.length).toBe(0);
   });
 
+  it("refuses a confirmation minted for a MAIL target, as a refused confirmation and not a fault", async () => {
+    // CONF-01's own claim, asserted end to end rather than left as a type.
+    // The mail arm has no call site of its own until Phase 21/22, so this is
+    // the first and only place its refusal can be measured against real
+    // shipped code, and the measurement is worth more than the type: the seal
+    // verifies, the version is current, the lifetime has not run out and the
+    // user is the caller. The ONLY thing wrong with this token is the kind of
+    // resource it names.
+    //
+    // Two halves. The commit refuses it, which is CONF-01. And the DAV tree's
+    // own boundary translates the neutral refusal into the confirmation-refused
+    // category rather than letting it fall through to a connection diagnosis,
+    // which is the half that decides whether the model is told to wait for the
+    // network or to stop presenting this token.
+    const stub = writeDavStub();
+    await warmWrite(stub);
+
+    const { change } = await deletePreviewFor(SIMPLE_EVENT_ID);
+    const wrongTarget = await mintConfirmation(
+      {
+        v: CONFIRM_VERSION,
+        t: "mail",
+        k: "delete",
+        j: crypto.randomUUID(),
+        // A mailbox token and a UID, in the fields a DAV commit would have read
+        // as a collection URL and an object URL if the discriminator were not
+        // there to stop it. That is the failure this case exists to prove is
+        // unreachable, and it is why the refusal has to happen inside the gate.
+        m: "Zm9sZGVyLXRva2VuLUlOQk9Y",
+        uv: 1_700_000_000,
+        i: 4242,
+        z: 18_431,
+        d: 1_800_000_000,
+        q: null,
+        n: "742",
+        h: await changeHashOf(change),
+        x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+        // The OWNER, so the refusal is genuinely about the target. A different
+        // user would move it to the user check one line down, and the case
+        // would stay green while proving nothing about the target at all.
+        u: principal.userId,
+      },
+      env.CONFIRM_SECRET,
+    );
+
+    stub.observed.length = 0;
+    const result = await invokeRegistered("calendar_commit", {
+      confirmToken: wrongTarget,
+      change,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).category).toBe(
+      "confirmation_invalid",
+    );
+    expect(
+      stub.observed.length,
+      "a confirmation for another protocol reached the network",
+    ).toBe(0);
+  });
+
   it("survives the sequence a phone actually produces: preview, delete there, commit", async () => {
     // Not a synthesised failure. This is what a user does — previews here,
     // deletes the event on their phone while reading it, then confirms — and

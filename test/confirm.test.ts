@@ -33,6 +33,7 @@ import type {
   ConfirmTarget,
   DavCollectionConfirmPayload,
   DavObjectConfirmPayload,
+  MailConfirmPayload,
   NormalizedChange,
 } from "../src/confirm";
 import { DavConfirmationError, davToErrorCategory } from "../src/dav/errors";
@@ -664,6 +665,135 @@ describe("a collection confirmation cannot reach an ETag at all", () => {
 });
 
 // ===========================================================================
+// The mail arm
+// ===========================================================================
+
+/** The mailbox a message in this suite lives in, as the opaque folder token. */
+const MAILBOX_TOKEN = "Zm9sZGVyLXRva2VuLUlOQk9Y";
+
+/** A second mailbox, for the cases that have somewhere to go. */
+const DESTINATION_TOKEN = "Zm9sZGVyLXRva2VuLUFyY2hpdmU";
+
+/**
+ * A MODSEQ past 2^53, as decimal digits.
+ *
+ * RFC 7162 permits a 63-bit mod-sequence value. `Number.MAX_SAFE_INTEGER` is
+ * 9007199254740991, so this one is comfortably past the point where a JSON
+ * number stops being exact — which is the whole reason the field is a string.
+ */
+const BIG_MODSEQ = "4611686018427387905";
+
+function mailPayload(
+  overrides: Partial<MailConfirmPayload> = {},
+): MailConfirmPayload {
+  return {
+    v: CONFIRM_VERSION,
+    t: "mail",
+    k: "update",
+    j: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+    m: MAILBOX_TOKEN,
+    uv: 1_700_000_000,
+    i: 4242,
+    z: 18_431,
+    d: 1_800_000_000,
+    q: null,
+    n: "742",
+    h: "cGxhY2Vob2xkZXItY2hhbmdlLWhhc2g",
+    x: soon(),
+    u: USER,
+    ...overrides,
+  };
+}
+
+describe("a mail confirmation carries a MODSEQ a JSON number would round", () => {
+  it("round-trips every field, including a MODSEQ above 2^53", async () => {
+    const original = mailPayload({ n: BIG_MODSEQ, q: DESTINATION_TOKEN });
+
+    const read = await verifyConfirmation(
+      await mintConfirmation(original, SECRET),
+      SECRET,
+      USER,
+      "mail",
+    );
+
+    expect(read).toEqual(original);
+    // The claim, spelled out: the SAME digit string, not a number that happens
+    // to print the same way. A value this size loses its last digits the moment
+    // it passes through a JSON number, and a rounded MODSEQ does not fail — it
+    // compares unequal to the real one forever, or equal to a neighbour's.
+    expect(read.n).toBe(BIG_MODSEQ);
+    expect(Number(read.n)).not.toBe(Number(BIG_MODSEQ) + 1);
+  });
+
+  it("refuses a MODSEQ carried as a JSON number rather than a digit string", async () => {
+    const numeric = malformed({ ...mailPayload(), n: 742 });
+
+    await expect(
+      verifyConfirmation(await mintConfirmation(numeric, SECRET), SECRET, USER, "mail"),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it.each([
+    ["a sign", "-742"],
+    ["a decimal point", "742.0"],
+    ["exponent notation", "7.42e2"],
+    ["surrounding space", " 742 "],
+    ["a hex prefix", "0x2e6"],
+    ["nothing at all", ""],
+  ])("refuses a MODSEQ string carrying %s", async (_label, value) => {
+    const odd = mailPayload({ n: value });
+
+    await expect(
+      verifyConfirmation(await mintConfirmation(odd, SECRET), SECRET, USER, "mail"),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it("refuses a mail payload with no MODSEQ field at all", async () => {
+    // There is no null MODSEQ, which is the collection binding's instinct one
+    // arm over: a preview that could not read one cannot mint a mail
+    // confirmation, rather than minting an unbound one.
+    const without: Record<string, unknown> = { ...mailPayload() };
+    delete without.n;
+
+    await expect(
+      verifyConfirmation(
+        await mintConfirmation(malformed(without), SECRET),
+        SECRET,
+        USER,
+        "mail",
+      ),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it("accepts a null destination and refuses an absent one", async () => {
+    // Nullable and never optional. An absent key and an explicit null are
+    // different bytes for the same meaning, and the slot naming where a message
+    // is GOING is the last place to let a later build read `undefined`.
+    const nowhere = mailPayload({ q: null });
+    expect(
+      await verifyConfirmation(
+        await mintConfirmation(nowhere, SECRET),
+        SECRET,
+        USER,
+        "mail",
+      ),
+    ).toEqual(nowhere);
+
+    const missing: Record<string, unknown> = { ...mailPayload() };
+    delete missing.q;
+
+    await expect(
+      verifyConfirmation(
+        await mintConfirmation(malformed(missing), SECRET),
+        SECRET,
+        USER,
+        "mail",
+      ),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+});
+
+// ===========================================================================
 // Every arm against every other arm
 // ===========================================================================
 
@@ -682,6 +812,7 @@ describe("a collection confirmation cannot reach an ETag at all", () => {
 const ARMS: { target: ConfirmTarget; build: () => ConfirmPayload }[] = [
   { target: "dav", build: () => payload() },
   { target: "col", build: () => collectionPayload() },
+  { target: "mail", build: () => mailPayload() },
 ];
 
 describe("a payload satisfies at most one arm, whatever order the predicate tries them in", () => {
