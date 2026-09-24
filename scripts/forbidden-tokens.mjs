@@ -1459,9 +1459,9 @@ export const PRINCIPAL_CONSTRUCTOR_SCOPE = "src/";
  * sentence rather than re-deciding it, and each of them is a session that could
  * lose it without a single assertion going red.
  *
- * WHAT IT DOES NOT AND CANNOT SEE. Four shapes each produce a second
- * human-facing sentence and fire nothing, and naming them is what stops a later
- * reader believing the rule proves more than it does:
+ * WHAT IT DOES NOT AND CANNOT SEE. Five shapes get past this rule, and naming
+ * them is what stops a later reader believing it proves more than it does. The
+ * first four each produce a second human-facing sentence and fire nothing:
  *
  *   1. a second composer bound to a `const` ARROW rather than declared. No
  *      declaration keyword follows, so nothing matches -- and this is the one
@@ -1474,7 +1474,32 @@ export const PRINCIPAL_CONSTRUCTOR_SCOPE = "src/";
  *      the response -- the count sees one composer and the user reads something
  *      else.
  *
- * What actually holds those two is named here rather than left implied: the
+ * The fifth runs the other way and is the sharper one, because it defeats the
+ * arm this rule exists for rather than the arm it shares with a plain ban:
+ *
+ *   5. a COMMENT satisfies the presence arm. This pattern matches text, not
+ *      code, so any line under `src/confirm.ts` that names the composer with the
+ *      declaration keyword in front of it -- in prose, in a docstring, in a
+ *      commented-out draft -- makes the collected list non-empty. Delete, rename
+ *      or inline the real definition after that and `composers.length === 0` is
+ *      false, `confirm-line-composer-missing` never fires, and the scan passes
+ *      with no composer in the tree -- which is precisely the failure direction
+ *      the paragraph above says this count exists to catch. No such comment
+ *      exists today. Do not rely on the zero arm alone, and do not write that
+ *      comment: name the composer WITHOUT the keyword in front of it, exactly as
+ *      the `does not see a CALL or an IMPORT` samples do -- which is also why
+ *      this bullet describes the shape instead of quoting it.
+ *
+ * A SIXTH SHAPE USED TO GET PAST AND NO LONGER DOES. Two definitions in the
+ * OWNER file both passed, because the collector used `String.prototype.search`
+ * and a file could contribute at most one entry: two composers in
+ * `src/confirm.ts` produced one entry, that entry was the owner, and the checker
+ * skipped it. "One composer, at one definition site" was then false with the
+ * scan green. The collector now counts EVERY match in a file and the checker
+ * reports the second and later occurrences in the owner, so the count is a count
+ * in both files and within one.
+ *
+ * What actually holds those four is named here rather than left implied: the
  * byte-exact line table in `test/confirm.test.ts`, which pins every sentence the
  * composer can produce and would fail the moment a second register appeared in a
  * response; and the fence audit's key-set comparison in
@@ -1487,9 +1512,14 @@ export const PRINCIPAL_CONSTRUCTOR_SCOPE = "src/";
  * collected scope, so a pattern keyed on the bare name would report the very
  * sites this rule exists to protect and the pre-commit hook would refuse every
  * commit in the repository. White space of any kind is matched, a line break
- * included, so a signature the formatter broke up is still one definition. No
- * `g` flag: `scan()` reaches this through `String.prototype.search`, which takes
- * the first match only, and one test asserts the absence.
+ * included, so a signature the formatter broke up is still one definition.
+ *
+ * No `g` flag on the exported constant, and one test asserts the absence. The
+ * collector needs every match rather than the first, so it builds its own global
+ * copy per file with `new RegExp(CONFIRM_LINE_COMPOSER, "g")`. That is the right
+ * way round: a shared global regex carries `lastIndex` between files, so a rule
+ * exported with the flag on would silently start matching from wherever the
+ * previous file left off.
  */
 export const CONFIRM_LINE_COMPOSER = /\bfunction\s+composeConfirmationLine\b/;
 
@@ -2004,11 +2034,18 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
     // definition is precisely what this pattern looks for -- so the owner is
     // expected to be the one entry in the list rather than an exception to it.
     if (relativePath.startsWith(CONFIRM_LINE_SCOPE)) {
-      const composerIndex = contents.search(CONFIRM_LINE_COMPOSER);
-      if (composerIndex !== -1) {
+      // EVERY match, not the first. Two definitions in the OWNER file are two
+      // registers exactly as two files are, and `search()` cannot tell one from
+      // two -- so it reported the owner once, the checker skipped it, and "one
+      // composer, at one definition site" was false with the scan green. The
+      // global copy is built fresh per file because a shared one carries
+      // `lastIndex` across files.
+      for (const match of contents.matchAll(
+        new RegExp(CONFIRM_LINE_COMPOSER, "g"),
+      )) {
         confirmLineComposers.push({
           file: relativePath,
-          ...positionOf(contents, composerIndex),
+          ...positionOf(contents, match.index),
         });
       }
     }
@@ -2383,22 +2420,33 @@ export function checkPrincipalConstructorOwnership(callers) {
  * Same split as the one-owner counts above, and the same body: split out from
  * `scan()` so both of its failure directions can be exercised without
  * materialising a fixture tree on disk. See the `CONFIRM_LINE_COMPOSER`
- * docstring for why this is a count rather than a negative, and for the four
- * evasions it cannot see.
+ * docstring for why this is a count rather than a negative, and for the five
+ * shapes it cannot see.
+ *
+ * **The owner is permitted ONE definition and not "any number of them".** The
+ * first occurrence in the owner file is the composer; a second is a second
+ * register in the same file, which is the same failure as a second file and gets
+ * the same id. The collector's `matchAll` is what makes this measurable at all
+ * -- while it used `search()`, a file contributed at most one entry and this loop
+ * could not have told the two apart.
  *
  * @param {Array<{file: string, line: number, column: number}>} composers
  */
 export function checkConfirmLineOwnership(composers) {
   const violations = [];
+  let ownerDefinitions = 0;
   for (const composer of composers) {
-    if (composer.file === CONFIRM_LINE_OWNER) continue;
+    if (composer.file === CONFIRM_LINE_OWNER) {
+      ownerDefinitions += 1;
+      if (ownerDefinitions === 1) continue;
+    }
     violations.push({
       file: composer.file,
       line: composer.line,
       column: composer.column,
       pattern: "confirm-line-composer-duplicated",
       patternIndex: FORBIDDEN.length + 21,
-      why: `A second module under ${CONFIRM_LINE_SCOPE} defines a composer for the human-facing confirmation line, outside ${CONFIRM_LINE_OWNER}. That sentence is the one thing the confirmation token cannot bind: the token proves this server applied exactly the change it previewed, and proves nothing at all about what the user was told before they agreed. CONF-04 answers that by having this server write the sentence, which only works while there is ONE of it -- two composers are two registers, and the drift between them is invisible until somebody reads two transcripts side by side. Call ${CONFIRM_LINE_OWNER}'s composer and pass it a resolved summary; do not phrase a line here. If a second composer genuinely belongs, that is a change to the safety boundary and not a refactor: get a decision, then change the owner, never the pattern. If this fired on a comment, name the composer without a declaration keyword in front of it.`,
+      why: `A second definition of the composer for the human-facing confirmation line -- either in another module under ${CONFIRM_LINE_SCOPE}, or a second one inside ${CONFIRM_LINE_OWNER} itself, which counts the same and used to pass. That sentence is the one thing the confirmation token cannot bind: the token proves this server applied exactly the change it previewed, and proves nothing at all about what the user was told before they agreed. CONF-04 answers that by having this server write the sentence, which only works while there is ONE of it -- two composers are two registers, and the drift between them is invisible until somebody reads two transcripts side by side. Call ${CONFIRM_LINE_OWNER}'s composer and pass it a resolved summary; do not phrase a line here. If a second composer genuinely belongs, that is a change to the safety boundary and not a refactor: get a decision, then change the owner, never the pattern. If this fired on a comment, name the composer without a declaration keyword in front of it.`,
     });
   }
   if (composers.length === 0) {

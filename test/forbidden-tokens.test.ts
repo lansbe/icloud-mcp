@@ -3515,6 +3515,45 @@ describe("one function composes the human-facing line (CONF-04)", () => {
     expect(violations[0]!.column).toBe(elsewhere.column);
   });
 
+  it("reports the SECOND definition inside the owner file, which used to pass", () => {
+    // The gap this closes. While the collector used `String.prototype.search` a
+    // file contributed at most one entry, so two composers both defined in
+    // src/confirm.ts produced ONE entry, that entry was the owner, and the
+    // checker skipped it. "One composer, at one definition site" was then false
+    // with the scan green. The collector now counts every match in a file.
+    const second = { file: CONFIRM_LINE_OWNER, line: 1402, column: 9 };
+    const violations = checkConfirmLineOwnership([owner, second]);
+
+    expect(violations.map((v) => v.pattern)).toEqual([
+      "confirm-line-composer-duplicated",
+    ]);
+    // The SECOND one is named, not the first: the first is the composer.
+    expect(violations[0]!.line).toBe(second.line);
+    expect(violations[0]!.column).toBe(second.column);
+    // And the reason the hook prints says an in-owner duplicate counts, because
+    // a reader who saw only "a second module" would read this as a false alarm.
+    expect(violations[0]!.why).toContain(CONFIRM_LINE_OWNER);
+  });
+
+  it("stays global-safe across files: a second file's definition is still found", () => {
+    // The collector builds its global copy fresh per file. A shared one would
+    // carry `lastIndex` between files, so the composer in the SECOND file
+    // scanned would be searched from an offset past it and silently missed --
+    // the duplicated arm would then stop firing on exactly the shape it exists
+    // for. Driven through the exported constant, which must stay flagless.
+    expect(CONFIRM_LINE_COMPOSER.global).toBe(false);
+    const fresh = () => new RegExp(CONFIRM_LINE_COMPOSER, "g");
+    const two = [
+      "function composeConfirmationLine(a, b) {}",
+      "function composeConfirmationLine(c, d) {}",
+    ];
+    for (const contents of two) {
+      expect([...contents.matchAll(fresh())]).toHaveLength(1);
+    }
+    // And two in ONE file are two, which is what `search()` could not see.
+    expect([...two.join("\n").matchAll(fresh())]).toHaveLength(2);
+  });
+
   it("reports a violation naming the owner when nothing defines one", () => {
     // The direction a negative cannot see, and the one that matters most here:
     // a composer deleted, renamed or inlined guards nothing, and nothing goes
@@ -3589,7 +3628,10 @@ describe("one function composes the human-facing line (CONF-04)", () => {
     }
   });
 
-  it("carries no global flag, because scan() takes the first match with search()", () => {
+  it("carries no global flag, because the collector builds its own copy per file", () => {
+    // The flag has to be OFF on the shared export. `lastIndex` lives on the
+    // regex object, so a global constant reused across files would search the
+    // next file from wherever the previous one left off.
     expect(CONFIRM_LINE_COMPOSER.flags).toBe("");
   });
 
