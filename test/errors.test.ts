@@ -574,3 +574,60 @@ describe("DavSubscriptionError and subscription_unreadable", () => {
     );
   });
 });
+
+describe("the wait outcome is one answer, not two that happen to agree (CONF-06)", () => {
+  // The IMAP half of the end-to-end proof whose DAV half lives in
+  // `test/dav-transport.test.ts`, asserted here beside it deliberately.
+  //
+  // The two trees share a vocabulary and nothing else at runtime, and each has
+  // its own class for a server asking the caller to wait. Two correct answers
+  // that were never compared are two answers, and one of them can drift. What
+  // makes this a single answer is that both dispatchers return the same entry
+  // of the same table, and that is asserted rather than assumed.
+
+  it("reads the IMAP throttle class as the wait category, exactly as a 429 does", () => {
+    expect(toErrorCategory(new ImapThrottleError()).category).toBe("rate_limited");
+    expect(davToErrorCategory(new DavThrottleError()).category).toBe(
+      "rate_limited",
+    );
+  });
+
+  it("hands both sides the identical fixed sentence, read from the shipped table", () => {
+    const imap = toErrorCategory(new ImapThrottleError());
+    const dav = davToErrorCategory(new DavThrottleError());
+
+    expect(imap.message).toBe(SAFE_MESSAGES.rate_limited);
+    expect(dav.message).toBe(SAFE_MESSAGES.rate_limited);
+
+    // Not implied by the two above: a table whose entry was read twice still
+    // proves nothing if a dispatcher were ever changed to compose its own
+    // string. This is the assertion that the two callers are one answer.
+    expect(imap.message).toBe(dav.message);
+  });
+
+  it("keeps the server's own refusal text out of the sentence the caller reads", () => {
+    // `ImapThrottleError` is the one class in `src/errors.ts` that takes a
+    // constructor argument, and the argument is the server's own reply text.
+    // It rides in a dedicated field the tool boundary surfaces after a type
+    // check; it must never reach `message`, or the fixed-string guarantee the
+    // whole table rests on would hold only for the bare form.
+    const carrying = toErrorCategory(
+      new ImapThrottleError("[UNAVAILABLE] Too many simultaneous connections"),
+    );
+
+    expect(carrying.category).toBe("rate_limited");
+    expect(carrying.message).toBe(SAFE_MESSAGES.rate_limited);
+    expect(carrying.message).not.toContain("simultaneous");
+  });
+
+  it("gives the wait sentence to the wait category and to nothing else", () => {
+    // The distinctness claim, stated about THIS string rather than about the
+    // table as a whole. The table-wide "no two alike" case above would stay
+    // green if the wait sentence and the floor's sentence were merged into one
+    // new string used by both — the count of distinct values would not move.
+    for (const category of CATEGORIES) {
+      if (category === "rate_limited") continue;
+      expect(SAFE_MESSAGES[category]).not.toBe(SAFE_MESSAGES.rate_limited);
+    }
+  });
+});

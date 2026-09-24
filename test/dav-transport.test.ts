@@ -623,6 +623,71 @@ describe("createDavFetch — status to typed error (D-60)", () => {
   });
 });
 
+describe("the wait outcome, from the status number to the sentence a caller reads (CONF-06)", () => {
+  // The leg that had never been measured. `test/errors.test.ts` constructs
+  // `DavThrottleError` by hand and asserts the category it maps to; the cases
+  // above construct a 429 and assert the CLASS it raises. Neither joins the
+  // two, so nothing in the suite said that a server asking this client to wait
+  // arrives at the caller as a sentence telling it to wait.
+  //
+  // That join is what CONF-06 is for. Phase 14's collection write probe
+  // produced "This may be transient — safe to retry once" for a failure that
+  // was neither, and the report read as a measurement of iCloud's behaviour.
+  // The answer for a throttling server has been correct all along on both
+  // sides; it had simply never been proven from one end to the other, and an
+  // unproven correct answer is indistinguishable from a lucky one.
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.each([429, 503])(
+    "carries %i to the fixed wait sentence, and to no other category",
+    async (status) => {
+      vi.stubGlobal("fetch", statusStub(status).fetch);
+      const raised = await raise(createDavFetch(owner));
+
+      expect(raised).toBeInstanceOf(DavThrottleError);
+
+      const answer = davToErrorCategory(raised);
+      expect(answer.category).toBe("rate_limited");
+
+      // Compared against the shipped table rather than a restated literal, so
+      // a reword moves both sides together. A literal here would let the table
+      // and the proof drift apart, which is the failure this whole case exists
+      // to close one layer down.
+      expect(answer.message).toBe(SAFE_MESSAGES.rate_limited);
+
+      // The two answers it must never be. `connection_failed` is the floor
+      // every unclassified value lands on and it offers a retry;
+      // `request_unsendable` says the remote end was never involved, which
+      // would be false — the server answered, and its answer was "wait".
+      expect(answer.category).not.toBe("connection_failed");
+      expect(answer.category).not.toBe("request_unsendable");
+      expect(raised).not.toBeInstanceOf(DavConnectError);
+      expect(raised).not.toBeInstanceOf(DavUnsendableError);
+    },
+  );
+
+  it.each([429, 503])(
+    "sends exactly one request while producing the wait outcome on %i",
+    async (status) => {
+      // The transport's own docstring says a server that has just declared it
+      // is throttling is the last thing to send a second request to. Nothing
+      // measured that. A retry inserted anywhere between the status number and
+      // the caller's string would walk straight into iCloud's undocumented
+      // per-account ceiling, whose cost falls on the user's own Mail.app
+      // rather than on this server.
+      const stub = statusStub(status);
+      vi.stubGlobal("fetch", stub.fetch);
+      const raised = await raise(createDavFetch(owner));
+
+      expect(stub.observed.length).toBe(1);
+      expect(davToErrorCategory(raised).message).toBe(SAFE_MESSAGES.rate_limited);
+    },
+  );
+});
+
 describe("the two categories that arrived with Phase 5", () => {
   it("translates DavStaleResourceError to stale_resource and its fixed message", () => {
     expect(davToErrorCategory(new DavStaleResourceError())).toEqual({
