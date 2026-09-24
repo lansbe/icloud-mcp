@@ -814,6 +814,57 @@ describe("a mail confirmation carries a MODSEQ a JSON number would round", () =>
       ),
     ).rejects.toBeInstanceOf(ConfirmationInvalidError);
   });
+
+  it("refuses an EMPTY destination while still accepting a null one", async () => {
+    // `null` is "no destination". `""` is not a quieter way of saying that — it
+    // is a destination nobody named, and it is the one shape on this arm whose
+    // consequence is a write: a move to an empty wire name moves a message to a
+    // mailbox that does not exist. The collection arm refuses an empty `b` for
+    // this reason; this arm used not to.
+    //
+    // The null half is asserted in the case above, so this one only has to hold
+    // the refusal — but a predicate that refused BOTH would turn that case red,
+    // which is what stops this being satisfied by refusing everything.
+    await expect(
+      verifyConfirmation(
+        await mintConfirmation(mailPayload({ q: "" }), SECRET),
+        SECRET,
+        USER,
+        "mail",
+      ),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it("refuses an EMPTY mailbox token", async () => {
+    // `MailConfirmPayload.m`'s own docstring says the token exists so reopening
+    // the mailbox from it is byte-exact by construction, and an empty token
+    // satisfies that vacuously: the commit reopens "the mailbox" as an empty
+    // wire name and selects nothing. It is the shape a blank lookup reaches by
+    // accident, not a mailbox anybody chose.
+    //
+    // Latent today — the mail arm has no mutating call site until Phase 21/22 —
+    // and closed here while the predicate is the only thing that has to change.
+    await expect(
+      verifyConfirmation(
+        await mintConfirmation(mailPayload({ m: "" }), SECRET),
+        SECRET,
+        USER,
+        "mail",
+      ),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+
+    // Non-vacuity: the SAME payload with a real token is accepted, so the
+    // refusal above is about the emptiness and not about the field.
+    const named = mailPayload({ m: "Zm9sZGVyLXRva2VuLUlOQk9Y" });
+    expect(
+      await verifyConfirmation(
+        await mintConfirmation(named, SECRET),
+        SECRET,
+        USER,
+        "mail",
+      ),
+    ).toEqual(named);
+  });
 });
 
 // ===========================================================================

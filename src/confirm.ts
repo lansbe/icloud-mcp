@@ -1461,6 +1461,14 @@ const DECIMAL_DIGITS = /^[0-9]+$/;
 function hasMailArm(candidate: Record<string, unknown>): boolean {
   return (
     typeof candidate.m === "string" &&
+    // Non-empty, for `b`'s stated reason one arm over: an empty token is the
+    // shape a blank lookup reaches by accident, and it is not "no mailbox" — it
+    // is a mailbox that compares equal to the next empty one.
+    // `MailConfirmPayload.m`'s own docstring says the token exists so reopening
+    // the mailbox from it is byte-exact by construction, which an empty token
+    // satisfies vacuously: the commit reopens "the mailbox" as an empty wire
+    // name and selects nothing.
+    candidate.m.length > 0 &&
     typeof candidate.uv === "number" &&
     Number.isInteger(candidate.uv) &&
     typeof candidate.i === "number" &&
@@ -1469,7 +1477,12 @@ function hasMailArm(candidate: Record<string, unknown>): boolean {
     Number.isInteger(candidate.z) &&
     typeof candidate.d === "number" &&
     Number.isInteger(candidate.d) &&
-    (candidate.q === null || typeof candidate.q === "string") &&
+    // Null is "no destination"; an empty string is not a quieter way of saying
+    // that, it is a destination nobody named. A move to it moves a message to a
+    // mailbox that does not exist, which is the one shape on this arm whose
+    // consequence is a write rather than a failed read.
+    (candidate.q === null ||
+      (typeof candidate.q === "string" && candidate.q.length > 0)) &&
     // The companion `q` needs and `m` does not, for the reason the base
     // predicate's `u` comment gives: `q`'s type ADMITS null, so an absent key
     // and a present null both read as `candidate.q === null`.
