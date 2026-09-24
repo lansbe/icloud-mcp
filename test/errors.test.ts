@@ -631,3 +631,68 @@ describe("the wait outcome is one answer, not two that happen to agree (CONF-06)
     }
   });
 });
+
+describe("the floor, and what it is allowed to promise (CONF-06)", () => {
+  it("still holds exactly eight categories, with no ninth added beside the wait outcome", () => {
+    // Stated here as well as in the vocabulary block above, because THIS is
+    // the plan that had the obvious reason to add one. A server asking the
+    // caller to wait already has its own entry; inventing a second beside it
+    // would have put a category in the model's vocabulary that duplicates a
+    // shipped one, which is the hazard `src/errors.ts`'s own header names from
+    // the other direction.
+    expect(CATEGORIES).toHaveLength(8);
+    expect(Object.keys(SAFE_MESSAGES)).toHaveLength(8);
+    expect(CATEGORIES).not.toContain("throttled");
+    expect(CATEGORIES).not.toContain("service_unavailable");
+  });
+
+  it("no longer tells the caller an unclassified failure is safe to retry once", () => {
+    // The sentence Phase 14's collection write probe produced for a failure
+    // that was neither transient nor retryable. `request_unsendable` closed
+    // that particular hole by adding a CLASS; this closes what remains, which
+    // is every OTHER unclassified value that still lands here.
+    //
+    // Asserted by VALUE, not by substring. The claim is about what the string
+    // promises, and a promise can be restored in different words — a substring
+    // check for the old phrasing would pass against a paraphrase of it.
+    expect(SAFE_MESSAGES.connection_failed).not.toContain("safe to retry once");
+    expect(SAFE_MESSAGES.connection_failed).toBe(
+      "Could not establish a secure connection to iCloud Mail. This is what " +
+        "this server reports when it cannot tell what went wrong, so it may " +
+        "or may not be transient. Retry once at most — if it happens again, " +
+        "the cause is not transient and retrying will not help.",
+    );
+  });
+
+  it("still names iCloud Mail in its first clause, which is a separate decision", () => {
+    // The small inaccuracy on a calendar call, accepted deliberately and
+    // recorded in `src/dav/errors.ts`. Pinned so a reword of the retry clause
+    // cannot quietly take the naming with it: that would touch shipped Phase 1
+    // and 2 responses, and it is not this plan's decision to take.
+    expect(SAFE_MESSAGES.connection_failed).toContain(
+      "Could not establish a secure connection to iCloud Mail.",
+    );
+  });
+
+  it("still gives the caller a recovery, and one distinct from every other entry", () => {
+    // Closing the promise must not close the guidance. A floor that said only
+    // "something failed" would leave the model to invent its own policy, and
+    // the policy it invents is a loop.
+    expect(SAFE_MESSAGES.connection_failed).toContain("Retry once at most");
+    expect(SAFE_MESSAGES.connection_failed).toContain("will not help");
+    for (const category of CATEGORIES) {
+      if (category === "connection_failed") continue;
+      expect(SAFE_MESSAGES[category]).not.toBe(SAFE_MESSAGES.connection_failed);
+    }
+  });
+
+  it("still catches every undesigned value without throwing", () => {
+    // The floor's actual job, unchanged by the reword. A `catch` in this
+    // runtime receives whatever was thrown, and the translation boundary must
+    // answer for all of it.
+    for (const thrown of [new Error("plain"), null, undefined, "", {}]) {
+      expect(toErrorCategory(thrown).category).toBe("connection_failed");
+      expect(davToErrorCategory(thrown).category).toBe("connection_failed");
+    }
+  });
+});
