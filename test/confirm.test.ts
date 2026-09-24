@@ -1616,6 +1616,78 @@ describe("the server composes the human-facing line", () => {
     );
   });
 
+  /**
+   * The two consequence clauses the override still replaces, spelled out here.
+   *
+   * Duplicated from `src/confirm.ts` deliberately rather than imported: the
+   * table there is not exported, and a test that read the value under test out
+   * of the code under test would pass whatever that code said.
+   */
+  const CONFIRMATION_CONSEQUENCES_TEXT = {
+    create: "Undoing it is a separate, explicit request.",
+    update: "The values it held before cannot be recovered.",
+  } as const;
+
+  it("still says a delete cannot be undone when it also tells people", () => {
+    // The combination that had no case, which is how the gap stayed invisible:
+    // the notification clause used to REPLACE the operation's own consequence,
+    // so deleting a meeting with attendees — the common case for the recruiter
+    // calls this project is for — lost "This cannot be undone." entirely. The
+    // clause that remained was about the notice, and a reader can fairly take
+    // the notice for the irreversible part.
+    //
+    // `occurrencesGoingWith`'s docstring states the governing direction for
+    // this path: under-warning is the direction it must never fail in.
+    const line = composeConfirmationLine(
+      {
+        kind: "delete",
+        noun: "event",
+        name: "One-to-one",
+        alsoRemoved: { count: 2, noun: "event" },
+        fieldCount: null,
+        recipientCount: 2,
+      },
+      "would",
+    );
+
+    expect(line).toBe(
+      "Deleting event 'One-to-one', along with the 2 events in it, telling 2 people. This cannot be undone. An invitation cannot be unsent.",
+    );
+    // Read as the two claims rather than as one string: the delete's own
+    // consequence is present, and it comes BEFORE the notification's, because
+    // the thing being destroyed is what the user is deciding about.
+    expect(line).toContain("This cannot be undone.");
+    expect(line).toContain("An invitation cannot be unsent.");
+    expect(line.indexOf("This cannot be undone.")).toBeLessThan(
+      line.indexOf("An invitation cannot be unsent."),
+    );
+  });
+
+  it("keeps the override on a create and an update, where the comparative holds", () => {
+    // The join is the DELETE arm's, and only the delete arm's. A create that
+    // tells people can be undone by a separate explicit request and an update's
+    // old values are gone but not irrecoverably notified, so on those two the
+    // invitation genuinely is the less walkable of the pair and replacing is
+    // right. A join everywhere would be two consequence clauses on every
+    // invited write, which is how a warning stops being read.
+    for (const kind of ["create", "update"] as const) {
+      const line = composeConfirmationLine(
+        {
+          kind,
+          noun: "event",
+          name: "Standup",
+          alsoRemoved: null,
+          fieldCount: null,
+          recipientCount: 1,
+        },
+        "would",
+      );
+
+      expect(line, kind).toContain("An invitation cannot be unsent.");
+      expect(line, kind).not.toContain(CONFIRMATION_CONSEQUENCES_TEXT[kind]);
+    }
+  });
+
   it("agrees with itself about number, for one and for many", () => {
     // A line that said "1 fields" or "3 person" would be a line a reader stops
     // trusting, and the count is the half that makes the sentence checkable.

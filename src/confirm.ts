@@ -1094,8 +1094,27 @@ const CONFIRMATION_CONSEQUENCES: Record<ConfirmKind, string> = {
 };
 
 /**
- * What a write tells people, said once and overriding the operation's own
- * consequence, because it is the one that cannot be walked back at all.
+ * What a write tells people, said once, and said BESIDE a delete's own
+ * consequence rather than instead of it.
+ *
+ * This replaced the operation's consequence outright until a review caught what
+ * that cost on the delete arm. The comparative it rested on — "it is the one
+ * that cannot be walked back at all" — is true against a create and an update
+ * and false against a delete, where the two are equally unwalkable. So
+ * "Deleting event 'One-to-one', along with the 2 events in it, telling 2
+ * people. An invitation cannot be unsent." dropped "This cannot be undone."
+ * from the one sentence the user is asked to read, about two occurrences that
+ * were about to go irrecoverably, and left the only consequence clause pointing
+ * at the notification. A reader can fairly take that as "the notice is the
+ * irreversible part".
+ *
+ * `occurrencesGoingWith`'s docstring in `src/mcp/tools/calendar.ts` states the
+ * governing direction for this path: under-warning is the direction it must
+ * never fail in. So the delete arm joins both clauses, and create and update
+ * keep the override, where the comparative does hold.
+ *
+ * Tense-free, for `CONFIRMATION_VERBS`' reason, and that survives the join
+ * because both clauses it joins are tense-free too.
  */
 const INVITATION_CONSEQUENCE = "An invitation cannot be unsent.";
 
@@ -1232,9 +1251,14 @@ export function composeConfirmationLine(
     clauses.push(`telling ${summary.recipientCount} ${word}`);
   }
 
-  const consequence = tells
-    ? INVITATION_CONSEQUENCE
-    : CONFIRMATION_CONSEQUENCES[summary.kind];
+  // A delete gets BOTH clauses, not the notification one instead of its own.
+  // See `INVITATION_CONSEQUENCE`: the override is only defensible where the
+  // invitation is the less recoverable of the two, which a delete is not.
+  const consequence = !tells
+    ? CONFIRMATION_CONSEQUENCES[summary.kind]
+    : summary.kind === "delete"
+      ? `${CONFIRMATION_CONSEQUENCES.delete} ${INVITATION_CONSEQUENCE}`
+      : INVITATION_CONSEQUENCE;
 
   const head = [`${CONFIRMATION_VERBS[summary.kind][tense]} ${subject}`, ...clauses];
   return `${head.join(", ")}. ${consequence}`;

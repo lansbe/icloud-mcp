@@ -7206,8 +7206,14 @@ describe("the composed line, built from this server's own counts", () => {
     expect(trusted.recipientCount).toBe(2);
     expect(untrusted.confirmationLine).toBe(
       "Deleting event 'One-to-one', along with the 2 events in it, " +
-        "telling 2 people. An invitation cannot be unsent.",
+        "telling 2 people. This cannot be undone. " +
+        "An invitation cannot be unsent.",
     );
+    // BOTH consequences, and this is the shape the review caught. Two
+    // occurrences are about to go irrecoverably; a line whose only consequence
+    // clause was about the notification let a reader take the notice for the
+    // irreversible part.
+    expect(untrusted.confirmationLine).toContain("This cannot be undone.");
   });
 
   it("names the recipient count and the thing that cannot be undone, on a create", async () => {
@@ -7282,7 +7288,8 @@ describe("the composed line, built from this server's own counts", () => {
 
     expect(untrusted.confirmationLine).toBe(
       "Deleted event 'One-to-one', along with the 2 events in it, " +
-        "telling 2 people. An invitation cannot be unsent.",
+        "telling 2 people. This cannot be undone. " +
+        "An invitation cannot be unsent.",
     );
     // **A lie at preview becomes contradicted text in the transcript.** The two
     // lines come from one composer with one difference, and this says so by
