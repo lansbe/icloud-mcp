@@ -201,7 +201,7 @@ describe("key shapes today, one pin per store", () => {
     ).toBe(3);
   });
 
-  it("CONFIRM_KV: confirm:v2:{user id}:{jti}", async () => {
+  it("CONFIRM_KV: confirm:v3:{user id}:{jti}", async () => {
     const kv = fakeKv();
     const jti = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     const soon = Math.floor(Date.now() / 1000) + 300;
@@ -209,17 +209,17 @@ describe("key shapes today, one pin per store", () => {
     await reserveConfirmation(kv.binding, USER_A.userId, jti, soon);
 
     expect(kv.puts.length, "the reservation wrote nothing").toBe(1);
-    // The literal prefix at version 2, then the user id the caller passed in,
+    // The literal prefix at version 3, then the user id the caller passed in,
     // then the jti. The prefix is typed out rather than imported so the prefix
     // itself is pinned; the user id is the literal vectors row, which is a
     // different thing from the key it is being compared against.
     expect(kv.puts[0]!.key).toBe(
-      "confirm:v2:" + USER_A.userId + ":aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "confirm:v3:" + USER_A.userId + ":aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
     );
     // Three colon-separated parts after the scheme word, and the middle one is
     // 64 hex. A key with no user in it fails this even if the prefix moved.
     expect(kv.puts[0]!.key).toMatch(
-      /^confirm:v2:[0-9a-f]{64}:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee$/,
+      /^confirm:v3:[0-9a-f]{64}:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee$/,
     );
   });
 

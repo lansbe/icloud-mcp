@@ -80,6 +80,11 @@ function soon(offsetSeconds = 300): number {
 function payload(overrides: Partial<ConfirmPayload> = {}): ConfirmPayload {
   return {
     v: CONFIRM_VERSION,
+    // The target this confirmation names. Every case built on this helper is a
+    // DAV object case, and a case about another target writes its own literal
+    // rather than overriding this one — a payload's field set and its
+    // discriminator have to agree, so there is nothing here to override.
+    t: "dav",
     k: "update",
     j: "11111111-2222-3333-4444-555555555555",
     c: "https://p00-caldav.icloud.example/1234567890/calendars/work/",
@@ -240,7 +245,7 @@ describe("the confirmation token's wire format", () => {
     const original = payload();
     const token = await mintConfirmation(original, SECRET);
 
-    expect(await verifyConfirmation(token, SECRET, USER)).toEqual(original);
+    expect(await verifyConfirmation(token, SECRET, USER, "dav")).toEqual(original);
   });
 
   it("round-trips a create's null etag and an occurrence's recurrence id", async () => {
@@ -256,6 +261,7 @@ describe("the confirmation token's wire format", () => {
         await mintConfirmation(created, SECRET),
         SECRET,
         USER,
+        "dav",
       ),
     ).toEqual(created);
     expect(
@@ -263,6 +269,7 @@ describe("the confirmation token's wire format", () => {
         await mintConfirmation(occurrence, SECRET),
         SECRET,
         USER,
+        "dav",
       ),
     ).toEqual(occurrence);
   });
@@ -278,7 +285,7 @@ describe("the confirmation token cannot be forged or tampered with", () => {
     const [payloadPart, macPart] = token.split(".");
 
     await expect(
-      verifyConfirmation(`${flip(payloadPart, 4)}.${macPart}`, SECRET, USER),
+      verifyConfirmation(`${flip(payloadPart, 4)}.${macPart}`, SECRET, USER, "dav"),
     ).rejects.toBeInstanceOf(ConfirmationInvalidError);
   });
 
@@ -287,7 +294,7 @@ describe("the confirmation token cannot be forged or tampered with", () => {
     const [payloadPart, macPart] = token.split(".");
 
     await expect(
-      verifyConfirmation(`${payloadPart}.${flip(macPart, 4)}`, SECRET, USER),
+      verifyConfirmation(`${payloadPart}.${flip(macPart, 4)}`, SECRET, USER, "dav"),
     ).rejects.toBeInstanceOf(ConfirmationInvalidError);
   });
 
@@ -295,7 +302,7 @@ describe("the confirmation token cannot be forged or tampered with", () => {
     const token = await mintConfirmation(payload(), SECRET);
 
     await expect(
-      verifyConfirmation(token, OTHER_SECRET, USER),
+      verifyConfirmation(token, OTHER_SECRET, USER, "dav"),
     ).rejects.toBeInstanceOf(ConfirmationInvalidError);
   });
 
@@ -308,7 +315,7 @@ describe("the confirmation token cannot be forged or tampered with", () => {
     ["a separator and nothing else", "."],
     ["a MAC part outside the alphabet", "aGVsbG8.!!!!"],
   ])("refuses a token with %s", async (_label, token) => {
-    await expect(verifyConfirmation(token, SECRET, USER)).rejects.toBeInstanceOf(
+    await expect(verifyConfirmation(token, SECRET, USER, "dav")).rejects.toBeInstanceOf(
       ConfirmationInvalidError,
     );
   });
@@ -321,7 +328,7 @@ describe("the confirmation token cannot be forged or tampered with", () => {
       SECRET,
     );
 
-    await expect(verifyConfirmation(token, SECRET, USER)).rejects.toBeInstanceOf(
+    await expect(verifyConfirmation(token, SECRET, USER, "dav")).rejects.toBeInstanceOf(
       ConfirmationInvalidError,
     );
   });
@@ -357,7 +364,7 @@ describe("the confirmation token cannot be forged or tampered with", () => {
       );
 
       await expect(
-        verifyConfirmation(token, SECRET, USER),
+        verifyConfirmation(token, SECRET, USER, "dav"),
       ).rejects.toBeInstanceOf(ConfirmationInvalidError);
     }
   });
@@ -369,14 +376,116 @@ describe("the confirmation token cannot be forged or tampered with", () => {
     // wrong with this token is who it was minted for.
     const token = await mintConfirmation(payload({ u: OTHER_USER }), SECRET);
 
-    await expect(verifyConfirmation(token, SECRET, USER)).rejects.toBeInstanceOf(
+    await expect(verifyConfirmation(token, SECRET, USER, "dav")).rejects.toBeInstanceOf(
       ConfirmationInvalidError,
     );
     // And the same token still works for the user it WAS minted for, which is
     // the half that stops the check passing by refusing everybody.
-    expect(await verifyConfirmation(token, SECRET, OTHER_USER)).toMatchObject({
+    expect(await verifyConfirmation(token, SECRET, OTHER_USER, "dav")).toMatchObject({
       u: OTHER_USER,
     });
+  });
+});
+
+// ===========================================================================
+// The target discriminator
+// ===========================================================================
+
+describe("a confirmation names the target it was minted for", () => {
+  it("round-trips an object confirmation read back with the object target expected", async () => {
+    // The tracer's own round trip, written as its own case rather than left to
+    // the general one above: the general case would still pass if the
+    // discriminator were silently dropped on the way through, because the
+    // payload it compares against is the one it minted.
+    const original = payload();
+    const token = await mintConfirmation(original, SECRET);
+
+    const read = await verifyConfirmation(token, SECRET, USER, "dav");
+
+    expect(read).toEqual(original);
+    expect(read.t).toBe("dav");
+  });
+
+  it("refuses an object confirmation read back with the mail target expected", async () => {
+    const token = await mintConfirmation(payload(), SECRET);
+
+    await expect(
+      verifyConfirmation(token, SECRET, USER, "mail"),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it("spends nothing when it refuses a target mismatch", async () => {
+    // The position of the check is the claim, and this is what measures it.
+    // `verifyConfirmation` is handed no KV namespace at all, so a mismatch
+    // cannot reach the one-time slot — and the proof is that the slot is still
+    // there to be claimed afterwards. A check that had drifted below the
+    // reservation would leave this token already spent and the caller it was
+    // minted for previewing again.
+    const live = payload();
+    const kv = fakeKv();
+
+    await expect(
+      verifyConfirmation(await mintConfirmation(live, SECRET), SECRET, USER, "mail"),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+
+    await reserveConfirmation(kv.binding, USER, live.j, live.x);
+    expect(kv.puts.length, "the refused verify burnt the slot").toBe(1);
+  });
+
+  it("refuses a token with no target field at all", async () => {
+    // A payload this server signed under the build BEFORE the discriminator
+    // existed. The seal verifies; the only thing wrong with it is that nothing
+    // in it says which kind of resource it names. Sealed by hand rather than
+    // minted, because the minter takes a payload of the CURRENT type.
+    const targetless: Record<string, unknown> = { ...payload() };
+    delete targetless.t;
+
+    const token = await sealAs(
+      toBase64Url(TOKEN_ENCODER.encode(JSON.stringify(targetless))),
+      SECRET,
+    );
+
+    await expect(
+      verifyConfirmation(token, SECRET, USER, "dav"),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it("refuses a version 2 token outright, discriminator or no discriminator", async () => {
+    // Version 2 is the format this build REPLACED, and the claim is the same
+    // one the version-1 case above makes one version later: the strict
+    // inequality is what kills every preview in flight at the deploy, and no
+    // compatibility arm admits one back.
+    //
+    // Two tokens, because a v2 token in the wild has no `t` and would also be
+    // refused by the payload predicate — a case resting on whichever check ran
+    // first would prove less than it looks. The second carries a valid
+    // discriminator with the version set back, so only the version comparison
+    // can refuse it.
+    const withoutTarget: Record<string, unknown> = { ...payload(), v: 2 };
+    delete withoutTarget.t;
+    const withTarget: Record<string, unknown> = { ...payload(), v: 2 };
+
+    for (const stale of [withoutTarget, withTarget]) {
+      const token = await sealAs(
+        toBase64Url(TOKEN_ENCODER.encode(JSON.stringify(stale))),
+        SECRET,
+      );
+
+      await expect(
+        verifyConfirmation(token, SECRET, USER, "dav"),
+      ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+    }
+  });
+
+  it("keeps the signed-in user immediately after the versioned prefix", async () => {
+    // The `store-key-without-a-user` rule's property, asserted here as well as
+    // in `test/key-shapes.test.ts`, because the prefix moved this phase and a
+    // namespace bump is exactly the edit that flattens a key by accident.
+    const kv = fakeKv();
+
+    await reserveConfirmation(kv.binding, USER, "target-arm-key", soon());
+
+    expect(kv.puts[0]!.key).toBe(`confirm:v3:${USER}:target-arm-key`);
   });
 });
 
@@ -390,7 +499,7 @@ describe("the confirmation dies at the second its payload names", () => {
     freezeClockAt(now);
     const token = await mintConfirmation(payload({ x: now + 1 }), SECRET);
 
-    expect(await verifyConfirmation(token, SECRET, USER)).toMatchObject({
+    expect(await verifyConfirmation(token, SECRET, USER, "dav")).toMatchObject({
       x: now + 1,
     });
   });
@@ -402,7 +511,7 @@ describe("the confirmation dies at the second its payload names", () => {
 
     // `>=` means expired: the boundary second belongs to the dead side, so a
     // token can never be spent in the second it names.
-    await expect(verifyConfirmation(token, SECRET, USER)).rejects.toBeInstanceOf(
+    await expect(verifyConfirmation(token, SECRET, USER, "dav")).rejects.toBeInstanceOf(
       ConfirmationInvalidError,
     );
   });
@@ -412,7 +521,7 @@ describe("the confirmation dies at the second its payload names", () => {
     freezeClockAt(now);
     const token = await mintConfirmation(payload({ x: now - 1 }), SECRET);
 
-    await expect(verifyConfirmation(token, SECRET, USER)).rejects.toBeInstanceOf(
+    await expect(verifyConfirmation(token, SECRET, USER, "dav")).rejects.toBeInstanceOf(
       ConfirmationInvalidError,
     );
   });
@@ -441,7 +550,7 @@ describe("an unusable signing secret fails closed on BOTH paths", () => {
     // loses its key must refuse everything, not accept what it signed earlier.
     const token = await mintConfirmation(payload(), SECRET);
 
-    await expect(verifyConfirmation(token, secret, USER)).rejects.toBeInstanceOf(
+    await expect(verifyConfirmation(token, secret, USER, "dav")).rejects.toBeInstanceOf(
       ConfirmationInvalidError,
     );
   });
@@ -497,14 +606,14 @@ describe("every refusal on the verify path answers identically", () => {
     const [payloadPart, macPart] = token.split(".");
 
     return [
-      ["an unusable signing key", verifyConfirmation(token, undefined, USER)],
+      ["an unusable signing key", verifyConfirmation(token, undefined, USER, "dav")],
       [
         "a token that is not two encoded parts",
-        verifyConfirmation("nodot", SECRET, USER),
+        verifyConfirmation("nodot", SECRET, USER, "dav"),
       ],
       [
         "a seal that does not verify",
-        verifyConfirmation(`${payloadPart}.${flip(macPart, 2)}`, SECRET, USER),
+        verifyConfirmation(`${payloadPart}.${flip(macPart, 2)}`, SECRET, USER, "dav"),
       ],
       [
         "a payload that is not JSON",
@@ -512,6 +621,7 @@ describe("every refusal on the verify path answers identically", () => {
           await sealAs(toBase64Url(TOKEN_ENCODER.encode("not json")), SECRET),
           SECRET,
           USER,
+          "dav",
         ),
       ],
       [
@@ -523,6 +633,7 @@ describe("every refusal on the verify path answers identically", () => {
           ),
           SECRET,
           USER,
+          "dav",
         ),
       ],
       [
@@ -531,6 +642,7 @@ describe("every refusal on the verify path answers identically", () => {
           await mintConfirmation(payload({ x: now - 1 }), SECRET),
           SECRET,
           USER,
+          "dav",
         ),
       ],
       [
@@ -539,6 +651,7 @@ describe("every refusal on the verify path answers identically", () => {
           await mintConfirmation(payload({ u: OTHER_USER }), SECRET),
           SECRET,
           USER,
+          "dav",
         ),
       ],
     ];
@@ -591,7 +704,7 @@ describe("every refusal on the verify path answers identically", () => {
   }
 
   it("names nothing about the check that failed", async () => {
-    const err = (await verifyConfirmation("nodot", SECRET, USER).catch(
+    const err = (await verifyConfirmation("nodot", SECRET, USER, "dav").catch(
       (caught: unknown) => caught,
     )) as Error;
 
@@ -882,7 +995,7 @@ describe("the single-use reservation", () => {
     await reserveConfirmation(kv.binding, USER, "value-shape", soon());
 
     expect(kv.puts[0].value).toBe("1");
-    expect(CONFIRM_KEY_PREFIX).toBe("confirm:v2:");
+    expect(CONFIRM_KEY_PREFIX).toBe("confirm:v3:");
   });
 
   it("refuses a spent token with the same error every other cause raises", async () => {
@@ -898,7 +1011,7 @@ describe("the single-use reservation", () => {
       "same-answer",
       soon(),
     ).catch((err: unknown) => err)) as Error;
-    const forged = (await verifyConfirmation("nodot", SECRET, USER).catch(
+    const forged = (await verifyConfirmation("nodot", SECRET, USER, "dav").catch(
       (err: unknown) => err,
     )) as Error;
 
@@ -932,7 +1045,7 @@ describe("a confirmation and an event id cannot be used for one another", () => 
     const eventId = encodeEventId(ref);
 
     await expect(
-      verifyConfirmation(eventId, SECRET, USER),
+      verifyConfirmation(eventId, SECRET, USER, "dav"),
     ).rejects.toBeInstanceOf(
       ConfirmationInvalidError,
     );
@@ -977,7 +1090,7 @@ describe("the refusal is translated at the DAV tree's own boundary", () => {
    */
   async function davBoundary(token: string): Promise<ConfirmPayload> {
     try {
-      return await verifyConfirmation(token, SECRET, USER);
+      return await verifyConfirmation(token, SECRET, USER, "dav");
     } catch {
       throw new DavConfirmationError();
     }

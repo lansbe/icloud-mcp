@@ -1823,6 +1823,7 @@ describe("the calendar_commit write", () => {
     const expired = await mintConfirmation(
       {
         v: CONFIRM_VERSION,
+        t: "dav",
         k: "update",
         j: crypto.randomUUID(),
         c: CALENDAR_URL,
@@ -1847,6 +1848,7 @@ describe("the calendar_commit write", () => {
     const wrongKind = await mintConfirmation(
       {
         v: CONFIRM_VERSION,
+        t: "dav",
         k: "delete",
         j: crypto.randomUUID(),
         c: CALENDAR_URL,
@@ -2762,6 +2764,7 @@ describe("the calendar_commit delete", () => {
         const confirmToken = await mintConfirmation(
           {
             v: CONFIRM_VERSION,
+            t: "dav",
             k: kind,
             j: crypto.randomUUID(),
             c: CALENDAR_URL,
@@ -2968,6 +2971,7 @@ describe("the calendar_commit delete", () => {
     const mismatched = await mintConfirmation(
       {
         v: CONFIRM_VERSION,
+        t: "dav",
         k: "update",
         j: crypto.randomUUID(),
         c: CALENDAR_URL,
@@ -3020,6 +3024,7 @@ describe("the calendar_commit delete", () => {
     const token = await mintConfirmation(
       {
         v: CONFIRM_VERSION,
+        t: "dav",
         k: "create",
         j: crypto.randomUUID(),
         c: CALENDAR_URL,
@@ -3110,6 +3115,7 @@ describe("the calendar_commit delete", () => {
     const expired = await mintConfirmation(
       {
         v: CONFIRM_VERSION,
+        t: "dav",
         k: "delete",
         j: crypto.randomUUID(),
         c: CALENDAR_URL,
@@ -4869,6 +4875,7 @@ describe("an attendee list this server read cannot reach one it writes", () => {
     const token = await mintConfirmation(
       {
         v: CONFIRM_VERSION,
+        t: "dav",
         k: "update",
         j: crypto.randomUUID(),
         c: CALENDAR_URL,
