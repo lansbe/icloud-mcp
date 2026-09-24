@@ -116,12 +116,23 @@ import { TOKEN_DECODER, TOKEN_ENCODER, fromBase64Url, toBase64Url } from "./toke
  *
  * **Every cause answers identically, and that is a security property rather
  * than tidiness.** An unusable signing key, a token that is not two encoded
- * parts, a seal that does not verify, a payload that is not JSON, a version
- * this build does not know, a lifetime that has run out, a change that does not
- * match what was confirmed, and one already spent — all of them raise this, with
- * the same label and the same shape. A distinguishable refusal is an oracle for
- * the confirmation's internal structure, and the commonest way to reach one is
- * a model probing the format.
+ * parts, a seal that does not verify, a payload that is not JSON, a payload
+ * whose shape this build will not read, a version this build does not know, a
+ * confirmation minted for another user, a target this caller did not expect, a
+ * lifetime that has run out, a change that does not match what was confirmed,
+ * and one already spent — all of them raise this, with the same label and the
+ * same shape. A distinguishable refusal is an oracle for the confirmation's
+ * internal structure, and the commonest way to reach one is a model probing the
+ * format.
+ *
+ * That list is deliberately written out and deliberately carries no count. It
+ * was short by two for a phase — the wrong user and the wrong target, each
+ * added by the phase that added the check — and a count beside it would have
+ * been a second thing to go stale rather than a guard against the first. The
+ * enumeration that is actually asserted lives in
+ * `test/confirm.test.ts`'s `EXPECTED_CAUSE_LABELS`, which fails when a produced
+ * cause and a named one stop matching. Read this as the argument and read that
+ * as the inventory.
  */
 export class ConfirmationInvalidError extends Error {
   readonly kind = "confirmation-invalid" as const;

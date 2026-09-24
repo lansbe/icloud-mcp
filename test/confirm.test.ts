@@ -969,25 +969,30 @@ describe("the HMAC key is write-only", () => {
 
 describe("every refusal on the verify path answers identically", () => {
   /**
-   * The seven causes `verifyConfirmation` can raise, LISTED BY NAME.
+   * Every cause `verifyConfirmation` can raise, LISTED BY NAME.
    *
    * Named rather than generated, on the same non-vacuity discipline
    * `test/dav-tools.test.ts`'s stranger-authored walk uses: a helper that
    * quietly stopped producing one of these would otherwise make the loop below
-   * run over six and still pass. The count assertion is what says so.
+   * run over one fewer and still pass. `EXPECTED_CAUSE_LABELS` is what says so,
+   * and it is a written-out list of names rather than a count for a reason this
+   * repository records elsewhere — a number written in prose beside the code it
+   * counts goes stale silently, and this docstring and the case title below both
+   * said "seven" for a whole phase after the eighth cause landed.
    *
-   * The seventh is the wrong user, and it is on this list rather than only in
-   * a case of its own for a reason the others share: a refusal that named its
-   * cause would tell whoever probed the format which guess was well formed.
-   * The user check is the one most worth proving that about, because it is the
-   * one an attacker is actively guessing at.
+   * Two of these are on the list rather than only in cases of their own, for a
+   * reason the rest share: a refusal that named its cause would tell whoever
+   * probed the format which guess was well formed. The wrong user is the one
+   * most worth proving that about, because it is the one an attacker is actively
+   * guessing at. The wrong target is the one most recently added, and a new
+   * refusal arm is exactly where a distinguishable refusal gets in.
    *
-   * These are the seven the NEUTRAL module owns. The DAV commit handler's own
+   * These are the ones the NEUTRAL module owns. The DAV commit handler's own
    * list — which adds a change that does not match and one already spent, and
    * folds several of these together — is a different list reaching the same
    * answer; `reserveConfirmation` is asserted against that answer separately.
    */
-  async function sevenCauses(): Promise<[string, Promise<unknown>][]> {
+  async function everyCause(): Promise<[string, Promise<unknown>][]> {
     const now = 1_800_000_000;
     freezeClockAt(now);
     const token = await mintConfirmation(payload(), SECRET);
@@ -1042,21 +1047,41 @@ describe("every refusal on the verify path answers identically", () => {
           "dav",
         ),
       ],
+      [
+        "a confirmation minted for a different target",
+        verifyConfirmation(
+          await mintConfirmation(payload(), SECRET),
+          SECRET,
+          USER,
+          "mail",
+        ),
+      ],
     ];
   }
 
-  it("exercises exactly the seven causes that exist, named one by one", async () => {
+  /**
+   * The same names again, as the non-vacuity guard.
+   *
+   * Written out rather than counted. A row that stopped being produced makes
+   * this array and the produced one unequal, which is the property the old
+   * `toHaveLength(7)` was reaching for — without a number that has to be
+   * remembered when a ninth arm lands.
+   */
+  const EXPECTED_CAUSE_LABELS = [
+    "an unusable signing key",
+    "a token that is not two encoded parts",
+    "a seal that does not verify",
+    "a payload that is not JSON",
+    "a version this build does not know",
+    "a lifetime that has run out",
+    "a confirmation minted for a different user",
+    "a confirmation minted for a different target",
+  ] as const;
+
+  it("exercises exactly the causes that exist, named one by one", async () => {
     const causes = await causeResults();
 
-    expect(causes.map(([label]) => label)).toEqual([
-      "an unusable signing key",
-      "a token that is not two encoded parts",
-      "a seal that does not verify",
-      "a payload that is not JSON",
-      "a version this build does not know",
-      "a lifetime that has run out",
-      "a confirmation minted for a different user",
-    ]);
+    expect(causes.map(([label]) => label)).toEqual([...EXPECTED_CAUSE_LABELS]);
     // Every one of them actually threw. A cause that resolved instead would be
     // a branch this suite believes it covers and does not.
     for (const [, err] of causes) {
@@ -1064,7 +1089,7 @@ describe("every refusal on the verify path answers identically", () => {
     }
   });
 
-  it("gives one message, one name and one property set across all seven", async () => {
+  it("gives one message, one name and one property set across every one of them", async () => {
     const causes = await causeResults();
     const errors = causes.map(([, err]) => err as Error);
 
@@ -1078,8 +1103,8 @@ describe("every refusal on the verify path answers identically", () => {
   });
 
   async function causeResults(): Promise<[string, unknown][]> {
-    const causes = await sevenCauses();
-    expect(causes).toHaveLength(7);
+    const causes = await everyCause();
+    expect(causes).toHaveLength(EXPECTED_CAUSE_LABELS.length);
 
     const settled: [string, unknown][] = [];
     for (const [label, attempt] of causes) {
@@ -1106,6 +1131,10 @@ describe("every refusal on the verify path answers identically", () => {
       "json",
       "separator",
       "secret",
+      // The two newest arms, and the two whose names would be the most useful
+      // to a caller probing which guess was well formed.
+      "user",
+      "target",
     ]) {
       expect(err.message.toLowerCase()).not.toContain(forbidden);
     }
