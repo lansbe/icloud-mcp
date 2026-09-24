@@ -1555,12 +1555,25 @@ export const CONFIRM_LINE_SCOPE = "src/";
  *      here, because neither is exported. The alternation covers them; this
  *      manifest cannot, and an export list is not a call-site list.
  *
- * What makes the regex SUFFICIENT rather than merely convenient is a fact about
- * the tree as it stands: today every export of all three declared modules is a
- * plain `function` declaration. A `const` arrow export added later would be
- * invisible to the reader and would therefore never be reported as unmanifested
- * -- a gap, not an alarm. A rule believed to prove more than it does is worse
- * than one whose limits are written down.
+ * What makes the regex SUFFICIENT rather than merely convenient is a narrower
+ * fact about the tree as it stands: every export of all three declared modules
+ * that is a FUNCTION is a plain `function` declaration. VALUE exports do exist
+ * -- `MAX_RANGE_DAYS`, `MAX_SLOT_RANGE_DAYS`, `SLOT_GRANULARITY_MINUTES` and
+ * `UNOBSERVED_DELIVERY` in `src/dav/calendar.ts`, `CONTACT_TERM_MAX_LENGTH` in
+ * `src/dav/contacts.ts` -- and the reader does not see any of them, which is
+ * correct, because a number is not an entry point and a manifest entry for one
+ * would be a disposition nobody can act on. A function bound to a `const` arrow
+ * would be invisible in exactly the same way and would NOT be correct, which is
+ * gap 2 above.
+ *
+ * This paragraph claimed the wider fact -- that every export of the declared
+ * modules is a plain `function` declaration -- and that was false the day it was
+ * written, by five exports. A reader sent to verify it finds it false in thirty
+ * seconds, and both conclusions available from that are wrong: either "the
+ * manifest is broken and missing five entries", or "const exports must be
+ * covered somehow, since this says there are none". A rule believed to prove
+ * more than it does is worse than one whose limits are written down -- and the
+ * sentence stating the limit is the last place that can afford to be wrong.
  *
  * TWO ABSENCES, RECORDED AS DECISIONS RATHER THAN LEFT TO BE RE-DERIVED.
  * `src/dav/discovery.ts` and `src/dav/transport.ts` both export names that ARE
