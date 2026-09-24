@@ -28,7 +28,12 @@ import {
   reserveConfirmation,
   verifyConfirmation,
 } from "../src/confirm";
-import type { ConfirmPayload, NormalizedChange } from "../src/confirm";
+import type {
+  ConfirmPayload,
+  ConfirmTarget,
+  DavCollectionConfirmPayload,
+  NormalizedChange,
+} from "../src/confirm";
 import { DavConfirmationError, davToErrorCategory } from "../src/dav/errors";
 import { decodeEventId, encodeEventId } from "../src/dav/ids";
 import { TOKEN_ENCODER, fromBase64Url, toBase64Url } from "../src/tokens";
@@ -486,6 +491,232 @@ describe("a confirmation names the target it was minted for", () => {
     await reserveConfirmation(kv.binding, USER, "target-arm-key", soon());
 
     expect(kv.puts[0]!.key).toBe(`confirm:v3:${USER}:target-arm-key`);
+  });
+});
+
+// ===========================================================================
+// The collection arm
+// ===========================================================================
+
+/** The home set a collection in this suite lives under. */
+const HOME_SET = "https://p00-caldav.icloud.example/1234567890/calendars/";
+
+/** The collection itself. */
+const COLLECTION_URL =
+  "https://p00-caldav.icloud.example/1234567890/calendars/work/";
+
+/**
+ * The binding a preview observed on that collection.
+ *
+ * A quoted opaque string, because a `CS:getctag` is one and a `sync-token` is a
+ * URI — neither is a value this module reads, and both go in this slot. What
+ * matters to every case below is only that it is a NON-EMPTY string.
+ */
+const COLLECTION_BINDING = '"ctag-observed-by-the-preview"';
+
+function collectionPayload(
+  overrides: Partial<DavCollectionConfirmPayload> = {},
+): DavCollectionConfirmPayload {
+  return {
+    v: CONFIRM_VERSION,
+    t: "col",
+    k: "delete",
+    j: "66666666-7777-8888-9999-aaaaaaaaaaaa",
+    c: HOME_SET,
+    o: COLLECTION_URL,
+    b: COLLECTION_BINDING,
+    h: "cGxhY2Vob2xkZXItY2hhbmdlLWhhc2g",
+    x: soon(),
+    u: USER,
+    ...overrides,
+  };
+}
+
+/**
+ * Build a payload the TYPE would refuse, so the structural predicate can be
+ * measured on its own.
+ *
+ * Every field-set case below is about what the runtime predicate does with a
+ * shape TypeScript already forbids — a collection carrying an ETag, an object
+ * carrying a binding. The type is the first layer and the predicate is the
+ * second, and a second layer can only be measured by handing it something the
+ * first would never have produced. That is what this cast is for, and it is
+ * confined to this helper so no case has to spell one out.
+ */
+function malformed(fields: Record<string, unknown>): ConfirmPayload {
+  return fields as unknown as ConfirmPayload;
+}
+
+describe("a collection confirmation cannot reach an ETag at all", () => {
+  it("round-trips a collection confirmation with its binding intact", async () => {
+    const original = collectionPayload();
+
+    const read = await verifyConfirmation(
+      await mintConfirmation(original, SECRET),
+      SECRET,
+      USER,
+      "col",
+    );
+
+    expect(read).toEqual(original);
+    expect(read.b).toBe(COLLECTION_BINDING);
+  });
+
+  it("refuses a collection payload carrying an ETag byte-identical to its binding", async () => {
+    // The adjacency case, and the one a reader assumes is harmless. The two
+    // strings being the same does not make the shape legal: a payload carrying
+    // both fields satisfies the object arm too, and the arm that reads it is
+    // whichever one asked first. Refusing it here is what stops a collection
+    // being committed as an object.
+    const both = malformed({
+      ...collectionPayload(),
+      e: COLLECTION_BINDING,
+    });
+
+    await expect(
+      verifyConfirmation(await mintConfirmation(both, SECRET), SECRET, USER, "col"),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it("refuses a collection payload carrying an ETag unlike its binding", async () => {
+    const both = malformed({
+      ...collectionPayload(),
+      e: '"a-completely-different-etag"',
+    });
+
+    await expect(
+      verifyConfirmation(await mintConfirmation(both, SECRET), SECRET, USER, "col"),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it("refuses an object payload carrying a collection binding", async () => {
+    // The other direction, and it has to be asserted separately: a predicate
+    // that only checked the collection arm for a stray `e` would let an object
+    // token smuggle a binding through and a later build read it.
+    const both = malformed({ ...payload(), b: COLLECTION_BINDING });
+
+    await expect(
+      verifyConfirmation(await mintConfirmation(both, SECRET), SECRET, USER, "dav"),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it("refuses a collection payload whose binding is the empty string", async () => {
+    // Empty is the shape a binding reaches by accident — a header that was not
+    // there, a property the server answered blank. It is not "no binding": it
+    // is a binding that compares equal to the next empty one.
+    const empty = collectionPayload({ b: "" });
+
+    await expect(
+      verifyConfirmation(await mintConfirmation(empty, SECRET), SECRET, USER, "col"),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it("admits no null binding, and the TYPE is what refuses it", async () => {
+    // The first layer, asserted as a compile error rather than as prose. Remove
+    // the annotation below and `npm run typecheck` goes red on an unused
+    // `@ts-expect-error`; widen `b` to `string | null` and it goes red because
+    // the expected error stopped happening. Either way the claim cannot rot
+    // quietly.
+    const unbound = collectionPayload({
+      // @ts-expect-error — `b` is `string`, never `string | null` and never
+      // optional. `unbound` has to be unreachable rather than discouraged.
+      b: null,
+    });
+
+    // And the second layer, for a null that arrived through a cast anyway.
+    await expect(
+      verifyConfirmation(await mintConfirmation(unbound, SECRET), SECRET, USER, "col"),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it("mints two spendable confirmations for the same collection, and spends each once", async () => {
+    // Idempotency, in the only sense this module has one. Two previews of the
+    // same collection are two separate authorisations: they differ in `j`, so
+    // each has its own slot, and spending one must leave the other alone.
+    const first = collectionPayload({ j: crypto.randomUUID() });
+    const second = collectionPayload({ j: crypto.randomUUID() });
+    expect(first.j).not.toBe(second.j);
+
+    const kv = fakeKv();
+    await reserveConfirmation(kv.binding, USER, first.j, first.x);
+
+    // The other one is untouched.
+    await reserveConfirmation(kv.binding, USER, second.j, second.x);
+
+    // And neither can go twice.
+    await expect(
+      reserveConfirmation(kv.binding, USER, first.j, first.x),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+});
+
+// ===========================================================================
+// Every arm against every other arm
+// ===========================================================================
+
+/**
+ * Every arm of the union, each with the field set that belongs to it.
+ *
+ * Driven as an ordered-pair table below rather than asserted arm by arm,
+ * because the claim is about the PREDICATE's structure and not about any one
+ * arm: no payload may satisfy two. An arm-by-arm suite would still pass if the
+ * predicate accepted a field set under the first arm it happened to test, and
+ * "the first arm it happened to test" is exactly the thing a later edit
+ * reorders without noticing.
+ *
+ * A new arm adds one row here and the table grows quadratically on its own.
+ */
+const ARMS: { target: ConfirmTarget; build: () => ConfirmPayload }[] = [
+  { target: "dav", build: () => payload() },
+  { target: "col", build: () => collectionPayload() },
+];
+
+describe("a payload satisfies at most one arm, whatever order the predicate tries them in", () => {
+  it("accepts each arm's field set under its own discriminator", async () => {
+    for (const arm of ARMS) {
+      const built = arm.build();
+
+      expect(
+        await verifyConfirmation(
+          await mintConfirmation(built, SECRET),
+          SECRET,
+          USER,
+          arm.target,
+        ),
+        `${arm.target} refused its own field set`,
+      ).toEqual(built);
+    }
+  });
+
+  it("refuses each arm's field set under at most one arm, every ordered pair", async () => {
+    let pairs = 0;
+
+    for (const arm of ARMS) {
+      for (const other of ARMS) {
+        if (other.target === arm.target) continue;
+        pairs += 1;
+
+        // The first arm's fields, relabelled with the second arm's
+        // discriminator. Nothing else changes, so the only question the
+        // predicate is being asked is whether the field set belongs to the arm
+        // the label names.
+        const relabelled = malformed({ ...arm.build(), t: other.target });
+
+        await expect(
+          verifyConfirmation(
+            await mintConfirmation(relabelled, SECRET),
+            SECRET,
+            USER,
+            other.target,
+          ),
+          `${arm.target}'s field set was accepted as ${other.target}`,
+        ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+      }
+    }
+
+    // Non-vacuity: a table that quietly stopped producing pairs would pass the
+    // loop above by running it zero times.
+    expect(pairs).toBe(ARMS.length * (ARMS.length - 1));
   });
 });
 
