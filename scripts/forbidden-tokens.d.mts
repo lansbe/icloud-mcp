@@ -104,6 +104,9 @@ export declare const ADDRESS_HASH_SCOPE: string;
 export declare const PRINCIPAL_CONSTRUCTOR: RegExp;
 export declare const PRINCIPAL_CONSTRUCTOR_OWNERS: readonly string[];
 export declare const PRINCIPAL_CONSTRUCTOR_SCOPE: string;
+export declare const CONFIRM_LINE_COMPOSER: RegExp;
+export declare const CONFIRM_LINE_OWNER: string;
+export declare const CONFIRM_LINE_SCOPE: string;
 export declare const OWNERSHIP_VIOLATION_IDS: readonly string[];
 
 /** One declared DAV write module: why it is declared, and a disposition for
@@ -143,6 +146,9 @@ export declare function checkAddressHashOwnership(
 ): Violation[];
 export declare function checkPrincipalConstructorOwnership(
   callers: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function checkConfirmLineOwnership(
+  composers: ReadonlyArray<OwnershipMatch>,
 ): Violation[];
 
 /** Every name `contents` exports as a `function` declaration, in source order. */
