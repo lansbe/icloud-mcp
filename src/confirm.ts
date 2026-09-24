@@ -8,6 +8,19 @@
 // an arm is a FIELD SHAPE, not protocol knowledge. This module issues no
 // request, reads no resource, and never inspects a value it seals.
 //
+// **The first clause of that paragraph has been NARROWED, and the narrowing is
+// written here rather than left for a reader to notice.** This module now knows
+// a closed list of six resource WORDS — see `ConfirmationNoun` — because
+// CONF-04 puts the human-facing sentence in one place and a sentence has to
+// name its subject. So "nothing here knows what a calendar is" is no longer
+// literally true: this module knows that "calendar" is one of the words it may
+// print. What is still true is the part that was ever load-bearing. It issues
+// no request, reads no resource, resolves no identifier, and holds no opinion
+// about what a calendar CONTAINS or how one is addressed; the nouns are a
+// vocabulary for a sentence, not protocol knowledge, and a caller cannot widen
+// them, which is what keeps a caller-chosen word out of the line. A bound that
+// is quietly false is worse than a narrower one that is true.
+//
 // **Why the source root rather than inside a protocol tree.** `V2-MAIL-02`
 // ("mail delete and move behind the same preview-then-commit safety") is
 // already on the books, so the NEXT consumer of this module is a mail delete,
@@ -977,6 +990,192 @@ export async function changeHashMatches(
     crypto.subtle.digest("SHA-256", TOKEN_ENCODER.encode(b)),
   ]);
   return crypto.subtle.timingSafeEqual(left, right);
+}
+
+/**
+ * The resource words this server will ever name in a composed line.
+ *
+ * A CLOSED vocabulary rather than a caller-supplied string, on `changedFields`'
+ * own precedent one module over: a noun a caller could choose is not a noun, it
+ * is content — and content in the composed line is exactly the thing the line
+ * exists to stop a caller writing. Six words cover every consumer on the books:
+ * the calendar object and the collection, the contact, the message and the
+ * draft, and the reminder.
+ */
+export type ConfirmationNoun =
+  | "event"
+  | "calendar"
+  | "contact"
+  | "message"
+  | "draft"
+  | "reminder";
+
+/**
+ * Which way a composed line faces: what a commit WOULD do, or what it DID.
+ *
+ * Two literals rather than a boolean, because `past: false` at a call site reads
+ * as a fact about the world rather than as a choice about a sentence.
+ */
+export type ConfirmationTense = "would" | "did";
+
+/**
+ * The resolved struct the composer takes.
+ *
+ * Every optional value is `null` rather than absent, for `NormalizedChange`'s
+ * own stated reason: an absent key and an explicit null are different bytes for
+ * the same meaning, and a field that can be ABSENT is a field a later build
+ * reads as `undefined` in the slot naming how many people are about to be told.
+ *
+ * It is a RESOLVED struct rather than a bag of tool arguments, on
+ * `NormalizedChange`'s other reason: every count here must be the number the
+ * write actually produces, which means it comes off the caller's own walk of the
+ * resource and never off the request. A composer handed raw arguments would
+ * cheerfully state the number somebody asked for.
+ */
+export interface ConfirmationSummary {
+  /** The operation, matching the confirmation's own `k`. */
+  kind: ConfirmKind;
+  /** The resource word, from the closed vocabulary. */
+  noun: ConfirmationNoun;
+  /** The resource's own name, or `null` when there is none to give. */
+  name: string | null;
+  /** What disappears alongside, or `null` when nothing does. */
+  alsoRemoved: { count: number; noun: ConfirmationNoun } | null;
+  /** How many fields the write moves, or `null` when it moves none. */
+  fieldCount: number | null;
+  /** How many people the write tells, or `null` when it tells nobody. */
+  recipientCount: number | null;
+}
+
+/**
+ * The verb, per operation and per tense.
+ *
+ * The WHOLE tense lives here and nowhere else, which is what makes the two lines
+ * for one summary comparable: strip the leading verb and the remainders are
+ * byte-identical. Every clause below is a participle or a tense-free statement
+ * for that reason, and a second inflected word added later would quietly break
+ * the property a test asserts by comparing the two strings.
+ */
+const CONFIRMATION_VERBS: Record<
+  ConfirmKind,
+  Record<ConfirmationTense, string>
+> = {
+  create: { would: "Creating", did: "Created" },
+  update: { would: "Overwriting", did: "Overwrote" },
+  delete: { would: "Deleting", did: "Deleted" },
+};
+
+/**
+ * The plural of each noun in the vocabulary.
+ *
+ * A closed table rather than a suffix rule, even though all six take the same
+ * letter today. A rule would be this module claiming an opinion about English,
+ * and the seventh noun is the one that would break it silently.
+ */
+const CONFIRMATION_PLURALS: Record<ConfirmationNoun, string> = {
+  event: "events",
+  calendar: "calendars",
+  contact: "contacts",
+  message: "messages",
+  draft: "drafts",
+  reminder: "reminders",
+};
+
+/**
+ * The irreversible consequence, per operation.
+ *
+ * Tense-free by construction, for `CONFIRMATION_VERBS`' reason: each of these
+ * reads identically after "Deleting" and after "Deleted".
+ */
+const CONFIRMATION_CONSEQUENCES: Record<ConfirmKind, string> = {
+  create: "Undoing it is a separate, explicit request.",
+  update: "The values it held before cannot be recovered.",
+  delete: "This cannot be undone.",
+};
+
+/**
+ * What a write tells people, said once and overriding the operation's own
+ * consequence, because it is the one that cannot be walked back at all.
+ */
+const INVITATION_CONSEQUENCE = "An invitation cannot be unsent.";
+
+/**
+ * The one human-facing sentence a preview and a commit each carry.
+ *
+ * **The property that matters: the sentence the user reads is written by this
+ * server and not by the model, so a truthful commit cannot be preceded by a
+ * misleading summary without the divergence being visible to anyone reading the
+ * transcript.** The confirmation token is strong on the mechanics — user-bound,
+ * etag-bound, change-hashed, single-use — and guarantees nothing at all about
+ * what somebody was told before they agreed. This is the half that addresses
+ * that (PITFALLS #40).
+ *
+ * The ways the obvious implementation fails, in the register `changeHashOf`'s
+ * docstring sets:
+ *
+ * - **Five call sites each phrasing their own line is five chances to drift
+ *   apart**, and the drift is invisible until somebody reads two transcripts
+ *   side by side. That is why this is one function rather than a helper each
+ *   tool owns, and why a count constraint in `scripts/forbidden-tokens.mjs`
+ *   holds it at exactly one definition site — zero as much a violation as two.
+ * - **The commit line is the SAME composer with a different tense**, not a
+ *   second function that happens to agree today. A preview line and a commit
+ *   line that cannot structurally disagree is a stronger guarantee than two
+ *   that do.
+ * - **It is not a guarantee, and saying so is part of the guarantee.** The model
+ *   can still paraphrase, and nothing here can stop it. What this buys is that
+ *   divergence is VISIBLE, which is the same standard the recipient-naming
+ *   requirement already sets — and claiming more would leave a reader
+ *   over-trusting this layer.
+ * - **Counts and names are the load-bearing part, not decoration.** A line
+ *   saying "deleting a calendar" is one a misleading summary can be written
+ *   over; a line naming the calendar and the nine events going with it is not.
+ *   Which is why every count reaching here has to have come off the caller's own
+ *   walk rather than off the request.
+ *
+ * It throws nothing and refuses nothing. PITFALLS #40 is explicit that there is
+ * nothing to refuse — a response-shape requirement is satisfied by the shape
+ * being there, and a refusal invented for it would turn a missing sentence into
+ * a failed preview.
+ */
+export function composeConfirmationLine(
+  summary: ConfirmationSummary,
+  tense: ConfirmationTense,
+): string {
+  const subject =
+    summary.name === null
+      ? `the ${summary.noun}`
+      : `${summary.noun} '${summary.name}'`;
+
+  const clauses: string[] = [];
+
+  // A zero count is not a smaller version of nine, so the clause goes rather
+  // than reading "the 0 events in it" — a warning about nothing, published in
+  // the shape of a warning about something.
+  const removed = summary.alsoRemoved;
+  if (removed !== null && removed.count > 0) {
+    const word =
+      removed.count === 1 ? removed.noun : CONFIRMATION_PLURALS[removed.noun];
+    clauses.push(`along with the ${removed.count} ${word} in it`);
+  }
+
+  if (summary.fieldCount !== null && summary.fieldCount > 0) {
+    const word = summary.fieldCount === 1 ? "field" : "fields";
+    clauses.push(`changing ${summary.fieldCount} ${word}`);
+  }
+
+  const tells = summary.recipientCount !== null && summary.recipientCount > 0;
+  if (tells) {
+    const word = summary.recipientCount === 1 ? "person" : "people";
+    clauses.push(`telling ${summary.recipientCount} ${word}`);
+  }
+
+  const consequence = tells
+    ? INVITATION_CONSEQUENCE
+    : CONFIRMATION_CONSEQUENCES[summary.kind];
+
+  const head = [`${CONFIRMATION_VERBS[summary.kind][tense]} ${subject}`, ...clauses];
+  return `${head.join(", ")}. ${consequence}`;
 }
 
 /**
