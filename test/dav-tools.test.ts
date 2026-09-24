@@ -7102,3 +7102,149 @@ describe("a principal that was refused reaches no DAV tool", () => {
     expect(requests, "a refused principal still sent a request").toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The server-composed line, through the tools (CONF-04, PITFALLS #40)
+//
+// The confirmation token is strong on the mechanics and guarantees nothing
+// about the sentence the user actually read, because that sentence is written
+// by the model from the preview payload — while the model is reading
+// stranger-authored content in the same context window. The residual attack is
+// not on the token: preview a real delete, describe it inaccurately, get a yes,
+// commit honestly. Every mechanical check passes.
+//
+// These cases pin the line BYTE-EXACTLY through the shipped tools rather than
+// against the composer in isolation, because what matters here is which values
+// reached it: every count must be the one this server's own walk produced, not
+// the one the request asked for.
+// ---------------------------------------------------------------------------
+
+describe("the composed line, built from this server's own counts", () => {
+  it("names the event and how many fields move, on an update preview", async () => {
+    const stub = writeDavStub();
+    await warmWrite(stub);
+
+    const { trusted, untrusted, raw } = await preview({
+      id: SIMPLE_EVENT_ID,
+      startLocal: "2026-02-10T16:00:00",
+      endLocal: "2026-02-10T17:00:00",
+    });
+
+    expect(untrusted.confirmationLine).toBe(
+      `Overwriting event '${HOSTILE_TITLE}', changing 2 fields. ` +
+        "The values it held before cannot be recovered.",
+    );
+    // The count in the line is the count in the response, which is what stops
+    // the sentence and the structure describing two different writes.
+    expect((trusted.changedFields as string[]).length).toBe(2);
+    // And the line is fenced, because it quotes the resource's own title.
+    expect("confirmationLine" in trusted).toBe(false);
+    expect(raw.trusted).not.toContain("Overwriting");
+  });
+
+  it("names the event, the occurrences going with it, and the people told", async () => {
+    const stub = bodyStub(invitedSeriesIcs());
+    await warmWrite(stub);
+
+    const { trusted, untrusted } = await deletePreview({
+      id: SERIES_EVENT_ID,
+      scope: "this-and-future",
+    });
+
+    // The occurrence count and the recipient count are both this server's own
+    // walk — `affectedOccurrences` and `recipientCount` out in the trusted half
+    // — and the line states the same two numbers rather than its own.
+    expect(trusted.affectedOccurrences).toBe(2);
+    expect(trusted.recipientCount).toBe(2);
+    expect(untrusted.confirmationLine).toBe(
+      "Deleting event 'One-to-one', along with the 2 events in it, " +
+        "telling 2 people. An invitation cannot be unsent.",
+    );
+  });
+
+  it("names the recipient count and the thing that cannot be undone, on a create", async () => {
+    const stub = writeDavStub();
+    await warmWrite(stub);
+
+    const { trusted, untrusted } = await createCall(
+      createArgs({ attendees: [{ email: GUEST_ONE, name: GUEST_ONE_NAME }] }),
+    );
+
+    expect(trusted.recipientCount).toBe(1);
+    expect(untrusted.confirmationLine).toBe(
+      `Creating event '${HOSTILE_TITLE}', telling 1 person. ` +
+        "An invitation cannot be unsent.",
+    );
+  });
+
+  it("carries a NULL line when the preview minted nothing", async () => {
+    // On `nothingMinted`'s own argument: the outcome fields describe what a
+    // commit would do, and a preview with no commit to describe has none.
+    const recurring = icsLines(
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Example Org//Synthesised Fixture//EN",
+      "BEGIN:VEVENT",
+      `UID:${SIMPLE_UID}`,
+      "DTSTAMP:20260101T120000Z",
+      "SUMMARY:Standup",
+      "DTSTART:20260210T150000Z",
+      "DTEND:20260210T151500Z",
+      "RRULE:FREQ=WEEKLY;COUNT=4",
+      "END:VEVENT",
+      "END:VCALENDAR",
+    );
+    const stub = writeDavStub({ objects: { [SIMPLE_OBJECT_PATH]: recurring } });
+    await warmWrite(stub);
+
+    const id = encodeEventId({
+      calendarUrl: CALENDAR_URL,
+      objectUrl: SIMPLE_OBJECT_URL,
+      recurrenceId: "20260210T150000Z",
+    });
+    const { trusted, untrusted } = await preview({
+      id,
+      startLocal: "2026-02-10T16:00:00",
+    });
+
+    expect(trusted.scopeRequired).toBe(true);
+    expect(trusted.confirmToken).toBeNull();
+    // Present and EMPTY rather than absent, so the key set does not vary.
+    expect("confirmationLine" in untrusted).toBe(true);
+    expect(untrusted.confirmationLine).toBeNull();
+  });
+
+  it("restates what was done, in the past tense, from the same composer", async () => {
+    const stub = bodyStub(invitedSeriesIcs());
+    await warmWrite(stub);
+
+    const previewed = await deletePreview({
+      id: SERIES_EVENT_ID,
+      scope: "this-and-future",
+    });
+
+    const result = await invokeRegistered("calendar_commit", {
+      confirmToken: String(previewed.trusted.confirmToken),
+      change: previewed.untrusted.change,
+    });
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+
+    const raw = blocks(result);
+    const untrusted = fencedObject(raw.untrusted);
+
+    expect(untrusted.confirmationLine).toBe(
+      "Deleted event 'One-to-one', along with the 2 events in it, " +
+        "telling 2 people. An invitation cannot be unsent.",
+    );
+    // **A lie at preview becomes contradicted text in the transcript.** The two
+    // lines come from one composer with one difference, and this says so by
+    // COMPARING them: the commit line is the preview line with one verb
+    // replaced, and nothing else moved.
+    const forward = String(previewed.untrusted.confirmationLine);
+    const past = String(untrusted.confirmationLine);
+    expect(forward).not.toBe(past);
+    expect(past).toBe(forward.replace("Deleting", "Deleted"));
+    // And it is fenced on this shape too.
+    expect(raw.trusted).not.toContain("Deleted event");
+  });
+});
