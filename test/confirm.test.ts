@@ -438,13 +438,23 @@ describe("a confirmation names the target it was minted for", () => {
     ).rejects.toBeInstanceOf(ConfirmationInvalidError);
   });
 
-  it("spends nothing when it refuses a target mismatch", async () => {
-    // The position of the check is the claim, and this is what measures it.
-    // `verifyConfirmation` is handed no KV namespace at all, so a mismatch
-    // cannot reach the one-time slot — and the proof is that the slot is still
-    // there to be claimed afterwards. A check that had drifted below the
-    // reservation would leave this token already spent and the caller it was
-    // minted for previewing again.
+  it("reaches no storage at all on the way to refusing a target mismatch", async () => {
+    // **What this proves, and what it deliberately does not.** It proves
+    // `verifyConfirmation` reaches no storage: it is handed no KV namespace, so
+    // the slot this test claims afterwards is untouched and claimable.
+    //
+    // It does NOT prove the POSITION of the target check, and it used to say it
+    // did. It cannot: the reservation lives in `applyCommit`
+    // (`src/mcp/tools/calendar.ts`), not here, so the assertions below stay
+    // green for every possible ordering of the checks inside this function — and
+    // stay green if the target check is deleted outright. A test that cannot
+    // fail is worse than no test, because it is counted.
+    //
+    // The position IS measured, at the handler where the reservation exists:
+    // `test/dav-tools.test.ts`'s "refuses a confirmation minted for a MAIL
+    // target" drives a mail token into `calendar_commit` and then claims that
+    // token's slot, which only succeeds while the refusal stands ahead of
+    // step 6.
     const live = payload();
     const kv = fakeKv();
 

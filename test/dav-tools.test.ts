@@ -53,6 +53,7 @@ import {
   CONFIRM_VERSION,
   changeHashOf,
   mintConfirmation,
+  reserveConfirmation,
 } from "../src/confirm";
 import type { NormalizedChange } from "../src/confirm";
 import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
@@ -3066,21 +3067,32 @@ describe("the calendar_commit delete", () => {
     // user is the caller. The ONLY thing wrong with this token is the kind of
     // resource it names.
     //
-    // Two halves. The commit refuses it, which is CONF-01. And the DAV tree's
-    // own boundary translates the neutral refusal into the confirmation-refused
+    // Three halves, and the third is the one the confirm suite structurally
+    // cannot see. The commit refuses it, which is CONF-01. The DAV tree's own
+    // boundary translates the neutral refusal into the confirmation-refused
     // category rather than letting it fall through to a connection diagnosis,
     // which is the half that decides whether the model is told to wait for the
-    // network or to stop presenting this token.
+    // network or to stop presenting this token. And the refusal SPENDS NOTHING:
+    // the target check stands ahead of the reservation, so the slot is still
+    // there to be claimed afterwards.
+    //
+    // That last claim can only be measured here. `verifyConfirmation` is handed
+    // no KV namespace at all, so a case in `test/confirm.test.ts` asserting it
+    // touched no storage is true for every possible ordering of the checks
+    // inside it and stays true if the target check is deleted. The reservation
+    // lives in `applyCommit`, which is what this drives.
     const stub = writeDavStub();
     await warmWrite(stub);
 
     const { change } = await deletePreviewFor(SIMPLE_EVENT_ID);
+    const jti = crypto.randomUUID();
+    const expiry = Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS;
     const wrongTarget = await mintConfirmation(
       {
         v: CONFIRM_VERSION,
         t: "mail",
         k: "delete",
-        j: crypto.randomUUID(),
+        j: jti,
         // A mailbox token and a UID, in the fields a DAV commit would have read
         // as a collection URL and an object URL if the discriminator were not
         // there to stop it. That is the failure this case exists to prove is
@@ -3093,7 +3105,7 @@ describe("the calendar_commit delete", () => {
         q: null,
         n: "742",
         h: await changeHashOf(change),
-        x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+        x: expiry,
         // The OWNER, so the refusal is genuinely about the target. A different
         // user would move it to the user check one line down, and the case
         // would stay green while proving nothing about the target at all.
@@ -3116,6 +3128,19 @@ describe("the calendar_commit delete", () => {
       stub.observed.length,
       "a confirmation for another protocol reached the network",
     ).toBe(0);
+
+    // The slot is UNSPENT. Claimed here for the first time, so this resolving
+    // is the proof: `reserveConfirmation` refuses a key that is already there.
+    // Move the target check below step 6 and the refused commit will have
+    // burnt this slot, and this line turns red.
+    await expect(
+      reserveConfirmation(env.CONFIRM_KV, principal.userId, jti, expiry),
+    ).resolves.toBeUndefined();
+    // And the claim above is not vacuous: a second claim of the same slot is
+    // refused, which is what makes the first one's success mean something.
+    await expect(
+      reserveConfirmation(env.CONFIRM_KV, principal.userId, jti, expiry),
+    ).rejects.toThrow();
   });
 
   it("survives the sequence a phone actually produces: preview, delete there, commit", async () => {
