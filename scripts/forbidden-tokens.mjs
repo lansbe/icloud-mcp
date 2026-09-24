@@ -1434,6 +1434,74 @@ export const PRINCIPAL_CONSTRUCTOR_OWNERS = Object.freeze([
 export const PRINCIPAL_CONSTRUCTOR_SCOPE = "src/";
 
 /**
+ * The definition of the one function that composes the human-facing line.
+ *
+ * THE RULE. One composer, at one definition site, so five call sites cannot
+ * phrase five sentences that drift apart. The sentence a user reads before they
+ * agree to a destructive change is the one thing the confirmation token cannot
+ * bind -- it is written from the preview payload, by a model that is reading
+ * stranger-authored content in the same context window -- so CONF-04 moves the
+ * writing of it into this server. Two composers is two registers, and the drift
+ * between them is invisible until somebody reads two transcripts side by side.
+ *
+ * WHY A COUNT RATHER THAN A SCOPED NEGATIVE. The standing answer every count in
+ * this file gives. The natural spelling would be "ban a composer outside the
+ * confirm module", and this scanner has no per-rule path exemption: `EXCLUDED`
+ * skips a file for EVERY rule. Buying that exemption by path would silently drop
+ * the logging ban and the account-binding ban on the one module that holds the
+ * confirmation gate.
+ *
+ * WHAT THE COUNT SEES THAT A NEGATIVE CANNOT. Zero is a violation. A composer
+ * that was deleted, renamed or inlined back into its call sites guards nothing,
+ * and that direction is far easier to miss, because nothing fails on the way
+ * out: the tests covering the deleted code are deleted with it. Five phases --
+ * contacts, collections, RSVP, mail triage, draft editing -- inherit this
+ * sentence rather than re-deciding it, and each of them is a session that could
+ * lose it without a single assertion going red.
+ *
+ * WHAT IT DOES NOT AND CANNOT SEE. Four shapes each produce a second
+ * human-facing sentence and fire nothing, and naming them is what stops a later
+ * reader believing the rule proves more than it does:
+ *
+ *   1. a second composer bound to a `const` ARROW rather than declared. No
+ *      declaration keyword follows, so nothing matches -- and this is the one
+ *      most likely to arrive by accident, because it is a style choice rather
+ *      than an evasion;
+ *   2. a line assembled INLINE at a tool shaper as a template literal, which is
+ *      the shortest route and therefore the tempting one;
+ *   3. a RE-EXPORT under an alias, imported from there under a different name;
+ *   4. a helper that takes the composed line and REWRITES it before it reaches
+ *      the response -- the count sees one composer and the user reads something
+ *      else.
+ *
+ * What actually holds those two is named here rather than left implied: the
+ * byte-exact line table in `test/confirm.test.ts`, which pins every sentence the
+ * composer can produce and would fail the moment a second register appeared in a
+ * response; and the fence audit's key-set comparison in
+ * `test/dav-fence-audit.test.ts`, which pins the exhaustive key set of both
+ * halves of both write shapes, so a second line field has nowhere quiet to land.
+ *
+ * THE SHAPE. The declaration keyword, whitespace, then the composer's name.
+ * Anchoring on the KEYWORD is what makes a call site and an import invisible,
+ * and that is load-bearing rather than tidy: every call site lives under the
+ * collected scope, so a pattern keyed on the bare name would report the very
+ * sites this rule exists to protect and the pre-commit hook would refuse every
+ * commit in the repository. White space of any kind is matched, a line break
+ * included, so a signature the formatter broke up is still one definition. No
+ * `g` flag: `scan()` reaches this through `String.prototype.search`, which takes
+ * the first match only, and one test asserts the absence.
+ */
+export const CONFIRM_LINE_COMPOSER = /\bfunction\s+composeConfirmationLine\b/;
+
+/** The one file under `CONFIRM_LINE_SCOPE` permitted to match
+ *  `CONFIRM_LINE_COMPOSER`. */
+export const CONFIRM_LINE_OWNER = "src/confirm.ts";
+
+/** The tree `CONFIRM_LINE_COMPOSER` is collected from. A test that declares a
+ *  look-alike to prove the pattern is not vacuous is not a shipped composer. */
+export const CONFIRM_LINE_SCOPE = "src/";
+
+/**
  * The DAV write modules, and a recorded disposition for every name each of them
  * exports.
  *
@@ -1632,6 +1700,8 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "dav-write-export-unmanifested",
   "dav-write-manifest-stale",
   "dav-write-entry-point-unguarded",
+  "confirm-line-composer-duplicated",
+  "confirm-line-composer-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -1826,6 +1896,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const passwordReaderImporters = [];
   const addressHashers = [];
   const principalConstructors = [];
+  const confirmLineComposers = [];
   const davWriteExports = {};
 
   for (const absolute of files) {
@@ -1916,6 +1987,18 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
         });
       }
     }
+    // The confirm module is not skipped: it DEFINES the composer, and the
+    // definition is precisely what this pattern looks for -- so the owner is
+    // expected to be the one entry in the list rather than an exception to it.
+    if (relativePath.startsWith(CONFIRM_LINE_SCOPE)) {
+      const composerIndex = contents.search(CONFIRM_LINE_COMPOSER);
+      if (composerIndex !== -1) {
+        confirmLineComposers.push({
+          file: relativePath,
+          ...positionOf(contents, composerIndex),
+        });
+      }
+    }
     // The write-module manifest collects NAMES rather than a match position, so
     // it is the one collector that keys by module instead of appending to a list.
     // A declared module that is never walked therefore has no key at all, which
@@ -1936,6 +2019,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   violations.push(...checkPasswordReaderOwnership(passwordReaderImporters));
   violations.push(...checkAddressHashOwnership(addressHashers));
   violations.push(...checkPrincipalConstructorOwnership(principalConstructors));
+  violations.push(...checkConfirmLineOwnership(confirmLineComposers));
   violations.push(...checkDavWriteCoverage(davWriteExports));
 
   return violations.sort(
@@ -2274,6 +2358,44 @@ export function checkPrincipalConstructorOwnership(callers) {
       pattern: "principal-constructor-missing",
       patternIndex: FORBIDDEN.length + 17,
       why: `${owner} no longer calls the props-backed principal constructor, which means that identity path was deleted, moved, or rewritten to get identity some other way this count cannot see. Zero callers is as much a violation as three, and it is the quieter of the pair: nothing goes red on the way out, because the tests that covered the deleted code leave with it. The specific regression this arm exists to catch is the one Phase 11 spent a whole phase making impossible — identity read back out of the Worker environment instead of out of the grant, which serves the wrong person's mail to whoever still holds a token. Restore the plain named call in ${owner}. If the identity path really moved, that is a change to the safety boundary: get a decision, then change the owner list, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The one site that composes the human-facing line, as a pure function over a
+ * list of definitions.
+ *
+ * Same split as the one-owner counts above, and the same body: split out from
+ * `scan()` so both of its failure directions can be exercised without
+ * materialising a fixture tree on disk. See the `CONFIRM_LINE_COMPOSER`
+ * docstring for why this is a count rather than a negative, and for the four
+ * evasions it cannot see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} composers
+ */
+export function checkConfirmLineOwnership(composers) {
+  const violations = [];
+  for (const composer of composers) {
+    if (composer.file === CONFIRM_LINE_OWNER) continue;
+    violations.push({
+      file: composer.file,
+      line: composer.line,
+      column: composer.column,
+      pattern: "confirm-line-composer-duplicated",
+      patternIndex: FORBIDDEN.length + 21,
+      why: `A second module under ${CONFIRM_LINE_SCOPE} defines a composer for the human-facing confirmation line, outside ${CONFIRM_LINE_OWNER}. That sentence is the one thing the confirmation token cannot bind: the token proves this server applied exactly the change it previewed, and proves nothing at all about what the user was told before they agreed. CONF-04 answers that by having this server write the sentence, which only works while there is ONE of it -- two composers are two registers, and the drift between them is invisible until somebody reads two transcripts side by side. Call ${CONFIRM_LINE_OWNER}'s composer and pass it a resolved summary; do not phrase a line here. If a second composer genuinely belongs, that is a change to the safety boundary and not a refactor: get a decision, then change the owner, never the pattern. If this fired on a comment, name the composer without a declaration keyword in front of it.`,
+    });
+  }
+  if (composers.length === 0) {
+    violations.push({
+      file: CONFIRM_LINE_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "confirm-line-composer-missing",
+      patternIndex: FORBIDDEN.length + 22,
+      why: `No file under ${CONFIRM_LINE_SCOPE} defines a composer for the human-facing confirmation line, which means ${CONFIRM_LINE_OWNER}'s was deleted, renamed, or inlined back into its call sites. Zero composers is as much a violation as two, and it is the quieter of the pair: nothing goes red on the way out, because the tests that covered the deleted code leave with it. What that loses is the whole of CONF-04 -- the sentence a person reads before agreeing to a destructive change goes back to being written by a model that is reading stranger-authored content in the same context window, which is the residual attack PITFALLS #40 describes: preview a real delete, describe it inaccurately, get a yes, commit honestly, and every mechanical check passes. Restore the definition in ${CONFIRM_LINE_OWNER}. If the composer really moved, that is a change to the safety boundary: get a decision, then change the owner, never the pattern.`,
     });
   }
   return violations;
