@@ -286,8 +286,8 @@ export function presignedKeyFor(
  * **The encode is TOTAL.** `encodeURIComponent` throws `URIError` on a lone
  * surrogate, which is a legal JSON string and passes `z.string()`, so an
  * unguarded call raises a class `toErrorCategory` does not recognise — reported
- * to the model as `connection_failed`, "safe to retry once", for an input that
- * fails identically forever. The refusal this function already has for an
+ * to the model as `connection_failed` — the floor, which still offers a retry
+ * — for an input that fails identically forever. The refusal this function already has for an
  * unencodable name is the right answer and is reused rather than joined by a
  * second one. See `metadataValue` in `./r2.ts`, which closes the same hole on
  * the binding-side ingress.

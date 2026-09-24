@@ -2001,7 +2001,7 @@ describe("the minted upload URL", () => {
     // The mirror of the binding-side case in `putStaged`. A lone surrogate
     // makes `encodeURIComponent` throw `URIError`, which is a class
     // `toErrorCategory` does not recognise — so it reaches the model as a
-    // transient connection failure that is "safe to retry once", for a name
+    // connection failure at the floor, which still offers a retry, for a name
     // that fails identically forever. The refusal this function already has for
     // an unencodable name is the right answer, and the assertion is that the
     // raised class is that one rather than the encoder's.

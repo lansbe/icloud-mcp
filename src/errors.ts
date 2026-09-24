@@ -218,9 +218,42 @@ export const SAFE_MESSAGES: Record<ErrorCategory, string> = {
     "iCloud rejected the password saved for this connection. Reconnect " +
     "this server in your Claude app and sign in again; retrying will not " +
     "help.",
+  // The floor, and the one entry in this table whose old wording was measured
+  // wrong rather than argued wrong.
+  //
+  // It used to end "This may be transient — safe to retry once." Phase 14's
+  // collection write was refused by the runtime before any byte left the
+  // Worker; the throw landed in the DAV transport's catch, fell through to
+  // this default, and the probe reported that sentence for a failure that was
+  // neither transient nor retryable. The report then read as a measurement of
+  // what iCloud does with collection writes. It was a measurement of what the
+  // platform this server runs on does with a method string, and it was on its
+  // way into a written verdict that would have reshaped a later phase.
+  //
+  // `request_unsendable` closed that particular hole by adding a CLASS. This
+  // wording closes what is left of it: every unclassified value still arrives
+  // here — a thrown string, a plain `Error`, a tsdav error this layer refuses
+  // to read — and most of them are not connection failures at all. So the
+  // entry now says what this server can actually tell, which is nothing, and
+  // offers a single retry instead of certifying one as safe.
+  //
+  // **The CATEGORY did not change, and that was decided rather than
+  // defaulted.** A server asking the caller to wait already has its own entry
+  // in this table, `rate_limited`, and that entry already says to wait and not
+  // to loop. The gap was never a missing category; it was a floor that
+  // promised more than it knew, and a ninth member beside a shipped eighth
+  // that already answers the question would put a duplicate in the model's
+  // vocabulary.
+  //
+  // The first clause still names iCloud Mail, which is the small inaccuracy on
+  // a calendar call that `src/dav/errors.ts` records as deliberately accepted.
+  // Rewording it would touch shipped Phase 1 and 2 responses for a cosmetic
+  // gain; that is a separate decision and this is not it.
   connection_failed:
-    "Could not establish a secure connection to iCloud Mail. This may be " +
-    "transient — safe to retry once.",
+    "Could not establish a secure connection to iCloud Mail. This is what " +
+    "this server reports when it cannot tell what went wrong, so it may or " +
+    "may not be transient. Retry once at most — if it happens again, the " +
+    "cause is not transient and retrying will not help.",
   rate_limited:
     "iCloud is temporarily refusing connections. Wait before retrying; do " +
     "not retry in a loop.",

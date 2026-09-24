@@ -771,7 +771,8 @@ describe("extractAttachmentText: application/pdf", () => {
     //
     // Unhandled, that rejection reaches `mailErrorResult` as a class the closed
     // vocabulary does not recognise, so it is reported as `connection_failed` —
-    // "safe to retry once" — for a document that fails identically forever.
+    // the floor, which still offers a retry — for a document that fails
+    // identically forever.
     const truncated = pdfWithText(["Job description: Staff Engineer"]).slice(
       0,
       64,

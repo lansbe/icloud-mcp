@@ -232,8 +232,8 @@ function bounded(text: string, sourceType: string): ExtractResult {
  *   sender-authored attachment is precisely where a malformed PDF arrives, so
  *   the rejection is reachable from a stranger's mail. Unhandled it propagates
  *   to `mailErrorResult`, where an unrecognised class becomes
- *   `connection_failed` — "safe to retry once" — for a document that will fail
- *   identically on every retry. The union already had the right shape for
+ *   `connection_failed` — the floor, which still offers a retry — for a
+ *   document that will fail identically on every retry. The union already had the right shape for
  *   this; it only lacked a member, which `unreadable` now is.
  * - **An empty string must not be returned as a success.** To a model, `text:
  *   ""` on a successful extraction reads as "this document is blank", which is a
