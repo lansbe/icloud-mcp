@@ -106,6 +106,17 @@ export declare const PRINCIPAL_CONSTRUCTOR_OWNERS: readonly string[];
 export declare const PRINCIPAL_CONSTRUCTOR_SCOPE: string;
 export declare const OWNERSHIP_VIOLATION_IDS: readonly string[];
 
+/** One declared DAV write module: why it is declared, and a disposition for
+ *  every name it exports — the exact string `"guarded"` when the name must
+ *  appear in the `dav-concurrent-request` alternation, or a prose reason when it
+ *  must not. */
+export interface DavWriteModule {
+  readonly why: string;
+  readonly exports: Readonly<Record<string, string>>;
+}
+
+export declare const DAV_WRITE_MODULES: Readonly<Record<string, DavWriteModule>>;
+
 export declare function checkDavHostOwnership(
   resolvers: ReadonlyArray<OwnershipMatch>,
 ): Violation[];
@@ -132,4 +143,31 @@ export declare function checkAddressHashOwnership(
 ): Violation[];
 export declare function checkPrincipalConstructorOwnership(
   callers: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+
+/** Every name `contents` exports as a `function` declaration, in source order. */
+export declare function exportedFunctionNames(contents: string): string[];
+
+/**
+ * The names in the trailing alternation group of the shipped
+ * `dav-concurrent-request` rule.
+ *
+ * The optional parameter exists so a test can prove the extraction THROWS on a
+ * pattern with no trailing group. `checkDavWriteCoverage` calls this with no
+ * argument, so its third arm always measures the rule that actually ships.
+ */
+export declare function davAlternationNames(rule?: ForbiddenRule): string[];
+
+/**
+ * The three-armed write-module coverage check.
+ *
+ * `collected` maps a repo-relative module path to the exported names `scan()`
+ * read out of that file during the walk. The optional `manifest` exists so a
+ * test can drive the third arm, which no value of `collected` can produce
+ * against the shipped manifest; the alternation is deliberately NOT a
+ * parameter.
+ */
+export declare function checkDavWriteCoverage(
+  collected: Readonly<Record<string, readonly string[]>>,
+  manifest?: Readonly<Record<string, DavWriteModule>>,
 ): Violation[];

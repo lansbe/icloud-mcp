@@ -24,6 +24,7 @@ import {
   DAV_FETCH_OWNER,
   DAV_HOST_LITERAL,
   DAV_HOST_OWNER,
+  DAV_WRITE_MODULES,
   EXCLUDED,
   FORBIDDEN,
   OWNERSHIP_VIOLATION_IDS,
@@ -45,11 +46,14 @@ import {
   checkCommitHook,
   checkDavFetchOwnership,
   checkDavHostOwnership,
+  checkDavWriteCoverage,
   checkPasswordReaderOwnership,
   checkPrincipalConstructorOwnership,
   checkPropsReaderOwnership,
   checkSocketOwnership,
   checkSubscriptionFeedFetchOwnership,
+  davAlternationNames,
+  exportedFunctionNames,
   formatViolation,
   matchRule,
   scan,
@@ -273,6 +277,39 @@ function alternationNamesOf(pattern: RegExp): string[] {
 /** Exclusion disabled, so a rule's reach over a real tree can be compared with
  *  and without the skip-list. */
 const NO_EXCLUSIONS = { excluded: new Set<string>() };
+
+// Source text, read off the repository rather than restated here. The write-module
+// constraint below needs two kinds of it: the DAV modules, so a green pass means
+// the SHIPPED tree passes rather than a fixture, and the scanner itself, so the
+// production call site can be pinned by its own text.
+//
+// `?raw` rather than `node:fs`, following test/dav-home-containment.test.ts:
+// this project deliberately carries no Node type package, and a `node:fs` import
+// in a .ts file fails typecheck. Vite's suffix inlines the file's text at build
+// time instead, at the cost of a suppression — the suffix has no ambient
+// declaration because `vite/client` is not in tsconfig's `types`. The
+// suppression is proven non-vacuous by `tsc` itself, which errors on a
+// `@ts-expect-error` that suppresses nothing.
+//
+// The DAV tree is GLOBBED rather than listed file by file so a module declared
+// in the manifest later is picked up without editing this line, and
+// `rawSourceOf` throws rather than returning an empty string when a declared
+// module is not globbed — an empty string would silently report every manifest
+// name as stale.
+// @ts-expect-error — Vite's `import.meta.glob` has no ambient declaration here; see above.
+const RAW_SOURCES: Record<string, string> = import.meta.glob(
+  ["../src/dav/*.ts", "../scripts/forbidden-tokens.mjs"],
+  { query: "?raw", import: "default", eager: true },
+);
+
+/** The text of one repo-relative file, or a throw naming what was not globbed. */
+function rawSourceOf(repoRelative: string): string {
+  const text = RAW_SOURCES[`../${repoRelative}`];
+  if (text === undefined || text.length === 0) {
+    throw new Error(`no raw source globbed for ${repoRelative}`);
+  }
+  return text;
+}
 
 describe("the ban list itself", () => {
   it("gives every rule a non-empty reason, because the hook prints it on rejection", () => {
@@ -3087,6 +3124,186 @@ describe("the two sites that mint a principal are a count constraint with two ow
   });
 });
 
+/** A module that does not exist, so nothing about the shipped tree can make the
+ *  third arm agree by accident. */
+const FABRICATED_MODULE = "src/dav/fabricated.ts";
+
+/** The fabricated manifest, and the ONLY way the third arm is producible.
+ *
+ *  That arm compares the MANIFEST against the ALTERNATION. Both are module-level
+ *  constants in the scanner, and every shipped guarded name is already in the
+ *  shipped alternation — so on a clean tree no value of `collected` can produce
+ *  it, and a rule nothing in the suite can ever observe is exactly the failure
+ *  .claude/CLAUDE.md's Enforcement section names: a constraint whose arm can
+ *  never fire looks identical to a constraint that was never added.
+ *
+ *  Only the HAND-WRITTEN side is substitutable. `davAlternationNames()` is
+ *  called inside the checker and is not a parameter, so the measured side cannot
+ *  be supplied by a test at all — which is what keeps this an injection point
+ *  rather than a way to make the rule see less.
+ *
+ *  Three exports, tuned so one call produces exactly one of each arm. */
+const FABRICATED_MANIFEST = {
+  [FABRICATED_MODULE]: {
+    why: "A fabricated module, declared only so the unguarded arm can be driven without editing the shipped rule.",
+    exports: {
+      // Guarded, and on the shipped alternation: no third-arm violation.
+      getEvent: "guarded",
+      // Guarded, and deliberately NOT on the shipped alternation: exactly one.
+      createContactRecord: "guarded",
+      // A reason rather than a disposition, so the alternation is not consulted
+      // for it at all. Omitted from the collected list below, so it is the one
+      // stale name.
+      matchesNothing:
+        "A matcher over a value the caller already holds. Issues no request.",
+    },
+  },
+};
+
+/** The collected list for that same module: the two guarded names, plus one name
+ *  the fabricated manifest does not carry (one unmanifested), and omitting the
+ *  reasoned name (one stale). */
+const FABRICATED_COLLECTED = {
+  [FABRICATED_MODULE]: ["getEvent", "createContactRecord", "unmanifestedHelper"],
+};
+
+describe("the DAV write modules are a manifested constraint", () => {
+  // Pitfall 65, closed before the first v3.0 write entry point is written. A
+  // name absent from the `dav-concurrent-request` alternation is invisible to
+  // every assertion in this file — the rule-level set-equality guard included,
+  // because that guard operates at the RULE level and cannot see inside one. So
+  // today an unguarded entry point is indistinguishable from a guarded one by
+  // any check that exists. This constraint inverts the failure direction: a new
+  // export in a declared write module fails the scan until somebody records a
+  // disposition for it.
+  const CALENDAR_MODULE = "src/dav/calendar.ts";
+  const CONTACTS_MODULE = "src/dav/contacts.ts";
+  const DIAGNOSE_MODULE = "src/dav/diagnose.ts";
+
+  /** What the walk collects for the declared modules, read off the SHIPPED tree
+   *  through the scanner's own reader.
+   *
+   *  Never derived from the manifest. A collected list built from the manifest
+   *  would agree with the manifest by construction, so dropping a name would
+   *  drop it from both sides at once and every assertion here would stay green —
+   *  the shape of dead gate this project has already shipped once and had to
+   *  measure. */
+  const shipped = (): Record<string, string[]> =>
+    Object.fromEntries(
+      Object.keys(DAV_WRITE_MODULES).map((path) => [
+        path,
+        exportedFunctionNames(rawSourceOf(path)),
+      ]),
+    );
+
+  it("passes on the shipped tree: every export manifested, every guarded name in the alternation", () => {
+    expect(Object.keys(DAV_WRITE_MODULES).sort()).toEqual([
+      CALENDAR_MODULE,
+      CONTACTS_MODULE,
+      DIAGNOSE_MODULE,
+    ]);
+    expect(checkDavWriteCoverage(shipped())).toEqual([]);
+  });
+
+  it("reports the unmanifested arm, naming the module and the name, when a module gains an export", () => {
+    // The realistic case and the whole reason this exists: phase 16 adds contact
+    // create to the contacts module, and nothing about writing that function
+    // makes anybody think about the fan-out alternation.
+    const collected = shipped();
+    collected[CONTACTS_MODULE] = [...collected[CONTACTS_MODULE]!, "createContact"];
+    const violations = checkDavWriteCoverage(collected);
+    expect(violations.map((v) => v.pattern)).toEqual(["dav-write-export-unmanifested"]);
+    expect(violations[0]!.file).toBe(CONTACTS_MODULE);
+    expect(violations[0]!.why).toContain("createContact");
+  });
+
+  it("reports the stale arm, naming the module and the name, when a manifest name is no longer exported", () => {
+    const collected = shipped();
+    const dropped = collected[CALENDAR_MODULE]![0]!;
+    collected[CALENDAR_MODULE] = collected[CALENDAR_MODULE]!.slice(1);
+    const violations = checkDavWriteCoverage(collected);
+    expect(violations.map((v) => v.pattern)).toEqual(["dav-write-manifest-stale"]);
+    expect(violations[0]!.file).toBe(CALENDAR_MODULE);
+    expect(violations[0]!.why).toContain(dropped);
+  });
+
+  it("reports the stale arm once per manifest name when a declared module was never walked", () => {
+    // The deleted-module direction, and the reason this is a count rather than a
+    // negative. A module that was moved, renamed or emptied is never walked, its
+    // collected list is empty, and every manifest name comes back stale — a
+    // manifest that matches nothing guards nothing, and that failure is quieter
+    // than a duplicate because the tests covering the deleted code leave with it.
+    //
+    // It lives here rather than in either set-equality loop below on purpose:
+    // those loops assert an exact violation COUNT, and one stale violation per
+    // shipped manifest name would break their arithmetic. Here the count is the
+    // point.
+    const collected = shipped();
+    delete collected[DIAGNOSE_MODULE];
+    const violations = checkDavWriteCoverage(collected);
+    const names = Object.keys(DAV_WRITE_MODULES[DIAGNOSE_MODULE]!.exports);
+    expect(names.length).toBeGreaterThan(0);
+    expect(violations.map((v) => v.pattern)).toEqual(
+      names.map(() => "dav-write-manifest-stale"),
+    );
+    for (const violation of violations) expect(violation.file).toBe(DIAGNOSE_MODULE);
+    expect(violations.map((v) => v.line)).toEqual(names.map(() => 0));
+    expect(violations.map((v) => v.column)).toEqual(names.map(() => 0));
+  });
+
+  it("reports the unguarded arm when a guarded manifest name is absent from the alternation", () => {
+    // Driven through the checker's SECOND parameter, never by editing the
+    // shipped rule and never by substituting the alternation — which the checker
+    // does not accept as a parameter, precisely so that it cannot be done.
+    const violations = checkDavWriteCoverage(
+      { [FABRICATED_MODULE]: ["getEvent", "createContactRecord", "matchesNothing"] },
+      FABRICATED_MANIFEST,
+    );
+    expect(violations.map((v) => v.pattern)).toEqual(["dav-write-entry-point-unguarded"]);
+    expect(violations[0]!.file).toBe(FABRICATED_MODULE);
+    // Named in the reason, so a checker producing this arm for some OTHER reason
+    // still fails here.
+    expect(violations[0]!.why).toContain("createContactRecord");
+    expect(violations[0]!.why).not.toContain("getEvent");
+  });
+
+  it("still measures the SHIPPED alternation when driven from a fabricated manifest", () => {
+    // The guard on the guard above. `getEvent` is in the shipped alternation and
+    // `createContactRecord` is not, and the fabricated manifest marks both
+    // guarded — so if a test could supply the alternation, both or neither would
+    // fire. Exactly one does, which is only true if the checker read the rule
+    // that actually ships.
+    const names = davAlternationNames();
+    expect(names).toContain("getEvent");
+    expect(names).not.toContain("createContactRecord");
+  });
+
+  it("takes the manifest as an OPTIONAL parameter, so a one-argument call is the ordinary call", () => {
+    // A default parameter does not count toward a function's arity, so this is
+    // mechanical proof that the shipped constant is the default.
+    expect(checkDavWriteCoverage.length).toBe(1);
+    const collected = shipped();
+    expect(checkDavWriteCoverage(collected)).toEqual(
+      checkDavWriteCoverage(collected, DAV_WRITE_MODULES),
+    );
+  });
+
+  it("is deterministic: two runs over the same input return deeply equal arrays", () => {
+    // `scan()` sorts by file, line, column then rule index, and every violation
+    // this checker emits for one module shares all four — so the checker's own
+    // emission order is what makes the output byte-identical between runs.
+    const collected = shipped();
+    collected[CALENDAR_MODULE] = [...collected[CALENDAR_MODULE]!.slice(2), "somethingNew"];
+    const first = checkDavWriteCoverage(collected);
+    const second = checkDavWriteCoverage(collected);
+    expect(first.length).toBeGreaterThan(0);
+    expect(first).toEqual(second);
+    expect(checkDavWriteCoverage(FABRICATED_COLLECTED, FABRICATED_MANIFEST)).toEqual(
+      checkDavWriteCoverage(FABRICATED_COLLECTED, FABRICATED_MANIFEST),
+    );
+  });
+});
+
 describe("the count constraints as a set", () => {
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
@@ -3136,6 +3353,22 @@ describe("the count constraints as a set", () => {
       ...checkPrincipalConstructorOwnership(
         bothConstructorOwners.slice(0, 1),
       ).map((v) => v.pattern),
+      // The write-module constraint, fed ONE call carrying a FABRICATED manifest
+      // rather than the two lists every count above is fed. Three reasons it is
+      // shaped differently, and all three are properties of the constraint rather
+      // than conveniences: it takes a MAP rather than a list of matches; its three
+      // arms can all be produced by a single well-chosen call; and its third arm
+      // cannot be produced from the shipped manifest at all, because every shipped
+      // guarded name is already in the shipped alternation.
+      //
+      // Tuned to produce exactly one of each arm, so the count loop below can feed
+      // it the same single call. The empty-map direction is deliberately NOT here:
+      // it yields one stale violation per shipped manifest name, which would break
+      // that loop's arithmetic. It has its own `it` above, where the count is the
+      // point.
+      ...checkDavWriteCoverage(FABRICATED_COLLECTED, FABRICATED_MANIFEST).map(
+        (v) => v.pattern,
+      ),
     ]);
     expect([...observed].sort()).toEqual([...OWNERSHIP_VIOLATION_IDS].sort());
   });
@@ -3173,6 +3406,10 @@ describe("the count constraints as a set", () => {
         nonOwner,
       ]),
       ...checkPrincipalConstructorOwnership(bothConstructorOwners.slice(0, 1)),
+      // The same single fabricated call the loop above is fed, for the same three
+      // reasons, and tuned to contribute exactly three violations — one per arm —
+      // so this loop's arithmetic still reads one violation per id.
+      ...checkDavWriteCoverage(FABRICATED_COLLECTED, FABRICATED_MANIFEST),
     ];
     expect(violations.length).toBe(OWNERSHIP_VIOLATION_IDS.length);
     for (const violation of violations) {
