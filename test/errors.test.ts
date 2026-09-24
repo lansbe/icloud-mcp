@@ -1,11 +1,17 @@
-// The FND-05 error boundary: a closed vocabulary of exactly seven categories,
+// The FND-05 error boundary: a closed vocabulary of exactly eight categories,
 // and a translation function that dispatches on type rather than on text.
 //
 // Four through Phases 1-4. Two more arrived in Phase 5 (CALW-05 and CALW-04),
 // in one edit, because a category that exists before anything can raise it is
 // the hazard `src/errors.ts`'s own header names. A seventh,
 // `subscription_unreadable`, arrived with quick task 260822-h1c, from the DAV
-// side only, on the same footing.
+// side only, on the same footing. An eighth, `request_unsendable`, arrived in
+// Phase 14 on that same footing and for a reason the others did not have: it
+// was added AFTER a wrong answer had already been produced and read. workerd
+// refuses to build a request carrying `MKCALENDAR`, the throw landed in the
+// DAV transport's catch, and the probe reported `connection_failed` against a
+// server it had never contacted -- a failure that says nothing about iCloud,
+// dressed as a transient fault the model is told to retry.
 
 import { describe, expect, it } from "vitest";
 import {
@@ -16,6 +22,7 @@ import {
   DavStaleResourceError,
   DavSubscriptionError,
   DavThrottleError,
+  DavUnsendableError,
   davToErrorCategory,
 } from "../src/dav/errors";
 import type { ErrorCategory } from "../src/errors";
@@ -30,10 +37,10 @@ import {
 import { FAKE_APP_PASSWORD, FAKE_APPLE_ID } from "./fixtures/bound-secrets";
 
 /**
- * The seven values the vocabulary now holds, listed exhaustively.
+ * The eight values the vocabulary now holds, listed exhaustively.
  *
  * The record below is the type-level half of the exhaustiveness claim: adding
- * an eighth member to `ErrorCategory` makes it a compile error, and removing
+ * a ninth member to `ErrorCategory` makes it a compile error, and removing
  * one makes the excess key a compile error. `npx tsc --noEmit` is therefore
  * part of this assertion, not merely adjacent to it.
  */
@@ -45,17 +52,19 @@ const EVERY_CATEGORY: Record<ErrorCategory, true> = {
   stale_resource: true,
   confirmation_invalid: true,
   subscription_unreadable: true,
+  request_unsendable: true,
 };
 
 const CATEGORIES = Object.keys(EVERY_CATEGORY) as ErrorCategory[];
 
-/** The seven, sorted, so every set assertion below reads from one place. */
+/** The eight, sorted, so every set assertion below reads from one place. */
 const SORTED_CATEGORIES = [
   "auth_failed",
   "confirmation_invalid",
   "connection_failed",
   "not_found",
   "rate_limited",
+  "request_unsendable",
   "stale_resource",
   "subscription_unreadable",
 ];
@@ -93,13 +102,13 @@ const EVERY_INPUT: unknown[] = [
 ];
 
 describe("the category vocabulary", () => {
-  it("is exactly the seven values the vocabulary now holds, with no eighth", () => {
-    expect(CATEGORIES).toHaveLength(7);
+  it("is exactly the eight values the vocabulary now holds, with no ninth", () => {
+    expect(CATEGORIES).toHaveLength(8);
     expect([...CATEGORIES].sort()).toEqual(SORTED_CATEGORIES);
   });
 
   it("has one fixed safe message per category and no others", () => {
-    expect(Object.keys(SAFE_MESSAGES)).toHaveLength(7);
+    expect(Object.keys(SAFE_MESSAGES)).toHaveLength(8);
     expect([...Object.keys(SAFE_MESSAGES)].sort()).toEqual(
       [...CATEGORIES].sort(),
     );
@@ -220,17 +229,17 @@ describe("toErrorCategory", () => {
     // class rather than in a deliberate vocabulary edit would fail here and in
     // the `EVERY_CATEGORY` record above, which `npx tsc --noEmit` checks.
     expect(toErrorCategory(new ImapNotFoundError()).category).toBe("not_found");
-    expect(CATEGORIES).toHaveLength(7);
+    expect(CATEGORIES).toHaveLength(8);
 
     const produced = new Set(
       EVERY_INPUT.map((input) => toErrorCategory(input).category),
     );
-    // The IMAP tree reaches four of the seven. The three categories that
+    // The IMAP tree reaches four of the eight. The four categories that
     // arrived after Phase 1 (the two from Phase 5, plus
-    // `subscription_unreadable`) are raised from the DAV tree only, which is
-    // why this is a subset assertion and not an equality one — the equality
-    // lives in the reachability case at the bottom of this file, over BOTH
-    // translation functions.
+    // `subscription_unreadable` and `request_unsendable`) are raised from the
+    // DAV tree only, which is why this is a subset assertion and not an
+    // equality one — the equality lives in the reachability case at the bottom
+    // of this file, over BOTH translation functions.
     expect(produced.size).toBeLessThanOrEqual(4);
     for (const category of produced) {
       expect(CATEGORIES).toContain(category);
@@ -280,7 +289,7 @@ describe("the connection-limit detail (WINDOWS.md ledger entry 6)", () => {
     expect(toErrorCategory(new ImapThrottleError(REFUSAL)).category).toBe(
       "rate_limited",
     );
-    expect(CATEGORIES).toHaveLength(7);
+    expect(CATEGORIES).toHaveLength(8);
     expect([...CATEGORIES].sort()).toEqual(SORTED_CATEGORIES);
   });
 
@@ -413,7 +422,7 @@ describe("every category is reachable, and every reachable answer is a category"
    *
    * The two trees share a vocabulary and nothing else at runtime, so neither
    * translation function can prove this on its own: the IMAP tree reaches four
-   * of the seven, and the three categories that arrived after Phase 1 are
+   * of the eight, and the four categories that arrived after Phase 1 are
    * raised only from the DAV side. The union is the only thing the claim can
    * be made over.
    */
@@ -433,6 +442,7 @@ describe("every category is reachable, and every reachable answer is a category"
       new DavStaleResourceError(),
       new DavConfirmationError(),
       new DavSubscriptionError(),
+      new DavUnsendableError(),
     ].map((err) => davToErrorCategory(err).category),
   ]);
 

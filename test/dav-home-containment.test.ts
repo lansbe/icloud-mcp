@@ -269,10 +269,18 @@ const DAV_REQUEST_FUNCTIONS = Object.freeze([
   // Phase 14's three, added with the SPIKE-04 collection write probe. The
   // additive-only bias above would have tolerated leaving them off as an
   // under-report — but it reads the same way here as it did for phase 5's
-  // writes, and worse: `makeCalendar` CREATES a collection at whatever URL it
-  // is handed, `davRequest` sends a hand-assembled PROPPATCH to one, and
-  // `deleteObject` REMOVES one. An unchecked target on any of the three sends
-  // the account's credential somewhere and changes something there.
+  // writes, and worse: `davRequest` sends a hand-assembled extended MKCOL or
+  // PROPPATCH to whatever URL it is handed, and `deleteObject` REMOVES what it
+  // addresses. An unchecked target on either sends the account's credential
+  // somewhere and changes something there.
+  //
+  // `makeCalendar` stays in this VOCABULARY with no call site to match, and
+  // that is deliberate. It is tsdav's collection-creation helper, it issues
+  // `MKCALENDAR`, and this runtime refuses to build a request carrying that
+  // method at all — so the probe uses extended MKCOL instead and nothing calls
+  // it. Leaving the name here means the day something does call it, the
+  // enumeration finds the site and the set equality below goes red until it is
+  // declared. Removing the name would make that site invisible instead.
   "makeCalendar",
   "davRequest",
   "deleteObject",
@@ -523,9 +531,9 @@ export const HOME_EXEMPT_REQUEST_SITES: readonly ExemptSite[] = Object.freeze([
     reason:
       "the account is davAccountFor(service, resolved), built from the resolved home set and a service name taken from the DAV_SERVICES constant this function loops over; the whole dav_diagnose input is three booleans, so no caller-supplied value reaches this URL at all",
   },
-  // Phase 14's four sites. All of them are reached only behind their own named
-  // boolean, and all four targets are built from the SAME resolved home set the
-  // two sites above are — there is no fifth way into this file.
+  // Phase 14's three sites. All of them are reached only behind their own
+  // named boolean, and all three targets are built from the SAME resolved home
+  // set the two sites above are — there is no fourth way into this file.
   {
     file: DIAGNOSE,
     fn: "runTaskCollectionProbe",
@@ -536,16 +544,9 @@ export const HOME_EXEMPT_REQUEST_SITES: readonly ExemptSite[] = Object.freeze([
   {
     file: DIAGNOSE,
     fn: "runCollectionWriteProbe",
-    request: "makeCalendar",
-    reason:
-      "the target is resolveDavAccount's homeUrl for THIS principal plus one path segment from crypto.randomUUID(), so the only free component of the URL is generated on this line rather than accepted from anywhere. The probe's whole input is one boolean saying whether to run: no host, no path and no identifier crosses the tool boundary, which is why this is exempt rather than checked — there is no caller-supplied URL for assertUnderHome to be checking",
-  },
-  {
-    file: DIAGNOSE,
-    fn: "runCollectionWriteProbe",
     request: "davRequest",
     reason:
-      "the PROPPATCH addresses the same generated URL the create above built, held in a local const that nothing between them reassigns; the same argument applies unchanged and for the same reason",
+      "TWO requests share this entry because they share this key and this argument exactly — the extended MKCOL that creates the collection, and the PROPPATCH that renames and recolours it. Both address one local const holding resolveDavAccount's homeUrl for THIS principal plus one path segment from crypto.randomUUID(), so the only free component of the URL is generated on that line rather than accepted from anywhere, and nothing between them reassigns it. The create used to be a makeCalendar of its own and is not any more: this runtime refuses to build a request carrying MKCALENDAR, so the create is assembled by hand through the same raw helper the PROPPATCH already was. The probe's whole input is one boolean saying whether to run: no host, no path and no identifier crosses the tool boundary, which is why this is exempt rather than checked — there is no caller-supplied URL for assertUnderHome to be checking",
   },
   {
     file: DIAGNOSE,

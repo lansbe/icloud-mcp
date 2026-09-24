@@ -196,10 +196,19 @@ export function registerDavDiagnoseTool(
         // for by name. `=== true` rather than a truthy test, so nothing but the
         // boolean itself can turn either of them on.
         //
-        // The READ runs before the WRITE, deliberately. A failure inside the
-        // to-do listing travels to the catch below, which drops the report — so
-        // ordering it first is what stops a refused query discarding a write
-        // report whose URL the owner may need in order to clean up by hand.
+        // **NEITHER PROBE MAY DISCARD THE REPORT, and that is why each is
+        // total rather than throwing.** Both now fold every refusal into their
+        // own returned value — per collection for the to-do listing, per step
+        // for the write — so neither can reach the catch below and replace a
+        // whole diagnostic with a bare category. That is not a convenience: the
+        // live account answers 404 on two abandoned to-do lists, and while the
+        // listing threw, asking for it discarded both services' discovery, the
+        // collection enumeration, the timings, and the write report beside it.
+        //
+        // The READ still runs before the WRITE. The ordering no longer protects
+        // the write report from a thrown read — nothing throws now — but it
+        // keeps the cheap read ahead of the mutation, so a run that is going to
+        // fail costs nothing on the account.
         if (!outcome.failed && probeTaskObjects === true) {
           outcome.report.caldav.taskObjects = await runTaskCollectionProbe(
             env,

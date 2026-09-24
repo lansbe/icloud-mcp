@@ -206,6 +206,46 @@ export class DavSubscriptionError extends Error {
 }
 
 /**
+ * Thrown when THIS RUNTIME refuses to build the request, so nothing is sent.
+ *
+ * **The only class in this file raised without any server involvement at all**,
+ * and the one that exists because of a measured failure rather than a
+ * foreseeable one. Phase 14's collection write probe called tsdav's
+ * collection-creation helper, which issues `MKCALENDAR`. workerd validates the
+ * method string when it builds the `Request` and refuses that one — while
+ * accepting `PROPFIND`, `PROPPATCH`, `REPORT`, `MKCOL` and every other method
+ * this project sends. The refusal is a `TypeError` raised before any I/O,
+ * inside `./transport.ts`'s `try` around the fetch, which mapped every caught
+ * value to `DavConnectError`. So the probe reported `connection_failed`
+ * against a server that had never seen the request, and the report read as a
+ * measurement of what iCloud does with collection writes. It was a
+ * measurement of what Cloudflare does with a method string.
+ *
+ * That is the same failure `DavStaleResourceError` was added to prevent one
+ * class up — a failure no retry can fix, dressed as a transient one — with a
+ * second claim on top: a wrong answer here is not merely unhelpful, it is
+ * evidence, and it was on its way into a written verdict that would have
+ * reshaped a later phase.
+ *
+ * It carries no constructor argument, and in particular **it does not carry
+ * the method**. The reason is not the credential discipline the other classes
+ * rest on — a method string cannot hold a secret — it is the same reason
+ * `DavNotFoundError` carries a boolean rather than the status number: nothing
+ * downstream needs it, and a field that exists is one step from being
+ * reported. The place a reader learns WHICH request could not be built is the
+ * step record in `./diagnose.ts`, which names the method it chose because it
+ * chose it, not because an error handed it over.
+ */
+export class DavUnsendableError extends Error {
+  readonly kind = "unsendable" as const;
+
+  constructor() {
+    super("dav-request-unsendable");
+    this.name = "DavUnsendableError";
+  }
+}
+
+/**
  * The ONLY function in the DAV tree permitted to produce a tool-visible error.
  *
  * Mirrors `toErrorCategory` exactly: dispatch on the error's *type*, default to
@@ -226,12 +266,16 @@ export class DavSubscriptionError extends Error {
  * the response — so by the time a `Dav*` error reaches here it already carries
  * its category in its type.
  *
- * **The chain is seven branches, and its ORDER is a constraint rather than an
- * accident.** `DavConnectError` is last because it is the explicit statement of
- * the same answer the default already gives, and a branch appended after it
- * would sit below the floor while looking like a peer of the others. The two
- * Phase 5 branches, and now `DavSubscriptionError`, are therefore inserted
- * before it, and any eighth goes in the same place. The first branch also
+ * **The chain's ORDER is a constraint rather than an accident, and the count is
+ * deliberately not written down here.** `DavConnectError` is last because it is
+ * the explicit statement of the same answer the default already gives, and a
+ * branch appended after it would sit below the floor while looking like a peer
+ * of the others. The two Phase 5 branches, `DavSubscriptionError`, and Phase
+ * 14's `DavUnsendableError` are therefore all inserted before it, and every
+ * later one goes in the same place. This sentence used to say "seven branches"
+ * and went stale on the next branch added — a number written in prose beside
+ * the code it counts has a silent expiry date, and nothing fails when it
+ * passes. The first branch also
  * answers for the principal module's refusal, because a DAV callback awaits the
  * promise of the principal and a bad secret must read `auth_failed` and not a
  * connection fault.
@@ -258,6 +302,8 @@ export function davToErrorCategory(err: unknown): {
     category = "confirmation_invalid";
   } else if (err instanceof DavSubscriptionError) {
     category = "subscription_unreadable";
+  } else if (err instanceof DavUnsendableError) {
+    category = "request_unsendable";
   } else if (err instanceof DavConnectError) category = "connection_failed";
 
   return { category, message: SAFE_MESSAGES[category] };

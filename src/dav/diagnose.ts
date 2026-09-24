@@ -15,12 +15,16 @@
 // This module contains no logging calls of any kind and must never acquire any.
 
 import ICAL from "ical.js";
+// `makeCalendar` is deliberately NOT imported. It is tsdav's collection-creation
+// helper and it issues `MKCALENDAR`, which this runtime refuses to build a
+// request from — see `CREATE_METHOD` below for the measurement. It stays on the
+// `dav-concurrent-request` alternation in `scripts/forbidden-tokens.mjs` so a
+// future call site is guarded the moment it appears; nothing here calls it.
 import {
   calendarQuery,
   davRequest,
   deleteObject,
   fetchAddressBooks,
-  makeCalendar,
   propfind,
 } from "tsdav";
 import type { DAVResponse } from "tsdav";
@@ -158,6 +162,19 @@ export interface DavServiceReport {
 export interface CollectionWriteStep {
   /** Which step: `resolve`, `create`, `rename-and-recolour`, `delete`, `verify`. */
   step: string;
+  /**
+   * The HTTP method this step issued, or `null` for a step that issues no
+   * single request of its own.
+   *
+   * **Here because a verdict is going to be written from this report, and the
+   * method is the half of the answer a reader would otherwise supply from
+   * memory.** The create step does not send `MKCALENDAR` — this runtime
+   * refuses to build a request carrying that method — so it sends RFC 5689
+   * extended `MKCOL` instead. A server may accept one and refuse the other, so
+   * "create: ok, 201" without the method names a fact about a request that was
+   * never sent. See `CREATE_METHOD` for the measurement behind this.
+   */
+  method: string | null;
   /** The HTTP status observed, or `null` when none was. */
   status: number | null;
   /** Whether this step did what it set out to do. */
@@ -209,6 +226,28 @@ export interface TaskCollectionEntry {
   unparsed: number;
   /** The objects kept, in the order the server returned them. */
   objects: TaskObjectProbe[];
+  /**
+   * The category of the refusal this collection's query met, or `null` when
+   * the server answered it.
+   *
+   * **This field is the difference between a partial answer that says so and
+   * a partial answer that does not, and it arrived because the alternative
+   * was measured.** The query used to be left to throw: one refused
+   * collection travelled to the tool boundary, which discarded the whole
+   * report — every other collection's to-do objects, both services'
+   * discovery, all of it — and answered with a bare category. Against the real
+   * account that is exactly what happened, on two abandoned lists that
+   * predate Apple's iOS 13 storage migration.
+   *
+   * Swallowing the refusal would have been worse than either: SPIKE-02's
+   * documented pass-but-wrong mode is a probe that answers short without
+   * saying so, and a collection silently missing from this list is that mode
+   * precisely. So the refusal is REPORTED, per collection, and the run
+   * continues. The entry is still present, still named, and carries no
+   * objects — a reader can see that this collection was asked and refused,
+   * which is a different fact from it holding nothing.
+   */
+  category: string | null;
 }
 
 /**
@@ -238,6 +277,19 @@ export interface TaskCollectionProbe {
   collectionsVisited: number;
   /** One entry per visited collection, in home-set order. */
   collections: TaskCollectionEntry[];
+  /**
+   * The category of a refusal that stopped the probe BEFORE any collection was
+   * visited, or `null` when it got as far as the collections.
+   *
+   * Distinct from the per-collection field above, and the distinction is the
+   * one that matters to a reader: that one says "this list was asked and
+   * refused", this one says "no list was ever asked". Both are reported rather
+   * than thrown, because the report is this run's record of what it observed
+   * and a diagnostic that discards its measurements at the first problem is
+   * useless for the one job it has — the argument this module's own header
+   * already makes.
+   */
+  category: string | null;
 }
 
 /**
@@ -603,6 +655,64 @@ const PROBE_COLOUR = "#7F7F7FFF";
 const PROBE_RECOLOURED = "#1F7F3FFF";
 
 /**
+ * The method the create step issues, and the reason it is not the obvious one.
+ *
+ * RFC 4791 defines `MKCALENDAR` for exactly this, and tsdav ships a helper that
+ * issues it. **Neither can be used here: workerd refuses to build a request
+ * carrying that method string.** It is the one method in this project's whole
+ * DAV vocabulary that it refuses — `PROPFIND`, `PROPPATCH`, `REPORT`, `MKCOL`,
+ * `DELETE` and `PUT` are all accepted — and the refusal is a `TypeError` raised
+ * before any I/O. Phase 14 shipped the helper, and the live probe reported
+ * `connection_failed` on a request iCloud never received.
+ *
+ * So the create step issues RFC 5689 extended `MKCOL` instead: the same
+ * intent, expressed with a method this platform will send. The body sets the
+ * calendar resource type alongside the collection one, which is what makes the
+ * result a calendar collection rather than a plain one.
+ *
+ * **This changes what the create step's answer MEANS, and the report says so
+ * rather than leaving it to be inferred.** A server may accept `MKCALENDAR`
+ * and refuse extended `MKCOL`, or the reverse, so a `201` here is evidence
+ * about extended `MKCOL` and about nothing else. The step record therefore
+ * carries the method it used, because a verdict written from a report that
+ * said only "create: ok, 201" would name the wrong method — which is the
+ * measured-looking wrong verdict this probe exists to avoid producing.
+ */
+const CREATE_METHOD = "MKCOL";
+
+/**
+ * Whether the create step's own status means the collection was created.
+ *
+ * **`207` is the trap, and it is a trap this change introduced.** `MKCALENDAR`
+ * either works or fails with a plain status; extended `MKCOL` has a third
+ * answer. RFC 5689 §3 makes the request all-or-nothing — a server that cannot
+ * satisfy every property in the body MUST fail the whole request and MUST NOT
+ * create the collection — and it reports that partial failure as a `207
+ * Multi-Status` whose body says which property was refused. So `207` here means
+ * NOTHING WAS CREATED, while sitting inside the 2xx range that
+ * `recordWriteStep`'s generic rule reads as success.
+ *
+ * Left generic, the report would have said `create: ok, 207` and a verdict
+ * written from it would have recorded that iCloud accepts collection creation
+ * from a third-party client — which is the same shape of measured-looking wrong
+ * answer this whole probe was rewritten to stop producing, arriving by a
+ * different door.
+ *
+ * The rule is narrow on purpose: every 2xx is accepted EXCEPT `207`. Demanding
+ * `201` exactly would be the mirror-image error — a server answering `200` on a
+ * genuine creation would be recorded as having refused. `207` is the only
+ * status in the range that is definitionally an envelope rather than an answer.
+ *
+ * Because the RFC makes the failure all-or-nothing, stopping the sequence on a
+ * `207` leaves no litter: there is no collection to delete.
+ */
+function createdBy(status: number | null): boolean {
+  if (status === null) return false;
+  if (status === 207) return false;
+  return status >= 200 && status < 300;
+}
+
+/**
  * The ceiling on task collections one to-do probe may visit.
  *
  * Every collection is a round trip, every round trip counts against the same
@@ -626,17 +736,28 @@ const MAX_TASK_OBJECTS = 25;
 async function recordWriteStep(
   steps: CollectionWriteStep[],
   step: string,
+  method: string | null,
   run: () => Promise<number | null>,
+  /**
+   * What counts as success for THIS step, when the generic rule is wrong.
+   *
+   * Only the create passes one. See `createdBy` for why: extended `MKCOL`
+   * answers a partial failure with a `207`, which is inside the 2xx range and
+   * means the opposite of what the range implies.
+   */
+  succeeded: (status: number | null) => boolean = (status) =>
+    status === null || (status >= 200 && status < 300),
 ): Promise<boolean> {
   try {
     const status = await run();
-    const ok = status === null || (status >= 200 && status < 300);
-    steps.push({ step, status, ok, category: null });
+    const ok = succeeded(status);
+    steps.push({ step, method, status, ok, category: null });
     return ok;
   } catch (err) {
     // The TYPE is read; the value never is.
     steps.push({
       step,
+      method,
       status: null,
       ok: false,
       category: davToErrorCategory(err).category,
@@ -670,15 +791,28 @@ function firstStatusOf(responses: DAVResponse[]): number | null {
  * **Five awaits, in this order and no other**, each its own statement:
  *
  *   1. resolve the CalDAV account,
- *   2. create the collection,
+ *   2. create the collection, with RFC 5689 extended `MKCOL`,
  *   3. rename and recolour it with one PROPPATCH,
  *   4. delete it,
  *   5. re-list the home set and check whether it is still there.
+ *
+ * **Step 2 is not `MKCALENDAR`, and that is a platform fact rather than a
+ * preference.** workerd refuses to build a request carrying that method string
+ * — see `CREATE_METHOD` — so what it answers about iCloud is unmeasurable from
+ * this runtime. The step records the method it did use, because a report that
+ * named only the status would be read as an answer about the method it did
+ * not.
  *
  * A refused CREATE stops the sequence — there is nothing to rename and nothing
  * to remove. A refused rename does NOT stop it, and that asymmetry is
  * deliberate: once the collection exists, the delete and the verification are
  * how it stops being litter on a real account.
+ *
+ * **Every step is RECORDED rather than thrown, including the first.** The
+ * resolve used to be awaited bare, so a refusal there threw past this whole
+ * function and the tool's catch discarded the entire report — a diagnostic
+ * losing its own measurements at the first problem, which is the one thing
+ * this module's header says it must never do.
  *
  * Statuses are recorded; bodies are not. A body is bytes a server wrote, and
  * this report carries this server's own observations (T-03-04).
@@ -693,28 +827,85 @@ export async function runCollectionWriteProbe(
   const steps: CollectionWriteStep[] = [];
 
   // 1. The account's own home set. Everything below is built from it.
-  const resolved = await resolveDavAccount(env, principal, davFetch, "caldav");
-  steps.push({ step: "resolve", status: null, ok: true, category: null });
+  //
+  // RECORDED like every other step, rather than awaited bare. It used to be
+  // awaited bare and followed by a hand-written `ok: true`, which meant the
+  // step could report only success: a refusal here threw past the whole probe,
+  // the tool's catch discarded the entire report, and the one field that was
+  // supposed to say which step failed said nothing at all because it never ran.
+  let resolved: ResolvedDavAccount | null = null;
+  await recordWriteStep(steps, "resolve", null, async () => {
+    resolved = await resolveDavAccount(env, principal, davFetch, "caldav");
+    // Discovery may answer from cache and issue no request, so there is no
+    // status of its own to report. `recordWriteStep` reads `null` as "this
+    // step issued no request whose status this layer can see", not as failure.
+    return null;
+  });
+
+  if (resolved === null) {
+    // No home set, so no URL can be built and nothing was addressed. The empty
+    // URL is honest: the probe named no collection, so there is none to clean
+    // up and none to report for a hand cleanup.
+    return { url: "", steps, cleanupVerified: false, stillPresent: null };
+  }
+  // TypeScript cannot see through the closure assignment above.
+  const home = (resolved as ResolvedDavAccount).homeUrl;
 
   // The one free component, and it is generated here rather than accepted.
-  const url = new URL(`${crypto.randomUUID()}/`, resolved.homeUrl).href;
+  const url = new URL(`${crypto.randomUUID()}/`, home).href;
 
-  // 2. Create.
-  const created = await recordWriteStep(steps, "create", async () =>
-    firstStatusOf(
-      await makeCalendar({
-        url,
-        props: {
-          "d:displayname": PROBE_DISPLAY_NAME,
-          "ca:calendar-color": PROBE_COLOUR,
-        },
-        depth: "0",
-        // Never a credential from here. `./transport.ts` attaches it per call
-        // and is the only place that may.
-        headers: {},
-        fetch: davFetch,
-      }),
-    ),
+  // 2. Create — RFC 5689 extended MKCOL, NOT MKCALENDAR. See `CREATE_METHOD`
+  //    for the measurement that forced this: workerd refuses to build a
+  //    request carrying `MKCALENDAR` at all, so the helper that issues it
+  //    threw before any byte left the Worker and the failure was reported as
+  //    a connection fault against a server that never saw it.
+  //
+  //    Assembled by hand through tsdav's raw request helper, exactly as the
+  //    property update below is and for the same reason: the library ships no
+  //    helper for this shape.
+  const created = await recordWriteStep(
+    steps,
+    "create",
+    CREATE_METHOD,
+    async () =>
+      firstStatusOf(
+        await davRequest({
+          url,
+          init: {
+            method: CREATE_METHOD,
+            // Never a credential from here. `./transport.ts` attaches it per
+            // call and is the only place that may.
+            headers: {},
+            namespace: "d",
+            body: {
+              "d:mkcol": {
+                _attributes: {
+                  "xmlns:d": "DAV:",
+                  "xmlns:c": "urn:ietf:params:xml:ns:caldav",
+                  "xmlns:ca": "http://apple.com/ns/ical/",
+                },
+                "d:set": {
+                  "d:prop": {
+                    // The pair that makes the result a CALENDAR collection
+                    // rather than a plain one. Without the second element this
+                    // creates an ordinary WebDAV collection, which would be a
+                    // different question answered by accident.
+                    "d:resourcetype": {
+                      "d:collection": {},
+                      "c:calendar": {},
+                    },
+                    "d:displayname": PROBE_DISPLAY_NAME,
+                    "ca:calendar-color": PROBE_COLOUR,
+                  },
+                },
+              },
+            },
+          },
+          fetch: davFetch,
+        }),
+      ),
+    // The step whose generic 2xx rule is wrong. See `createdBy`.
+    createdBy,
   );
 
   if (!created) {
@@ -728,7 +919,7 @@ export async function runCollectionWriteProbe(
   // 3. Rename and recolour, in one property update. tsdav ships no PROPPATCH
   //    helper, so the request is assembled by hand through its raw request
   //    helper — which is why `davRequest` is named on the fan-out alternation.
-  await recordWriteStep(steps, "rename-and-recolour", async () =>
+  await recordWriteStep(steps, "rename-and-recolour", "PROPPATCH", async () =>
     firstStatusOf(
       await davRequest({
         url,
@@ -758,16 +949,16 @@ export async function runCollectionWriteProbe(
 
   // 4. Delete. Reached whether or not step 3 was accepted, because a collection
   //    that exists has to be removed either way.
-  await recordWriteStep(steps, "delete", async () => {
+  await recordWriteStep(steps, "delete", "DELETE", async () => {
     const response = await deleteObject({ url, headers: {}, fetch: davFetch });
     return response.status;
   });
 
   // 5. LOOK AGAIN. The delete's own status is not evidence of a deletion.
   let stillPresent: boolean | null = null;
-  await recordWriteStep(steps, "verify", async () => {
-    const home = await probeCalendarHome(davFetch, resolved.homeUrl);
-    stillPresent = home.collections.some((one) => one.href === url);
+  await recordWriteStep(steps, "verify", null, async () => {
+    const listing = await probeCalendarHome(davFetch, home);
+    stillPresent = listing.collections.some((one) => one.href === url);
     // The re-listing's own HTTP status is not surfaced by the enumeration, and
     // this report does not invent one.
     return null;
@@ -858,10 +1049,21 @@ function taskIdentityOf(raw: unknown): TaskObjectProbe | null {
  * server that ignores it sends the whole object and the parse above reads the
  * same two values out of it either way.
  *
- * A collection whose query the server refuses is NOT swallowed: the failure
- * travels to the tool boundary, which maps it to a category. Suppressing it
- * here would report a partial answer as a whole one, and a to-do listing that
- * silently lost a collection is the same pass-but-wrong mode as a silent cap.
+ * **A collection whose query the server refuses is RECORDED, and the run
+ * continues.** This used to let the failure travel to the tool boundary
+ * instead, on the reasoning that suppressing it would report a partial answer
+ * as a whole one. The reasoning was right about the danger and wrong about the
+ * remedy, and the live account proved it: two abandoned lists predating
+ * Apple's iOS 13 storage migration answer 404, so the boundary's catch
+ * discarded the entire report — every other collection's to-do objects, both
+ * services' discovery, all of it — and replaced it with a bare category. The
+ * remedy for "a partial answer must not read as a whole one" is to SAY which
+ * part is missing, which is neither swallowing nor aborting: the entry stays
+ * in the list, named, carrying no objects and carrying its refusal's category.
+ *
+ * A refusal before any collection is reached — discovery, or the home
+ * listing — is recorded on the probe itself for the same reason, so the
+ * report survives that too.
  *
  * Nothing here is logged. This module contains no logging calls of any kind.
  */
@@ -870,8 +1072,22 @@ export async function runTaskCollectionProbe(
   principal: Principal,
   davFetch: DavFetch,
 ): Promise<TaskCollectionProbe> {
-  const resolved = await resolveDavAccount(env, principal, davFetch, "caldav");
-  const home = await probeCalendarHome(davFetch, resolved.homeUrl);
+  // Discovery and the home listing, recorded rather than thrown. A refusal
+  // here means no collection was ever asked, which the probe's own `category`
+  // says — and the surrounding report survives to be read.
+  let home: Awaited<ReturnType<typeof probeCalendarHome>>;
+  try {
+    const resolved = await resolveDavAccount(env, principal, davFetch, "caldav");
+    home = await probeCalendarHome(davFetch, resolved.homeUrl);
+  } catch (err) {
+    // The TYPE is read; the value never is — ./.claude/CLAUDE.md §4.
+    return {
+      collectionsFound: 0,
+      collectionsVisited: 0,
+      collections: [],
+      category: davToErrorCategory(err).category,
+    };
+  }
 
   const found = home.collections.filter((one) =>
     one.components.includes("VTODO"),
@@ -882,33 +1098,51 @@ export async function runTaskCollectionProbe(
   // One collection at a time, one await each. No combinator, and nothing that
   // resembles one.
   for (const collection of visiting) {
-    const responses = await calendarQuery({
-      url: collection.href,
-      props: {
-        "d:getetag": {},
-        "c:calendar-data": {
-          "c:comp": {
-            _attributes: { name: "VCALENDAR" },
+    let responses: DAVResponse[];
+    try {
+      responses = await calendarQuery({
+        url: collection.href,
+        props: {
+          "d:getetag": {},
+          "c:calendar-data": {
             "c:comp": {
-              _attributes: { name: "VTODO" },
-              "c:prop": [
-                { _attributes: { name: "UID" } },
-                { _attributes: { name: "SUMMARY" } },
-              ],
+              _attributes: { name: "VCALENDAR" },
+              "c:comp": {
+                _attributes: { name: "VTODO" },
+                "c:prop": [
+                  { _attributes: { name: "UID" } },
+                  { _attributes: { name: "SUMMARY" } },
+                ],
+              },
             },
           },
         },
-      },
-      filters: {
-        "c:comp-filter": {
-          _attributes: { name: "VCALENDAR" },
-          "c:comp-filter": { _attributes: { name: "VTODO" } },
+        filters: {
+          "c:comp-filter": {
+            _attributes: { name: "VCALENDAR" },
+            "c:comp-filter": { _attributes: { name: "VTODO" } },
+          },
         },
-      },
-      depth: "1",
-      headers: {},
-      fetch: davFetch,
-    });
+        depth: "1",
+        headers: {},
+        fetch: davFetch,
+      });
+    } catch (err) {
+      // This collection was asked and refused. Recorded and named, so the
+      // reader can tell it apart from a collection that holds nothing — and
+      // the loop goes on to the next one, because one dead list must not cost
+      // the whole account's answer. The TYPE is read; the value never is.
+      collections.push({
+        href: collection.href,
+        displayName: collection.displayName,
+        objectCount: 0,
+        truncated: false,
+        unparsed: 0,
+        objects: [],
+        category: davToErrorCategory(err).category,
+      });
+      continue;
+    }
 
     const objects: TaskObjectProbe[] = [];
     let unparsed = 0;
@@ -929,6 +1163,10 @@ export async function runTaskCollectionProbe(
       truncated: responses.length > objects.length + unparsed,
       unparsed,
       objects,
+      // The server answered. An empty list here means the collection really
+      // holds no to-do objects, which is why this must not be conflated with
+      // the refusal branch above.
+      category: null,
     });
   }
 
@@ -936,5 +1174,6 @@ export async function runTaskCollectionProbe(
     collectionsFound: found.length,
     collectionsVisited: visiting.length,
     collections,
+    category: null,
   };
 }

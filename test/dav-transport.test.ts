@@ -2,11 +2,14 @@
 // suite proves each obligation of the choke point independently, so a
 // regression names the thing that broke instead of "dav_diagnose is red".
 //
-// Four obligations land on `createDavFetch` and no other seam can serve any of
+// Five obligations land on `createDavFetch` and no other seam can serve any of
 // them: the credential is attached per call, the redirect policy is forced to
 // the observable one, requests are serialised against the per-invocation
-// connection budget, and a status NUMBER is turned into a typed error before
-// tsdav ever sees the response. Each has cases below.
+// connection budget, a status NUMBER is turned into a typed error before tsdav
+// ever sees the response, and a method this runtime cannot build a request from
+// is refused BEFORE the attempt. Each has cases below. The fifth arrived in
+// Phase 14, after the absence of it produced a wrong answer that was read as a
+// measurement of iCloud's behaviour.
 //
 // No network and no real credentials — D-09 forbids any automated job
 // authenticating against the real Apple ID. The seam is the same one production
@@ -21,6 +24,7 @@ import {
   DavNotFoundError,
   DavStaleResourceError,
   DavThrottleError,
+  DavUnsendableError,
   davToErrorCategory,
 } from "../src/dav/errors";
 import { createDavFetch, davAuthHeader } from "../src/dav/transport";
@@ -734,6 +738,109 @@ describe("no Dav* error carries anything a server said (T-03-03, T-03-04)", () =
     const raised = (await raise(createDavFetch(owner))) as Error;
     const serialized = `${JSON.stringify(ownFields(raised))}${raised.message}${raised.stack ?? ""}`;
 
+    expect(serialized).not.toContain(FAKE_APPLE_ID);
+    expect(serialized).not.toContain(FAKE_APP_PASSWORD);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The fifth obligation: refuse a method this runtime cannot send.
+//
+// MEASURED on 2026-09-24. workerd's `Request` constructor rejects
+// `MKCALENDAR` -- and accepts `PROPFIND`, `PROPPATCH`, `REPORT`, `MKCOL`,
+// `DELETE` and `PUT`. tsdav's collection-creation helper hardcodes the one it
+// rejects, so the `TypeError` landed in the `catch` around the fetch below,
+// became a `DavConnectError`, and reached the caller as `connection_failed`:
+// "Could not establish a secure connection to iCloud Mail. This may be
+// transient -- safe to retry once." Every clause of that was false. No
+// connection was attempted, nothing was transient, and no retry could ever
+// work.
+//
+// The check is BEHAVIOURAL rather than a written-down allow-list, and that is
+// the design: a list here would be a second copy of workerd's, agreeing today
+// and drifting silently. The runtime is asked instead.
+// ---------------------------------------------------------------------------
+
+describe("a method this runtime cannot send", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("raises request_unsendable, NOT connection_failed", async () => {
+    // The whole point. `connection_failed` told the reader a connection to
+    // iCloud had failed and that a retry was safe, about a server that was
+    // never contacted -- and that report was on its way into SPIKE-04's
+    // written verdict.
+    const stub = stubFetch(() => new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const davFetch = createDavFetch(owner);
+    await expect(
+      davFetch("https://p42-caldav.icloud.com/x/", { method: "MKCALENDAR" }),
+    ).rejects.toBeInstanceOf(DavUnsendableError);
+
+    const { category, message } = davToErrorCategory(new DavUnsendableError());
+    expect(category).toBe("request_unsendable");
+    expect(message).toBe(SAFE_MESSAGES.request_unsendable);
+    expect(category).not.toBe("connection_failed");
+  });
+
+  it("says nothing was sent and that retrying cannot help", async () => {
+    // The message is the only prose a caller ever sees, and it is what stops a
+    // platform limit being written down as Apple's answer.
+    const { message } = davToErrorCategory(new DavUnsendableError());
+    expect(message).toContain("iCloud never saw it");
+    expect(message).toContain("Retrying will not help");
+  });
+
+  it("issues NO request at all, so nothing reaches the network", async () => {
+    const stub = stubFetch(() => new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", stub.fetch);
+
+    await expect(
+      createDavFetch(owner)("https://p42-caldav.icloud.com/x/", {
+        method: "MKCALENDAR",
+      }),
+    ).rejects.toThrow();
+
+    expect(stub.observed).toEqual([]);
+  });
+
+  it("lets through every method this project actually sends", async () => {
+    // Non-vacuity, and a guard against the check being tightened into a
+    // hand-written allow-list that quietly drops one. Each of these is a
+    // method some shipped path depends on.
+    const stub = stubFetch(() => new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const davFetch = createDavFetch(owner);
+    for (const method of [
+      "GET",
+      "PUT",
+      "DELETE",
+      "PROPFIND",
+      "PROPPATCH",
+      "REPORT",
+      "MKCOL",
+    ]) {
+      await expect(
+        davFetch("https://p42-caldav.icloud.com/x/", { method }),
+      ).resolves.toBeInstanceOf(Response);
+    }
+    expect(stub.observed.length).toBe(7);
+  });
+
+  it("carries no method, no URL and no credential on the error it raises", async () => {
+    // Same discipline as every other class in this tree. A method string
+    // cannot hold a secret, but a field that exists is one step from being
+    // reported, and the report already names its own method because it chose
+    // it -- not because an error handed it over.
+    const raised = new DavUnsendableError();
+    const serialized = `${JSON.stringify(ownFields(raised))}${raised.message}${raised.stack ?? ""}`;
+
+    expect(raised.message).toMatch(/^dav-[a-z-]+$/);
+    expect(serialized).not.toContain("MKCALENDAR");
+    expect(serialized).not.toContain("icloud");
     expect(serialized).not.toContain(FAKE_APPLE_ID);
     expect(serialized).not.toContain(FAKE_APP_PASSWORD);
   });

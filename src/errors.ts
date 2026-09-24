@@ -63,6 +63,23 @@
  *   `not_found` — the calendar exists and `calendar_list_calendars` lists it,
  *   so telling the model it does not exist trades one confident falsehood for
  *   another.
+ * - `request_unsendable` — THIS SERVER could not express the request at all,
+ *   so nothing was sent and no server saw it. Reserved and unreachable before
+ *   Phase 14; **reachable from Phase 14** via `DavUnsendableError`, which
+ *   `src/dav/transport.ts` raises when the runtime refuses to build the
+ *   request. It exists because of a measured failure rather than a
+ *   hypothetical one: workerd accepts `PROPFIND`, `PROPPATCH`, `REPORT`,
+ *   `MKCOL` and every other method this project sends, and refuses
+ *   `MKCALENDAR` — so tsdav's collection-creation helper threw before any
+ *   byte left the Worker, and the throw arrived at `connection_failed`, which
+ *   told the reader that a connection to iCloud had failed and that a retry
+ *   was safe. Both halves of that sentence were false, and the result was a
+ *   report that looked like a measurement of iCloud's behaviour. That is the
+ *   same argument `stale_resource` already rests on one category up — a
+ *   failure no retry can fix must not be dressed as a transient one — with a
+ *   second claim on top: this category is the only one in the union that says
+ *   the remote end was never involved, so it is the only one that can stop a
+ *   platform limit being written down as a server's answer.
  */
 export type ErrorCategory =
   | "auth_failed"
@@ -71,7 +88,8 @@ export type ErrorCategory =
   | "not_found"
   | "stale_resource"
   | "confirmation_invalid"
-  | "subscription_unreadable";
+  | "subscription_unreadable"
+  | "request_unsendable";
 
 /**
  * Thrown when the server rejects the credentials.
@@ -233,6 +251,16 @@ export const SAFE_MESSAGES: Record<ErrorCategory, string> = {
     "calendar being empty — do not report it as having no events. " +
     "Retrying will not help; the user can see these events in their own " +
     "Calendar app.",
+  // Says the remote end was never involved, in the first sentence, because
+  // that is the whole reason the category exists. Every other string in this
+  // table describes something iCloud did; a reader who skimmed this one and
+  // filed it beside them would record a platform limit as a measurement of
+  // Apple's behaviour, which is the exact mistake it was added to prevent.
+  request_unsendable:
+    "This server could not build the request, so nothing was sent and " +
+    "iCloud never saw it. This says nothing about your account or about " +
+    "iCloud. Retrying will not help — it is a limit of the platform this " +
+    "server runs on, and it needs a code change.",
 };
 
 /**

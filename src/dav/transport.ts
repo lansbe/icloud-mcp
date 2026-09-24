@@ -9,14 +9,19 @@
 // which carries the full rationale for the request-budget rule this module
 // enforces.
 //
-// Four obligations land on this one seam and no other seam can serve any of
+// Five obligations land on this one seam and no other seam can serve any of
 // them. tsdav does not throw on a non-2xx — it returns a response object with
 // `ok: false` — and where it does throw, it throws a bare `Error` whose message
 // embeds a server URL, so error classification has to happen here, by status
 // number, before tsdav sees the response. tsdav sets no redirect policy, so the
 // manual policy has to be forced here. tsdav fans out internally over
-// collections, so the serialisation gate has to live here. And the credential
-// has to be attached here, per call, so that no caller ever holds one.
+// collections, so the serialisation gate has to live here. The credential has
+// to be attached here, per call, so that no caller ever holds one. And tsdav
+// hardcodes method strings this runtime refuses to build a request from, so the
+// sendability check has to happen here too — Phase 14 shipped a probe whose
+// `MKCALENDAR` threw before any byte left the Worker and was reported as a
+// failed connection to iCloud, which is a wrong answer of the worst shape:
+// plausible, specific, and about a server that was never contacted.
 //
 // Nothing in this module goes near a socket, and nothing in it may name a
 // transport mode or a port: the DAV protocols run over ordinary HTTPS. The
@@ -35,6 +40,7 @@ import {
   DavNotFoundError,
   DavStaleResourceError,
   DavThrottleError,
+  DavUnsendableError,
 } from "./errors";
 
 const ENCODER = new TextEncoder();
@@ -242,6 +248,59 @@ function throwForStatus(status: number): void {
 }
 
 /**
+ * A URL that can never resolve, used only to build a request and throw it away.
+ *
+ * `.invalid` is reserved by RFC 2606 precisely so that it cannot be registered,
+ * and nothing is ever fetched from it: the request below is constructed and
+ * discarded in the same expression. The host is required because a `Request`
+ * needs one, not because anything is addressed.
+ */
+const SENDABILITY_PROBE_URL = "https://method-check.invalid/";
+
+/**
+ * Refuse a method this runtime cannot express, BEFORE attempting to send it.
+ *
+ * **This is a behavioural check against the platform, not a restatement of
+ * it, and that distinction is the whole design.** An allow-list of method
+ * names written here would be a second copy of workerd's own list, agreeing
+ * with it today and drifting silently the day either side changes. So the
+ * question is put to the runtime itself: build a `Request` carrying this
+ * method against a host that cannot exist, and see whether the constructor
+ * accepts it. The construction IS the check; the object is discarded.
+ *
+ * **It exists because of a measured failure.** Phase 14's collection write
+ * probe sent `MKCALENDAR`, which workerd refuses while accepting `PROPFIND`,
+ * `PROPPATCH`, `REPORT`, `MKCOL` and every other method this project uses. The
+ * refusal is a `TypeError` raised before any I/O — which landed in the `catch`
+ * around the fetch below, became a `DavConnectError`, and was reported as a
+ * transient connection fault against a server that had never seen the request.
+ * The tool that produced that report exists to write down what iCloud does, so
+ * the wrong answer was on its way into a verdict.
+ *
+ * **It runs here rather than at the call sites, and that is the point.** Every
+ * method string in this repository is a compile-time constant at its call
+ * site, so a check up there would be one assertion per site and a new blind
+ * spot per site added. This seam is the only place every DAV request passes
+ * through, which is the same argument the credential, the redirect policy and
+ * the serialisation gate already rest on.
+ *
+ * `undefined` is permitted and checked as nothing: the fetch below then sends
+ * `GET`, which no runtime refuses.
+ *
+ * The caught value is never read — only the fact that construction failed.
+ */
+function assertSendableMethod(method: string | undefined): void {
+  if (method === undefined) return;
+  try {
+    // Constructed and discarded. See the docstring: this is the check.
+    new Request(SENDABILITY_PROBE_URL, { method });
+  } catch {
+    // Never read the caught value — ./.claude/CLAUDE.md §4.
+    throw new DavUnsendableError();
+  }
+}
+
+/**
  * Build the one outbound DAV function for ONE request.
  *
  * Constructed per request inside `createServerFactory`, never at module scope.
@@ -299,6 +358,17 @@ export function createDavFetch(principal: Promise<Principal>): DavFetch {
         // Never read the caught value.
         throw new DavAuthError();
       }
+
+      // Can this runtime express the request at all? Its own statement,
+      // outside the `try` around the fetch below, for the same reason the
+      // principal's await is: a refusal here means nothing was sent and no
+      // retry can ever succeed, and reporting that as a connection fault tells
+      // the reader the one thing that can never work. See the docstring above
+      // for the measured failure this was added for.
+      //
+      // BEFORE the credential is built, deliberately. A request that cannot be
+      // sent has no business causing a password to be read.
+      assertSendableMethod(init?.method);
 
       // Built per call, and merged rather than assigned, so no caller ever
       // holds a header carrying the credential.

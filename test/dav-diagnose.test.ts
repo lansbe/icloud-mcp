@@ -26,7 +26,10 @@ import {
 import { SAFE_MESSAGES } from "../src/errors";
 import type { DavDiagnosticOutcome } from "../src/dav/diagnose";
 import type { DavCollectionProbe } from "../src/dav/diagnose";
-import { runDavDiagnosticOutcome } from "../src/dav/diagnose";
+import {
+  runCollectionWriteProbe,
+  runDavDiagnosticOutcome,
+} from "../src/dav/diagnose";
 // The listing, driven against the SAME stub as the diagnostic. Pitfall 57's
 // quieter half is that loosening the listing's component filter would make
 // reminder lists show up as calendars with no events; asserting both answers
@@ -261,6 +264,26 @@ function davStub(
           ? input.href
           : input.url;
     const method = String(init?.method ?? "GET");
+
+    // ASK THE RUNTIME WHETHER THIS REQUEST COULD EXIST, BEFORE PRETENDING TO
+    // SEND IT.
+    //
+    // This stub IS the global fetch — `vi.stubGlobal("fetch", stub.fetch)` —
+    // which is what makes the credential assertions discriminating, and is also
+    // what made this harness blind to the whole class of failure that shipped
+    // in Phase 14. workerd validates the method string when it builds the
+    // `Request`, and it refuses some WebDAV/CalDAV methods outright. Replacing
+    // the global replaces that check too, so a call site using a method this
+    // platform cannot express looked green here and threw in production —
+    // where the throw lands inside `createDavFetch`'s `try`, becomes a
+    // `DavConnectError`, and is reported as a transient connection fault
+    // against a server that never saw the request.
+    //
+    // Constructed and discarded: the construction IS the check. It runs before
+    // the record is pushed, because in production nothing goes on the wire and
+    // nothing would be there to record.
+    new Request(url, { method });
+
     const record: ObservedRequest = {
       url,
       method,
@@ -788,6 +811,8 @@ function methodsOf(stub: Stub, ...methods: string[]): ObservedRequest[] {
 /** One write-probe step, as the report carries it. */
 interface WriteStep {
   step: string;
+  /** The method the step issued, or null for a step that issues no request. */
+  method: string | null;
   status: number | null;
   ok: boolean;
   category: string | null;
@@ -812,12 +837,14 @@ interface TaskEntry {
   truncated: boolean;
   unparsed: number;
   objects: TaskObject[];
+  category: string | null;
 }
 
 interface TaskProbe {
   collectionsFound: number;
   collectionsVisited: number;
   collections: TaskEntry[];
+  category: string | null;
 }
 
 function writeProbeOf(result: {
@@ -870,7 +897,13 @@ function writeProbeStub(
         ? calendarCollection(probeUrl, "iCloud MCP write probe", "")
         : ""),
     onRequest: (url, method) => {
-      if (method === "MKCALENDAR") {
+      // MKCOL, not MKCALENDAR. workerd refuses to build a request carrying
+      // that method at all, so the probe issues RFC 5689 extended MKCOL -- and
+      // this stub now proves that by construction rather than by agreement:
+      // the `new Request` at the top of `davStub` throws on the old method, so
+      // a regression here cannot be papered over by teaching the stub to
+      // answer it.
+      if (method === "MKCOL") {
         probeUrl = url;
         return new Response(null, { status: options.createStatus ?? 201 });
       }
@@ -1036,7 +1069,7 @@ describe("dav_diagnose, the collection write probe (SPIKE-04)", () => {
       probeCollectionWrite: true,
     });
 
-    const created = methodsOf(stub, "MKCALENDAR");
+    const created = methodsOf(stub, "MKCOL");
     expect(created.length).toBe(1);
     expect(created[0].url.startsWith(CALDAV_HOME)).toBe(true);
     expect(writeProbeOf(result)!.url.startsWith(CALDAV_HOME)).toBe(true);
@@ -1092,7 +1125,7 @@ describe("dav_diagnose, the collection write probe (SPIKE-04)", () => {
 
     // Non-vacuity first, and per probe: a walk over a list that never grew
     // the probes' own requests would pass while proving nothing about them.
-    expect(methodsOf(stub, "MKCALENDAR").length).toBe(1);
+    expect(methodsOf(stub, "MKCOL").length).toBe(1);
     expect(methodsOf(stub, "PROPPATCH").length).toBe(1);
     expect(methodsOf(stub, "DELETE").length).toBe(1);
     expect(methodsOf(stub, "REPORT").length).toBeGreaterThan(0);
@@ -1333,5 +1366,373 @@ describe("dav_diagnose, the bounded to-do listing (SPIKE-02, object level)", () 
       "probeTaskObjects",
       "refresh",
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The Phase 14 write-probe defect, and the three layers that close it.
+//
+// MEASURED LIVE on 2026-09-24 against deployed version
+// b35d0d58-14b3-4c65-88ab-53052a40d1bc. The probe reported
+// `{ step: "create", status: null, ok: false, category: "connection_failed" }`
+// and no calendar appeared on the account. That reads as "iCloud refused the
+// collection write", and it was on its way into SPIKE-04's verdict.
+//
+// It was not iCloud. It was workerd refusing to BUILD the request: tsdav's
+// collection-creation helper issues `MKCALENDAR`, the `Request` constructor
+// rejects that method string, the `TypeError` landed in the DAV transport's
+// `catch`, and `davToErrorCategory`'s DEFAULT arm answered
+// `connection_failed`. No byte left the Worker.
+//
+// The 14-02 suite could not see any of it, and the reason is worth stating
+// because it is the reason a whole CLASS of failure was invisible:
+// `vi.stubGlobal("fetch", stub.fetch)` replaces the runtime's fetch with a
+// plain function, so no `Request` was ever constructed and workerd's method
+// validation never ran. `davStub` now builds one per call, which is the guard
+// that makes every case below able to fail.
+// ---------------------------------------------------------------------------
+
+describe("the methods this runtime will and will not send", () => {
+  it("refuses MKCALENDAR and accepts every other method this project sends", () => {
+    // THE FINDING ITSELF, pinned against the real runtime rather than against
+    // a note in a summary. Nothing in this repository can assert what
+    // Cloudflare will accept; it can only ask, which is what this does.
+    //
+    // If a future workerd accepts MKCALENDAR, this case goes red and the
+    // create step's whole reason for using extended MKCOL is up for review.
+    // That is the intended behaviour: a workaround for a platform limit must
+    // fail loudly when the limit lifts, not outlive it silently.
+    const observed: Record<string, boolean> = {};
+    for (const method of [
+      "GET",
+      "PUT",
+      "DELETE",
+      "PROPFIND",
+      "PROPPATCH",
+      "REPORT",
+      "MKCOL",
+      "MKCALENDAR",
+    ]) {
+      try {
+        new Request("https://method-check.invalid/", { method });
+        observed[method] = true;
+      } catch {
+        observed[method] = false;
+      }
+    }
+
+    expect(observed).toEqual({
+      GET: true,
+      PUT: true,
+      DELETE: true,
+      PROPFIND: true,
+      PROPPATCH: true,
+      REPORT: true,
+      MKCOL: true,
+      // The one that cost a live probe run and nearly cost a verdict.
+      MKCALENDAR: false,
+    });
+  });
+
+  it("makes the stub refuse what the runtime refuses, so a bad method cannot pass offline", async () => {
+    // The GUARD, asserted directly rather than only through its effect on the
+    // cases above. Without this the harness is blind to every runtime-level
+    // rejection, which is exactly how the defect shipped green.
+    const stub = davStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    await expect(
+      stub.fetch("https://p1-caldav.icloud.invalid/x/", {
+        method: "MKCALENDAR",
+      }),
+    ).rejects.toThrow();
+    // Nothing recorded: in production nothing goes on the wire either.
+    expect(stub.requests).toEqual([]);
+  });
+});
+
+describe("the collection write probe, after the MKCALENDAR finding", () => {
+  beforeEach(async () => {
+    await clearDavCache(env, principal);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("creates with extended MKCOL and NEVER sends MKCALENDAR", async () => {
+    const { stub } = writeProbeStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeCollectionWrite: true,
+    });
+
+    // Read off the wire, not off the call site.
+    expect(methodsOf(stub, "MKCALENDAR")).toEqual([]);
+    expect(methodsOf(stub, "MKCOL").length).toBe(1);
+    expect(stepNamed(writeProbeOf(result)!, "create")!.ok).toBe(true);
+  });
+
+  it("names the method on every step, so a verdict cannot be written about the wrong request", async () => {
+    // The report is evidence. A create step reporting only "ok, 201" would be
+    // read as iCloud accepting MKCALENDAR, which is a fact about a request
+    // this server cannot even build. The method is therefore IN the report.
+    const { stub } = writeProbeStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeCollectionWrite: true,
+    });
+
+    const probe = writeProbeOf(result)!;
+    expect(
+      probe.steps.map((one) => [one.step, one.method]),
+    ).toEqual([
+      ["resolve", null],
+      ["create", "MKCOL"],
+      ["rename-and-recolour", "PROPPATCH"],
+      ["delete", "DELETE"],
+      ["verify", null],
+    ]);
+    // Nowhere in the response does the method it could not send appear.
+    expect(JSON.stringify(probe)).not.toContain("MKCALENDAR");
+  });
+
+  it("sends the calendar resourcetype in the MKCOL body, so the result is a CALENDAR collection", async () => {
+    // Extended MKCOL without this pair creates an ordinary WebDAV collection,
+    // which would answer a different question by accident and look identical
+    // in the report.
+    const { stub } = writeProbeStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    await diagnoseHandler(createDavFetch(owner))({ probeCollectionWrite: true });
+
+    const body = String(methodsOf(stub, "MKCOL")[0].init.body);
+    expect(body).toContain("<d:mkcol");
+    expect(body).toContain("<d:collection/>");
+    expect(body).toContain("<c:calendar/>");
+    expect(body).toContain('xmlns:c="urn:ietf:params:xml:ns:caldav"');
+    expect(body).toContain("iCloud MCP write probe (throwaway)");
+  });
+
+  it("treats a 207 on the create as a REFUSAL, not as a 2xx success", async () => {
+    // THE TRAP THIS CHANGE INTRODUCED, closed deliberately. MKCALENDAR either
+    // works or fails with a plain status. Extended MKCOL has a third answer:
+    // RFC 5689 makes the request all-or-nothing, and a server that cannot set
+    // every property in the body fails the WHOLE request, creates nothing, and
+    // says so with a 207 Multi-Status naming the property it refused.
+    //
+    // 207 sits inside the 2xx range. Read by the generic rule it would have
+    // produced `create: ok, 207` -- and a SPIKE-04 verdict written from that
+    // would record iCloud as accepting collection creation on a run where
+    // nothing was created. That is the same measured-looking wrong answer the
+    // MKCALENDAR defect produced, arriving through a different door.
+    const { stub } = writeProbeStub({ createStatus: 207 });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeCollectionWrite: true,
+    });
+
+    const probe = writeProbeOf(result)!;
+    const create = stepNamed(probe, "create")!;
+    expect(create.status).toBe(207);
+    expect(create.ok).toBe(false);
+    // The sequence stopped. RFC 5689's all-or-nothing rule means there is
+    // nothing to rename and nothing to delete -- and no litter left behind.
+    expect(probe.steps.map((one) => one.step)).toEqual(["resolve", "create"]);
+    expect(methodsOf(stub, "PROPPATCH")).toEqual([]);
+    expect(methodsOf(stub, "DELETE")).toEqual([]);
+    expect(probe.stillPresent).toBeNull();
+  });
+
+  it("still accepts a plain 2xx that is not 207, so the rule is narrow", async () => {
+    // The mirror-image error, guarded against. Demanding 201 exactly would
+    // record a server answering 200 on a genuine creation as having refused.
+    // 207 is the only status in the range that is an envelope rather than an
+    // answer, and it is the only one excluded.
+    const { stub } = writeProbeStub({ createStatus: 200 });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeCollectionWrite: true,
+    });
+
+    const probe = writeProbeOf(result)!;
+    expect(stepNamed(probe, "create")!.ok).toBe(true);
+    expect(probe.steps.map((one) => one.step)).toEqual([
+      "resolve",
+      "create",
+      "rename-and-recolour",
+      "delete",
+      "verify",
+    ]);
+  });
+
+  it("records a REFUSED resolve as a failed step instead of throwing past the probe", async () => {
+    // The resolve used to be awaited bare and followed by a hand-written
+    // `ok: true`, so the step could only ever report SUCCESS -- and a refusal
+    // threw past the whole probe, where the tool boundary discarded the entire
+    // report. The one field that was supposed to say which step failed said
+    // nothing, because it never ran.
+    //
+    // Driven against the probe directly rather than through the tool, because
+    // the tool only reaches the probe once discovery has already succeeded and
+    // been cached. That is exactly why this case has to exist separately: the
+    // path is unreachable from the handler, so nothing else in this file can
+    // fail on it.
+    const stub = davStub({
+      onRequest: (_url, _method) => new Response(null, { status: 503 }),
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+    await clearDavCache(env, principal);
+
+    const probe = await runCollectionWriteProbe(
+      env,
+      principal,
+      createDavFetch(owner),
+    );
+
+    // It RETURNED. Before the fix this call threw.
+    expect(probe.steps.length).toBe(1);
+    expect(probe.steps[0].step).toBe("resolve");
+    expect(probe.steps[0].ok).toBe(false);
+    expect(probe.steps[0].category).toBe("rate_limited");
+    // No URL was ever built, so the probe names none -- rather than naming one
+    // the owner would go looking for on an account that never had it.
+    expect(probe.url).toBe("");
+    expect(probe.cleanupVerified).toBe(false);
+    expect(probe.stillPresent).toBeNull();
+    // And nothing was attempted on the account.
+    expect(methodsOf(stub, ...MUTATING_METHODS)).toEqual([]);
+  });
+});
+
+describe("the to-do probe when one collection is refused", () => {
+  beforeEach(async () => {
+    await clearDavCache(env, principal);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("records the refusal per collection and KEEPS GOING", async () => {
+    // MEASURED LIVE: the owner's account carries two abandoned to-do lists
+    // that predate Apple's iOS 13 storage migration, and iCloud answers 404 on
+    // a calendar-query against them. While the query was left to throw, asking
+    // for the to-do listing discarded the ENTIRE diagnostic -- both services'
+    // discovery, the collection enumeration, the timings, and the other
+    // collection's reminders -- and answered with a bare `not_found`.
+    //
+    // Swallowing it would have been worse than either: a collection silently
+    // missing from this list is SPIKE-02's documented pass-but-wrong mode
+    // exactly. So it is REPORTED, per collection, and the run continues.
+    const stub = davStub({
+      caldavHomeBody: () =>
+        homeSelfResponse() +
+        todoCollection(TASKS_A, "Reminders (abandoned)") +
+        todoCollection(TASKS_B, "Groceries"),
+      onRequest: (url, method) => {
+        if (method !== "REPORT") return null;
+        if (url === TASKS_A) return new Response(null, { status: 404 });
+        return multistatus(todoObject(`${TASKS_B}1.ics`, "uid-milk", "Buy milk"));
+      },
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeTaskObjects: true,
+    });
+
+    // Not an error payload. The report came back.
+    expect(result.isError).toBeUndefined();
+    const probe = taskProbeOf(result)!;
+    expect(probe.category).toBeNull();
+    expect(probe.collectionsFound).toBe(2);
+    expect(probe.collectionsVisited).toBe(2);
+
+    // The refused one is PRESENT and NAMED, carrying its category and no
+    // objects -- which is a different fact from a list that holds nothing.
+    const refused = probe.collections[0];
+    expect(refused.displayName).toBe("Reminders (abandoned)");
+    expect(refused.category).toBe("not_found");
+    expect(refused.objects).toEqual([]);
+
+    // And the collection after it was still asked, which is the "keeps going"
+    // half. A probe that stopped would have left this entry out entirely.
+    const answered = probe.collections[1];
+    expect(answered.category).toBeNull();
+    expect(answered.objects).toEqual([
+      { uid: "uid-milk", summary: "Buy milk" },
+    ]);
+    expect(methodsOf(stub, "REPORT").length).toBe(2);
+    expect(stub.overlapped).toBe(false);
+  });
+
+  it("tells a refused collection apart from an EMPTY one", async () => {
+    // The distinction the `category` field exists for. Without it both read as
+    // `objects: []`, and "your reminder is not there" would be indistinguish-
+    // able from "this server could not look".
+    const stub = davStub({
+      caldavHomeBody: () =>
+        homeSelfResponse() +
+        todoCollection(TASKS_A, "Refused") +
+        todoCollection(TASKS_B, "Genuinely empty"),
+      onRequest: (url, method) => {
+        if (method !== "REPORT") return null;
+        return url === TASKS_A
+          ? new Response(null, { status: 404 })
+          : multistatus("");
+      },
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeTaskObjects: true,
+    });
+
+    const probe = taskProbeOf(result)!;
+    expect(probe.collections[0].objects).toEqual([]);
+    expect(probe.collections[1].objects).toEqual([]);
+    // Identical object lists, different answers.
+    expect(probe.collections[0].category).toBe("not_found");
+    expect(probe.collections[1].category).toBeNull();
+  });
+
+  it("keeps the report when the probe is refused BEFORE any collection is reached", async () => {
+    // A refusal on the home listing means no list was ever asked, which is a
+    // different statement from a list being asked and refused -- so it is
+    // carried on the probe rather than on an entry. Either way the surrounding
+    // report survives: a diagnostic that discards its own measurements at the
+    // first problem is useless for the one job it has.
+    let seenHome = 0;
+    const stub = davStub({
+      onRequest: (url, _method) => {
+        if (url !== CALDAV_HOME) return null;
+        // The first listing belongs to the two services and must succeed, so
+        // there is a real report for the probe's failure to survive inside.
+        seenHome += 1;
+        return seenHome === 1 ? null : new Response(null, { status: 404 });
+      },
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probeTaskObjects: true,
+    });
+
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text) as Record<string, unknown>;
+    // The services' own measurements are still there.
+    expect(
+      (parsed.caldav as { homeUrl: string | null }).homeUrl,
+    ).not.toBeNull();
+
+    const probe = taskProbeOf(result)!;
+    expect(probe.category).toBe("not_found");
+    expect(probe.collections).toEqual([]);
+    expect(probe.collectionsFound).toBe(0);
   });
 });
