@@ -3379,6 +3379,8 @@ function previewFixture(overrides: Partial<EventPreview> = {}): EventPreview {
     willNotify: false,
     confirmToken: "cGF5bG9hZA.c2VhbA",
     expiresInSeconds: CONFIRM_TTL_SECONDS,
+    // Quoting the resource's own title, which is what puts it inside the fence.
+    confirmationLine: `Overwriting event '${HOSTILE_TITLE}', changing 1 field. The values it held before cannot be recovered.`,
     unsupportedTarget: null,
     change: {
       kind: "update",
@@ -3411,6 +3413,8 @@ function commitFixture(overrides: Partial<CommitOutcome> = {}): CommitOutcome {
     recipients: [],
     summary: HOSTILE_TITLE,
     location: "Room nine",
+    // The same sentence in the past tense, and fenced for the same reason.
+    confirmationLine: `Overwrote event '${HOSTILE_TITLE}', changing 2 fields. The values it held before cannot be recovered.`,
     ...overrides,
   };
 }
