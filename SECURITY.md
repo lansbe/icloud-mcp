@@ -222,6 +222,49 @@ importer, one session orchestrator, no concurrent combinator around either) so
 the server cannot exhaust iCloud's per-account connection ceiling and lock you
 out of your own mail.
 
+### No Zero Trust portal in front of this server
+
+This server does not sit behind a Cloudflare Zero Trust MCP portal, and it is
+not going to. That is a decision with a reason, not a gap nobody has got round
+to yet.
+
+The reason is one setting. Cloudflare's guidance for an unattended caller — a
+service token — tells you to turn the portal's per-user authentication off. With
+it off, every caller through the portal shares one identity: whichever account
+authenticated the server first. This server is built on the opposite of that. A
+separate Apple credential per person, a separate cache, separate counters, a
+separate everything — and that one setting would collapse all of it. Nothing in
+this repository could tell. It is account configuration, invisible to the test
+suite, the commit scan and the pre-commit hook. A related step gets there by
+another route: configuring this server's own OAuth provider as the access layer
+is the documented remedy for a portal being bypassable by URL, and it replaces
+this server's sign-in outright, ending per-user Apple grants.
+
+So the constraints are written here as standing refusals, before any portal
+exists. A future session reading the vendor's documentation will find the
+recommended-but-wrong path; it should find these first.
+
+- **Per-user authentication must be Enabled.** With it off there is one identity,
+  and the multi-user model is gone.
+- **No service token, ever**, and no autonomous caller routed through a portal.
+- **No tool aliases and no description overrides.** Tool names here carry
+  promises a model reasons from, and tool descriptions carry the
+  untrusted-content warnings. A dashboard can rewrite both with no diff, no
+  review and no commit-time scan.
+- **A portal is never the gate.** The allow list is, and always was. Cloudflare's
+  own documentation concedes that a user blocked by an access policy can still
+  reach the server directly by its URL.
+
+What would have to change for this to be worth revisiting is the identity model
+itself. A portal is the right answer when it supplies something missing — when
+the server behind it has no authentication of its own, or when every caller
+legitimately is the same person. Neither is true here. It was not dropped for
+cost: Zero Trust is already in use on this account and there is no per-seat
+charge at this size. It was not dropped for difficulty: no code change was
+needed. And it was not dropped because a trial failed — whether a portal's
+sign-in composes with this server's own was never tested, and that question is
+still open for anyone who revisits this.
+
 ## Scope for reports
 
 **In scope:** authentication or authorization bypass; one person reaching
@@ -233,6 +276,7 @@ safety rules being circumventable.
 
 **Out of scope:** anything requiring your Cloudflare account or Apple
 credentials to already be compromised; the deliberate design decisions above
-(no sending, no background jobs, and the two-step removal whose cost is stated
-above); and issues in third-party dependencies that should be reported upstream
+(no sending, no background jobs, no Zero Trust portal in front of the endpoint,
+and the two-step removal whose cost is stated above); and issues in third-party
+dependencies that should be reported upstream
 (tell us anyway if they affect this server).
