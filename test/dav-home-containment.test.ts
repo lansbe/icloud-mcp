@@ -145,13 +145,14 @@ import {
   vi,
 } from "vitest";
 import {
+  createCalendarCollection,
   createEvent,
   deleteEvent,
   updateEvent,
 } from "../src/dav/calendar";
 import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
 import { DavNotFoundError } from "../src/dav/errors";
-import { encodeCalendarId } from "../src/dav/ids";
+import { decodeCalendarId, encodeCalendarId } from "../src/dav/ids";
 import type { EventRef } from "../src/dav/ids";
 import { createDavFetch } from "../src/dav/transport";
 import { ownerPrincipal } from "./fixtures/bound-secrets";
@@ -565,6 +566,42 @@ export const HOME_EXEMPT_REQUEST_SITES: readonly ExemptSite[] = Object.freeze([
     request: "fetchCalendarUserAddresses",
     reason:
       "the target is account.principalUrl, built by davAccountFor from the discovery triple this call's own withRediscovery just resolved — the same bootstrap-adjacent URL every other target on this account is derived from, so there is nothing above it to be contained by. The stronger half of the claim is that this function takes NO caller input at all: no identifier, no cursor and no reference reaches it, so there is nothing a token could aim even in principle, which is the same argument the two dav_diagnose sites below make",
+  },
+  // Phase 17 (CALM-04). The first COLLECTION write in this project, and the
+  // sharpest request target the milestone has produced so far — which is
+  // precisely why it is exempt rather than checked, and why saying so in one
+  // line would be the wrong length.
+  //
+  // **What makes the class sharp.** On the rename and the delete that follow in
+  // plans 17-04 and 17-06, a collection URL is CALLER-SUPPLIED: it arrives
+  // inside an opaque id the model may have read out of an event description a
+  // stranger wrote, and `src/dav/transport.ts` attaches the Apple ID and the
+  // app-specific password to whatever URL it is handed. An unchecked target on
+  // either ships both to an attacker's host, and on the delete it removes
+  // whatever it addressed first.
+  //
+  // **What makes THIS one exempt anyway.** The create is the one member of that
+  // class with no caller-supplied URL at all. `CreateCalendarInput` carries a
+  // display name and a `#RRGGBB` colour and nothing else — no id, no href, no
+  // reference of any kind — and the target is one `crypto.randomUUID()` segment
+  // resolved against the home set THIS principal's own discovery just returned.
+  // There is nothing a forged token could aim, so a hostile case here would be
+  // an assertion that cannot fail, and this reason string is what that
+  // mechanism exists to record honestly rather than dress up.
+  //
+  // The site nonetheless calls `assertUnderHome` on the planned URL before the
+  // request. That is defence in depth against a future edit to the two lines
+  // that build it, not the authorisation it is on the paths that decode an id —
+  // so it is recorded here rather than claimed as a check this gate verified.
+  // The DRIVEN half below does what is actually falsifiable about this site: it
+  // runs the real function and asserts the recorded request went under the
+  // resolved home, and that no extra key on the input can move it.
+  {
+    file: CALENDAR,
+    fn: "createCalendarCollection",
+    request: "davRequest",
+    reason:
+      "the target is one crypto.randomUUID() segment resolved against resolveDavAccount's own homeUrl for THIS principal, so the only free component of the URL is generated on that line rather than accepted from anywhere. CreateCalendarInput carries a display name and a #RRGGBB colour and nothing else -- no id, no href and no reference of any kind crosses the tool boundary -- so there is no caller-supplied URL for assertUnderHome to be checking, which is why this is exempt rather than checked. It is the same claim the two dav_diagnose collection sites make and it is stronger than a derivation argument, not weaker. The site does call assertUnderHome on the planned URL before the request anyway, as defence in depth against a future edit to the lines that build it; that is recorded rather than claimed, because a hostile case against an input carrying no URL is an assertion that cannot fail. This exemption is scoped to the CREATE: the rename and delete that follow in plans 17-04 and 17-06 take a collection URL out of a caller-supplied opaque id and belong on the checked list instead",
   },
   {
     file: CONTACTS,
@@ -1271,6 +1308,72 @@ describe("a forged reference is refused before the credential leaves", () => {
         live.observed.length,
         `create / ${label} reached the network`,
       ).toBe(0);
+    }
+  });
+
+  it("aims the collection create under the resolved home, with nothing to forge", async () => {
+    // **The driven half of the create's exemption, and the honest form of it.**
+    // The audit above records WHY no hostile case exists for this site: the
+    // input carries no URL, so there is nothing to forge and a refusal case
+    // would be an assertion that cannot fail. What IS falsifiable is where the
+    // request actually went, and that is what this checks — against the
+    // recorded URL rather than against the return value, because the return
+    // value is minted from the same string and would agree with itself.
+    live.observed.length = 0;
+    const created = await createCalendarCollection(
+      env,
+      principal,
+      createDavFetch(owner),
+      { displayName: "Job search", color: "#1f77b4" },
+    );
+
+    expect(live.observed.length, "the create issued nothing at all").toBe(1);
+    const target = live.observed[0];
+    expect(
+      target.startsWith(CALDAV_HOME),
+      `the collection create targeted ${target}, which is not under the resolved home`,
+    ).toBe(true);
+    // The id names what was actually addressed. A token decoding to something
+    // else would name a collection nobody made.
+    expect(decodeCalendarId(created.id).collectionUrl).toBe(target);
+  });
+
+  it("cannot be aimed by any extra key smuggled onto its input", async () => {
+    // **The nearest thing to a hostile case this entry point admits, and it can
+    // genuinely fail.** The claim the exemption rests on is that no URL crosses
+    // this boundary. TypeScript says so at compile time and says nothing at
+    // all at runtime, so this drives the real function with every plausible
+    // URL-bearing key name a later parameter might arrive under, each naming a
+    // FOREIGN origin, and asserts the request still went under this account's
+    // own home.
+    //
+    // If somebody later adds a URL-bearing parameter to `CreateCalendarInput`
+    // and wires it to the target without a containment assertion, this goes red
+    // — which is the day the site stops being exempt and moves to the checked
+    // list.
+    for (const key of [
+      "collectionUrl",
+      "url",
+      "href",
+      "calendarId",
+      "id",
+      "home",
+      "homeUrl",
+    ]) {
+      live.observed.length = 0;
+      await createCalendarCollection(env, principal, createDavFetch(owner), {
+        displayName: "Job search",
+        color: "#1f77b4",
+        // Deliberately outside the declared shape. The cast is the point: it is
+        // how a runtime caller reaches a function whose type says no.
+        [key]: FOREIGN_COLLECTION,
+      } as unknown as Parameters<typeof createCalendarCollection>[3]);
+
+      expect(live.observed.length, `${key}: the create issued nothing`).toBe(1);
+      expect(
+        live.observed[0].startsWith(CALDAV_HOME),
+        `${key} aimed the create at ${live.observed[0]} — the credential went to a host this account does not own`,
+      ).toBe(true);
     }
   });
 
