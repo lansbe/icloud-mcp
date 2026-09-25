@@ -1004,6 +1004,244 @@ export async function changeHashMatches(
 }
 
 /**
+ * One text field of a contact change, and the reason it is a wrapper.
+ *
+ * A bare `string | null` cannot say the thing a contact change has to say.
+ * `null` would have to mean both "the caller did not mention this field" and
+ * "the caller asked for it to be cleared", and those are different requests
+ * about the same field: the first must leave whatever the card holds, and the
+ * second must take it away. CONW-03's whole guarantee is that an unmentioned
+ * field survives, so the two have to be distinguishable in the TYPE and not by
+ * a convention a later call site can read the other way round.
+ *
+ * So: the OUTER `null` — `formattedName: null` — means not mentioned, and this
+ * wrapper being present means mentioned, with `value: null` meaning clear it.
+ * An empty string is a VALUE and clears nothing.
+ */
+export interface ContactTextEdit {
+  /** The new text, or `null` to take the property away entirely. */
+  value: string | null;
+}
+
+/**
+ * `N`'s five components, as a change rather than as a reading.
+ *
+ * Positionally identical to `ContactName` in `src/dav/vcard.ts` and named the
+ * same way on purpose, but deliberately a separate type: that one is the
+ * read-side projection of a card and this one is an instruction about one. Each
+ * component is `string | null`, and a `null` component is an EMPTY component of
+ * the written `N` rather than an unmentioned one — the property is structured,
+ * so mentioning it at all replaces the whole of it. Whether `N` is mentioned is
+ * carried one level up, by `NormalizedContactChange.name` being `null` or not.
+ */
+export interface ContactNameEdit {
+  /** `N` index 0. */
+  family: string | null;
+  /** `N` index 1. */
+  given: string | null;
+  /** `N` index 2. */
+  additional: string | null;
+  /** `N` index 3. */
+  prefix: string | null;
+  /** `N` index 4. */
+  suffix: string | null;
+}
+
+/**
+ * `ADR`'s seven components, as a change rather than as a reading.
+ *
+ * The same argument `ContactNameEdit` carries, over the address's own seven
+ * components. Indexing past a gap rather than through it shifts every field
+ * after it, which is how a postcode ends up written into a region — so the
+ * components are named here and never handled as a bare array by a caller.
+ */
+export interface ContactAddressEdit {
+  /** `ADR` index 0. */
+  poBox: string | null;
+  /** `ADR` index 1. */
+  extended: string | null;
+  /** `ADR` index 2. */
+  street: string | null;
+  /** `ADR` index 3. */
+  locality: string | null;
+  /** `ADR` index 4. */
+  region: string | null;
+  /** `ADR` index 5. */
+  postalCode: string | null;
+  /** `ADR` index 6. */
+  country: string | null;
+}
+
+/**
+ * One entry of a repeated contact property — an email, a telephone number.
+ *
+ * `value` is required, because an entry with no value is not an entry: a caller
+ * removing one drops it from the list rather than sending an empty one. `types`
+ * is always a list, on `ContactValue.types`' own reason one module over: the
+ * library's parameter accessor returns a bare string for one parameter and an
+ * array for several, and mapping the string yields its characters.
+ *
+ * Both are caller-supplied and neither is repaired.
+ */
+export interface ContactListEntry {
+  value: string;
+  types: string[];
+}
+
+/**
+ * The shape a contact preview and a contact commit both reduce their request to.
+ *
+ * Its own type rather than a widening of `NormalizedChange`, and the reason is
+ * mechanical rather than stylistic: that type is calendar-shaped — `summary`,
+ * `startLocal`, `endTzid`, `attendees` — and a contact change has nowhere to
+ * sit in it. `AttendeeChange` is the precedent for this module owning a change
+ * vocabulary per consumer, and adding beside it changes no existing export.
+ *
+ * **"Normalized" means every optional key has already been resolved**, exactly
+ * as it does on `NormalizedChange` — but here the resolution has TWO
+ * destinations rather than one, and that is the whole point. An absent key
+ * becomes the outer `null`, and an explicit wire `null` becomes the cleared
+ * form: `{ value: null }` for a text field, and for a list, an ARRAY (empty
+ * included) that replaces the whole of it. The single place those two are told
+ * apart is the tool boundary's own normaliser; by the time a change reaches
+ * here, they already are.
+ *
+ * Emails and telephone numbers are WHOLE-LIST replacement only. Supplying the
+ * key replaces every entry; omitting it leaves them all alone. There is no
+ * per-entry patching, because a grouped `itemN.X-ABLabel` label is exactly the
+ * structure CONW-03 protects and per-entry editing by index or by value is
+ * where that protection is lost.
+ */
+export interface NormalizedContactChange {
+  /** The operation, matching the confirmation's own `k`. */
+  kind: ConfirmKind;
+  /** `FN`. */
+  formattedName: ContactTextEdit | null;
+  /** `N`, whole. */
+  name: ContactNameEdit | null;
+  /** `ORG`'s components in order, whole. */
+  organisation: string[] | null;
+  /** `ADR`, whole. */
+  address: ContactAddressEdit | null;
+  /** `NOTE`. */
+  note: ContactTextEdit | null;
+  /** Every `EMAIL`, whole. */
+  emails: ContactListEntry[] | null;
+  /** Every `TEL`, whole. */
+  tels: ContactListEntry[] | null;
+}
+
+/**
+ * An edit slot, as bytes that cannot collide with the not-mentioned slot.
+ *
+ * **This is the function the whole absent-versus-cleared guarantee rests on,
+ * and the hazard it exists for is one line of runtime behaviour.**
+ * `JSON.stringify` turns an `undefined` ARRAY ELEMENT into `null`, so
+ * `JSON.stringify([undefined])` and `JSON.stringify([null])` are the SAME
+ * BYTES. A positional tuple that put "not mentioned" in a slot as `undefined`
+ * and "clear it" in the same slot as `null` would therefore hash the two
+ * identically — and a caller could swap one for the other after the user
+ * approved the preview, which is a confirm-gate bypass rather than a cosmetic
+ * collision.
+ *
+ * So the two are made different by CONSTRUCTION rather than by care: not
+ * mentioned is `null`, and mentioned is a ONE-ELEMENT ARRAY holding the value.
+ * `null` and `[null]` are different bytes under `JSON.stringify` and there is
+ * no value the wrapped form can take that reaches the bare `null`.
+ */
+function editSlot<T>(edit: T | null, project: (edit: T) => unknown): unknown {
+  return edit === null ? null : [project(edit)];
+}
+
+/**
+ * The bytes a contact change hashes to, as a fixed-order tuple.
+ *
+ * `canonicalChange`'s twin for a contact, and it carries that function's two
+ * standing rules unaltered:
+ *
+ * - **No Unicode normalisation of any user-authored text.** A name, an
+ *   organisation, a note and an address are left exactly as the caller sent
+ *   them, NFC and NFD alike. Normalising somebody's own name is a repair, and
+ *   this project refuses repairs on user-authored text as firmly as it refuses
+ *   them on stranger-authored text. A test pins it red.
+ * - **Never hash the serialized card.** A vCard carries a `REV`, so two
+ *   serialisations of one change differ by construction — precisely the hazard
+ *   `canonicalChange` records about `DTSTAMP`. The hash covers the normalized
+ *   CHANGE and the card bytes are never an input.
+ *
+ * Key insertion order cannot reach the output, because every field is read by
+ * name into a positional tuple of fixed order. And every nullable slot goes
+ * through `editSlot`, which is where the absent-versus-cleared distinction
+ * becomes different bytes; read that function before changing anything here.
+ *
+ * List entries keep the caller's own ORDER and are not de-duplicated, which is
+ * the opposite of what `canonicalChange` does to attendees, and deliberately.
+ * An attendee list names a set of people, so the same three in a different
+ * order are the same change. An email list is written onto a card in order, and
+ * the first entry is the one Apple's clients treat as preferred — so a
+ * reordering IS a different write, and collapsing it would let a caller reorder
+ * an approved list after the fact.
+ */
+export function canonicalContactChange(
+  change: NormalizedContactChange,
+): string {
+  return JSON.stringify([
+    change.kind,
+    editSlot(change.formattedName ?? null, (edit) => edit.value ?? null),
+    editSlot(change.name ?? null, (edit) => [
+      edit.family ?? null,
+      edit.given ?? null,
+      edit.additional ?? null,
+      edit.prefix ?? null,
+      edit.suffix ?? null,
+    ]),
+    editSlot(change.organisation ?? null, (components) =>
+      components.map((component) => component),
+    ),
+    editSlot(change.address ?? null, (edit) => [
+      edit.poBox ?? null,
+      edit.extended ?? null,
+      edit.street ?? null,
+      edit.locality ?? null,
+      edit.region ?? null,
+      edit.postalCode ?? null,
+      edit.country ?? null,
+    ]),
+    editSlot(change.note ?? null, (edit) => edit.value ?? null),
+    editSlot(change.emails ?? null, canonicalEntries),
+    editSlot(change.tels ?? null, canonicalEntries),
+  ]);
+}
+
+/**
+ * A list of entries as fixed-order `[value, types]` pairs.
+ *
+ * `types` is sorted, and that is the one normalisation applied anywhere in this
+ * canonical. A `TYPE` parameter set is unordered by RFC 6350 and the library
+ * hands the parameters back in whatever order the card carried them, so two
+ * requests naming `CELL` and `VOICE` in opposite order are the same
+ * instruction — while the ENTRIES themselves keep their order, because a
+ * card's list order is caller-visible. The values themselves are untouched.
+ */
+function canonicalEntries(entries: ContactListEntry[]): unknown {
+  return entries.map((entry) => [
+    entry.value,
+    [...entry.types].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+  ]);
+}
+
+/** The canonical contact change, digested and carried as base64url. */
+export async function contactChangeHashOf(
+  change: NormalizedContactChange,
+): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    TOKEN_ENCODER.encode(canonicalContactChange(change)),
+  );
+  return toBase64Url(new Uint8Array(digest));
+}
+
+/**
  * The resource words this server will ever name in a composed line.
  *
  * A CLOSED vocabulary rather than a caller-supplied string, on `changedFields`'

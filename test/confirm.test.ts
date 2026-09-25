@@ -21,9 +21,11 @@ import {
   CONFIRM_VERSION,
   ConfirmationInvalidError,
   canonicalChange,
+  canonicalContactChange,
   changeHashMatches,
   changeHashOf,
   composeConfirmationLine,
+  contactChangeHashOf,
   importConfirmationKey,
   mintConfirmation,
   reserveConfirmation,
@@ -36,10 +38,12 @@ import type {
   ConfirmationNoun,
   ConfirmationSummary,
   ConfirmationTense,
+  ContactListEntry,
   DavCollectionConfirmPayload,
   DavObjectConfirmPayload,
   MailConfirmPayload,
   NormalizedChange,
+  NormalizedContactChange,
 } from "../src/confirm";
 import { DavConfirmationError, davToErrorCategory } from "../src/dav/errors";
 import { decodeEventId, encodeEventId } from "../src/dav/ids";
@@ -170,6 +174,39 @@ function change(overrides: Partial<NormalizedChange> = {}): NormalizedChange {
     attendees: [],
     ...overrides,
   };
+}
+
+/**
+ * A contact change mentioning NOTHING, so every case below states exactly the
+ * one thing it is about.
+ *
+ * The default is every field at the outer `null` — "the caller did not mention
+ * it" — because that is the floor the absent-versus-cleared distinction is
+ * measured against, and a default carrying values would make each case below
+ * an assertion about two differences rather than one.
+ */
+function contactChange(
+  overrides: Partial<NormalizedContactChange> = {},
+): NormalizedContactChange {
+  return {
+    kind: "create",
+    formattedName: null,
+    name: null,
+    organisation: null,
+    address: null,
+    note: null,
+    emails: null,
+    tels: null,
+    ...overrides,
+  };
+}
+
+/** One list entry, so a case naming a list is not three lines of literal. */
+function listEntry(
+  value: string,
+  types: string[] = ["INTERNET"],
+): ContactListEntry {
+  return { value, types };
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,6 +1425,323 @@ describe("comparing two canonical change hashes", () => {
       changeHashMatches(await changeHashOf(change()), "x"),
     ).resolves.toBe(false);
     await expect(changeHashMatches("", "xx")).resolves.toBe(false);
+  });
+});
+
+// ===========================================================================
+// The canonical CONTACT change
+// ===========================================================================
+
+describe("the canonical contact change keeps absent and cleared apart", () => {
+  // The whole reason this canonical is its own function rather than a reuse of
+  // `canonicalChange`'s positional tuple. `JSON.stringify` turns an `undefined`
+  // ARRAY ELEMENT into `null`, so a positional tuple that put "not mentioned"
+  // in the slot as `undefined` and "clear it" in the slot as `null` would emit
+  // the identical bytes `[null]` for both — and a caller could then swap one
+  // for the other AFTER the user approved the preview, which is a confirm-gate
+  // bypass rather than a cosmetic collision. The pinned proof of the hazard
+  // itself:
+  it("is built against a JSON.stringify collapse that provably happens", () => {
+    expect(JSON.stringify([undefined])).toBe(JSON.stringify([null]));
+  });
+
+  it("differs between mentioning nothing and clearing one text field", () => {
+    const untouched = contactChange();
+    const cleared = contactChange({ note: { value: null } });
+
+    // On the canonical STRING and not only on the hash: a collision here is a
+    // fact about the bytes, and asserting it through a digest would report the
+    // same failure one indirection away from its cause.
+    expect(canonicalContactChange(untouched)).not.toBe(
+      canonicalContactChange(cleared),
+    );
+  });
+
+  const textFields = ["formattedName", "note"] as const;
+
+  it.each(textFields)(
+    "keeps absent, cleared and valued apart for %s",
+    (field) => {
+      const absent = canonicalContactChange(contactChange());
+      const cleared = canonicalContactChange(
+        contactChange({ [field]: { value: null } }),
+      );
+      const valued = canonicalContactChange(
+        contactChange({ [field]: { value: "something" } }),
+      );
+
+      expect(new Set([absent, cleared, valued]).size).toBe(3);
+    },
+  );
+
+  it("keeps absent, cleared and valued apart for the structured name", () => {
+    const absent = canonicalContactChange(contactChange());
+    const cleared = canonicalContactChange(
+      contactChange({
+        name: {
+          family: null,
+          given: null,
+          additional: null,
+          prefix: null,
+          suffix: null,
+        },
+      }),
+    );
+    const valued = canonicalContactChange(
+      contactChange({
+        name: {
+          family: "Okonkwo",
+          given: "Adaeze",
+          additional: null,
+          prefix: null,
+          suffix: null,
+        },
+      }),
+    );
+
+    expect(new Set([absent, cleared, valued]).size).toBe(3);
+  });
+
+  it("keeps absent, cleared and valued apart for the postal address", () => {
+    const absent = canonicalContactChange(contactChange());
+    const cleared = canonicalContactChange(
+      contactChange({
+        address: {
+          poBox: null,
+          extended: null,
+          street: null,
+          locality: null,
+          region: null,
+          postalCode: null,
+          country: null,
+        },
+      }),
+    );
+    const valued = canonicalContactChange(
+      contactChange({
+        address: {
+          poBox: null,
+          extended: null,
+          street: "12 Ludlow Row",
+          locality: "Chicago",
+          region: "IL",
+          postalCode: "60601",
+          country: null,
+        },
+      }),
+    );
+
+    expect(new Set([absent, cleared, valued]).size).toBe(3);
+  });
+
+  it("treats a null list and an empty list as different instructions", () => {
+    // "Leave the list alone" and "replace the list with nothing" are different
+    // requests, and an empty array is the second one. Collapsing them would let
+    // a caller turn an approved no-op into the removal of every address on the
+    // card.
+    expect(canonicalContactChange(contactChange({ emails: null }))).not.toBe(
+      canonicalContactChange(contactChange({ emails: [] })),
+    );
+    expect(canonicalContactChange(contactChange({ tels: null }))).not.toBe(
+      canonicalContactChange(contactChange({ tels: [] })),
+    );
+  });
+
+  it("treats a null organisation and an empty one as different instructions", () => {
+    expect(
+      canonicalContactChange(contactChange({ organisation: null })),
+    ).not.toBe(canonicalContactChange(contactChange({ organisation: [] })));
+  });
+});
+
+describe("the canonical contact change is stable under everything that is not a change", () => {
+  it("emits byte-identical output for two calls with the same change", () => {
+    // A pure function: no timestamp, no revision, no ordering of its own. A
+    // `REV` invented on the way through is the same hazard `canonicalChange`
+    // records about `DTSTAMP`, and it would refuse every commit.
+    const supplied = contactChange({
+      formattedName: { value: "Adaeze Okonkwo" },
+      emails: [listEntry("adaeze@example.invalid")],
+    });
+
+    expect(canonicalContactChange(supplied)).toBe(
+      canonicalContactChange(supplied),
+    );
+    expect(canonicalContactChange(contactChange({ note: { value: "x" } }))).toBe(
+      canonicalContactChange(contactChange({ note: { value: "x" } })),
+    );
+  });
+
+  it("ignores the order the caller's own keys were inserted in", () => {
+    const first: NormalizedContactChange = {
+      kind: "create",
+      formattedName: { value: "Adaeze Okonkwo" },
+      name: null,
+      organisation: ["Reliability"],
+      address: null,
+      note: { value: "Met at the conference" },
+      emails: [listEntry("adaeze@example.invalid")],
+      tels: null,
+    };
+    const second: NormalizedContactChange = {
+      tels: null,
+      emails: [listEntry("adaeze@example.invalid")],
+      note: { value: "Met at the conference" },
+      address: null,
+      organisation: ["Reliability"],
+      name: null,
+      formattedName: { value: "Adaeze Okonkwo" },
+      kind: "create",
+    };
+
+    expect(JSON.stringify(first)).not.toBe(JSON.stringify(second));
+    expect(canonicalContactChange(first)).toBe(canonicalContactChange(second));
+  });
+
+  it("applies NO Unicode normalisation, so NFC and NFD differ", () => {
+    // The same decision `canonicalChange` pins, carried to a contact's own
+    // name. Normalising somebody's name is a repair, and this project refuses
+    // repairs on user-authored text.
+    const composed = "René"; // NFC: e-acute as one code point
+    const decomposed = "René"; // NFD: e followed by combining acute
+    expect(composed).not.toBe(decomposed);
+    expect(composed.normalize("NFD")).toBe(decomposed);
+
+    expect(
+      canonicalContactChange(contactChange({ formattedName: { value: composed } })),
+    ).not.toBe(
+      canonicalContactChange(
+        contactChange({ formattedName: { value: decomposed } }),
+      ),
+    );
+  });
+});
+
+describe("the contact change hash differs on every field it covers", () => {
+  // A loop rather than a case per field, so a field added to
+  // `NormalizedContactChange` later without a mutation here shows up as a GAP
+  // in the coverage assertion below rather than as silently uncovered surface.
+  const mutations: Record<string, Partial<NormalizedContactChange>> = {
+    kind: { kind: "update" },
+    formattedName: { formattedName: { value: "Adaeze Okonkwo" } },
+    name: {
+      name: {
+        family: "Okonkwo",
+        given: "Adaeze",
+        additional: null,
+        prefix: null,
+        suffix: null,
+      },
+    },
+    organisation: { organisation: ["Reliability"] },
+    address: {
+      address: {
+        poBox: null,
+        extended: null,
+        street: "12 Ludlow Row",
+        locality: "Chicago",
+        region: "IL",
+        postalCode: "60601",
+        country: null,
+      },
+    },
+    note: { note: { value: "Met at the conference" } },
+    emails: { emails: [listEntry("adaeze@example.invalid")] },
+    tels: { tels: [listEntry("+1-555-0142", ["CELL"])] },
+  };
+
+  it("covers every field of a canonical NormalizedContactChange", () => {
+    expect(Object.keys(mutations).sort()).toEqual(
+      Object.keys(contactChange()).sort(),
+    );
+  });
+
+  it.each(Object.keys(mutations))(
+    "changes the contact change hash when %s changes",
+    async (field) => {
+      expect(await contactChangeHashOf(contactChange(mutations[field]))).not.toBe(
+        await contactChangeHashOf(contactChange()),
+      );
+    },
+  );
+});
+
+describe("the contact change hash follows its canonical exactly", () => {
+  // Every row of the table the canonical is asserted over, again through the
+  // hash. The hash is what the confirmation seals, so a canonical that keeps
+  // two changes apart while the hash collapses them would be a gate that reads
+  // correct and enforces nothing.
+  const pairs: Record<
+    string,
+    [NormalizedContactChange, NormalizedContactChange]
+  > = {
+    "absent against cleared": [
+      contactChange(),
+      contactChange({ note: { value: null } }),
+    ],
+    "cleared against valued": [
+      contactChange({ note: { value: null } }),
+      contactChange({ note: { value: "something" } }),
+    ],
+    "a null list against an empty list": [
+      contactChange({ emails: null }),
+      contactChange({ emails: [] }),
+    ],
+    "a null organisation against an empty one": [
+      contactChange({ organisation: null }),
+      contactChange({ organisation: [] }),
+    ],
+    "an entry's types": [
+      contactChange({ tels: [listEntry("+1-555-0142", ["CELL"])] }),
+      contactChange({ tels: [listEntry("+1-555-0142", ["HOME"])] }),
+    ],
+    "two entries against one": [
+      contactChange({ emails: [listEntry("adaeze@example.invalid")] }),
+      contactChange({
+        emails: [
+          listEntry("adaeze@example.invalid"),
+          listEntry("a.okonkwo@example.invalid"),
+        ],
+      }),
+    ],
+  };
+
+  it.each(Object.keys(pairs))("hashes %s differently", async (label) => {
+    const [left, right] = pairs[label];
+    expect(canonicalContactChange(left)).not.toBe(
+      canonicalContactChange(right),
+    );
+    expect(await contactChangeHashOf(left)).not.toBe(
+      await contactChangeHashOf(right),
+    );
+  });
+
+  it("hashes the same change identically across two calls", async () => {
+    const supplied = contactChange({
+      formattedName: { value: "Adaeze Okonkwo" },
+      tels: [listEntry("+1-555-0142", ["CELL", "VOICE"])],
+    });
+
+    expect(await contactChangeHashOf(supplied)).toBe(
+      await contactChangeHashOf(supplied),
+    );
+  });
+
+  it("produces a hash the shipped constant-time comparison accepts", async () => {
+    // The binding the commit actually performs: `changeHashMatches` over the
+    // re-derived hash and the one the confirmation sealed.
+    const supplied = contactChange({ note: { value: "Bring the deck" } });
+    const sealed = await contactChangeHashOf(supplied);
+
+    expect(
+      await changeHashMatches(await contactChangeHashOf(supplied), sealed),
+    ).toBe(true);
+    expect(
+      await changeHashMatches(
+        await contactChangeHashOf(contactChange({ note: { value: null } })),
+        sealed,
+      ),
+    ).toBe(false);
   });
 });
 
