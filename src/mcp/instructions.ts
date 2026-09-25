@@ -83,7 +83,9 @@ Listings are cursor-paginated and metadata-only. A message body, an attachment, 
 
 Mail is read-only apart from drafts. There is no mail triage: nothing here moves, flags, marks or deletes a message.
 
-Calendar can create, update and delete, through the preview-and-commit shape above.
+Calendar EVENTS can be created, updated and deleted, through the preview-and-commit shape above.
+
+A CALENDAR itself can be created, with a name and a colour as \`#RRGGBB\`. That one writes on the first call and has no preview: making a calendar is reversible, and the user can delete it from any of their own devices. Do not offer to preview it, and do not pass its answer to \`calendar_commit\`.
 
 Contacts can create and update, through the same preview-and-commit shape.
 

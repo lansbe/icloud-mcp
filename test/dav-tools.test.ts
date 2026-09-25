@@ -38,6 +38,7 @@ import {
 } from "../src/dav/icalendar";
 import { createDavFetch } from "../src/dav/transport";
 import {
+  decodeCalendarId,
   encodeCalendarCursor,
   encodeCalendarId,
   encodeEventId,
@@ -608,10 +609,16 @@ function registeredDav(who: Promise<Principal> = owner): Registration[] {
   registerDavDiagnoseTool(server as unknown as McpServer, davFetch, who);
   registerCalendarTools(server as unknown as McpServer, davFetch, who);
   // The last registrar the phase adds. After this line the ceiling loop below
-  // covers the phase's ENTIRE tool surface — one diagnostic, nine calendar
+  // covers the phase's ENTIRE tool surface — one diagnostic, TEN calendar
   // tools and FIVE contacts tools — rather than two thirds of it, and the mail
   // suite's own loop keeps covering the mail tools, which is all it was ever
   // able to see.
+  //
+  // TEN rather than nine since CALM-04, and the harness needed no edit to reach
+  // the new one: `calendar_create_calendar` registers inside
+  // `registerCalendarTools` beside the other nine, which is why it is measured
+  // by the ceiling loop through this one call rather than through a line
+  // somebody had to remember to add.
   //
   // FIVE rather than two since CONW-01 and CONW-02, and the harness needed no edit
   // to reach any of the three: `registerContactsTools` delegates to
@@ -646,6 +653,7 @@ describe("the DAV registrations", () => {
   it("registers the diagnostic and every calendar and contacts tool", () => {
     expect(registeredDav().map((one) => one.name).sort()).toEqual([
       "calendar_commit",
+      "calendar_create_calendar",
       "calendar_create_event",
       "calendar_delete_event",
       "calendar_find_free_slots",
@@ -703,7 +711,7 @@ describe("the DAV registrations", () => {
     // The loop above iterates the REGISTRATIONS rather than an enumerated list
     // of names, so a tool added to a DAV registrar in a later plan is measured
     // by construction — with no edit to this file and no cross-plan conflict.
-    expect(registeredDav().length).toBe(15);
+    expect(registeredDav().length).toBe(16);
   });
 
   it("carries the untrusted notice on every calendar description that returns stranger content", () => {
@@ -7190,7 +7198,7 @@ describe("a principal that was refused reaches no DAV tool", () => {
   }
 
   it("covers every DAV registration, and the count is pinned", () => {
-    // One diagnostic, nine calendar tools, five contacts tools. A tool added
+    // One diagnostic, TEN calendar tools, five contacts tools. A tool added
     // later lands in the loop below by itself. This pin is what makes a tool
     // REMOVED from the loop show up.
     //
@@ -7198,7 +7206,12 @@ describe("a principal that was refused reaches no DAV tool", () => {
     // principal before it decodes an id, plans a target or mints a confirmation,
     // so a refused principal reads `auth_failed` rather than spending a signing
     // key on somebody who is not signed in.
-    expect(registeredDav(refused()).length).toBe(15);
+    //
+    // `calendar_create_calendar` (CALM-04) joins them on the same footing, and
+    // it is the one that writes on the FIRST call — there is no preview leg to
+    // absorb a refusal, so awaiting the principal first is the only thing
+    // between a grant that does not check out and a collection create.
+    expect(registeredDav(refused()).length).toBe(16);
   });
 
   it("answers auth_failed from EVERY tool, with the unchanged message and zero requests", async () => {
@@ -7508,5 +7521,250 @@ describe("the composed line, built from this server's own counts", () => {
     expect(past).toBe(forward.replace("Deleting", "Deleted"));
     // And it is fenced on this shape too.
     expect(raw.trusted).not.toContain("Deleted event");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CALM-04 — the calendar create, at the tool boundary
+//
+// The other end of the tracer slice. The service-layer cases in
+// `test/dav-calendar.test.ts` prove what reaches the wire; these prove what is
+// allowed to get that far, and the sharpest one is the colour: a malformed
+// value must be refused with the request list still EMPTY, because this is the
+// last layer before a caller's string is inside an XML element in a request
+// body.
+// ---------------------------------------------------------------------------
+
+/**
+ * Drive `calendar_create_calendar` the way a real MCP server drives it.
+ *
+ * Through the SCHEMA and then through the handler, rather than straight into
+ * the handler. `registeredDav` records the callback and the schema separately,
+ * so calling the callback directly would walk past the very gate D-08 puts on
+ * this tool — and a case asserting "no request was made" would then be
+ * asserting something about a code path nobody uses.
+ */
+async function createCalendarCall(args: Record<string, unknown>): Promise<
+  | { refused: true }
+  | { refused: false; trusted: Record<string, unknown>; untrusted: Record<string, unknown> }
+> {
+  const parsed = schemaFor("calendar_create_calendar").safeParse(args);
+  if (!parsed.success) return { refused: true };
+
+  const result = await invokeRegistered(
+    "calendar_create_calendar",
+    parsed.data as Record<string, unknown>,
+  );
+  expect(
+    result.isError,
+    `the create refused: ${result.content[0]?.text}`,
+  ).not.toBe(true);
+  const raw = blocks(result);
+  return {
+    refused: false,
+    trusted: JSON.parse(raw.trusted) as Record<string, unknown>,
+    untrusted: fencedObject(raw.untrusted),
+  };
+}
+
+/** A stub that answers a collection create, and everything else as usual. */
+function creatingWriteStub(status = 201): WriteStub {
+  return writeDavStub({
+    onRequest: (_url, method) =>
+      method === "MKCOL" ? new Response(null, { status }) : null,
+  });
+}
+
+describe("the calendar_create_calendar registration", () => {
+  it("takes a name and a colour, and nothing else", () => {
+    expect(Object.keys(schemaFor("calendar_create_calendar").shape).sort()).toEqual(
+      ["color", "displayName"],
+    );
+  });
+
+  it("says in the description that it writes with no confirmation (D-07)", () => {
+    // The absence of a gate is a fact about the TOOL rather than about either
+    // parameter, so it belongs in the description — and stating it is what
+    // stops a model offering the user a preview this tool does not have.
+    const description = String(
+      registeredDav().find((one) => one.name === "calendar_create_calendar")!
+        .options.description,
+    );
+
+    expect(description).toContain("Writes immediately");
+    expect(description).toContain(CALENDAR_UNTRUSTED_NOTICE);
+    // NOT routed through the single commit endpoint. A create is reversible,
+    // and a gate on a reversible operation trains the user to click through the
+    // one that matters.
+    expect(description).not.toContain("calendar_commit");
+  });
+
+  it("refuses every colour that is not exactly #RRGGBB", () => {
+    // ANCHORED AT BOTH ENDS. Each of these passes an unanchored pattern, and
+    // each is a different way for text to ride into a request body behind six
+    // legitimate hex digits.
+    const schema = schemaFor("calendar_create_calendar");
+    for (const color of [
+      "1f77b4",
+      "#1f77b",
+      "#1f77b4a",
+      "#1f77b4ff",
+      "#1f77bz",
+      " #1f77b4",
+      "#1f77b4 ",
+      "#1f77b4\n#ffffff",
+      "red",
+      "",
+    ]) {
+      expect(
+        schema.safeParse({ displayName: "Job search", color }).success,
+        `${JSON.stringify(color)} was admitted`,
+      ).toBe(false);
+    }
+
+    // Both cases of hex, because `[0-9A-Fa-f]` admits both and a pattern
+    // narrowed to one would refuse half the colours a person copies out of a
+    // design tool.
+    for (const color of ["#1f77b4", "#1F77B4", "#000000", "#ffffff"]) {
+      expect(
+        schema.safeParse({ displayName: "Job search", color }).success,
+        `${color} was refused`,
+      ).toBe(true);
+    }
+  });
+
+  it("refuses an empty name and one past the cap", () => {
+    const schema = schemaFor("calendar_create_calendar");
+
+    expect(schema.safeParse({ displayName: "", color: "#1f77b4" }).success).toBe(
+      false,
+    );
+    expect(
+      schema.safeParse({ displayName: "x".repeat(201), color: "#1f77b4" })
+        .success,
+    ).toBe(false);
+    expect(
+      schema.safeParse({ displayName: "x".repeat(200), color: "#1f77b4" })
+        .success,
+    ).toBe(true);
+  });
+});
+
+describe("the calendar_create_calendar call", () => {
+  it("refuses a malformed colour with ZERO requests issued", async () => {
+    const stub = creatingWriteStub();
+    await warmWrite(stub);
+
+    const outcome = await createCalendarCall({
+      displayName: "Job search",
+      color: "not-a-colour",
+    });
+
+    expect(outcome.refused).toBe(true);
+    // ZERO. The refusal happens before the KV read discovery performs and
+    // before anything reaches the wire, which is the cheapest possible refusal
+    // and the one that spends none of the connection budget.
+    expect(
+      stub.observed.length,
+      "a malformed colour reached the network",
+    ).toBe(0);
+  });
+
+  it("sends a valid #RRGGBB to the wire as eight hex digits", async () => {
+    const stub = creatingWriteStub();
+    await warmWrite(stub);
+
+    const outcome = await createCalendarCall({
+      displayName: "Job search",
+      color: "#1f77b4",
+    });
+
+    expect(outcome.refused).toBe(false);
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].method).toBe("MKCOL");
+    expect(String(stub.observed[0].body)).toContain(
+      "<ca:calendar-color>#1f77b4FF</ca:calendar-color>",
+    );
+    // ONE request, and it did not fan out with anything.
+    expect(stub.maxInFlight).toBe(1);
+  });
+
+  it("names the created calendar by an id that decodes to what it created", async () => {
+    const stub = creatingWriteStub();
+    await warmWrite(stub);
+
+    const outcome = await createCalendarCall({
+      displayName: "Job search",
+      color: "#1f77b4",
+    });
+    if (outcome.refused) throw new Error("the create was refused");
+
+    // The round trip, against the URL the request ACTUALLY targeted rather than
+    // one this test named. An id that decoded to something else would be a
+    // token naming a collection nobody made.
+    const id = String(outcome.trusted.id);
+    expect(decodeCalendarId(id).collectionUrl).toBe(stub.observed[0].url);
+    // Repeated inside the fence so the two halves join by IDENTITY.
+    expect(outcome.untrusted.id).toBe(id);
+  });
+
+  it("keeps the caller's own name and colour INSIDE the fence", async () => {
+    const stub = creatingWriteStub();
+    await warmWrite(stub);
+
+    const parsed = schemaFor("calendar_create_calendar").safeParse({
+      displayName: HOSTILE_CALENDAR_NAME,
+      color: "#1f77b4",
+    });
+    expect(parsed.success).toBe(true);
+    const result = await invokeRegistered(
+      "calendar_create_calendar",
+      parsed.data as Record<string, unknown>,
+    );
+    const raw = blocks(result);
+
+    // The fence's stated test is *did a stranger choose it*, and on a write
+    // path the caller is a model that may have read the name out of a message
+    // somebody else sent. Both echoed values ride inside the fence; only the
+    // id — this server's own token — is outside it.
+    expect(raw.trusted).not.toContain(HOSTILE_CALENDAR_NAME);
+    expect(raw.untrusted).toContain(HOSTILE_CALENDAR_NAME);
+    expect(raw.trusted).not.toContain("#1f77b4");
+    expect(Object.keys(JSON.parse(raw.trusted))).toEqual(["id"]);
+  });
+
+  it("reports a 207 as a refusal rather than as a created calendar", async () => {
+    // D-06 at the boundary the user actually reads. The tool must not print an
+    // id beside a calendar RFC 5689 § 3 says was never created.
+    const stub = creatingWriteStub();
+    await warmWrite(stub);
+
+    const parsed = schemaFor("calendar_create_calendar").safeParse({
+      displayName: "Job search",
+      color: "#1f77b4",
+    });
+    expect(parsed.success).toBe(true);
+
+    const refusingStub = writeDavStub({
+      onRequest: (_url, method) =>
+        method === "MKCOL" ? new Response(null, { status: 207 }) : null,
+    });
+    vi.stubGlobal("fetch", refusingStub.fetch);
+
+    const result = await invokeRegistered(
+      "calendar_create_calendar",
+      parsed.data as Record<string, unknown>,
+    );
+
+    expect(result.isError).toBe(true);
+    // ONE block, the error shape, not the two-block success shape — so there is
+    // no id anywhere in the answer for a model to report back.
+    expect(result.content.length).toBe(1);
+    const whole = result.content[0].text;
+    expect(JSON.parse(whole).category).toBe("connection_failed");
+    // Nothing of the server's answer escapes: not the status, not the host.
+    expect(whole).not.toContain("207");
+    expect(whole).not.toContain("p42");
+    expect(whole).not.toContain("1234567890");
   });
 });

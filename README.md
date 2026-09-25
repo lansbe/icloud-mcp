@@ -87,7 +87,7 @@ enforcement, and the module map — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ## Tools
 
-27 tools in four groups. Every tool description carries an untrusted-content
+28 tools in four groups. Every tool description carries an untrusted-content
 notice; event titles, message bodies, and contact fields are treated as data,
 never as instructions.
 
@@ -119,6 +119,7 @@ never as instructions.
 | Tool | What it does |
 |------|--------------|
 | `calendar_list_calendars` | List calendars: id, name, colour, subscription flag. |
+| `calendar_create_calendar` | Create a calendar with a name and a `#RRGGBB` colour. **Writes immediately** — no preview, because it is reversible. |
 | `calendar_list_events` | List events in a date range (recurring events expand to occurrences). |
 | `calendar_get_event` | Read one event in full by opaque id. |
 | `calendar_search` | Find events by keyword or attendee within a range. |

@@ -28,6 +28,7 @@
 import {
   calendarMultiGet,
   createCalendarObject,
+  davRequest,
   deleteCalendarObject,
   fetchCalendarObjects,
   fetchCalendarUserAddresses,
@@ -616,6 +617,269 @@ export async function listCalendars(
       cacheHit: resolved.cacheHit,
     };
   });
+}
+
+// ---------------------------------------------------------------------------
+// CALM-04 — creating a calendar collection
+// ---------------------------------------------------------------------------
+
+/**
+ * What one `calendar_create_calendar` call supplies.
+ *
+ * Two values, both the USER's own rather than anything this server read, and
+ * both already refused at the tool boundary if they are the wrong shape. No
+ * URL, no identifier and no reference of any kind crosses this boundary, which
+ * is what makes the request target below unaimable rather than merely checked.
+ */
+export interface CreateCalendarInput {
+  /** The calendar's name, verbatim. */
+  displayName: string;
+  /** `#RRGGBB`, already matched against the anchored pattern at the tool (D-08). */
+  color: string;
+}
+
+/** A calendar that now exists, named by the token every other calendar tool takes. */
+export interface CreatedCalendar {
+  /** The opaque id `calendar_list_calendars` would mint for the same collection. */
+  id: string;
+  /** What was asked for, echoed. */
+  displayName: string;
+  /** The `#RRGGBB` that was asked for, NOT the eight-digit form the wire carries. */
+  color: string;
+}
+
+/**
+ * The method a calendar collection is created with, and why it is not the
+ * obvious one.
+ *
+ * RFC 4791 defines a method whose entire purpose is creating a calendar, and
+ * the DAV library ships a helper that issues it. **Neither can be used from
+ * here: this runtime refuses to build a request carrying that method string at
+ * all**, and the refusal is a `TypeError` raised before any I/O — see
+ * `assertSendableMethod` in `./transport.ts` for the measured failure that
+ * settled it. Both are named by ROLE and never spelled, here and everywhere
+ * else in this tree, because both are banned tokens in every scanned root; see
+ * `./../../.claude/CLAUDE.md` § Enforcement.
+ *
+ * So the create issues RFC 5689 extended `MKCOL` instead: the same intent,
+ * expressed with a method this platform will send. The body sets the calendar
+ * resource type alongside the collection one, which is what makes the result a
+ * calendar rather than an ordinary WebDAV collection.
+ *
+ * **The request shape below is SPIKE-04's, lifted rather than re-derived.**
+ * That probe ran against the owner's real account on 2026-09-24 and iCloud
+ * answered `201` to exactly these bytes. A second derivation of a shape that is
+ * already measured is a second thing to get wrong.
+ */
+const CREATE_COLLECTION_METHOD = "MKCOL";
+
+/**
+ * The opaque alpha pair every colour this server writes carries.
+ *
+ * Uppercase, and the case is a CHOICE rather than a fact about the protocol.
+ * This repository's own listing fixture spells a colour `#1f77b4` and SPIKE-04's
+ * live probe sent `#7F7F7FFF`; iCloud accepted the second, neither case means
+ * anything on the wire, and exactly one of them has to be picked or it drifts
+ * between call sites. The measured one is picked, and a test pins it.
+ */
+const OPAQUE_ALPHA = "FF";
+
+/**
+ * The eight-digit colour iCloud stores, from the six-digit one a person types.
+ *
+ * APPEND ONLY. The six digits go back out in whatever case the CALLER chose,
+ * because re-casing somebody's value is a change to it that nobody asked for.
+ * Only the alpha pair is this server's, and it is a constant.
+ *
+ * **It validates nothing, deliberately.** The anchored `^#[0-9A-Fa-f]{6}$`
+ * lives at the tool boundary (D-08), so a malformed colour is refused before
+ * any request leaves the Worker; a second check here would be a second
+ * mitigation of the same thing, drifting from the first the day either is
+ * edited.
+ *
+ * Apple's `symbolic-color` attribute is NOT emitted beside it. This server has
+ * no swatch vocabulary, and inventing one would put a claim on the resource the
+ * user never made — the same argument `addParticipants` makes for not inventing
+ * an organiser `CN`.
+ *
+ * Nothing normalises colour on the READ side to match. `collectionsFrom`
+ * publishes whatever string the server sent, marked stranger-authored, so a
+ * listing reports eight digits for a calendar this server created and six for
+ * one Apple created. That asymmetry is iCloud's, not this server's.
+ */
+export function calendarColorForWire(rgb: string): string {
+  return `${rgb}${OPAQUE_ALPHA}`;
+}
+
+/**
+ * Whether the create's own status means the calendar exists (D-06).
+ *
+ * **`207` is the trap, and it sits INSIDE the success range.** RFC 5689 § 3
+ * makes an extended `MKCOL` all-or-nothing: a server that cannot satisfy every
+ * property in the body MUST fail the whole request and MUST NOT create the
+ * collection, and the body of that refusal is a `DAV:mkcol-response` naming the
+ * property it rejected. The specification's own § 3.5 example carries that body
+ * under `403` and names no `207` for the case at all — so this rule is
+ * CONSERVATIVE rather than spec-quoting, and it is conservative in the only
+ * direction that matters. A `207` is definitionally an envelope rather than an
+ * answer, so reading one as a refusal can only ever under-report a success,
+ * while reading one as a success would record a creation that did not happen.
+ * "The tool said your calendar was made and it is on none of your devices" is
+ * the one error on this path that cannot be walked back.
+ *
+ * Narrow on purpose: every 2xx is accepted EXCEPT `207`. Demanding `201`
+ * exactly would be the mirror-image mistake — a server answering `200` to a
+ * genuine creation would be recorded as having refused.
+ *
+ * It lives HERE and not in `./transport.ts`, and that is forced rather than
+ * chosen: `throwForStatus` returns for the whole 2xx range, so a `207` reaches
+ * this layer as a success and the refusal cannot be hoped for from below.
+ *
+ * **What it cannot see, written down rather than left to be discovered.** The
+ * status handed to it is the library's, and the library reports the ENVELOPE's
+ * status only when the body is not a `DAV:multistatus`. RFC 5689 gives the
+ * refusal a `DAV:mkcol-response` body, which is not one — so the real shape is
+ * caught. A server answering `207` with a `multistatus` instead would have its
+ * inner per-response status reported here and could slip through. That shape is
+ * undefined for `MKCOL` by every specification involved and unmeasured against
+ * iCloud, and refusing it would mean inventing a rule that could also refuse a
+ * genuine success. The limit is recorded; it is not closed.
+ */
+function collectionCreatedBy(status: number | null): boolean {
+  if (status === null) return false;
+  if (status === 207) return false;
+  return status >= 200 && status < 300;
+}
+
+/**
+ * Create one calendar collection on this account (CALM-04).
+ *
+ * ## The target is not the caller's, and cannot be made to be
+ *
+ * `CreateCalendarInput` carries a name and a colour and nothing else. The
+ * collection URL is `crypto.randomUUID()` resolved against the home set
+ * discovery just returned, so the only free component is generated on that line
+ * rather than accepted from anywhere. `assertUnderHome` still runs before the
+ * request — defence in depth rather than the authorisation it is on the paths
+ * that decode an id, because `./transport.ts` attaches the Apple ID and the
+ * app-specific password to whatever URL it is handed and a future edit to the
+ * two lines above is precisely what this catches.
+ *
+ * **The trailing slash is on the SEGMENT.** A collection URL without one is a
+ * different URL, and `assertUnderHome` compares pathname prefixes.
+ *
+ * ## Three properties, and no fourth
+ *
+ * `d:resourcetype`, `d:displayname` and `ca:calendar-color` — exactly what
+ * SPIKE-04 measured. `c:supported-calendar-component-set` is deliberately NOT
+ * sent: § 3's all-or-nothing rule means one property iCloud declines kills the
+ * whole create, and whether iCloud accepts that element inside an extended
+ * `MKCOL` is unmeasured in either direction. It costs the listing nothing —
+ * `collectionsFrom` already admits a collection declaring an empty component
+ * set.
+ *
+ * ## No retry, and this one is sharper than the event create's
+ *
+ * `allowRediscovery` is `false`. `createEvent` passes `false` because a retried
+ * write can be reported as a failure that actually landed; here the retry would
+ * mint a FRESH uuid, so a first attempt that landed and then reported a
+ * rediscoverable failure leaves TWO calendars on the account and no way to say
+ * which one the user asked for. The cost is stated rather than hidden: a stale
+ * cached shard host makes this tool fail until the discovery entry expires,
+ * which is one refusal the user can retry by hand against a duplicate nobody
+ * can clean up automatically.
+ *
+ * ## Serial, because every one of these is a socket
+ *
+ * One request, one calendar. `dav-concurrent-request` names this function, so a
+ * combinator wrapped around it is a commit-time rejection: an account with many
+ * calendars invites "make all of these", and iCloud's per-account connection
+ * ceiling is lower than the platform's, undocumented, and deliberately
+ * unmeasured — exhausting it locks the user out of their own mail in Mail.app
+ * on their own devices.
+ *
+ * Nothing here is logged. This module contains no logging calls of any kind.
+ */
+export async function createCalendarCollection(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  input: CreateCalendarInput,
+): Promise<CreatedCalendar> {
+  return withRediscovery(
+    env,
+    principal,
+    davFetch,
+    "caldav",
+    async (resolved) => {
+      const collectionUrl = new URL(
+        `${crypto.randomUUID()}/`,
+        resolved.homeUrl,
+      ).href;
+      assertUnderHome(collectionUrl, resolved.homeUrl);
+
+      const responses = await davRequest({
+        url: collectionUrl,
+        init: {
+          method: CREATE_COLLECTION_METHOD,
+          // Never a credential from here. `./transport.ts` attaches it per call
+          // and is the only place that may: building a header object here would
+          // mean this module held the app-specific password across an await,
+          // for nothing at all.
+          headers: {},
+          namespace: "d",
+          body: {
+            "d:mkcol": {
+              _attributes: {
+                "xmlns:d": "DAV:",
+                "xmlns:c": "urn:ietf:params:xml:ns:caldav",
+                "xmlns:ca": "http://apple.com/ns/ical/",
+              },
+              "d:set": {
+                "d:prop": {
+                  // The PAIR is what makes the result a calendar collection
+                  // rather than a plain one. Without the second element this
+                  // creates an ordinary WebDAV collection, which is a different
+                  // thing answered by accident.
+                  "d:resourcetype": {
+                    "d:collection": {},
+                    "c:calendar": {},
+                  },
+                  "d:displayname": input.displayName,
+                  "ca:calendar-color": calendarColorForWire(input.color),
+                },
+              },
+            },
+          },
+        },
+        fetch: davFetch,
+      });
+
+      const answered = responses[0]?.status;
+      if (
+        !collectionCreatedBy(typeof answered === "number" ? answered : null)
+      ) {
+        // `DavConnectError` is the honest floor for "the server answered
+        // something this layer cannot act on", and it needs no fifth error
+        // category: `davToErrorCategory`'s vocabulary is closed at four values
+        // and this class is last in that chain precisely because it is the
+        // explicit statement of the default. Nothing about the answer is read
+        // or carried — not its status, not its body, not the URL.
+        throw new DavConnectError();
+      }
+
+      return {
+        // The same encoder a listing row goes through, so the calendar is
+        // addressable by every other calendar tool the moment it exists.
+        id: encodeCalendarId({ collectionUrl }),
+        displayName: input.displayName,
+        color: input.color,
+      };
+    },
+    // See the docstring. A retry mints a fresh uuid, so this is the whole of
+    // the "two calendars, one request" mitigation.
+    false,
+  );
 }
 
 /**

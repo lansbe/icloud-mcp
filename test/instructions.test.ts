@@ -63,6 +63,7 @@ import { ownerPrincipal } from "./fixtures/bound-secrets";
 const EXPECTED_TOOLS: readonly string[] = [
   "account_whoami",
   "calendar_commit",
+  "calendar_create_calendar",
   "calendar_create_event",
   "calendar_delete_event",
   "calendar_find_free_slots",

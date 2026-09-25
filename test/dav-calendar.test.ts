@@ -51,6 +51,8 @@ import {
   MAX_RANGE_DAYS,
   MAX_SLOT_RANGE_DAYS,
   assertEtag,
+  calendarColorForWire,
+  createCalendarCollection,
   createEvent,
   deleteEvent,
   findFreeSlots,
@@ -78,6 +80,7 @@ import type {
 } from "../src/dav/calendar";
 import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
 import {
+  DavConnectError,
   DavNotFoundError,
   DavStaleResourceError,
   DavSubscriptionError,
@@ -3665,7 +3668,7 @@ describe("the calendar_create_event handler", () => {
 });
 
 describe("the calendar registrations", () => {
-  it("records exactly the nine calendar tools", () => {
+  it("records exactly the ten calendar tools", () => {
     // Named explicitly rather than counted, so neither the description loop in
     // `test/dav-tools.test.ts` nor this case can pass by the registrar having
     // been called and registered nothing.
@@ -3674,8 +3677,13 @@ describe("the calendar registrations", () => {
     // what this list is really pinning: a second commit endpoint appearing here
     // would be a second handler that could be the one missing the check.
     // `calendar_find_free_slots` (SCHED-01) is the ninth, added in phase 6.
+    // `calendar_create_calendar` (CALM-04) is the tenth, added in phase 17 —
+    // and it is the one tool on this list that deliberately does NOT reach
+    // `calendar_commit`, because a create is reversible and D-07 declines to
+    // spend the user's attention on a gate that does not need spending.
     expect(calendarRegistrations().map((one) => one.name).sort()).toEqual([
       "calendar_commit",
+      "calendar_create_calendar",
       "calendar_create_event",
       "calendar_delete_event",
       "calendar_find_free_slots",
@@ -5855,5 +5863,221 @@ describe("findFreeSlots across every calendar", () => {
       page.candidates.some((one) => one.startLocal.startsWith("2026-03-10")),
     ).toBe(false);
     expect(page.truncated).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CALM-04 — creating a calendar collection
+//
+// The tracer slice, at the service layer. These cases can tell a buildable
+// method from an unbuildable one, because 17-01 made every stub in this
+// repository construct a real `Request` before recording that it was sent —
+// so a create reaching for the RFC 4791 method this runtime refuses would
+// throw out of the stub rather than look green.
+// ---------------------------------------------------------------------------
+
+/**
+ * A server's refusal to create the collection, in the shape RFC 5689 gives it.
+ *
+ * `DAV:mkcol-response` and deliberately NOT a `DAV:multistatus`: the library
+ * reports the ENVELOPE's status only for a body that is not a multistatus, and
+ * this is the shape the specification actually defines for the case. § 3.5's
+ * own example carries it under `403`; the `207` here is the status that matters
+ * to D-06, because it is the one sitting inside the range every other layer
+ * reads as success.
+ */
+const MKCOL_REFUSAL_BODY =
+  '<?xml version="1.0" encoding="UTF-8"?>' +
+  '<d:mkcol-response xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">' +
+  "<d:propstat><d:prop><c:supported-calendar-component-set/></d:prop>" +
+  "<d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>" +
+  "</d:mkcol-response>";
+
+/** Answer every collection create with one status, and everything else normally. */
+function creatingStub(answer: () => Response): Stub {
+  return davStub({
+    onRequest: (_url, method) => (method === "MKCOL" ? answer() : null),
+  });
+}
+
+/** The one create this suite drives, with the fixture's own name and colour. */
+function createOne(): Promise<{ id: string; displayName: string; color: string }> {
+  return createCalendarCollection(env, principal, createDavFetch(owner), {
+    displayName: "Job search",
+    color: "#1f77b4",
+  });
+}
+
+describe("the wire form of a calendar colour", () => {
+  it("appends the alpha pair and changes nothing else", () => {
+    // The CASE is pinned, and it is pinned because neither case means anything
+    // on the wire and exactly one of them has to be chosen or it drifts between
+    // call sites. Uppercase, matching SPIKE-04's live probe value; the six
+    // digits are handed back in whatever case the CALLER wrote them in, because
+    // re-casing somebody's value is a change to it nobody asked for.
+    expect(calendarColorForWire("#1f77b4")).toBe("#1f77b4FF");
+    expect(calendarColorForWire("#1F77B4")).toBe("#1F77B4FF");
+  });
+
+  it("emits eight hex digits and no Apple swatch attribute", () => {
+    const wire = calendarColorForWire("#7f7f7f");
+
+    expect(wire).toMatch(/^#[0-9A-Fa-f]{8}$/);
+    // This server has no swatch vocabulary, and inventing one would put a claim
+    // on the resource the user never made.
+    expect(wire).not.toContain("symbolic");
+  });
+});
+
+describe("creating a calendar collection (CALM-04)", () => {
+  it("issues ONE extended MKCOL, at a URL under the resolved home", async () => {
+    const stub = creatingStub(() => new Response(null, { status: 201 }));
+    await warm(stub);
+
+    const created = await createOne();
+
+    // ONE. A collection create is one round trip against an account whose
+    // connection ceiling is lower than the platform's and undocumented.
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].method).toBe("MKCOL");
+
+    const target = stub.observed[0].url;
+    expect(target.startsWith(CALDAV_HOME)).toBe(true);
+    // The trailing slash is ON THE SEGMENT. A collection URL without one is a
+    // different URL, and `assertUnderHome` compares pathname prefixes.
+    expect(target.endsWith("/")).toBe(true);
+    // The only free component is generated locally. Nothing a caller supplies
+    // reaches this URL — `CreateCalendarInput` carries a name and a colour.
+    expect(target.slice(CALDAV_HOME.length)).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/$/,
+    );
+
+    // The returned id round-trips to the URL the request actually targeted, so
+    // the calendar is addressable by every other calendar tool the moment it
+    // exists — and the id names the collection that was made rather than one
+    // this test named.
+    expect(decodeCalendarId(created.id).collectionUrl).toBe(target);
+    expect(created.displayName).toBe("Job search");
+    // The six-digit form the caller supplied, NOT the eight-digit wire form.
+    expect(created.color).toBe("#1f77b4");
+  });
+
+  it("sends the three properties SPIKE-04 measured, and no fourth", async () => {
+    const stub = creatingStub(() => new Response(null, { status: 201 }));
+    await warm(stub);
+
+    await createOne();
+    const body = String(stub.observed[0].body);
+
+    // The PAIR is what makes the result a calendar collection rather than a
+    // plain WebDAV one. Both children, asserted separately, because dropping
+    // the second silently creates the wrong kind of thing.
+    expect(body).toContain("<d:resourcetype>");
+    expect(body).toContain("<d:collection/>");
+    expect(body).toContain("<c:calendar/>");
+    expect(body).toContain("<d:displayname>Job search</d:displayname>");
+    expect(body).toContain(
+      "<ca:calendar-color>#1f77b4FF</ca:calendar-color>",
+    );
+
+    // NOT sent, and this is the assertion that keeps it that way. RFC 5689 § 3
+    // is all-or-nothing: one property iCloud declines kills the whole create,
+    // and whether iCloud accepts this element inside an extended MKCOL is
+    // unmeasured in either direction. `collectionsFrom` already admits a
+    // collection declaring an empty component set, so omitting it costs the
+    // listing nothing.
+    expect(body).not.toContain("supported-calendar-component-set");
+
+    // The three namespaces the measured request declared, all on the one root.
+    expect(body).toContain('xmlns:d="DAV:"');
+    expect(body).toContain('xmlns:c="urn:ietf:params:xml:ns:caldav"');
+    expect(body).toContain('xmlns:ca="http://apple.com/ns/ical/"');
+  });
+
+  it("carries a credential built by the transport and by nothing else", async () => {
+    const stub = creatingStub(() => new Response(null, { status: 201 }));
+    await warm(stub);
+
+    await createOne();
+
+    // The service module passes `headers: {}`. What arrives is the transport's,
+    // and only the transport's: `createDavFetch` is the single place a
+    // credential may be attached, which the scan holds as a COUNT rather than a
+    // prohibition. This case pins the observable half — the credential is
+    // present and is the Basic form that seam builds — and the structural half
+    // is that there is nowhere else it could have come from.
+    expect(stub.observed[0].headers.authorization.startsWith("Basic ")).toBe(
+      true,
+    );
+    expect(stub.observed[0].headers["content-type"]).toContain("xml");
+  });
+
+  it("accepts a 200 as readily as a 201, so `=== 201` is not the predicate", async () => {
+    // The mirror-image error D-06 is narrow to avoid: demanding 201 exactly
+    // would record a server answering 200 to a genuine creation as having
+    // refused, and the user would be told nothing was made when something was.
+    for (const status of [200, 201, 204] as const) {
+      const stub = creatingStub(() => new Response(null, { status }));
+      await warm(stub);
+
+      const created = await createOne();
+      expect(created.id.length, `a ${status} was not treated as a success`).toBeGreaterThan(0);
+      expect(decodeCalendarId(created.id).collectionUrl).toBe(
+        stub.observed[0].url,
+      );
+    }
+  });
+
+  it("treats a 207 as a REFUSAL and reports nothing as created", async () => {
+    const stub = creatingStub(
+      () =>
+        new Response(MKCOL_REFUSAL_BODY, {
+          status: 207,
+          headers: { "content-type": "text/xml; charset=utf-8" },
+        }),
+    );
+    await warm(stub);
+
+    // It throws rather than returning something with a caveat on it. There is
+    // no shape in which a refused create comes back as a value: `CreatedCalendar`
+    // has no `created` field to be false, deliberately, because a field that can
+    // only ever say `true` is one nobody can read an answer out of.
+    let outcome: unknown = "no refusal";
+    try {
+      outcome = await createOne();
+    } catch (err) {
+      outcome = err;
+    }
+
+    expect(
+      outcome,
+      "a 207 came back as a created calendar — RFC 5689 § 3 says nothing was created",
+    ).toBeInstanceOf(DavConnectError);
+    // The request WAS issued; it is the ANSWER that is refused. Asserted so the
+    // case cannot pass by failing earlier than the status classification.
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].method).toBe("MKCOL");
+  });
+
+  it("refuses a 207 whether or not the transport would have let it through", async () => {
+    // The layering claim, made checkable. `throwForStatus` in
+    // `src/dav/transport.ts` RETURNS for the whole 2xx range, so a 207 reaches
+    // the service layer looking exactly like a success — which is why D-06's
+    // refusal has to live there. If the transport ever started refusing 207
+    // this case would still pass, and if the service layer stopped refusing it
+    // this case goes red on its own.
+    const stub = creatingStub(
+      () =>
+        new Response(MKCOL_REFUSAL_BODY, {
+          status: 207,
+          headers: { "content-type": "text/xml; charset=utf-8" },
+        }),
+    );
+    await warm(stub);
+
+    await expect(createOne()).rejects.toBeInstanceOf(DavConnectError);
+    // Nothing about the server's answer is carried out of this layer: no
+    // status, no body, no URL. `davToErrorCategory` dispatches on the TYPE.
+    await expect(createOne()).rejects.not.toHaveProperty("status");
   });
 });

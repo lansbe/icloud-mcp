@@ -24,6 +24,7 @@ import { env } from "cloudflare:workers";
 import { z } from "zod";
 import type {
   CalendarListing,
+  CreatedCalendar,
   CreatedEvent,
   DeliveryReport,
   DeliveryStatus,
@@ -45,6 +46,7 @@ import {
   MAX_RANGE_DAYS,
   MAX_SLOT_RANGE_DAYS,
   UNOBSERVED_DELIVERY,
+  createCalendarCollection,
   createEvent,
   deliveryReportOf,
   deleteEvent,
@@ -209,6 +211,66 @@ export function calendarListToolResult(listing: CalendarListing): ToolResult {
   return untrustedToolResult(
     calendarTrustedPart(listing),
     calendarUntrustedPart(listing),
+  );
+}
+
+/**
+ * A created calendar's trusted fields, and there is exactly one (CALM-04).
+ *
+ * **There is no `created` boolean here, and the absence is a decision.**
+ * `eventCreatedToolResult` carries one because a create CAN come back having
+ * written nothing — an unsupported zone is reported rather than raised, so that
+ * field genuinely answers a question. A collection create has no such path:
+ * `createCalendarCollection` throws on every refusal, including the `207` that
+ * sits inside the success range, so a `created` field here could only ever say
+ * `true`. A field that cannot say anything else is a field nobody can read an
+ * answer out of, and it invites exactly the mistake D-06 exists to prevent —
+ * "created: true" printed beside a calendar that was never made.
+ *
+ * The `id` is this server's own: `base64url(JSON)` minted here over a
+ * collection URL built from the account's resolved home set and one uuid.
+ */
+function calendarCreatedTrustedPart(
+  result: CreatedCalendar,
+): Record<string, unknown> {
+  return { id: result.id };
+}
+
+/**
+ * The same create's fenced half.
+ *
+ * **Both values are the CALLER's own, echoed back, and they are fenced anyway
+ * — the same way round as `eventCreatedUntrustedPart`.** The fence's stated
+ * test is *did a stranger choose it*, and on a write path the caller is a model
+ * that may have read the name out of a message a stranger sent. A calendar name
+ * is also the least obvious entry on the listing's own untrusted notice, for a
+ * reason that applies here first: it reads as the account owner's filing and is
+ * not necessarily that.
+ *
+ * The `id` is repeated from the trusted half, so the model joins the two by
+ * IDENTITY rather than by position.
+ */
+function calendarCreatedUntrustedPart(
+  result: CreatedCalendar,
+): Record<string, unknown> {
+  return {
+    id: result.id,
+    displayName: result.displayName,
+    color: result.color,
+  };
+}
+
+/**
+ * Shape a finished calendar create into the tool's response.
+ *
+ * Exported for the reason `calendarListToolResult` is: the containment
+ * assertion over this shape is a WALK, and a walk run against a test-local copy
+ * of this mapping proves nothing about the mapping that ships.
+ */
+export function calendarCreatedToolResult(result: CreatedCalendar): ToolResult {
+  return untrustedToolResult(
+    calendarCreatedTrustedPart(result),
+    calendarCreatedUntrustedPart(result),
   );
 }
 
@@ -3219,6 +3281,32 @@ const SCOPE_PARAMETER = z
 const CALENDAR_DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
 
 /**
+ * A calendar colour, as `#RRGGBB` and nothing looser (D-08).
+ *
+ * ANCHORED AT BOTH ENDS, which is the whole of it. An unanchored pattern
+ * accepts a string that merely CONTAINS six hex digits behind a hash, so
+ * anything at all could ride in front of or behind it and straight into a
+ * request body. The value reaches the wire inside an XML element, and this is
+ * the layer that decides what may.
+ *
+ * The eight-digit form iCloud stores is built in `src/dav/calendar.ts` from
+ * this six-digit one, so the alpha pair is never a thing a caller can choose:
+ * there is no partly-transparent calendar to ask for and no way to ask for one.
+ */
+const CALENDAR_COLOR = /^#[0-9A-Fa-f]{6}$/;
+
+/**
+ * The most characters a new calendar's name may carry.
+ *
+ * A cap belongs on every free string that reaches a request body, and this one
+ * is not stranger-authored — it is text the USER supplied — so the cap is about
+ * the BODY rather than about trust. iCloud's own limit is unmeasured; this is a
+ * number chosen to be far past any name a person types and far short of
+ * anything worth sending.
+ */
+const MAX_CALENDAR_NAME_LENGTH = 200;
+
+/**
  * A local wall clock, as `YYYY-MM-DDTHH:MM:SS`.
  *
  * No offset, no `Z`, no fractional seconds. The zone travels in its own
@@ -3396,6 +3484,59 @@ export function registerCalendarTools(
       } catch (err) {
         // The same backstop shape every tool in this tree uses: one boundary,
         // one fixed vocabulary, nothing of the caught value escaping.
+        return davErrorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "calendar_create_calendar",
+    {
+      // **NO CONFIRM GATE, and the absence is a decision rather than an
+      // oversight (D-07).** This tool writes on the first call. Creating a
+      // calendar is not destructive and is trivially reversible — the owner can
+      // delete it from any of their own devices today, and this server will be
+      // able to once CALM-06 lands — and a gate on a reversible operation
+      // teaches the user to click through the one that matters.
+      //
+      // It is a DELIBERATE DIVERGENCE from `contacts_create`, which IS
+      // previewed. That gate is not there because a create is dangerous; it is
+      // there because it carries duplicate detection, and a calendar create has
+      // no equivalent: there is nothing to scan and nothing to warn about.
+      // Saying so here is what stops the next reader adding a gate to "make the
+      // write tools consistent".
+      description:
+        "Create a calendar with a name and a colour. Writes immediately — " +
+        `there is no preview and no confirmation for this one. ${CALENDAR_UNTRUSTED_NOTICE}`,
+      inputSchema: z.object({
+        displayName: z
+          .string()
+          .min(1)
+          .max(MAX_CALENDAR_NAME_LENGTH)
+          .describe(
+            `What to call it, 1 to ${MAX_CALENDAR_NAME_LENGTH} characters. Shown on the user's own devices.`,
+          ),
+        color: z
+          .string()
+          .regex(CALENDAR_COLOR, "expected #RRGGBB")
+          .describe(
+            "The colour, as #RRGGBB — six hex digits behind a hash, nothing " +
+              "else. Refused before anything is sent.",
+          ),
+      }),
+    },
+    async ({ displayName, color }) => {
+      try {
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
+        return calendarCreatedToolResult(
+          await createCalendarCollection(env, actor, davFetch, {
+            displayName,
+            color,
+          }),
+        );
+      } catch (err) {
         return davErrorResult(err);
       }
     },
