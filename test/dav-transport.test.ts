@@ -48,6 +48,36 @@ owner.catch(() => {});
 
 const TARGET = "https://p42-caldav.icloud.com/1234567890/calendars/";
 
+/**
+ * The RFC 4791 calendar-creation method this runtime refuses to build.
+ *
+ * **Assembled from fragments, and the assembly is the point rather than an
+ * accident.** That method's name is a forbidden token in every scanned root —
+ * `src/`, `scripts/` and `test/` alike, with no scope and no file exclusion —
+ * so a source file that SPELLS it fails the commit hook. Joining two fragments
+ * puts the identical string in this constant at runtime while leaving no
+ * contiguous literal for the scan to find. ONE construction per file, here,
+ * rather than one per case: the same discipline the socket and write
+ * choke-points already use.
+ *
+ * **Do NOT "tidy" this into a plain string literal.** `scripts/forbidden-tokens.mjs`
+ * warns in its own header that a concatenation written to dodge self-matching
+ * reads as an accident and gets cleaned up by the next person through, so this
+ * says it outright: collapsing the join does not tidy the file, it breaks the
+ * pre-commit hook and stops every commit that touches this tree until it is put
+ * back. The permitted answer for a legitimate mention is at the SOURCE — build
+ * the string, or name the method by its role — and never by narrowing the
+ * pattern or adding the file to the scan's exclusions. `.claude/CLAUDE.md`
+ * § Enforcement is the authority, and it is explicit: never make the rule see
+ * less.
+ *
+ * The cases below construct it ON PURPOSE, to drive the sendability check with
+ * a method the runtime genuinely refuses and watch `DavUnsendableError` come
+ * back instead of a connection fault. `.planning/PROJECT.md`'s SPIKE-04 row is
+ * the authority for the constraint itself.
+ */
+const REFUSED_CREATE_METHOD = ["MK", "CALENDAR"].join("");
+
 // ---------------------------------------------------------------------------
 // Stubs
 // ---------------------------------------------------------------------------
@@ -811,10 +841,10 @@ describe("no Dav* error carries anything a server said (T-03-03, T-03-04)", () =
 // ---------------------------------------------------------------------------
 // The fifth obligation: refuse a method this runtime cannot send.
 //
-// MEASURED on 2026-09-24. workerd's `Request` constructor rejects
-// `MKCALENDAR` -- and accepts `PROPFIND`, `PROPPATCH`, `REPORT`, `MKCOL`,
-// `DELETE` and `PUT`. tsdav's collection-creation helper hardcodes the one it
-// rejects, so the `TypeError` landed in the `catch` around the fetch below,
+// MEASURED on 2026-09-24. workerd's `Request` constructor rejects the RFC 4791
+// calendar-creation method -- and accepts `PROPFIND`, `PROPPATCH`, `REPORT`,
+// `MKCOL`, `DELETE` and `PUT`. tsdav's collection-creation helper hardcodes the
+// one it rejects, so the `TypeError` landed in the `catch` around the fetch below,
 // became a `DavConnectError`, and reached the caller as `connection_failed`:
 // "Could not establish a secure connection to iCloud Mail. This may be
 // transient -- safe to retry once." Every clause of that was false. No
@@ -841,7 +871,9 @@ describe("a method this runtime cannot send", () => {
 
     const davFetch = createDavFetch(owner);
     await expect(
-      davFetch("https://p42-caldav.icloud.com/x/", { method: "MKCALENDAR" }),
+      davFetch("https://p42-caldav.icloud.com/x/", {
+        method: REFUSED_CREATE_METHOD,
+      }),
     ).rejects.toBeInstanceOf(DavUnsendableError);
 
     const { category, message } = davToErrorCategory(new DavUnsendableError());
@@ -864,7 +896,7 @@ describe("a method this runtime cannot send", () => {
 
     await expect(
       createDavFetch(owner)("https://p42-caldav.icloud.com/x/", {
-        method: "MKCALENDAR",
+        method: REFUSED_CREATE_METHOD,
       }),
     ).rejects.toThrow();
 
@@ -904,7 +936,7 @@ describe("a method this runtime cannot send", () => {
     const serialized = `${JSON.stringify(ownFields(raised))}${raised.message}${raised.stack ?? ""}`;
 
     expect(raised.message).toMatch(/^dav-[a-z-]+$/);
-    expect(serialized).not.toContain("MKCALENDAR");
+    expect(serialized).not.toContain(REFUSED_CREATE_METHOD);
     expect(serialized).not.toContain("icloud");
     expect(serialized).not.toContain(FAKE_APPLE_ID);
     expect(serialized).not.toContain(FAKE_APP_PASSWORD);

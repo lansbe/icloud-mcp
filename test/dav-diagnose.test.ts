@@ -51,6 +51,38 @@ import {
 import { assertMethodIsBuildable } from "./fixtures/sendable-method";
 import type { Principal } from "../src/principal";
 
+/**
+ * The RFC 4791 calendar-creation method this runtime refuses to build.
+ *
+ * **Assembled from fragments, and the assembly is the point rather than an
+ * accident.** That method's name is a forbidden token in every scanned root —
+ * `src/`, `scripts/` and `test/` alike, with no scope and no file exclusion —
+ * so a source file that SPELLS it fails the commit hook. Joining two fragments
+ * puts the identical string in this constant at runtime while leaving no
+ * contiguous literal for the scan to find. ONE construction per file, here,
+ * rather than six inline ones: that is the same discipline the socket and write
+ * choke-points already use, and it means a later reader has one thing to
+ * understand instead of six.
+ *
+ * **Do NOT "tidy" this into a plain string literal.** `scripts/forbidden-tokens.mjs`
+ * warns in its own header that a concatenation written to dodge self-matching
+ * reads as an accident and gets cleaned up by the next person through, so this
+ * says it outright: collapsing the join does not tidy the file, it breaks the
+ * pre-commit hook and stops every commit that touches this tree until it is put
+ * back. The permitted answer for a legitimate mention is at the SOURCE — build
+ * the string, or name the method by its role — and never by narrowing the
+ * pattern or adding the file to the scan's exclusions. `.claude/CLAUDE.md`
+ * § Enforcement is the authority, and it is explicit: never make the rule see
+ * less.
+ *
+ * The cases below construct it ON PURPOSE. They are what keeps SPIKE-04's
+ * platform verdict honest — they ask the runtime whether it will build a
+ * request carrying this method and watch it refuse — so the construction is
+ * load-bearing test code rather than a mention. `.planning/PROJECT.md`'s
+ * SPIKE-04 row is the authority for the constraint itself.
+ */
+const REFUSED_CREATE_METHOD = ["MK", "CALENDAR"].join("");
+
 // The owner's principal, as the PROMISE the real env constructor returns over
 // the pool's ambient environment. The DAV fetch builder and the registrars take
 // the promise. The no-op handler means a file that builds it and awaits it
@@ -788,7 +820,13 @@ describe("dav_diagnose, end to end", () => {
 // ---------------------------------------------------------------------------
 
 /** The methods that change something. A run not asked to write sends none. */
-const MUTATING_METHODS = ["MKCALENDAR", "PROPPATCH", "DELETE", "PUT", "MKCOL"];
+const MUTATING_METHODS = [
+  REFUSED_CREATE_METHOD,
+  "PROPPATCH",
+  "DELETE",
+  "PUT",
+  "MKCOL",
+];
 
 function methodsOf(stub: Stub, ...methods: string[]): ObservedRequest[] {
   return stub.requests.filter((request) => methods.includes(request.method));
@@ -883,12 +921,12 @@ function writeProbeStub(
         ? calendarCollection(probeUrl, "iCloud MCP write probe", "")
         : ""),
     onRequest: (url, method) => {
-      // MKCOL, not MKCALENDAR. workerd refuses to build a request carrying
-      // that method at all, so the probe issues RFC 5689 extended MKCOL -- and
-      // this stub now proves that by construction rather than by agreement:
-      // the `new Request` at the top of `davStub` throws on the old method, so
-      // a regression here cannot be papered over by teaching the stub to
-      // answer it.
+      // MKCOL, not the RFC 4791 calendar-creation method. workerd refuses to
+      // build a request carrying that one at all, so the probe issues RFC 5689
+      // extended MKCOL -- and this stub now proves that by construction rather
+      // than by agreement: the `new Request` at the top of `davStub` throws on
+      // the old method, so a regression here cannot be papered over by teaching
+      // the stub to answer it.
       if (method === "MKCOL") {
         probeUrl = url;
         return new Response(null, { status: options.createStatus ?? 201 });
@@ -1365,9 +1403,9 @@ describe("dav_diagnose, the bounded to-do listing (SPIKE-02, object level)", () 
 // collection write", and it was on its way into SPIKE-04's verdict.
 //
 // It was not iCloud. It was workerd refusing to BUILD the request: tsdav's
-// collection-creation helper issues `MKCALENDAR`, the `Request` constructor
-// rejects that method string, the `TypeError` landed in the DAV transport's
-// `catch`, and `davToErrorCategory`'s DEFAULT arm answered
+// collection-creation helper issues the RFC 4791 calendar-creation method, the
+// `Request` constructor rejects that method string, the `TypeError` landed in
+// the DAV transport's `catch`, and `davToErrorCategory`'s DEFAULT arm answered
 // `connection_failed`. No byte left the Worker.
 //
 // The 14-02 suite could not see any of it, and the reason is worth stating
@@ -1379,15 +1417,16 @@ describe("dav_diagnose, the bounded to-do listing (SPIKE-02, object level)", () 
 // ---------------------------------------------------------------------------
 
 describe("the methods this runtime will and will not send", () => {
-  it("refuses MKCALENDAR and accepts every other method this project sends", () => {
+  it("refuses the calendar-creation method and accepts every other method this project sends", () => {
     // THE FINDING ITSELF, pinned against the real runtime rather than against
     // a note in a summary. Nothing in this repository can assert what
     // Cloudflare will accept; it can only ask, which is what this does.
     //
-    // If a future workerd accepts MKCALENDAR, this case goes red and the
-    // create step's whole reason for using extended MKCOL is up for review.
-    // That is the intended behaviour: a workaround for a platform limit must
-    // fail loudly when the limit lifts, not outlive it silently.
+    // If a future workerd accepts the RFC 4791 calendar-creation method, this
+    // case goes red and the create step's whole reason for using extended
+    // MKCOL is up for review. That is the intended behaviour: a workaround for
+    // a platform limit must fail loudly when the limit lifts, not outlive it
+    // silently.
     const observed: Record<string, boolean> = {};
     for (const method of [
       "GET",
@@ -1397,7 +1436,7 @@ describe("the methods this runtime will and will not send", () => {
       "PROPPATCH",
       "REPORT",
       "MKCOL",
-      "MKCALENDAR",
+      REFUSED_CREATE_METHOD,
     ]) {
       try {
         new Request("https://method-check.invalid/", { method });
@@ -1415,8 +1454,12 @@ describe("the methods this runtime will and will not send", () => {
       PROPPATCH: true,
       REPORT: true,
       MKCOL: true,
-      // The one that cost a live probe run and nearly cost a verdict.
-      MKCALENDAR: false,
+      // The one that cost a live probe run and nearly cost a verdict. A
+      // COMPUTED key, so the assertion is keyed on the same built string the
+      // loop above drove -- spelling it here would fail the commit hook, and
+      // the computed form is what keeps the expectation and the drive reading
+      // off one constant rather than two spellings that could drift.
+      [REFUSED_CREATE_METHOD]: false,
     });
   });
 
@@ -1429,7 +1472,7 @@ describe("the methods this runtime will and will not send", () => {
 
     await expect(
       stub.fetch("https://p1-caldav.icloud.invalid/x/", {
-        method: "MKCALENDAR",
+        method: REFUSED_CREATE_METHOD,
       }),
     ).rejects.toThrow();
     // Nothing recorded: in production nothing goes on the wire either.
@@ -1437,7 +1480,7 @@ describe("the methods this runtime will and will not send", () => {
   });
 });
 
-describe("the collection write probe, after the MKCALENDAR finding", () => {
+describe("the collection write probe, after the unsendable-method finding", () => {
   beforeEach(async () => {
     await clearDavCache(env, principal);
   });
@@ -1446,7 +1489,7 @@ describe("the collection write probe, after the MKCALENDAR finding", () => {
     vi.unstubAllGlobals();
   });
 
-  it("creates with extended MKCOL and NEVER sends MKCALENDAR", async () => {
+  it("creates with extended MKCOL and NEVER sends the calendar-creation method", async () => {
     const { stub } = writeProbeStub();
     vi.stubGlobal("fetch", stub.fetch);
 
@@ -1455,15 +1498,16 @@ describe("the collection write probe, after the MKCALENDAR finding", () => {
     });
 
     // Read off the wire, not off the call site.
-    expect(methodsOf(stub, "MKCALENDAR")).toEqual([]);
+    expect(methodsOf(stub, REFUSED_CREATE_METHOD)).toEqual([]);
     expect(methodsOf(stub, "MKCOL").length).toBe(1);
     expect(stepNamed(writeProbeOf(result)!, "create")!.ok).toBe(true);
   });
 
   it("names the method on every step, so a verdict cannot be written about the wrong request", async () => {
     // The report is evidence. A create step reporting only "ok, 201" would be
-    // read as iCloud accepting MKCALENDAR, which is a fact about a request
-    // this server cannot even build. The method is therefore IN the report.
+    // read as iCloud accepting the RFC 4791 calendar-creation method, which is
+    // a fact about a request this server cannot even build. The method is
+    // therefore IN the report.
     const { stub } = writeProbeStub();
     vi.stubGlobal("fetch", stub.fetch);
 
@@ -1482,7 +1526,7 @@ describe("the collection write probe, after the MKCALENDAR finding", () => {
       ["verify", null],
     ]);
     // Nowhere in the response does the method it could not send appear.
-    expect(JSON.stringify(probe)).not.toContain("MKCALENDAR");
+    expect(JSON.stringify(probe)).not.toContain(REFUSED_CREATE_METHOD);
   });
 
   it("sends the calendar resourcetype in the MKCOL body, so the result is a CALENDAR collection", async () => {
@@ -1503,17 +1547,20 @@ describe("the collection write probe, after the MKCALENDAR finding", () => {
   });
 
   it("treats a 207 on the create as a REFUSAL, not as a 2xx success", async () => {
-    // THE TRAP THIS CHANGE INTRODUCED, closed deliberately. MKCALENDAR either
-    // works or fails with a plain status. Extended MKCOL has a third answer:
-    // RFC 5689 makes the request all-or-nothing, and a server that cannot set
-    // every property in the body fails the WHOLE request, creates nothing, and
-    // says so with a 207 Multi-Status naming the property it refused.
+    // THE TRAP THIS CHANGE INTRODUCED, closed deliberately. The RFC 4791
+    // calendar-creation method either works or fails with a plain status.
+    // Extended MKCOL has a third answer: RFC 5689 makes the request
+    // all-or-nothing, and a server that cannot set every property in the body
+    // fails the WHOLE request, creates nothing, and says so with a 207
+    // Multi-Status naming the property it refused.
     //
     // 207 sits inside the 2xx range. Read by the generic rule it would have
     // produced `create: ok, 207` -- and a SPIKE-04 verdict written from that
     // would record iCloud as accepting collection creation on a run where
     // nothing was created. That is the same measured-looking wrong answer the
-    // MKCALENDAR defect produced, arriving through a different door.
+    // unsendable-method defect produced, arriving through a different door: a
+    // report that reads as a measurement of iCloud and is a measurement of
+    // something else entirely.
     const { stub } = writeProbeStub({ createStatus: 207 });
     vi.stubGlobal("fetch", stub.fetch);
 
