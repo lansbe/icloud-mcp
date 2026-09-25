@@ -946,7 +946,16 @@ export interface CommitOutcome {
   /** The location that was written. Content. */
   location: string | null;
   /**
-   * The same sentence the preview carried, in the past tense.
+   * The preview's sentence restated in the past tense, by the same composer.
+   *
+   * **It is not always the same sentence, and the two places that said it was
+   * were overclaiming.** On a rename the subject differs as well as the verb:
+   * the preview names the event as the resource carried it then and this names
+   * the title that was written. Both are right at their own moment — see the
+   * comment at this field's construction site, which owns that argument
+   * alongside the field-count divergence it already records. What survives is
+   * that ONE writer produces both, so a lie at preview still becomes
+   * contradicted text in the transcript.
    *
    * **NOT nullable, unlike the preview's, and the difference is the claim.** A
    * preview that minted nothing has no commit to describe; a commit that
@@ -3136,6 +3145,21 @@ async function applyCommit(
       {
         kind: "update",
         noun: "event",
+        // **The SUBJECT here answers a different question from the preview's
+        // too, on a rename, and that divergence is deliberate in the same way
+        // the field count below it is.** The preview names the title the
+        // resource carried THEN, because a user recognises the event by what
+        // it is called today and would be asked to confirm a change to
+        // something they have never seen otherwise. This names the title that
+        // was WRITTEN, because a commit re-reads nothing and the old name is
+        // no longer a fact about the calendar. Each line is right at its own
+        // moment; what is NOT true, and what two places used to claim, is that
+        // the pair differs by the verb alone. It does on a create and on a
+        // delete, which compose both sides from one hash-bound title, and it
+        // does not here whenever `summary` was supplied. `SERVER_INSTRUCTIONS`
+        // and `EventCommitOutcome.confirmationLine` both say so now, so a
+        // reader comparing the two is not trained to tolerate a mismatched
+        // subject — which is the one signal a lying preview would produce.
         name: change.summary,
         alsoRemoved: null,
         fieldCount: assertedFields(change).length,
