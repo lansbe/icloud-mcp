@@ -38,9 +38,17 @@ import {
   createVCard,
   fetchAddressBooks,
   propfind,
+  updateVCard,
 } from "tsdav";
 import type { DAVResponse } from "tsdav";
 import type { Env } from "../env";
+// ONE definition of the entity-tag refusal, imported rather than written a
+// second time. Its own docstring one module over carries the argument this
+// module's conditional write inherits verbatim -- the library's header builder
+// drops any entry whose value is falsy, so a falsy entity tag produces an
+// UNCONDITIONAL write with a 200 and no warning. A second copy here is a second
+// place that argument could be weakened without the first one changing.
+import { assertEtag } from "./calendar";
 import { assertUnderHome, davAccountFor, withRediscovery } from "./discovery";
 import type { ResolvedDavAccount } from "./discovery";
 import { DavNotFoundError } from "./errors";
@@ -818,12 +826,25 @@ function normaliseTerm(term: string): string {
  *
  * A response with no body is skipped rather than repaired: there is nothing to
  * read, and a partial contact is worse than an absent one (T-03-16).
+ *
+ * **The row carries the entity tag as well, and keeping it costs no request.**
+ * Every multi-status this function is handed already ASKED for it — every call
+ * site's `props` names `d:getetag` beside `card:address-data` — so the value was
+ * always arriving and was always being dropped on the floor. The widening is
+ * additive: `searchContacts`, `getContact` and the duplicate scan each read the
+ * two fields they already read and ignore the third, which is why the shipped
+ * contacts suite staying green is the proof rather than a reading of this diff.
+ *
+ * It is `null` for a response that carried no entity tag. A card this server
+ * cannot name a version of is still a card it can READ, so the refusal belongs
+ * at the one caller that is about to write (`getContactWithEtag`) rather than
+ * here, where it would turn a readable card into an unreadable one.
  */
 function cardsFrom(
   responses: DAVResponse[],
   bookUrl: string,
-): Array<{ url: string; body: string }> {
-  const cards: Array<{ url: string; body: string }> = [];
+): Array<{ url: string; body: string; etag: string | null }> {
+  const cards: Array<{ url: string; body: string; etag: string | null }> = [];
 
   for (const response of responses) {
     const href = response.href;
@@ -841,7 +862,7 @@ function cardsFrom(
 
     const body = addressDataOf(response);
     if (body === null) continue;
-    cards.push({ url, body });
+    cards.push({ url, body, etag: etagOf(response) });
   }
 
   return cards;
@@ -860,6 +881,32 @@ function addressDataOf(response: DAVResponse): string | null {
       ? (raw as { _cdata?: unknown })._cdata
       : raw;
   return typeof data === "string" && data.length > 0 ? data : null;
+}
+
+/**
+ * One response's entity tag, however the XML layer read the element.
+ *
+ * `addressDataOf`'s double read exactly, and for the same reason: the library
+ * types the prop loosely and hands back either the CDATA wrapper or the bare
+ * value depending on how the body was written. `etagFor` in `./calendar.ts` is
+ * the same read on the other tree; it is not shared because that one additionally
+ * resolves an href and compares it, which is work `cardsFrom` has already done by
+ * the time this is called.
+ *
+ * **Returned BYTE-EXACT, quotes and weak prefix included.** An entity tag is an
+ * opaque quoted string. Stripping the quotes to re-add them later is a
+ * normalisation that eventually meets a `W/"..."` and gets it wrong — and the
+ * value's whole job is to travel back out unaltered on a conditional write, so a
+ * normalisation here is a conditional write asking about a version the server
+ * never named.
+ */
+function etagOf(response: DAVResponse): string | null {
+  const raw = response.props?.getetag;
+  const value =
+    raw !== null && typeof raw === "object"
+      ? (raw as { _cdata?: unknown })._cdata
+      : raw;
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 /**
@@ -1176,8 +1223,28 @@ export async function searchContacts(
   });
 }
 
+/** One card as it arrived: the parsed view, the raw bytes, and the version. */
+interface ReadContact {
+  detail: ContactDetail;
+  /** The card's own text, byte-for-byte as the server sent it. */
+  body: string;
+  /** Byte-exact, quotes included. `null` when the server named no version. */
+  etag: string | null;
+}
+
 /**
  * Fetch one contact in full, by the opaque id a search returned (CONT-02).
+ *
+ * ## Two callers, one body
+ *
+ * `readEvent` one module over, for the same reason and reached the same way: the
+ * write path needs the entity tag from the SAME multi-status as the card, so the
+ * plain read and the read-with-version share one body rather than issuing one
+ * request each. `test/dav-home-containment.test.ts` keys its containment audit on
+ * the ENCLOSING function's name, so this function being the enclosing one — and
+ * not `getContact` any more — is a diff a reader has to approve rather than a
+ * silent rename. The request did not move and did not lose its guard; it acquired
+ * a second caller.
  *
  * ## Cost
  *
@@ -1195,17 +1262,21 @@ export async function searchContacts(
  * the wrapper is a path on which a moved shard host surfaces to the user as
  * not-found instead of being re-resolved.
  *
+ * Re-discovery is left at its DEFAULT here, unlike the write path's containment
+ * helper which pins it off: a retried read returns an answer, while a retried
+ * write is a second write.
+ *
  * The same honest limitation `getEvent` records applies here. The reference
  * carries ABSOLUTE URLs minted when the search ran, so a re-discovery does not
  * repoint this attempt at a new host. What it buys is real and identical on
  * both paths: the stale entry is deleted, so the next call resolves live.
  */
-export async function getContact(
+async function readContact(
   env: Env,
   principal: Principal,
   davFetch: DavFetch,
   ref: ContactRef,
-): Promise<ContactDetail> {
+): Promise<ReadContact> {
   return withRediscovery(env, principal, davFetch, "carddav", async (resolved) => {
     // BEFORE the multi-get, because everything after this line reaches the
     // network and `./transport.ts` attaches the credential to whatever URL it is
@@ -1235,16 +1306,83 @@ export async function getContact(
     // the host answered, and it answered about this resource.
     if (card === undefined) throw new DavNotFoundError(false);
 
-    return detailFor(
-      {
-        key: { displayNameKey: "", objectUrl: ref.objectUrl },
-        addressBookUrl: ref.addressBookUrl,
-        objectUrl: ref.objectUrl,
-        contact: parseVCard(card.body),
-      },
-      resolved.cacheHit,
-    );
+    return {
+      detail: detailFor(
+        {
+          key: { displayNameKey: "", objectUrl: ref.objectUrl },
+          addressBookUrl: ref.addressBookUrl,
+          objectUrl: ref.objectUrl,
+          contact: parseVCard(card.body),
+        },
+        resolved.cacheHit,
+      ),
+      body: card.body,
+      etag: card.etag,
+    };
   });
+}
+
+/**
+ * Fetch one contact in full (CONT-02). `readContact`'s parsed half, and nothing
+ * else: the raw bytes and the version stamp are the write path's business, and a
+ * read tool returning either would put them in front of eight call sites that
+ * have no use for them.
+ */
+export async function getContact(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  ref: ContactRef,
+): Promise<ContactDetail> {
+  const read = await readContact(env, principal, davFetch, ref);
+  return read.detail;
+}
+
+/** One card, the bytes it arrived as, and the version a write must bind to. */
+export interface ContactWithEtag {
+  /** The parsed view, exactly what `getContact` answers with. */
+  detail: ContactDetail;
+  /**
+   * The card's own text, byte-for-byte as the server sent it.
+   *
+   * Carried rather than rebuilt from `detail`, and that is CONTEXT's decision
+   * rather than a convenience: a patch needs BYTES to clone, and `ParsedContact`
+   * is deliberately not growing to hold them — widening it would make eight
+   * existing read call sites able to reshape the write path's fidelity guarantee.
+   */
+  body: string;
+  /** Byte-exact, quotes included. Never absent: see `getContactWithEtag`. */
+  etag: string;
+}
+
+/**
+ * Read one card AND the version stamp a conditional write must bind to (CONW-02).
+ *
+ * ONE outbound request, and the count is the property rather than a side note.
+ * It is `getContact`'s own multi-get — which already ASKED for the entity tag and
+ * threw it away — reading both values out of the one multi-status.
+ *
+ * A card that came back with a body and no entity tag is REFUSED, through the
+ * same `DavNotFoundError(false)` the absent-card path uses. That is not
+ * fastidiousness: the caller of this function is about to sign that value into a
+ * capability to write, and a missing one would travel as `undefined` into a
+ * header builder that DROPS falsy entries — producing an unconditional write the
+ * server answers 200 to. Refusing at the read is cheaper than discovering it at
+ * the write, where the discovery is somebody's overwritten card.
+ *
+ * A plain `export function` declaration, for `planContactCreateTarget`'s stated
+ * reason about the write manifest.
+ */
+export async function getContactWithEtag(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  ref: ContactRef,
+): Promise<ContactWithEtag> {
+  const read = await readContact(env, principal, davFetch, ref);
+  assertEtag(read.etag);
+
+  return { detail: read.detail, body: read.body, etag: read.etag };
 }
 
 // --------------------------------------------------- the write path's safeguard
@@ -1702,6 +1840,75 @@ export async function createContact(
       }),
       addressBookId: encodeAddressBookId({ collectionUrl: ref.addressBookUrl }),
       created: true,
+    };
+  });
+}
+
+/** What an update answers with: the ids it wrote, and that it reached the account. */
+export interface UpdatedContact {
+  /** The opaque contact id, unchanged by the write — an update moves nothing. */
+  id: string;
+  /** The opaque address book id the card lives in, for join-by-identity. */
+  addressBookId: string;
+  /** True when the write was accepted. */
+  applied: boolean;
+}
+
+/**
+ * Overwrite one existing card, conditionally on the version it was read at
+ * (CONW-02, CONW-06).
+ *
+ * `updateEvent`'s twin, down to the order of the first two lines, because the
+ * order IS the safety property here.
+ *
+ * ONE outbound request. The read that produced `etag` was its own request on its
+ * own leg; this one does not repeat it.
+ *
+ * **What happens when the card moved underneath.** The server answers 412, and
+ * `./transport.ts` already maps that to `DavStaleResourceError`, which
+ * `./errors.ts` already reports as `stale_resource`. That whole mechanism ships
+ * and is consumed here rather than rebuilt — including the recorded decision that
+ * 412 is NOT re-discovery eligible, because re-resolving the account's home URLs
+ * cannot make a superseded version current, and falling through to the
+ * unclassified floor would offer the model a retry of the one thing that can
+ * never work.
+ *
+ * Never a credential from here. `./transport.ts` attaches it per call and is the
+ * only place that may. The library supplies the content type and the conditional
+ * header that makes this write conditional — asserting the resource is UNCHANGED,
+ * which is `If-None-Match: *`'s mirror image on the create.
+ *
+ * A plain `export function` declaration, for `planContactCreateTarget`'s stated
+ * reason about the write manifest.
+ */
+export async function updateContact(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  ref: ContactRef,
+  vcfBody: string,
+  etag: string | null | undefined,
+): Promise<UpdatedContact> {
+  // FIRST. See `assertEtag`'s own docstring — everything below this line can
+  // reach the wire, and a falsy value reaching the library turns this write
+  // unconditional with no error, no warning and a 200 from the server.
+  assertEtag(etag);
+
+  return withContainedContactTarget(env, principal, davFetch, ref, async () => {
+    await updateVCard({
+      vCard: { url: ref.objectUrl, data: vcfBody, etag },
+      // Never a credential from here. See the docstring.
+      headers: {},
+      fetch: davFetch,
+    });
+
+    return {
+      id: encodeContactId({
+        addressBookUrl: ref.addressBookUrl,
+        objectUrl: ref.objectUrl,
+      }),
+      addressBookId: encodeAddressBookId({ collectionUrl: ref.addressBookUrl }),
+      applied: true,
     };
   });
 }

@@ -43,9 +43,11 @@ import {
   contactFilter,
   findDuplicateCandidates,
   getContact,
+  getContactWithEtag,
   listAddressBooks,
   matchesContact,
   searchContacts,
+  updateContact,
 } from "../src/dav/contacts";
 import type {
   ContactDetail,
@@ -55,7 +57,13 @@ import type {
   DuplicateProbe,
 } from "../src/dav/contacts";
 import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
-import { DavAuthError, DavNotFoundError, DavThrottleError } from "../src/dav/errors";
+import {
+  DavAuthError,
+  DavNotFoundError,
+  DavStaleResourceError,
+  DavThrottleError,
+  davToErrorCategory,
+} from "../src/dav/errors";
 import {
   decodeAddressBookId,
   decodeContactId,
@@ -419,10 +427,29 @@ function etagBody(href: string): string {
   );
 }
 
-function cardBody(href: string, data: string): string {
+/**
+ * One card in a multi-status, with the entity tag the server named it at.
+ *
+ * The tag is a PARAMETER rather than a constant because the write path's whole
+ * safety property is that the value travels back out unaltered — so a case
+ * asserting that has to be able to choose a value the code could not have
+ * guessed, quotes and weak prefix included. Every existing caller gets the same
+ * `"etag-1"` it always got.
+ */
+function cardBody(href: string, data: string, etag = '"etag-1"'): string {
   return (
     `<response><href>${href}</href><propstat>` +
-    `<status>HTTP/1.1 200 OK</status><prop><getetag>"etag-1"</getetag>` +
+    `<status>HTTP/1.1 200 OK</status><prop><getetag>${etag}</getetag>` +
+    `<C:address-data><![CDATA[${data}]]></C:address-data>` +
+    `</prop></propstat></response>`
+  );
+}
+
+/** One card in a multi-status carrying NO entity tag element at all. */
+function cardBodyWithoutEtag(href: string, data: string): string {
+  return (
+    `<response><href>${href}</href><propstat>` +
+    `<status>HTTP/1.1 200 OK</status><prop>` +
     `<C:address-data><![CDATA[${data}]]></C:address-data>` +
     `</prop></propstat></response>`
   );
@@ -506,6 +533,17 @@ interface Observed {
   url: string;
   method: string;
   body: string;
+  /**
+   * The conditional-write header's value, verbatim, or `null` when absent.
+   *
+   * ONE named header rather than the whole set, and that is deliberate: the
+   * header set this stub is handed already carries the account's credential by
+   * the time it arrives, because `./transport.ts` merges it in on the way past.
+   * Recording the set would put that value into an object a failing assertion
+   * prints. Recording the one header whose value this project has a property
+   * about does not.
+   */
+  ifMatch: string | null;
   start: number;
   end: number;
 }
@@ -554,6 +592,7 @@ function davStub(options: StubOptions = {}): Stub {
       url,
       method,
       body,
+      ifMatch: new Headers(init?.headers).get("if-match"),
       start: (tick += 1),
       end: -1,
     };
@@ -1827,6 +1866,304 @@ describe("getContact", () => {
     expect(detail.displayName).toBe("Dr. Marisol Q Solano PhD");
     expect(stub.observed.length).toBe(1);
     expect(stub.observed[0].method).toBe("REPORT");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The conditional-update halves (CONW-02, CONW-06)
+//
+// Two functions, and the seam between them is the request budget: the read
+// brings back the version stamp, the write hands it straight back, and neither
+// pays for the other. Every count below is on a WARM account, so what is being
+// counted is the operation rather than the discovery chain.
+//
+// The property none of these cases can be written without is that a falsy
+// version stamp is refused BEFORE anything is sent. The library builds its
+// headers through a helper that drops any entry whose value is falsy, so an
+// absent one does not fail — it produces an UNCONDITIONAL write, and the server
+// answers 200. That failure looks exactly like success from every vantage point
+// except the user's own card.
+// ---------------------------------------------------------------------------
+
+/** The object URL the fixture's full card lives at. */
+const FULL_OBJECT_URL = `https://p42-contacts.icloud.com${FULL_CARD_HREF}`;
+
+function fullContactRef() {
+  return { addressBookUrl: BOOK_A_URL, objectUrl: FULL_OBJECT_URL };
+}
+
+/**
+ * An entity tag no code path could have produced by accident.
+ *
+ * A weak prefix, an inner slash, mixed case and digits — every character class a
+ * normalisation would plausibly touch. The point of a value like this is that a
+ * caller which strips the quotes and re-adds them, or which lower-cases, or which
+ * splits on the slash, produces something visibly different rather than something
+ * that happens to still match.
+ */
+const AWKWARD_ETAG = 'W/"aB3-xY/9==z"';
+
+describe("getContactWithEtag", () => {
+  it("reads the card and its version stamp from exactly ONE outbound request", async () => {
+    const read = await getContactWithEtag(
+      env,
+      principal,
+      createDavFetch(owner),
+      fullContactRef(),
+    );
+
+    // The count IS the property. The version stamp arrives in the same
+    // multi-status `getContact` already issued, so a second round trip here
+    // would mean the value was being re-fetched rather than kept.
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].method).toBe("REPORT");
+    expect(stub.observed[0].body).toContain("addressbook-multiget");
+
+    expect(read.detail.displayName).toBe("Dr. Marisol Q Solano PhD");
+    expect(read.etag).toBe('"etag-1"');
+  });
+
+  it("hands back the card's OWN bytes, not a re-serialisation of them", async () => {
+    // The patch path clones these bytes, so anything that reshaped them here
+    // would be a fidelity loss arriving before the patch had a chance to preserve
+    // anything. Full-string equality, deliberately.
+    //
+    // **The one measured difference, and it is the XML layer's rather than this
+    // module's.** A card handed to `xml-js` inside a CDATA section comes back
+    // without its trailing terminator — measured here, not assumed, which is why
+    // the expectation names the transformation instead of trimming both sides
+    // into agreement. It is consistent with what 16-03 recorded from the other
+    // end: `patchContactCard` APPENDS the terminator rather than preserving one,
+    // so the round trip closes even though the fetched bytes arrive one CRLF
+    // short. Nothing INSIDE the card moves, which is the property the patch path
+    // actually depends on.
+    const read = await getContactWithEtag(
+      env,
+      principal,
+      createDavFetch(owner),
+      fullContactRef(),
+    );
+
+    expect(FULL_CONTACT_VCF.endsWith("\r\n"), "the fixture lost its terminator").toBe(
+      true,
+    );
+    expect(read.body).toBe(FULL_CONTACT_VCF.slice(0, -2));
+  });
+
+  it("keeps the version stamp byte-exact, weak prefix and quotes included", async () => {
+    const weird = restub({
+      onRequest: (url, method, body) =>
+        method === "REPORT" && body.includes("addressbook-multiget")
+          ? multistatus(
+              cardBody(FULL_CARD_HREF, FULL_CONTACT_VCF, AWKWARD_ETAG),
+            )
+          : null,
+    });
+
+    const read = await getContactWithEtag(
+      env,
+      principal,
+      createDavFetch(owner),
+      fullContactRef(),
+    );
+
+    expect(read.etag).toBe(AWKWARD_ETAG);
+    expect(weird.observed.length).toBe(1);
+  });
+
+  it("refuses a card the server named no version for", async () => {
+    // Cheaper here than at the write, where the discovery would be somebody's
+    // overwritten card. The card itself is perfectly readable — `getContact`
+    // still returns it — and that is the point: this refusal is about what can be
+    // WRITTEN safely, not about what can be read.
+    const noEtag = restub({
+      onRequest: (url, method, body) =>
+        method === "REPORT" && body.includes("addressbook-multiget")
+          ? multistatus(cardBodyWithoutEtag(FULL_CARD_HREF, FULL_CONTACT_VCF))
+          : null,
+    });
+
+    const err = await capture(() =>
+      getContactWithEtag(env, principal, createDavFetch(owner), fullContactRef()),
+    );
+
+    expect(err).toBeInstanceOf(DavNotFoundError);
+    expect((err as DavNotFoundError).rediscoverable).toBe(false);
+
+    // The same response still reads as a contact through the plain read. A
+    // refusal that also broke the read would be a narrower tool rather than a
+    // safer one.
+    noEtag.observed.length = 0;
+    const detail = await getContact(
+      env,
+      principal,
+      createDavFetch(owner),
+      fullContactRef(),
+    );
+    expect(detail.displayName).toBe("Dr. Marisol Q Solano PhD");
+  });
+
+  it("refuses a forged object URL, spending NO request", async () => {
+    const err = await capture(() =>
+      getContactWithEtag(env, principal, createDavFetch(owner), {
+        addressBookUrl: BOOK_A_URL,
+        objectUrl: "https://attacker.example/1234567890/carddavhome/card/steal.vcf",
+      }),
+    );
+
+    expect(err).toBeInstanceOf(DavNotFoundError);
+    expect(stub.observed.length).toBe(0);
+  });
+});
+
+describe("updateContact", () => {
+  /** The card the write sends. Its contents are irrelevant to every case here. */
+  const PATCHED = FULL_CONTACT_VCF.replace("Marisol", "Marisol Q");
+
+  /** Every request whose method is the conditional overwrite. */
+  function writes(source: Stub): Observed[] {
+    return source.observed.filter((one) => one.method === "PUT");
+  }
+
+  it("carries the version stamp byte-exact on the conditional header", async () => {
+    // The whole safety property in one assertion, and it is an equality against
+    // the value the STUBBED RESPONSE carried rather than against a literal
+    // written twice. A caller that normalised the value would satisfy a
+    // "the header is present" check completely.
+    const live = restub({
+      onRequest: (url, method, body) => {
+        if (method === "PUT") return new Response(null, { status: 204 });
+        return method === "REPORT" && body.includes("addressbook-multiget")
+          ? multistatus(
+              cardBody(FULL_CARD_HREF, FULL_CONTACT_VCF, AWKWARD_ETAG),
+            )
+          : null;
+      },
+    });
+
+    const read = await getContactWithEtag(
+      env,
+      principal,
+      createDavFetch(owner),
+      fullContactRef(),
+    );
+    live.observed.length = 0;
+
+    const outcome = await updateContact(
+      env,
+      principal,
+      createDavFetch(owner),
+      fullContactRef(),
+      PATCHED,
+      read.etag,
+    );
+
+    expect(outcome.applied).toBe(true);
+    expect(outcome.id).toBe(encodeContactId(fullContactRef()));
+
+    const sent = writes(live);
+    expect(sent.length, "the write did not cost exactly one request").toBe(1);
+    expect(live.observed.length, "the write cost more than the one request").toBe(1);
+    expect(sent[0].ifMatch).toBe(AWKWARD_ETAG);
+    expect(sent[0].body).toBe(PATCHED);
+    expect(sent[0].url).toBe(FULL_OBJECT_URL);
+  });
+
+  it("refuses an ABSENT version stamp before anything is sent", async () => {
+    // Not a type-system claim. A `null` reaching the library is dropped from the
+    // header set, and what goes out is an unconditional overwrite the server
+    // answers 200 to — so the refusal has to be a runtime one and it has to be
+    // first. The request count is what says it was first.
+    for (const absent of [null, undefined, ""]) {
+      stub.observed.length = 0;
+
+      const err = await capture(() =>
+        updateContact(
+          env,
+          principal,
+          createDavFetch(owner),
+          fullContactRef(),
+          PATCHED,
+          absent,
+        ),
+      );
+
+      expect(err, `an entity tag of ${JSON.stringify(absent)} was not refused`)
+        .toBeInstanceOf(DavNotFoundError);
+      expect(
+        stub.observed.length,
+        `an entity tag of ${JSON.stringify(absent)} reached the network`,
+      ).toBe(0);
+    }
+  });
+
+  it("reports a 412 as stale_resource, with NO re-discovery retry", async () => {
+    // CONW-06. The mechanism ships in `./transport.ts` and `./errors.ts`; this
+    // asserts this write consumes it rather than re-deciding it. The COUNT is the
+    // half that matters: a retried write is a second write, and a second write
+    // against a card somebody else just changed is the exact loss the conditional
+    // header exists to prevent.
+    const raced = restub({
+      onRequest: (url, method) =>
+        method === "PUT" ? new Response(null, { status: 412 }) : null,
+    });
+
+    const err = await capture(() =>
+      updateContact(
+        env,
+        principal,
+        createDavFetch(owner),
+        fullContactRef(),
+        PATCHED,
+        '"etag-1"',
+      ),
+    );
+
+    expect(err).toBeInstanceOf(DavStaleResourceError);
+    expect(davToErrorCategory(err).category).toBe("stale_resource");
+    expect(writes(raced).length, "the refused write was retried").toBe(1);
+    expect(raced.observed.length, "something else was spent on the retry").toBe(1);
+  });
+
+  it("refuses a forged address book URL, spending NO request", async () => {
+    const err = await capture(() =>
+      updateContact(
+        env,
+        principal,
+        createDavFetch(owner),
+        {
+          addressBookUrl: "https://attacker.example/1234567890/carddavhome/card/",
+          objectUrl: "https://attacker.example/1234567890/carddavhome/card/steal.vcf",
+        },
+        PATCHED,
+        '"etag-1"',
+      ),
+    );
+
+    expect(err).toBeInstanceOf(DavNotFoundError);
+    expect(stub.observed.length).toBe(0);
+  });
+
+  it("refuses a LEGITIMATE book URL carrying a forged object URL", async () => {
+    // The case a collection-only check passes. The object URL is what the PUT is
+    // actually aimed at, so checking the book alone checks nothing about the
+    // request that gets made.
+    const err = await capture(() =>
+      updateContact(
+        env,
+        principal,
+        createDavFetch(owner),
+        {
+          addressBookUrl: BOOK_A_URL,
+          objectUrl: "https://attacker.example/1234567890/carddavhome/card/steal.vcf",
+        },
+        PATCHED,
+        '"etag-1"',
+      ),
+    );
+
+    expect(err).toBeInstanceOf(DavNotFoundError);
+    expect(stub.observed.length).toBe(0);
   });
 });
 

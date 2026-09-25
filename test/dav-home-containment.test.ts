@@ -284,6 +284,16 @@ const DAV_REQUEST_FUNCTIONS = Object.freeze([
   "makeCalendar",
   "davRequest",
   "deleteObject",
+  // Phase 16's two CardDAV write primitives. `createVCard` shipped with CONW-01
+  // and was left off this vocabulary, which the additive-only bias above
+  // tolerates as an under-report — but the tolerance reads exactly as oddly here
+  // as it did for phase 5's calendar writes, and for the same reason: a write
+  // sends the account's credential AND the caller's own card content to whatever
+  // the URL named. `updateVCard` arrives with CONW-02 and is the sharper of the
+  // two, because an unchecked target on an overwrite does not merely leak — it
+  // replaces whatever it addressed. Both are declared below rather than exempt.
+  "createVCard",
+  "updateVCard",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -415,17 +425,62 @@ export const HOME_CHECKED_CALL_SITES: readonly CheckedSite[] = Object.freeze([
     guards: "deleteCalendarObject",
     via: "withContainedTarget",
   },
+  // `readContact` rather than `getContact`, for `readEvent`'s reason above
+  // exactly: CONW-02's write needs the entity tag out of the same multi-status as
+  // the card, so the plain read and the read-with-version now share one body. The
+  // request did not move origin and did not lose its guard — it acquired a second
+  // caller — but the enclosing function's NAME is this gate's identity, so the
+  // rename is a diff a reader has to approve rather than a silent one.
   {
     file: CONTACTS,
-    fn: "getContact",
+    fn: "readContact",
     field: "ref.addressBookUrl",
     guards: "addressBookMultiGet",
   },
   {
     file: CONTACTS,
-    fn: "getContact",
+    fn: "readContact",
     field: "ref.objectUrl",
     guards: "addressBookMultiGet",
+  },
+  // The two CardDAV writes, both contained through one shared helper — which is
+  // why both declare `via` and the ordering assertion becomes a two-link chain.
+  // `withContainedContactTarget` is a LOCAL twin of the calendar helper rather
+  // than a reuse of it, because `resolved.homeUrl` is a DIFFERENT value for
+  // CardDAV and asserting a contact's urls against the calendar home set is
+  // 03-REVIEW.md CR-01's bug exactly.
+  //
+  // `createContact` shipped with CONW-01 while `createVCard` was absent from the
+  // vocabulary above, so this gate could not see its site at all. Declaring the
+  // primitive is what surfaced it; these entries are that declaration, not a new
+  // check on the create.
+  {
+    file: CONTACTS,
+    fn: "createContact",
+    field: "ref.addressBookUrl",
+    guards: "createVCard",
+    via: "withContainedContactTarget",
+  },
+  {
+    file: CONTACTS,
+    fn: "createContact",
+    field: "ref.objectUrl",
+    guards: "createVCard",
+    via: "withContainedContactTarget",
+  },
+  {
+    file: CONTACTS,
+    fn: "updateContact",
+    field: "ref.addressBookUrl",
+    guards: "updateVCard",
+    via: "withContainedContactTarget",
+  },
+  {
+    file: CONTACTS,
+    fn: "updateContact",
+    field: "ref.objectUrl",
+    guards: "updateVCard",
+    via: "withContainedContactTarget",
   },
 ]);
 

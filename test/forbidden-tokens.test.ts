@@ -263,6 +263,25 @@ const DAV_FAN_OUT_SERVICE = [
   // not contiguous inside it. So its per-name loop below can genuinely fail, and
   // the `getEventWithEtag` exception list stays at one.
   "findDuplicateCandidates",
+  // Phase 16 (CONW-02, CONW-06). The two halves of a conditional update: the read
+  // that brings back the version stamp, and the overwrite that is conditional on
+  // it. Both are named for the reason the WRITE paragraph of the rule's own text
+  // gives, and the read is named because it ends in a request too — a fan-out over
+  // reads-with-a-version is a fan-out over multi-gets.
+  //
+  // `getContactWithEtag` JOINS the exception list below rather than adding a
+  // per-name loop with teeth: `getContact` precedes it in the alternation and is a
+  // prefix of it, so it matched before it was written down, exactly as
+  // `getEventWithEtag` does on the calendar tree. That is recorded there rather
+  // than repaired here, because the repair — a trailing word boundary on the
+  // group — would make the rule match strictly LESS than it does today.
+  //
+  // `updateContact` has no such defect: no entry is a prefix or a substring of it
+  // and it contains none. `getContact` and `createContact` are not contiguous
+  // inside it, and `updateEvent` shares only `update`. So its loop can genuinely
+  // fail, and the exception list grows by exactly one rather than two.
+  "getContactWithEtag",
+  "updateContact",
 ];
 
 /** The request primitive and the tsdav standalone helpers: what a "just do them
@@ -314,6 +333,16 @@ const DAV_FAN_OUT_LIBRARY = [
   // in. It is not a prefix or a substring of any entry above it and none is a
   // substring of it, so its per-name loop can genuinely fail.
   "createVCard",
+  // Phase 16's second, CONW-02. tsdav ships `updateVCard` as the CardDAV object
+  // overwrite — verified against the installed package's own exported surface
+  // rather than taken from prose — and it is the primitive `updateContact` ends
+  // in. It is the sharper of the two on this list for the reason the write
+  // paragraph above gives: a create aimed at the wrong origin leaks, and an
+  // overwrite aimed at the wrong origin also REPLACES what it found there. It is
+  // not a prefix or a substring of any entry above it — `createVCard` shares only
+  // `VCard`, which is not a leading match either way — so its loop can genuinely
+  // fail.
+  "updateVCard",
 ];
 
 /** The names actually present in the shipped rule's final alternation group.
@@ -827,8 +856,8 @@ describe("the patterns have teeth", () => {
     const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
     expect(
       DAV_FAN_OUT_SERVICE.length,
-      "eleven read entry points, phase 5's four writes, the organiser resolution WINDOWS 60 filed, the eight composite tool-layer entry points 05-REVIEW.md WR-04 filed plus 05-14's scopelessBody, phase 6's findFreeSlots orchestrator and its looped collectFrom, phase 14's two dav_diagnose probes — runCollectionWriteProbe, whose fan-out would leave half-finished collections on a real account and race its own cleanup check, and runTaskCollectionProbe, a loop over collections issuing one calendar-query apiece — and phase 16's three: the CardDAV write createContact, plus the two composites buildContactCreatePreview and applyContactCommit, which end in it and were therefore covered only by accident. planContactCreateTarget and contactUidFromObjectUrl are NOT among them: both are synchronous and issue no request, so they carry a written manifest disposition instead. CONW-05 adds a fourth from phase 16, findDuplicateCandidates — the duplicate scan, and the case this rule's own text describes most directly: two probes over one address book is exactly the loop a combinator gets wrapped around, and the concurrent version returns the same candidates, so nothing about the answer reveals it. duplicateFilter is NOT among them either, on planContactCreateTarget's precedent: it assembles a report body and issues no request",
-    ).toBe(32);
+      "eleven read entry points, phase 5's four writes, the organiser resolution WINDOWS 60 filed, the eight composite tool-layer entry points 05-REVIEW.md WR-04 filed plus 05-14's scopelessBody, phase 6's findFreeSlots orchestrator and its looped collectFrom, phase 14's two dav_diagnose probes — runCollectionWriteProbe, whose fan-out would leave half-finished collections on a real account and race its own cleanup check, and runTaskCollectionProbe, a loop over collections issuing one calendar-query apiece — and phase 16's three: the CardDAV write createContact, plus the two composites buildContactCreatePreview and applyContactCommit, which end in it and were therefore covered only by accident. planContactCreateTarget and contactUidFromObjectUrl are NOT among them: both are synchronous and issue no request, so they carry a written manifest disposition instead. CONW-05 adds a fourth from phase 16, findDuplicateCandidates — the duplicate scan, and the case this rule's own text describes most directly: two probes over one address book is exactly the loop a combinator gets wrapped around, and the concurrent version returns the same candidates, so nothing about the answer reveals it. duplicateFilter is NOT among them either, on planContactCreateTarget's precedent: it assembles a report body and issues no request. CONW-02 and CONW-06 add the two halves of a conditional update — getContactWithEtag, the read that brings back the version stamp out of the same multi-status the plain read already issued, and updateContact, the overwrite that is conditional on it. Their read and their write are two SERIAL awaits and never a pair to be raced: racing them asks the server about a version nobody has read yet",
+    ).toBe(34);
     for (const entryPoint of DAV_FAN_OUT_SERVICE) {
       const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
       expect(
@@ -847,8 +876,8 @@ describe("the patterns have teeth", () => {
     const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
     expect(
       DAV_FAN_OUT_LIBRARY.length,
-      "the request primitive and the tsdav helpers, plus phase 5's three writes and phase 14's three — makeCalendar, davRequest and deleteObject, the collection create, the hand-assembled property update and the collection removal the SPIKE-04 probe needs — and phase 16's one, createVCard, the CardDAV object create the contact write ends in. calendarQuery, which phase 14's to-do probe also calls, is NOT among them: it has been on this list since the event listing and must appear exactly once",
-    ).toBe(19);
+      "the request primitive and the tsdav helpers, plus phase 5's three writes and phase 14's three — makeCalendar, davRequest and deleteObject, the collection create, the hand-assembled property update and the collection removal the SPIKE-04 probe needs — and phase 16's one, createVCard, the CardDAV object create the contact write ends in. calendarQuery, which phase 14's to-do probe also calls, is NOT among them: it has been on this list since the event listing and must appear exactly once. CONW-02 adds the second phase-16 primitive, updateVCard, the CardDAV overwrite the conditional contact write ends in — the sharper of the two, because an overwrite aimed at the wrong origin does not merely leak the credential, it replaces whatever it addressed",
+    ).toBe(20);
     for (const entryPoint of DAV_FAN_OUT_LIBRARY) {
       const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
       expect(
@@ -902,10 +931,18 @@ describe("the patterns have teeth", () => {
     const covered = names.filter((name) =>
       names.some((other) => other !== name && name.includes(other)),
     );
+    // `getContactWithEtag` (CONW-02) is the second, and it is the SAME defect on
+    // the other tree: `getContact` precedes it in the alternation and is a prefix
+    // of it, so it matched before it was written down. It is argued for here
+    // rather than tolerated silently, which is what this exact list is for. The
+    // alternative was to name it something `getContact` is not a prefix of, and
+    // renaming a service export to satisfy a test's assertion mechanics is worse
+    // than recording the mechanics — the name it has is the name `getEventWithEtag`
+    // set on the tree this one is a twin of.
     expect(
       covered,
       "a name in the alternation is matched through another entry, so its per-name loop cannot fail",
-    ).toEqual(["getEventWithEtag"]);
+    ).toEqual(["getEventWithEtag", "getContactWithEtag"]);
   });
 
   it("asserts every name in the shipped alternation, with nothing left over", () => {
@@ -3529,10 +3566,15 @@ describe("the DAV write modules are a manifested constraint", () => {
     const covered = guarded.filter((name) =>
       names.some((other) => other !== name && name.includes(other)),
     );
+    // `getContactWithEtag` (CONW-02) is the second, and it is the same defect on
+    // the other tree: `getContact` is a guarded manifest name in the same module
+    // and is a prefix of it. Argued for in the alternation's own block above rather
+    // than argued twice; recorded here because this list is what a write export
+    // added later has to pass.
     expect(
       covered,
       "a guarded manifest name is matched through another alternation entry, so its coverage claim cannot fail",
-    ).toEqual(["getEventWithEtag"]);
+    ).toEqual(["getEventWithEtag", "getContactWithEtag"]);
   });
 
   it("is deterministic: two runs over the same input return deeply equal arrays", () => {
