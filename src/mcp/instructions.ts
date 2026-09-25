@@ -85,7 +85,7 @@ Mail is read-only apart from drafts. There is no mail triage: nothing here moves
 
 Calendar EVENTS can be created, updated and deleted, through the preview-and-commit shape above.
 
-A CALENDAR itself can be created, with a name and a colour as \`#RRGGBB\`. That one writes on the first call and has no preview: making a calendar is reversible, and the user can delete it from any of their own devices. Do not offer to preview it, and do not pass its answer to \`calendar_commit\`.
+A CALENDAR itself can be created, and renamed or recoloured afterwards, with a colour as \`#RRGGBB\`. Those two write on the first call and have no preview: both are reversible, and the user can undo either from any of their own devices. Do not offer to preview them, and do not pass their answers to \`calendar_commit\`. A rename or recolour reports WHICH of the two properties actually changed -- iCloud may accept one and refuse the other, so read that answer rather than assuming both landed.
 
 Contacts can create and update, through the same preview-and-commit shape.
 

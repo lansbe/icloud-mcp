@@ -35,6 +35,7 @@ import type {
   ScopedDeletePlan,
   SlotPage,
   UnsupportedTarget,
+  UpdatedCalendar,
 } from "../../dav/calendar";
 import type {
   BuildEventInput,
@@ -63,6 +64,7 @@ import {
   resolveOrganizerAddress,
   searchEvents,
   uidFromObjectUrl,
+  updateCalendarCollection,
   updateEvent,
   updateEventBody,
   updateOccurrenceBody,
@@ -75,7 +77,12 @@ import {
   isWriteScope,
   localTimeToUtc,
 } from "../../dav/icalendar";
-import { decodeEventId, encodeCalendarId, encodeEventId } from "../../dav/ids";
+import {
+  decodeCalendarId,
+  decodeEventId,
+  encodeCalendarId,
+  encodeEventId,
+} from "../../dav/ids";
 import type { EventRef } from "../../dav/ids";
 import {
   DavConfirmationError,
@@ -271,6 +278,78 @@ export function calendarCreatedToolResult(result: CreatedCalendar): ToolResult {
   return untrustedToolResult(
     calendarCreatedTrustedPart(result),
     calendarCreatedUntrustedPart(result),
+  );
+}
+
+/**
+ * An updated calendar's trusted fields — the id and the per-property verdict.
+ *
+ * **`changed` and `unchanged` are THIS SERVER's own reading and belong outside
+ * the fence for the reason `subscribed` and `timezoneUnresolved` do.** Nobody
+ * chose their contents: each is drawn from a closed two-value vocabulary
+ * declared in `src/dav/calendar.ts`, and which list a property lands in is this
+ * server's answer about a multi-status it parsed. No byte of the server's
+ * answer reaches either array — not a status line, not a body, not a URL.
+ *
+ * That closed vocabulary is the whole mechanism behind § 4 here. "Which
+ * property failed" is exactly the field somebody would otherwise answer by
+ * quoting the server's own propstat back, and once the names are this server's
+ * there is nothing to quote.
+ *
+ * `unchanged` is ALWAYS present, including when it is empty. A field that
+ * disappears on the happy path is a field a reader has to know the absence
+ * rule for, and "no property failed" is an answer worth stating.
+ */
+function calendarUpdatedTrustedPart(
+  result: UpdatedCalendar,
+): Record<string, unknown> {
+  return {
+    id: result.id,
+    changed: result.changed,
+    unchanged: result.unchanged,
+  };
+}
+
+/**
+ * The same update's fenced half — the VALUES, which are the caller's own.
+ *
+ * The same way round as `calendarCreatedUntrustedPart`, and for the same
+ * reason: on a write path the caller is a model that may have read the name out
+ * of a message a stranger sent. Only what was actually asked for appears, so a
+ * recolour carries no name and a rename carries no colour — an echoed value the
+ * caller never supplied would be this server inventing a claim about the
+ * resource.
+ *
+ * The `id` is repeated from the trusted half, so the model joins the two by
+ * IDENTITY rather than by position.
+ */
+function calendarUpdatedUntrustedPart(
+  result: UpdatedCalendar,
+  asked: { displayName?: string; color?: string },
+): Record<string, unknown> {
+  return {
+    id: result.id,
+    ...(asked.displayName === undefined
+      ? {}
+      : { displayName: asked.displayName }),
+    ...(asked.color === undefined ? {} : { color: asked.color }),
+  };
+}
+
+/**
+ * Shape a finished calendar update into the tool's response.
+ *
+ * Exported for the reason `calendarCreatedToolResult` is: the containment
+ * assertion over this shape is a WALK, and a walk run against a test-local copy
+ * of this mapping proves nothing about the mapping that ships.
+ */
+export function calendarUpdatedToolResult(
+  result: UpdatedCalendar,
+  asked: { displayName?: string; color?: string },
+): ToolResult {
+  return untrustedToolResult(
+    calendarUpdatedTrustedPart(result),
+    calendarUpdatedUntrustedPart(result, asked),
   );
 }
 
@@ -3307,6 +3386,39 @@ const CALENDAR_COLOR = /^#[0-9A-Fa-f]{6}$/;
 const MAX_CALENDAR_NAME_LENGTH = 200;
 
 /**
+ * The colour field, built once and used by both collection tools.
+ *
+ * **ONE fragment rather than two copies, and the reason is not tidiness.** The
+ * anchoring is the mitigation D-08 names, so a second copy is a second thing
+ * that has to stay anchored — and the day somebody loosens one of them, the
+ * other goes on passing and the suite goes on being green about a boundary that
+ * now holds on one tool and not the other. A function rather than a shared
+ * const because zod fragments are chained onto (`.optional()` here), and a
+ * chain that mutated a shared value would be the same drift arriving by a
+ * quieter door.
+ */
+function calendarColorField(): z.ZodString {
+  return z
+    .string()
+    .regex(CALENDAR_COLOR, "expected #RRGGBB")
+    .describe(
+      "The colour, as #RRGGBB — six hex digits behind a hash, nothing " +
+        "else. Refused before anything is sent.",
+    );
+}
+
+/** The calendar-name field, shared by both collection tools for the same reason. */
+function calendarNameField(): z.ZodString {
+  return z
+    .string()
+    .min(1)
+    .max(MAX_CALENDAR_NAME_LENGTH)
+    .describe(
+      `What to call it, 1 to ${MAX_CALENDAR_NAME_LENGTH} characters. Shown on the user's own devices.`,
+    );
+}
+
+/**
  * A local wall clock, as `YYYY-MM-DDTHH:MM:SS`.
  *
  * No offset, no `Z`, no fractional seconds. The zone travels in its own
@@ -3509,20 +3621,8 @@ export function registerCalendarTools(
         "Create a calendar with a name and a colour. Writes immediately — " +
         `there is no preview and no confirmation for this one. ${CALENDAR_UNTRUSTED_NOTICE}`,
       inputSchema: z.object({
-        displayName: z
-          .string()
-          .min(1)
-          .max(MAX_CALENDAR_NAME_LENGTH)
-          .describe(
-            `What to call it, 1 to ${MAX_CALENDAR_NAME_LENGTH} characters. Shown on the user's own devices.`,
-          ),
-        color: z
-          .string()
-          .regex(CALENDAR_COLOR, "expected #RRGGBB")
-          .describe(
-            "The colour, as #RRGGBB — six hex digits behind a hash, nothing " +
-              "else. Refused before anything is sent.",
-          ),
+        displayName: calendarNameField(),
+        color: calendarColorField(),
       }),
     },
     async ({ displayName, color }) => {
@@ -3536,6 +3636,79 @@ export function registerCalendarTools(
             color,
           }),
         );
+      } catch (err) {
+        return davErrorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "calendar_update_calendar",
+    {
+      // **NO CONFIRM GATE, and the absence is a decision rather than an
+      // oversight (D-07).** This tool writes on the first call. A rename and a
+      // recolour are trivially reversible — the user can type the old name back
+      // from any of their own devices, or from this tool — and a gate on a
+      // reversible operation teaches the user to click through the one that
+      // matters. The delete in CALM-06 is where the gate belongs, and it is
+      // routed through `calendar_commit` precisely so this one need not be.
+      //
+      // It is the same DELIBERATE DIVERGENCE from `contacts_create` the create
+      // beside it makes: that gate carries duplicate detection, and there is no
+      // equivalent hazard in renaming a calendar the caller already named.
+      description:
+        "Rename a calendar, recolour it, or both. Writes immediately — no " +
+        "preview, no confirmation. Reports which of the two changed. " +
+        CALENDAR_UNTRUSTED_NOTICE,
+      inputSchema: z
+        .object({
+          calendarId: z
+            .string()
+            .min(1)
+            .describe(
+              "The calendar's opaque id from calendar_list_calendars. Pass it " +
+                "back exactly as received; never build or edit one.",
+            ),
+          displayName: calendarNameField()
+            .optional()
+            .describe(
+              `A new name, 1 to ${MAX_CALENDAR_NAME_LENGTH} characters. Omit to leave the name alone.`,
+            ),
+          color: calendarColorField()
+            .optional()
+            .describe(
+              "A new colour, as #RRGGBB — six hex digits behind a hash, " +
+                "nothing else. Omit to leave the colour alone.",
+            ),
+        })
+        // Refused at the SCHEMA, so a call asking for no change never reaches
+        // the handler — which means it never reaches the KV read discovery
+        // performs or the request that follows it. The service layer repeats
+        // the check for callers that do not arrive through MCP.
+        .refine(
+          ({ displayName, color }) =>
+            displayName !== undefined || color !== undefined,
+          { message: "supply displayName, color, or both" },
+        ),
+    },
+    async ({ calendarId, displayName, color }) => {
+      try {
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
+        // The decoder refuses a token this server did not mint, and it issues
+        // no request to do it. `assertUnderHome` inside the entry point is what
+        // refuses one that decodes but names another account's host.
+        const { collectionUrl } = decodeCalendarId(calendarId);
+        const updated = await updateCalendarCollection(env, actor, davFetch, {
+          collectionUrl,
+          displayName,
+          color,
+        });
+        // A TOTAL refusal never arrives here: `updateCalendarCollection` throws
+        // when nothing changed, so there is no path to "a partial success with
+        // zero parts" for this shaper to print.
+        return calendarUpdatedToolResult(updated, { displayName, color });
       } catch (err) {
         return davErrorResult(err);
       }

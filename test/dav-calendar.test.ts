@@ -3671,7 +3671,7 @@ describe("the calendar_create_event handler", () => {
 });
 
 describe("the calendar registrations", () => {
-  it("records exactly the ten calendar tools", () => {
+  it("records exactly the eleven calendar tools", () => {
     // Named explicitly rather than counted, so neither the description loop in
     // `test/dav-tools.test.ts` nor this case can pass by the registrar having
     // been called and registered nothing.
@@ -3680,10 +3680,12 @@ describe("the calendar registrations", () => {
     // what this list is really pinning: a second commit endpoint appearing here
     // would be a second handler that could be the one missing the check.
     // `calendar_find_free_slots` (SCHED-01) is the ninth, added in phase 6.
-    // `calendar_create_calendar` (CALM-04) is the tenth, added in phase 17 —
-    // and it is the one tool on this list that deliberately does NOT reach
-    // `calendar_commit`, because a create is reversible and D-07 declines to
-    // spend the user's attention on a gate that does not need spending.
+    // `calendar_create_calendar` (CALM-04) is the tenth and
+    // `calendar_update_calendar` (CALM-05) the eleventh, both added in phase
+    // 17 — and they are the two tools on this list that deliberately do NOT
+    // reach `calendar_commit`, because a create and a rename are both
+    // reversible and D-07 declines to spend the user's attention on a gate
+    // that does not need spending. CALM-06's delete is where the gate belongs.
     expect(calendarRegistrations().map((one) => one.name).sort()).toEqual([
       "calendar_commit",
       "calendar_create_calendar",
@@ -3694,6 +3696,7 @@ describe("the calendar registrations", () => {
       "calendar_list_calendars",
       "calendar_list_events",
       "calendar_search",
+      "calendar_update_calendar",
       "calendar_update_event",
     ]);
   });

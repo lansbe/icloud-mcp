@@ -101,6 +101,7 @@ import {
 import {
   calendarCreatedToolResult,
   calendarListToolResult,
+  calendarUpdatedToolResult,
   commitToolResult,
   eventCreatedToolResult,
   eventPageToolResult,
@@ -212,6 +213,36 @@ export const TRUSTED_FIELD_ALLOWLIST: Record<string, AllowedShape> = {
     ]),
     // No `optionalTop`, and no refusal path to declare one for: a refused
     // create never reaches this shaper at all.
+  },
+
+  // -- calendar_update_calendar (CALM-05) -----------------------------------
+  //
+  // THREE keys, and the two new ones are the interesting entry on this whole
+  // list — the first fields published outside the fence that answer a question
+  // about what a SERVER did, rather than reporting a value this server computed
+  // from its own inputs.
+  //
+  // They pass the fence's stated test anyway, and the mechanism is the reason.
+  // Each array's contents are drawn from a CLOSED two-value vocabulary declared
+  // in `src/dav/calendar.ts` (`CalendarProperty`), and which of the two lists a
+  // property lands in is this server's own reading of a multi-status it parsed.
+  // No byte of the server's answer reaches either array: not a status line, not
+  // a propstat, not a body, not a URL. The closed vocabulary IS the mitigation
+  // `.claude/CLAUDE.md` § 4 asks for — "which property failed" is precisely the
+  // field somebody would otherwise answer by quoting the server's own propstat
+  // back, and once the names are this server's there is nothing left to quote.
+  //
+  // **`unchanged` is not optional and must not become optional.** A field that
+  // disappears on the happy path is a field a reader has to know an absence
+  // rule for, and "no property failed" is an answer worth stating out loud.
+  calendarUpdatedToolResult: {
+    top: new Set([
+      "id", // server-generated: base64url(JSON) minted here over the collection URL the request ACTUALLY addressed.
+      "changed", // server-generated: this server's own reading, from a closed two-value vocabulary it declares. No server text reaches it.
+      "unchanged", // server-generated: the same reading, same closed vocabulary. Always present, including when empty.
+    ]),
+    // No `optionalTop`: both arrays are spread unconditionally, and an empty
+    // array is a real answer rather than an absent one.
   },
 
   // -- calendar_list_events, calendar_search --------------------------------
@@ -1079,7 +1110,7 @@ describe("the trusted block of every shipped DAV shaper", () => {
     expect(Object.keys(TRUSTED_FIELD_ALLOWLIST).sort()).toEqual(SHIPPED_SHAPERS);
   });
 
-  it("covers all eleven two-block shapers and nothing else", () => {
+  it("covers all twelve two-block shapers and nothing else", () => {
     // The allow-list itself is guarded: an entry silently dropped would make
     // its shaper unwatched while the suite stayed green, and a shaper added to
     // this phase without an entry would be invisible here.
@@ -1092,6 +1123,7 @@ describe("the trusted block of every shipped DAV shaper", () => {
     expect(Object.keys(TRUSTED_FIELD_ALLOWLIST).sort()).toEqual([
       "calendarCreatedToolResult",
       "calendarListToolResult",
+      "calendarUpdatedToolResult",
       "commitToolResult",
       "contactCommitToolResult",
       "contactPageToolResult",
@@ -1114,6 +1146,33 @@ describe("the trusted block of every shipped DAV shaper", () => {
     for (const row of rows) {
       expectExactKeys(row, shape.rows!.keys, "calendarListToolResult row");
     }
+  });
+
+  it("calendarUpdatedToolResult publishes exactly the audited keys", () => {
+    const shape = TRUSTED_FIELD_ALLOWLIST.calendarUpdatedToolResult;
+
+    // Driven on the HALF-SUCCESS, deliberately. A full success leaves
+    // `unchanged` empty, and an empty array is the one value that would let a
+    // shaper drop the key entirely while this case stayed green.
+    const trusted = trustedBlockOf(
+      calendarUpdatedToolResult(
+        {
+          id: encodeCalendarId({ collectionUrl: CALENDAR_URL }),
+          changed: ["displayName"],
+          unchanged: ["color"],
+        },
+        { displayName: "Job search 2026", color: "#1f77b4" },
+      ),
+    );
+
+    expectExactKeys(trusted, shape.top, "calendarUpdatedToolResult top level");
+
+    // The VALUES, not only the keys. This gate is otherwise blind to what sits
+    // at a permitted key, and the whole reason these two arrays are allowed
+    // outside the fence is that their contents come from a closed vocabulary
+    // this server declares rather than from anything the server sent back.
+    expect(trusted.changed).toEqual(["displayName"]);
+    expect(trusted.unchanged).toEqual(["color"]);
   });
 
   it("eventPageToolResult publishes exactly the audited keys", () => {

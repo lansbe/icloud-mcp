@@ -71,6 +71,7 @@ const EXPECTED_TOOLS: readonly string[] = [
   "calendar_list_calendars",
   "calendar_list_events",
   "calendar_search",
+  "calendar_update_calendar",
   "calendar_update_event",
   "contacts_commit",
   "contacts_create",

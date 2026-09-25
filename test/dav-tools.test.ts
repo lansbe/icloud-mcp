@@ -609,16 +609,17 @@ function registeredDav(who: Promise<Principal> = owner): Registration[] {
   registerDavDiagnoseTool(server as unknown as McpServer, davFetch, who);
   registerCalendarTools(server as unknown as McpServer, davFetch, who);
   // The last registrar the phase adds. After this line the ceiling loop below
-  // covers the phase's ENTIRE tool surface — one diagnostic, TEN calendar
+  // covers the phase's ENTIRE tool surface — one diagnostic, ELEVEN calendar
   // tools and FIVE contacts tools — rather than two thirds of it, and the mail
   // suite's own loop keeps covering the mail tools, which is all it was ever
   // able to see.
   //
-  // TEN rather than nine since CALM-04, and the harness needed no edit to reach
-  // the new one: `calendar_create_calendar` registers inside
-  // `registerCalendarTools` beside the other nine, which is why it is measured
-  // by the ceiling loop through this one call rather than through a line
-  // somebody had to remember to add.
+  // ELEVEN rather than nine since CALM-04 and CALM-05, and the harness needed
+  // no edit to reach either: `calendar_create_calendar` and
+  // `calendar_update_calendar` both register inside `registerCalendarTools`
+  // beside the other nine, which is why they are measured by the ceiling loop
+  // through this one call rather than through a line somebody had to remember
+  // to add.
   //
   // FIVE rather than two since CONW-01 and CONW-02, and the harness needed no edit
   // to reach any of the three: `registerContactsTools` delegates to
@@ -661,6 +662,7 @@ describe("the DAV registrations", () => {
       "calendar_list_calendars",
       "calendar_list_events",
       "calendar_search",
+      "calendar_update_calendar",
       "calendar_update_event",
       "contacts_commit",
       "contacts_create",
@@ -711,7 +713,7 @@ describe("the DAV registrations", () => {
     // The loop above iterates the REGISTRATIONS rather than an enumerated list
     // of names, so a tool added to a DAV registrar in a later plan is measured
     // by construction — with no edit to this file and no cross-plan conflict.
-    expect(registeredDav().length).toBe(16);
+    expect(registeredDav().length).toBe(17);
   });
 
   it("carries the untrusted notice on every calendar description that returns stranger content", () => {
@@ -7207,11 +7209,12 @@ describe("a principal that was refused reaches no DAV tool", () => {
     // so a refused principal reads `auth_failed` rather than spending a signing
     // key on somebody who is not signed in.
     //
-    // `calendar_create_calendar` (CALM-04) joins them on the same footing, and
-    // it is the one that writes on the FIRST call — there is no preview leg to
-    // absorb a refusal, so awaiting the principal first is the only thing
-    // between a grant that does not check out and a collection create.
-    expect(registeredDav(refused()).length).toBe(16);
+    // `calendar_create_calendar` (CALM-04) and `calendar_update_calendar`
+    // (CALM-05) join them on the same footing, and both write on the FIRST call
+    // — there is no preview leg to absorb a refusal, so awaiting the principal
+    // first is the only thing between a grant that does not check out and a
+    // collection write.
+    expect(registeredDav(refused()).length).toBe(17);
   });
 
   it("answers auth_failed from EVERY tool, with the unchanged message and zero requests", async () => {
@@ -7766,5 +7769,369 @@ describe("the calendar_create_calendar call", () => {
     expect(whole).not.toContain("207");
     expect(whole).not.toContain("p42");
     expect(whole).not.toContain("1234567890");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CALM-05 — the rename and recolour, at the tool boundary
+//
+// The service-layer cases in `test/dav-calendar.test.ts` prove what is read out
+// of a `207`; these prove what the user is TOLD about it. The sharpest one is
+// the half-success: the name changed, the colour did not, and the answer has to
+// say so in this server's own words — no status line, no URL, no server body.
+// ---------------------------------------------------------------------------
+
+/** One `d:response` wrapper for a property update's answer. */
+function propertyUpdateAnswer(propstats: string): string {
+  return (
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<d:multistatus xmlns:d="DAV:" xmlns:ca="http://apple.com/ns/ical/">' +
+    `<d:response><d:href>${WORK_PATH}</d:href>${propstats}</d:response>` +
+    "</d:multistatus>"
+  );
+}
+
+/** Both properties accepted. */
+const UPDATE_BOTH_SET = propertyUpdateAnswer(
+  "<d:propstat><d:prop><d:displayname/><ca:calendar-color/></d:prop>" +
+    "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>",
+);
+
+/** The name accepted, the colour refused — the half the probe could not see. */
+const UPDATE_COLOUR_REFUSED = propertyUpdateAnswer(
+  "<d:propstat><d:prop><d:displayname/></d:prop>" +
+    "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>" +
+    "<d:propstat><d:prop><ca:calendar-color/></d:prop>" +
+    "<d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>",
+);
+
+/** A stub that answers a property update, and everything else as usual. */
+function updatingWriteStub(body = UPDATE_BOTH_SET, status = 207): WriteStub {
+  return writeDavStub({
+    onRequest: (_url, method) =>
+      method === "PROPPATCH"
+        ? new Response(body, { status, headers: XML_HEADERS })
+        : null,
+  });
+}
+
+/**
+ * Drive `calendar_update_calendar` the way a real MCP server drives it.
+ *
+ * Through the SCHEMA and then through the handler, for the reason
+ * `createCalendarCall` gives: the object-level refusal of a call asking for no
+ * change lives on the schema, so a case that called the handler directly would
+ * be asserting about a code path nobody uses.
+ */
+async function updateCalendarCall(args: Record<string, unknown>): Promise<
+  | { refused: true }
+  | {
+      refused: false;
+      trusted: Record<string, unknown>;
+      untrusted: Record<string, unknown>;
+      raw: { trusted: string; untrusted: string };
+    }
+> {
+  const parsed = schemaFor("calendar_update_calendar").safeParse(args);
+  if (!parsed.success) return { refused: true };
+
+  const result = await invokeRegistered(
+    "calendar_update_calendar",
+    parsed.data as Record<string, unknown>,
+  );
+  expect(
+    result.isError,
+    `the update refused: ${result.content[0]?.text}`,
+  ).not.toBe(true);
+  const raw = blocks(result);
+  return {
+    refused: false,
+    trusted: JSON.parse(raw.trusted) as Record<string, unknown>,
+    untrusted: fencedObject(raw.untrusted),
+    raw,
+  };
+}
+
+describe("the calendar_update_calendar registration", () => {
+  it("takes an id and the two optional properties, and nothing else", () => {
+    expect(
+      Object.keys(schemaFor("calendar_update_calendar").shape).sort(),
+    ).toEqual(["calendarId", "color", "displayName"]);
+  });
+
+  it("says in the description that it writes with no confirmation (D-07)", () => {
+    const description = String(
+      registeredDav().find((one) => one.name === "calendar_update_calendar")!
+        .options.description,
+    );
+
+    expect(description).toContain("Writes immediately");
+    expect(description).toContain(CALENDAR_UNTRUSTED_NOTICE);
+    // NOT routed through the single commit endpoint. A rename is reversible,
+    // and a gate on a reversible operation trains the user to click through the
+    // one that matters. CALM-06's delete is where the gate belongs.
+    expect(description).not.toContain("calendar_commit");
+  });
+
+  it("refuses a call changing NOTHING, at the schema", () => {
+    const schema = schemaFor("calendar_update_calendar");
+
+    expect(schema.safeParse({ calendarId: CALENDAR_ID }).success).toBe(false);
+    // Either one alone is enough. That is the whole of CALM-05's "it can do
+    // either alone or both together".
+    expect(
+      schema.safeParse({ calendarId: CALENDAR_ID, displayName: "Job search" })
+        .success,
+    ).toBe(true);
+    expect(
+      schema.safeParse({ calendarId: CALENDAR_ID, color: "#1f77b4" }).success,
+    ).toBe(true);
+    expect(
+      schema.safeParse({
+        calendarId: CALENDAR_ID,
+        displayName: "Job search",
+        color: "#1f77b4",
+      }).success,
+    ).toBe(true);
+  });
+
+  it("refuses every colour that is not exactly #RRGGBB, as the create does", () => {
+    // The SAME anchored pattern, reached through the SAME shared fragment. This
+    // case exists so the two tools cannot drift: a fragment loosened for one of
+    // them turns this red as well as the create's own case.
+    const schema = schemaFor("calendar_update_calendar");
+    for (const color of [
+      "1f77b4",
+      "#1f77b",
+      "#1f77b4a",
+      "#1f77b4ff",
+      "#1f77bz",
+      " #1f77b4",
+      "#1f77b4 ",
+      "#1f77b4\n#ffffff",
+      "red",
+      "",
+    ]) {
+      expect(
+        schema.safeParse({ calendarId: CALENDAR_ID, color }).success,
+        `${JSON.stringify(color)} was admitted`,
+      ).toBe(false);
+    }
+
+    for (const color of ["#1f77b4", "#1F77B4", "#000000", "#ffffff"]) {
+      expect(
+        schema.safeParse({ calendarId: CALENDAR_ID, color }).success,
+        `${color} was refused`,
+      ).toBe(true);
+    }
+  });
+
+  it("refuses an empty name and one past the same cap the create uses", () => {
+    const schema = schemaFor("calendar_update_calendar");
+
+    expect(
+      schema.safeParse({ calendarId: CALENDAR_ID, displayName: "" }).success,
+    ).toBe(false);
+    expect(
+      schema.safeParse({
+        calendarId: CALENDAR_ID,
+        displayName: "x".repeat(201),
+      }).success,
+    ).toBe(false);
+    expect(
+      schema.safeParse({
+        calendarId: CALENDAR_ID,
+        displayName: "x".repeat(200),
+      }).success,
+    ).toBe(true);
+  });
+});
+
+describe("the calendar_update_calendar call", () => {
+  it("names BOTH properties as changed when both propstats are 2xx", async () => {
+    const stub = updatingWriteStub();
+    await warmWrite(stub);
+
+    const outcome = await updateCalendarCall({
+      calendarId: CALENDAR_ID,
+      displayName: "Job search 2026",
+      color: "#1f77b4",
+    });
+    if (outcome.refused) throw new Error("the update was refused");
+
+    expect((outcome.trusted.changed as string[]).sort()).toEqual([
+      "color",
+      "displayName",
+    ]);
+    expect(outcome.trusted.unchanged).toEqual([]);
+    // ONE request, and it did not fan out with anything.
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].method).toBe("PROPPATCH");
+    expect(stub.maxInFlight).toBe(1);
+  });
+
+  it("names WHICH half landed when the colour is refused, echoing no server text", async () => {
+    // **The case this whole plan exists for.** The envelope is a `207`, which
+    // is the only successful answer RFC 4918 § 9.2 defines for a property
+    // update — and the colour's own propstat inside it says `403`. Reading the
+    // envelope alone tells the user their calendar was recoloured when it was
+    // not.
+    const stub = updatingWriteStub(UPDATE_COLOUR_REFUSED);
+    await warmWrite(stub);
+
+    const outcome = await updateCalendarCall({
+      calendarId: CALENDAR_ID,
+      displayName: "Job search 2026",
+      color: "#1f77b4",
+    });
+    if (outcome.refused) throw new Error("the update was refused");
+
+    expect(outcome.trusted.changed).toEqual(["displayName"]);
+    expect(outcome.trusted.unchanged).toEqual(["color"]);
+
+    // NOT an error. The collection exists and half the change landed; a thrown
+    // category would carry no way to learn which half.
+    const whole = outcome.raw.trusted + outcome.raw.untrusted;
+    // ./.claude/CLAUDE.md § 4: no response field may echo a server status line,
+    // a body or a URL. The property names come from this server's own closed
+    // two-value vocabulary, which is what leaves nothing to quote.
+    expect(whole).not.toContain("403");
+    expect(whole).not.toContain("Forbidden");
+    expect(whole).not.toContain("propstat");
+    expect(whole).not.toContain("HTTP/1.1");
+    expect(whole).not.toContain("p42");
+    expect(whole).not.toContain("1234567890");
+  });
+
+  it("reports the change REFUSED when every property was refused", async () => {
+    // Not "a partial success with zero parts". A response saying a change
+    // succeeded partially while naming no part of it that did is worse than no
+    // answer at all.
+    const stub = updatingWriteStub(
+      propertyUpdateAnswer(
+        "<d:propstat><d:prop><d:displayname/><ca:calendar-color/></d:prop>" +
+          "<d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>",
+      ),
+    );
+    await warmWrite(stub);
+
+    const parsed = schemaFor("calendar_update_calendar").safeParse({
+      calendarId: CALENDAR_ID,
+      displayName: "Job search 2026",
+      color: "#1f77b4",
+    });
+    expect(parsed.success).toBe(true);
+    const result = await invokeRegistered(
+      "calendar_update_calendar",
+      parsed.data as Record<string, unknown>,
+    );
+
+    expect(result.isError).toBe(true);
+    // ONE block, the error shape — so there is no `changed: []` anywhere in the
+    // answer for a model to report as a partial success.
+    expect(result.content.length).toBe(1);
+    const whole = result.content[0].text;
+    expect(JSON.parse(whole).category).toBe("connection_failed");
+    expect(whole).not.toContain("403");
+    expect(whole).not.toContain("p42");
+  });
+
+  it("refuses a call changing nothing with ZERO requests issued", async () => {
+    const stub = updatingWriteStub();
+    await warmWrite(stub);
+
+    const outcome = await updateCalendarCall({ calendarId: CALENDAR_ID });
+
+    expect(outcome.refused).toBe(true);
+    // ZERO. The refusal happens before the KV read discovery performs and
+    // before anything reaches the wire.
+    expect(stub.observed.length, "a no-op change reached the network").toBe(0);
+  });
+
+  it("refuses a malformed colour with ZERO requests issued", async () => {
+    const stub = updatingWriteStub();
+    await warmWrite(stub);
+
+    const outcome = await updateCalendarCall({
+      calendarId: CALENDAR_ID,
+      color: "not-a-colour",
+    });
+
+    expect(outcome.refused).toBe(true);
+    expect(stub.observed.length, "a malformed colour reached the network").toBe(
+      0,
+    );
+  });
+
+  it("refuses an id this server did not mint, before any request", async () => {
+    const stub = updatingWriteStub();
+    await warmWrite(stub);
+
+    const parsed = schemaFor("calendar_update_calendar").safeParse({
+      // Structurally a token and not one of ours. `decodeCalendarId` refuses it
+      // without issuing anything, which is the cheapest possible refusal.
+      calendarId: "not-a-token",
+      displayName: "Job search 2026",
+    });
+    expect(parsed.success).toBe(true);
+    const result = await invokeRegistered(
+      "calendar_update_calendar",
+      parsed.data as Record<string, unknown>,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(stub.observed.length, "a forged id reached the network").toBe(0);
+  });
+
+  it("sends the colour to the wire as eight hex digits, the create's own pairing", async () => {
+    const stub = updatingWriteStub(
+      propertyUpdateAnswer(
+        "<d:propstat><d:prop><ca:calendar-color/></d:prop>" +
+          "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>",
+      ),
+    );
+    await warmWrite(stub);
+
+    const outcome = await updateCalendarCall({
+      calendarId: CALENDAR_ID,
+      color: "#1f77b4",
+    });
+    if (outcome.refused) throw new Error("the update was refused");
+
+    expect(String(stub.observed[0].body)).toContain(
+      "<ca:calendar-color>#1f77b4FF</ca:calendar-color>",
+    );
+    // A recolour with no rename carries no name element and reports on no name.
+    expect(String(stub.observed[0].body)).not.toContain("displayname");
+    expect(outcome.trusted.changed).toEqual(["color"]);
+    expect(outcome.untrusted).not.toHaveProperty("displayName");
+  });
+
+  it("keeps the caller's own name and colour INSIDE the fence", async () => {
+    const stub = updatingWriteStub();
+    await warmWrite(stub);
+
+    const parsed = schemaFor("calendar_update_calendar").safeParse({
+      calendarId: CALENDAR_ID,
+      displayName: HOSTILE_CALENDAR_NAME,
+      color: "#1f77b4",
+    });
+    expect(parsed.success).toBe(true);
+    const result = await invokeRegistered(
+      "calendar_update_calendar",
+      parsed.data as Record<string, unknown>,
+    );
+    const raw = blocks(result);
+
+    expect(raw.trusted).not.toContain(HOSTILE_CALENDAR_NAME);
+    expect(raw.untrusted).toContain(HOSTILE_CALENDAR_NAME);
+    expect(raw.trusted).not.toContain("#1f77b4");
+    // The verdict is this server's own reading and rides OUTSIDE the fence, on
+    // the same footing as `subscribed` and `timezoneUnresolved`.
+    expect(Object.keys(JSON.parse(raw.trusted)).sort()).toEqual([
+      "changed",
+      "id",
+      "unchanged",
+    ]);
   });
 });
