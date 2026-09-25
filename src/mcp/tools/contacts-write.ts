@@ -595,6 +595,23 @@ function firstProbeValue(entries: ContactListEntry[] | null): string | null {
  * confirmation binds the card this preview is describing. See its own docstring
  * for why that also gives a create the second replay defence the update kind
  * gets from `If-Match`.
+ *
+ * ## A change that names nothing is refused
+ *
+ * `buildContactUpdatePreview` carries the general reason: a confirmation for a
+ * no-op is a capability nobody should be holding. The create leg has a sharper
+ * one of its own. A no-op update writes a card identical to the one fetched, but
+ * a no-op CREATE writes a card whose entire content is a version and a uid — no
+ * `FN` and no `N`, both of which vCard 3.0 requires (RFC 2426 sections 3.1.1 and
+ * 3.1.2). Either iCloud accepts it, and the user has an unnamed empty card on
+ * the account and on every device; or iCloud refuses it, and the refusal lands
+ * after `reserveConfirmation` has spent the one-time slot, so the caller cannot
+ * retry the corrected request with the confirmation they were handed. The
+ * confirmation line would also name nothing — `displayNameForChange` answers
+ * the empty string for a change carrying no name at all, so the sentence the
+ * user must be shown before a write would read `Creating contact ''.`
+ *
+ * Refused ahead of the scan, so it costs no outbound request either.
  */
 async function buildContactCreatePreview(
   principal: Principal,
@@ -605,6 +622,18 @@ async function buildContactCreatePreview(
   const ref = planContactCreateTarget(addressBookId);
   const change = normalizeSuppliedContact(supplied);
   const fields = changedContactFields(change);
+
+  // BEFORE the scan, so a no-op create costs zero outbound requests as well as
+  // being refused. `buildContactUpdatePreview`'s own reason applies here — a
+  // confirmation for a no-op is a capability nobody should be holding — and it
+  // is SHARPER on this leg, because a create is the one that would go through:
+  // the card `buildContactCard` would write carries neither `FN` nor `N`, both
+  // mandatory in vCard 3.0, so iCloud either accepts an unnamed empty card onto
+  // the account and every device the user owns, or refuses it AFTER
+  // `reserveConfirmation` has already spent the one-time slot, leaving the
+  // caller unable to retry with the confirmation they hold.
+  if (fields.length === 0) throw new ConfirmationInvalidError();
+
   const id = encodeContactId(ref);
 
   const duplicateCandidates = await findDuplicateCandidates(

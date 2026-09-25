@@ -498,6 +498,67 @@ describe("the contacts_create preview", () => {
     expect(stub.observed).toHaveLength(0);
     expect(JSON.parse(result.content[0].text).category).toBe("not_found");
   });
+
+  it("refuses a change that names NOTHING, having sent nothing", async () => {
+    // The mirror of the update leg's refusal, and sharper on this one. The card
+    // a no-op create would write carries neither `FN` nor `N`, both mandatory in
+    // vCard 3.0 — so iCloud either accepts an unnamed empty card onto the
+    // account and every device, or refuses it AFTER the one-time confirmation
+    // slot has been spent. The confirmation line would name nothing either.
+    const stub = writeStub();
+    await warm(stub);
+
+    const result = await invoke("contacts_create", {
+      addressBookId: BOOK_ID,
+      change: { kind: "create" },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).category).toBe(
+      "confirmation_invalid",
+    );
+    // ZERO outbound requests. **This assertion does not pin WHERE the guard
+    // sits, and saying so is the point.** `findDuplicateCandidates` returns `[]`
+    // lexically ahead of `withRediscovery` when the probe carries neither an
+    // email address nor a number, and a change that names no field necessarily
+    // carries neither — so the cost is zero whether the refusal runs before the
+    // scan or after it. Measured both ways: moving the guard below the scan
+    // leaves this case green. The guard is placed ahead of the scan anyway,
+    // because relying on another function's early return for a cost claim is
+    // how the claim goes stale when that function grows a third probe.
+    expect(stub.observed).toHaveLength(0);
+  });
+
+  it("refuses a no-field create with no confirmation and no preview on it", async () => {
+    // Independent of the case above: that one says the request was refused,
+    // this one says WHAT came back is a refusal and not a preview. Nobody is
+    // handed a confirmation, and nobody is shown the `Creating contact ''.`
+    // sentence — which is what a user would otherwise have been asked to agree
+    // to, naming nothing.
+    //
+    // Also measured: this does not pin the guard above `mintConfirmation`
+    // either, because a throw after minting discards the token rather than
+    // returning it, and minting is an HMAC with no reservation behind it. What
+    // it does pin is the shipped contract WR-02 was about.
+    const stub = writeStub();
+    await warm(stub);
+
+    const result = await invoke("contacts_create", {
+      addressBookId: BOOK_ID,
+      change: { kind: "create" },
+    });
+
+    // One block, and it is the refusal rather than a preview. Asserted through
+    // the FIELDS a preview carries and not through the word "confirmation",
+    // which the refusal's own safe message legitimately contains.
+    expect(result.content).toHaveLength(1);
+    const body = JSON.parse(result.content[0].text) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("confirmToken");
+    expect(body).not.toHaveProperty("confirmationLine");
+    expect(body).not.toHaveProperty("id");
+    // And the sentence a user would have been asked to agree to never existed.
+    expect(result.content[0].text).not.toContain("Creating contact");
+  });
 });
 
 // ===========================================================================
