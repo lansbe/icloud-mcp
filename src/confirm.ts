@@ -1105,24 +1105,43 @@ const CONFIRMATION_CONSEQUENCES: Record<ConfirmKind, string> = {
 };
 
 /**
- * What a write tells people, said once, and said BESIDE a delete's own
- * consequence rather than instead of it.
+ * What a write tells people, said once, and said BESIDE the operation's own
+ * consequence wherever that consequence is itself an unrecoverability claim.
  *
  * This replaced the operation's consequence outright until a review caught what
- * that cost on the delete arm. The comparative it rested on — "it is the one
- * that cannot be walked back at all" — is true against a create and an update
- * and false against a delete, where the two are equally unwalkable. So
- * "Deleting event 'One-to-one', along with the 2 events in it, telling 2
- * people. An invitation cannot be unsent." dropped "This cannot be undone."
- * from the one sentence the user is asked to read, about two occurrences that
- * were about to go irrecoverably, and left the only consequence clause pointing
- * at the notification. A reader can fairly take that as "the notice is the
- * irreversible part".
+ * that cost on the delete arm, and a second review caught the same thing one
+ * arm over. The comparative it rested on — "it is the one that cannot be
+ * walked back at all" — is true against a create ALONE. It is false against a
+ * delete, where the two are equally unwalkable, and it is false against an
+ * update too, because `CONFIRMATION_CONSEQUENCES` a few lines up says an update
+ * costs "The values it held before cannot be recovered." — an unrecoverability
+ * claim in the same register as the delete's.
+ *
+ * **The first pass asserted here that the comparative held against an update.**
+ * That was wrong against this module's own table, and it is recorded as having
+ * been wrong rather than quietly rewritten, because the table it contradicted
+ * sits three lines above it and a reader who believed the comment would not
+ * have looked.
+ *
+ * What the override cost, on both arms. "Deleting event 'One-to-one', along
+ * with the 2 events in it, telling 2 people. An invitation cannot be unsent."
+ * dropped "This cannot be undone." from the one sentence the user is asked to
+ * read, about two occurrences that were about to go irrecoverably. And
+ * "Overwriting event 'Screen', changing 3 fields, telling 3 people. An
+ * invitation cannot be unsent." says nothing at all about the time, the
+ * location and the description that are about to become unreadable. Each left
+ * the only consequence clause pointing at the notification, and a reader can
+ * fairly take that as "the notice is the irreversible part".
  *
  * `occurrencesGoingWith`'s docstring in `src/mcp/tools/calendar.ts` states the
  * governing direction for this path: under-warning is the direction it must
- * never fail in. So the delete arm joins both clauses, and create and update
- * keep the override, where the comparative does hold.
+ * never fail in. So a delete and an update each join both clauses, and the
+ * override survives on the create arm alone. "Undoing it is a separate,
+ * explicit request." describes a state that CAN be walked back, so there the
+ * invitation genuinely is the less recoverable of the pair — and joining
+ * there would put two consequence clauses on an invited create, one of them
+ * saying the write can be undone. That is how the clause that matters stops
+ * being read.
  *
  * Tense-free, for `CONFIRMATION_VERBS`' reason, and that survives the join
  * because both clauses it joins are tense-free too.
@@ -1321,14 +1340,15 @@ export function composeConfirmationLine(
     clauses.push(`telling ${summary.recipientCount} ${word}`);
   }
 
-  // A delete gets BOTH clauses, not the notification one instead of its own.
-  // See `INVITATION_CONSEQUENCE`: the override is only defensible where the
-  // invitation is the less recoverable of the two, which a delete is not.
+  // A delete and an update each get BOTH clauses, not the notification one
+  // instead of their own. See `INVITATION_CONSEQUENCE`: the override is only
+  // defensible where the invitation is the less recoverable of the two, and
+  // that is the create arm alone.
   const consequence = !tells
     ? CONFIRMATION_CONSEQUENCES[summary.kind]
-    : summary.kind === "delete"
-      ? `${CONFIRMATION_CONSEQUENCES.delete} ${INVITATION_CONSEQUENCE}`
-      : INVITATION_CONSEQUENCE;
+    : summary.kind === "create"
+      ? INVITATION_CONSEQUENCE
+      : `${CONFIRMATION_CONSEQUENCES[summary.kind]} ${INVITATION_CONSEQUENCE}`;
 
   const head = [`${CONFIRMATION_VERBS[summary.kind][tense]} ${subject}`, ...clauses];
   return `${head.join(", ")}. ${consequence}`;

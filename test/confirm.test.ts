@@ -1707,7 +1707,7 @@ describe("the server composes the human-facing line", () => {
   });
 
   /**
-   * The two consequence clauses the override still replaces, spelled out here.
+   * The two non-delete consequence clauses, spelled out here.
    *
    * Duplicated from `src/confirm.ts` deliberately rather than imported: the
    * table there is not exported, and a test that read the value under test out
@@ -1753,29 +1753,66 @@ describe("the server composes the human-facing line", () => {
     );
   });
 
-  it("keeps the override on a create and an update, where the comparative holds", () => {
-    // The join is the DELETE arm's, and only the delete arm's. A create that
-    // tells people can be undone by a separate explicit request and an update's
-    // old values are gone but not irrecoverably notified, so on those two the
-    // invitation genuinely is the less walkable of the pair and replacing is
-    // right. A join everywhere would be two consequence clauses on every
-    // invited write, which is how a warning stops being read.
-    for (const kind of ["create", "update"] as const) {
-      const line = composeConfirmationLine(
-        {
-          kind,
-          noun: "event",
-          name: "Standup",
-          alsoRemoved: null,
-          fieldCount: null,
-          recipientCount: 1,
-        },
-        "would",
-      );
+  it("still says an update's old values are gone when it also tells people", () => {
+    // The delete's gap, one arm over, and reachable: `src/mcp/tools/calendar.ts`
+    // sets `recipientCount` on the update preview from the desired attendee
+    // list. The first pass joined the delete arm only, on a comparative this
+    // module's own table contradicts -- "The values it held before cannot be
+    // recovered." is an unrecoverability claim in the register of "This cannot
+    // be undone.", so the invitation is not the less walkable of the pair
+    // there either.
+    //
+    // What the user read before this: three fields moving on a standing
+    // interview, and not one word saying the previous time, location and
+    // description were gone and could not be read back.
+    const line = composeConfirmationLine(
+      {
+        kind: "update",
+        noun: "event",
+        name: "Screen \u2014 platform team",
+        alsoRemoved: null,
+        fieldCount: 3,
+        recipientCount: 3,
+      },
+      "would",
+    );
 
-      expect(line, kind).toContain("An invitation cannot be unsent.");
-      expect(line, kind).not.toContain(CONFIRMATION_CONSEQUENCES_TEXT[kind]);
-    }
+    expect(line).toBe(
+      "Overwriting event 'Screen \u2014 platform team', changing 3 fields, " +
+        "telling 3 people. The values it held before cannot be recovered. " +
+        "An invitation cannot be unsent.",
+    );
+    // Read as the two claims rather than as one string, as the delete case is:
+    // the update's own consequence is present, and it comes BEFORE the
+    // notification's, because the thing being destroyed is what the user is
+    // deciding about.
+    expect(line).toContain(CONFIRMATION_CONSEQUENCES_TEXT.update);
+    expect(line.indexOf(CONFIRMATION_CONSEQUENCES_TEXT.update)).toBeLessThan(
+      line.indexOf("An invitation cannot be unsent."),
+    );
+  });
+
+  it("keeps the override on a create alone, where the comparative holds", () => {
+    // `create` is the one arm where the comparative the override rests on is
+    // true. "Undoing it is a separate, explicit request." describes a state
+    // that CAN be walked back, so there the invitation really is the less
+    // recoverable of the pair. Joining here would put two consequence clauses
+    // on an invited create, one of them saying the write can be undone, which
+    // is how the clause that matters stops being read.
+    const line = composeConfirmationLine(
+      {
+        kind: "create",
+        noun: "event",
+        name: "Standup",
+        alsoRemoved: null,
+        fieldCount: null,
+        recipientCount: 1,
+      },
+      "would",
+    );
+
+    expect(line).toContain("An invitation cannot be unsent.");
+    expect(line).not.toContain(CONFIRMATION_CONSEQUENCES_TEXT.create);
   });
 
   it("agrees with itself about number, for one and for many", () => {
@@ -1805,10 +1842,10 @@ describe("the server composes the human-facing line", () => {
     );
 
     expect(one).toBe(
-      "Overwriting event 'Standup', along with the 1 event in it, changing 1 field, telling 1 person. An invitation cannot be unsent.",
+      "Overwriting event 'Standup', along with the 1 event in it, changing 1 field, telling 1 person. The values it held before cannot be recovered. An invitation cannot be unsent.",
     );
     expect(many).toBe(
-      "Overwriting event 'Standup', along with the 4 events in it, changing 2 fields, telling 3 people. An invitation cannot be unsent.",
+      "Overwriting event 'Standup', along with the 4 events in it, changing 2 fields, telling 3 people. The values it held before cannot be recovered. An invitation cannot be unsent.",
     );
   });
 
