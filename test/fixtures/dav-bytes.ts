@@ -1025,6 +1025,73 @@ export const NAMELESS_VCF = resource(
 );
 
 /**
+ * A card carrying the three things a LOSSY contact write silently drops.
+ *
+ * `parseVCard` reads EIGHT properties off a card — `uid`, `fn`, `n`, `org`,
+ * `adr`, `note`, `email`, `tel` — and discards the rest. A write path that
+ * rebuilt a card from what it read would therefore return a card missing
+ * everything below, and the user would never be told. That is what CONW-04 is
+ * a proof against, and this is the card the proof runs against.
+ *
+ * **Shortening this card retires coverage rather than tidying it.** Each of the
+ * three is here for a different reason, and dropping any one leaves a card that
+ * round-trips through a parser that threw most of it away:
+ *
+ *   1. **A base64 `PHOTO`, folded across continuation lines.** The multi-line
+ *      folded-value case, and the one a hand-rolled serialiser destroys. A photo
+ *      is not editable in this phase — it must SURVIVE an update untouched,
+ *      which is a harder guarantee than being writable.
+ *   2. **An `item1.EMAIL` paired with an `item1.X-ABLabel`.** Apple's custom
+ *      labels live in these group prefixes. This is the structure whole-list
+ *      replacement is most likely to corrupt, and `GROUPED_LABEL_VCF` is the
+ *      shape it copies.
+ *   3. **`X-PHONETIC-LAST-NAME`, deliberately a property this project's parser
+ *      does NOT model.** Its whole job is to be invisible to `parseVCard` and
+ *      survive a write anyway. Apple emits it; nothing here reads it.
+ *
+ * **The photo payload is hand-picked and screened, not generated.** Two of the
+ * fixture rules in `test/dav-fixtures.test.ts` bite standard base64 head-on: it
+ * refuses any run of nine or more consecutive digits, and it refuses a `+`
+ * followed by nine or more characters that could spell a telephone number — and
+ * `+` is in the base64 alphabet. So this payload contains no `+` at all and no
+ * digit run longer than two. It is base64-shaped and NOT a decodable image:
+ * decode it and it says so in words. Nothing in this project decodes a photo,
+ * and a real image's base64 would carry the very characters the rules refuse.
+ *
+ * The card also carries an `ORG`, a `NOTE`, an ungrouped `EMAIL` and a `TEL`, so
+ * a patch has ordinary surface to change while the three hazards sit beside it
+ * untouched.
+ */
+export const ROUND_TRIP_HAZARDS_VCF = resource(
+  "BEGIN:VCARD",
+  "VERSION:3.0",
+  "UID:33334444-5555-6666-7777-88889999abcd",
+  "FN:Noor Vasquez",
+  "N:Vasquez;Noor;;;",
+  "ORG:Example Bindery;Restoration",
+  // Hazard three: outside the eight properties `parseVCard` reads, and so
+  // invisible to every read path in this project. It is here to survive a write
+  // that cannot see it.
+  "X-PHONETIC-LAST-NAME:Vaskez",
+  // Hazard one: inline base64, folded across three continuation lines. Each
+  // continuation begins with a single space, exactly as `FULL_CONTACT_VCF`'s
+  // `NOTE` does.
+  "PHOTO;ENCODING=b;TYPE=JPEG:VGhpcyBpcyBub3QgYW4gaW1hZ2UuIEl0IGlzIGEgYmFzZTY0",
+  " IHNoYXBlZCBwYXlsb2FkLCBoYW5kIHBpY2tlZCBzbyB0aGF0IG5vIHBsdXMgY2hhcmFjdGVyIG",
+  " FuZCBubyBsb25nIGRpZ2l0IHJ1biByZWFjaGVzIHRoZSBmaXh0dXJlIHJ1bGVzLiBEZWNvZGUg",
+  " aXQgYW5kIHlvdSBnZXQgdGhpcyBzZW50ZW5jZS4=",
+  // Hazard two: the grouped label. The label belongs to the address above it by
+  // sharing its group prefix, and nothing else.
+  "item1.EMAIL;TYPE=INTERNET:noor@example.invalid",
+  "item1.X-ABLabel:Studio",
+  "EMAIL;TYPE=INTERNET;TYPE=HOME:noor.vasquez@example.invalid",
+  "TEL;TYPE=CELL;TYPE=VOICE:+1-555-0188",
+  "NOTE:Restores ledgers and asks for a fortnight of notice.",
+  "REV:20260106T000000Z",
+  "END:VCARD",
+);
+
+/**
  * Bytes that are not a contact resource at all.
  *
  * The vCard half of `MALFORMED_ICS`, and it exists for the same reason: a
