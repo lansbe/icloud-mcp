@@ -32,7 +32,13 @@
 //
 // This module contains no logging calls of any kind and must never acquire any.
 
-import { addressBookMultiGet, addressBookQuery, fetchAddressBooks, propfind } from "tsdav";
+import {
+  addressBookMultiGet,
+  addressBookQuery,
+  createVCard,
+  fetchAddressBooks,
+  propfind,
+} from "tsdav";
 import type { DAVResponse } from "tsdav";
 import type { Env } from "../env";
 import { assertUnderHome, davAccountFor, withRediscovery } from "./discovery";
@@ -41,6 +47,7 @@ import { DavNotFoundError } from "./errors";
 import {
   clampPageSize,
   compareContactOrder,
+  decodeAddressBookId,
   decodeContactsCursor,
   displayNameKeyOf,
   encodeAddressBookId,
@@ -958,5 +965,228 @@ export async function getContact(
       },
       resolved.cacheHit,
     );
+  });
+}
+
+// ---------------------------------------------------------------- the write half
+//
+// One entry point, and it is a create (CONW-01). Everything above this line
+// reads; everything below it writes exactly one card per request, and the
+// `dav-concurrent-request` scan rule names both new exports so a combinator
+// around either fails the commit rather than the review.
+
+/** The resource name a UID takes inside an address book, percent-encoded. */
+function contactObjectNameFor(uid: string): string {
+  return `${encodeURIComponent(uid)}.vcf`;
+}
+
+/**
+ * Where a create WOULD write, decided before anything is sent (CONW-01).
+ *
+ * `planCreateTarget`'s twin one module over, and it inherits that function's
+ * whole argument: the confirmation binds the resource the preview described, so
+ * `ConfirmPayload.o` has to be an OBJECT url rather than a collection url, which
+ * means the uid has to exist before the preview answers. The commit derives it
+ * back out of the signed url rather than minting a second one.
+ *
+ * That buys the same second, independent replay defence for free. A commit
+ * replayed after the KV reservation has propagated away still carries the
+ * ORIGINAL object url, so its `PUT` meets `If-None-Match: *` against a resource
+ * that now exists and is refused by the server.
+ *
+ * **It takes an OPAQUE address book id and never a url**, which is
+ * `planCreateTarget`'s own stated reason and is the one line here worth reading
+ * twice: a collection url taken straight from a caller is a request target, and
+ * `./transport.ts` attaches the Apple ID and the app-specific password to
+ * whatever url it is handed. The kind letter inside the token is what stops a
+ * calendar id resolving here into a plausible-looking address book reference.
+ *
+ * **It reaches no network and asserts no containment**, and both are correct:
+ * nothing is requested, so there is nothing to contain. `createContact` runs the
+ * containment on both urls at the moment the write actually happens, which is
+ * the only moment at which `resolved.homeUrl` exists.
+ *
+ * A plain `export function` declaration rather than a `const` arrow, and that is
+ * not a style choice: `exportedFunctionNames` in
+ * `scripts/forbidden-tokens.mjs` sees only `function` declarations, so an arrow
+ * export in this module would be INVISIBLE to the DAV write manifest — an
+ * unguarded export that looks exactly like a guarded one.
+ */
+export function planContactCreateTarget(addressBookId: string): ContactRef {
+  const book = decodeAddressBookId(addressBookId);
+  const uid = `${crypto.randomUUID()}@icloud-mcp`;
+
+  return {
+    addressBookUrl: book.collectionUrl,
+    objectUrl: new URL(contactObjectNameFor(uid), book.collectionUrl).href,
+  };
+}
+
+/**
+ * The UID a card's own url names, or null when the url does not name one.
+ *
+ * `uidFromObjectUrl`'s twin one module over, and it exists here rather than in
+ * the tool layer for one reason: the convention it reverses is
+ * `contactObjectNameFor`'s, five lines up. A copy in the tool layer would be the
+ * naming rule living in two modules, which is the drift `src/tokens.ts` names as
+ * the failure in its own header.
+ *
+ * **The commit leg has one outbound request and it is the write, so it never
+ * sees the resource's bytes.** The UID it must write therefore has to come from
+ * the only thing it holds: the object url inside the signed confirmation.
+ * Reading it back out rather than minting a second one is what makes "the card
+ * that was previewed is the card that is created" true rather than merely
+ * likely.
+ *
+ * The decode is what makes it work on a real account rather than only on a tidy
+ * fixture: every uid this server mints carries an `@`, so the href naming it is
+ * percent-encoded.
+ *
+ * It issues no request and asserts no containment, so it carries a written
+ * disposition in the DAV write manifest rather than the `"guarded"` string.
+ */
+export function contactUidFromObjectUrl(objectUrl: string): string | null {
+  let path: string;
+  try {
+    path = new URL(objectUrl).pathname;
+  } catch {
+    // Nothing is read from the caught value — the url may be attacker-chosen.
+    return null;
+  }
+
+  const last = path.slice(path.lastIndexOf("/") + 1);
+  if (!last.toLowerCase().endsWith(".vcf")) return null;
+
+  try {
+    return decodeURIComponent(last.slice(0, -".vcf".length));
+  } catch {
+    // A stray `%` is not a uid. Nothing is read from the caught value.
+    return null;
+  }
+}
+
+/**
+ * What one contact create supplies, once the confirmation has been verified.
+ *
+ * The card BODY arrives already serialised, from `./vcard.ts`. This module owns
+ * shape and cost and does not own meaning, which is the separation its header
+ * states — so it never touches a vCard byte, here or anywhere else.
+ */
+export interface CreateContactInput {
+  /** The target this create's own preview planned and signed. */
+  ref: ContactRef;
+  /** The card, serialised by `buildContactCard`. */
+  vcfBody: string;
+}
+
+/** What a create answers with: the opaque ids the card is now addressable by. */
+export interface CreatedContact {
+  /** The opaque contact id, minted through the existing encoder. */
+  id: string;
+  /** The opaque address book id the card now lives in. */
+  addressBookId: string;
+  /** True when the write was accepted. */
+  created: boolean;
+}
+
+/**
+ * Assert both urls are under the resolved CardDAV home set, then write.
+ *
+ * `withContainedTarget`'s twin one module over, and a LOCAL helper rather than a
+ * reuse of that one: it is typed on `EventRef` and resolves `"caldav"`. The
+ * substitution is what matters here — **`resolved.homeUrl` is a DIFFERENT value
+ * for CardDAV**, and reusing the calendar helper would assert a contact's urls
+ * against the calendar home set, which is 03-REVIEW.md CR-01's bug exactly.
+ *
+ * The assert-then-delegate shape is held in one function so the two assertions
+ * cannot drift apart from the write they protect, and both `assertUnderHome`
+ * calls are lexically ahead of the delegation for the same reason
+ * `test/dav-home-containment.test.ts` reads the calendar helper by name.
+ *
+ * Inside the callback rather than above it, because `resolved.homeUrl` does not
+ * exist until discovery has run.
+ *
+ * **The final `false` is "no retry", and it is not a parameter.** No caller can
+ * re-open the question. `withRediscovery` re-runs its operation once on a
+ * rediscoverable failure when the account came from cache, and for a write that
+ * means the request goes out TWICE: the second `PUT` meets `If-None-Match: *`
+ * against the resource the first one created and is refused, so a create that
+ * SUCCEEDED would be reported as a failure. The preview leg immediately before
+ * resolved the same account successfully, so a genuinely-moved host is not the
+ * likely cause of a failure here.
+ */
+async function withContainedContactTarget<T>(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  ref: ContactRef,
+  write: (resolved: ResolvedDavAccount) => Promise<T>,
+): Promise<T> {
+  return withRediscovery(
+    env,
+    principal,
+    davFetch,
+    "carddav",
+    async (resolved) => {
+      assertUnderHome(ref.addressBookUrl, resolved.homeUrl);
+      assertUnderHome(ref.objectUrl, resolved.homeUrl);
+      return write(resolved);
+    },
+    false,
+  );
+}
+
+/**
+ * Write one new card into one address book (CONW-01).
+ *
+ * `createEvent`'s twin, and deliberately a narrower one. That function decodes an
+ * id, checks a zone, builds a resource and mints a uid; this one does none of
+ * those, because the gated path already did all of it at preview time and signed
+ * the result. What arrives here is a target the confirmation named and a body
+ * somebody approved, so the only work left is containment and the request.
+ *
+ * ONE outbound request, and no read before it: a create has nothing to read.
+ * That is also why this is the only write path in the project where the write
+ * count and the request count agree.
+ *
+ * Never a credential from here. `./transport.ts` attaches it per call and is the
+ * only place that may. The library supplies the content type and the
+ * `If-None-Match: *` that makes this write conditional — which is the create's
+ * whole optimistic-concurrency story, `If-Match`'s mirror image: it asserts the
+ * resource does NOT exist rather than that it is unchanged.
+ *
+ * A plain `export function` declaration, for `planContactCreateTarget`'s stated
+ * reason about the write manifest.
+ */
+export async function createContact(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  input: CreateContactInput,
+): Promise<CreatedContact> {
+  const ref = input.ref;
+  // Computed here rather than taken as an argument, so the name the library
+  // resolves against the collection is byte-identical to the one the object url
+  // inside the signed confirmation already carries.
+  const filename = new URL(ref.objectUrl).pathname.split("/").pop() ?? "";
+
+  return withContainedContactTarget(env, principal, davFetch, ref, async () => {
+    await createVCard({
+      addressBook: { url: ref.addressBookUrl },
+      filename,
+      vCardString: input.vcfBody,
+      // Never a credential from here. See the docstring.
+      headers: {},
+      fetch: davFetch,
+    });
+
+    return {
+      id: encodeContactId({
+        addressBookUrl: ref.addressBookUrl,
+        objectUrl: ref.objectUrl,
+      }),
+      addressBookId: encodeAddressBookId({ collectionUrl: ref.addressBookUrl }),
+      created: true,
+    };
   });
 }

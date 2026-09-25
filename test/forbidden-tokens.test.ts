@@ -215,6 +215,33 @@ const DAV_FAN_OUT_SERVICE = [
   // `getEventWithEtag` exception list stays at one.
   "runCollectionWriteProbe",
   "runTaskCollectionProbe",
+  // Phase 16 (CONW-01). `createContact` is the CardDAV service write: one card
+  // per request, conditional on `If-None-Match`, and irreversible in the sense
+  // the rule's WRITE paragraph means — "add all of these people" is one
+  // sentence, and a half-completed fan-out over it leaves an address book
+  // holding some of a list nobody can name.
+  //
+  // `buildContactCreatePreview` and `applyContactCommit` are the composites, on
+  // the same terms as phase 5's eight: each ends in one or more of the names
+  // above, so each was covered only BY ACCIDENT, and a body is a refactor away
+  // from not doing that.
+  //
+  // No entry here is a prefix or a substring of any of the three, and none of
+  // the three contains any existing entry: `getContact` is not contiguous inside
+  // `createContact`, `applyCommit` is not contiguous inside
+  // `applyContactCommit`, and neither `buildPreview` nor `buildCreatePreview` is
+  // contiguous inside `buildContactCreatePreview`. So all three per-name loops
+  // below can genuinely fail, and the `getEventWithEtag` exception list stays at
+  // one — which the exception case itself proves rather than takes on trust.
+  //
+  // `planContactCreateTarget` and `contactUidFromObjectUrl` are deliberately NOT
+  // here, on the precedent `planCreateTarget` set at WINDOWS entry 60: both are
+  // synchronous, issue no request, and this rule's subject is round trips
+  // against one account, so listing a pure function would misstate what it bans.
+  // Both carry a WRITTEN disposition in the DAV write manifest instead.
+  "createContact",
+  "buildContactCreatePreview",
+  "applyContactCommit",
 ];
 
 /** The request primitive and the tsdav standalone helpers: what a "just do them
@@ -260,6 +287,12 @@ const DAV_FAN_OUT_LIBRARY = [
   "makeCalendar",
   "davRequest",
   "deleteObject",
+  // Phase 16's one. tsdav ships `createVCard` as the CardDAV object-creation
+  // helper — verified against the installed package's own exported surface
+  // rather than taken from prose — and it is the primitive `createContact` ends
+  // in. It is not a prefix or a substring of any entry above it and none is a
+  // substring of it, so its per-name loop can genuinely fail.
+  "createVCard",
 ];
 
 /** The names actually present in the shipped rule's final alternation group.
@@ -773,8 +806,8 @@ describe("the patterns have teeth", () => {
     const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
     expect(
       DAV_FAN_OUT_SERVICE.length,
-      "eleven read entry points, phase 5's four writes, the organiser resolution WINDOWS 60 filed, the eight composite tool-layer entry points 05-REVIEW.md WR-04 filed plus 05-14's scopelessBody, phase 6's findFreeSlots orchestrator and its looped collectFrom, and phase 14's two dav_diagnose probes — runCollectionWriteProbe, whose fan-out would leave half-finished collections on a real account and race its own cleanup check, and runTaskCollectionProbe, a loop over collections issuing one calendar-query apiece",
-    ).toBe(28);
+      "eleven read entry points, phase 5's four writes, the organiser resolution WINDOWS 60 filed, the eight composite tool-layer entry points 05-REVIEW.md WR-04 filed plus 05-14's scopelessBody, phase 6's findFreeSlots orchestrator and its looped collectFrom, phase 14's two dav_diagnose probes — runCollectionWriteProbe, whose fan-out would leave half-finished collections on a real account and race its own cleanup check, and runTaskCollectionProbe, a loop over collections issuing one calendar-query apiece — and phase 16's three: the CardDAV write createContact, plus the two composites buildContactCreatePreview and applyContactCommit, which end in it and were therefore covered only by accident. planContactCreateTarget and contactUidFromObjectUrl are NOT among them: both are synchronous and issue no request, so they carry a written manifest disposition instead",
+    ).toBe(31);
     for (const entryPoint of DAV_FAN_OUT_SERVICE) {
       const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
       expect(
@@ -793,8 +826,8 @@ describe("the patterns have teeth", () => {
     const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
     expect(
       DAV_FAN_OUT_LIBRARY.length,
-      "the request primitive and the tsdav helpers, plus phase 5's three writes and phase 14's three — makeCalendar, davRequest and deleteObject, the collection create, the hand-assembled property update and the collection removal the SPIKE-04 probe needs. calendarQuery, which phase 14's to-do probe also calls, is NOT among them: it has been on this list since the event listing and must appear exactly once",
-    ).toBe(18);
+      "the request primitive and the tsdav helpers, plus phase 5's three writes and phase 14's three — makeCalendar, davRequest and deleteObject, the collection create, the hand-assembled property update and the collection removal the SPIKE-04 probe needs — and phase 16's one, createVCard, the CardDAV object create the contact write ends in. calendarQuery, which phase 14's to-do probe also calls, is NOT among them: it has been on this list since the event listing and must appear exactly once",
+    ).toBe(19);
     for (const entryPoint of DAV_FAN_OUT_LIBRARY) {
       const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
       expect(
@@ -3210,15 +3243,24 @@ describe("the DAV write modules are a manifested constraint", () => {
   });
 
   it("reports the unmanifested arm, naming the module and the name, when a module gains an export", () => {
-    // The realistic case and the whole reason this exists: phase 16 adds contact
-    // create to the contacts module, and nothing about writing that function
-    // makes anybody think about the fan-out alternation.
+    // The realistic case and the whole reason this exists: a phase adds a write
+    // to the contacts module, and nothing about writing that function makes
+    // anybody think about the fan-out alternation.
+    //
+    // **This case named `createContact` until phase 16 shipped it**, which is
+    // the constraint working rather than the case going stale: the name stopped
+    // being a hypothetical unmanifested export the moment it acquired a real
+    // disposition, and the arm it drives has to be driven by a name that is
+    // genuinely absent from the manifest. `deleteContact` is the honest
+    // replacement — contact delete is named OUT of scope by the roadmap, so
+    // nothing is going to manifest it by accident, and it is also the next
+    // contact write anybody will reach for.
     const collected = shipped();
-    collected[CONTACTS_MODULE] = [...collected[CONTACTS_MODULE]!, "createContact"];
+    collected[CONTACTS_MODULE] = [...collected[CONTACTS_MODULE]!, "deleteContact"];
     const violations = checkDavWriteCoverage(collected);
     expect(violations.map((v) => v.pattern)).toEqual(["dav-write-export-unmanifested"]);
     expect(violations[0]!.file).toBe(CONTACTS_MODULE);
-    expect(violations[0]!.why).toContain("createContact");
+    expect(violations[0]!.why).toContain("deleteContact");
   });
 
   it("reports the stale arm, naming the module and the name, when a manifest name is no longer exported", () => {

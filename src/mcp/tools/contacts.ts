@@ -34,6 +34,7 @@ import { decodeContactId } from "../../dav/ids";
 import type { DavFetch } from "../../dav/transport";
 import type { ToolResult } from "../untrusted";
 import { untrustedToolResult } from "../untrusted";
+import { registerContactsWriteTools } from "./contacts-write";
 import { davErrorResult } from "./dav-diagnose";
 import type { Principal } from "../../principal";
 
@@ -240,7 +241,8 @@ export function contactToolResult(detail: ContactDetail): ToolResult {
  * and `test/dav-tools.test.ts` is what asserts it for the tools below. Its
  * helper now calls all three DAV registrars, so after this module the ceiling
  * loop covers the phase's entire tool surface — one diagnostic, four calendar
- * tools and two contacts tools.
+ * tools and four contacts tools, the last two of which arrive through the
+ * delegation at the foot of this function.
  *
  * The rule for where a fact lives is the one `./mail.ts` records and
  * `./calendar.ts` follows: a RELATION between two parameters goes in the
@@ -327,4 +329,14 @@ export function registerContactsTools(
       }
     },
   );
+
+  // The write tools, delegated rather than registered as a FOURTH registrar in
+  // `src/mcp/server.ts`. The reason is mechanical: the per-tool description
+  // ceiling in `test/dav-tools.test.ts` reaches this surface through
+  // `registerContactsTools` and through nothing else, so a registration added
+  // behind this line is measured by that loop automatically — while one added to
+  // a new registrar would be covered only if somebody remembered to extend the
+  // harness. The same `davFetch` and the same principal promise, so the write
+  // tools share this request's own queue rather than opening a second one.
+  registerContactsWriteTools(server, davFetch, principal);
 }
