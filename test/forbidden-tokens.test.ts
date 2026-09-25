@@ -333,6 +333,32 @@ const DAV_FAN_OUT_SERVICE = [
   // its per-name loop below can genuinely fail and the recorded prefix-shadow
   // exception list stays at two.
   "createCalendarCollection",
+  // CALM-05's rename and recolour, and the FIRST entry on this list whose
+  // request target is genuinely caller-supplied: the collection URL arrives
+  // inside an opaque id rather than being built from the account's own resolved
+  // home set. That changes nothing about why a fan-out is banned here — every
+  // one of these is still a socket against the same account — but it is why the
+  // home-containment gate drives a real hostile case against this one where the
+  // create beside it is exempt.
+  //
+  // The temptation is the same sentence and slightly worse: "recolour all of
+  // these" means N property updates, and a half-completed fan-out leaves an
+  // account where some calendars were renamed, some recoloured and some
+  // neither, with no answer that can say which.
+  //
+  // `propstatOutcomes` is NOT among them, on `calendarColorForWire`'s
+  // precedent: it is a pure reader over a multi-status the caller already holds
+  // and issues no request, so it carries a WRITTEN disposition in the DAV write
+  // manifest instead.
+  //
+  // Prefix-shadow check RUN against all 56 shipped alternation names rather
+  // than eyeballed: it neither contains nor is contained by any of them.
+  // `updateCalendarObject` is the near miss and is not contiguous inside it —
+  // this name spells `CalendarCollection` — and `updateEvent`,
+  // `updateContact` and `updateVCard` share only `update`. So its per-name loop
+  // below can genuinely fail and the recorded prefix-shadow exception list
+  // stays at two.
+  "updateCalendarCollection",
 ];
 
 /** The request primitive and the tsdav standalone helpers: what a "just do them
@@ -919,8 +945,8 @@ describe("the patterns have teeth", () => {
     const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
     expect(
       DAV_FAN_OUT_SERVICE.length,
-      "eleven read entry points, phase 5's four writes, the organiser resolution WINDOWS 60 filed, the eight composite tool-layer entry points 05-REVIEW.md WR-04 filed plus 05-14's scopelessBody, phase 6's findFreeSlots orchestrator and its looped collectFrom, phase 14's two dav_diagnose probes — runCollectionWriteProbe, whose fan-out would leave half-finished collections on a real account and race its own cleanup check, and runTaskCollectionProbe, a loop over collections issuing one calendar-query apiece — and phase 16's three: the CardDAV write createContact, plus the two composites buildContactCreatePreview and applyContactCommit, which end in it and were therefore covered only by accident. planContactCreateTarget and contactUidFromObjectUrl are NOT among them: both are synchronous and issue no request, so they carry a written manifest disposition instead. CONW-05 adds a fourth from phase 16, findDuplicateCandidates — the duplicate scan, and the case this rule's own text describes most directly: two probes over one address book is exactly the loop a combinator gets wrapped around, and the concurrent version returns the same candidates, so nothing about the answer reveals it. duplicateFilter is NOT among them either, on planContactCreateTarget's precedent: it assembles a report body and issues no request. CONW-02 and CONW-06 add the two halves of a conditional update — getContactWithEtag, the read that brings back the version stamp out of the same multi-status the plain read already issued, and updateContact, the overwrite that is conditional on it. Their read and their write are two SERIAL awaits and never a pair to be raced: racing them asks the server about a version nobody has read yet. CONW-02 adds one more composite, buildContactUpdatePreview, and it is the strongest instance of the COMPOSITE paragraph above: it ends in TWO guarded names rather than one, the read-with-a-version and the duplicate scan, so it would be covered only by accident through whichever of the two a later body still happened to call. Its two awaits are serial on purpose and the order is load-bearing, because the card is read first so the scan can be told which card to leave out of its own answer. Phase 17 (CALM-04) adds createCalendarCollection, the collection create and the first entry whose subject is a calendar rather than something inside one: once a calendar can be made, renamed or removed by name, 'tidy up my calendars' is one sentence that means N of them, and a half-completed fan-out over collections leaves whole calendars nobody chose. calendarColorForWire is NOT among them, on planCreateTarget's precedent: it is a synchronous string transformation over an already-validated colour and issues no request, so it carries a written manifest disposition instead",
-    ).toBe(36);
+      "eleven read entry points, phase 5's four writes, the organiser resolution WINDOWS 60 filed, the eight composite tool-layer entry points 05-REVIEW.md WR-04 filed plus 05-14's scopelessBody, phase 6's findFreeSlots orchestrator and its looped collectFrom, phase 14's two dav_diagnose probes — runCollectionWriteProbe, whose fan-out would leave half-finished collections on a real account and race its own cleanup check, and runTaskCollectionProbe, a loop over collections issuing one calendar-query apiece — and phase 16's three: the CardDAV write createContact, plus the two composites buildContactCreatePreview and applyContactCommit, which end in it and were therefore covered only by accident. planContactCreateTarget and contactUidFromObjectUrl are NOT among them: both are synchronous and issue no request, so they carry a written manifest disposition instead. CONW-05 adds a fourth from phase 16, findDuplicateCandidates — the duplicate scan, and the case this rule's own text describes most directly: two probes over one address book is exactly the loop a combinator gets wrapped around, and the concurrent version returns the same candidates, so nothing about the answer reveals it. duplicateFilter is NOT among them either, on planContactCreateTarget's precedent: it assembles a report body and issues no request. CONW-02 and CONW-06 add the two halves of a conditional update — getContactWithEtag, the read that brings back the version stamp out of the same multi-status the plain read already issued, and updateContact, the overwrite that is conditional on it. Their read and their write are two SERIAL awaits and never a pair to be raced: racing them asks the server about a version nobody has read yet. CONW-02 adds one more composite, buildContactUpdatePreview, and it is the strongest instance of the COMPOSITE paragraph above: it ends in TWO guarded names rather than one, the read-with-a-version and the duplicate scan, so it would be covered only by accident through whichever of the two a later body still happened to call. Its two awaits are serial on purpose and the order is load-bearing, because the card is read first so the scan can be told which card to leave out of its own answer. Phase 17 (CALM-04) adds createCalendarCollection, the collection create and the first entry whose subject is a calendar rather than something inside one: once a calendar can be made, renamed or removed by name, 'tidy up my calendars' is one sentence that means N of them, and a half-completed fan-out over collections leaves whole calendars nobody chose. calendarColorForWire is NOT among them, on planCreateTarget's precedent: it is a synchronous string transformation over an already-validated colour and issues no request, so it carries a written manifest disposition instead. Phase 17 (CALM-05) adds updateCalendarCollection, the rename and recolour, and the first entry on this list whose request target is genuinely CALLER-SUPPLIED rather than built from the account's own resolved home set -- which is why the home-containment gate drives a real hostile case against it where the create beside it is exempt. propstatOutcomes is NOT among them, on calendarColorForWire's own precedent: it is a pure reader over a multi-status the caller already holds and issues no request, so it carries a written manifest disposition instead",
+    ).toBe(37);
     for (const entryPoint of DAV_FAN_OUT_SERVICE) {
       const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
       expect(

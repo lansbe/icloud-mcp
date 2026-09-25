@@ -148,6 +148,7 @@ import {
   createCalendarCollection,
   createEvent,
   deleteEvent,
+  updateCalendarCollection,
   updateEvent,
 } from "../src/dav/calendar";
 import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
@@ -527,6 +528,30 @@ export const HOME_CHECKED_CALL_SITES: readonly CheckedSite[] = Object.freeze([
     guards: "updateVCard",
     via: "withContainedContactTarget",
   },
+  // CALM-05's rename and recolour — **the first entry on this list with ONE
+  // url rather than two, and the first collection write in this project whose
+  // target is genuinely caller-supplied.**
+  //
+  // The create beside it in the same module is EXEMPT, and the difference is
+  // the whole reason this one is here: `CreateCalendarInput` carries a name and
+  // a colour and no url at all, so there is nothing a forged token could aim.
+  // `UpdateCalendarInput` carries a collection URL that arrives inside an
+  // opaque id the model may have read out of an event description a stranger
+  // wrote, and `src/dav/transport.ts` attaches the Apple ID and the
+  // app-specific password to whatever URL it is handed. So the exemption's own
+  // closing sentence — "the rename and delete that follow in plans 17-04 and
+  // 17-06 belong on the checked list instead" — is discharged here.
+  //
+  // ONE url is not a gap in the pairing claim above; it is the shape of the
+  // request. A property update addresses a collection, and a collection has no
+  // object hanging off it the way an event ref does. That is why the expected
+  // count is now derived from the source rather than fixed at two.
+  {
+    file: CALENDAR,
+    fn: "updateCalendarCollection",
+    field: "collectionUrl",
+    guards: "davRequest",
+  },
 ]);
 
 /** One request site that needs no containment assertion, and why. */
@@ -777,6 +802,30 @@ function enumerateRequestSites(file: string, source: string): FoundSite[] {
  * prose beside it — the guarded call sites carry comments that discuss the very
  * request they precede.
  */
+/**
+ * Every url one body actually asserts containment on, sorted and de-duplicated.
+ *
+ * Read off the FIRST ARGUMENT of each `assertUnderHome(` call, which is the
+ * same text the declared `field` carries, so the two can be compared directly.
+ * The text is already comment-stripped by `bodyOf`, so a comment mentioning the
+ * assertion cannot inflate the answer.
+ *
+ * `[^,)]` rather than `[^,]` so a call written across two lines — or one whose
+ * argument is itself a call — fails loudly here instead of silently swallowing
+ * the rest of the body. No such shape exists today and none should: the
+ * argument at every site is a plain reference, because a computed one would
+ * mean the value checked and the value sent could differ.
+ */
+function assertedFieldsIn(body: string): string[] {
+  return [
+    ...new Set(
+      [...body.matchAll(/assertUnderHome\(\s*([^,)]+?)\s*,/g)].map(
+        (match) => match[1],
+      ),
+    ),
+  ].sort();
+}
+
 function bodyOf(file: string, fn: string): string {
   const lines = withoutWholeLineComments(SOURCES[file]);
   const start = lines.findIndex((line) => {
@@ -875,21 +924,62 @@ describe("every DAV request site is either home-checked or exempt with a reason"
     // at the wrong thing. What was actually being asserted is the PAIRING —
     // every protected function names both of its urls — and that claim has no
     // expiry date.
+    //
+    // **CALM-05 made the literal `2` below the same kind of stale number, and
+    // it is replaced by a DERIVATION rather than relaxed.** `updateCalendarCollection`
+    // is the first protected function in this project whose request has ONE
+    // url: it addresses a collection, and a collection has no object hanging
+    // off it the way an event ref does. Relaxing `toBe(2)` to "at least one"
+    // was refused outright — that is the exact widening 17-03's summary says
+    // would let a future pair-shaped writer declare one of its two and pass.
+    //
+    // So the expected count is read off the SOURCE instead: it is however many
+    // urls the holder actually asserts containment on. That is strictly
+    // stronger than the constant for every site the constant covered, because
+    // it also catches a three-url writer declaring two, and it is not
+    // self-certifying — the number comes from the code rather than from the
+    // entry.
+    //
+    // The pair claim itself is kept ALONGSIDE it, keyed on the `ref.`
+    // vocabulary, because a derivation cannot see a check that was deleted
+    // together with its declaration. A url read out of a decoded reference is
+    // by definition one half of a pair, which is what the original message
+    // below says, so a function declaring any `ref.` field must still declare
+    // both of them.
     expect(
       HOME_CHECKED_CALL_SITES.length,
       "the checked list is empty, so every assertion built on it passes over nothing",
     ).toBeGreaterThan(0);
 
-    const perFunction = new Map<string, number>();
+    const perFunction = new Map<string, CheckedSite[]>();
     for (const site of HOME_CHECKED_CALL_SITES) {
       const key = `${site.file} › ${site.fn}`;
-      perFunction.set(key, (perFunction.get(key) ?? 0) + 1);
+      perFunction.set(key, [...(perFunction.get(key) ?? []), site]);
     }
-    for (const [key, count] of perFunction) {
+    for (const [key, sites] of perFunction) {
+      const declared = [...new Set(sites.map((site) => site.field))].sort();
       expect(
-        count,
-        `${key} declares ${count} checked url(s) rather than both. The object URL travels separately from the collection URL and each independently names what the server is asked for.`,
-      ).toBe(2);
+        declared.length,
+        `${key} declares the same url twice. Two entries naming one field is one check wearing two hats.`,
+      ).toBe(sites.length);
+
+      // Every url the holder really guards, read off the code. A site declaring
+      // `via` is credited with the HELPER's assertions, which is where its
+      // containment actually lives.
+      const asserted = assertedFieldsIn(
+        bodyOf(sites[0].file, sites[0].via ?? sites[0].fn),
+      );
+      expect(
+        declared,
+        `${key} declares ${declared.length} checked url(s) and its body asserts containment on ${asserted.length}. Every url this function hands to the network must be declared here, and a declaration with no assertion behind it is a claim about a check that does not run.`,
+      ).toEqual(asserted);
+
+      if (declared.some((field) => field.startsWith("ref."))) {
+        expect(
+          declared.length,
+          `${key} declares ${declared.length} checked url(s) rather than both. The object URL travels separately from the collection URL and each independently names what the server is asked for.`,
+        ).toBe(2);
+      }
     }
     expect(
       HOME_EXEMPT_REQUEST_SITES.length,
@@ -1375,6 +1465,73 @@ describe("a forged reference is refused before the credential leaves", () => {
         `${key} aimed the create at ${live.observed[0]} — the credential went to a host this account does not own`,
       ).toBe(true);
     }
+  });
+
+  it("refuses a forged collection on the RENAME, wrong-origin and same-origin alike", async () => {
+    // **The hostile case the create beside it cannot have, written properly
+    // rather than exempted.** `createCalendarCollection`'s input carries no URL
+    // at all, so a refusal case against it would be an assertion that cannot
+    // fail — which is what that site's exemption reason records. This one's
+    // collection URL comes out of a caller-supplied opaque id, so a forged or
+    // cross-account token is a real input and this case can genuinely go red.
+    for (const [label, collection] of [
+      ["wrong origin", FOREIGN_COLLECTION],
+      ["same-origin sibling path", SIBLING_COLLECTION],
+    ] as const) {
+      live.observed.length = 0;
+      const err = await refusal(() =>
+        updateCalendarCollection(env, principal, createDavFetch(owner), {
+          collectionUrl: collection,
+          displayName: "Job search 2026",
+        }),
+      );
+
+      expect(err, `rename / ${label} was not refused`).toBeInstanceOf(
+        DavNotFoundError,
+      );
+      // **`rediscoverable` is FALSE, and the refusal is deliberately
+      // INDISTINGUISHABLE from a genuine miss.** A distinguishable one would
+      // hand this endpoint to the same forged id it exists to refuse as a
+      // collection-existence oracle: ask about a URL, read which refusal came
+      // back, learn whether the collection is there. A later reader improving
+      // the message into something more helpful is exactly how that oracle
+      // gets built, so it is written down here rather than left to be inferred.
+      // `false` is also what stops a forged id spending one of D-60's two
+      // permitted retries on a real PROPFIND against iCloud.
+      expect(
+        (err as DavNotFoundError).rediscoverable,
+        `rename / ${label} was refused as rediscoverable, which spends a real PROPFIND on a forged id`,
+      ).toBe(false);
+      // ZERO. One request is one credential delivered to the forged origin.
+      expect(
+        live.observed.length,
+        `rename / ${label} reached the network, so the credential went to the forged target`,
+      ).toBe(0);
+    }
+  });
+
+  it("negative control: the rename DOES reach the wire with a legitimate target", async () => {
+    // Without this the zero-count assertions above pass just as happily on a
+    // harness that never issues anything at all — which is the failure mode
+    // this whole file is written against.
+    //
+    // It asserts the REQUEST and not the answer, and that is deliberate rather
+    // than a shortcut. This stub answers every write a bare `204` with no
+    // multistatus body, which `updateCalendarCollection` correctly reads as
+    // "the server reported no property set" and refuses. Teaching the stub to
+    // answer a real multistatus would make this file own a second copy of a
+    // fixture `test/dav-calendar.test.ts` already owns, and the property THIS
+    // gate holds is where the credential went, not what came back.
+    live.observed.length = 0;
+    await refusal(() =>
+      updateCalendarCollection(env, principal, createDavFetch(owner), {
+        collectionUrl: WORK_URL,
+        displayName: "Job search 2026",
+      }),
+    );
+
+    expect(live.observed.length, "the rename issued nothing at all").toBe(1);
+    expect(live.observed[0]).toBe(WORK_URL);
   });
 
   it("refuses the sibling path when the home set has NO trailing slash", async () => {
