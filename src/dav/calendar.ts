@@ -674,6 +674,16 @@ export interface CreatedCalendar {
 const CREATE_COLLECTION_METHOD = "MKCOL";
 
 /**
+ * The method a calendar's own properties are changed with (CALM-05).
+ *
+ * RFC 4918 § 9.2, and unremarkable where the create's method is not: this
+ * runtime builds a request carrying it without complaint, and SPIKE-04 sent one
+ * to the owner's real account on 2026-09-24 and got a `207` back. Named rather
+ * than written inline only so the create and the update read as a pair.
+ */
+const UPDATE_COLLECTION_METHOD = "PROPPATCH";
+
+/**
  * The opaque alpha pair every colour this server writes carries.
  *
  * Uppercase, and the case is a CHOICE rather than a fact about the protocol.
@@ -878,6 +888,283 @@ export async function createCalendarCollection(
     },
     // See the docstring. A retry mints a fresh uuid, so this is the whole of
     // the "two calendars, one request" mitigation.
+    false,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CALM-05 — renaming and recolouring a calendar collection
+// ---------------------------------------------------------------------------
+
+/**
+ * A calendar property this server knows how to change, in THIS server's words.
+ *
+ * A closed two-value vocabulary, and closed on purpose. Every sentence the tool
+ * layer composes about a half-completed change names one of these two strings,
+ * so the answer a user reads is built from names chosen here rather than from
+ * anything the server sent back. `./../../.claude/CLAUDE.md` § 4 is the reason:
+ * no diagnostic field may echo a server status line, a body or a URL, and
+ * "which property failed" is exactly the field somebody would otherwise answer
+ * by quoting the server's own propstat.
+ */
+export type CalendarProperty = "displayName" | "color";
+
+/**
+ * Each property's key in the parsed property region the DAV library returns.
+ *
+ * The library camel-cases every element name and strips the namespace prefix,
+ * so `D:displayname` arrives as `displayname` and `ca:calendar-color` arrives
+ * as `calendarColor`. `collectionsFrom` above already reads the same two keys
+ * off a listing, which is why these spellings are not a guess.
+ */
+const CALENDAR_PROPERTY_KEYS: Readonly<Record<CalendarProperty, string>> =
+  Object.freeze({
+    displayName: "displayname",
+    color: "calendarColor",
+  });
+
+/** How a property update went, property by property. */
+export interface CalendarPropertyOutcomes {
+  /** Properties this server asked to set and the server reported set. */
+  changed: CalendarProperty[];
+  /** Properties this server asked to set and the server did NOT report set. */
+  unchanged: CalendarProperty[];
+}
+
+/** A calendar that has been asked to change, and what actually changed. */
+export interface UpdatedCalendar extends CalendarPropertyOutcomes {
+  /** The opaque id for the collection the request ACTUALLY addressed. */
+  id: string;
+}
+
+/** What one `calendar_update_calendar` call supplies. */
+export interface UpdateCalendarInput {
+  /** The collection URL, decoded from an opaque id this server minted. */
+  collectionUrl: string;
+  /** The new name, when a rename was asked for. ABSENT means leave it alone. */
+  displayName?: string;
+  /** `#RRGGBB`, already matched at the tool (D-08). ABSENT means leave it alone. */
+  color?: string;
+}
+
+/**
+ * Read the per-property outcome out of a property update's answer (CALM-05).
+ *
+ * ## The `207` here means the OPPOSITE of the `207` one function up
+ *
+ * `collectionCreatedBy` treats a `207` on the create as a REFUSAL, because RFC
+ * 5689 § 3 makes an extended `MKCOL` all-or-nothing and gives its failure a
+ * `DAV:mkcol-response` body. A property update is the other shape entirely: RFC
+ * 4918 § 9.2 makes it a PER-PROPERTY operation whose only defined successful
+ * answer is a `207` carrying one `propstat` per property. **Do not "make these
+ * two consistent."** They are different methods with different specifications,
+ * and the agreement would have to be a lie about one of them.
+ *
+ * ## What the library actually hands over, MEASURED
+ *
+ * Research left this open as assumption A7 and it was verified against
+ * `node_modules/tsdav/dist/tsdav.js` before this reader was written, because
+ * the obvious implementation depends entirely on the answer. What the library
+ * does with a multistatus is REDUCE every `propstat` into ONE flat property
+ * region — and it DROPS, silently and entirely, any `propstat` whose status
+ * line parses outside the 2xx range. No per-property status survives the parse.
+ *
+ * That measurement turns the plan's first rule from a defensive precaution into
+ * the only mechanism available: **ABSENCE IS THE SIGNAL.** A property this
+ * server asked to set and the answer does not carry was either refused with its
+ * own status or never mentioned at all, and from here those two are the same
+ * observation. So the reader asks one question per property — is it present —
+ * and a property that is missing is reported UNCHANGED.
+ *
+ * Three ways the obvious reader gets this wrong, all closed above:
+ *
+ * 1. **A property the request set and the answer omits is a FAILURE.** A reader
+ *    that only inspects what is present reports success for a property the
+ *    server silently dropped, which is why `asked` is a parameter.
+ * 2. **Only a 2xx propstat is a success.** A `424 Failed Dependency` is not a
+ *    success, and neither is the `403` RFC 5689 § 3.5 itself uses for a refused
+ *    property set. The library's own filter already removes both, and this
+ *    reader inherits that rather than restating it — see the limit below.
+ * 3. **It does not throw.** The collection still exists and half the change may
+ *    have landed; throwing would hand the caller a category and no way to learn
+ *    WHICH half. The outcome is returned and the tool composes the sentence.
+ *
+ * ## What it cannot see, written down rather than left to be discovered
+ *
+ * The 2xx filter is the LIBRARY's, and the library applies it only when the
+ * status line parses. A `propstat` carrying no status element, or one this
+ * parser cannot read, is KEPT — so its properties would arrive in the region
+ * below and be reported changed. RFC 4918 § 14.22 requires the status element,
+ * so that shape is malformed rather than merely unusual, and it is unmeasured
+ * against iCloud. Restating the range check here would not close it either:
+ * the status is gone by the time this function is handed the value. The limit
+ * is recorded; it is not closed.
+ *
+ * A non-multistatus answer — a bare `200` with no body — arrives with no
+ * property region at all, and every asked property is then reported unchanged.
+ * That is conservative in the direction this module has already chosen once:
+ * under-reporting a change the user can verify beats telling them a calendar
+ * was renamed when it was not.
+ *
+ * Narrowed BY HAND throughout. The property region is typed `any` by the
+ * library, and `any` on one field widens what inference can promise about
+ * everything reached through the value.
+ */
+export function propstatOutcomes(
+  responses: DAVResponse[],
+  asked: readonly CalendarProperty[],
+): CalendarPropertyOutcomes {
+  const reported = new Set<string>();
+  for (const response of responses) {
+    const props: unknown = response.props;
+    if (props === null || typeof props !== "object") continue;
+    for (const key of Object.keys(props as Record<string, unknown>)) {
+      reported.add(key);
+    }
+  }
+
+  const changed: CalendarProperty[] = [];
+  const unchanged: CalendarProperty[] = [];
+  for (const property of asked) {
+    if (reported.has(CALENDAR_PROPERTY_KEYS[property])) changed.push(property);
+    else unchanged.push(property);
+  }
+  return { changed, unchanged };
+}
+
+/**
+ * Rename and recolour one calendar, in one request (CALM-05).
+ *
+ * ## The target IS the caller's here, and that is the difference from the create
+ *
+ * `createCalendarCollection` above is exempt from the home-containment gate
+ * because its input carries no URL at all. This one is the first collection
+ * write in the project whose target is genuinely caller-influenced: the URL
+ * arrives inside an opaque id the model may have read out of an event
+ * description a stranger wrote, and `./transport.ts` attaches the Apple ID and
+ * the app-specific password to whatever URL it is handed. So `assertUnderHome`
+ * runs BEFORE the request and is the authorisation rather than defence in
+ * depth. Its refusal is deliberately byte-identical to a genuine miss, so this
+ * endpoint is not a collection-existence oracle.
+ *
+ * ## Absent means LEAVE ALONE
+ *
+ * A property the caller did not supply is not in the body at all. That is this
+ * project's settled convention and it is also the only way to recolour without
+ * renaming: an element present with an empty value is a request to blank the
+ * property, which nobody asked for.
+ *
+ * A call naming NEITHER property is refused before the request, with
+ * `DavNotFoundError(false)` on `assertRange`'s precedent below — a change this
+ * server declines to make is the same class of answer as an identifier it
+ * declines to resolve. Sending an empty `d:prop` would spend a round trip
+ * asking iCloud to do nothing.
+ *
+ * ## A total refusal THROWS; a partial one does not
+ *
+ * If the answer reports nothing changed, this throws rather than returning an
+ * outcome with an empty `changed` list. "A partial success with zero parts" is
+ * not a sentence the tool layer should have to compose, and the alternative is
+ * a response saying a change succeeded partially while naming no part of it
+ * that did. A PARTIAL outcome comes back as a value, because the caller needs
+ * to learn which half landed and a thrown category cannot carry that.
+ *
+ * ## No retry, and the reason differs from the create's
+ *
+ * `allowRediscovery` is `false`, matching every other write in this module. The
+ * create's reason — a retry mints a fresh uuid and could leave two calendars —
+ * does not apply, because a property update is idempotent against a fixed URL.
+ * The reason that does apply is narrower and still decisive: re-discovery
+ * re-resolves the account's home set, and the caller's collection URL was
+ * minted against the home this server resolved EARLIER. If the shard host moved,
+ * the retry's only possible outcome is the containment refusal above — so the
+ * retry would buy a real PROPFIND against iCloud and spend it on a request that
+ * cannot succeed.
+ *
+ * ## Serial, because every one of these is a socket
+ *
+ * `dav-concurrent-request` names this function, so a combinator wrapped around
+ * it is a commit-time rejection. "Tidy up my calendars" is one sentence that
+ * means N of these, and iCloud's per-account connection ceiling is lower than
+ * the platform's, undocumented, and deliberately unmeasured — exhausting it
+ * locks the user out of their own mail in Mail.app on their own devices.
+ *
+ * Nothing here is logged. This module contains no logging calls of any kind.
+ */
+export async function updateCalendarCollection(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  input: UpdateCalendarInput,
+): Promise<UpdatedCalendar> {
+  return withRediscovery(
+    env,
+    principal,
+    davFetch,
+    "caldav",
+    async (resolved) => {
+      const collectionUrl = input.collectionUrl;
+      // FIRST, and before the credential can be attached to anything. The URL
+      // came out of a caller-supplied token.
+      assertUnderHome(collectionUrl, resolved.homeUrl);
+
+      const asked: CalendarProperty[] = [];
+      const prop: Record<string, string> = {};
+      if (input.displayName !== undefined) {
+        asked.push("displayName");
+        prop["d:displayname"] = input.displayName;
+      }
+      if (input.color !== undefined) {
+        asked.push("color");
+        prop["ca:calendar-color"] = calendarColorForWire(input.color);
+      }
+      // See the docstring: a change naming no property is refused rather than
+      // sent. `DavNotFoundError(false)` keeps the four-value error vocabulary
+      // closed and cannot be re-tried into existence.
+      if (asked.length === 0) throw new DavNotFoundError(false);
+
+      const responses = await davRequest({
+        url: collectionUrl,
+        init: {
+          method: UPDATE_COLLECTION_METHOD,
+          // Never a credential from here. `./transport.ts` attaches it per call
+          // and is the only place that may.
+          headers: {},
+          namespace: "d",
+          body: {
+            "d:propertyupdate": {
+              // TWO namespaces, exactly what SPIKE-04's probe declared on the
+              // request iCloud answered `207` to. The CalDAV namespace is not
+              // among them because no property here is in it.
+              _attributes: {
+                "xmlns:d": "DAV:",
+                "xmlns:ca": "http://apple.com/ns/ical/",
+              },
+              "d:set": { "d:prop": prop },
+            },
+          },
+        },
+        fetch: davFetch,
+      });
+
+      const outcomes = propstatOutcomes(responses, asked);
+      if (outcomes.changed.length === 0) {
+        // Nothing landed. `DavConnectError` is the same honest floor the create
+        // uses for "the server answered something this layer cannot act on",
+        // and nothing about the answer is read or carried — not its status, not
+        // its body, not the URL.
+        throw new DavConnectError();
+      }
+
+      return {
+        // Minted from the URL the request ACTUALLY addressed rather than echoed
+        // from the caller's token, so an id that named something else would be
+        // visible instead of agreeing with itself.
+        id: encodeCalendarId({ collectionUrl }),
+        ...outcomes,
+      };
+    },
+    // See the docstring. A retry could only ever reach the containment refusal.
     false,
   );
 }

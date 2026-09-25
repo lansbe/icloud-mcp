@@ -66,8 +66,10 @@ import {
   patchEventBody,
   pinnedOccurrencesFor,
   planCreateTarget,
+  propstatOutcomes,
   resolveOrganizerAddress,
   searchEvents,
+  updateCalendarCollection,
   updateEvent,
   updateEventBody,
   updateOccurrenceBody,
@@ -77,6 +79,7 @@ import type {
   EventDetail,
   EventSummary,
   FindSlotsOptions,
+  UpdatedCalendar,
 } from "../src/dav/calendar";
 import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
 import {
@@ -6079,5 +6082,318 @@ describe("creating a calendar collection (CALM-04)", () => {
     // Nothing about the server's answer is carried out of this layer: no
     // status, no body, no URL. `davToErrorCategory` dispatches on the TYPE.
     await expect(createOne()).rejects.not.toHaveProperty("status");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CALM-05 — renaming and recolouring a calendar collection
+//
+// **The `207` here means the OPPOSITE of the `207` in the block above, and
+// that is the whole point of these cases.** A `207` on the create is a refusal
+// (RFC 5689 § 3, all-or-nothing). A `207` on a property update is the ONLY
+// successful answer RFC 4918 § 9.2 defines — and it is a success only if every
+// `propstat` inside it carries a 2xx status. SPIKE-04's probe read the outer
+// `207` and nothing else, which was enough to answer "does iCloud allow this at
+// all" and is not enough to tell a user their calendar was renamed.
+// ---------------------------------------------------------------------------
+
+/** One `d:response` wrapper, so each fixture below is only its own propstats. */
+function propertyUpdateAnswer(propstats: string): string {
+  return (
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<d:multistatus xmlns:d="DAV:" xmlns:ca="http://apple.com/ns/ical/">' +
+    `<d:response><d:href>${WORK_PATH}</d:href>${propstats}</d:response>` +
+    "</d:multistatus>"
+  );
+}
+
+/** Both properties accepted, in ONE propstat — the ordinary success. */
+const BOTH_SET_BODY = propertyUpdateAnswer(
+  "<d:propstat><d:prop><d:displayname/><ca:calendar-color/></d:prop>" +
+    "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>",
+);
+
+/**
+ * The name accepted and the colour REFUSED — the case the probe could not see.
+ *
+ * Two propstats, which is the shape RFC 4918 § 9.2 defines for exactly this:
+ * one status line per group of properties that shared an outcome. The outer
+ * envelope is still `207`, and a reader that stops there reports this as a
+ * complete success.
+ */
+const COLOUR_REFUSED_BODY = propertyUpdateAnswer(
+  "<d:propstat><d:prop><d:displayname/></d:prop>" +
+    "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>" +
+    "<d:propstat><d:prop><ca:calendar-color/></d:prop>" +
+    "<d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>",
+);
+
+/**
+ * The colour SILENTLY DROPPED — mentioned nowhere in the answer.
+ *
+ * Not refused with a status, not acknowledged: absent. A reader that inspects
+ * only the propstats present has nothing to report about it and reports success
+ * by omission, which is the second of the three ways the obvious implementation
+ * is wrong.
+ */
+const COLOUR_OMITTED_BODY = propertyUpdateAnswer(
+  "<d:propstat><d:prop><d:displayname/></d:prop>" +
+    "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>",
+);
+
+/** Both properties refused — nothing landed at all. */
+const NOTHING_SET_BODY = propertyUpdateAnswer(
+  "<d:propstat><d:prop><d:displayname/><ca:calendar-color/></d:prop>" +
+    "<d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>",
+);
+
+/** Answer every property update with one body, and everything else normally. */
+function updatingStub(body: string, status = 207): Stub {
+  return davStub({
+    onRequest: (_url, method) =>
+      method === "PROPPATCH"
+        ? new Response(body, {
+            status,
+            headers: { "content-type": "text/xml; charset=utf-8" },
+          })
+        : null,
+  });
+}
+
+/** The one update this suite drives, with whatever the case asks to change. */
+function updateOne(
+  change: { displayName?: string; color?: string },
+  collectionUrl = WORK_URL,
+): Promise<UpdatedCalendar> {
+  return updateCalendarCollection(env, principal, createDavFetch(owner), {
+    collectionUrl,
+    ...change,
+  });
+}
+
+describe("renaming and recolouring a calendar collection (CALM-05)", () => {
+  it("issues ONE property update at the collection the id named", async () => {
+    const stub = updatingStub(BOTH_SET_BODY);
+    await warm(stub);
+
+    const updated = await updateOne({
+      displayName: "Job search 2026",
+      color: "#1f77b4",
+    });
+
+    // ONE. A rename and a recolour are one request, not two.
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].method).toBe("PROPPATCH");
+    expect(stub.observed[0].url).toBe(WORK_URL);
+    // The id names what was actually addressed rather than echoing the caller's
+    // token, so an id naming something else would be visible here.
+    expect(decodeCalendarId(updated.id).collectionUrl).toBe(WORK_URL);
+  });
+
+  it("reports BOTH properties changed when both propstats are 2xx", async () => {
+    const stub = updatingStub(BOTH_SET_BODY);
+    await warm(stub);
+
+    const updated = await updateOne({
+      displayName: "Job search 2026",
+      color: "#1f77b4",
+    });
+
+    expect(updated.changed.sort()).toEqual(["color", "displayName"]);
+    expect(updated.unchanged).toEqual([]);
+  });
+
+  it("reports the colour NOT changed when its propstat is 403, and does not throw", async () => {
+    // **This is the case SPIKE-04's probe could not see, and the point of the
+    // whole plan.** The envelope is `207`, which the create one block up treats
+    // as a refusal and which RFC 4918 § 9.2 makes the ONLY successful answer
+    // here. Reading it alone reports "renamed and recoloured" to a user whose
+    // calendar is still the old colour.
+    const stub = updatingStub(COLOUR_REFUSED_BODY);
+    await warm(stub);
+
+    const updated = await updateOne({
+      displayName: "Job search 2026",
+      color: "#1f77b4",
+    });
+
+    expect(updated.changed).toEqual(["displayName"]);
+    expect(updated.unchanged).toEqual(["color"]);
+    // It came back as a VALUE. Throwing would hand the caller a category and no
+    // way to learn which half landed.
+    expect(stub.observed.length).toBe(1);
+  });
+
+  it("treats a property the answer OMITS as not changed", async () => {
+    // Omission is not an implicit success. A reader that inspects only what is
+    // present has nothing to say about a property the server silently dropped,
+    // and saying nothing reads as "it worked" at every layer above.
+    const stub = updatingStub(COLOUR_OMITTED_BODY);
+    await warm(stub);
+
+    const updated = await updateOne({
+      displayName: "Job search 2026",
+      color: "#1f77b4",
+    });
+
+    expect(updated.changed).toEqual(["displayName"]);
+    expect(updated.unchanged).toEqual(["color"]);
+  });
+
+  it("refuses outright when NOTHING changed, rather than reporting an empty partial", async () => {
+    const stub = updatingStub(NOTHING_SET_BODY);
+    await warm(stub);
+
+    await expect(
+      updateOne({ displayName: "Job search 2026", color: "#1f77b4" }),
+    ).rejects.toBeInstanceOf(DavConnectError);
+    // The request WAS issued; it is the ANSWER that is refused.
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].method).toBe("PROPPATCH");
+  });
+
+  it("sends no colour element at all on a rename with no colour", async () => {
+    const stub = updatingStub(
+      propertyUpdateAnswer(
+        "<d:propstat><d:prop><d:displayname/></d:prop>" +
+          "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>",
+      ),
+    );
+    await warm(stub);
+
+    const updated = await updateOne({ displayName: "Job search 2026" });
+    const body = String(stub.observed[0].body);
+
+    expect(body).toContain("<d:displayname>Job search 2026</d:displayname>");
+    // ABSENT, not empty. An element present with no value is a request to BLANK
+    // the property, which is not what "leave the colour alone" means.
+    expect(body).not.toContain("calendar-color");
+    // Only the property that was asked for is reported on.
+    expect(updated.changed).toEqual(["displayName"]);
+    expect(updated.unchanged).toEqual([]);
+  });
+
+  it("sends no displayname element at all on a recolour with no rename", async () => {
+    const stub = updatingStub(
+      propertyUpdateAnswer(
+        "<d:propstat><d:prop><ca:calendar-color/></d:prop>" +
+          "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>",
+      ),
+    );
+    await warm(stub);
+
+    const updated = await updateOne({ color: "#1F77B4" });
+    const body = String(stub.observed[0].body);
+
+    expect(body).not.toContain("displayname");
+    // The eight-digit wire form, through the same helper the create uses, with
+    // the caller's own case on the six digits.
+    expect(body).toContain("<ca:calendar-color>#1F77B4FF</ca:calendar-color>");
+    expect(updated.changed).toEqual(["color"]);
+  });
+
+  it("declares two namespaces and carries the transport's credential only", async () => {
+    const stub = updatingStub(BOTH_SET_BODY);
+    await warm(stub);
+
+    await updateOne({ displayName: "Job search 2026", color: "#1f77b4" });
+    const body = String(stub.observed[0].body);
+
+    expect(body).toContain('xmlns:d="DAV:"');
+    expect(body).toContain('xmlns:ca="http://apple.com/ns/ical/"');
+    // The CalDAV namespace is NOT declared: no property here lives in it, and
+    // this is the pair SPIKE-04's measured probe sent.
+    expect(body).not.toContain("urn:ietf:params:xml:ns:caldav");
+
+    // The service module passes `headers: {}`. What arrives is the transport's
+    // and only the transport's.
+    expect(stub.observed[0].headers.authorization.startsWith("Basic ")).toBe(
+      true,
+    );
+  });
+
+  it("refuses a change naming NEITHER property, with nothing sent", async () => {
+    const stub = updatingStub(BOTH_SET_BODY);
+    await warm(stub);
+
+    await expect(updateOne({})).rejects.toBeInstanceOf(DavNotFoundError);
+    // ZERO. Sending an empty `d:prop` would spend a round trip asking iCloud to
+    // do nothing, against a connection budget this project counts.
+    expect(stub.observed.length).toBe(0);
+  });
+
+  it("refuses a collection URL outside the resolved home, with nothing sent", async () => {
+    // The first collection write whose target is genuinely caller-supplied. The
+    // URL arrives inside an opaque id, and `src/dav/transport.ts` attaches the
+    // Apple ID and the app-specific password to whatever URL it is handed.
+    const stub = updatingStub(BOTH_SET_BODY);
+    await warm(stub);
+
+    await expect(
+      updateOne(
+        { displayName: "Job search 2026" },
+        "https://evil.example/1234567890/calendars/work/",
+      ),
+    ).rejects.toBeInstanceOf(DavNotFoundError);
+    expect(stub.observed.length).toBe(0);
+  });
+
+  it("reports nothing changed when the answer carries no multistatus at all", async () => {
+    // A bare `200` with no body. The library hands back a response with no
+    // property region, so every asked property is absent and the change is
+    // refused — conservative in the direction this module already chose once on
+    // the create: under-reporting a change the user can verify beats telling
+    // them a calendar was renamed when it was not.
+    const stub = updatingStub("", 200);
+    await warm(stub);
+
+    await expect(
+      updateOne({ displayName: "Job search 2026" }),
+    ).rejects.toBeInstanceOf(DavConnectError);
+    expect(stub.observed.length).toBe(1);
+  });
+});
+
+describe("propstatOutcomes, read directly", () => {
+  it("splits what was asked into what the answer mentions and what it does not", () => {
+    // The reader in isolation, over the shape the library actually produces:
+    // ONE flat property region per response, because the library reduces every
+    // propstat into it and DROPS any whose status parses outside 2xx. Absence
+    // is therefore the only signal available, which is why `asked` is a
+    // parameter rather than something inferred from the answer.
+    const responses = [
+      {
+        status: 207,
+        statusText: "Multi-Status",
+        ok: true,
+        props: { displayname: {} },
+      },
+    ];
+
+    expect(propstatOutcomes(responses, ["displayName", "color"])).toEqual({
+      changed: ["displayName"],
+      unchanged: ["color"],
+    });
+  });
+
+  it("reports everything unchanged when there is no property region", () => {
+    const responses = [
+      { status: 200, statusText: "OK", ok: true },
+    ];
+
+    expect(propstatOutcomes(responses, ["displayName", "color"])).toEqual({
+      changed: [],
+      unchanged: ["displayName", "color"],
+    });
+  });
+
+  it("asks about nothing when nothing was asked", () => {
+    // Non-vacuity in the other direction: an empty `asked` must not invent a
+    // property to report on. The entry point refuses this call before the
+    // request, so this pins the reader's own behaviour rather than a reachable
+    // path.
+    expect(
+      propstatOutcomes([{ status: 207, statusText: "", ok: true, props: {} }], []),
+    ).toEqual({ changed: [], unchanged: [] });
   });
 });
