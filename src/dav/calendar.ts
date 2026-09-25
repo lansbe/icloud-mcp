@@ -1385,6 +1385,39 @@ export function assertCtag(
 }
 
 /**
+ * Whether a collection URL is the account's default calendar (CALM-07).
+ *
+ * A comparison between two strings the caller already holds. It reaches no
+ * network, and that is the requirement rather than a happy property: CALM-07
+ * words the refusal as local, "before any request is sent", so the default
+ * calendar's URL is memoised with the discovery triple by
+ * `resolveDefaultCalendarUrl` and this is the entire cost at delete time.
+ *
+ * **Raw `===`, and no normalisation of any kind** — no trailing-slash fixing, no
+ * case folding, no percent-decoding. `assertEtag`'s neighbouring argument about
+ * comparing a revision byte-for-byte holds here and holds harder: normalisation
+ * eventually meets a value it gets wrong, and the direction it gets wrong decides
+ * whether the least reversible operation in this milestone proceeds. Both sides
+ * are already normalised ONCE, at store time, by resolving the href against the
+ * account's own resolved home URL. Comparing raw thereafter is what keeps that
+ * the only normalisation there is.
+ *
+ * A `null` default means the account named none, so nothing is the default and
+ * this answers false. That is the honest answer AND a fail-open one, which is why
+ * `resolveDefaultCalendarUrl` stores a null it read and re-throws rather than
+ * storing one it merely guessed at.
+ *
+ * Exported so the tool layer has one named thing to call and one named thing to
+ * drive, rather than an inline `===` a later refactor can quietly widen.
+ */
+export function isDefaultCalendar(
+  collectionUrl: string,
+  defaultCalendarUrl: string | null,
+): boolean {
+  return defaultCalendarUrl !== null && collectionUrl === defaultCalendarUrl;
+}
+
+/**
  * Refuse a range this server will not walk, before anything is opened.
  *
  * `DavNotFoundError` rather than a fifth error category: the four-value

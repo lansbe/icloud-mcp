@@ -426,15 +426,25 @@ function caldavRequests(stub: Stub): ObservedRequest[] {
  * How many round trips a cold CalDAV half costs: the well-known probe, which
  * tsdav tries twice (PROPFIND, then GET) against an account that answers it
  * with a 404; the root PROPFIND that names the principal; the principal
- * PROPFIND that names the home set; and the one depth-1 listing of that home
- * set.
+ * PROPFIND that names the home set; the depth-1 listing of that home set; and —
+ * since phase 17 (CALM-07) — one further principal PROPFIND asking where this
+ * account's scheduling inbox is.
  *
- * Pinned as a literal on purpose. Everything this phase adds to the CalDAV
- * report — the supported-report-set, the collection enumeration — rides the
- * LAST of those five, and the whole claim that it does is this number not
- * moving.
+ * Pinned as a literal on purpose. Everything the DIAGNOSTIC adds to the CalDAV
+ * report — the supported-report-set, the collection enumeration, the
+ * default-calendar property on each row — still rides ONE listing, and the whole
+ * claim that it does is the home-listing count beside this one staying at one.
+ *
+ * **The sixth request is not part of the report, and it moved this number for a
+ * reason worth writing down rather than absorbing.** `resolveDavAccount` now
+ * resolves the account's default calendar on a cache MISS and stores it with the
+ * triple, because CALM-07 refuses a delete of that calendar by a LOCAL
+ * comparison and the value therefore has to be in hand before the delete tool is
+ * called. It is two requests at most, and this stub pays only the first: its
+ * principal names no scheduling inbox, so there is no inbox to ask a second
+ * question of. A fixture that DID name one would make this seven.
  */
-const COLD_CALDAV_REQUESTS = 5;
+const COLD_CALDAV_REQUESTS = 6;
 
 describe("dav_diagnose, end to end", () => {
   beforeEach(async () => {
@@ -499,8 +509,11 @@ describe("dav_diagnose, end to end", () => {
     const result = await diagnoseHandler(createDavFetch(owner))({});
 
     expect(caldavRequests(stub).length).toBe(COLD_CALDAV_REQUESTS);
-    // Exactly one of those five is the home-set listing, and it is the one
-    // carrying the answer. No per-collection helper ran.
+    // Exactly ONE of them is the home-set listing, and it is the one carrying
+    // the answer. No per-collection helper ran. This is the assertion that
+    // actually holds the "no extra round trip to say so" claim — the total beside
+    // it also counts discovery's own bootstrap, which grew by one in phase 17
+    // and has nothing to do with the report.
     expect(
       caldavRequests(stub).filter((request) => request.url === CALDAV_HOME).length,
     ).toBe(1);

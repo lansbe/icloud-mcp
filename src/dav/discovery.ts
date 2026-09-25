@@ -14,7 +14,7 @@
 //
 // This module contains no logging calls of any kind and must never acquire any.
 
-import { createAccount } from "tsdav";
+import { createAccount, propfind } from "tsdav";
 import type { DAVAccount } from "tsdav";
 import type { Env } from "../env";
 import type { Principal } from "../principal";
@@ -48,14 +48,29 @@ export interface ResolvedDavAccount {
   rootUrl: string;
   principalUrl: string;
   homeUrl: string;
+  /**
+   * The account's default calendar URL, or `null` when it named none (CALM-07).
+   *
+   * **Resolved for CalDAV only.** On CardDAV it is `null` because the property
+   * has no meaning against a contacts home, not because it could not be read.
+   *
+   * **`null` is a real stored answer rather than a gap**, and the distinction
+   * matters because of what the value is FOR: a collection delete refuses the
+   * account's default calendar by a local comparison, so the URL has to already
+   * be in hand when the tool is called. A null therefore means "this account
+   * named no default calendar", a caller comparing against it gets `false`, and
+   * the refusal does not fire — which is why `resolveDefaultCalendarUrl` stores a
+   * null it READ and re-throws rather than storing one it merely guessed at.
+   */
+  defaultCalendarUrl: string | null;
   /** True when no outbound request was made to produce this. */
   cacheHit: boolean;
 }
 
-/** The three URLs, as stored. `cacheHit` is a property of the read, not the value. */
+/** The stored value. `cacheHit` is a property of the read, not of the value. */
 type CachedDiscovery = Pick<
   ResolvedDavAccount,
-  "rootUrl" | "principalUrl" | "homeUrl"
+  "rootUrl" | "principalUrl" | "homeUrl" | "defaultCalendarUrl"
 >;
 
 /**
@@ -77,25 +92,42 @@ export const DISCOVERY_TTL_SECONDS = 86400;
 /**
  * The key namespace, versioned, separator included.
  *
- * The `v1` buys the same hedge `TOKEN_VERSION` buys in `src/mail/ids.ts`: a
- * future change to the stored shape becomes detectable rather than silently
- * misread as the current one.
+ * The version segment buys the same hedge `TOKEN_VERSION` buys in
+ * `src/mail/ids.ts`: a future change to the stored shape becomes detectable
+ * rather than silently misread as the current one.
+ *
+ * **It has been needed once, and that is why `v2` is the live value.** Phase 17
+ * (CALM-07) grew the stored value by a field — the account's default calendar
+ * URL — and an entry written under the previous version carries every URL the
+ * reader wants except that one. Read as the current shape, the missing field
+ * would present as `null`, which is indistinguishable from an account that
+ * genuinely named no default calendar; and null is precisely the value that
+ * makes a delete's refusal not fire. Moving the namespace makes the older
+ * entries unreachable instead, so the first call per user after deploy pays one
+ * full rediscovery and every call after it reads a value of the current shape.
+ *
+ * **The previous version is deliberately not spelled anywhere in this file, not
+ * even here.** It is described by role, on the same footing as
+ * `.claude/CLAUDE.md` § 1's role-not-name rule: a file that still writes the old
+ * value somewhere is a file where a later reader cannot tell which one is live,
+ * and a comment is exactly as confusing as a constant for that purpose. A gate
+ * in this plan's verification greps the whole file for it.
  *
  * **The trailing colon is part of the value, and that is a decision (D-20).**
  * The key expression below interpolates the user id straight after this
- * constant, with nothing at all between them. Written the other way — a bare
- * `dav:v1` here and the colon in the expression — the key comes out
+ * constant, with nothing at all between them. Written the other way — the
+ * version here and the colon in the expression — the key comes out
  * byte-identical, so nothing about the stored shape turns on which spelling is
  * used. What turns on it is the ISO-06 scan rule, which reads a key prefix
  * constant followed by anything other than a user id as a key with no user in
  * it. Moving the colon back out would fire that rule on a correct key.
  */
-const DAV_CACHE_KEY_PREFIX = "dav:v1:";
+const DAV_CACHE_KEY_PREFIX = "dav:v2:";
 
 /**
  * The KV key for one `{user, service}` pair (DAV-03).
  *
- * `dav:v1:<user id>:<service>`. The user id is the 64-hex value `userIdOf`
+ * `dav:v2:<user id>:<service>`. The user id is the 64-hex value `userIdOf`
  * produces, taken off the signed-in principal — **nothing in this module hashes
  * anything** (D-14). What the key carries is therefore a digest of the address
  * and never the address, and the reason for that is NOT secrecy — KV is not
@@ -217,6 +249,170 @@ async function discoverAccount(
 }
 
 /**
+ * Where a `DAV:href`-valued property points, resolved against a base, or null.
+ *
+ * Hand-narrowed rather than trusted, because the XML layer types this region
+ * `any` and an EMPTY element yields `{}` rather than `{ href }` — whose string
+ * conversion is the nine characters `[object Object]`. That would read as a real
+ * URL to everything downstream of here, and what is downstream of here is the
+ * value a collection delete refuses against.
+ *
+ * `./diagnose.ts` narrows the same property the same way for its own listing. The
+ * duplication is deliberate and is not the second mitigation D-56 bans: that
+ * module's reader is private to it, and reaching across for it would make the
+ * discovery path depend on the diagnostic path — a cycle, and a direction of
+ * dependency nobody wants.
+ *
+ * Nothing is read from the caught value (./.claude/CLAUDE.md §4).
+ */
+function hrefPropOf(value: unknown, base: string): string | null {
+  if (value === null || typeof value !== "object") return null;
+  const href = (value as { href?: unknown }).href;
+  if (typeof href !== "string" || href.length === 0) return null;
+  try {
+    return new URL(href, base).href;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The account's default calendar URL, resolved once per discovery (CALM-07, D-11).
+ *
+ * ## Why this is two requests rather than none
+ *
+ * D-11 assumed the property could ride along on a listing the account already
+ * sends. RFC 6638 § 9.2 puts `CALDAV:schedule-default-calendar-URL` on the
+ * scheduling INBOX collection rather than on the principal, and the inbox is a
+ * child of the calendar home, so the assumption was reasonable — the depth-1 home
+ * listing already traverses that row. It was then MEASURED against the real
+ * account on 2026-09-25, on a deploy carrying the property in the home listing's
+ * own prop list, and iCloud answered it empty on the inbox row and on all
+ * thirteen others. So the free route does not exist, and this is the fallback the
+ * owner decided the same day: ask the principal where its scheduling inbox is,
+ * then ask that inbox directly. RFC 6638 § 9.2 defines the property ON the inbox,
+ * so asking the inbox is where the question belongs.
+ *
+ * **Two extra requests on a cache MISS, and none per delete.** That is the
+ * distinction D-11's "zero extra requests" was always about: CALM-07 words the
+ * refusal as local, "before any request is sent", so the cost has to land where
+ * the discovery cost already is rather than on the operation being refused.
+ *
+ * ## Serial, and not merely as a connection-budget matter
+ *
+ * `dav-concurrent-request` names this function in its own right rather than
+ * leaving it covered by the `propfind` it ends in — the rule's own COMPOSITE
+ * paragraph rejects that accident, and the accident would evaporate the first
+ * time this body was refactored. Two serial round trips inside one function is
+ * exactly the pair a combinator gets wrapped around, because that is what makes
+ * two round trips fast, and the concurrent version returns the same URL, so
+ * nothing about the answer would reveal the change. It cannot be raced anyway:
+ * the second request asks a URL the first one supplies, so racing them would be
+ * asking about an inbox nobody has resolved yet.
+ *
+ * ## Why a relative href resolves against the HOME and not the principal
+ *
+ * This is the trap in the whole function. iCloud answers relative hrefs, and
+ * `principalUrl` sits on the DISCOVERY ENTRY host — the unsharded one — while
+ * every collection on the account sits on the account's own `pXX-` shard, which
+ * is the host `homeUrl` carries. Resolving the inbox href against the principal
+ * would therefore produce a correct PATH on the wrong ORIGIN, the containment
+ * check below would refuse it, and a property the server really served would come
+ * back as a null. An ABSOLUTE href wins over the base either way, so resolving
+ * against the home gives up nothing.
+ *
+ * ## Which failures become a null, and which fail the resolve
+ *
+ * A `DavNotFoundError` becomes `null`: the server answered, and what it said is
+ * that there is no such resource or property — which is the same answer as "this
+ * account named no default calendar". The containment refusal below arrives as
+ * that same class and is treated the same way, deliberately: an inbox href
+ * pointing outside this account's own home is not a value to send a credential
+ * to, and it is not a reason to fail every calendar operation either.
+ *
+ * Every other typed failure — auth, throttle, connect — is RE-THROWN and fails
+ * the resolve, because none of them is an answer about the account. Caching
+ * "none" on the strength of a throttled request would store a guess for a day,
+ * and that guess is the one value that makes a delete's refusal not fire. A slow
+ * failure the caller can retry is the cheaper mistake by a wide margin.
+ *
+ * Dispatch is on error TYPE and nothing else, and no caught value is read. This
+ * module contains no logging calls of any kind.
+ *
+ * ## `env` and `principal` are carried and not read
+ *
+ * On purpose. Every entry point in the DAV tree takes the two of them in this
+ * order, so a call site here reads like every other one, and an arm of this
+ * resolution that needed either — a cache of its own, a per-account decision —
+ * would not move the call site to acquire it. Neither is consulted below.
+ */
+export async function resolveDefaultCalendarUrl(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  resolved: Pick<ResolvedDavAccount, "principalUrl" | "homeUrl">,
+): Promise<string | null> {
+  try {
+    const principalResponses = await propfind({
+      url: resolved.principalUrl,
+      props: { "c:schedule-inbox-URL": {} },
+      depth: "0",
+      // Never a credential from here. `./transport.ts` attaches it per call and
+      // is the only place that may.
+      headers: {},
+      fetch: davFetch,
+    });
+
+    let inboxUrl: string | null = null;
+    for (const response of principalResponses) {
+      // `schedule-inbox-URL` camel-cases to this once the library has stripped
+      // the namespace prefix: `-U` becomes `U`, so the trailing capitals survive.
+      const found = hrefPropOf(
+        (response.props ?? {}).scheduleInboxURL,
+        resolved.homeUrl,
+      );
+      if (found !== null) {
+        inboxUrl = found;
+        break;
+      }
+    }
+
+    // A principal naming no scheduling inbox has no default calendar to name
+    // either. A real answer, stored rather than retried.
+    if (inboxUrl === null) return null;
+
+    // The inbox href came off the wire, so it is checked before the credential
+    // can be attached to it. "The server said so" is not an authorisation.
+    assertUnderHome(inboxUrl, resolved.homeUrl);
+
+    const inboxResponses = await propfind({
+      url: inboxUrl,
+      props: { "c:schedule-default-calendar-URL": {} },
+      depth: "0",
+      headers: {},
+      fetch: davFetch,
+    });
+
+    for (const response of inboxResponses) {
+      // `schedule-default-calendar-URL` camel-cases to this, for the same reason
+      // the inbox property above does.
+      const found = hrefPropOf(
+        (response.props ?? {}).scheduleDefaultCalendarURL,
+        resolved.homeUrl,
+      );
+      if (found !== null) return found;
+    }
+
+    // The inbox exists and named no default calendar. Also a real answer.
+    return null;
+  } catch (err) {
+    // See the docstring: this one class is an ANSWER, every other is a failure.
+    if (err instanceof DavNotFoundError) return null;
+    throw err;
+  }
+}
+
+/**
  * Resolve one service's root, principal and home URLs (DAV-02, DAV-03).
  *
  * On a cache hit this issues **zero** outbound requests — no PROPFIND, no
@@ -224,7 +420,11 @@ async function discoverAccount(
  * function API: `createAccount` is the only call that needs a `serverUrl`, and
  * everything after it takes the three URLs directly.
  *
- * On a miss it runs tsdav's three-stage chain and stores the result. **Neither
+ * On a miss it runs tsdav's three-stage chain, resolves the account's default
+ * calendar, and stores all of it under one key. The default-calendar resolution
+ * costs two further requests on the miss and NONE on every hit afterwards, which
+ * is what makes a collection delete's CALM-07 refusal a local string comparison
+ * — see `resolveDefaultCalendarUrl`. **Neither
  * of `createAccount`'s two eager-load flags is ever passed**, and they are
  * described here rather than spelled, on `src/mail/socket.ts`'s own precedent:
  * a future scan rule bans those two token names under `src/dav/`, so a comment
@@ -255,6 +455,12 @@ export async function resolveDavAccount(
     cached.principalUrl &&
     cached.homeUrl
   ) {
+    // `defaultCalendarUrl` is deliberately NOT in that guard. Null is a real
+    // stored answer — "this account named no default calendar" — so requiring it
+    // truthy would turn every such account into a permanent cache miss and pay
+    // full discovery on every single call. What makes the field's PRESENCE safe
+    // to assume instead is the namespace version above: no entry written under
+    // the previous one is reachable from this key at all.
     return { ...cached, cacheHit: true };
   }
 
@@ -268,7 +474,25 @@ export async function resolveDavAccount(
     throw new DavNotFoundError(false);
   }
 
-  const value: CachedDiscovery = { rootUrl, principalUrl, homeUrl };
+  // Resolved HERE, on the miss, and stored with the triple — so a warm call
+  // hands the delete path its comparand for zero outbound requests, which is the
+  // whole of what CALM-07's "locally, before any request is sent" asks for.
+  // CardDAV skips it outright: the property is a CalDAV one and there is nothing
+  // to ask a contacts home about.
+  const defaultCalendarUrl =
+    service === "caldav"
+      ? await resolveDefaultCalendarUrl(env, principal, davFetch, {
+          principalUrl,
+          homeUrl,
+        })
+      : null;
+
+  const value: CachedDiscovery = {
+    rootUrl,
+    principalUrl,
+    homeUrl,
+    defaultCalendarUrl,
+  };
   try {
     await env.DAV_CACHE.put(key, JSON.stringify(value), {
       expirationTtl: DISCOVERY_TTL_SECONDS,

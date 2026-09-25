@@ -59,6 +59,7 @@ import {
   findFreeSlots,
   getEvent,
   getEventWithEtag,
+  isDefaultCalendar,
   listCalendars,
   listEvents,
   matchesAttendee,
@@ -6549,5 +6550,64 @@ describe("what a collection is bound to and how much goes with it (CALM-06)", ()
 
     expect(stub.observed.length).toBe(1);
     expect(stub.observed[0].body).toContain("getctag");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The default-calendar comparison (CALM-07)
+//
+// No transport, no stub and no `warm()` in this whole block, and that is the
+// property rather than a convenience: CALM-07 words the refusal as local,
+// "before any request is sent", so a case here that needed a fixture would be
+// evidence the refusal was not local at all.
+// ---------------------------------------------------------------------------
+
+describe("refusing the account's default calendar, locally (CALM-07)", () => {
+  const DEFAULT_URL = "https://p42-caldav.icloud.com/1234567890/calendars/work/";
+
+  it("recognises the exact stored URL and nothing else", () => {
+    expect(isDefaultCalendar(DEFAULT_URL, DEFAULT_URL)).toBe(true);
+    expect(
+      isDefaultCalendar(
+        "https://p42-caldav.icloud.com/1234567890/calendars/home/",
+        DEFAULT_URL,
+      ),
+    ).toBe(false);
+  });
+
+  it("answers false when the account named no default calendar", () => {
+    // A null is a real stored answer — see `ResolvedDavAccount.defaultCalendarUrl`
+    // — and this is its consequence: nothing is the default, so no delete is
+    // refused on this ground. That is a FAIL-OPEN result, which is exactly why
+    // `resolveDefaultCalendarUrl` re-throws a failure rather than caching a null
+    // it merely guessed at.
+    expect(isDefaultCalendar(DEFAULT_URL, null)).toBe(false);
+  });
+
+  it("compares RAW: a trailing slash is a different URL", () => {
+    // Pinned deliberately. This is the normalisation this code refuses to do at
+    // compare time — and every other one with it: no case folding and no
+    // percent-decoding either. `assertEtag`'s neighbouring argument about
+    // comparing a revision byte-for-byte holds here and holds harder, because
+    // normalisation eventually meets a value it gets wrong and the direction it
+    // gets wrong decides whether the least reversible operation in this milestone
+    // proceeds.
+    //
+    // Both sides are normalised ONCE, at store time, by resolving the href
+    // against the account's own resolved home URL. A reader tempted to "fix" this
+    // case by trimming a slash here would be adding a second normalisation whose
+    // disagreement with the first is invisible until it matters.
+    expect(
+      isDefaultCalendar(
+        "https://p42-caldav.icloud.com/1234567890/calendars/work",
+        DEFAULT_URL,
+      ),
+    ).toBe(false);
+    expect(
+      isDefaultCalendar(
+        DEFAULT_URL,
+        "https://p42-caldav.icloud.com/1234567890/calendars/work",
+      ),
+    ).toBe(false);
   });
 });

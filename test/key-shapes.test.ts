@@ -223,19 +223,19 @@ describe("key shapes today, one pin per store", () => {
     );
   });
 
-  it("DAV_CACHE: dav:v1:{user id}:caldav, checked against both vector rows", async () => {
+  it("DAV_CACHE: dav:v2:{user id}:caldav, checked against both vector rows", async () => {
     const keyOfA = await davKeyWrittenFor(USER_A, HOME_A);
     const keyOfB = await davKeyWrittenFor(USER_B, HOME_B);
 
     // The user ids are literal rows from the vectors file. Nothing is hashed
     // here. Production code did the hashing, and these two lines are what hold
     // it to the spec.
-    expect(keyOfA).toBe("dav:v1:" + USER_A.userId + ":caldav");
-    expect(keyOfB).toBe("dav:v1:" + USER_B.userId + ":caldav");
+    expect(keyOfA).toBe("dav:v2:" + USER_A.userId + ":caldav");
+    expect(keyOfB).toBe("dav:v2:" + USER_B.userId + ":caldav");
     expect(keyOfA, "A and B were given one cache key").not.toBe(keyOfB);
 
     // The shape, as well as the value: 64 hex and nothing else in the middle.
-    expect(keyOfA).toMatch(/^dav:v1:[0-9a-f]{64}:caldav$/);
-    expect(keyOfB).toMatch(/^dav:v1:[0-9a-f]{64}:caldav$/);
+    expect(keyOfA).toMatch(/^dav:v2:[0-9a-f]{64}:caldav$/);
+    expect(keyOfB).toMatch(/^dav:v2:[0-9a-f]{64}:caldav$/);
   });
 });

@@ -934,8 +934,8 @@ describe("DAV_CACHE: a cached home belongs to the account it was resolved for", 
     // user id the spec gives it.
     const listed = await env.DAV_CACHE.list({ prefix: "dav:" });
     const names = listed.keys.map((one) => one.name);
-    const keyOfA = `dav:v1:${USER_A.userId}:caldav`;
-    const keyOfB = `dav:v1:${USER_B.userId}:caldav`;
+    const keyOfA = `dav:v2:${USER_A.userId}:caldav`;
+    const keyOfB = `dav:v2:${USER_B.userId}:caldav`;
     expect(names, "A's home is not stored under A's own key").toContain(keyOfA);
     expect(names, "B's home is not stored under B's own key").toContain(keyOfB);
     expect(keyOfA, "A and B share one cache key").not.toBe(keyOfB);
@@ -1003,8 +1003,8 @@ describe("DAV_CACHE: a cached home belongs to the account it was resolved for", 
     // hashed here (D-12).
     const listed = await env.DAV_CACHE.list({ prefix: "dav:" });
     const names = listed.keys.map((one) => one.name).sort();
-    const keyOfA = `dav:v1:${USER_A.userId}:caldav`;
-    const keyOfB = `dav:v1:${USER_B.userId}:caldav`;
+    const keyOfA = `dav:v2:${USER_A.userId}:caldav`;
+    const keyOfB = `dav:v2:${USER_B.userId}:caldav`;
     expect(keyOfA, "A and B share one cache key").not.toBe(keyOfB);
     expect(
       names,

@@ -1664,6 +1664,8 @@ export const DAV_WRITE_MODULES = Object.freeze({
       readCollectionState: "guarded",
       assertCtag:
         "An assertion over a binding the caller already holds. Throws or returns; no request. The neighbouring register assertEtag's entry uses, and for the same class of value: a revision read off a resource, refused when it is absent so a conditional operation cannot silently become an unconditional one.",
+      isDefaultCalendar:
+        "A comparison between two strings the caller already holds -- a collection URL, and the default-calendar URL resolveDavAccount memoised with the discovery triple. It issues no request, and that is the REQUIREMENT rather than an incidental property: CALM-07 words the refusal as local, before any request is sent, so fetching the default calendar at delete time would breach the requirement this function exists to satisfy. It compares raw and normalises nothing -- both sides were normalised once, at store time, by resolving the href against the account's own resolved home URL.",
       propstatOutcomes:
         "A reader over a multi-status the CALLER ALREADY HOLDS. It is handed the responses a property update already returned plus the list of properties that update asked to set, and answers which of them the server reported set; it takes no transport, addresses no URL and issues no request. It is exported because the property it enforces -- a property the request set and the answer does not mention is a FAILURE rather than an implicit success -- is worth driving directly rather than only through the entry point above.",
       listEvents: "guarded",

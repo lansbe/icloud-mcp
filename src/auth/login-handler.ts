@@ -464,7 +464,10 @@ const MAX_FAILURES_PER_WINDOW = 5;
  * plain literals — and the rule's own comment names that gap as this phase's to
  * close.
  *
- * The version segment is the same hedge `confirm:v3:` and `dav:v1:` carry: a
+ * The version segment is the same hedge `confirm:v3:` and the DAV discovery
+ * cache's own versioned prefix carry — named by role there rather than spelled,
+ * because that one has already moved once and a spelled cross-reference goes
+ * stale in silence when it moves again: a
  * later change to the shape becomes detectable rather than silently misread as
  * the current one. It has been needed twice. The keys before `v2` were
  * keyed by source rather than by target. `v2` keys held a plain count per

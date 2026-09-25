@@ -688,6 +688,31 @@ export const HOME_EXEMPT_REQUEST_SITES: readonly ExemptSite[] = Object.freeze([
     reason:
       "resolves the home set, so it cannot be under one — this is the bootstrap request, and it is the reason 03-12 chose a call-site helper over a transport choke point, which would have needed a mode to let this one request past",
   },
+  // Phase 17 (CALM-07). TWO requests share this entry because the enumeration
+  // keys on `file › fn › request` and both of them are a `propfind` inside this
+  // one function: a PROPFIND against the principal asking where the scheduling
+  // inbox is, then a depth-0 PROPFIND against that inbox asking which calendar is
+  // the account's default. They are SERIAL and cannot be otherwise — the second
+  // addresses a URL the first one supplies.
+  //
+  // **It is exempt, and the second target is nonetheless checked.** That is not a
+  // contradiction: exempt here means no CALLER can aim it, and the whole input to
+  // this function is the discovery triple this principal's own resolution just
+  // produced — no identifier, no cursor, no reference, nothing decoded from a
+  // token. The check on the inbox href exists because the href came off the WIRE
+  // rather than from a caller, and "the server said so" is not an authorisation
+  // either: `src/dav/transport.ts` attaches the Apple ID and the app-specific
+  // password to whatever URL it is handed. So the check is defence against the
+  // remote answer, recorded here rather than claimed as the containment this gate
+  // verifies — which is the same shape `createCalendarCollection`'s exemption
+  // above already carries.
+  {
+    file: DISCOVERY,
+    fn: "resolveDefaultCalendarUrl",
+    request: "propfind",
+    reason:
+      "the first target IS resolved.principalUrl and the second is the scheduling-inbox href the first request returned, resolved against resolved.homeUrl. The whole input to this function is the discovery triple resolveDavAccount just produced for THIS principal -- no identifier, no cursor and no reference of any kind reaches it, so there is nothing a forged token could aim, which is the same claim the dav_diagnose sites below make and it is stronger than a derivation argument rather than weaker. The inbox href is nonetheless passed through assertUnderHome against resolved.homeUrl before the second request, because it arrived from the SERVER rather than from a caller and transport.ts attaches the credential to whatever URL it is handed; the refusal is caught and becomes a null default calendar rather than failing every calendar operation. That is recorded here rather than claimed as a check this gate verified, on createCalendarCollection's own precedent",
+  },
   // The two sites the three-file list never looked at. Traced during the
   // phase-03 security audit and traced again when this glob was written, both
   // times to the same answer: `dav_diagnose`'s ENTIRE input is booleans. There

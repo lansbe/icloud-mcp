@@ -83,6 +83,18 @@ const PRINCIPAL_PATH = "/1234567890/principal/";
 const CALDAV_HOME = "https://p42-caldav.icloud.com/1234567890/calendars/";
 const CARDDAV_HOME = "https://p61-contacts.icloud.com/1234567890/carddavhome/";
 
+/**
+ * The scheduling inbox and the calendar it names as this account's default.
+ *
+ * Both under the CalDAV home, which is where iCloud really puts them — measured
+ * live on 2026-09-25 at `.../calendars/inbox/`. That matters to more than
+ * realism: `resolveDefaultCalendarUrl` passes the inbox href through
+ * `assertUnderHome` before it addresses it, so an inbox fixture placed outside the
+ * home would exercise the refusal rather than the resolution.
+ */
+const CALDAV_INBOX = `${CALDAV_HOME}inbox/`;
+const CALDAV_DEFAULT_CALENDAR = `${CALDAV_HOME}work/`;
+
 const XML_HEADERS = { "content-type": "text/xml; charset=utf-8" };
 
 function multistatus(body: string): Response {
@@ -101,10 +113,14 @@ function principalBodyWithoutHref(): string {
   return `<response><href>${PRINCIPAL_PATH}</href><propstat><status>HTTP/1.1 200 OK</status><prop><current-user-principal/></prop></propstat></response>`;
 }
 
-function homeBody(service: "caldav" | "carddav", home: string): string {
+function homeBody(
+  service: "caldav" | "carddav",
+  home: string,
+  extra = "",
+): string {
   const element =
     service === "caldav" ? "C:calendar-home-set" : "CARD:addressbook-home-set";
-  return `<response><href>${PRINCIPAL_PATH}</href><propstat><status>HTTP/1.1 200 OK</status><prop><${element}><href>${home}</href></${element}></prop></propstat></response>`;
+  return `<response><href>${PRINCIPAL_PATH}</href><propstat><status>HTTP/1.1 200 OK</status><prop><${element}><href>${home}</href></${element}>${extra}</prop></propstat></response>`;
 }
 
 /** A well-formed 207 that carries no home-set href. */
@@ -138,6 +154,40 @@ interface StubOptions {
   principalHref?: boolean;
   /** Serve no home-set href, so the chain cannot produce a home URL. */
   homeHref?: boolean;
+  /**
+   * How much of the scheduling chain this account answers (CALM-07).
+   *
+   * `"none"` — the principal names no scheduling inbox. The default, and the
+   * shape every pre-existing case in this file was written against.
+   * `"inbox"` — the principal names an inbox, and the inbox names no default
+   * calendar. Two requests, and a null that was READ rather than guessed.
+   * `"full"` — the inbox names one. Two requests and a URL.
+   */
+  scheduling?: "none" | "inbox" | "full";
+}
+
+/**
+ * The scheduling-inbox href, as a prop on the principal's own response element.
+ *
+ * RELATIVE, which is how iCloud answers one — and the reason this fixture is not
+ * merely decorative. A relative href resolved against `principalUrl` lands on the
+ * unsharded DISCOVERY ENTRY host, where no collection on this account lives, and
+ * the containment check would then refuse a URL the server really served. This
+ * body is what makes that mistake visible: the path below carries no host at all,
+ * so an implementation resolving against the wrong base returns null here.
+ */
+function scheduleInboxProp(): string {
+  const path = new URL(CALDAV_INBOX).pathname;
+  return `<C:schedule-inbox-URL><href>${path}</href></C:schedule-inbox-URL>`;
+}
+
+/** The inbox's own 207, carrying the default calendar or deliberately not. */
+function inboxBody(withDefault: boolean): string {
+  const path = new URL(CALDAV_DEFAULT_CALENDAR).pathname;
+  const prop = withDefault
+    ? `<C:schedule-default-calendar-URL><href>${path}</href></C:schedule-default-calendar-URL>`
+    : "";
+  return `<response><href>${CALDAV_INBOX}</href><propstat><status>HTTP/1.1 200 OK</status><prop>${prop}</prop></propstat></response>`;
 }
 
 /**
@@ -150,6 +200,7 @@ interface StubOptions {
 function davStub(options: StubOptions = {}): Stub {
   const wantPrincipal = options.principalHref ?? true;
   const wantHome = options.homeHref ?? true;
+  const scheduling = options.scheduling ?? "none";
 
   const state: Stub = {
     observed: [],
@@ -184,9 +235,22 @@ function davStub(options: StubOptions = {}): Stub {
       // iCloud serves no useful redirect here for this account shape.
       return new Response(null, { status: 404 });
     }
+    // The inbox's own depth-0 PROPFIND. Checked BEFORE the principal branch
+    // below, though the two cannot collide: the inbox is on the sharded host and
+    // the principal is on the entry host.
+    if (url === CALDAV_INBOX) {
+      return multistatus(inboxBody(scheduling === "full"));
+    }
     if (url.startsWith(CALDAV_SERVER) && url.endsWith(PRINCIPAL_PATH)) {
+      // ONE body answers both principal questions — the home set tsdav asks for,
+      // and the scheduling inbox CALM-07's resolution asks for. A real server
+      // returns only the props each PROPFIND requested; a fixture returning both
+      // is harmless, because each reader looks up its own property by name.
+      const scheduleProp = scheduling === "none" ? "" : scheduleInboxProp();
       return multistatus(
-        wantHome ? homeBody("caldav", CALDAV_HOME) : homeBodyWithoutHref("caldav"),
+        wantHome
+          ? homeBody("caldav", CALDAV_HOME, scheduleProp)
+          : homeBodyWithoutHref("caldav"),
       );
     }
     if (url.startsWith(CARDDAV_SERVER) && url.endsWith(PRINCIPAL_PATH)) {
@@ -458,10 +522,16 @@ describe("the discovery cache (DAV-03)", () => {
     expect(DISCOVERY_TTL_SECONDS).toBe(86400);
     // KV's floor is 60 seconds; a value under it is rejected at write time.
     expect(DISCOVERY_TTL_SECONDS).toBeGreaterThanOrEqual(60);
+    // Exact equality, keys included, so a field added to the stored shape fails
+    // here rather than shipping under a namespace version that did not move with
+    // it — which is the failure the version segment exists to prevent and this is
+    // where it is caught. `defaultCalendarUrl` is the field CALM-07 added; it is
+    // null here because this stub's principal names no scheduling inbox.
     expect(JSON.parse(kv.puts[0].value)).toEqual({
       rootUrl: expect.stringContaining(CALDAV_SERVER),
       principalUrl: `${CALDAV_SERVER}${PRINCIPAL_PATH}`,
       homeUrl: CALDAV_HOME,
+      defaultCalendarUrl: null,
     });
   });
 
@@ -491,7 +561,7 @@ describe("the discovery cache (DAV-03)", () => {
 
     const key = kv.puts[0].key;
     expect(key).not.toContain(FAKE_APPLE_ID);
-    expect(key).toMatch(/^dav:v1:[0-9a-f]{64}:caldav$/);
+    expect(key).toMatch(/^dav:v2:[0-9a-f]{64}:caldav$/);
   });
 
   it("degrades to uncached, silently, when the write is refused", async () => {
@@ -1187,4 +1257,253 @@ describe("assertUnderHome, against the adversarial URL corpus (03-13)", () => {
       ).toBe(false);
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// The account's default calendar (CALM-07, D-11)
+//
+// Resolved on a cache MISS and stored with the triple, so a delete-time refusal
+// is a string comparison and costs no request at all. Two requests get it —
+// principal, then inbox — and they are serial because the second addresses a URL
+// the first one supplies.
+//
+// D-11 originally assumed the property would ride free on a listing the account
+// already sends. It was measured against the real account on 2026-09-25, on a
+// deploy carrying the property in the home listing's prop list, and iCloud
+// answered it empty on every row including the inbox's. So the free route does
+// not exist and this is the owner's fallback, decided the same day.
+// ---------------------------------------------------------------------------
+
+describe("the account's default calendar (CALM-07)", () => {
+  beforeEach(async () => {
+    await clearDavCache(env, principal);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("resolves it on a cache MISS, principal then inbox, strictly in sequence", async () => {
+    const stub = davStub({ scheduling: "full" });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const resolved = await resolveDavAccount(
+      env,
+      principal,
+      createDavFetch(owner),
+      "caldav",
+    );
+
+    expect(resolved.cacheHit).toBe(false);
+    // ABSOLUTE, on the sharded host, out of a RELATIVE href. An implementation
+    // resolving against `principalUrl` instead would produce this path on the
+    // unsharded entry host, the containment check would refuse it, and this would
+    // be null — see `scheduleInboxProp`.
+    expect(resolved.defaultCalendarUrl).toBe(CALDAV_DEFAULT_CALENDAR);
+
+    const askedInbox = stub.observed.filter((one) => one.url === CALDAV_INBOX);
+    expect(askedInbox.length, "the inbox was asked once, or not at all").toBe(1);
+
+    const askedPrincipal = stub.observed.filter(
+      (one) => one.url === `${CALDAV_SERVER}${PRINCIPAL_PATH}`,
+    );
+    expect(askedPrincipal.length).toBeGreaterThan(0);
+
+    // SERIAL, and not merely un-raced by luck: the last principal request had
+    // finished before the inbox request began, because the inbox request cannot
+    // be built until the principal has said where the inbox is.
+    expect(
+      askedPrincipal[askedPrincipal.length - 1].end,
+      "the inbox was addressed before the principal named it",
+    ).toBeLessThan(askedInbox[0].start);
+    expect(stub.overlapped).toBe(false);
+  });
+
+  it("hands it back from a warm cache with ZERO outbound requests", async () => {
+    const cold = davStub({ scheduling: "full" });
+    vi.stubGlobal("fetch", cold.fetch);
+    const first = await resolveDavAccount(
+      env,
+      principal,
+      createDavFetch(owner),
+      "caldav",
+    );
+    expect(first.cacheHit).toBe(false);
+    expect(first.defaultCalendarUrl).toBe(CALDAV_DEFAULT_CALENDAR);
+
+    // A FRESH stub, so the warm read has its own recording to be empty.
+    const warm = davStub({ scheduling: "full" });
+    vi.stubGlobal("fetch", warm.fetch);
+    const second = await resolveDavAccount(
+      env,
+      principal,
+      createDavFetch(owner),
+      "caldav",
+    );
+
+    expect(second.cacheHit).toBe(true);
+    expect(second.defaultCalendarUrl).toBe(CALDAV_DEFAULT_CALENDAR);
+    // The whole of CALM-07 in one assertion. The comparand is in hand before the
+    // delete tool is ever called, so refusing the default calendar sends nothing.
+    expect(warm.observed).toEqual([]);
+  });
+
+  it("stores a NULL the inbox answered, and does not retry it as a miss", async () => {
+    // An inbox that names no default calendar is a real answer, not a gap. It has
+    // to be CACHED as one: treating it as a miss would pay two requests on every
+    // single call for the lifetime of the account.
+    const cold = davStub({ scheduling: "inbox" });
+    vi.stubGlobal("fetch", cold.fetch);
+    const first = await resolveDavAccount(
+      env,
+      principal,
+      createDavFetch(owner),
+      "caldav",
+    );
+    expect(first.defaultCalendarUrl).toBeNull();
+    // Both questions were asked: the inbox exists and was consulted.
+    expect(cold.observed.filter((one) => one.url === CALDAV_INBOX).length).toBe(1);
+
+    const warm = davStub({ scheduling: "inbox" });
+    vi.stubGlobal("fetch", warm.fetch);
+    const second = await resolveDavAccount(
+      env,
+      principal,
+      createDavFetch(owner),
+      "caldav",
+    );
+    expect(second.cacheHit).toBe(true);
+    expect(second.defaultCalendarUrl).toBeNull();
+    expect(warm.observed).toEqual([]);
+  });
+
+  it("asks the inbox nothing when the principal names none", async () => {
+    const stub = davStub({ scheduling: "none" });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const resolved = await resolveDavAccount(
+      env,
+      principal,
+      createDavFetch(owner),
+      "caldav",
+    );
+
+    expect(resolved.defaultCalendarUrl).toBeNull();
+    expect(stub.observed.filter((one) => one.url === CALDAV_INBOX)).toEqual([]);
+  });
+
+  it("stores NULL for CardDAV and asks the CalDAV side nothing at all", async () => {
+    // The property is a CalDAV one. A contacts home has no default calendar, so
+    // the resolution is skipped rather than attempted and discarded.
+    const stub = davStub({ scheduling: "full" });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const resolved = await resolveDavAccount(
+      env,
+      principal,
+      createDavFetch(owner),
+      "carddav",
+    );
+
+    expect(resolved.defaultCalendarUrl).toBeNull();
+    // `carddav` does not contain `caldav`, so this partition is exact.
+    expect(stub.observed.filter((one) => one.url.includes("caldav"))).toEqual([]);
+  });
+
+  it("answers null rather than failing when the inbox itself is not found", async () => {
+    // A DavNotFoundError is the server ANSWERING — there is no such resource or
+    // property — and "this account named no default calendar" is the same answer.
+    // Every other typed failure fails the resolve instead, because caching
+    // "none" on the strength of a throttled request would store a guess for a
+    // day, and that guess is the one value that makes a delete's refusal not fire.
+    const stub = davStub({
+      scheduling: "full",
+      onRequest: (url) =>
+        url === CALDAV_INBOX ? new Response(null, { status: 404 }) : null,
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const resolved = await resolveDavAccount(
+      env,
+      principal,
+      createDavFetch(owner),
+      "caldav",
+    );
+
+    expect(resolved.defaultCalendarUrl).toBeNull();
+    expect(resolved.homeUrl, "the triple still resolved").toBe(CALDAV_HOME);
+  });
+
+  it("fails the resolve rather than caching a guess when the inbox throttles", async () => {
+    // The other direction, and the one that matters. A 429 is not an answer about
+    // the account. Storing a null here would disarm the CALM-07 refusal for a
+    // day on the strength of one throttled request.
+    const stub = davStub({
+      scheduling: "full",
+      onRequest: (url) =>
+        url === CALDAV_INBOX ? new Response(null, { status: 429 }) : null,
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const err = await capture(() =>
+      resolveDavAccount(env, principal, createDavFetch(owner), "caldav"),
+    );
+
+    expect(err).toBeInstanceOf(DavThrottleError);
+    // And nothing was stored, so the next call resolves properly rather than
+    // reading a value this failure invented.
+    const kv = await env.DAV_CACHE.list({ prefix: "dav:" });
+    expect(kv.keys.map((one) => one.name)).toEqual([]);
+  });
+
+  it("does not read an entry written under the previous cache-key prefix as a hit", async () => {
+    // **The old prefix is spelled here ON PURPOSE, and this file is the only path
+    // in `src/` or `test/` that still carries it.** A tree-wide gate in plan
+    // 17-05's verification enforces exactly that, with this path as its single
+    // exception — by PATH, never by softening the gate — because the claim below
+    // cannot be written without the value. Do not delete it as a leftover.
+    //
+    // What it proves is the whole reason the namespace moved. An entry written
+    // under the previous version carries every URL the reader wants EXCEPT the
+    // default calendar, and read as the current shape that missing field would
+    // present as null — indistinguishable from an account that genuinely named
+    // none, and null is precisely the value that makes a delete's refusal not
+    // fire. So the old entries have to be unreachable rather than merely old.
+    const stale = `dav:v1:${principal.userId}:caldav`;
+    await env.DAV_CACHE.put(
+      stale,
+      JSON.stringify({
+        rootUrl: `${CALDAV_SERVER}/`,
+        principalUrl: `${CALDAV_SERVER}${PRINCIPAL_PATH}`,
+        homeUrl: CALDAV_HOME,
+      }),
+    );
+
+    try {
+      const stub = davStub({ scheduling: "full" });
+      vi.stubGlobal("fetch", stub.fetch);
+
+      const resolved = await resolveDavAccount(
+        env,
+        principal,
+        createDavFetch(owner),
+        "caldav",
+      );
+
+      expect(resolved.cacheHit, "the stale entry was read as a hit").toBe(false);
+      expect(resolved.defaultCalendarUrl).toBe(CALDAV_DEFAULT_CALENDAR);
+      expect(stub.observed.length).toBeGreaterThan(0);
+
+      // And the value that WAS stored sits under the current namespace, beside
+      // the stale one rather than on top of it.
+      const listed = await env.DAV_CACHE.list({ prefix: "dav:" });
+      const names = listed.keys.map((one) => one.name);
+      expect(names).toContain(`dav:v2:${principal.userId}:caldav`);
+      expect(names).toContain(stale);
+    } finally {
+      // Removed by hand: `clearDavCache` only knows the current namespace, which
+      // is the point of the namespace.
+      await env.DAV_CACHE.delete(stale);
+    }
+  });
 });
