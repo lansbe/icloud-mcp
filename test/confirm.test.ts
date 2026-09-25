@@ -2050,6 +2050,40 @@ describe("the server composes the human-facing line", () => {
     expect(line).toContain("This cannot be undone.");
   });
 
+  it("clips on code points, so an astral character is never cut in half", () => {
+    // The cap was a UTF-16 code-unit slice, which cuts an emoji in two at the
+    // boundary and leaves an unpaired high surrogate immediately before the
+    // ellipsis. `src/mcp/untrusted.ts` puts the payload through
+    // `JSON.stringify`, which is well-formed and therefore escapes a lone
+    // surrogate into the six literal characters of its escape sequence rather
+    // than throwing -- so those six characters printed inside the one sentence
+    // the user is asked to read. Not a security defect. It decides nothing and
+    // corrupts nothing, but the trigger is an emoji in a long event title,
+    // which is ordinary rather than hostile.
+    const burst = "\u{1F4A5}";
+    const line = composeConfirmationLine(
+      named("a".repeat(119) + burst.repeat(10)),
+      "would",
+    );
+
+    // The claim read structurally: no high surrogate without its low.
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(line)).toBe(false);
+    // And byte-exact: 119 letters, ONE whole burst, then the ellipsis. Under
+    // the code-unit slice the burst was halved, so this is the non-vacuous
+    // half -- a clip that kept 119 letters and no burst at all fails here.
+    expect(line).toBe(
+      `Deleting event '${"a".repeat(119)}${burst}\u2026'. This cannot be undone.`,
+    );
+    expect(JSON.stringify(line)).toContain(burst);
+
+    // And the other side of counting points: 120 astral characters is 240 code
+    // units and is NOT clipped, because what the cap bounds is how much of one
+    // sentence a stranger gets to write, not how it is encoded.
+    expect(composeConfirmationLine(named(burst.repeat(120)), "would")).toBe(
+      `Deleting event '${burst.repeat(120)}'. This cannot be undone.`,
+    );
+  });
+
   it("leaves a title that needed no folding byte-exact", () => {
     // The fold is not a rewrite of ordinary titles. A name at the cap exactly
     // is not clipped, and an unremarkable one is untouched.

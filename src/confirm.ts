@@ -1135,6 +1135,11 @@ const INVITATION_CONSEQUENCE = "An invitation cannot be unsent.";
  * A cap and not a limit on the value: nothing refuses a longer name, and the
  * structured fields beside this line publish it whole. What the cap bounds is
  * how much of one sentence a stranger gets to write.
+ *
+ * Counted in code POINTS, where `quotedName` takes the count. That is both the
+ * safe measure and the honest one: a UTF-16 count would cut an astral
+ * character in half at the boundary, and it would also charge an emoji twice
+ * what it charges a letter for the same amount of the sentence.
  */
 const NAME_MAX = 120;
 
@@ -1217,8 +1222,25 @@ function quotedName(name: string): string {
     .replace(/'/g, "\u2019")
     .trim();
 
-  return flattened.length > NAME_MAX
-    ? `${flattened.slice(0, NAME_MAX).trimEnd()}\u2026`
+  // Code POINTS, not code units. A UTF-16 slice cuts an astral character -- an
+  // emoji, most of CJK extension B, the mathematical alphanumerics -- in half
+  // at the boundary, and the unpaired surrogate left behind reaches
+  // `JSON.stringify` in `src/mcp/untrusted.ts`. That is well-formed (ES2019),
+  // so it escapes the lone surrogate into the six literal characters of its
+  // escape sequence rather than throwing, and those six characters then print
+  // inside the one sentence the user is asked to read. The trigger is an emoji
+  // in a long event title, which is ordinary rather than hostile.
+  //
+  // It still splits a GRAPHEME cluster -- a ZWJ emoji sequence, or a base
+  // letter and its combining mark -- and that is left alone deliberately.
+  // Said here because the next reader will ask: the result is well-formed and
+  // merely looks different, and an `Intl.Segmenter` for it would buy
+  // appearance at the price of a second notion of length inside a function
+  // whose whole job is bounding one.
+  const points = [...flattened];
+
+  return points.length > NAME_MAX
+    ? `${points.slice(0, NAME_MAX).join("").trimEnd()}\u2026`
     : flattened;
 }
 
