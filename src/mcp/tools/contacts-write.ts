@@ -52,8 +52,10 @@ import type {
 import {
   contactUidFromObjectUrl,
   createContact,
+  findDuplicateCandidates,
   planContactCreateTarget,
 } from "../../dav/contacts";
+import type { DuplicateCandidate } from "../../dav/contacts";
 import { DavConfirmationError } from "../../dav/errors";
 import { encodeContactId } from "../../dav/ids";
 import type { ContactRef } from "../../dav/ids";
@@ -141,6 +143,28 @@ export interface ContactCreatePreview {
   change: NormalizedContactChange;
   /** The sentence this server wrote for a person to read. */
   confirmationLine: string;
+  /**
+   * How many existing cards already carry one of the supplied values (CONW-05).
+   *
+   * **Present on EVERY preview, zero included**, so the key set does not vary
+   * between one preview and the next. A field that appears only when it is
+   * interesting teaches a reader to treat its absence as the absence of the
+   * question rather than as an answer to it.
+   */
+  duplicateCandidateCount: number;
+  /**
+   * The candidates themselves, at most three (CONW-05).
+   *
+   * **An observation this server made at preview time, like an ETag — NOT part
+   * of the signed change.** It never enters `canonicalContactChange` or the
+   * hash, deliberately: binding it would make the commit refuse a write because
+   * somebody else added a card in between, which is not what CONW-06 is for and
+   * not a refusal anybody asked for (T-16-19).
+   *
+   * Nothing has been merged, nothing redirected and nothing refused. Committing
+   * creates a new card ALONGSIDE these.
+   */
+  duplicateCandidates: DuplicateCandidate[];
 }
 
 /** What a finished contact commit answers with. */
@@ -157,14 +181,22 @@ export interface ContactCommitOutcome {
 /**
  * The half of a preview this server planned, counted or minted.
  *
- * Six fields, and every one of them is a statement about this server's own work:
- * an opaque id it minted from a target it planned, a boolean it decided, a list
- * of names from its OWN closed vocabulary, that list's length, the capability it
- * signed, and that capability's life.
+ * Eight fields, and every one of them is a statement about this server's own
+ * work: an opaque id it minted from a target it planned, a boolean it decided, a
+ * list of names from its OWN closed vocabulary, that list's length, the
+ * capability it signed, that capability's life, a COUNT it took, and a row per
+ * candidate carrying two opaque ids and a label from a closed three-value
+ * vocabulary it chose from.
  *
  * **Note what is NOT here: `confirmationLine`.** It quotes a card-supplied name,
  * so it rides in the untrusted half — Phase 15 decided that and this module is
  * the first new consumer to inherit it rather than the first to reopen it.
+ *
+ * **And note what is not here from the candidates: every word off the cards.** A
+ * candidate's display name and its addresses came off a card somebody else wrote,
+ * and an address is the field a reader is most likely to assume is safe because
+ * it looks like a protocol value. The COUNT and the SIGNAL are this server's, on
+ * `matchPath`'s own precedent one module over.
  */
 function contactPreviewTrustedPart(
   preview: ContactCreatePreview,
@@ -176,6 +208,12 @@ function contactPreviewTrustedPart(
     fieldCount: preview.fieldCount,
     confirmToken: preview.confirmToken,
     expiresInSeconds: preview.expiresInSeconds,
+    duplicateCandidateCount: preview.duplicateCandidateCount,
+    duplicateCandidates: preview.duplicateCandidates.map((one) => ({
+      id: one.id,
+      addressBookId: one.addressBookId,
+      signal: one.signal,
+    })),
   };
 }
 
@@ -198,6 +236,15 @@ function contactPreviewUntrustedPart(
     // own name, so it belongs on this side. The fence did not move to
     // accommodate it and must not.
     confirmationLine: preview.confirmationLine,
+    // Every word somebody ELSE wrote onto the cards this scan found. The rows are
+    // keyed on the same container name as the trusted half and repeat the opaque
+    // id, so the model joins the two halves BY IDENTITY exactly as it does for the
+    // preview itself.
+    duplicateCandidates: preview.duplicateCandidates.map((one) => ({
+      id: one.id,
+      displayName: one.displayName,
+      emails: one.emails,
+    })),
   };
 }
 
@@ -437,14 +484,53 @@ function displayNameForChange(change: NormalizedContactChange): string {
 }
 
 /**
- * Preview a contact create: plan a target, mint a confirmation, write nothing.
+ * The FIRST value on a supplied list, or null for a list with nothing on it.
  *
- * ## Nothing reaches the network
+ * First and not every one, because a create carrying five addresses must not cost
+ * five queries — the phase's locked "at most two queries" decision is about the
+ * whole scan and not about one field. The first is the one the caller led with,
+ * and both routes probe the same two values, so the two stay in agreement with
+ * each other rather than each seeing a different slice of the change.
  *
- * Not one outbound request. A create has nothing to read, the target is computed
- * from an opaque id, and the confirmation is signed locally — so this whole leg
- * is a decode, a uuid, a hash and an HMAC. The commit leg's single request is the
- * write.
+ * A blank value is null rather than a probe. `findDuplicateCandidates` would
+ * match nothing on it, but supplying it would still spend a query.
+ */
+function firstProbeValue(entries: ContactListEntry[] | null): string | null {
+  if (entries === null) return null;
+  for (const entry of entries) {
+    if (entry.value.length > 0) return entry.value;
+  }
+  return null;
+}
+
+/**
+ * Preview a contact create: plan a target, scan for duplicates, write nothing.
+ *
+ * ## What reaches the network, and what does not
+ *
+ * The create itself reaches nothing: its target is computed from an opaque id and
+ * its confirmation is signed locally, so that half is a decode, a uuid, a hash and
+ * an HMAC. The duplicate scan (CONW-05) is the only outbound cost on this leg, and
+ * it is bounded rather than incidental — at most two filtered queries, issued
+ * serially, and **NOTHING AT ALL when the change carries neither an address nor a
+ * telephone number.** See `findDuplicateCandidates` for the whole cost argument.
+ *
+ * ## The order, and why the scan sits where it does
+ *
+ * Whether the scan runs inside this builder or beside it is the phase context's
+ * explicit discretion. It runs inside, AFTER the target has been planned and
+ * BEFORE the confirmation is minted, for two reasons: a refusal that costs nothing
+ * still costs nothing, because planning is free and comes first; and the candidate
+ * list becomes a fact about the moment the user was shown rather than about some
+ * later moment.
+ *
+ * ## The candidates change nothing
+ *
+ * They are not in the signed change and never enter the hash — see the field's own
+ * docstring. Nothing is merged, nothing is copied off a candidate, the write is not
+ * redirected to one, and no write is refused because one exists. Refusing would
+ * make a legitimate second card for the same person impossible to create, which is
+ * why CONW-05 asks for surfacing rather than for a gate.
  *
  * ## The target is planned before anything exists
  *
@@ -455,6 +541,7 @@ function displayNameForChange(change: NormalizedContactChange): string {
  */
 async function buildContactCreatePreview(
   principal: Principal,
+  davFetch: DavFetch,
   addressBookId: string,
   supplied: SuppliedContactChange,
 ): Promise<ContactCreatePreview> {
@@ -462,6 +549,23 @@ async function buildContactCreatePreview(
   const change = normalizeSuppliedContact(supplied);
   const fields = changedContactFields(change);
   const id = encodeContactId(ref);
+
+  const duplicateCandidates = await findDuplicateCandidates(
+    env,
+    principal,
+    davFetch,
+    {
+      email: firstProbeValue(change.emails),
+      tel: firstProbeValue(change.tels),
+      // RANKS and never queries. Through `displayNameForChange` so the name the
+      // scan compares is the name the card will actually be called — including
+      // the empty-`FN` fallback that function exists for.
+      displayName: displayNameForChange(change),
+      // NULL: a create has no card yet, so there is nothing to exclude. The
+      // update kind passes the card it is updating.
+      excludeObjectUrl: null,
+    },
+  );
 
   const confirmToken = await mintConfirmation(
     {
@@ -526,6 +630,8 @@ async function buildContactCreatePreview(
       },
       "would",
     ),
+    duplicateCandidateCount: duplicateCandidates.length,
+    duplicateCandidates,
   };
 }
 
@@ -786,9 +892,20 @@ export function registerContactsWriteTools(
   server.registerTool(
     "contacts_create",
     {
+      // **Why the duplicate list gets words here at all.** A list of names with
+      // no account of itself reads as an instruction — "here are some people",
+      // and a model with no statement of what they mean is left to guess whether
+      // it should be merging into one of them. So the description states the
+      // CONSEQUENCE, in the register the rest of this registrar uses: these cards
+      // already hold something you supplied, nothing was merged, and committing
+      // adds a card. The per-tool ceiling is 280 characters and the untrusted
+      // notice is 133 of them, which is why the original "returns what would be
+      // created plus a confirmation" was compressed rather than extended: a
+      // sentence that does not fit is a sentence nobody reads.
       description:
-        "Preview a new contact. Writes nothing: returns what would be " +
-        `created plus a confirmation for contacts_commit. ${CONTACTS_UNTRUSTED_NOTICE}`,
+        "Preview a new contact. Writes nothing. duplicateCandidates: cards " +
+        "already holding a supplied value; none merged. Commit with " +
+        `contacts_commit. ${CONTACTS_UNTRUSTED_NOTICE}`,
       inputSchema: z.object({
         addressBookId: z
           .string()
@@ -807,6 +924,7 @@ export function registerContactsWriteTools(
           await withContactConfirmationBoundary(() =>
             buildContactCreatePreview(
               actor,
+              davFetch,
               addressBookId,
               change as SuppliedContactChange,
             ),

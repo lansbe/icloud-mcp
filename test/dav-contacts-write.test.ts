@@ -79,19 +79,35 @@ interface WriteStub {
 }
 
 /**
- * The smallest CardDAV conversation that reaches the write: discovery and a PUT.
+ * The smallest CardDAV conversation that reaches BOTH legs: the duplicate scan's
+ * reads, and the write's PUT.
  *
- * No enumeration branch and no multi-get, deliberately — a create reads nothing,
- * so a stub that could answer a read would let a leg that performed one pass
- * unnoticed. Anything this stub does not recognise answers 500, which surfaces as
- * a refusal rather than as a silent success.
+ * **It answered no read at all until CONW-05, and the reason it answered none is
+ * worth keeping in view: a create reads nothing, so a stub that could answer a
+ * read would let a leg that performed one pass unnoticed.** The duplicate scan is
+ * a read, on the PREVIEW leg, deliberately and by design — so the read branches
+ * exist now and the property that argument protected is held a different way: the
+ * commit-leg assertions count from a clean slate through `afterPreview`, which
+ * also asserts the preview wrote nothing.
+ *
+ * The book advertises only the reports the real account advertises, so the scan
+ * takes the live route rather than the one this account does not have. `cards`
+ * defaults to EMPTY, which is the cheapest shape that still issues every request
+ * the route costs: with no object to read, the bulk read is skipped by the route
+ * itself rather than by this stub.
+ *
+ * Anything this stub does not recognise answers 500, which surfaces as a refusal
+ * rather than as a silent success.
  *
  * The overlap counter wraps the WHOLE conversation rather than one branch, so a
  * fan-out anywhere in a leg is seen — including one pairing a read with a write,
  * which is the shape a two-request commit would most plausibly grow into. §3 of
  * `.claude/CLAUDE.md` is what makes that worth counting rather than assuming.
  */
-function writeStub(options: { onPut?: () => Response } = {}): WriteStub {
+function writeStub(
+  options: { onPut?: () => Response; cards?: Record<string, string> } = {},
+): WriteStub {
+  const cards = options.cards ?? {};
   const state: WriteStub = {
     observed: [],
     fetch: async () => new Response(null, { status: 500 }),
@@ -138,6 +154,53 @@ function writeStub(options: { onPut?: () => Response } = {}): WriteStub {
       return options.onPut?.() ?? new Response(null, { status: 201 });
     }
 
+    // --- the duplicate scan's reads (CONW-05) ------------------------------
+    //
+    // One address book, advertising what the real account advertises, so the scan
+    // takes the route production takes.
+    const body = String(init?.body ?? "");
+
+    if (method === "PROPFIND") {
+      if (body.includes("supported-report-set")) {
+        return path === BOOK_PATH
+          ? multistatus(
+              `<response><href>${BOOK_PATH}</href><propstat><status>HTTP/1.1 200 OK</status><prop><supported-report-set><supported-report><report><sync-collection/></report></supported-report><supported-report><report><addressbook-multiget/></report></supported-report></supported-report-set></prop></propstat></response>`,
+            )
+          : new Response(null, { status: 404 });
+      }
+      // The home set.
+      if (path !== BOOK_PATH) {
+        return multistatus(
+          `<response><href>${BOOK_PATH}</href><propstat><status>HTTP/1.1 200 OK</status><prop><displayname>Contacts</displayname><resourcetype><collection/><C:addressbook/></resourcetype></prop></propstat></response>`,
+        );
+      }
+      // One address book's objects, plus the collection itself — which a real
+      // server includes and a caller must therefore filter out.
+      return multistatus(
+        [BOOK_PATH, ...Object.keys(cards)]
+          .map(
+            (href) =>
+              `<response><href>${href}</href><propstat><status>HTTP/1.1 200 OK</status><prop><getetag>"etag-1"</getetag></prop></propstat></response>`,
+          )
+          .join(""),
+      );
+    }
+
+    if (method === "REPORT" && body.includes("addressbook-multiget")) {
+      const asked = [
+        ...body.matchAll(/<[a-z]*:?href>([^<]+)<\/[a-z]*:?href>/g),
+      ].map((one) => one[1]);
+      return multistatus(
+        asked
+          .filter((href) => cards[href] !== undefined)
+          .map(
+            (href) =>
+              `<response><href>${href}</href><propstat><status>HTTP/1.1 200 OK</status><prop><getetag>"etag-1"</getetag><C:address-data><![CDATA[${cards[href]}]]></C:address-data></prop></propstat></response>`,
+          )
+          .join(""),
+      );
+    }
+
     return new Response(null, { status: 500 });
   };
 
@@ -170,6 +233,28 @@ async function warm(stub: WriteStub): Promise<void> {
     "carddav",
   );
   expect(resolved.cacheHit).toBe(false);
+  stub.observed.length = 0;
+}
+
+/**
+ * Assert the preview leg WROTE nothing, then forget its reads.
+ *
+ * Every commit-leg count below used to be able to say "the whole conversation was
+ * one request", because the preview leg spent nothing at all. CONW-05 put a read
+ * on the preview leg on purpose, so the claim is split into the two halves it was
+ * always really making: the preview writes nothing (asserted here, on the method,
+ * which is the half that matters), and the commit costs exactly one request
+ * (asserted there, from a clean slate).
+ *
+ * Clearing rather than counting a delta, because a delta hides WHICH requests were
+ * the preview's — and a preview that grew a PUT would show up as a bigger delta
+ * rather than as the write it is.
+ */
+function afterPreview(stub: WriteStub): void {
+  expect(
+    stub.observed.filter((one) => one.method === "PUT"),
+    "the preview leg wrote something",
+  ).toHaveLength(0);
   stub.observed.length = 0;
 }
 
@@ -278,9 +363,11 @@ describe("the contacts_create preview", () => {
 
     const { trusted } = await preview({ addressBookId: BOOK_ID, change: supplied() });
 
-    // ZERO requests. A create has nothing to read and this leg writes nothing,
-    // so the whole preview is a decode, a uuid, a hash and an HMAC.
-    expect(stub.observed).toHaveLength(0);
+    // NOTHING WRITTEN. A create has nothing to read on its own account — the
+    // target is computed from an opaque id and the confirmation is signed locally
+    // — so every request this leg makes is the duplicate scan's, and the scan
+    // writes nothing. The method is what the claim is about, not the count.
+    expect(stub.observed.filter((one) => one.method === "PUT")).toHaveLength(0);
     expect(typeof trusted.confirmToken).toBe("string");
     expect(String(trusted.confirmToken).length).toBeGreaterThan(0);
     expect(trusted.willCreate).toBe(true);
@@ -384,6 +471,240 @@ describe("the contacts_create preview", () => {
 });
 
 // ===========================================================================
+// The duplicate candidates on the preview (CONW-05)
+// ===========================================================================
+
+describe("the preview's duplicate candidates", () => {
+  /**
+   * A card already holding the address and the number `supplied()` carries.
+   *
+   * **Named DIFFERENTLY from the card being created, on purpose.** The fence
+   * assertions below check that this name does not reach the trusted half, and a
+   * twin sharing the created card's name would make those assertions pass on
+   * either string — so they would no longer be about the candidate at all.
+   */
+  const TWIN_HREF = `${BOOK_PATH}twin.vcf`;
+  const TWIN_NAME = "Marisol Solano";
+  const TWIN_EMAIL = "adaeze@example.invalid";
+  const TWIN_VCF = [
+    "BEGIN:VCARD",
+    "VERSION:3.0",
+    "UID:twin-0001",
+    `FN:${TWIN_NAME}`,
+    "N:Solano;Marisol;;;",
+    `EMAIL;TYPE=INTERNET:${TWIN_EMAIL}`,
+    "TEL;TYPE=CELL:+1-555-0142",
+    "END:VCARD",
+    "",
+  ].join("\r\n");
+
+  it("names a card already holding a supplied value, and merges nothing", async () => {
+    const stub = writeStub({ cards: { [TWIN_HREF]: TWIN_VCF } });
+    await warm(stub);
+
+    const { trusted, untrusted } = await preview({
+      addressBookId: BOOK_ID,
+      change: supplied(),
+    });
+
+    expect(trusted.duplicateCandidateCount).toBe(1);
+    // The signal is a CLOSED three-value vocabulary this server chose from, so it
+    // rides OUTSIDE the fence beside the count.
+    expect(trusted.duplicateCandidates).toEqual([
+      {
+        id: encodeContactId({
+          addressBookUrl: BOOK_URL,
+          objectUrl: `${BOOK_URL}twin.vcf`,
+        }),
+        addressBookId: BOOK_ID,
+        signal: "email",
+      },
+    ]);
+    // And the write is unaffected by what it found: this is still a create of a
+    // NEW card, at the id the preview planned, which is not the candidate's.
+    expect(trusted.willCreate).toBe(true);
+    expect(trusted.id).not.toBe(
+      encodeContactId({
+        addressBookUrl: BOOK_URL,
+        objectUrl: `${BOOK_URL}twin.vcf`,
+      }),
+    );
+    // Nothing was copied off the candidate into the change either.
+    expect(untrusted.change).toEqual(
+      (await preview({ addressBookId: BOOK_ID, change: supplied() })).untrusted
+        .change,
+    );
+  });
+
+  it("keeps every candidate's NAME and ADDRESS inside the fence", async () => {
+    const stub = writeStub({ cards: { [TWIN_HREF]: TWIN_VCF } });
+    await warm(stub);
+
+    const { raw, untrusted } = await preview({
+      addressBookId: BOOK_ID,
+      change: supplied(),
+    });
+
+    // Both came off a card somebody ELSE wrote. The address is the sharper of the
+    // two: it looks like a protocol value, so a reader assumes it is safe.
+    expect(raw.trusted).not.toContain(TWIN_NAME);
+    expect(raw.trusted).not.toContain(TWIN_EMAIL);
+
+    const candidates = untrusted.duplicateCandidates as Record<
+      string,
+      unknown
+    >[];
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].displayName).toBe(TWIN_NAME);
+    expect(
+      (candidates[0].emails as { value: string }[]).map((one) => one.value),
+    ).toEqual([TWIN_EMAIL]);
+    // The id is on BOTH sides, so the fenced name joins the trusted signal by
+    // identity rather than by position.
+    expect(candidates[0].id).toBe(
+      (trustedCandidates(raw.trusted)[0] as Record<string, unknown>).id,
+    );
+  });
+
+  it("reports ZERO on a preview that found nothing, rather than omitting the key", async () => {
+    const stub = writeStub();
+    await warm(stub);
+
+    const { trusted } = await preview({
+      addressBookId: BOOK_ID,
+      change: supplied(),
+    });
+
+    // A field that appears only when it is interesting teaches a reader to treat
+    // its absence as the absence of the question rather than as an answer to it.
+    expect("duplicateCandidateCount" in trusted).toBe(true);
+    expect(trusted.duplicateCandidateCount).toBe(0);
+    expect(trusted.duplicateCandidates).toEqual([]);
+  });
+
+  it("spends NOTHING scanning when the change carries no address and no number", async () => {
+    const stub = writeStub();
+    await warm(stub);
+
+    const withoutValues = supplied();
+    delete withoutValues.emails;
+    delete withoutValues.tels;
+
+    const { trusted } = await preview({
+      addressBookId: BOOK_ID,
+      change: withoutValues,
+    });
+
+    // The whole preview is a decode, a uuid, a hash and an HMAC again — which is
+    // the locked "a create carrying neither spends nothing" decision, and it has
+    // to be true of the discovery read as well as of the queries.
+    expect(stub.observed).toHaveLength(0);
+    expect(trusted.duplicateCandidateCount).toBe(0);
+  });
+
+  it("probes the FIRST supplied address and number, not all of them", async () => {
+    const stub = writeStub();
+    await warm(stub);
+
+    await preview({
+      addressBookId: BOOK_ID,
+      change: supplied({
+        emails: [
+          { value: "first@example.invalid" },
+          { value: "second@example.invalid" },
+          { value: "third@example.invalid" },
+        ],
+      }),
+    });
+
+    // A create carrying five addresses must not cost five queries. On the live
+    // route the probe values are not on the wire at all, so what this counts is
+    // the route's cost: one enumeration over one book, and no more.
+    const enumerations = stub.observed.filter(
+      (one) =>
+        one.method === "PROPFIND" &&
+        new URL(one.url).pathname === BOOK_PATH &&
+        !String(one.body).includes("supported-report-set"),
+    );
+    expect(enumerations).toHaveLength(1);
+    expect(stub.maxInFlight).toBe(1);
+  });
+
+  it("writes exactly ONE card, carrying nothing off the candidate", async () => {
+    const stub = writeStub({ cards: { [TWIN_HREF]: TWIN_VCF } });
+    await warm(stub);
+
+    const { trusted } = await preview({
+      addressBookId: BOOK_ID,
+      change: supplied(),
+    });
+    expect(trusted.duplicateCandidateCount).toBe(1);
+    afterPreview(stub);
+
+    const result = await invoke("contacts_commit", {
+      confirmToken: trusted.confirmToken,
+      change: supplied(),
+    });
+    expect(
+      result.isError,
+      `the commit refused: ${result.content[0]?.text}`,
+    ).not.toBe(true);
+
+    // ONE write. Not a merge into the candidate, not a second card, and not a
+    // refusal: refusing would make a legitimate second card for the same person
+    // impossible to create, which is why CONW-05 asks for surfacing.
+    const writes = stub.observed.filter((one) => one.method === "PUT");
+    expect(writes).toHaveLength(1);
+    expect(new URL(writes[0].url).pathname).not.toBe(TWIN_HREF);
+
+    // And no field of the candidate reached the written body. The candidate's uid
+    // is the sharpest witness: a merge would have written it.
+    const body = String(writes[0].body);
+    expect(body).not.toContain("twin-0001");
+    expect(body).not.toContain(TWIN_NAME);
+    expect(body).toContain("\r\nUID:");
+    expect(parseVCard(body).uid).not.toBe("twin-0001");
+  });
+
+  it("does NOT bind the candidates into the signed change", async () => {
+    // They are an observation this server made at preview time, like an ETag.
+    // Binding them would make the commit refuse a write because somebody else
+    // added a card in between, which is not what CONW-06 is for.
+    const withTwin = writeStub({ cards: { [TWIN_HREF]: TWIN_VCF } });
+    await warm(withTwin);
+
+    const { trusted } = await preview({
+      addressBookId: BOOK_ID,
+      change: supplied(),
+    });
+    expect(trusted.duplicateCandidateCount).toBe(1);
+
+    // The book changes underneath: the candidate is gone by commit time.
+    const emptied = writeStub();
+    vi.stubGlobal("fetch", emptied.fetch);
+
+    const result = await invoke("contacts_commit", {
+      confirmToken: trusted.confirmToken,
+      change: supplied(),
+    });
+
+    expect(
+      result.isError,
+      `the commit refused: ${result.content[0]?.text}`,
+    ).not.toBe(true);
+    expect(emptied.observed.filter((one) => one.method === "PUT")).toHaveLength(
+      1,
+    );
+  });
+});
+
+/** The candidate rows of a trusted block, already parsed. */
+function trustedCandidates(trusted: string): unknown[] {
+  const parsed = JSON.parse(trusted) as Record<string, unknown>;
+  return parsed.duplicateCandidates as unknown[];
+}
+
+// ===========================================================================
 // The commit
 // ===========================================================================
 
@@ -396,7 +717,7 @@ describe("the contacts_commit write", () => {
       addressBookId: BOOK_ID,
       change: supplied(),
     });
-    expect(stub.observed).toHaveLength(0);
+    afterPreview(stub);
 
     const result = await invoke("contacts_commit", {
       confirmToken: trusted.confirmToken,
@@ -466,6 +787,7 @@ describe("the contacts_commit write", () => {
       addressBookId: BOOK_ID,
       change: supplied(),
     });
+    afterPreview(stub);
     const result = await invoke("contacts_commit", {
       confirmToken: trusted.confirmToken,
       change: supplied(),
@@ -493,6 +815,7 @@ describe("the contacts_commit write", () => {
       addressBookId: BOOK_ID,
       change: supplied(),
     });
+    afterPreview(stub);
 
     const first = await invoke("contacts_commit", {
       confirmToken: trusted.confirmToken,
@@ -573,6 +896,7 @@ describe("the contacts_commit write", () => {
       addressBookId: BOOK_ID,
       change: supplied(),
     });
+    afterPreview(stub);
 
     const result = await invoke("contacts_commit", {
       confirmToken: trusted.confirmToken,
@@ -603,6 +927,7 @@ describe("the contacts_commit write", () => {
       addressBookId: BOOK_ID,
       change: withoutNote,
     });
+    afterPreview(stub);
 
     const result = await invoke("contacts_commit", {
       confirmToken: trusted.confirmToken,

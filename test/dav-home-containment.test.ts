@@ -483,6 +483,13 @@ export const HOME_EXEMPT_REQUEST_SITES: readonly ExemptSite[] = Object.freeze([
   },
   {
     file: CONTACTS,
+    fn: "duplicateQuery",
+    request: "addressBookQuery",
+    reason:
+      "the target is a book URL from fetchBooks, which is derived from resolved.homeUrl, exactly as its search counterpart above. The probe values a caller supplied reach the filter body and never the URL, and the property name reaching the filter is one of two constants this module owns rather than anything the caller chose — so the duplicate scan (CONW-05) adds no new way to aim a request even though it adds a new request",
+  },
+  {
+    file: CONTACTS,
     fn: "localRoute",
     request: "propfind",
     reason:
