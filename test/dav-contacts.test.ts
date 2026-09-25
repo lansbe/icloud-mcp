@@ -2461,17 +2461,18 @@ function describedParam(name: string, param: string): string {
 }
 
 describe("the contacts registrations", () => {
-  it("registers exactly the two read tools and the two write tools", () => {
-    // Four since CONW-01, and the two writes arrive through the DELEGATION at the
-    // foot of `registerContactsTools` rather than through a registrar of their
-    // own. This suite is the read side's own, and it pins all four anyway: a
-    // delegation that stopped being called would leave every read case here green
-    // while two tools silently vanished from the server.
+  it("registers exactly the two read tools and the three write tools", () => {
+    // Four since CONW-01 and FIVE since CONW-02, and every write arrives through
+    // the DELEGATION at the foot of `registerContactsTools` rather than through a
+    // registrar of its own. This suite is the read side's own, and it pins all
+    // five anyway: a delegation that stopped being called would leave every read
+    // case here green while three tools silently vanished from the server.
     expect(registeredContacts().map((one) => one.name).sort()).toEqual([
       "contacts_commit",
       "contacts_create",
       "contacts_get",
       "contacts_search",
+      "contacts_update",
     ]);
   });
 

@@ -18,7 +18,7 @@
 // early has read the half that will still be true.
 //
 // **It deliberately enumerates no tools beyond the three it tells the model to
-// REACH FOR.** The tool list already names all twenty-four with their own
+// REACH FOR.** The tool list already names all twenty-seven with their own
 // descriptions; a second copy here would be a second thing to update, and the
 // copy nobody updated is the one the model would act on. `account_whoami`,
 // `calendar_commit`, `mail_imap_diagnose` and `dav_diagnose` appear because each
@@ -85,7 +85,9 @@ Mail is read-only apart from drafts. There is no mail triage: nothing here moves
 
 Calendar can create, update and delete, through the preview-and-commit shape above.
 
-Contacts can create, through the same preview-and-commit shape.
+Contacts can create and update, through the same preview-and-commit shape.
+
+An update replaces the WHOLE card -- CardDAV has no partial update. This server handles that by patching the card it fetched rather than building a new one, so send only the fields that change and everything you did not mention survives. Do not assemble a complete contact object from what you remember: the fields you leave out of one of those would be deletions, on every device the user owns. The preview reports preservedPropertyCount, which is how many properties on the card it is leaving alone.
 
 ## When a call says the password was rejected
 

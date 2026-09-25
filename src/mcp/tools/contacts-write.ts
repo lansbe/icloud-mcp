@@ -53,14 +53,21 @@ import {
   contactUidFromObjectUrl,
   createContact,
   findDuplicateCandidates,
+  getContactWithEtag,
   planContactCreateTarget,
+  updateContact,
 } from "../../dav/contacts";
 import type { DuplicateCandidate } from "../../dav/contacts";
-import { DavConfirmationError } from "../../dav/errors";
-import { encodeContactId } from "../../dav/ids";
+import { DavConfirmationError, DavStaleResourceError } from "../../dav/errors";
+import { decodeContactId, encodeContactId } from "../../dav/ids";
 import type { ContactRef } from "../../dav/ids";
 import type { DavFetch } from "../../dav/transport";
-import { buildContactCard, displayNameFor } from "../../dav/vcard";
+import {
+  buildContactCard,
+  countPreservedProperties,
+  displayNameFor,
+  patchContactCard,
+} from "../../dav/vcard";
 import type { ParsedContact } from "../../dav/vcard";
 import type { ToolResult } from "../untrusted";
 import { untrustedToolResult } from "../untrusted";
@@ -125,11 +132,39 @@ export interface SuppliedContactChange {
   tels?: { value: string; types?: string[] }[] | null;
 }
 
-/** What a contact create preview answers with. Nothing has been written. */
-export interface ContactCreatePreview {
-  /** The opaque contact id the card WOULD get, minted from the planned target. */
+/**
+ * What a contact write preview answers with. Nothing has been written.
+ *
+ * ONE type for both operations rather than two, and `willCreate` is what tells
+ * them apart. Two independently declared shapes would agree today and drift the
+ * first time either grew a field — silently, because both would still serialise
+ * into a plausible response — which is the argument `ContactDetail` records for
+ * extending `ContactSummary` rather than paralleling it. Here it is sharper
+ * still: the fence audit walks this shape's key set, so a second shape would be
+ * a second thing the fence has to be taught about.
+ *
+ * It was called `ContactCreatePreview` until the update arrived, and the rename
+ * is not tidying: a type named for one operation is a type the next reader
+ * copies for the other.
+ */
+export interface ContactWritePreview {
+  /**
+   * The opaque contact id.
+   *
+   * On a create, the card the preview PLANNED, minted before anything exists. On
+   * an update, the card that was fetched — byte-identical to the id the caller
+   * supplied, because an update moves nothing.
+   */
   id: string;
-  /** True on this path always: a create brings one card into being. */
+  /**
+   * Which operation was previewed: true brings a new card into being, false
+   * overwrites one that already exists.
+   *
+   * **It discriminates now, and it was constantly true before the update
+   * existed.** A boolean nobody could read a `false` out of is a field that
+   * teaches a reader to skip it, so the one fact worth checking about the two
+   * legs would have been the field nobody looked at.
+   */
   willCreate: boolean;
   /** Field NAMES from `CONTACT_CHANGE_FIELDS`. Never values. */
   changedFields: ContactChangeField[];
@@ -165,6 +200,26 @@ export interface ContactCreatePreview {
    * creates a new card ALONGSIDE these.
    */
   duplicateCandidates: DuplicateCandidate[];
+  /**
+   * How many properties on the existing card this change leaves alone (CONW-02).
+   *
+   * **PITFALLS #40's own recommendation, made concrete.** A CardDAV update is a
+   * whole-card overwrite, so the user's real question is not "what changes" but
+   * "what survives" — and a preview showing only the new value is one of the
+   * warning signs Pitfall 39 lists for exactly this operation. "Changing 1
+   * field, 23 other properties preserved" is a sentence somebody can check
+   * against the card in front of them.
+   *
+   * A COUNT this server took by walking the card it fetched, never a value read
+   * off that card, which is why it rides outside the fence beside
+   * `duplicateCandidateCount`.
+   *
+   * **Present on EVERY preview, and ZERO on a create**, so the key set does not
+   * vary between one preview and the next — `duplicateCandidateCount`'s own
+   * argument. Zero is the true answer for a create rather than a placeholder:
+   * there is no existing card, so there is nothing being preserved.
+   */
+  preservedPropertyCount: number;
 }
 
 /** What a finished contact commit answers with. */
@@ -181,12 +236,13 @@ export interface ContactCommitOutcome {
 /**
  * The half of a preview this server planned, counted or minted.
  *
- * Eight fields, and every one of them is a statement about this server's own
- * work: an opaque id it minted from a target it planned, a boolean it decided, a
- * list of names from its OWN closed vocabulary, that list's length, the
- * capability it signed, that capability's life, a COUNT it took, and a row per
- * candidate carrying two opaque ids and a label from a closed three-value
- * vocabulary it chose from.
+ * Nine fields, and every one of them is a statement about this server's own
+ * work: an opaque id it minted from a target it planned or was handed, a boolean
+ * it decided, a list of names from its OWN closed vocabulary, that list's
+ * length, the capability it signed, that capability's life, a COUNT of cards it
+ * found, a row per candidate carrying two opaque ids and a label from a closed
+ * three-value vocabulary it chose from, and a COUNT of properties it took by
+ * walking the card it fetched.
  *
  * **Note what is NOT here: `confirmationLine`.** It quotes a card-supplied name,
  * so it rides in the untrusted half — Phase 15 decided that and this module is
@@ -199,7 +255,7 @@ export interface ContactCommitOutcome {
  * `matchPath`'s own precedent one module over.
  */
 function contactPreviewTrustedPart(
-  preview: ContactCreatePreview,
+  preview: ContactWritePreview,
 ): Record<string, unknown> {
   return {
     id: preview.id,
@@ -214,6 +270,7 @@ function contactPreviewTrustedPart(
       addressBookId: one.addressBookId,
       signal: one.signal,
     })),
+    preservedPropertyCount: preview.preservedPropertyCount,
   };
 }
 
@@ -226,7 +283,7 @@ function contactPreviewTrustedPart(
  * address and every address and number are all in here.
  */
 function contactPreviewUntrustedPart(
-  preview: ContactCreatePreview,
+  preview: ContactWritePreview,
 ): Record<string, unknown> {
   return {
     // Repeated from the trusted half so the model joins the two BY IDENTITY.
@@ -256,7 +313,7 @@ function contactPreviewUntrustedPart(
  * test-local copy would prove something about the copy.
  */
 export function contactPreviewToolResult(
-  preview: ContactCreatePreview,
+  preview: ContactWritePreview,
 ): ToolResult {
   return untrustedToolResult(
     contactPreviewTrustedPart(preview),
@@ -544,7 +601,7 @@ async function buildContactCreatePreview(
   davFetch: DavFetch,
   addressBookId: string,
   supplied: SuppliedContactChange,
-): Promise<ContactCreatePreview> {
+): Promise<ContactWritePreview> {
   const ref = planContactCreateTarget(addressBookId);
   const change = normalizeSuppliedContact(supplied);
   const fields = changedContactFields(change);
@@ -632,6 +689,157 @@ async function buildContactCreatePreview(
     ),
     duplicateCandidateCount: duplicateCandidates.length,
     duplicateCandidates,
+    // ZERO, and the true answer rather than a placeholder: there is no existing
+    // card, so there is nothing being preserved. Present because the key set
+    // must not vary between one preview and the next — see the field's own
+    // docstring.
+    preservedPropertyCount: 0,
+  };
+}
+
+/**
+ * Preview a contact update: read the card, count what survives, write nothing.
+ *
+ * ## What reaches the network, and in what order
+ *
+ * TWO reads at most, both on the preview leg and both serial. The card itself,
+ * through `getContactWithEtag` — one request, and the entity tag it brings back is
+ * what the confirmation binds. Then the duplicate scan (CONW-05), which costs
+ * nothing at all when the change carries neither an address nor a number.
+ *
+ * The id is decoded FIRST, before anything reaches the network, because that is
+ * the cheapest possible refusal of a forged id and the kind letter inside the
+ * token is what stops a calendar id resolving here into a plausible-looking
+ * contact reference.
+ *
+ * ## The scan excludes the card being updated
+ *
+ * `excludeObjectUrl` is this card's own object url, so an update never offers the
+ * card it is updating as its own duplicate. That is CONW-05 on the update side
+ * and it is the reason that parameter exists — a card matched against its own
+ * address would otherwise be presented as a second person with the same details,
+ * which is the one candidate that is certainly not one.
+ *
+ * ## `preservedPropertyCount` is the field this preview exists for
+ *
+ * A CardDAV update is a whole-card overwrite, so the question the user actually
+ * has is what survives. See the field's own docstring for the whole argument; the
+ * mechanism is a walk over the FETCHED card's own properties in
+ * `countPreservedProperties`, which is why it can count a property this project
+ * has never heard of.
+ *
+ * ## A change that names nothing is refused
+ *
+ * There is no write to confirm, and a confirmation for a no-op is a capability
+ * nobody should be holding. Refused BEFORE the read, so it costs nothing.
+ */
+async function buildContactUpdatePreview(
+  principal: Principal,
+  davFetch: DavFetch,
+  contactId: string,
+  supplied: SuppliedContactChange,
+): Promise<ContactWritePreview> {
+  // BEFORE the network. A forged id is refused having sent nothing.
+  const ref = decodeContactId(contactId);
+  const change = normalizeSuppliedContact(supplied);
+  const fields = changedContactFields(change);
+
+  // Also before the network. See the docstring: a confirmation for a no-op is a
+  // capability nobody should be holding, and refusing it here costs nothing.
+  if (fields.length === 0) throw new ConfirmationInvalidError();
+
+  const fetched = await getContactWithEtag(env, principal, davFetch, ref);
+
+  // The NAME the user reads, and it comes off the FETCHED card. `detail`'s
+  // `displayName` IS `displayNameFor`'s output over the bytes just fetched, which
+  // is what carries the empty-`FN` fallback: iCloud returns cards with an empty
+  // `FN` while `N` is populated, inconsistently across resyncs, on contacts that
+  // display correctly everywhere else — that function's docstring holds the
+  // evidence. A write path reading `FN` directly reports a named contact as
+  // nameless on a real subset of the owner's address book, and this is the
+  // sentence somebody reads before agreeing to an overwrite.
+  const name = fetched.detail.displayName;
+
+  // SERIAL, after the read and before the mint. Two awaits and never a pair:
+  // `getContactWithEtag` and `findDuplicateCandidates` are both named in the
+  // `dav-concurrent-request` alternation, and so is this function.
+  const duplicateCandidates = await findDuplicateCandidates(
+    env,
+    principal,
+    davFetch,
+    {
+      email: firstProbeValue(change.emails),
+      tel: firstProbeValue(change.tels),
+      // RANKS and never queries, exactly as on the create — and off the FETCHED
+      // card rather than off the change, because the change may not mention a
+      // name at all.
+      displayName: name,
+      // THIS card. An update must not offer the card it is updating as its own
+      // duplicate, which is why this parameter exists at all.
+      excludeObjectUrl: ref.objectUrl,
+    },
+  );
+
+  const confirmToken = await mintConfirmation(
+    {
+      v: CONFIRM_VERSION,
+      t: "dav",
+      k: "update",
+      j: crypto.randomUUID(),
+      c: ref.addressBookUrl,
+      o: ref.objectUrl,
+      // NULL: a card has no recurrence, so there is nothing to discriminate.
+      r: null,
+      // **NOT null, and this is the distinction the create arm's refusal makes
+      // load-bearing.** `ConfirmPayload.e` is null ONLY for a create; an update
+      // binds the version stamp observed one read ago, and the commit sends it
+      // back as the conditional header. Byte-exact, quotes included — a
+      // re-quoted value is a different version as far as the server is
+      // concerned.
+      e: fetched.etag,
+      // NULL: a vCard has no `SEQUENCE`. The concept does not exist on this
+      // protocol, and `updateContact` never reads it.
+      s: null,
+      h: await contactChangeHashOf(change),
+      x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+      u: principal.userId,
+    },
+    env.CONFIRM_SECRET,
+  );
+
+  return {
+    id: encodeContactId(ref),
+    // FALSE. The field discriminates the two previews rather than being
+    // constantly true, which is what makes it worth a reader's attention.
+    willCreate: false,
+    changedFields: fields,
+    fieldCount: fields.length,
+    confirmToken,
+    expiresInSeconds: CONFIRM_TTL_SECONDS,
+    change,
+    confirmationLine: composeConfirmationLine(
+      {
+        kind: "update",
+        noun: "contact",
+        name,
+        // An overwrite takes nothing else with it: a card is not a container.
+        alsoRemoved: null,
+        // **The field count, unlike the create's null.** On a create every field
+        // is new, so "changing 3 fields" would be counting the card rather than
+        // describing a change. On an update it is the whole point — it is the
+        // number that says how much of an existing card is being replaced.
+        fieldCount: fields.length,
+        // NULL and NOT zero. The composer switches its whole consequence clause
+        // on this field, and a contact write invites nobody: no invitation
+        // leaves the building on this path, so the clause the user must read is
+        // the one saying the previous values cannot be recovered.
+        recipientCount: null,
+      },
+      "would",
+    ),
+    duplicateCandidateCount: duplicateCandidates.length,
+    duplicateCandidates,
+    preservedPropertyCount: countPreservedProperties(fetched.body, change),
   };
 }
 
@@ -646,6 +854,12 @@ async function buildContactCreatePreview(
  *   5.    Recompute the change hash and compare it constant-time.
  *   6.    Claim the one-time slot.
  *   7.    Only now: read the target from the payload and write.
+ *
+ * The create arm's step 7 is one request. The update arm's is four steps and TWO
+ * requests — re-read, compare the version locally, patch the bytes just read,
+ * write conditionally on the SIGNED version — and each of those is argued at its
+ * own line. Two serial awaits and never a pair: the fan-out rule bans concurrency
+ * and not request count, and its own text permits this shape by name.
  *
  * Copied from `applyCommit` in `./calendar.ts` including the numbering, so the
  * two can be read side by side and a step missing from one is visible.
@@ -726,9 +940,9 @@ async function applyContactCommit(
     objectUrl: payload.o,
   };
 
-  // The dispatch. Only the create arm exists this plan; the update arm lands in
-  // 16-05 and everything above this line already ran identically for it, which
-  // is the whole shape the gate was built for.
+  // The dispatch. Both arms exist now, and everything above this line ran
+  // identically for each of them — which is the whole shape the gate was built
+  // for.
   if (payload.k === "create") {
     // The uid comes out of the SIGNED object url rather than being minted
     // afresh, so the card that gets written is the card the preview named.
@@ -782,10 +996,83 @@ async function applyContactCommit(
     };
   }
 
-  // Unreachable: step 4 admits only `create` and `update`, and the update arm
-  // arrives in 16-05. A refusal rather than a fall-through, because a dispatch
-  // that falls through is a dispatch that writes something nobody chose.
-  throw new ConfirmationInvalidError();
+  // **An update confirmation MUST carry an ETag, and that is enforced rather
+  // than merely documented.** The create arm's mirror image, and the pair is
+  // what makes `ConfirmPayload.e`'s "null ONLY for a create" invariant real: the
+  // type cannot express it, because the field is `string | null` for every kind.
+  // An update whose payload names no version is one this server did not mint,
+  // and the reason to refuse rather than write unconditionally is the whole of
+  // CONW-06 — an unconditional overwrite is the raced write nobody can detect.
+  if (payload.e === null) throw new ConfirmationInvalidError();
+
+  // Step 7a. RE-READ the card. **The commit holds no card bytes and must not**:
+  // carrying them through the token would put a card's whole text inside a value
+  // the caller holds and can alter, and hashing the serialized card instead is
+  // the hazard `canonicalChange`'s docstring names — a revision property makes
+  // two serializations of one change differ.
+  const fetched = await getContactWithEtag(env, principal, davFetch, ref);
+
+  // Step 7b. The cheap refusal. A card edited on the phone between the preview
+  // and now costs ONE read rather than a write the server was always going to
+  // refuse — and the user is told the same `stale_resource` either way.
+  //
+  // Byte equality, quotes included. No normalisation of weak validators, no
+  // trimming: this project has no entity-tag comparison rule and inventing one
+  // here would be deciding, in a commit path, that two versions iCloud
+  // distinguishes are the same.
+  if (fetched.etag !== payload.e) throw new DavStaleResourceError();
+
+  // Step 7c. Patch the bytes just READ, never a card built from a parse. This is
+  // PITFALLS #39: `ParsedContact` sees eight properties, so a card rebuilt from
+  // one deletes the photo, the grouped label pair and every `X-` property on a
+  // routine telephone-number edit — on the account and on every device the user
+  // owns, silently.
+  const vcfBody = patchContactCard(fetched.body, change);
+
+  // Step 7d. The write, conditional on the SIGNED entity tag and not the re-read
+  // one. The two agree by step 7b, so this is not belt-and-braces: passing the
+  // signed value is what makes the conditional header carry the version the USER
+  // approved against, and it is the only thing that catches a card changing
+  // between THIS SERVER'S own read and its own write — a window step 7b
+  // structurally cannot see, because it happened after step 7b ran.
+  const written = await updateContact(
+    env,
+    principal,
+    davFetch,
+    ref,
+    vcfBody,
+    payload.e,
+  );
+
+  // Two requests on this leg, serial, and the fan-out rule's own text permits
+  // exactly this by name: it bans CONCURRENCY and not request count, "because a
+  // patch needs the whole resource and rebuilding drops every component it did
+  // not rebuild".
+  const fields = changedContactFields(change);
+
+  return {
+    applied: written.applied,
+    id: written.id,
+    changedFields: fields,
+    fieldCount: fields.length,
+    change,
+    // The SAME composer with the tense supplied, never a second sentence. The
+    // name comes off the card this commit itself fetched, so a card renamed
+    // between the preview and now is named here as it was called at THIS line's
+    // own moment — which is the behaviour the server-level instructions already
+    // tell a client to expect of the calendar's pair.
+    confirmationLine: composeConfirmationLine(
+      {
+        kind: "update",
+        noun: "contact",
+        name: fetched.detail.displayName,
+        alsoRemoved: null,
+        fieldCount: fields.length,
+        recipientCount: null,
+      },
+      "did",
+    ),
+  };
 }
 
 /**
@@ -937,11 +1224,74 @@ export function registerContactsWriteTools(
   );
 
   server.registerTool(
+    "contacts_update",
+    {
+      // **The one sentence this description must carry is the one about what
+      // SURVIVES.** CardDAV has no partial update, so the half of PITFALLS #39
+      // that no code path can refuse is a model helpfully supplying a complete
+      // contact object assembled from what it remembers — every field it forgot
+      // would become a deletion. The input here is a DIFF, and saying so plus
+      // naming `preservedPropertyCount` is what tells a model it does not need
+      // to send the whole card and must not try. The per-tool ceiling is 280
+      // characters and the untrusted notice is 133 of them, so this is the
+      // shortest form of that fact that still says it.
+      description:
+        "Preview one change to an existing contact. Writes nothing. Send ONLY " +
+        "changed fields; omitted ones survive. Commit with contacts_commit. " +
+        `${CONTACTS_UNTRUSTED_NOTICE}`,
+      inputSchema: z.object({
+        // `id`, matching `contacts_get` one module over, and NOT `contactId`.
+        // That spelling is on an explicit forbidden list in
+        // `test/dav-tools.test.ts`, because on a CALENDAR write a `contactId`
+        // parameter would mean "derive the attendee list from this person" —
+        // PITFALLS #12's autonomous-schedule shape, and Conventions §2 point 5.
+        // Here the id names the resource being written rather than a source of
+        // values, which is `contacts_get`'s own role for the same spelling; the
+        // rule is left exactly as strict as it was rather than taught an
+        // exception for a tool that never needed one.
+        id: z
+          .string()
+          .describe("Opaque contact id from contacts_search or contacts_get."),
+        change: z
+          .object(changeShape)
+          .describe(
+            "The fields to change, and nothing else. Pass it back to " +
+              "contacts_commit unaltered.",
+          ),
+      }),
+    },
+    async ({ id, change }) => {
+      try {
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
+        return contactPreviewToolResult(
+          await withContactConfirmationBoundary(() =>
+            buildContactUpdatePreview(
+              actor,
+              davFetch,
+              id,
+              change as SuppliedContactChange,
+            ),
+          ),
+        );
+      } catch (err) {
+        return davErrorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
     "contacts_commit",
     {
+      // It names BOTH previews, because the relation is undiscoverable from
+      // either tool alone and a model told only about the create would be left
+      // guessing whether an update token belongs here. Which operation actually
+      // runs is read from the SIGNED payload rather than from which tool was
+      // called, so naming both here reports the wiring rather than widening it.
       description:
-        "Apply what contacts_create previewed. Pass its confirmToken and its " +
-        `change back unaltered. ${CONTACTS_UNTRUSTED_NOTICE}`,
+        "Apply what contacts_create or contacts_update previewed. Pass its " +
+        `confirmToken and its change back unaltered. ${CONTACTS_UNTRUSTED_NOTICE}`,
       inputSchema: z.object({
         // The REASON goes on the parameter that carries it. This is the sentence
         // a model reads at the moment it is about to apply a change somebody has
@@ -950,7 +1300,8 @@ export function registerContactsWriteTools(
         confirmToken: z
           .string()
           .describe(
-            "The confirmToken from contacts_create, unaltered. Before you " +
+            "The confirmToken from contacts_create or contacts_update, " +
+              "unaltered. Before you " +
               "pass this back, the user must have seen the preview's " +
               "confirmationLine word for word: it is the sentence this server " +
               "wrote about what is about to happen, and a summary of your own " +

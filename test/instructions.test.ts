@@ -75,6 +75,7 @@ const EXPECTED_TOOLS: readonly string[] = [
   "contacts_create",
   "contacts_get",
   "contacts_search",
+  "contacts_update",
   "dav_diagnose",
   "mail_compose_new",
   "mail_compose_reply",

@@ -608,14 +608,15 @@ function registeredDav(who: Promise<Principal> = owner): Registration[] {
   registerCalendarTools(server as unknown as McpServer, davFetch, who);
   // The last registrar the phase adds. After this line the ceiling loop below
   // covers the phase's ENTIRE tool surface — one diagnostic, nine calendar
-  // tools and FOUR contacts tools — rather than two thirds of it, and the mail
+  // tools and FIVE contacts tools — rather than two thirds of it, and the mail
   // suite's own loop keeps covering the mail tools, which is all it was ever
   // able to see.
   //
-  // Four rather than two since CONW-01, and the harness needed no edit to reach
-  // the new pair: `registerContactsTools` delegates to
-  // `registerContactsWriteTools` at its own foot, so `contacts_create` and
-  // `contacts_commit` are measured by the ceiling loop through this one call.
+  // FIVE rather than two since CONW-01 and CONW-02, and the harness needed no edit
+  // to reach any of the three: `registerContactsTools` delegates to
+  // `registerContactsWriteTools` at its own foot, so `contacts_create`,
+  // `contacts_update` and `contacts_commit` are all measured by the ceiling loop
+  // through this one call.
   // That is the whole reason the write tools were delegated rather than given a
   // fourth registrar in `src/mcp/server.ts` — a registrar added there would be
   // covered only if somebody remembered to add a line here.
@@ -656,6 +657,7 @@ describe("the DAV registrations", () => {
       "contacts_create",
       "contacts_get",
       "contacts_search",
+      "contacts_update",
       "dav_diagnose",
     ]);
   });
@@ -700,7 +702,7 @@ describe("the DAV registrations", () => {
     // The loop above iterates the REGISTRATIONS rather than an enumerated list
     // of names, so a tool added to a DAV registrar in a later plan is measured
     // by construction — with no edit to this file and no cross-plan conflict.
-    expect(registeredDav().length).toBe(14);
+    expect(registeredDav().length).toBe(15);
   });
 
   it("carries the untrusted notice on every calendar description that returns stranger content", () => {
@@ -7114,7 +7116,7 @@ describe("a principal that was refused reaches no DAV tool", () => {
   }
 
   it("covers every DAV registration, and the count is pinned", () => {
-    // One diagnostic, nine calendar tools, four contacts tools. A tool added
+    // One diagnostic, nine calendar tools, five contacts tools. A tool added
     // later lands in the loop below by itself. This pin is what makes a tool
     // REMOVED from the loop show up.
     //
@@ -7122,7 +7124,7 @@ describe("a principal that was refused reaches no DAV tool", () => {
     // principal before it decodes an id, plans a target or mints a confirmation,
     // so a refused principal reads `auth_failed` rather than spending a signing
     // key on somebody who is not signed in.
-    expect(registeredDav(refused()).length).toBe(14);
+    expect(registeredDav(refused()).length).toBe(15);
   });
 
   it("answers auth_failed from EVERY tool, with the unchanged message and zero requests", async () => {

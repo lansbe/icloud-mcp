@@ -12,7 +12,12 @@ import { describe, expect, it } from "vitest";
 import type { NormalizedContactChange } from "../src/confirm";
 import { DavConnectError } from "../src/dav/errors";
 import type { ContactName, ParsedContact } from "../src/dav/vcard";
-import { displayNameFor, parseVCard, patchContactCard } from "../src/dav/vcard";
+import {
+  countPreservedProperties,
+  displayNameFor,
+  parseVCard,
+  patchContactCard,
+} from "../src/dav/vcard";
 // Named imports for the cases that assert against one card, and a NAMESPACE
 // import for the fidelity loop, which discovers its cards by name so a fixture
 // added later is enrolled without anybody editing a list here.
@@ -703,3 +708,131 @@ function firstDifferenceReport(name: string, expected: string, actual: string): 
     `  written: ${JSON.stringify(actual.slice(from, from + window))}`,
   ].join("\n");
 }
+
+// ===========================================================================
+// countPreservedProperties (CONW-02)
+//
+// The number a person reads before agreeing to overwrite a card, so the cases
+// below are about the two directions it can be wrong in. Over-counting tells
+// somebody more survives than does, which is the direction that matters; under-
+// counting reads as a scarier warning than the truth, which is the tolerable one.
+// ===========================================================================
+
+describe("countPreservedProperties", () => {
+  /** Every field the closed vocabulary carries, all mentioned at once. */
+  const MENTIONS_EVERYTHING: NormalizedContactChange = {
+    kind: "update",
+    formattedName: { value: "Noor Vasquez" },
+    name: {
+      family: "Vasquez",
+      given: "Noor",
+      additional: null,
+      prefix: null,
+      suffix: null,
+    },
+    organisation: ["Example Bindery"],
+    address: {
+      poBox: null,
+      extended: null,
+      street: "1 Ledger Lane",
+      locality: null,
+      region: null,
+      postalCode: null,
+      country: null,
+    },
+    note: { value: "A note." },
+    emails: [{ value: "noor@example.invalid", types: [] }],
+    tels: [{ value: "+1-555-0188", types: [] }],
+  };
+
+  /** The outer null in every slot: the caller mentioned nothing. */
+  const MENTIONS_NOTHING_AT_ALL: NormalizedContactChange = {
+    kind: "update",
+    formattedName: null,
+    name: null,
+    organisation: null,
+    address: null,
+    note: null,
+    emails: null,
+    tels: null,
+  };
+
+  it("counts EVERY property when the change mentions nothing", () => {
+    // Thirteen on the hazard card: VERSION, UID, FN, N, ORG, the phonetic name,
+    // the photo, both EMAILs, the grouped label, TEL, NOTE and the card's own REV.
+    // VERSION and UID are counted because they are on the card that gets written,
+    // and the claim the number makes is about the whole resource.
+    expect(
+      countPreservedProperties(
+        fixtures.ROUND_TRIP_HAZARDS_VCF,
+        MENTIONS_NOTHING_AT_ALL,
+      ),
+    ).toBe(13);
+  });
+
+  it("excludes EVERY occurrence of a mentioned property, group prefix and all", () => {
+    // Six names mentioned, and one of them — EMAIL — is carried by TWO properties
+    // on this card, one of them under an `item1.` group. The group is not part of
+    // the property's name as far as the library is concerned, which is why
+    // replacing the email list removes both, and why both are correctly excluded
+    // here. ADR is mentioned and absent from the card, which subtracts nothing.
+    //
+    // 13 - (FN, N, ORG, both EMAILs, TEL, NOTE) = 6: VERSION, UID, the phonetic
+    // name, the photo, the orphaned label and REV.
+    expect(
+      countPreservedProperties(
+        fixtures.ROUND_TRIP_HAZARDS_VCF,
+        MENTIONS_EVERYTHING,
+      ),
+    ).toBe(6);
+  });
+
+  it("counts a property this project has never heard of", () => {
+    // The whole point, and PITFALLS #39's own subject. A count derived from
+    // `ParsedContact` could not see either of these, and a card REBUILT from one
+    // would delete them both.
+    const preserved = countPreservedProperties(
+      fixtures.ROUND_TRIP_HAZARDS_VCF,
+      MENTIONS_EVERYTHING,
+    );
+    const withoutTheUnmodelled = countPreservedProperties(
+      fixtures.ROUND_TRIP_HAZARDS_VCF.replace(
+        "X-PHONETIC-LAST-NAME:Vaskez\r\n",
+        "",
+      ),
+      MENTIONS_EVERYTHING,
+    );
+    expect(withoutTheUnmodelled).toBe(preserved - 1);
+  });
+
+  it("agrees with the card the patch actually writes", () => {
+    // The count and the patch read the same mapping table, and this is what pins
+    // them together: a field added to one without the other would make the number
+    // a claim about a card nobody wrote. Mentioning the note leaves twelve, and
+    // the patched card still carries exactly twelve properties that are not NOTE.
+    const change: NormalizedContactChange = {
+      ...MENTIONS_NOTHING_AT_ALL,
+      note: { value: "Prefers a fortnight of notice." },
+    };
+    const counted = countPreservedProperties(
+      fixtures.ROUND_TRIP_HAZARDS_VCF,
+      change,
+    );
+    expect(counted).toBe(12);
+
+    const written = patchContactCard(fixtures.ROUND_TRIP_HAZARDS_VCF, change);
+    const survived = new ICAL.Component(ICAL.parse(written))
+      .getAllProperties()
+      .filter((property) => property.name.toLowerCase() !== "note");
+    expect(survived).toHaveLength(counted);
+  });
+
+  it("refuses bytes that are not a contact resource", () => {
+    // A refusal rather than a plausible number, for `parseVCard`'s own reason: a
+    // caller cannot tell a half-built result from a real one, and this number is
+    // read by a person deciding whether to overwrite their own card.
+    expect(() =>
+      countPreservedProperties(MALFORMED_VCF, MENTIONS_NOTHING_AT_ALL),
+    ).toThrow(DavConnectError);
+  });
+});

@@ -450,6 +450,99 @@ export function patchContactCard(
 }
 
 /**
+ * The vCard property name each field of a change writes to.
+ *
+ * The SAME mapping `patchContactCard` above applies, held once so the count
+ * below cannot disagree with the patch it is describing. A field added to
+ * `NormalizedContactChange` without an entry here would be counted as preserved
+ * while the patch overwrote it, which is the one direction this number must
+ * never be wrong in — it would under-state what the write touches.
+ *
+ * `kind` has no entry because it names no property: it discriminates the
+ * operation rather than describing a value on the card.
+ */
+const CHANGE_FIELD_PROPERTIES: Readonly<
+  Record<Exclude<keyof NormalizedContactChange, "kind">, string>
+> = {
+  formattedName: "fn",
+  name: "n",
+  organisation: "org",
+  address: "adr",
+  note: "note",
+  emails: "email",
+  tels: "tel",
+};
+
+/**
+ * How many properties on a FETCHED card a change leaves completely alone
+ * (CONW-02).
+ *
+ * ## What the number is for
+ *
+ * PITFALLS #40's recommendation made concrete. "Changing 1 field, 23 other
+ * properties preserved" is a sentence a person can actually check against the
+ * card in front of them, and a preview that shows only the new value is one of
+ * the warning signs Pitfall 39 lists for exactly this operation. A whole-card
+ * overwrite is the write where the user's real question is not "what changes"
+ * but "what survives", and this is the only field in either response that
+ * answers it.
+ *
+ * ## It walks the CARD, never the change
+ *
+ * The card's own property list is the subject, so a property this project has
+ * never heard of is counted — which is the point, because those are the
+ * properties PITFALLS #39 is about and the ones a rebuilt card would delete.
+ * Nothing here enumerates a field list and asks the card about each one; that
+ * shape could only count what this file already knows the names of.
+ *
+ * ## Every occurrence, and `VERSION` and `UID` among them
+ *
+ * A card carrying two `EMAIL` properties has two properties, not one, because
+ * the user reading the number is counting lines on a card rather than concepts.
+ * `VERSION`, `UID` and the card's own `REV` are counted for the same reason:
+ * they are on the card, they are on the card that gets written, and the claim
+ * the number makes is about the whole resource.
+ *
+ * A group prefix is NOT part of a property's name as far as this count goes,
+ * because it is not part of it as far as the library goes either: `item1.EMAIL`
+ * arrives as `email` carrying a group, so replacing the email list removes it
+ * and it is correctly excluded here. Its partner `item1.X-ABLabel` is a
+ * separate property under a name no field of a change maps to, so it is counted
+ * — and it does survive the write, which is the behaviour `patchContactCard`'s
+ * docstring records rather than a gap in this count.
+ *
+ * Throws `DavConnectError` on a body that is not a contact resource, for
+ * `parseVCard`'s own reason, with nothing read off the caught value.
+ */
+export function countPreservedProperties(
+  vcfText: string,
+  change: NormalizedContactChange,
+): number {
+  let card: IcalComponent;
+  try {
+    card = new ICAL.Component(ICAL.parse(vcfText));
+  } catch {
+    // Nothing is read from the caught value — not its message, not its stack.
+    throw new DavConnectError();
+  }
+  if (card.name !== "vcard") throw new DavConnectError();
+
+  // The property names the change MENTIONS, lower-cased to match the names the
+  // library reports. A field whose slot is the outer null was not mentioned, so
+  // the property it maps to is left alone and counts as preserved.
+  const touched = new Set<string>();
+  for (const [field, property] of Object.entries(CHANGE_FIELD_PROPERTIES)) {
+    if (change[field as keyof NormalizedContactChange] !== null) {
+      touched.add(property);
+    }
+  }
+
+  return card
+    .getAllProperties()
+    .filter((property) => !touched.has(property.name.toLowerCase())).length;
+}
+
+/**
  * A card that shares no state with the one it was made from.
  *
  * **The copy is required, not tidy.** `Component#toJSON()` returns the LIVE
