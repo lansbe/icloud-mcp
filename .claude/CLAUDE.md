@@ -531,6 +531,38 @@ write entry point left out of the alternation is therefore unguarded while
 looking exactly like a guarded one, and no assertion in the suite can tell the
 two apart.
 
+**Phase 17 added two blanket bans, and "blanket" is the owner's decision rather
+than a default, so it is recorded here.** The tokens are the RFC 4791
+calendar-creation method this runtime refuses to build, and the DAV library's
+collection-creation helper that hardcodes it. Neither carries a `scope`. A
+narrower scope — `src/` only — was offered on 2026-09-25 and declined, after the
+cost of the wider ban was measured rather than estimated: thirty-eight
+occurrences across eight files, most of them prose explaining the very
+constraint the rules encode. A file exclusion was refused for the harder reason:
+exclusion is all-rules-per-file, so skipping the two test files that carry the
+platform finding would have silently dropped their fan-out, logging,
+host-literal and read-only coverage as well, and that loss would have been
+invisible — nothing fails on the way out.
+
+Six live test sites genuinely need the method string, because they ask the
+runtime to build a request carrying it and watch it refuse, which is what keeps
+the platform verdict honest rather than remembered. All six were fixed AT THE
+SOURCE, by assembling the string from fragments at one module-scope constant per
+file, which is what this section already prescribes and what § 1 already does for
+the banned transport paths. One entry in the containment gate's request
+vocabulary is assembled the same way and for the same reason; deleting it was
+refused, because a name removed from that vocabulary makes a future call site
+invisible while looking exactly like a guarded one.
+
+The consequence lands on every module added under `src/` from now on, and it is
+the same consequence § 2 already states: **describe this method by its role and
+never by its name** — "the RFC 4791 calendar-creation method this runtime
+refuses to build" — and describe the library helper by role too. A source
+comment spelling either one fails the very check it was trying to explain, and
+the failure arrives as a pre-commit rejection in the middle of an unrelated
+plan, with no obvious cause and a tempting one-character "fix" to the pattern.
+Take neither that fix nor an exclusion: the answer is always at the source.
+
 Changing any of these five is a change to the project's safety boundary, not a
 refactor. If one of them is genuinely in the way, say so and get a decision —
 do not loosen the pattern list to make a commit go through. Exclusion is by

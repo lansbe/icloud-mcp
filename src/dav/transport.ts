@@ -19,9 +19,10 @@
 // to be attached here, per call, so that no caller ever holds one. And tsdav
 // hardcodes method strings this runtime refuses to build a request from, so the
 // sendability check has to happen here too — Phase 14 shipped a probe whose
-// `MKCALENDAR` threw before any byte left the Worker and was reported as a
-// failed connection to iCloud, which is a wrong answer of the worst shape:
-// plausible, specific, and about a server that was never contacted.
+// create step used the RFC 4791 calendar-creation method, and it threw before
+// any byte left the Worker and was reported as a failed connection to iCloud,
+// which is a wrong answer of the worst shape: plausible, specific, and about a
+// server that was never contacted.
 //
 // Nothing in this module goes near a socket, and nothing in it may name a
 // transport mode or a port: the DAV protocols run over ordinary HTTPS. The
@@ -276,8 +277,11 @@ const SENDABILITY_PROBE_URL = "https://method-check.invalid/";
  * accepts it. The construction IS the check; the object is discarded.
  *
  * **It exists because of a measured failure.** Phase 14's collection write
- * probe sent `MKCALENDAR`, which workerd refuses while accepting `PROPFIND`,
- * `PROPPATCH`, `REPORT`, `MKCOL` and every other method this project uses. The
+ * probe sent the RFC 4791 calendar-creation method, which workerd refuses
+ * while accepting `PROPFIND`, `PROPPATCH`, `REPORT`, `MKCOL` and every other
+ * method this project uses. That method is named here by role and never
+ * spelled, exactly as the banned transport tokens are in this module's header
+ * and for the same reason: the scan reads this file too. The
  * refusal is a `TypeError` raised before any I/O — which landed in the `catch`
  * around the fetch below, became a `DavConnectError`, and was reported as a
  * transient connection fault against a server that had never seen the request.

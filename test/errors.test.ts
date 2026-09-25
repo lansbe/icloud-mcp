@@ -8,10 +8,13 @@
 // side only, on the same footing. An eighth, `request_unsendable`, arrived in
 // Phase 14 on that same footing and for a reason the others did not have: it
 // was added AFTER a wrong answer had already been produced and read. workerd
-// refuses to build a request carrying `MKCALENDAR`, the throw landed in the
-// DAV transport's catch, and the probe reported `connection_failed` against a
-// server it had never contacted -- a failure that says nothing about iCloud,
-// dressed as a transient fault the model is told to retry.
+// refuses to build a request carrying the RFC 4791 calendar-creation method --
+// named by role rather than spelled, because it is a banned token in every
+// scanned root, see ./../.claude/CLAUDE.md § Enforcement -- so the request was
+// never built, the throw landed in the DAV transport's catch, and the probe
+// reported `connection_failed` against a server it had never contacted: a
+// failure that says nothing about iCloud, dressed as a transient fault the
+// model is told to retry.
 
 import { describe, expect, it } from "vitest";
 // Namespace imports, used by the reachability set-equality at the foot of this

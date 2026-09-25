@@ -211,7 +211,10 @@ export class DavSubscriptionError extends Error {
  * **The only class in this file raised without any server involvement at all**,
  * and the one that exists because of a measured failure rather than a
  * foreseeable one. Phase 14's collection write probe called tsdav's
- * collection-creation helper, which issues `MKCALENDAR`. workerd validates the
+ * collection-creation helper, which issues the RFC 4791 calendar-creation
+ * method — the one this runtime refuses to build a request from, named here by
+ * role rather than spelled because it is a banned token in every scanned root
+ * (see ./../../.claude/CLAUDE.md § Enforcement). workerd validates the
  * method string when it builds the `Request` and refuses that one — while
  * accepting `PROPFIND`, `PROPPATCH`, `REPORT`, `MKCOL` and every other method
  * this project sends. The refusal is a `TypeError` raised before any I/O,

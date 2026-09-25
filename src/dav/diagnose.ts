@@ -15,11 +15,15 @@
 // This module contains no logging calls of any kind and must never acquire any.
 
 import ICAL from "ical.js";
-// `makeCalendar` is deliberately NOT imported. It is tsdav's collection-creation
-// helper and it issues `MKCALENDAR`, which this runtime refuses to build a
-// request from — see `CREATE_METHOD` below for the measurement. It stays on the
-// `dav-concurrent-request` alternation in `scripts/forbidden-tokens.mjs` so a
-// future call site is guarded the moment it appears; nothing here calls it.
+// tsdav's collection-creation helper is deliberately NOT imported, and it is
+// named by role here rather than spelled because it is itself a banned token in
+// every scanned root. It issues the RFC 4791 calendar-creation method, which
+// this runtime refuses to build a request from — see `CREATE_METHOD` below for
+// the measurement. What this module DOES send is RFC 5689 extended `MKCOL`,
+// which is not banned and is spelled throughout. The helper's name stays on the
+// `dav-concurrent-request` alternation in `scripts/forbidden-tokens.mjs`, and on
+// the containment gate's request vocabulary, so a future call site is guarded
+// the moment it appears; nothing here calls it.
 import {
   calendarQuery,
   davRequest,
@@ -168,9 +172,10 @@ export interface CollectionWriteStep {
    *
    * **Here because a verdict is going to be written from this report, and the
    * method is the half of the answer a reader would otherwise supply from
-   * memory.** The create step does not send `MKCALENDAR` — this runtime
-   * refuses to build a request carrying that method — so it sends RFC 5689
-   * extended `MKCOL` instead. A server may accept one and refuse the other, so
+   * memory.** The create step does not send the RFC 4791 calendar-creation
+   * method — this runtime refuses to build a request carrying it — so it sends
+   * RFC 5689 extended `MKCOL` instead. A server may accept one and refuse the
+   * other, so
    * "create: ok, 201" without the method names a fact about a request that was
    * never sent. See `CREATE_METHOD` for the measurement behind this.
    */
@@ -657,9 +662,12 @@ const PROBE_RECOLOURED = "#1F7F3FFF";
 /**
  * The method the create step issues, and the reason it is not the obvious one.
  *
- * RFC 4791 defines `MKCALENDAR` for exactly this, and tsdav ships a helper that
- * issues it. **Neither can be used here: workerd refuses to build a request
- * carrying that method string.** It is the one method in this project's whole
+ * RFC 4791 defines a calendar-creation method for exactly this, and tsdav ships
+ * a helper that issues it. **Neither can be used here: workerd refuses to build
+ * a request carrying that method string.** Neither is spelled anywhere in this
+ * tree, by role only, because both are banned tokens in every scanned root —
+ * see `./../../.claude/CLAUDE.md` § Enforcement. It is the one method in this
+ * project's whole
  * DAV vocabulary that it refuses — `PROPFIND`, `PROPPATCH`, `REPORT`, `MKCOL`,
  * `DELETE` and `PUT` are all accepted — and the refusal is a `TypeError` raised
  * before any I/O. Phase 14 shipped the helper, and the live probe reported
@@ -671,7 +679,8 @@ const PROBE_RECOLOURED = "#1F7F3FFF";
  * result a calendar collection rather than a plain one.
  *
  * **This changes what the create step's answer MEANS, and the report says so
- * rather than leaving it to be inferred.** A server may accept `MKCALENDAR`
+ * rather than leaving it to be inferred.** A server may accept the RFC 4791
+ * calendar-creation method
  * and refuse extended `MKCOL`, or the reverse, so a `201` here is evidence
  * about extended `MKCOL` and about nothing else. The step record therefore
  * carries the method it used, because a verdict written from a report that
@@ -683,12 +692,24 @@ const CREATE_METHOD = "MKCOL";
 /**
  * Whether the create step's own status means the collection was created.
  *
- * **`207` is the trap, and it is a trap this change introduced.** `MKCALENDAR`
+ * **`207` is the trap, and it is a trap this change introduced.** The RFC 4791
+ * calendar-creation method
  * either works or fails with a plain status; extended `MKCOL` has a third
  * answer. RFC 5689 §3 makes the request all-or-nothing — a server that cannot
  * satisfy every property in the body MUST fail the whole request and MUST NOT
- * create the collection — and it reports that partial failure as a `207
- * Multi-Status` whose body says which property was refused. So `207` here means
+ * create the collection — and the body of that refusal is a
+ * `DAV:mkcol-response` naming the property that was rejected.
+ *
+ * **The status that body arrives under is where an earlier version of this
+ * docstring was wrong, and the correction does not change the rule.** It said
+ * RFC 5689 "reports that partial failure as a `207 Multi-Status`". It does not:
+ * the RFC's own §3.5 example carries the `DAV:mkcol-response` body under `403
+ * Forbidden`, and the specification names no `207` for this case at all. The
+ * refusal below stays exactly as it was, because it is conservative in the only
+ * direction that matters: a `207` is definitionally an envelope rather than an
+ * answer, so treating one as a refusal can only ever under-report a success,
+ * while treating one as a success would record a creation that did not happen.
+ * A server answering `207` here — whether or not the RFC sanctions it — means
  * NOTHING WAS CREATED, while sitting inside the 2xx range that
  * `recordWriteStep`'s generic rule reads as success.
  *
@@ -796,12 +817,13 @@ function firstStatusOf(responses: DAVResponse[]): number | null {
  *   4. delete it,
  *   5. re-list the home set and check whether it is still there.
  *
- * **Step 2 is not `MKCALENDAR`, and that is a platform fact rather than a
- * preference.** workerd refuses to build a request carrying that method string
- * — see `CREATE_METHOD` — so what it answers about iCloud is unmeasurable from
- * this runtime. The step records the method it did use, because a report that
- * named only the status would be read as an answer about the method it did
- * not.
+ * **Step 2 sends RFC 5689 extended `MKCOL` and NOT the RFC 4791
+ * calendar-creation method, and that is a platform fact rather than a
+ * preference.** workerd refuses to build a request carrying that other method
+ * string — see `CREATE_METHOD` — so what it answers about iCloud is
+ * unmeasurable from this runtime. The step records the method it did use,
+ * because a report that named only the status would be read as an answer about
+ * the method it did not.
  *
  * A refused CREATE stops the sequence — there is nothing to rename and nothing
  * to remove. A refused rename does NOT stop it, and that asymmetry is
@@ -854,11 +876,12 @@ export async function runCollectionWriteProbe(
   // The one free component, and it is generated here rather than accepted.
   const url = new URL(`${crypto.randomUUID()}/`, home).href;
 
-  // 2. Create — RFC 5689 extended MKCOL, NOT MKCALENDAR. See `CREATE_METHOD`
-  //    for the measurement that forced this: workerd refuses to build a
-  //    request carrying `MKCALENDAR` at all, so the helper that issues it
-  //    threw before any byte left the Worker and the failure was reported as
-  //    a connection fault against a server that never saw it.
+  // 2. Create — RFC 5689 extended MKCOL, NOT the RFC 4791 calendar-creation
+  //    method. See `CREATE_METHOD` for the measurement that forced this:
+  //    workerd refuses to build a request carrying that other method at all,
+  //    so the helper that issues it threw before any byte left the Worker and
+  //    the failure was reported as a connection fault against a server that
+  //    never saw it.
   //
   //    Assembled by hand through tsdav's raw request helper, exactly as the
   //    property update below is and for the same reason: the library ships no

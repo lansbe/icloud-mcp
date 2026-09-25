@@ -69,8 +69,9 @@
  *   `src/dav/transport.ts` raises when the runtime refuses to build the
  *   request. It exists because of a measured failure rather than a
  *   hypothetical one: workerd accepts `PROPFIND`, `PROPPATCH`, `REPORT`,
- *   `MKCOL` and every other method this project sends, and refuses
- *   `MKCALENDAR` — so tsdav's collection-creation helper threw before any
+ *   `MKCOL` and every other method this project sends, and refuses the RFC
+ *   4791 calendar-creation method — so tsdav's collection-creation helper,
+ *   which hardcodes that one, threw before any
  *   byte left the Worker, and the throw arrived at `connection_failed`, which
  *   told the reader that a connection to iCloud had failed and that a retry
  *   was safe. Both halves of that sentence were false, and the result was a

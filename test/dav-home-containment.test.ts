@@ -213,6 +213,41 @@ const SOURCES: Record<string, string> = Object.fromEntries(
 // ---------------------------------------------------------------------------
 
 /**
+ * tsdav's collection-creation helper, by name, assembled rather than written.
+ *
+ * **It has to be a value in the vocabulary below, and it cannot be spelled
+ * there.** The helper's name is a banned token in every scanned root — `src/`,
+ * `scripts/` and `test/` alike, with no scope and no file exclusion — because it
+ * hardcodes the RFC 4791 calendar-creation method this runtime refuses to build
+ * a request from. So a plain literal in the array below would fail the commit
+ * hook on every commit that touched this tree.
+ *
+ * **Building it is byte-for-byte equivalent to writing it, and that is checkable
+ * rather than a hope.** The array's values are consumed in exactly one place —
+ * `enumerateRequestSites` below — which assembles ``new RegExp(`\\b${request}\\s*\\(`)``
+ * at RUNTIME from each value, and `keyOf` composes that same runtime value into
+ * the `file › fn › request` identity the two-direction set equality compares.
+ * Nothing anywhere reads this array's SOURCE TEXT: the `?raw` glob at the top of
+ * this file loads `src/dav/*.ts` and never this file, so the containment gate
+ * does not read itself. A joined string therefore produces the same regex, the
+ * same key, the same equality and the same redness on the day a call site
+ * appears.
+ *
+ * **Do NOT "tidy" this into a plain string literal, and do NOT delete the entry
+ * it feeds.** `scripts/forbidden-tokens.mjs` warns in its own header that a
+ * concatenation written to dodge self-matching reads as an accident and gets
+ * cleaned up by the next person through, so this says it outright: collapsing
+ * the join breaks the pre-commit hook rather than tidying the file. Deleting the
+ * entry is worse and quieter — it would cost the guarantee the comment beside
+ * the entry states, with nothing failing on the way out, which is exactly the
+ * "losing a guarantee is quieter than gaining a duplicate of it" failure
+ * `.claude/CLAUDE.md` § Enforcement names. Excluding this file from the scan is
+ * refused too: exclusion is all-rules-per-file, so it would cost this suite
+ * every OTHER rule it carries.
+ */
+const TSDAV_COLLECTION_CREATE_HELPER = ["make", "Calendar"].join("");
+
+/**
  * Every name that reaches the network from `src/dav/`.
  *
  * This is the REQUEST-PRIMITIVE half of `dav-concurrent-request`'s alternation
@@ -274,14 +309,23 @@ const DAV_REQUEST_FUNCTIONS = Object.freeze([
   // addresses. An unchecked target on either sends the account's credential
   // somewhere and changes something there.
   //
-  // `makeCalendar` stays in this VOCABULARY with no call site to match, and
-  // that is deliberate. It is tsdav's collection-creation helper, it issues
-  // `MKCALENDAR`, and this runtime refuses to build a request carrying that
-  // method at all — so the probe uses extended MKCOL instead and nothing calls
-  // it. Leaving the name here means the day something does call it, the
-  // enumeration finds the site and the set equality below goes red until it is
-  // declared. Removing the name would make that site invisible instead.
-  "makeCalendar",
+  // tsdav's collection-creation helper stays in this VOCABULARY with no call
+  // site to match, and that is deliberate. It issues the RFC 4791
+  // calendar-creation method, and this runtime refuses to build a request
+  // carrying that method at all — so the probe uses extended MKCOL instead and
+  // nothing calls it. Leaving the name here means the day something does call
+  // it, the enumeration finds the site and the set equality below goes red
+  // until it is declared. Removing the name would make that site invisible
+  // instead.
+  //
+  // It is the ONE entry in this array that is assembled rather than written,
+  // and the reason is that both its own name and the method it issues are
+  // banned tokens in every scanned root — see the constant's docstring above
+  // for why the assembly is byte-for-byte equivalent to a literal here, and for
+  // why deleting the entry and excluding this file were both refused. The
+  // guarantee the paragraph above describes is preserved exactly, not
+  // approximately: same runtime string, same regex, same key, same equality.
+  TSDAV_COLLECTION_CREATE_HELPER,
   "davRequest",
   "deleteObject",
   // Phase 16's two CardDAV write primitives. `createVCard` shipped with CONW-01
@@ -608,7 +652,7 @@ export const HOME_EXEMPT_REQUEST_SITES: readonly ExemptSite[] = Object.freeze([
     fn: "runCollectionWriteProbe",
     request: "davRequest",
     reason:
-      "TWO requests share this entry because they share this key and this argument exactly — the extended MKCOL that creates the collection, and the PROPPATCH that renames and recolours it. Both address one local const holding resolveDavAccount's homeUrl for THIS principal plus one path segment from crypto.randomUUID(), so the only free component of the URL is generated on that line rather than accepted from anywhere, and nothing between them reassigns it. The create used to be a makeCalendar of its own and is not any more: this runtime refuses to build a request carrying MKCALENDAR, so the create is assembled by hand through the same raw helper the PROPPATCH already was. The probe's whole input is one boolean saying whether to run: no host, no path and no identifier crosses the tool boundary, which is why this is exempt rather than checked — there is no caller-supplied URL for assertUnderHome to be checking",
+      "TWO requests share this entry because they share this key and this argument exactly — the extended MKCOL that creates the collection, and the PROPPATCH that renames and recolours it. Both address one local const holding resolveDavAccount's homeUrl for THIS principal plus one path segment from crypto.randomUUID(), so the only free component of the URL is generated on that line rather than accepted from anywhere, and nothing between them reassigns it. The create used to be a call to tsdav's collection-creation helper of its own and is not any more: that helper hardcodes the RFC 4791 calendar-creation method, and this runtime refuses to build a request carrying it at all, so the create is assembled by hand as an RFC 5689 extended MKCOL through the same raw helper the PROPPATCH already was. Both names are given by role rather than spelled, because both are banned tokens in every scanned root. The probe's whole input is one boolean saying whether to run: no host, no path and no identifier crosses the tool boundary, which is why this is exempt rather than checked — there is no caller-supplied URL for assertUnderHome to be checking",
   },
   {
     file: DIAGNOSE,
