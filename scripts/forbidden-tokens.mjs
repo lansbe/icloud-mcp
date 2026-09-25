@@ -560,6 +560,29 @@ export const FORBIDDEN = [
     why: "A tsdav account-discovery flag that turns one PROPFIND into a fan-out over every collection on the account -- and the object-loading one additionally fetches every object inside each of them. That is a request-count problem and a response-size problem in a single boolean, on an account with nine calendars, and neither cost is legible at the call site. Discovery resolves the home URL and stops there; collections are enumerated deliberately, by the code that knows how many of them it actually needs.",
   },
 
+  // ----------------------------------------------------- unsendable method
+  // D-15, Phase 17. The only pair on this list banning something this project
+  // cannot do rather than something it must not do -- and the reason it is a
+  // ban rather than a note is that the platform's refusal is INVISIBLE at the
+  // call site and arrives wearing another failure's clothes.
+  //
+  // Neither entry carries a `scope`. That is the owner's 2026-09-25 ruling and
+  // an absent `scope` is what makes the ban blanket: every root in
+  // `SCAN_ROOTS`, `src/`, `scripts/` and `test/` alike. A narrower scope was
+  // offered and declined, and a file exclusion was refused outright -- see the
+  // `EXCLUDED` docstring below for why an exclusion is the more expensive
+  // answer than it looks.
+  {
+    id: "mkcalendar-method",
+    pattern: /\bMKCALENDAR\b/g,
+    why: "The RFC 4791 calendar-creation method, which this runtime cannot express at all: `new Request(url, { method: \"MKCALENDAR\" })` throws `TypeError: Invalid HTTP method string` inside workerd's own method validation, while `PROPFIND`, `PROPPATCH`, `REPORT`, `MKCOL`, `DELETE` and `PUT` are all accepted. The request is never built, so no byte leaves the Worker and no server ever sees it. That would be harmless if it failed honestly, and it does not: the `TypeError` is raised inside `createDavFetch`'s `try` around the fetch, which mapped every caught value to `DavConnectError`, and `davToErrorCategory` defaults that to `connection_failed` -- so the caller was told \"Could not establish a secure connection to iCloud Mail. This may be transient -- safe to retry once\", and every clause of that was false. No connection was attempted, nothing was transient, and no retry could ever work. This is MEASURED rather than hypothetical: it is what SPIKE-04's first live probe run actually reported to the owner on 2026-09-24, against the real account, and that report was on its way into a written verdict about what iCloud does with collection writes when it was a fact about what Cloudflare does with a method string. The route this project takes instead is RFC 5689 extended `MKCOL`, which expresses the same intent with a method this platform will send. A LEGITIMATE mention -- a docstring explaining the constraint, a test constructing the string to prove the runtime still refuses it -- is fixed AT THE SOURCE, by building the string from fragments or by naming the method by its role, exactly as `src/mail/socket.ts` already does for the banned transport paths. It is never fixed by narrowing this pattern and never by adding a file to EXCLUDED: ./.claude/CLAUDE.md's Enforcement section is explicit that exclusion is by PATH and never by making a rule see less, and EXCLUDED is all-rules-per-file, so skipping a file here silently drops its fan-out, logging, host-literal and read-only coverage too.",
+  },
+  {
+    id: "tsdav-make-calendar",
+    pattern: /\bmakeCalendar\b/g,
+    why: "The DAV library's collection-creation helper, which hardcodes the method the rule above bans. It is therefore unusable from this platform no matter what iCloud would accept -- the throw happens in the `Request` constructor, before anything is sent, so its behaviour against a real server is unmeasurable from this runtime and cannot be established by trying. `src/dav/diagnose.ts` deliberately does NOT import it, and the collection create in this project is a hand-rolled RFC 5689 extended `MKCOL` assembled through the library's raw request helper instead. This name is ALSO one of the names on the `dav-concurrent-request` alternation above, and that is intentional rather than a duplicate to be tidied away: the alternation fires only on a concurrent combinator wrapped around the name, while this rule fires on the name appearing at all. The two answer different questions and neither one covers the other, so do not remove it from the alternation and do not remove this rule because the alternation already mentions it -- the alternation entry is what keeps a future call site guarded by the containment gate's vocabulary the moment one appears.",
+  },
+
   // ------------------------------------------------------------------ time
   // The one rule here that is not about a request budget. It is on this list
   // rather than in a review checklist because its failure mode is silence: no

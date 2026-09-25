@@ -538,6 +538,18 @@ describe("the patterns have teeth", () => {
     // counted the readers of was deleted; zero became the correct number, so the
     // missing arm could never fire and the count became a ban.
     "mail-secret-read": "  const appleId = env.APPLE_ID;",
+    // Phase 17, D-15. Spelled verbatim here for the same reason every sample
+    // above is: this file is skipped by PATH for every rule, and it is the only
+    // file under test/ that is. The shape is the one a future session would
+    // actually write -- the obvious method for the obvious job, reached for
+    // because RFC 4791 names it and the library ships a helper for it.
+    "mkcalendar-method":
+      'const made = await davRequest({ url, init: { method: "MKCALENDAR" } });',
+    // And the helper itself, at the import that makes it reachable. An import
+    // rather than a call site on purpose: the import is where the decision is
+    // actually taken, and it is one line earlier than the call the rule would
+    // otherwise first see.
+    "tsdav-make-calendar": 'import { makeCalendar } from "tsdav";',
   };
 
   it("covers every rule with a known-violating sample", () => {
@@ -2056,19 +2068,36 @@ describe("self-exclusion", () => {
     ).toBeGreaterThan(0);
   });
 
-  it("does not rely on the scanner's pattern spellings failing to self-match", () => {
-    // As written, the scanner's own regex literals do not match themselves: a
-    // word-boundary escape puts a word character immediately before the banned
-    // identifier, and the quoted-string patterns put a bracket where a quote
-    // would have to be. That is a coincidence of spelling, not a property, and
-    // one reworded `why` string would end it. The path exclusion is what
-    // actually holds — this asserts the set contains the path, so a future
-    // reader who notices the coincidence does not conclude the skip is dead
-    // weight and delete it.
+  it("no longer relies on the scanner's pattern spellings failing to self-match", () => {
+    // **That day has arrived, and this case now records it rather than
+    // predicting it.** Until Phase 17 the scanner's own regex literals happened
+    // not to match themselves: a word-boundary escape puts a word character
+    // immediately before the banned identifier, and the quoted-string patterns
+    // put a bracket where a quote would have to be. This case said in as many
+    // words that the coincidence was a coincidence and that one reworded `why`
+    // string would end it.
+    //
+    // What ended it is not a reworded string. It is STRUCTURAL and cannot be
+    // undone without giving up a rule: the request-fan-out rule's alternation
+    // lists the DAV library's collection-creation helper by name, delimited by
+    // `|` on both sides — which is a word boundary — so the moment a rule banned
+    // that name outright, the scanner file began matching its own pattern. The
+    // alternation entry is load-bearing (it is what makes a future call site
+    // visible to the containment gate's vocabulary) and the new rule is
+    // load-bearing, so neither side can be given up to restore the coincidence.
+    //
+    // The assertion is therefore turned the other way up, which is STRONGER
+    // than what it replaced: the path exclusion is no longer merely believed to
+    // be load-bearing, it is shown to be. Without the skip this file is flagged;
+    // with it, it is clean. That is exactly the shape of the sibling case above
+    // for this test file, and it is the assertion a future reader needs — the
+    // one that stops them concluding the skip is dead weight and deleting it.
     expect(EXCLUDED.has(SCANNER_PATH)).toBe(true);
-    expect(scan("scripts", NO_EXCLUSIONS).filter((v) => v.file === SCANNER_PATH)).toEqual(
-      scan("scripts").filter((v) => v.file === SCANNER_PATH),
-    );
+    expect(
+      scan("scripts", NO_EXCLUSIONS).filter((v) => v.file === SCANNER_PATH).length,
+      "the scanner file no longer self-matches, so the path skip is guarding nothing. Work out which rule stopped firing before changing this expectation.",
+    ).toBeGreaterThan(0);
+    expect(scan("scripts").filter((v) => v.file === SCANNER_PATH)).toEqual([]);
   });
 });
 
