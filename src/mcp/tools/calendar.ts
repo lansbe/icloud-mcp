@@ -1446,11 +1446,35 @@ function nothingMinted(): Pick<
  * and the reason the line is worth anything: a sentence stating the number the
  * caller asked for is a sentence a caller can choose.
  *
- * Two values are refused rather than stated. The UNBOUNDED constant is a string
- * — a rule with no reachable end — and a line cannot say how many of those go,
- * so it says nothing about a count rather than inventing one. And ONE is
- * dropped because the resource IS the single occurrence: "along with the 1
- * event in it" beside a subject that is that event says the same thing twice.
+ * ONE is refused rather than stated, because the resource IS the single
+ * occurrence: "along with the 1 event in it" beside a subject that is that
+ * event says the same thing twice.
+ *
+ * **The UNBOUNDED constant was refused here too, and that was this function
+ * failing in the one direction its own closing line forbids.** The argument
+ * recorded until plan 15's third review ran: the constant is a rule with no
+ * reachable end, a line cannot say how many of those go, so it says nothing
+ * about a count rather than inventing one. Both halves of that are still true
+ * and the conclusion never followed from them. Silence was only ever weighed
+ * against INVENTING A NUMBER, and there is a third answer nobody put on the
+ * table: a clause can state the REACH without stating a figure. So the
+ * constant now composes "along with every event in the series". The
+ * no-invented-number half stands exactly as it did — the figure is genuinely
+ * unknowable here, and computing, estimating or capping one would be this
+ * server stating a count it did not walk, which is the first rule above.
+ *
+ * Silence was the worst of the three by a distance, and the reason is worth
+ * stating rather than leaving as a preference. The unbounded case is the
+ * LARGEST delete this server performs and not a degenerate one — an ordinary
+ * weekly standup, with no end date and no repeat count, lands there. So the old
+ * arm put the weakest sentence on the strongest write, while a four-week series
+ * got the stronger one: the smaller deletion described more of itself than the
+ * endless one did.
+ *
+ * The clause says "the series" where the scope may be `this-and-future`, which
+ * names a reach one occurrence wider than the write. That is the same
+ * over-warning the paragraph below chooses, for the same reason, and the exact
+ * dates are published beside it either way.
  *
  * **It does NOT consult the removal boolean, and that is deliberate.** A
  * narrowing removes occurrences while leaving the resource behind, so the
@@ -1463,8 +1487,11 @@ function nothingMinted(): Pick<
  */
 function occurrencesGoingWith(
   affected: number | string,
-): { count: number; noun: "event" } | null {
-  if (typeof affected !== "number" || affected <= 1) return null;
+): { count: number | "unbounded"; noun: "event" } | null {
+  // The string is the unbounded constant. It carries the reach through to the
+  // clause and carries no figure, because there is no figure to carry.
+  if (typeof affected === "string") return { count: "unbounded", noun: "event" };
+  if (affected <= 1) return null;
   return { count: affected, noun: "event" };
 }
 

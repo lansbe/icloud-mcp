@@ -7241,6 +7241,37 @@ describe("the composed line, built from this server's own counts", () => {
     expect(untrusted.confirmationLine).toContain("This cannot be undone.");
   });
 
+  it("names the reach when the series never ends, instead of saying nothing", async () => {
+    // The SAME fixture with its repeat count removed — an ordinary weekly
+    // standup, which is the commonest shape of all and the largest delete this
+    // server performs. It used to compose the sentence for removing one event,
+    // while the strictly smaller four-week deletion above got the stronger one.
+    const stub = bodyStub(invitedSeriesIcs("RRULE:FREQ=WEEKLY"));
+    await warmWrite(stub);
+
+    const { trusted, untrusted } = await deletePreview({
+      id: SERIES_EVENT_ID,
+      scope: "this-and-future",
+    });
+
+    // The structured half says the walk hit no end, and the line says the same
+    // thing in words rather than leaving the field to say it alone. The server
+    // instructions tell the model NOT to rebuild the sentence from these
+    // fields, so a field the sentence contradicts is a field nobody reads.
+    expect(trusted.affectedOccurrences).toBe("unbounded");
+    expect(trusted.recipientCount).toBe(2);
+    expect(untrusted.confirmationLine).toBe(
+      "Deleting event 'One-to-one', along with every event in the series, " +
+        "telling 2 people. This cannot be undone. " +
+        "An invitation cannot be unsent.",
+    );
+    // No number was invented to fill the gap. The walk's own ceiling, an
+    // estimate, or a cap would each be a figure this server did not walk.
+    expect(untrusted.confirmationLine).not.toMatch(
+      /along with the \d+ events? in it/,
+    );
+  });
+
   it("names the recipient count and the thing that cannot be undone, on a create", async () => {
     const stub = writeDavStub();
     await warmWrite(stub);

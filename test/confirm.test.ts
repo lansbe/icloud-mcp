@@ -1849,6 +1849,54 @@ describe("the server composes the human-facing line", () => {
     );
   });
 
+  it("states the reach of an endless series without inventing a number for it", () => {
+    // The largest write this composer describes, and it used to be the one it
+    // said least about: a count it could not know became a clause it did not
+    // write, so a rule with no end composed the sentence for removing one
+    // thing. "Every" is the answer that invents nothing.
+    const shaped: ConfirmationSummary = {
+      kind: "delete",
+      noun: "event",
+      name: "One-to-one",
+      alsoRemoved: { count: "unbounded", noun: "event" },
+      fieldCount: null,
+      recipientCount: 2,
+    };
+
+    expect(composeConfirmationLine(shaped, "would")).toBe(
+      "Deleting event 'One-to-one', along with every event in the series, telling 2 people. This cannot be undone. An invitation cannot be unsent.",
+    );
+    expect(composeConfirmationLine(shaped, "did")).toBe(
+      "Deleted event 'One-to-one', along with every event in the series, telling 2 people. This cannot be undone. An invitation cannot be unsent.",
+    );
+
+    // And no digit reaches the reach clause. A later edit that reached for a
+    // cap, an estimate or the walk's own ceiling would state a figure this
+    // server never walked, which is the thing the clause exists to avoid.
+    const clause = composeConfirmationLine(shaped, "would").split(", ")[1];
+    expect(clause).toBe("along with every event in the series");
+    expect(clause).not.toMatch(/[0-9]/);
+  });
+
+  it("keeps the whole tense in the verb on the unbounded clause too", () => {
+    // The clause is a tense-free statement, on `CONFIRMATION_VERBS`' rule. A
+    // second inflected word added here would break the comparison the preview
+    // and commit pair is read by, and it would break it silently.
+    const shaped: ConfirmationSummary = {
+      kind: "delete",
+      noun: "event",
+      name: "Standup",
+      alsoRemoved: { count: "unbounded", noun: "event" },
+      fieldCount: null,
+      recipientCount: null,
+    };
+    const forward = composeConfirmationLine(shaped, "would");
+    const past = composeConfirmationLine(shaped, "did");
+
+    expect(forward).not.toBe(past);
+    expect(past).toBe(forward.replace("Deleting", "Deleted"));
+  });
+
   it("confines the difference between the two tenses to the tense, by comparison", () => {
     // Read by COMPARING the two strings rather than by looking at them. The
     // composer keeps the whole tense in the leading verb and nowhere else, so

@@ -1050,8 +1050,16 @@ export interface ConfirmationSummary {
   noun: ConfirmationNoun;
   /** The resource's own name, or `null` when there is none to give. */
   name: string | null;
-  /** What disappears alongside, or `null` when nothing does. */
-  alsoRemoved: { count: number; noun: ConfirmationNoun } | null;
+  /**
+   * What disappears alongside, or `null` when nothing does.
+   *
+   * `count` is a number, or the string `"unbounded"` for a container with no
+   * reachable end. The string is NOT a missing number and must never be read
+   * as one: it is the single case where the reach is knowable and the figure is
+   * not, and it composes a clause that states the reach and states no figure.
+   * See `composeConfirmationLine`, which owns that argument.
+   */
+  alsoRemoved: { count: number | "unbounded"; noun: ConfirmationNoun } | null;
   /** How many fields the write moves, or `null` when it moves none. */
   fieldCount: number | null;
   /** How many people the write tells, or `null` when it tells nobody. */
@@ -1322,11 +1330,23 @@ export function composeConfirmationLine(
   // A zero count is not a smaller version of nine, so the clause goes rather
   // than reading "the 0 events in it" — a warning about nothing, published in
   // the shape of a warning about something.
+  //
+  // The unbounded arm is the opposite case and it is the one worth arguing. A
+  // container with no reachable end has a KNOWABLE reach and an UNKNOWABLE
+  // figure. A number would be one this module made up, and silence describes
+  // removing the named thing alone while the write removes all of them — which
+  // is under-warning on the largest write on the books. A clause saying "every"
+  // states the reach and invents nothing, and nothing downstream is permitted
+  // to compute, estimate or cap a figure to replace it.
   const removed = summary.alsoRemoved;
-  if (removed !== null && removed.count > 0) {
-    const word =
-      removed.count === 1 ? removed.noun : CONFIRMATION_PLURALS[removed.noun];
-    clauses.push(`along with the ${removed.count} ${word} in it`);
+  if (removed !== null) {
+    if (removed.count === "unbounded") {
+      clauses.push(`along with every ${removed.noun} in the series`);
+    } else if (removed.count > 0) {
+      const word =
+        removed.count === 1 ? removed.noun : CONFIRMATION_PLURALS[removed.noun];
+      clauses.push(`along with the ${removed.count} ${word} in it`);
+    }
   }
 
   if (summary.fieldCount !== null && summary.fieldCount > 0) {
