@@ -13,6 +13,7 @@ import type { NormalizedContactChange } from "../src/confirm";
 import { DavConnectError } from "../src/dav/errors";
 import type { ContactName, ParsedContact } from "../src/dav/vcard";
 import {
+  buildContactCard,
   countPreservedProperties,
   displayNameFor,
   parseVCard,
@@ -648,6 +649,129 @@ describe("a patch moves what the change named and nothing else", () => {
 
   it("moves nothing at all when the change mentions nothing", () => {
     expect(patchContactCard(ROUND_TRIP_HAZARDS_VCF, MENTIONS_NOTHING)).toBe(NO_OP);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Clearing an optional structured property takes it OFF the card, and `N` is
+// the one exception.
+//
+// The empty husk — `ADR:;;;;;;`, `ORG:` — is not a cleared field, and the
+// reason it matters is that THIS FILE's read path cannot tell the husk from a
+// populated property: `addressFrom` returns a seven-null address for any
+// non-empty component list, and `componentsOf` lifts a bare `""` into `[""]`.
+// So each case below asserts the bytes AND the read-back, because either one
+// alone would pass for a defect the other catches. `patchContactCard` copying
+// what it fetched is what makes a husk permanent, so the write side is the only
+// place it can be stopped.
+//
+// `N` is exempt because vCard 3.0 REQUIRES it (RFC 2426 section 3.1.2), so
+// `N:;;;;` is the correct way to say "no name" and removing the property would
+// be the defect. Both halves of that asymmetry are asserted, in both
+// directions: a clear removes `ADR` and `ORG` and does not remove `N`, and a
+// non-empty value is still written for all three.
+// ---------------------------------------------------------------------------
+
+/** Every component of `ADR` cleared — what a wire `address: null` becomes. */
+const ADDRESS_CLEARED = {
+  poBox: null,
+  extended: null,
+  street: null,
+  locality: null,
+  region: null,
+  postalCode: null,
+  country: null,
+} as const;
+
+/** Every component of `N` cleared — what a wire `name: null` becomes. */
+const NAME_CLEARED = {
+  family: null,
+  given: null,
+  additional: null,
+  prefix: null,
+  suffix: null,
+} as const;
+
+describe("clearing an optional structured property removes it rather than emptying it", () => {
+  it("takes ADR off the card and reads back as an absent address", () => {
+    const patched = patchContactCard(FULL_CONTACT_VCF, {
+      ...MENTIONS_NOTHING,
+      address: { ...ADDRESS_CLEARED },
+    });
+    // The husk, named by its exact bytes, because that is what shipped before.
+    expect(patched).not.toContain("ADR:;;;;;;");
+    expect(patched).not.toMatch(/^ADR/im);
+    // And the read path agrees, which the husk would have made it not do.
+    expect(parseVCard(patched).address).toBeNull();
+  });
+
+  it("takes ORG off the card and reads back as an empty organisation", () => {
+    const patched = patchContactCard(FULL_CONTACT_VCF, {
+      ...MENTIONS_NOTHING,
+      organisation: [],
+    });
+    expect(patched).not.toMatch(/^ORG/im);
+    expect(parseVCard(patched).organisation).toEqual([]);
+  });
+
+  it("clears one structured property without disturbing the other", () => {
+    const patched = patchContactCard(FULL_CONTACT_VCF, {
+      ...MENTIONS_NOTHING,
+      address: { ...ADDRESS_CLEARED },
+    });
+    // The change named the address and nothing else, so the organisation is
+    // unmentioned data and survives whole.
+    expect(patched).toContain("ORG:Example Manufacturing;Reliability Engineering");
+    expect(parseVCard(patched).organisation).toEqual([
+      "Example Manufacturing",
+      "Reliability Engineering",
+    ]);
+  });
+
+  it("KEEPS an all-empty N, because vCard 3.0 requires the property", () => {
+    // The asymmetry, asserted rather than left to be inferred: the same helper
+    // serves all three properties and answers differently for this one.
+    const patched = patchContactCard(FULL_CONTACT_VCF, {
+      ...MENTIONS_NOTHING,
+      name: { ...NAME_CLEARED },
+    });
+    expect(patched).toMatch(/^N:;;;;\r$/m);
+    // A card with no `N` at all is malformed, so its absence is the failure.
+    expect(patched).toMatch(/^N[:;]/im);
+  });
+
+  it("still writes all three when the value is not empty", () => {
+    // The other direction. A removal that fired on a populated value would be
+    // a far worse defect than the husk it replaced, and nothing above would
+    // catch it.
+    const patched = patchContactCard(FULL_CONTACT_VCF, {
+      ...MENTIONS_NOTHING,
+      name: { ...NAME_CLEARED, family: "Solano" },
+      address: { ...ADDRESS_CLEARED, locality: "Example City" },
+      organisation: ["Example Bindery"],
+    });
+    expect(patched).toContain("N:Solano;;;;");
+    expect(patched).toContain("ADR:;;;Example City;;;");
+    expect(patched).toContain("ORG:Example Bindery");
+  });
+
+  it("writes no empty husk onto a card built from scratch either", () => {
+    // The create leg runs through the same helper, so a create naming a
+    // cleared address must not mint a card that is born carrying the husk.
+    const built = buildContactCard("created-uid", {
+      ...MENTIONS_NOTHING,
+      kind: "create",
+      formattedName: { value: "Noor Vasquez" },
+      address: { ...ADDRESS_CLEARED },
+      organisation: [],
+      name: { ...NAME_CLEARED },
+    });
+    expect(built).not.toMatch(/^ADR/im);
+    expect(built).not.toMatch(/^ORG/im);
+    // `N` is mandatory, so it is written here even though it is empty.
+    expect(built).toMatch(/^N:;;;;\r$/m);
+    expect(parseVCard(built).address).toBeNull();
+    expect(parseVCard(built).organisation).toEqual([]);
   });
 });
 

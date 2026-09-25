@@ -278,13 +278,16 @@ export function buildContactCard(
 
   if (change.name !== null && change.name !== undefined) {
     const name = change.name;
-    setStructured(card, "n", [
-      name.family,
-      name.given,
-      name.additional,
-      name.prefix,
-      name.suffix,
-    ]);
+    // `true` because `N` is mandatory in vCard 3.0: an all-empty one is written
+    // rather than removed. `ADR` and `ORG` below take the default and are
+    // REMOVED when every component is empty — see `setStructured`'s docstring
+    // for why the two answers differ.
+    setStructured(
+      card,
+      "n",
+      [name.family, name.given, name.additional, name.prefix, name.suffix],
+      true,
+    );
   }
 
   if (change.address !== null && change.address !== undefined) {
@@ -412,13 +415,16 @@ export function patchContactCard(
 
   if (change.name !== null && change.name !== undefined) {
     const name = change.name;
-    setStructured(card, "n", [
-      name.family,
-      name.given,
-      name.additional,
-      name.prefix,
-      name.suffix,
-    ]);
+    // `true` for the same reason as on the create leg: `N` is mandatory, so
+    // clearing it writes `N:;;;;`. Clearing `ADR` or `ORG` below takes the
+    // property off the card instead, which is what makes the tool's own "null
+    // clears it" true in the answer a later `contacts_get` gives.
+    setStructured(
+      card,
+      "n",
+      [name.family, name.given, name.additional, name.prefix, name.suffix],
+      true,
+    );
   }
 
   if (change.address !== null && change.address !== undefined) {
@@ -593,15 +599,42 @@ function setOrRemoveText(
  * Removed and re-added rather than updated in place, for the reason
  * `buildContactCard` gives about the repeated properties: the update helper
  * keeps the existing property's parameters, and an `ADR` carries a `TYPE`.
+ *
+ * ## An all-empty structured value is a REMOVAL, except for `N`
+ *
+ * The asymmetry is the whole point of the parameter, so here is why it runs the
+ * way it does. `ADR` and `ORG` are optional properties, so "clear it" has an
+ * exact representation on the wire: the property is not there. Writing the empty
+ * husk instead — `ADR:;;;;;;`, `ORG:` — leaves the property standing, and this
+ * file's OWN read path then answers that the field is still present:
+ * `addressFrom` returns a seven-null address for any non-empty component list,
+ * and `componentsOf` lifts a bare `""` into `[""]`. So the husk does not merely
+ * look untidy, it makes "null clears it" false in the tool's answer as well as
+ * on the wire — and because `patchContactCard` copies what it fetched, every
+ * later update carries the husk forward for the life of the card.
+ *
+ * `N` is the exception because vCard 3.0 REQUIRES it (RFC 2426 section 3.1.2).
+ * A card with no `N` at all is malformed, so the empty structured value `N:;;;;`
+ * is the correct way to say "this person has no name" and removing the property
+ * would be the defect rather than the fix. Hence `keepWhenEmpty`, passed at the
+ * two `n` call sites and nowhere else.
+ *
+ * The non-empty case is untouched: still remove-then-add, so a mentioned
+ * structured property still moves to the end of the card. That is a recorded
+ * decision, not something to correct here.
  */
 function setStructured(
   card: IcalComponent,
   name: string,
   components: (string | null)[],
+  /** `N` is mandatory in vCard 3.0, so an empty one is written, not removed. */
+  keepWhenEmpty = false,
 ): void {
   card.removeAllProperties(name);
+  const values = components.map((component) => component ?? "");
+  if (!keepWhenEmpty && values.every((value) => value === "")) return;
   const property = new ICAL.Property(name, card);
-  property.setValue(components.map((component) => component ?? ""));
+  property.setValue(values);
   card.addProperty(property);
 }
 
