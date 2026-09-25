@@ -128,6 +128,113 @@ describe("the hand-typed folds say what the constants claim", () => {
   });
 });
 
+describe("the round-trip card is still hazardous, not merely still safe", () => {
+  // Every rule in this file proves a fixture is SAFE to commit. Nothing above
+  // proves `ROUND_TRIP_HAZARDS_VCF` is still DANGEROUS, and that is the only
+  // property CONW-04's fidelity proof buys anything from. A card that lost its
+  // photo would sail through all nine rules while quietly retiring the coverage
+  // the proof rests on — the same argument "keeps at least one real fold in each
+  // format" makes about itself, applied to three more properties.
+  //
+  // The eight properties `parseVCard` reads (`src/dav/vcard.ts`), written out
+  // LITERALLY rather than derived from the parser. Deriving them would make the
+  // unmodelled-property case vacuous the day a ninth is added: the parser would
+  // grow, the fixture's extension property would become modelled, and the case
+  // would still pass while proving nothing.
+  const MODELLED_BY_PARSE_VCARD = [
+    "uid",
+    "fn",
+    "n",
+    "org",
+    "adr",
+    "note",
+    "email",
+    "tel",
+  ];
+
+  it("still carries a base64 photo folded across a continuation line", () => {
+    // The photo property plus every continuation line belonging to it. The fold
+    // has to be inside THAT span: a fold anywhere else in the card would satisfy
+    // a whole-text check while the photo sat on one line.
+    const span = /\r\nPHOTO;[^\r\n]*\r\n(?:[ \t][^\r\n]*\r\n)*/.exec(
+      fixtures.ROUND_TRIP_HAZARDS_VCF,
+    );
+    expect(
+      span,
+      "ROUND_TRIP_HAZARDS_VCF has lost its PHOTO property. That was the " +
+        "multi-line folded-value hazard, and CONW-04's fidelity proof runs " +
+        "against this card precisely because a hand-rolled serialiser destroys " +
+        "it. Restore it rather than adjusting this case.",
+    ).not.toBeNull();
+    const photo = span?.[0] ?? "";
+    expect(
+      /ENCODING=b\b/i.test(photo),
+      "ROUND_TRIP_HAZARDS_VCF's PHOTO is no longer in the inline base64 form. " +
+        "A photo held by reference is not the hazard: the bytes are what a " +
+        "whole-card overwrite drops.",
+    ).toBe(true);
+    // `.slice(2)` drops the leading CRLF the match starts with, so only a real
+    // continuation line inside the photo can satisfy this.
+    expect(
+      /\r\n[ \t]/.test(photo.slice(2)),
+      "ROUND_TRIP_HAZARDS_VCF's PHOTO no longer folds across a continuation " +
+        "line. An unfolded photo retires the only coverage this project has of " +
+        "the folded-value case, which is the thing it adopted a real parser for.",
+    ).toBe(true);
+  });
+
+  it("still pairs a grouped address with an Apple label under the same group prefix", () => {
+    const card = fixtures.ROUND_TRIP_HAZARDS_VCF;
+    const groupsWith = (property: string) =>
+      new Set(
+        [
+          ...card.matchAll(
+            new RegExp(`\\r\\n(item\\d+)\\.${property}[;:]`, "gi"),
+          ),
+        ].map((match) => (match[1] ?? "").toLowerCase()),
+      );
+    const addressGroups = groupsWith("EMAIL");
+    const labelGroups = groupsWith("X-ABLabel");
+    const shared = [...addressGroups].filter((group) => labelGroups.has(group));
+    expect(
+      shared,
+      "ROUND_TRIP_HAZARDS_VCF no longer has an item-group address and an " +
+        "X-ABLabel sharing one prefix. The shared prefix is the ONLY thing " +
+        "binding Apple's custom label to the address it names, and whole-list " +
+        "replacement of emails is the write this phase ships that is most " +
+        "likely to break it. Both properties existing separately is not the " +
+        "hazard; sharing a prefix is.",
+    ).not.toHaveLength(0);
+  });
+
+  it("still carries an extension property this project's parser cannot see", () => {
+    const card = new ICAL.Component(
+      ICAL.parse(fixtures.ROUND_TRIP_HAZARDS_VCF),
+    );
+    const unmodelled = card
+      .getAllProperties()
+      .map((property) => property.name.toLowerCase())
+      .filter(
+        (name) =>
+          name.startsWith("x-") &&
+          !MODELLED_BY_PARSE_VCARD.includes(name) &&
+          // X-ABLabel is already pinned by the grouped-label case above.
+          // Excluding it keeps this hazard independent: deleting the phonetic
+          // property must fail HERE and not be covered for free by the label.
+          name !== "x-ablabel",
+      );
+    expect(
+      unmodelled,
+      "ROUND_TRIP_HAZARDS_VCF no longer carries an extension property outside " +
+        "the eight `parseVCard` reads, other than the grouped label. That " +
+        "property's entire job is to be invisible to this project's parser and " +
+        "survive a write anyway, which is the failure PITFALLS #39 names: a " +
+        "contact update is a whole-vCard overwrite and it drops the fields the " +
+        "reader never showed you.",
+    ).not.toHaveLength(0);
+  });
+});
+
 describe("the undefined zone is undefined everywhere, not just locally", () => {
   it("is named as a parameter and defined by no fixture", () => {
     // `ICAL.TimezoneService` is process-global. If any fixture in this file
