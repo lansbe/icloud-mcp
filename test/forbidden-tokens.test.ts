@@ -242,6 +242,27 @@ const DAV_FAN_OUT_SERVICE = [
   "createContact",
   "buildContactCreatePreview",
   "applyContactCommit",
+  // Phase 16 (CONW-05). The duplicate scan, and the case the rule's own text
+  // describes most directly: two probes over one address book is exactly the
+  // loop a combinator gets wrapped around, because that is what makes two round
+  // trips fast — and the concurrent version returns the same candidates, so
+  // nothing about the answer reveals it.
+  //
+  // It needs no new entry on `DAV_FAN_OUT_LIBRARY`: every request it issues is
+  // already named there — `addressBookQuery` for the filtered probe, `propfind`
+  // for the enumeration and `addressBookMultiGet` for the bulk read. Read from
+  // the pattern rather than assumed.
+  //
+  // `duplicateFilter` is deliberately NOT here, on the precedent
+  // `planContactCreateTarget` set one entry up: it assembles a report body and
+  // issues no request, so listing it would misstate what this rule bans. It
+  // carries a WRITTEN disposition in the DAV write manifest instead.
+  //
+  // No entry here is a prefix or a substring of it, and it contains none:
+  // `findFreeSlots` shares only `find`, and `getContact` and `createContact` are
+  // not contiguous inside it. So its per-name loop below can genuinely fail, and
+  // the `getEventWithEtag` exception list stays at one.
+  "findDuplicateCandidates",
 ];
 
 /** The request primitive and the tsdav standalone helpers: what a "just do them
@@ -806,8 +827,8 @@ describe("the patterns have teeth", () => {
     const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
     expect(
       DAV_FAN_OUT_SERVICE.length,
-      "eleven read entry points, phase 5's four writes, the organiser resolution WINDOWS 60 filed, the eight composite tool-layer entry points 05-REVIEW.md WR-04 filed plus 05-14's scopelessBody, phase 6's findFreeSlots orchestrator and its looped collectFrom, phase 14's two dav_diagnose probes — runCollectionWriteProbe, whose fan-out would leave half-finished collections on a real account and race its own cleanup check, and runTaskCollectionProbe, a loop over collections issuing one calendar-query apiece — and phase 16's three: the CardDAV write createContact, plus the two composites buildContactCreatePreview and applyContactCommit, which end in it and were therefore covered only by accident. planContactCreateTarget and contactUidFromObjectUrl are NOT among them: both are synchronous and issue no request, so they carry a written manifest disposition instead",
-    ).toBe(31);
+      "eleven read entry points, phase 5's four writes, the organiser resolution WINDOWS 60 filed, the eight composite tool-layer entry points 05-REVIEW.md WR-04 filed plus 05-14's scopelessBody, phase 6's findFreeSlots orchestrator and its looped collectFrom, phase 14's two dav_diagnose probes — runCollectionWriteProbe, whose fan-out would leave half-finished collections on a real account and race its own cleanup check, and runTaskCollectionProbe, a loop over collections issuing one calendar-query apiece — and phase 16's three: the CardDAV write createContact, plus the two composites buildContactCreatePreview and applyContactCommit, which end in it and were therefore covered only by accident. planContactCreateTarget and contactUidFromObjectUrl are NOT among them: both are synchronous and issue no request, so they carry a written manifest disposition instead. CONW-05 adds a fourth from phase 16, findDuplicateCandidates — the duplicate scan, and the case this rule's own text describes most directly: two probes over one address book is exactly the loop a combinator gets wrapped around, and the concurrent version returns the same candidates, so nothing about the answer reveals it. duplicateFilter is NOT among them either, on planContactCreateTarget's precedent: it assembles a report body and issues no request",
+    ).toBe(32);
     for (const entryPoint of DAV_FAN_OUT_SERVICE) {
       const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
       expect(

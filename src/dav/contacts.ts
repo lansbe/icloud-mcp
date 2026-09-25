@@ -80,6 +80,42 @@ import type { Principal } from "../principal";
 const ADDRESS_BOOK_QUERY_REPORT = "addressbookQuery";
 
 /**
+ * The two properties a duplicate scan may probe, as the PROTOCOL spells them.
+ *
+ * Not the library's camel-cased reading — these go INTO a filter document rather
+ * than being read out of a response, so they are RFC 6350 property names and the
+ * spelling is the specification's. Named here rather than at the call site
+ * because a typo in either would produce a filter a server answers with an empty
+ * set, which is indistinguishable from "no duplicate exists".
+ */
+const EMAIL_PROPERTY = "EMAIL";
+const TEL_PROPERTY = "TEL";
+
+/**
+ * How many candidates a preview may name.
+ *
+ * Three, decided in the phase context: a longer list is one the user skims
+ * rather than reads. That is a statement about whether the safeguard WORKS and
+ * not about response size — a safeguard nobody reads is not a safeguard.
+ */
+const DUPLICATE_CANDIDATE_MAX = 3;
+
+/**
+ * The ranking order of the signals, strongest first.
+ *
+ * Exact address, then exact number, then name similarity — the phase context's
+ * locked order, expressed as a table so the sort reads it rather than
+ * re-deriving it from a chain of comparisons. A signal added to
+ * `DuplicateSignal` without a rank here fails to compile, which is the point of
+ * the `Record` rather than a lookup with a default.
+ */
+const DUPLICATE_SIGNAL_RANK: Record<DuplicateSignal, number> = {
+  email: 0,
+  phone: 1,
+  name: 2,
+};
+
+/**
  * The longest search term this server will carry.
  *
  * It bounds two different costs at once. On the server route the term is
@@ -242,6 +278,77 @@ export interface ContactSearchOptions {
   pageSize?: number;
   /** The `nextCursor` of a previous page, or absent for page one. */
   cursor?: string;
+}
+
+/**
+ * WHICH signal made a card a duplicate candidate, as a CLOSED vocabulary.
+ *
+ * Three values this server chooses from after matching a fixed rule, on
+ * `MatchPath`'s own footing exactly: it admits no free text, nothing a stranger
+ * wrote can widen it, and a value outside it can only arrive by editing this
+ * line. That is what lets the label ride in the TRUSTED half of a preview while
+ * every display name and address beside it rides inside the fence.
+ *
+ * The order of the union is also the RANKING order, strongest first, and
+ * `DUPLICATE_SIGNAL_RANK` is the machine-readable statement of the same thing.
+ * `"name"` is last because CONW-05 calls name similarity a weak signal.
+ */
+export type DuplicateSignal = "email" | "phone" | "name";
+
+/**
+ * One card that already carries something a write is about to supply (CONW-05).
+ *
+ * **An EXTENSION of the search row rather than a parallel shape**, for
+ * `ContactDetail`'s own recorded reason: two independently declared row shapes
+ * agree today and drift the first time either grows a field, silently, because
+ * both still serialise into a plausible response. Extending also means the
+ * fence placement of every inherited field is already audited — a candidate's
+ * `displayName` and `emails` are stranger-authored here for exactly the reason
+ * they are stranger-authored on a search row.
+ *
+ * `signal` is the one field a candidate adds, and it is the one field on this
+ * type this server wrote.
+ */
+export interface DuplicateCandidate extends ContactSummary {
+  /** Which rule matched this card. The STRONGEST one it matched. */
+  signal: DuplicateSignal;
+}
+
+/**
+ * What one duplicate scan probes with, and the cost it is allowed to spend.
+ *
+ * **`email` and `tel` are the only two fields that can cause a request, and a
+ * probe with both null causes none at all.** That is the phase's locked
+ * decision — "a create carrying neither spends nothing" — and it is enforced by
+ * `findDuplicateCandidates` refusing before it enters discovery, so the KV read
+ * is not spent either.
+ *
+ * `displayName` is different in kind and the difference is the whole of CONW-05's
+ * weak-signal rule: it RANKS and labels candidates the two probes already
+ * returned, and it never becomes a query. A query on a name would be the
+ * account-wide sweep this project has twice declined, so the value is carried
+ * here for comparison only and no code path reads it before a probe has run.
+ */
+export interface DuplicateProbe {
+  /** One address to look for, or null to look for none. */
+  email: string | null;
+  /** One telephone number to look for, or null to look for none. */
+  tel: string | null;
+  /**
+   * The name of the card being written, for RANKING only. Never queried.
+   *
+   * The empty string is a legitimate value: a card with neither a formatted nor
+   * a structured name is a real record, and `displayNameFor` returns `""` for
+   * one. It shares no tokens with anything, so it ranks nothing.
+   */
+  displayName: string;
+  /**
+   * The object URL a candidate must NOT be, or null when there is none.
+   *
+   * Null on a create: there is no card yet. An update passes the card it is
+   * updating, because offering a card as its own duplicate is not an answer.
+   */
+  excludeObjectUrl: string | null;
 }
 
 /** One address book collection, as this module carries it internally. */
@@ -508,6 +615,178 @@ export function matchesContact(contact: ParsedContact, term: string): boolean {
     if (email.value !== null && fold(email.value).includes(needle)) return true;
   }
   return false;
+}
+
+/**
+ * The server-side filter document for ONE named property (CONW-05).
+ *
+ * `contactFilter`'s sibling, and deliberately a narrower one: that function
+ * builds a three-way disjunction because a search asks one question of three
+ * properties, while a duplicate scan asks a different question per property and
+ * must be able to count what each one cost. One property per call is what makes
+ * "at most two queries, and only for the fields the caller supplied" a property
+ * of the call sites rather than of a comment.
+ *
+ * **`searchContacts` cannot serve this, and that is why the sibling exists
+ * rather than a second call to the search.** `contactFilter` names `FN`, `N` and
+ * `EMAIL` and no telephone property; `matchesContact` tests the display name and
+ * the addresses only; and `ContactSummary` carries no numbers at all. A scan
+ * built on the search with a number as the term would return an empty page every
+ * time and look like a working feature. Widening those two is NOT the repair:
+ * they are held in documented agreement with each other by tests that every
+ * existing read caller relies on, and a fourth property on one side changes
+ * shipped search behaviour for a write-path reason.
+ *
+ * **The collation and the match type are set EXPLICITLY even though both are the
+ * protocol's defaults**, for `contactFilter`'s own recorded reason: a default
+ * that is correct today is a default that changes silently.
+ *
+ * **`contains` and not `equals`, and the server filter is therefore deliberately
+ * a SUPERSET of the answer.** The equality rule this scan actually applies lives
+ * in `emailMatchesCard` and `telMatchesCard` and is applied to the cards BOTH
+ * routes return, so the two routes run one rule rather than two that agree until
+ * somebody edits either. Asking the server for equality instead would make the
+ * filter the rule on one route and the local comparison the rule on the other,
+ * and a telephone number is exactly where those two answers part company: the
+ * wire carries whatever spacing and punctuation somebody typed.
+ *
+ * **The term is carried as element TEXT, never concatenated into markup** — the
+ * library escapes on serialisation, so a term containing angle brackets or
+ * quotes becomes text rather than structure (T-16-18). This is `contactFilter`'s
+ * recorded mitigation reused rather than re-derived.
+ *
+ * It issues no request, so it carries a WRITTEN disposition in the DAV write
+ * manifest rather than the `"guarded"` string.
+ */
+export function duplicateFilter(
+  propertyName: string,
+  term: string,
+): Record<string, unknown> {
+  return {
+    _attributes: { test: "anyof" },
+    "prop-filter": [
+      {
+        _attributes: { name: propertyName },
+        "text-match": {
+          _attributes: {
+            collation: "i;unicode-casemap",
+            "match-type": "contains",
+          },
+          _text: term,
+        },
+      },
+    ],
+  };
+}
+
+/**
+ * Whether a supplied address is ALREADY on a card.
+ *
+ * Whole-address equality after folding both sides, and NOT the substring rule
+ * `matchesContact` uses. A substring rule is right for a person searching and
+ * wrong for a duplicate check, where it would report every colleague at a shared
+ * domain as a duplicate of every other.
+ *
+ * `fold` and not the locale-aware form: that function's own docstring carries
+ * the argument, and it applies here unchanged.
+ *
+ * **No Unicode normalisation is applied to either side, and that is a decision
+ * rather than an omission.** Normalising somebody's own address is a repair, and
+ * this project refuses repairs on user-authored text as firmly as it refuses
+ * them on stranger-authored text — `canonicalChange` in `../confirm.ts` states
+ * the same rule for the same reason. The consequence is worth stating: two
+ * addresses that differ only in how a composed character was encoded do not
+ * match, so the candidate is missed rather than wrongly claimed. That is the
+ * right direction for a signal that only ever surfaces and never acts.
+ */
+function emailMatchesCard(supplied: string, contact: ParsedContact): boolean {
+  const needle = fold(supplied);
+  if (needle.length === 0) return false;
+
+  for (const email of contact.emails) {
+    if (email.value !== null && fold(email.value) === needle) return true;
+  }
+  return false;
+}
+
+/** Every DIGIT of a value, in order, and nothing else. */
+function digitsOf(value: string): string {
+  let digits = "";
+  for (const character of value) {
+    if (character >= "0" && character <= "9") digits += character;
+  }
+  return digits;
+}
+
+/**
+ * Whether a supplied telephone number is ALREADY on a card.
+ *
+ * Equality after removing every character that is not a digit, so the spacing,
+ * the brackets and the dashes somebody typed do not decide the answer.
+ *
+ * **No country-code inference and no suffix matching, and the consequence is
+ * stated here rather than left to be discovered: a number stored WITH a country
+ * code will not match one supplied without it.** That is deliberate. Suffix
+ * matching would make a seven-digit number match a different person's number in
+ * another country, and inferring a country code means guessing which country the
+ * user is in from a value they did not supply. The cost of this rule is a MISSED
+ * candidate rather than a WRONG one, which is the only direction a weak signal
+ * that surfaces on a preview may fail in.
+ *
+ * A probe or a card whose value carries no digit at all matches nothing. Without
+ * that floor, a card holding `TEL:-` and a probe of `()` would both reduce to the
+ * empty string and every card in the book would match every probe.
+ */
+function telMatchesCard(supplied: string, contact: ParsedContact): boolean {
+  const needle = digitsOf(supplied);
+  if (needle.length === 0) return false;
+
+  for (const tel of contact.tels) {
+    if (tel.value !== null && digitsOf(tel.value) === needle) return true;
+  }
+  return false;
+}
+
+/**
+ * The whitespace-separated tokens of a name, folded, two characters and longer.
+ *
+ * The length floor is what stops an initial doing the work of a name: `J` shared
+ * between "J Smith" and "J Okonkwo" is not evidence of anything, and a rule
+ * without the floor would rank every card sharing an initial.
+ */
+function nameTokensOf(value: string): Set<string> {
+  const tokens = new Set<string>();
+  for (const token of fold(value).split(/\s+/)) {
+    if (token.length >= 2) tokens.add(token);
+  }
+  return tokens;
+}
+
+/**
+ * How many name tokens two display names share.
+ *
+ * **This RANKS and it never queries**, which is CONW-05's weak-signal rule and
+ * the reason the whole function is a pure comparison over values the caller
+ * already holds. It runs over candidates the two probes returned; a query on a
+ * name would be the account-wide sweep this project has twice declined.
+ *
+ * Zero shared tokens is not a name match. The count is the ranking key WITHIN
+ * the name group, descending, so the closest name reads first out of a list a
+ * user skims.
+ *
+ * Which function computes this is named as Claude's discretion in the phase
+ * context, so it can be changed later without moving a stored value or a signed
+ * token. Shared-token counting is the cheapest rule that is symmetric, needs no
+ * tuning constant, and cannot claim a similarity between two names with nothing
+ * in common.
+ */
+function sharedNameTokens(left: string, right: string): number {
+  const first = nameTokensOf(left);
+  let shared = 0;
+  for (const token of nameTokensOf(right)) {
+    if (first.has(token)) shared += 1;
+  }
+  return shared;
 }
 
 /**
@@ -965,6 +1244,242 @@ export async function getContact(
       },
       resolved.cacheHit,
     );
+  });
+}
+
+// --------------------------------------------------- the write path's safeguard
+//
+// CONW-05. It writes nothing and it is read-shaped, but it exists only for the
+// write path: it is the one moment at which a user can decide whether the card
+// they are about to create should exist. It surfaces what it found and it acts on
+// nothing — no merge, no redirect, no copied field, and no refusal. Refusing
+// would make a legitimate second card for the same person impossible to create,
+// and merging is the thing CONW-05 forbids by name.
+
+/**
+ * One filtered query over one address book, for one property (CONW-05).
+ *
+ * Extracted so the request count is countable by eye: this function issues
+ * EXACTLY one request, so the number of requests the server route spends is the
+ * number of times a call site reaches it.
+ */
+async function duplicateQuery(
+  book: AddressBook,
+  propertyName: string,
+  term: string,
+  davFetch: DavFetch,
+): Promise<Array<{ url: string; body: string }>> {
+  const responses = await addressBookQuery({
+    url: book.url,
+    props: { "d:getetag": {}, "card:address-data": {} },
+    filters: duplicateFilter(propertyName, term),
+    depth: "1",
+    // Never a credential from here. `./transport.ts` attaches it per call and is
+    // the only place that may.
+    headers: {},
+    fetch: davFetch,
+  });
+
+  return cardsFrom(responses, book.url);
+}
+
+/**
+ * The probe route: at most TWO filtered queries, issued SERIALLY (CONW-05).
+ *
+ * One per supplied field and none for a field the caller did not supply, which is
+ * the phase's locked cost decision expressed as control flow rather than as a
+ * comment. The two awaits are sequential and MUST stay that way: a combinator
+ * here is the exact shape `.claude/CLAUDE.md` §3 bans, and the reason is not this
+ * server's latency — it is iCloud's own per-account connection ceiling, which is
+ * lower than the platform's, undocumented, deliberately unmeasured, and which
+ * does not fail politely when it is exhausted. It locks the user out of their own
+ * mail in Mail.app on their own devices. `findDuplicateCandidates` is named in the
+ * `dav-concurrent-request` alternation so a combinator around it fails the commit
+ * rather than the review.
+ *
+ * A refusal propagates rather than falling back to the local route, unlike
+ * `searchContacts`. The two are different situations: a search that cannot filter
+ * still owes the caller their answer, while this scan is one leg of a preview, and
+ * paying a failed query AND then a whole enumeration plus bulk read for an
+ * advisory safeguard is spending the budget twice over. A failure here surfaces as
+ * a failed preview, which is honest; swallowing it would report "no duplicates"
+ * about a scan that never ran, which is the one answer this function must never
+ * give.
+ */
+async function duplicateProbeRoute(
+  book: AddressBook,
+  probe: DuplicateProbe,
+  davFetch: DavFetch,
+): Promise<Array<{ url: string; body: string }>> {
+  const cards: Array<{ url: string; body: string }> = [];
+
+  if (probe.email !== null) {
+    cards.push(
+      ...(await duplicateQuery(book, EMAIL_PROPERTY, probe.email, davFetch)),
+    );
+  }
+  // SERIAL: awaited after the one above, never beside it.
+  if (probe.tel !== null) {
+    cards.push(
+      ...(await duplicateQuery(book, TEL_PROPERTY, probe.tel, davFetch)),
+    );
+  }
+
+  return cards;
+}
+
+/** One candidate before the cap and the ordering are applied. */
+interface ScoredCandidate {
+  pending: PendingContact;
+  signal: DuplicateSignal;
+  /** Shared name tokens. Zero for an address or number match; it sorts last. */
+  nameScore: number;
+}
+
+/**
+ * The STRONGEST signal one card matched, or null for a card that matched none.
+ *
+ * Strongest wins in `DUPLICATE_SIGNAL_RANK`'s order, so a card carrying both the
+ * address and the number is reported once, as an address match. Reporting it
+ * twice would spend two of the three slots on one person.
+ *
+ * The same rule runs over the cards BOTH routes returned, which is what keeps the
+ * routes answering one question. The server route's filter is a deliberate
+ * superset — see `duplicateFilter` — so a card it returned may match no rule
+ * here, and a card that matches nothing is not a candidate.
+ */
+function duplicateSignalFor(
+  contact: ParsedContact,
+  probe: DuplicateProbe,
+): { signal: DuplicateSignal; nameScore: number } | null {
+  if (probe.email !== null && emailMatchesCard(probe.email, contact)) {
+    return { signal: "email", nameScore: 0 };
+  }
+  if (probe.tel !== null && telMatchesCard(probe.tel, contact)) {
+    return { signal: "phone", nameScore: 0 };
+  }
+
+  const shared = sharedNameTokens(probe.displayName, displayNameFor(contact));
+  if (shared > 0) return { signal: "name", nameScore: shared };
+
+  return null;
+}
+
+/**
+ * Which existing cards already carry something a write is about to supply
+ * (CONW-05).
+ *
+ * ## What it costs, and the one case where it costs nothing at all
+ *
+ * A probe with NEITHER an address nor a number returns the empty list WITHOUT
+ * entering `withRediscovery`, so it spends no KV read and no outbound request.
+ * The phase's locked decision — "a create carrying neither spends nothing" — is
+ * about the discovery read as well as about the queries, which is why the refusal
+ * is lexically ahead of the wrapper rather than inside it.
+ *
+ * With something to probe with, per address book:
+ *
+ *   - **The book advertises the query report:** at most two filtered queries,
+ *     one per supplied field, issued serially. See `duplicateProbeRoute`.
+ *   - **It does not:** the local route ONCE — one enumeration and one bulk read —
+ *     and BOTH probes matched against that single set of cards. One read serving
+ *     two probes is strictly cheaper than two reads serving one each, and the
+ *     local route already carries every card in the book, so asking twice buys
+ *     nothing. **The obvious edit is to loop the whole route per probe. Do not:
+ *     that doubles the most expensive route this module has for no new
+ *     information.**
+ *
+ * Address books are walked SERIALLY, one awaited before the next begins, exactly
+ * as `searchContacts` does and for the reason its own comment gives.
+ *
+ * ## It acts on nothing
+ *
+ * It returns rows. It merges nothing, copies nothing, redirects nothing and
+ * refuses nothing, and the tool layer above it does the same — the candidate list
+ * is deliberately outside the signed change, so it cannot alter the write or
+ * cause a refusal (T-16-19). A create that found three candidates writes exactly
+ * the card the user approved.
+ *
+ * ## Where the two routes agree, and where they do not
+ *
+ * They agree on the RULE: the same matchers classify the cards either route
+ * returned. The residual divergence is the `"name"` signal, and it is asserted in
+ * the tests rather than hidden behind a claim of equality — `contactFilter`'s
+ * docstring makes the same statement about the search. The local route holds
+ * every card in the book already, so a name-similar card with no matching address
+ * or number is visible to it; the server route only sees what its two filters
+ * returned. That divergence costs no extra request on either route, which is why
+ * it is not the sweep CONW-05 forbids: no code path here queries a name.
+ */
+export async function findDuplicateCandidates(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  probe: DuplicateProbe,
+): Promise<DuplicateCandidate[]> {
+  // BEFORE `withRediscovery`, and therefore before the KV read discovery
+  // performs and before any outbound request. See the docstring: this is the
+  // locked "spends nothing" decision, and it is only true here.
+  if (probe.email === null && probe.tel === null) return [];
+
+  return withRediscovery(env, principal, davFetch, "carddav", async (resolved) => {
+    const books = await fetchBooks(davFetch, resolved);
+
+    const scored: ScoredCandidate[] = [];
+    // The two queries can return the SAME card — a person whose card carries
+    // both the address and the number is matched by each filter — and the local
+    // route returns each card once. Keyed on the object URL so the answer does
+    // not depend on which route ran.
+    const seen = new Set<string>();
+
+    // SERIAL. One address book at a time, awaited before the next begins.
+    for (const book of books) {
+      const cards = book.reports.includes(ADDRESS_BOOK_QUERY_REPORT)
+        ? await duplicateProbeRoute(book, probe, davFetch)
+        : await localRoute(book, davFetch);
+
+      for (const card of cards) {
+        // An update must not offer the card it is updating as its own duplicate.
+        if (card.url === probe.excludeObjectUrl) continue;
+        if (seen.has(card.url)) continue;
+        seen.add(card.url);
+
+        const contact = parseVCard(card.body);
+        const matched = duplicateSignalFor(contact, probe);
+        if (matched === null) continue;
+
+        scored.push({
+          pending: {
+            key: {
+              displayNameKey: displayNameKeyOf(displayNameFor(contact)),
+              objectUrl: card.url,
+            },
+            addressBookUrl: book.url,
+            objectUrl: card.url,
+            contact,
+          },
+          signal: matched.signal,
+          nameScore: matched.nameScore,
+        });
+      }
+    }
+
+    // Signal first, then the closest name inside the name group, then the object
+    // URL. The last key is not decoration: without a total order two identical
+    // calls could name different three of four equally-ranked candidates, and the
+    // user would see a different answer each time they asked.
+    scored.sort((a, b) => {
+      const bySignal =
+        DUPLICATE_SIGNAL_RANK[a.signal] - DUPLICATE_SIGNAL_RANK[b.signal];
+      if (bySignal !== 0) return bySignal;
+      if (a.nameScore !== b.nameScore) return b.nameScore - a.nameScore;
+      if (a.pending.objectUrl === b.pending.objectUrl) return 0;
+      return a.pending.objectUrl < b.pending.objectUrl ? -1 : 1;
+    });
+
+    return scored
+      .slice(0, DUPLICATE_CANDIDATE_MAX)
+      .map((one) => ({ ...summaryFor(one.pending), signal: one.signal }));
   });
 }
 

@@ -40,6 +40,8 @@ import {
 import { z } from "zod";
 import {
   CONTACT_TERM_MAX_LENGTH,
+  contactFilter,
+  findDuplicateCandidates,
   getContact,
   listAddressBooks,
   matchesContact,
@@ -49,6 +51,8 @@ import type {
   ContactDetail,
   ContactPage,
   ContactSummary,
+  DuplicateCandidate,
+  DuplicateProbe,
 } from "../src/dav/contacts";
 import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
 import { DavAuthError, DavNotFoundError, DavThrottleError } from "../src/dav/errors";
@@ -165,6 +169,145 @@ const TIE_B_VCF = vcf(
   "FN:Jordan Vale",
   "N:Vale;Jordan;;;",
   "EMAIL;TYPE=INTERNET:jordan.b@example.invalid",
+  "END:VCARD",
+);
+
+// ---------------------------------------------------------------------------
+// The duplicate-scan book (CONW-05)
+//
+// Its OWN address book rather than more cards in book A, and that is what makes
+// the counts below mean anything: the name signal is compared against every card
+// the route returned, so a scan run over the general fixture set would score
+// against cards written for the paging and ordering cases and every expectation
+// here would be a statement about those cards instead.
+//
+// The hrefs are prefixed `a-` … `e-` because the final sort key is the object
+// URL, so the file names ARE the tie-break and a reader comparing an expectation
+// against this list should be able to see that.
+// ---------------------------------------------------------------------------
+
+const DUP_BOOK_PATH = "/1234567890/carddavhome/dup/";
+const DUP_BOOK_URL = `https://p42-contacts.icloud.com${DUP_BOOK_PATH}`;
+
+/** The address a create supplies, cased DIFFERENTLY from every card. */
+const PROBE_EMAIL = "Marisol@Example.Invalid";
+/** The number as one card actually stores it — a value BOTH routes can see. */
+const PROBE_TEL_AS_STORED = "(555) 01-00";
+/** The same number, re-punctuated. Equal in digits, unequal as text. */
+const PROBE_TEL_DIGITS = "555 0100";
+/** The name the card being written would be called. RANKS; never queried. */
+const PROBE_NAME = "Marisol Solano";
+
+const DUP_EMAIL_HREF = `${DUP_BOOK_PATH}a-email.vcf`;
+const DUP_TEL_HREF = `${DUP_BOOK_PATH}b-tel.vcf`;
+const DUP_NAME_HREF = `${DUP_BOOK_PATH}c-name.vcf`;
+const DUP_WEAK_NAME_HREF = `${DUP_BOOK_PATH}d-weak-name.vcf`;
+const DUP_MISS_HREF = `${DUP_BOOK_PATH}e-miss.vcf`;
+
+/** Carries the probe's address, cased differently. Also name-similar. */
+const DUP_EMAIL_VCF = vcf(
+  "BEGIN:VCARD",
+  "VERSION:3.0",
+  "UID:dup-email-0001",
+  "FN:Marisol Solano-Vega",
+  "N:Solano-Vega;Marisol;;;",
+  "EMAIL;TYPE=INTERNET:marisol@example.invalid",
+  "TEL;TYPE=CELL:+44 20 7946 1111",
+  "END:VCARD",
+);
+
+/** Carries the probe's NUMBER and nothing else the probe names. */
+const DUP_TEL_VCF = vcf(
+  "BEGIN:VCARD",
+  "VERSION:3.0",
+  "UID:dup-tel-0002",
+  "FN:Quill Vega",
+  "N:Vega;Quill;;;",
+  "EMAIL;TYPE=INTERNET:quill@example.invalid",
+  `TEL;TYPE=HOME:${PROBE_TEL_AS_STORED}`,
+  "END:VCARD",
+);
+
+/** Shares BOTH name tokens and neither value. The strongest name match. */
+const DUP_NAME_VCF = vcf(
+  "BEGIN:VCARD",
+  "VERSION:3.0",
+  "UID:dup-name-0003",
+  "FN:Marisol Solano",
+  "N:Solano;Marisol;;;",
+  "EMAIL;TYPE=INTERNET:different@example.invalid",
+  "TEL;TYPE=CELL:+1-555-9999",
+  "END:VCARD",
+);
+
+/** Shares ONE name token, so it ranks below the card above it. */
+const DUP_WEAK_NAME_VCF = vcf(
+  "BEGIN:VCARD",
+  "VERSION:3.0",
+  "UID:dup-weak-0004",
+  "FN:Marisol Adeyemi",
+  "N:Adeyemi;Marisol;;;",
+  "EMAIL;TYPE=INTERNET:ada@example.invalid",
+  "END:VCARD",
+);
+
+/** Matches nothing at all. Present so "not a candidate" has a witness. */
+const DUP_MISS_VCF = vcf(
+  "BEGIN:VCARD",
+  "VERSION:3.0",
+  "UID:dup-miss-0005",
+  "FN:Tobias Fell",
+  "N:Fell;Tobias;;;",
+  "EMAIL;TYPE=INTERNET:tobias@example.invalid",
+  "TEL;TYPE=CELL:+1-555-7777",
+  "END:VCARD",
+);
+
+const DUP_BOOK_CARDS: Record<string, string> = {
+  [DUP_EMAIL_HREF]: DUP_EMAIL_VCF,
+  [DUP_TEL_HREF]: DUP_TEL_VCF,
+  [DUP_NAME_HREF]: DUP_NAME_VCF,
+  [DUP_WEAK_NAME_HREF]: DUP_WEAK_NAME_VCF,
+  [DUP_MISS_HREF]: DUP_MISS_VCF,
+};
+
+/**
+ * One address written two ways: the composed character, and the decomposed pair.
+ *
+ * Built from code points rather than written as escapes, because every writing
+ * tool in this project silently turns a printable escape into the literal
+ * character — so a source line spelling the two forms out would be two copies of
+ * whichever form the editor chose, and the case would pass against a matcher that
+ * normalised.
+ */
+const COMPOSED_E = String.fromCharCode(0xe9);
+const DECOMPOSED_E = `e${String.fromCharCode(0x301)}`;
+
+const COMPOSED_EMAIL = `ren${COMPOSED_E}@example.invalid`;
+const DECOMPOSED_EMAIL = `ren${DECOMPOSED_E}@example.invalid`;
+
+const DUP_COMPOSED_HREF = `${DUP_BOOK_PATH}f-composed.vcf`;
+
+const DUP_COMPOSED_VCF = vcf(
+  "BEGIN:VCARD",
+  "VERSION:3.0",
+  "UID:dup-composed-0006",
+  "FN:Wren Ashby",
+  "N:Ashby;Wren;;;",
+  `EMAIL;TYPE=INTERNET:${COMPOSED_EMAIL}`,
+  "END:VCARD",
+);
+
+/** A number stored WITH a country code the probe will not supply. */
+const DUP_COUNTRY_HREF = `${DUP_BOOK_PATH}g-country.vcf`;
+
+const DUP_COUNTRY_VCF = vcf(
+  "BEGIN:VCARD",
+  "VERSION:3.0",
+  "UID:dup-country-0007",
+  "FN:Bryn Castellanos",
+  "N:Castellanos;Bryn;;;",
+  "TEL;TYPE=CELL:+1 555 0100",
   "END:VCARD",
 );
 
@@ -304,6 +447,26 @@ function termFrom(body: string): string | null {
 }
 
 /**
+ * The PROPERTY NAMES a filter document names, read back out of the body.
+ *
+ * The stub reads them the same way a real server would, for `termFrom`'s reason
+ * exactly: a stub that assumed which properties a filter names would be green
+ * against a builder that named different ones. It is also what lets one faithful
+ * server answer both filters this project builds — the search's three-property
+ * disjunction and the duplicate scan's single named property — rather than two
+ * stubs that agree until somebody edits one.
+ */
+function filterPropertiesFrom(body: string): string[] {
+  const names: string[] = [];
+  for (const match of body.matchAll(
+    /<[a-z]*:?prop-filter[^>]*\bname="([^"]*)"/g,
+  )) {
+    names.push(match[1]);
+  }
+  return names;
+}
+
+/**
  * Whether a raw card matches a term, computed INDEPENDENTLY of the shipped
  * matcher.
  *
@@ -311,20 +474,29 @@ function termFrom(body: string): string | null {
  * server route and the local route return the same set, and importing the
  * shipped matcher into the stub would make that assertion compare a function
  * with itself. This is a faithful server, written once, by hand.
+ *
+ * `properties` is which properties the filter document actually named, so the
+ * containment rule below is applied to the same set a real server would apply it
+ * to. It defaults to the search filter's three, which is what it was before the
+ * duplicate scan needed a filter over one named property.
  */
-function serverWouldMatch(card: string, term: string): boolean {
+function serverWouldMatch(
+  card: string,
+  term: string,
+  properties: string[] = ["FN", "N", "EMAIL"],
+): boolean {
   const needle = term.toLowerCase();
   for (const line of card.split("\r\n")) {
     const separator = line.indexOf(":");
     if (separator < 0) continue;
     const name = line.slice(0, separator).split(";")[0].split(".").pop() ?? "";
     const value = line.slice(separator + 1);
-    // The three properties the filter names, matched against the RAW wire
+    // The properties the filter document named, matched against the RAW wire
     // value — which for the structured name is `Family;Given;;;` and not the
     // display name this server derives from it. That difference is not a
     // simplification: it is the residual divergence the agreement cases below
     // assert rather than paper over.
-    if (name !== "FN" && name !== "N" && name !== "EMAIL") continue;
+    if (!properties.includes(name)) continue;
     if (value.toLowerCase().includes(needle)) return true;
   }
   return false;
@@ -460,9 +632,16 @@ function davStub(options: StubOptions = {}): Stub {
           // everything would let a broken builder pass the agreement case.
           return new Response(null, { status: 400 });
         }
+        const properties = filterPropertiesFrom(body);
+        if (properties.length === 0) {
+          // A filter naming no property either. Same argument: a real server has
+          // nothing to apply the text match to, and answering with everything
+          // would let a builder that emitted no `prop-filter` pass.
+          return new Response(null, { status: 400 });
+        }
         return multistatus(
           Object.entries(book.cards)
-            .filter(([, data]) => serverWouldMatch(data, term))
+            .filter(([, data]) => serverWouldMatch(data, term, properties))
             .map(([href, data]) => cardBody(href, data))
             .join(""),
         );
@@ -948,6 +1127,373 @@ describe("the two match paths agree", () => {
 
     expect(localRun.matchPath).toBe("local");
     expect(serverRun.matchPath).toBe("server");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The duplicate scan (CONW-05)
+//
+// Three properties here fail SILENTLY rather than loudly, which is why every one
+// of them is counted rather than inspected:
+//
+//   1. **The cost.** A probe with nothing to probe with must spend NOTHING — not
+//      a request and not the KV read discovery performs. An implementation that
+//      entered discovery and then returned the empty list returns byte-identical
+//      rows; only a counter can tell them apart.
+//   2. **One read serving two probes.** On the route that cannot filter, looping
+//      the whole route per probe returns the same candidates at twice the cost.
+//   3. **The fan-out.** Two probes over one address book is exactly the loop
+//      somebody wraps in a combinator to make it fast, and a concurrent version
+//      returns the same answer. The overlap counter is what sees it.
+// ---------------------------------------------------------------------------
+
+describe("findDuplicateCandidates", () => {
+  /** Only the duplicate book, reachable by whichever route `reports` allows. */
+  function dupBook(
+    reports: string[],
+    cards: Record<string, string> = DUP_BOOK_CARDS,
+  ): StubOptions {
+    return { books: [{ href: DUP_BOOK_PATH, reports, cards }] };
+  }
+
+  /** A probe with the fixture's two values and its name, overridable. */
+  function probe(overrides: Partial<DuplicateProbe> = {}): DuplicateProbe {
+    return {
+      email: PROBE_EMAIL,
+      tel: PROBE_TEL_DIGITS,
+      displayName: PROBE_NAME,
+      excludeObjectUrl: null,
+      ...overrides,
+    };
+  }
+
+  function scan(one: DuplicateProbe): Promise<DuplicateCandidate[]> {
+    return findDuplicateCandidates(env, principal, createDavFetch(owner), one);
+  }
+
+  /** `[signal, displayName]` per candidate, in the order they were returned. */
+  function labelled(candidates: DuplicateCandidate[]): string[][] {
+    return candidates.map((one) => [one.signal, one.displayName]);
+  }
+
+  /** Every request that enumerated a collection's objects. */
+  function enumerations(one: Stub): Observed[] {
+    return one.observed.filter(
+      (each) =>
+        each.method === "PROPFIND" &&
+        new URL(each.url).pathname === DUP_BOOK_PATH &&
+        !each.body.includes("supported-report-set"),
+    );
+  }
+
+  /** Every request that read card bodies in bulk. */
+  function multiGets(one: Stub): Observed[] {
+    return one.observed.filter((each) =>
+      each.body.includes("addressbook-multiget"),
+    );
+  }
+
+  it("spends NOTHING when the caller supplied neither an address nor a number", async () => {
+    const next = restub(dupBook(LIVE_REPORTS));
+
+    // The name is supplied and is deliberately one three cards in the book share.
+    // It must still cost nothing: name similarity RANKS candidates the probes
+    // returned and never queries, so with no probe there is nothing to rank.
+    const found = await scan(
+      probe({ email: null, tel: null, displayName: PROBE_NAME }),
+    );
+
+    expect(found).toEqual([]);
+    // ZERO. Not "one cheap discovery read" — the refusal is lexically ahead of
+    // `withRediscovery`, so the KV read is not spent either.
+    expect(next.observed).toHaveLength(0);
+  });
+
+  it("finds both probes' matches and labels each with the signal that matched", async () => {
+    restub(dupBook(LIVE_REPORTS));
+
+    const found = await scan(probe());
+
+    // Address first, then number, then name — the phase's locked order. The
+    // number matched across a re-punctuation, which is the digit rule working.
+    expect(labelled(found)).toEqual([
+      ["email", "Marisol Solano-Vega"],
+      ["phone", "Quill Vega"],
+      ["name", "Marisol Solano"],
+    ]);
+  });
+
+  it("caps the list at three and drops the WEAKEST name match to do it", async () => {
+    restub(dupBook(LIVE_REPORTS));
+
+    const found = await scan(probe());
+
+    // Four cards matched: two values and two names. The one dropped is the card
+    // sharing ONE name token, never one that matched a value — a longer list is
+    // one the user skims rather than reads, so what survives has to be what
+    // matters most.
+    expect(found).toHaveLength(3);
+    expect(found.map((one) => one.displayName)).not.toContain("Marisol Adeyemi");
+  });
+
+  it("gives a card that matched BOTH values one slot, as an address match", async () => {
+    // Otherwise one person spends two of the three slots.
+    restub(
+      dupBook(LIVE_REPORTS, {
+        [DUP_EMAIL_HREF]: vcf(
+          "BEGIN:VCARD",
+          "VERSION:3.0",
+          "UID:dup-both-0001",
+          "FN:Marisol Solano-Vega",
+          "EMAIL;TYPE=INTERNET:marisol@example.invalid",
+          `TEL;TYPE=CELL:${PROBE_TEL_AS_STORED}`,
+          "END:VCARD",
+        ),
+      }),
+    );
+
+    expect(labelled(await scan(probe()))).toEqual([
+      ["email", "Marisol Solano-Vega"],
+    ]);
+  });
+
+  it("scans for ONE field when only one was supplied", async () => {
+    restub(dupBook(LIVE_REPORTS));
+
+    // The name is blank, so nothing ranks and only the address can match.
+    const found = await scan(
+      probe({ tel: null, displayName: "" }),
+    );
+
+    expect(labelled(found)).toEqual([["email", "Marisol Solano-Vega"]]);
+  });
+
+  it("matches an address across a CASE difference", async () => {
+    restub(dupBook(LIVE_REPORTS));
+
+    // The probe is `Marisol@Example.Invalid`; the card carries it lower-cased.
+    const found = await scan(probe({ tel: null, displayName: "" }));
+
+    expect(found.map((one) => one.signal)).toEqual(["email"]);
+  });
+
+  it("does NOT match an address across a UNICODE COMPOSITION difference", async () => {
+    restub(
+      dupBook(LIVE_REPORTS, { [DUP_COMPOSED_HREF]: DUP_COMPOSED_VCF }),
+    );
+
+    // Precondition: the two spellings really are different strings. Without this
+    // the case would also pass if both constants had collapsed to one form.
+    expect(DECOMPOSED_EMAIL).not.toBe(COMPOSED_EMAIL);
+
+    // Normalising somebody's own address is a REPAIR, and this project refuses
+    // repairs on user-authored text. The cost is a missed candidate rather than a
+    // wrong one, which is the only direction a surfacing signal may fail in.
+    expect(
+      await scan(
+        probe({ email: DECOMPOSED_EMAIL, tel: null, displayName: "" }),
+      ),
+    ).toEqual([]);
+
+    // The same card IS found by the form it actually carries, so the case above
+    // is about normalisation rather than about a matcher that finds nothing.
+    expect(
+      (
+        await scan(
+          probe({ email: COMPOSED_EMAIL, tel: null, displayName: "" }),
+        )
+      ).map((one) => one.signal),
+    ).toEqual(["email"]);
+  });
+
+  it("does NOT match a number stored WITH a country code against one without", async () => {
+    restub(dupBook(LIVE_REPORTS, { [DUP_COUNTRY_HREF]: DUP_COUNTRY_VCF }));
+
+    // Deliberate, and stated in the matcher's own docstring: suffix matching
+    // would make a local number match a different person's number in another
+    // country, and inferring the code means guessing a value the user did not
+    // supply.
+    expect(
+      await scan(probe({ email: null, tel: PROBE_TEL_DIGITS, displayName: "" })),
+    ).toEqual([]);
+  });
+
+  it("never offers the card an update is updating as its own duplicate", async () => {
+    restub(dupBook(LIVE_REPORTS));
+
+    const found = await scan(
+      probe({ excludeObjectUrl: `${DUP_BOOK_URL}a-email.vcf` }),
+    );
+
+    expect(labelled(found)).toEqual([
+      ["phone", "Quill Vega"],
+      ["name", "Marisol Solano"],
+      ["name", "Marisol Adeyemi"],
+    ]);
+  });
+
+  it("costs ONE enumeration and ONE bulk read for two probes, not one each", async () => {
+    const next = restub(dupBook(LIVE_REPORTS));
+
+    await scan(probe());
+
+    // The local route already carries every card in the book, so asking twice
+    // buys nothing. Looping the whole route per probe is the obvious edit and
+    // this is what refuses it.
+    expect(enumerations(next)).toHaveLength(1);
+    expect(multiGets(next)).toHaveLength(1);
+    expect(queries(next)).toHaveLength(0);
+  });
+
+  it("costs at most TWO filtered queries where the server WILL filter", async () => {
+    const next = restub(dupBook(REPORTS_WITH_QUERY));
+
+    await scan(probe({ tel: PROBE_TEL_AS_STORED }));
+
+    expect(queries(next)).toHaveLength(2);
+    // And nothing else: no enumeration and no bulk read on this route.
+    expect(enumerations(next)).toHaveLength(0);
+    expect(multiGets(next)).toHaveLength(0);
+  });
+
+  it("costs ONE query when only one field was supplied", async () => {
+    const next = restub(dupBook(REPORTS_WITH_QUERY));
+
+    await scan(probe({ tel: null, displayName: "" }));
+
+    expect(queries(next)).toHaveLength(1);
+  });
+
+  it("names ONE property per query, and each of the two names its own", async () => {
+    const next = restub(dupBook(REPORTS_WITH_QUERY));
+
+    await scan(probe({ tel: PROBE_TEL_AS_STORED }));
+
+    const named = queries(next).map((one) =>
+      [...one.body.matchAll(/prop-filter[^>]*\bname="([^"]*)"/g)].map(
+        (each) => each[1],
+      ),
+    );
+    // One property each, and the search's three-way disjunction is NOT what got
+    // sent: a scan built on `contactFilter` could not probe a number at all.
+    expect(named).toEqual([["EMAIL"], ["TEL"]]);
+  });
+
+  it("issues its requests strictly one at a time", async () => {
+    const next = restub(dupBook(REPORTS_WITH_QUERY));
+
+    await scan(probe({ tel: PROBE_TEL_AS_STORED }));
+
+    // Two probes over one address book is exactly the loop a combinator gets
+    // wrapped around, and the concurrent version returns the same answer.
+    expect(next.overlapped).toBe(false);
+  });
+
+  it("carries the term as element TEXT, never concatenated markup", async () => {
+    const next = restub(dupBook(REPORTS_WITH_QUERY));
+
+    await scan(
+      probe({ email: "sol<ano&\"'@example.invalid", tel: null, displayName: "" }),
+    );
+
+    const body = queries(next)[0].body;
+    expect(body).toContain("&lt;");
+    expect(body).not.toContain("sol<ano");
+  });
+
+  it("asks for the collation and the match type EXPLICITLY", async () => {
+    const next = restub(dupBook(REPORTS_WITH_QUERY));
+
+    await scan(probe({ tel: null, displayName: "" }));
+
+    // A default that is correct today is a default that changes silently. The
+    // containment match is deliberate: the equality rule is applied locally to
+    // the cards BOTH routes return, so the two routes run ONE rule.
+    const body = queries(next)[0].body;
+    expect(body).toContain("i;unicode-casemap");
+    expect(body).toContain("contains");
+  });
+
+  it("leaves the shipped SEARCH filter untouched — it names no telephone property", async () => {
+    // The fact that shapes this whole path, asserted rather than trusted: a
+    // duplicate scan built on `searchContacts` would return an empty page for
+    // every number probe and look like a working feature. Widening the search
+    // filter is not the repair; this is the fence that says so.
+    expect(JSON.stringify(contactFilter("anything"))).not.toContain("TEL");
+  });
+
+  it("returns the SAME set on both routes for values both routes can see", async () => {
+    async function idsFor(reports: string[]): Promise<string[]> {
+      restub(dupBook(reports));
+      const found = await scan(
+        probe({ tel: PROBE_TEL_AS_STORED, displayName: "" }),
+      );
+      return found.map((one) => `${one.signal}:${one.id}`).sort();
+    }
+
+    // The name is blank, so both routes are answering the same question about the
+    // same two values, and the number is spelled the way the card stores it.
+    expect(await idsFor(REPORTS_WITH_QUERY)).toEqual(
+      await idsFor(LIVE_REPORTS),
+    );
+  });
+
+  it("DIVERGES where a value has no wire spelling a property filter can see", async () => {
+    // The two divergences this design cannot close, asserted rather than hidden,
+    // exactly as the search's own agreement cases do it.
+    //
+    //   - The digit rule ignores punctuation; a server-side containment filter
+    //     over the raw text cannot.
+    //   - The name signal ranks cards the route already holds. The local route
+    //     holds the whole book; the server route holds only what its two filters
+    //     returned. Neither costs an extra request, which is why this is not the
+    //     account-wide sweep CONW-05 forbids.
+    restub(dupBook(LIVE_REPORTS));
+    const local = labelled(await scan(probe()));
+    restub(dupBook(REPORTS_WITH_QUERY));
+    const server = labelled(await scan(probe()));
+
+    expect(local).toEqual([
+      ["email", "Marisol Solano-Vega"],
+      ["phone", "Quill Vega"],
+      ["name", "Marisol Solano"],
+    ]);
+    expect(server).toEqual([["email", "Marisol Solano-Vega"]]);
+  });
+
+  it("proves the two runs really took different routes", async () => {
+    // Without this the case above would pass on an implementation that ignored
+    // the advertised reports entirely and always ran locally.
+    const localStub = restub(dupBook(LIVE_REPORTS));
+    await scan(probe());
+    const serverStub = restub(dupBook(REPORTS_WITH_QUERY));
+    await scan(probe());
+
+    expect(queries(localStub)).toHaveLength(0);
+    expect(queries(serverStub)).toHaveLength(2);
+  });
+
+  it("mints the same opaque ids a search would, over the same two urls", async () => {
+    restub(dupBook(LIVE_REPORTS));
+
+    const found = await scan(probe({ tel: null, displayName: "" }));
+
+    const ref = decodeContactId(found[0].id);
+    expect(ref.addressBookUrl).toBe(DUP_BOOK_URL);
+    expect(ref.objectUrl).toBe(`${DUP_BOOK_URL}a-email.vcf`);
+    expect(found[0].addressBookId).toBe(
+      encodeAddressBookId({ collectionUrl: DUP_BOOK_URL }),
+    );
+  });
+
+  it("carries the card's addresses, because a candidate is a search row", async () => {
+    restub(dupBook(LIVE_REPORTS));
+
+    const found = await scan(probe({ tel: null, displayName: "" }));
+
+    expect(found[0].emails.map((one) => one.value)).toEqual([
+      "marisol@example.invalid",
+    ]);
   });
 });
 
