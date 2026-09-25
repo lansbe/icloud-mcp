@@ -607,10 +607,18 @@ function registeredDav(who: Promise<Principal> = owner): Registration[] {
   registerDavDiagnoseTool(server as unknown as McpServer, davFetch, who);
   registerCalendarTools(server as unknown as McpServer, davFetch, who);
   // The last registrar the phase adds. After this line the ceiling loop below
-  // covers the phase's ENTIRE tool surface — one diagnostic, four calendar
-  // tools and two contacts tools — rather than two thirds of it, and the mail
+  // covers the phase's ENTIRE tool surface — one diagnostic, nine calendar
+  // tools and FOUR contacts tools — rather than two thirds of it, and the mail
   // suite's own loop keeps covering the mail tools, which is all it was ever
   // able to see.
+  //
+  // Four rather than two since CONW-01, and the harness needed no edit to reach
+  // the new pair: `registerContactsTools` delegates to
+  // `registerContactsWriteTools` at its own foot, so `contacts_create` and
+  // `contacts_commit` are measured by the ceiling loop through this one call.
+  // That is the whole reason the write tools were delegated rather than given a
+  // fourth registrar in `src/mcp/server.ts` — a registrar added there would be
+  // covered only if somebody remembered to add a line here.
   registerContactsTools(server as unknown as McpServer, davFetch, who);
   return recorded;
 }
@@ -644,6 +652,8 @@ describe("the DAV registrations", () => {
       "calendar_list_events",
       "calendar_search",
       "calendar_update_event",
+      "contacts_commit",
+      "contacts_create",
       "contacts_get",
       "contacts_search",
       "dav_diagnose",
@@ -658,6 +668,13 @@ describe("the DAV registrations", () => {
 
     expect(names).toContain("contacts_search");
     expect(names).toContain("contacts_get");
+    // The write pair, which arrives through the DELEGATION at the foot of
+    // `registerContactsTools` rather than through a registrar of its own. Named
+    // here for the same reason the two reads are: a delegation that stopped
+    // being called would leave the count pin below as the only thing noticing,
+    // and a count cannot say WHICH two went missing.
+    expect(names).toContain("contacts_create");
+    expect(names).toContain("contacts_commit");
   });
 
   it("keeps every DAV description terse, because it is a tax paid on every call", () => {
@@ -683,7 +700,7 @@ describe("the DAV registrations", () => {
     // The loop above iterates the REGISTRATIONS rather than an enumerated list
     // of names, so a tool added to a DAV registrar in a later plan is measured
     // by construction — with no edit to this file and no cross-plan conflict.
-    expect(registeredDav().length).toBe(12);
+    expect(registeredDav().length).toBe(14);
   });
 
   it("carries the untrusted notice on every calendar description that returns stranger content", () => {
@@ -7097,10 +7114,15 @@ describe("a principal that was refused reaches no DAV tool", () => {
   }
 
   it("covers every DAV registration, and the count is pinned", () => {
-    // One diagnostic, nine calendar tools, two contacts tools. A tool added
+    // One diagnostic, nine calendar tools, four contacts tools. A tool added
     // later lands in the loop below by itself. This pin is what makes a tool
     // REMOVED from the loop show up.
-    expect(registeredDav(refused()).length).toBe(12);
+    //
+    // The two contact WRITE tools are the sharpest entries on it: each awaits the
+    // principal before it decodes an id, plans a target or mints a confirmation,
+    // so a refused principal reads `auth_failed` rather than spending a signing
+    // key on somebody who is not signed in.
+    expect(registeredDav(refused()).length).toBe(14);
   });
 
   it("answers auth_failed from EVERY tool, with the unchanged message and zero requests", async () => {

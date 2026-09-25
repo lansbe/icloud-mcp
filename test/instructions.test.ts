@@ -71,6 +71,8 @@ const EXPECTED_TOOLS: readonly string[] = [
   "calendar_list_events",
   "calendar_search",
   "calendar_update_event",
+  "contacts_commit",
+  "contacts_create",
   "contacts_get",
   "contacts_search",
   "dav_diagnose",
@@ -245,12 +247,20 @@ describe("the instructions still state every boundary", () => {
     // token cannot bind, so the server writes it and the model is told to pass
     // it on unchanged rather than to summarise from the structured fields.
     ["show the composed line verbatim", "word for word"],
+    // CONW-01. Written once, in a form that covers ANY contact write, so the
+    // update arriving in a later plan does not have to move this row. The clause
+    // pinned is the absent-versus-null rule rather than the preview sentence,
+    // because the preview half is already pinned by the calendar row above it
+    // ("previewed first" is a substring of both boundaries) while nothing else
+    // in this table would notice the field semantics being dropped -- and those
+    // are the half a caller gets silently wrong.
+    ["contact writes are previewed", "passing null for it clears it"],
   ] as const;
 
   it("pins every boundary the string states, with none silently dropped", () => {
     // The count lives HERE, in an assertion, and nowhere in the prose above.
     // A row deleted turns this red instead of leaving a boundary unwatched.
-    expect(REQUIRED.length).toBe(7);
+    expect(REQUIRED.length).toBe(8);
     expect(new Set(REQUIRED.map(([boundary]) => boundary)).size).toBe(
       REQUIRED.length,
     );
