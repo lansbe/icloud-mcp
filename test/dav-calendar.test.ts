@@ -119,6 +119,7 @@ import {
   registerCalendarTools,
 } from "../src/mcp/tools/calendar";
 import { ownerPrincipal } from "./fixtures/bound-secrets";
+import { assertMethodIsBuildable } from "./fixtures/sendable-method";
 import type { Principal } from "../src/principal";
 
 // The owner's principal, as the PROMISE the real env constructor returns over
@@ -631,6 +632,10 @@ function davStub(options: StubOptions = {}): Stub {
     new Headers(init?.headers).forEach((value, name) => {
       headers[name.toLowerCase()] = value;
     });
+    // Before the record push, and the whole argument for why is in
+    // `test/fixtures/sendable-method.ts`.
+    assertMethodIsBuildable(url, method);
+
     const record: Observed = {
       url,
       method,

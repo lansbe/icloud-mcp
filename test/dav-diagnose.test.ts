@@ -48,6 +48,7 @@ import {
   ownerPrincipal,
   refusedPrincipal,
 } from "./fixtures/bound-secrets";
+import { assertMethodIsBuildable } from "./fixtures/sendable-method";
 import type { Principal } from "../src/principal";
 
 // The owner's principal, as the PROMISE the real env constructor returns over
@@ -265,24 +266,9 @@ function davStub(
           : input.url;
     const method = String(init?.method ?? "GET");
 
-    // ASK THE RUNTIME WHETHER THIS REQUEST COULD EXIST, BEFORE PRETENDING TO
-    // SEND IT.
-    //
-    // This stub IS the global fetch — `vi.stubGlobal("fetch", stub.fetch)` —
-    // which is what makes the credential assertions discriminating, and is also
-    // what made this harness blind to the whole class of failure that shipped
-    // in Phase 14. workerd validates the method string when it builds the
-    // `Request`, and it refuses some WebDAV/CalDAV methods outright. Replacing
-    // the global replaces that check too, so a call site using a method this
-    // platform cannot express looked green here and threw in production —
-    // where the throw lands inside `createDavFetch`'s `try`, becomes a
-    // `DavConnectError`, and is reported as a transient connection fault
-    // against a server that never saw the request.
-    //
-    // Constructed and discarded: the construction IS the check. It runs before
-    // the record is pushed, because in production nothing goes on the wire and
-    // nothing would be there to record.
-    new Request(url, { method });
+    // Before the record push, and the whole argument for why is in
+    // `test/fixtures/sendable-method.ts`.
+    assertMethodIsBuildable(url, method);
 
     const record: ObservedRequest = {
       url,

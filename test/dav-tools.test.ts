@@ -72,6 +72,7 @@ import { registerContactsTools } from "../src/mcp/tools/contacts";
 import { registerDavDiagnoseTool } from "../src/mcp/tools/dav-diagnose";
 import { UNTRUSTED_PREAMBLE } from "../src/mcp/untrusted";
 import { ownerPrincipal, refusedPrincipal } from "./fixtures/bound-secrets";
+import { assertMethodIsBuildable } from "./fixtures/sendable-method";
 import type { Principal } from "../src/principal";
 
 // The owner's principal, as the PROMISE the real env constructor returns over
@@ -1498,6 +1499,12 @@ function writeDavStub(options: WriteStubOptions = {}): WriteStub {
     new Headers(init?.headers).forEach((value, name) => {
       headers[name.toLowerCase()] = value;
     });
+    // Before the record push, and the whole argument for why is in
+    // `test/fixtures/sendable-method.ts`. It sits HERE and not in `serialised`:
+    // that wrapper counts overlap, and the guard belongs on the request path
+    // rather than on the concurrency counter.
+    assertMethodIsBuildable(url, method);
+
     state.observed.push({
       url,
       method,
