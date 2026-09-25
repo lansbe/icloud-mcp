@@ -235,6 +235,125 @@ describe("the round-trip card is still hazardous, not merely still safe", () => 
   });
 });
 
+describe("the invited event is still hazardous, not merely still safe", () => {
+  // The same argument the card cases above make, applied to the resource
+  // CALM-03 is proved against. Every rule in this file proves that fixture is
+  // SAFE to commit; nothing proves it is still DANGEROUS. A later executor
+  // deleting a "redundant" attendee, or a serialiser round trip quietly
+  // unfolding it, would sail through all nine privacy rules while retiring the
+  // coverage the preserve-everything guarantee rests on.
+  //
+  // This is NOT the CALM-03 proof. That one needs a real iCloud event on the
+  // owner's own account and happens in plan 17-09 — see the fixture's own
+  // docstring, which says so at length.
+  const TEXT = fixtures.INVITED_EVENT_HAZARDS_ICS;
+  /** The resource with its continuation lines joined back up. */
+  const UNFOLDED = TEXT.replace(/\r\n[ \t]/g, "");
+  const CALENDAR = new ICAL.Component(ICAL.parse(TEXT));
+  const EVENT = CALENDAR.getFirstSubcomponent("vevent");
+
+  it("folds at 75 octets, and no physical line exceeds it", () => {
+    // A fixture that is already unfolded cannot prove a round trip preserves
+    // folding, which is the thing this project adopted a real parser to avoid
+    // hand-rolling.
+    expect(/\r\n[ \t]/.test(TEXT)).toBe(true);
+    for (const line of TEXT.split("\r\n")) {
+      expect(new TextEncoder().encode(line).length, line).toBeLessThanOrEqual(75);
+    }
+  });
+
+  it("carries a VTIMEZONE the write path must not take with it", () => {
+    // `removeAllSubcomponents()` with no argument takes the zone along with the
+    // events, and every wall-clock time in the resource then means something
+    // else.
+    expect(CALENDAR.getAllSubcomponents("vtimezone").length).toBeGreaterThan(0);
+    expect(EVENT?.getFirstProperty("dtstart")?.getParameter("tzid")).toBe(
+      fixtures.DEFINED_TZID,
+    );
+  });
+
+  it("carries an alarm serialised exactly as ical.js writes one", () => {
+    const alarm = EVENT?.getFirstSubcomponent("valarm");
+    expect(alarm, "the VALARM is gone; an update must not disturb one").not.toBeNull();
+    expect(alarm?.getFirstPropertyValue("action")).toBe("DISPLAY");
+    expect(String(alarm?.getFirstPropertyValue("trigger"))).toBe("-PT15M");
+    expect(alarm?.getFirstPropertyValue("description")).toBeTruthy();
+    // Byte-exact against the measured serialisation, not merely equivalent.
+    expect(UNFOLDED).toContain(
+      "BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Quarterly planning\r\n" +
+        "TRIGGER:-PT15M\r\nEND:VALARM",
+    );
+  });
+
+  it("names an organiser with a display name and no resolvable address", () => {
+    // Phase 14 measured `organizer.email` coming back null on the owner's own
+    // copy of an event he organised, while the display name was populated. A
+    // rebuild that wrote a mailto: back would invent an identity the stored
+    // bytes never carried.
+    const organizer = EVENT?.getFirstProperty("organizer");
+    expect(organizer?.getParameter("cn")).toBeTruthy();
+    expect(String(organizer?.getFirstValue()).startsWith("mailto:")).toBe(false);
+    expect(organizer?.getParameter("schedule-status")).toBeTruthy();
+  });
+
+  it("carries three answers and every parameter a rebuild would drop", () => {
+    const attendees = EVENT?.getAllProperties("attendee") ?? [];
+    expect(
+      attendees.length,
+      "an attendee has been deleted. Three PARTSTAT values are here so a " +
+        "rebuild that defaulted every attendee to one state cannot pass.",
+    ).toBeGreaterThanOrEqual(3);
+    const answers = attendees.map((one) => one.getParameter("partstat"));
+    expect(answers).toContain("ACCEPTED");
+    expect(answers).toContain("DECLINED");
+    expect(answers).toContain("NEEDS-ACTION");
+    for (const one of attendees) {
+      for (const parameter of ["role", "cutype", "rsvp", "schedule-status"]) {
+        expect(
+          one.getParameter(parameter),
+          `an attendee lost ${parameter}. A rebuild keeps the address and ` +
+            "loses the parameters, and the loss is invisible to any assertion " +
+            "made on the address alone.",
+        ).toBeTruthy();
+      }
+    }
+  });
+
+  it("is a scheduling object rather than an imported .ics", () => {
+    // SPIKE-05 measured the distinction: a scheduling object carries
+    // SCHEDULE-STATUS and an imported invitation carries none, and whether
+    // iCloud will tell the organiser about a change is visible in exactly that.
+    expect(UNFOLDED).toContain("SCHEDULE-STATUS=");
+  });
+
+  it("carries an unmodelled property AND an unmodelled parameter", () => {
+    // Both, because they fail differently. A property-level allow-list passes
+    // the unmodelled-PROPERTY case by dropping it and the modelled one by
+    // copying the value, while silently losing a non-standard PARAMETER on a
+    // property it does copy. Only a byte-level patch keeps the second.
+    const extensions = (EVENT?.getAllProperties() ?? [])
+      .map((one) => one.name)
+      .filter((name) => name.startsWith("x-"));
+    expect(extensions, "the unmodelled X- property is gone").not.toHaveLength(0);
+
+    const summary = EVENT?.getFirstProperty("summary");
+    const parameters = Object.keys(summary?.toJSON()[1] ?? {}).filter((name) =>
+      name.startsWith("x-"),
+    );
+    expect(
+      parameters,
+      "SUMMARY lost its non-standard parameter. That is the harder half of " +
+        "CALM-03: the property survives, the parameter does not, and no " +
+        "assertion on the summary TEXT can see the difference.",
+    ).not.toHaveLength(0);
+  });
+
+  it("is past its first revision, so a writer that resets one is visible", () => {
+    const sequence = EVENT?.getFirstPropertyValue("sequence");
+    expect(Number(sequence)).toBeGreaterThan(0);
+  });
+});
+
 describe("the undefined zone is undefined everywhere, not just locally", () => {
   it("is named as a parameter and defined by no fixture", () => {
     // `ICAL.TimezoneService` is process-global. If any fixture in this file

@@ -382,6 +382,100 @@ export const INVITED_WEEKLY_SERIES_ICS = resource(
 );
 
 /**
+ * One invited, scheduled event carrying every hazard CALM-03 claims to survive.
+ *
+ * **WHAT THIS FIXTURE IS NOT.** It proves the MECHANISM and it does not prove
+ * the phase's central claim. CALM-03 says an update preserves every property
+ * this server does not model, and the thing that proves it is a REAL iCloud
+ * event carrying REAL attendees on the owner's own account, updated through the
+ * shipped tool, with every RSVP read back intact. That is D-16, it needs the
+ * live account, and only the owner can give it — it happens in plan 17-09.
+ * Synthesised bytes cannot stand in for it, because they are this project's own
+ * idea of what iCloud stores, and the failure this phase is guarding against is
+ * precisely the gap between that idea and the real thing. If this fixture is
+ * green and 17-09 has not run, CALM-03 is UNPROVEN.
+ *
+ * **WHAT EACH HAZARD IS FOR.** One line each, so a later executor deleting a
+ * "redundant" attendee knows what leaves with it.
+ *
+ *   - **The `urn:uuid:` `ORGANIZER` with a populated `CN` and no resolvable
+ *     address.** Phase 14 measured `organizer.email` coming back `null` on the
+ *     owner's own copy of an event he organised, while the display name was
+ *     populated. A tool assuming that field is always present breaks on this
+ *     row, and a rebuild that wrote a `mailto:` back would invent an identity
+ *     the stored bytes never carried.
+ *   - **`SCHEDULE-STATUS` on the organiser and on every attendee.** SPIKE-05
+ *     measured the distinction this marks: a SCHEDULING OBJECT carries one and
+ *     an imported `.ics` carries none, and whether iCloud will tell the
+ *     organiser about a change is visible in exactly that. This fixture is the
+ *     FORMER. A write that dropped the parameter would erase the evidence.
+ *   - **Three `PARTSTAT` values — `ACCEPTED`, `DECLINED`, `NEEDS-ACTION`.**
+ *     Somebody's answer. Three rather than one because a rebuild that
+ *     defaulted every attendee to a single state would look correct against a
+ *     fixture that only held that state.
+ *   - **`ROLE`, `CUTYPE` and `RSVP` on every attendee line.** A rebuild from
+ *     modelled fields keeps the address and loses the parameters, and the loss
+ *     is invisible in any assertion made on the address alone.
+ *   - **The `VALARM`.** Byte-identical to the measured `ical.js@2.2.1`
+ *     serialisation. The write half of this phase must not disturb an alarm it
+ *     was not asked about — and `removeAllSubcomponents()` with no argument
+ *     would take it along with everything else.
+ *   - **`X-APPLE-TRAVEL-ADVISORY-BEHAVIOR`.** A property nothing in this
+ *     project models. Its whole job is to be invisible to the reader and
+ *     survive the write anyway.
+ *   - **`X-APPLE-STRUCTURED-TITLE` on `SUMMARY`.** The harder case, and the
+ *     reason both are here: a property-level allow-list passes the unmodelled
+ *     PROPERTY test by dropping it and the modelled one by copying the VALUE,
+ *     while silently losing a non-standard PARAMETER on a property it does
+ *     copy. Only a byte-level patch keeps this.
+ *   - **The `VTIMEZONE`.** A serialiser that strips every subcomponent to
+ *     re-add the events takes the zone with it, and every wall-clock time in
+ *     the resource then means something else.
+ *   - **`SEQUENCE:3`.** Greater than zero, so a writer that RESETS the revision
+ *     rather than advancing it is visible. A stalled revision on an invited
+ *     event fails silently: the other clients ignore the update.
+ *
+ * Folded at 75 octets the way stored bytes arrive, because a fixture that is
+ * already unfolded cannot prove a round trip preserves folding. Addresses are
+ * `.invalid` and the organiser identifier is opaque, so nothing here names an
+ * account.
+ *
+ * One consequence of folding, and it is worth knowing before editing a name
+ * here: `test/dav-fixtures.test.ts` reads addresses out of the RAW text, so a
+ * fold landing inside `.invalid` turns the privacy check red. That is the
+ * check working, not a false alarm — shorten the local part or the display
+ * name until the address lands whole on one line, and never relax the check.
+ */
+export const INVITED_EVENT_HAZARDS_ICS = resource(
+  ...VCALENDAR_HEAD,
+  ...CHICAGO_VTIMEZONE,
+  "BEGIN:VEVENT",
+  "UID:invited-hazards-0041@example.invalid",
+  "DTSTAMP:20260518T120000Z",
+  "SUMMARY;X-APPLE-STRUCTURED-TITLE=planning-block:Quarterly planning",
+  "LOCATION:Meeting room two",
+  "DTSTART;TZID=America/Chicago:20260601T100000",
+  "DTEND;TZID=America/Chicago:20260601T110000",
+  "ORGANIZER;CN=Priya Raman;SCHEDULE-STATUS=2.0:urn:uuid:4f1a2b3c-5d6e-4a7b-8c",
+  " 9d-0e1f2a3b4c5d",
+  "ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALS",
+  " E;SCHEDULE-STATUS=2.0;CN=Dev Whitaker:mailto:dev.whitaker@example.invalid",
+  "ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=DECLINED;RSVP=FALS",
+  " E;SCHEDULE-STATUS=2.0;CN=Mara Oyelaran:mailto:mara@example.invalid",
+  "ATTENDEE;CUTYPE=ROOM;ROLE=OPT-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;S",
+  " CHEDULE-STATUS=1.2;CN=Meeting room two:mailto:room.two@example.invalid",
+  "SEQUENCE:3",
+  "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+  "BEGIN:VALARM",
+  "ACTION:DISPLAY",
+  "DESCRIPTION:Quarterly planning",
+  "TRIGGER:-PT15M",
+  "END:VALARM",
+  "END:VEVENT",
+  "END:VCALENDAR",
+);
+
+/**
  * The same plain weekly series after ONE date has been excluded.
  *
  * Master otherwise untouched — same rule, same start, same title, same
