@@ -316,6 +316,158 @@ export function buildContactCard(
 }
 
 /**
+ * Patch one FETCHED contact card and hand the whole of it back (CONW-03).
+ *
+ * ## PITFALLS #39 is the reason this function exists at all
+ *
+ * A contact update is a whole-vCard overwrite. The server replaces the resource
+ * with the bytes it is given, so every property the outgoing bytes do not carry
+ * is DELETED — on the account, and on every device the user owns, silently, with
+ * nothing to put it back. `parseVCard` above reads EIGHT properties. A card
+ * built from its output would therefore drop a photo, a grouped `X-ABLabel`
+ * pair and every `X-` property on a routine telephone-number edit.
+ *
+ * So this function never builds a card. It parses the one that was fetched,
+ * clones it, changes the properties the change NAMES, and hands the whole thing
+ * to the library to serialise. **Every property this project has never heard of
+ * survives because it is never READ — only copied.** That is the entire
+ * mechanism, and it is why `ParsedContact` is not the write path's
+ * representation and is not going to become one: widening it into a lossless
+ * record would make eight read call sites able to quietly reshape the guarantee,
+ * and would put a fidelity promise in a type whose job is to throw detail away.
+ *
+ * ## Absent, cleared, and the difference between them
+ *
+ * Each field arrives already resolved by `NormalizedContactChange`, and the two
+ * resolutions land in different places. The OUTER `null` means the caller did
+ * not mention the field, and this function touches nothing at all — not the
+ * property, not its parameters, not its position in the card. A present wrapper
+ * means mentioned: `{ value: null }` removes the property, and a value sets it.
+ * The structured `N` and `ADR` and the repeated `EMAIL` and `TEL` follow the
+ * same rule at the whole property's granularity, because there is no per-entry
+ * editing on this path.
+ *
+ * ## The update-in-place helper is used for the singular text properties and
+ * ## forbidden for the repeated ones, and the asymmetry is deliberate
+ *
+ * `updatePropertyWithValue` PRESERVES the existing property's parameters. On
+ * `FN` and `NOTE` that is patch semantics working correctly: the caller named a
+ * value and named no parameters, so whatever parameters the card carried are
+ * unmentioned data that must survive — and updating in place also leaves the
+ * property where it was, so the serialised card differs from the fetched one in
+ * exactly one line. On `EMAIL` and `TEL` the same behaviour is corruption: the
+ * surviving parameters would be a `TYPE` and an `itemN.` group prefix belonging
+ * to a value the user just replaced, which is the grouped-label corruption
+ * CONW-03 exists to stop. `setEntries` therefore removes every property of that
+ * name and adds one per supplied entry, carrying nothing forward.
+ *
+ * **Replacing the email list leaves an `itemN.X-ABLabel` that pointed at a
+ * removed entry standing.** That is the rule above being obeyed rather than a
+ * gap in it: the label is a property the change did not name, and this server
+ * deleting an unnamed property is the failure this whole function is built to
+ * avoid. Editing labels is per-entry work, which `16-CONTEXT.md` defers.
+ *
+ * ## What this function must never do
+ *
+ * It must never enumerate the card's properties in order to decide what to
+ * keep — everything it does not name is kept by not being mentioned. It must
+ * never write a revision stamp, a product identifier or a version of its own
+ * choosing: a value invented on each write makes two serialisations of one
+ * change differ, which would destroy the fidelity proof and make the change
+ * hash meaningless. It must never fold, escape or frame a line by hand — the
+ * library folds at seventy-five OCTETS, escapes the separators and emits CRLF,
+ * and the octet half is what a character-counting writer gets wrong on the
+ * first non-ASCII name. It must never touch the library's process-global
+ * timezone registry; a vCard needs nothing from it.
+ *
+ * The trailing CRLF is appended because `Component#toString()` emits no
+ * terminator after the closing line, exactly as the calendar serialiser does.
+ *
+ * Throws `DavConnectError` on a body that is not a contact resource, for
+ * `parseVCard`'s own reason: a refusal rather than a partial result, with
+ * nothing read off the caught value.
+ */
+export function patchContactCard(
+  vcfText: string,
+  change: NormalizedContactChange,
+): string {
+  let fetched: IcalComponent;
+  try {
+    fetched = new ICAL.Component(ICAL.parse(vcfText));
+  } catch {
+    // Nothing is read from the caught value — not its message, not its stack.
+    throw new DavConnectError();
+  }
+  if (fetched.name !== "vcard") throw new DavConnectError();
+
+  const card = cloneVcardComponent(fetched);
+
+  if (change.formattedName !== null && change.formattedName !== undefined) {
+    setOrRemoveText(card, "fn", change.formattedName.value);
+  }
+
+  if (change.note !== null && change.note !== undefined) {
+    setOrRemoveText(card, "note", change.note.value);
+  }
+
+  if (change.name !== null && change.name !== undefined) {
+    const name = change.name;
+    setStructured(card, "n", [
+      name.family,
+      name.given,
+      name.additional,
+      name.prefix,
+      name.suffix,
+    ]);
+  }
+
+  if (change.address !== null && change.address !== undefined) {
+    const address = change.address;
+    setStructured(card, "adr", [
+      address.poBox,
+      address.extended,
+      address.street,
+      address.locality,
+      address.region,
+      address.postalCode,
+      address.country,
+    ]);
+  }
+
+  if (change.organisation !== null && change.organisation !== undefined) {
+    setStructured(card, "org", change.organisation);
+  }
+
+  if (change.emails !== null && change.emails !== undefined) {
+    setEntries(card, "email", change.emails);
+  }
+
+  if (change.tels !== null && change.tels !== undefined) {
+    setEntries(card, "tel", change.tels);
+  }
+
+  return `${card.toString()}\r\n`;
+}
+
+/**
+ * A card that shares no state with the one it was made from.
+ *
+ * **The copy is required, not tidy.** `Component#toJSON()` returns the LIVE
+ * jCal array — the library's own documentation says so and says to copy it
+ * before modifying — so wrapping the result directly would produce a second
+ * component writing straight through to the first. Every mutation
+ * `patchContactCard` performs would then land on the parse of the FETCHED card
+ * as well, and a caller holding that parse to compare against would be
+ * comparing the patched card with itself.
+ *
+ * `cloneComponent` in `./icalendar.ts` is this function's twin and carries the
+ * same argument for the calendar side. Do not remove the copy as ceremony.
+ */
+function cloneVcardComponent(card: IcalComponent): IcalComponent {
+  return new ICAL.Component(JSON.parse(JSON.stringify(card.toJSON())));
+}
+
+/**
  * Set a text property to a value, or take it away entirely when it is null.
  *
  * The absent-versus-null rule arrives here already resolved: by the time a
