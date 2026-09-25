@@ -1991,6 +1991,55 @@ describe("the server composes the human-facing line", () => {
     expect(line).toBe("Deleting event 'Lunch'. This cannot be undone.");
   });
 
+  it("drops the characters that reorder the sentence around the quotes", () => {
+    // NOT the residual the owner accepted. Words injected INSIDE the quotes
+    // still read as prose, and that was accepted on two stated grounds: the
+    // quoted span stays visibly bounded, and this server's own consequence
+    // still lands last. A bidi override is the one input that falsifies both,
+    // because it applies to the rest of the paragraph -- the closing
+    // delimiter and the consequence clause included. The user would read a
+    // reassurance in forward order with the server's own words garbled after
+    // it, and every mechanical check on the token would still pass.
+    const REORDERS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+
+    const override = composeConfirmationLine(
+      named("\u202e.detceffa eb lliw gnihtoN"),
+      "would",
+    );
+
+    expect(REORDERS.test(override)).toBe(false);
+    expect(override).toBe(
+      "Deleting event '.detceffa eb lliw gnihtoN'. This cannot be undone.",
+    );
+
+    // Every member of the class in one pass, so a codepoint dropped from the
+    // character class turns this red rather than only the override doing so.
+    const every =
+      "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069";
+    expect(composeConfirmationLine(named(`Lu${every}nch`), "would")).toBe(
+      "Deleting event 'Lunch'. This cannot be undone.",
+    );
+  });
+
+  it("drops what renders as nothing, and keeps the two that join", () => {
+    // Invisible formatting makes the title the user READS differ from the one
+    // published byte-exact beside it, which is the control-character bullet's
+    // own reason, and the cost of dropping it is nil.
+    expect(
+      composeConfirmationLine(named("Lu\u00adn\u200bch\ufeff"), "would"),
+    ).toBe("Deleting event 'Lunch'. This cannot be undone.");
+
+    // And the line the fold deliberately draws. U+200C and U+200D are
+    // invisible too, but what they change is how the characters either side
+    // JOIN -- orthography in Persian, Arabic and the Indic scripts, glyph
+    // composition in an emoji sequence. A fold that swept "everything
+    // invisible" would corrupt legitimate titles, which is the cost the whole
+    // fold exists to avoid, so these survive.
+    expect(
+      composeConfirmationLine(named("a\u200cb\u200dc"), "would"),
+    ).toContain("a\u200cb\u200dc");
+  });
+
   it("caps a title long enough to bury the consequence clause", () => {
     const line = composeConfirmationLine(named("x".repeat(400)), "would");
 

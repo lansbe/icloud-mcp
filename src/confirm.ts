@@ -1157,13 +1157,46 @@ const NAME_MAX = 120;
  * unaltered. A newline was worse still, because the injected clause could start
  * its own line and stop looking like part of a quoted title.
  *
- * Three folds, each closing one of those:
+ * Four folds, each closing one of those:
  *
  * - **Line and paragraph breaks become a space.** A clause a person reads as
  *   this server's must not be able to start its own line.
  * - **C0 and C1 controls go entirely.** They are never part of a title anybody
  *   typed, and they are how a terminal is made to show something other than
  *   what was sent.
+ * - **Characters that REORDER or HIDE text go entirely.** The same argument as
+ *   the bullet above, carried to characters that are not C0 or C1: the bidi
+ *   embeddings, overrides and isolates (U+061C, U+200E, U+200F, U+202A-U+202E,
+ *   U+2066-U+2069), and the invisible formatting characters U+00AD, U+200B and
+ *   U+FEFF.
+ *
+ *   The reordering half is the load-bearing one, and it is a DIFFERENT claim
+ *   from the residual this fold deliberately leaves standing. Injected words
+ *   can still read as prose INSIDE the quotes, and that was accepted on two
+ *   stated grounds: the quoted span stays visibly bounded, and this server's
+ *   own consequence still lands last. An override is the one input for which
+ *   both grounds are false. It applies to the rest of the paragraph, so what
+ *   it reverses is the closing delimiter and the consequence clause
+ *   THEMSELVES. A title that is U+202E followed by a reversed sentence renders
+ *   forwards as a reassurance nobody here wrote, with this server's own words
+ *   garbled after it. Keeping the accepted residual acceptable therefore
+ *   REQUIRES dropping these: they are what would unbound the span the
+ *   acceptance rests on.
+ *
+ *   The invisible half earns its place on a smaller argument, said plainly
+ *   because the next reader will weigh it: no attack is known through it. What
+ *   it closes is that a character rendering nothing makes what the user reads
+ *   differ from the value published beside it, which is the C0/C1 bullet's own
+ *   reason -- and the cost is nil, because no title's meaning rests on a
+ *   zero-width space, a byte-order mark or a soft hyphen.
+ *
+ *   U+200C and U+200D are deliberately NOT in the set, and that is the line
+ *   this fold draws. They are invisible too, but what they change is how the
+ *   characters either side JOIN: orthography in Persian, Arabic and the Indic
+ *   scripts, and glyph composition in an emoji sequence. Neither can move text
+ *   out of the quotes, and neither hides a character that was there, so
+ *   dropping them would buy nothing and corrupt legitimate titles -- which is
+ *   the cost this whole fold exists to avoid.
  * - **The delimiter cannot appear inside the delimiter.** An ASCII `'` becomes
  *   U+2019, which reads the same to a person and closes nothing.
  *
@@ -1177,6 +1210,10 @@ function quotedName(name: string): string {
   const flattened = name
     .replace(/[\r\n\u2028\u2029]+/g, " ")
     .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+    .replace(
+      /[\u00ad\u061c\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g,
+      "",
+    )
     .replace(/'/g, "\u2019")
     .trim();
 
