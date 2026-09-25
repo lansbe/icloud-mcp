@@ -385,6 +385,30 @@ interface CollectionSpec {
    * module over.
    */
   source?: string;
+  /**
+   * The `CS:getctag` binding.
+   *
+   * Undefined means the property is absent entirely, and that is a real answer
+   * rather than a gap in the fixture: CALM-06 has to REFUSE a collection that
+   * offers no binding rather than write it unbound, and a spec that could not
+   * express the absence could not test the refusal. The `CS` prefix is already
+   * bound on `multistatus()`'s root element.
+   */
+  ctag?: string;
+  /**
+   * The `C:schedule-default-calendar-URL` href.
+   *
+   * RFC 6638 § 9.2 puts this on the scheduling INBOX collection rather than on
+   * the principal, and the depth-1 home PROPFIND already traverses the inbox,
+   * so the property rides along for zero extra requests — D-11 as corrected on
+   * 2026-09-25.
+   *
+   * Undefined means absent, and absent is what the inbox row below carries BY
+   * DEFAULT, on purpose. Whether iCloud actually populates the property is
+   * unmeasured until the phase's live probe, and a fixture that assumed the
+   * answer would make that probe redundant.
+   */
+  scheduleDefaultCalendar?: string;
 }
 
 function collectionBody(spec: CollectionSpec): string {
@@ -405,16 +429,42 @@ function collectionBody(spec: CollectionSpec): string {
       : spec.source === ""
         ? "<CS:source/>"
         : `<CS:source><href>${spec.source}</href></CS:source>`;
+  const ctag =
+    spec.ctag === undefined ? "" : `<CS:getctag>${spec.ctag}</CS:getctag>`;
+  const scheduleDefault =
+    spec.scheduleDefaultCalendar === undefined
+      ? ""
+      : `<C:schedule-default-calendar-URL><href>${spec.scheduleDefaultCalendar}</href></C:schedule-default-calendar-URL>`;
 
   return (
     `<response><href>${spec.href}</href><propstat>` +
     `<status>HTTP/1.1 200 OK</status><prop>` +
     `${displayName}<resourcetype>${resourceType}</resourcetype>` +
     `<C:supported-calendar-component-set>${components}</C:supported-calendar-component-set>` +
-    `${color}${source}` +
+    `${color}${source}${ctag}${scheduleDefault}` +
     `</prop></propstat></response>`
   );
 }
+
+/**
+ * The `CS:getctag` the work calendar answers unless a case names another.
+ *
+ * Opaque and unquoted, which is what a ctag is on the wire — unlike an ETag it
+ * carries no quoting convention, so a fixture that quoted it would let an
+ * implementation that strips quotes pass. The value means nothing; that it is
+ * compared byte for byte is the whole point.
+ */
+const WORK_CTAG = "ctag-work-1";
+
+/**
+ * The calendar home's own pathname.
+ *
+ * The one thing that tells a depth-1 PROPFIND against the HOME apart from a
+ * depth-1 PROPFIND against a COLLECTION inside it — both are the same method
+ * against a URL on the same host, and until the stub could tell them apart it
+ * answered the home listing to both.
+ */
+const HOME_SET_PATH = new URL(CALDAV_HOME).pathname;
 
 /**
  * The home set this account serves, in DOCUMENT order.
@@ -432,10 +482,17 @@ const COLLECTIONS: CollectionSpec[] = [
     resourceType: ["collection", "calendar"],
     components: ["VEVENT"],
     color: "#1f77b4",
+    // The binding CALM-06 seals into a confirmation and re-reads at commit.
+    // Measured present and non-empty on a live iCloud collection — see
+    // `.planning/debug/resolved/subscribed-cal-events-empty.md`.
+    ctag: WORK_CTAG,
   },
   {
     href: NOTES_PATH,
     // No display name element content at all: the XML layer yields an OBJECT.
+    // No `ctag` either, and that is the OTHER half of CALM-06: a collection
+    // answering no binding must be refused rather than written unbound, and
+    // the refusal needs a collection that answers none to be tested against.
     resourceType: ["collection", "calendar"],
     components: ["VEVENT"],
   },
@@ -452,12 +509,21 @@ const COLLECTIONS: CollectionSpec[] = [
     resourceType: ["collection", "calendar"],
     components: ["VTODO"],
   },
-  // The scheduling inbox. Not a calendar collection at all.
+  // The scheduling inbox. Not a calendar collection at all, and the row
+  // CALM-07 has to find: RFC 6638 § 9.2 puts `schedule-default-calendar-URL`
+  // HERE and not on the principal, and the depth-1 home PROPFIND already
+  // traverses it. `scheduleDefaultCalendar` is deliberately UNSET — whether
+  // iCloud populates the property is unmeasured, and a fixture that assumed
+  // the answer would pre-empt the probe that settles it.
+  //
+  // The element name is `schedule-inbox` because this is the XML on the wire;
+  // D-11's live reading records `scheduleInbox`, which is tsdav's camel-cased
+  // form of the same element after parsing.
   {
     href: INBOX_PATH,
     displayName: "Inbox",
     resourceType: ["collection", "schedule-inbox"],
-    components: ["VEVENT"],
+    components: [],
   },
 ];
 
@@ -470,6 +536,64 @@ const COLLECTIONS: CollectionSpec[] = [
  * pass.
  */
 const DEFAULT_ETAG = '"etag-1"';
+
+/**
+ * A depth-1 `PROPFIND` answer for ONE collection: the container, then its members.
+ *
+ * **The collection's own row is first and it is there ON PURPOSE.** A depth-1
+ * PROPFIND against a collection returns a response element for the collection
+ * itself alongside every member, which was measured live against this account:
+ * a calendar holding zero objects came back with *"exactly ONE href returned:
+ * the collection's own URL"*
+ * (`.planning/debug/resolved/subscribed-cal-events-empty.md`). So an empty
+ * calendar answers one row and a calendar holding nine events answers ten.
+ * Counting the rows gives a number one too high — including the number in the
+ * sentence the user agrees to before a delete, which is the whole reason
+ * CALM-06 exists. A fixture that omitted the container could not prove the
+ * exclusion, because there would be nothing to exclude.
+ *
+ * **At least one default member href has no `.ics` suffix**, and that is the
+ * second hazard rather than a stray. tsdav's `fetchCalendarObjects` filters on
+ * `url.includes(".ics")` by default, so routing the count through it would
+ * silently drop that member and report a count that is quietly short — on the
+ * one operation where a short count means events disappear that the user was
+ * never told about. The count must be taken from `propfind` directly, and this
+ * fixture is what fails if it is not.
+ *
+ * `ctag` rides on the container's row when supplied, because that is where a
+ * real server puts it and where the binding is read from.
+ */
+function memberListingBody(
+  collectionHref: string,
+  memberHrefs: string[],
+  ctag?: string,
+): string {
+  const binding = ctag === undefined ? "" : `<CS:getctag>${ctag}</CS:getctag>`;
+  const container =
+    `<response><href>${collectionHref}</href><propstat>` +
+    `<status>HTTP/1.1 200 OK</status><prop>` +
+    `<displayname>Work</displayname>` +
+    `<resourcetype><collection/><C:calendar/></resourcetype>` +
+    `${binding}</prop></propstat></response>`;
+  return (
+    container + memberHrefs.map((href) => objectHrefBody(href)).join("")
+  );
+}
+
+/**
+ * The members each collection answers on a depth-1 `PROPFIND`, by href.
+ *
+ * The work calendar's list carries three members and the THIRD has no `.ics`
+ * suffix — see `memberListingBody` for why that one is load-bearing rather
+ * than untidy.
+ */
+const MEMBERS: Record<string, string[]> = {
+  [WORK_PATH]: [
+    `${WORK_PATH}weekly.ics`,
+    `${WORK_PATH}allday.ics`,
+    `${WORK_PATH}a-resource-with-no-suffix`,
+  ],
+};
 
 function objectHrefBody(href: string, etag: string = DEFAULT_ETAG): string {
   return (
@@ -540,6 +664,14 @@ interface StubOptions {
   /** `{ [calendarPath]: { [objectHref]: icsBody } }`. */
   objects?: Record<string, Record<string, string>>;
   /**
+   * `{ [collectionHref]: memberHrefs }` for the depth-1 collection listing.
+   *
+   * A collection a case does not name answers an EMPTY listing — its own href
+   * and nothing else, which is the real answer for an empty calendar and is
+   * also what keeps every existing case untouched by this field's arrival.
+   */
+  members?: Record<string, string[]>;
+  /**
    * `{ [objectHref]: etag }`, VERBATIM — quotes, weak prefix and all.
    *
    * A case that does not name one gets `DEFAULT_ETAG`. The value is spliced
@@ -608,6 +740,7 @@ function davStub(options: StubOptions = {}): Stub {
   const collections = options.collections ?? COLLECTIONS;
   const objects = options.objects ?? OBJECTS;
   const etags = options.etags ?? {};
+  const members = options.members ?? MEMBERS;
 
   const state: Stub = {
     observed: [],
@@ -681,6 +814,23 @@ function davStub(options: StubOptions = {}): Stub {
       }
       return multistatus(
         `<response><href>${PRINCIPAL_PATH}</href><propstat><status>HTTP/1.1 200 OK</status><prop><current-user-principal><href>${PRINCIPAL_PATH}</href></current-user-principal></prop></propstat></response>`,
+      );
+    }
+
+    // --- one collection's members ----------------------------------------
+    // Answered BEFORE the home-set branch, because that branch matches on the
+    // method alone and would otherwise swallow this one — the same ordering
+    // argument the address-set branch above makes for itself.
+    //
+    // A depth-1 PROPFIND against a COLLECTION is a different question from the
+    // depth-1 PROPFIND against the HOME, and until now this stub answered both
+    // with the home listing. The count CALM-06 puts in front of the user comes
+    // from this answer.
+    if (method === "PROPFIND" && new URL(url).pathname !== HOME_SET_PATH) {
+      const path = new URL(url).pathname;
+      const spec = collections.find((one) => one.href === path);
+      return multistatus(
+        memberListingBody(path, members[path] ?? [], spec?.ctag),
       );
     }
 

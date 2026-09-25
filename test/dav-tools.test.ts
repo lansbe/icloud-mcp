@@ -1349,6 +1349,31 @@ const OTHER_EVENT_ID = encodeEventId({
 /** The ETag the preview observes unless a case says otherwise. */
 const PREVIEW_ETAG = '"etag-A"';
 
+/**
+ * The `CS:getctag` the work calendar answers on both PROPFIND shapes.
+ *
+ * Opaque and unquoted, which is what a ctag is on the wire — unlike an ETag it
+ * carries no quoting convention, so a fixture that quoted it would let an
+ * implementation that strips quotes pass.
+ */
+const WORK_CTAG = "ctag-work-1";
+
+/**
+ * The members the work calendar answers on a depth-1 PROPFIND.
+ *
+ * **The third has no `.ics` suffix on purpose.** tsdav's
+ * `fetchCalendarObjects` filters on `url.includes(".ics")` by default, so a
+ * count routed through it drops that member silently and reports a number that
+ * is quietly SHORT — on the one operation where a short count means events
+ * disappear the user was never told about. The count has to come from
+ * `propfind` directly, and this member is what fails if it does not.
+ */
+const WORK_MEMBERS: string[] = [
+  SIMPLE_OBJECT_PATH,
+  OTHER_EVENT_PATH,
+  `${WORK_PATH}a-resource-with-no-suffix`,
+];
+
 function icsLines(...lines: string[]): string {
   return `${lines.join("\r\n")}\r\n`;
 }
@@ -1430,6 +1455,14 @@ interface WriteStubOptions {
    * selection a real choice rather than "take element zero".
    */
   userAddresses?: string[];
+  /**
+   * The member hrefs the work calendar answers on a depth-1 `PROPFIND`.
+   *
+   * A case that names none gets `WORK_MEMBERS`. An explicit `[]` is a real
+   * answer too: it is the empty calendar, which still returns ONE row — its
+   * own — and is the case an off-by-one count reports as holding one event.
+   */
+  members?: string[];
   /** Answer this request instead of the canned conversation. `null` defers. */
   onRequest?: (url: string, method: string) => Response | null;
 }
@@ -1544,6 +1577,36 @@ function writeDavStub(options: WriteStubOptions = {}): WriteStub {
       );
     }
 
+    // A depth-1 PROPFIND against the COLLECTION. A different question from the
+    // depth-1 PROPFIND against the HOME below, and until now this stub answered
+    // the home listing to both. Answered FIRST, because the home branch matches
+    // on the method alone and would otherwise swallow this one.
+    //
+    // **The container's OWN row comes back first, and it is not a member.**
+    // Measured live: a calendar holding nothing answered exactly one href, its
+    // own. Counting rows gives a number one too high, and on a collection
+    // delete that is a number the user agreed to which was never true.
+    if (method === "PROPFIND" && new URL(url).pathname === WORK_PATH) {
+      const rows = (options.members ?? WORK_MEMBERS)
+        .map(
+          (href) =>
+            `<response><href>${href}</href><propstat>` +
+            `<status>HTTP/1.1 200 OK</status>` +
+            `<prop><getetag>${PREVIEW_ETAG}</getetag></prop>` +
+            `</propstat></response>`,
+        )
+        .join("");
+      return multistatus(
+        `<response><href>${WORK_PATH}</href><propstat>` +
+          `<status>HTTP/1.1 200 OK</status><prop>` +
+          `<displayname>Work</displayname>` +
+          `<resourcetype><collection/><C:calendar/></resourcetype>` +
+          `<CS:getctag>${WORK_CTAG}</CS:getctag>` +
+          `</prop></propstat></response>` +
+          rows,
+      );
+    }
+
     if (method === "PROPFIND") {
       return multistatus(
         `<response><href>${WORK_PATH}</href><propstat>` +
@@ -1551,6 +1614,10 @@ function writeDavStub(options: WriteStubOptions = {}): WriteStub {
           `<displayname>Work</displayname>` +
           `<resourcetype><collection/><C:calendar/></resourcetype>` +
           `<C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set>` +
+          // The binding CALM-06 seals into a confirmation at preview and
+          // re-reads at commit. On the home listing it rides the collection's
+          // own row, which is where a real server puts it.
+          `<CS:getctag>${WORK_CTAG}</CS:getctag>` +
           `</prop></propstat></response>`,
       );
     }
