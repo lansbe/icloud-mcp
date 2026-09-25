@@ -50,6 +50,7 @@ import { fetchSubscriptionFeed } from "../src/feed/subscription-feed";
 import {
   MAX_RANGE_DAYS,
   MAX_SLOT_RANGE_DAYS,
+  assertCtag,
   assertEtag,
   calendarColorForWire,
   createCalendarCollection,
@@ -67,6 +68,7 @@ import {
   pinnedOccurrencesFor,
   planCreateTarget,
   propstatOutcomes,
+  readCollectionState,
   resolveOrganizerAddress,
   searchEvents,
   updateCalendarCollection,
@@ -75,6 +77,7 @@ import {
   updateOccurrenceBody,
 } from "../src/dav/calendar";
 import type {
+  CollectionState,
   CreateEventInput,
   EventDetail,
   EventSummary,
@@ -6398,5 +6401,153 @@ describe("propstatOutcomes, read directly", () => {
     expect(
       propstatOutcomes([{ status: 207, statusText: "", ok: true, props: {} }], []),
     ).toEqual({ changed: [], unchanged: [] });
+  });
+});
+
+describe("what a collection is bound to and how much goes with it (CALM-06)", () => {
+  /** The warm read this block measures, with discovery already paid for. */
+  async function readOne(url: string): Promise<CollectionState> {
+    return readCollectionState(env, principal, createDavFetch(owner), url);
+  }
+
+  it("issues exactly ONE request, a depth-1 PROPFIND at the collection", async () => {
+    await warm(stub);
+
+    await readOne(WORK_URL);
+
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].method).toBe("PROPFIND");
+    expect(stub.observed[0].url).toBe(WORK_URL);
+    expect(stub.observed[0].headers.depth).toBe("1");
+  });
+
+  it("counts ZERO for an empty collection, because the container is not a member", async () => {
+    // **The off-by-one this whole function exists to avoid.** A depth-1
+    // PROPFIND against a calendar holding nothing comes back with exactly one
+    // href — its own — measured live against this account. A naive reader
+    // counts the rows and tells the user their empty calendar holds one thing,
+    // in the sentence they agree to before a delete.
+    await warm(stub);
+
+    const state = await readOne(NOTES_URL);
+
+    expect(state.memberCount).toBe(0);
+  });
+
+  it("counts every member, including one whose href has no .ics suffix", async () => {
+    // The work calendar's third member is stored under a name with no suffix.
+    // tsdav's calendar-object fetcher filters on `url.includes(".ics")` by
+    // default, so routing this count through it would report TWO — quietly
+    // short, on the one operation where short means a resource disappears that
+    // the user was never told about.
+    await warm(stub);
+
+    const state = await readOne(WORK_URL);
+
+    expect(state.memberCount).toBe(3);
+    expect(MEMBERS[WORK_PATH].some((href) => !href.endsWith(".ics"))).toBe(true);
+  });
+
+  it("resolves relative hrefs against the collection URL before the self comparison", async () => {
+    // The fixture answers RELATIVE hrefs, which is what iCloud sends. A raw
+    // `===` against the absolute collection URL matches nothing, so the self row
+    // falls through into the count — which is the same off-by-one arriving by a
+    // different route, and it survives the empty case above only if the
+    // resolution is missing entirely rather than merely wrong.
+    await warm(stub);
+    expect(new URL(WORK_PATH, WORK_URL).href).toBe(WORK_URL);
+
+    const state = await readOne(WORK_URL);
+    expect(state.memberCount).toBe(3);
+  });
+
+  it("reads the display name and the binding off the container row", async () => {
+    await warm(stub);
+
+    const state = await readOne(WORK_URL);
+
+    expect(state.ctag).toBe(WORK_CTAG);
+    // Byte for byte. A ctag carries no quoting convention, so an implementation
+    // that stripped or added one would still look like it read something.
+    expect(state.ctag).toBe("ctag-work-1");
+    expect(state.displayName).toBe("Work");
+  });
+
+  it("returns ctag null for a collection answering no binding, and assertCtag refuses it", async () => {
+    // The other half of CALM-06. A confirmation carrying null there, re-read as
+    // null at commit, compares EQUAL — so an unbound delete would proceed
+    // having checked nothing and look exactly like a success.
+    await warm(stub);
+
+    const state = await readOne(NOTES_URL);
+
+    expect(state.ctag).toBeNull();
+    expect(() => assertCtag(state.ctag)).toThrow(DavNotFoundError);
+    const refusal = (() => {
+      try {
+        assertCtag(state.ctag);
+      } catch (err) {
+        return err as DavNotFoundError;
+      }
+      throw new Error("expected a throw, got a resolution");
+    })();
+    // Not rediscoverable: re-resolving the account's home URLs cannot make an
+    // absent ctag present, and a retry would spend a real PROPFIND to learn it.
+    expect(refusal.rediscoverable).toBe(false);
+  });
+
+  it("refuses an empty-string binding on the same footing as an absent one", () => {
+    // Three shapes, one refusal. `undefined` is the property absent from the
+    // type, `null` is the row answering none, and `""` is the shape the library
+    // yields for a value this reader would otherwise seal into a confirmation.
+    expect(() => assertCtag(undefined)).toThrow(DavNotFoundError);
+    expect(() => assertCtag(null)).toThrow(DavNotFoundError);
+    expect(() => assertCtag("")).toThrow(DavNotFoundError);
+    expect(() => assertCtag("ctag-work-1")).not.toThrow();
+  });
+
+  it("refuses a collection URL outside the resolved home, with ZERO requests", async () => {
+    // T-17-18. `src/dav/transport.ts` attaches the Apple ID and the
+    // app-specific password to whatever URL it is handed, and this one arrives
+    // inside a caller-supplied opaque id.
+    await warm(stub);
+
+    await expect(
+      readOne("https://attacker.example/1234567890/calendars/work/"),
+    ).rejects.toBeInstanceOf(DavNotFoundError);
+
+    expect(stub.observed.length).toBe(0);
+  });
+
+  it("leaves CalendarSummary's key set exactly as it was", async () => {
+    // **A binding is not an answer.** `EventWithEtag`'s docstring makes this
+    // argument for the ETag and it holds identically here: the listing now asks
+    // for `cs:getctag` because the property rides free on a request sent either
+    // way, and the value must stop at the service layer. A later executor
+    // adding a ctag to a row a tool returns turns this red.
+    await warm(stub);
+
+    const listing = await listCalendars(env, principal, createDavFetch(owner));
+    expect(listing.calendars.length).toBeGreaterThan(0);
+    for (const calendar of listing.calendars) {
+      expect(Object.keys(calendar).sort()).toEqual([
+        "color",
+        "displayName",
+        "id",
+        "subscribed",
+      ]);
+    }
+  });
+
+  it("asks the listing for the binding too, on one request", async () => {
+    // The prop addition itself, asserted off the bytes that went out rather
+    // than off the props object — a props key that never reached the wire would
+    // pass a reading of the source and nothing else.
+    await warm(stub);
+
+    await listCalendars(env, principal, createDavFetch(owner));
+
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].body).toContain("getctag");
   });
 });

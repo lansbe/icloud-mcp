@@ -86,6 +86,29 @@ export interface DavCollectionProbe {
    * accepts every component type.
    */
   components: string[];
+  /**
+   * The default-calendar href this row advertises, or `null` when it carries
+   * none.
+   *
+   * **RFC 6638 § 9.2 puts this property on the scheduling INBOX collection, not
+   * on the principal**, and the inbox is a child of the calendar home — measured
+   * live on 2026-09-25 at `…/calendars/inbox/` with `resourceTypes:
+   * ["collection", "scheduleInbox"]`. So the depth-1 home PROPFIND this probe
+   * already sends traverses the row that carries it, and asking for the property
+   * costs nothing: a server that does not know it omits it rather than refusing
+   * the whole PROPFIND, exactly as `cs:source` rides the listing one module over.
+   *
+   * **`null` on every row is the expected shape and it is not a bug.** Only the
+   * scheduling inbox can carry a value, so every calendar collection answers
+   * `null` by construction. The field is here rather than filtered to the inbox
+   * because this probe filters on nothing except addressability — a property
+   * that appeared only on the row the reader was already looking for could not
+   * show that it appears somewhere else instead.
+   *
+   * Whether iCloud POPULATES the property is a separate question from whether
+   * this server reads it, and the second is all that is settled in code.
+   */
+  scheduleDefaultCalendarUrl: string | null;
 }
 
 export interface DavServiceReport {
@@ -434,6 +457,34 @@ function componentNamesOf(value: unknown): string[] {
 }
 
 /**
+ * The `schedule-default-calendar-URL` href a row carries, or null.
+ *
+ * The property's content is a single `DAV:href`, so the parsed value is an
+ * object with an `href` member — the same shape `CS:source` has one module
+ * over, and hand-narrowed for the same reason: the library types this whole
+ * region `any`, and an EMPTY element yields `{}` rather than `{ href }`, whose
+ * string conversion is the nine characters `[object Object]`. That would read
+ * as a real URL in a tool response.
+ *
+ * Resolved against the home URL, because iCloud answers relative hrefs. A value
+ * that will not resolve is dropped rather than carried: a URL this server
+ * cannot address is one it must not claim to have, which is the same rule the
+ * enumeration below applies to a collection's own href. Nothing is read from a
+ * caught value.
+ */
+function scheduleDefaultHrefOf(value: unknown, base: string): string | null {
+  if (value === null || typeof value !== "object") return null;
+  const href = (value as { href?: unknown }).href;
+  if (typeof href !== "string" || href.length === 0) return null;
+  try {
+    return new URL(href, base).href;
+  } catch {
+    // Nothing is read from the caught value — ./.claude/CLAUDE.md §4.
+    return null;
+  }
+}
+
+/**
  * Everything the CalDAV home set can say about itself in ONE request.
  *
  * `propfind` at depth 1 rather than tsdav's `fetchCalendars`, and the reason is
@@ -481,6 +532,12 @@ async function probeCalendarHome(
       "d:displayname": {},
       "d:supported-report-set": {},
       "c:supported-calendar-component-set": {},
+      // Free, on `cs:source`'s own footing one module over: this is one request
+      // either way, and a server that does not know the property omits it from
+      // the response rather than refusing the whole PROPFIND. RFC 6638 § 9.2
+      // puts it on the scheduling inbox, which this depth-1 listing already
+      // traverses — see `DavCollectionProbe.scheduleDefaultCalendarUrl`.
+      "c:schedule-default-calendar-URL": {},
     },
     depth: "1",
     headers: {},
@@ -526,6 +583,14 @@ async function probeCalendarHome(
         typeof props.displayname === "string" ? props.displayname : "",
       resourceTypes,
       components: componentNamesOf(props.supportedCalendarComponentSet),
+      // `schedule-default-calendar-URL` camel-cases to this after the library
+      // strips the namespace prefix — `-U` becomes `U`, so the trailing
+      // capitals survive. Resolved against the HOME rather than the row's own
+      // href, because that is the base iCloud's relative hrefs are relative to.
+      scheduleDefaultCalendarUrl: scheduleDefaultHrefOf(
+        props.scheduleDefaultCalendarURL,
+        homeUrl,
+      ),
     });
   }
 

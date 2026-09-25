@@ -552,6 +552,24 @@ export const HOME_CHECKED_CALL_SITES: readonly CheckedSite[] = Object.freeze([
     field: "collectionUrl",
     guards: "davRequest",
   },
+  // CALM-06's count read, on exactly the rename's footing one entry up: the
+  // collection URL arrives inside a caller-supplied opaque id, so it is checked
+  // rather than exempt, and it addresses one url because a collection has no
+  // object hanging off it.
+  //
+  // A READ, so the leak is one-directional — but one-directional is not
+  // harmless here, and the additive-only tolerance above is not a reason to
+  // leave a site unchecked when it is right here being written:
+  // `src/dav/transport.ts` attaches the Apple ID and the app-specific password
+  // to whatever URL it is handed, and a forged id would ship both to whatever
+  // origin it named. The refusal is asserted to cost ZERO outbound requests in
+  // `test/dav-calendar.test.ts`, which is the falsifiable half.
+  {
+    file: CALENDAR,
+    fn: "readCollectionState",
+    field: "collectionUrl",
+    guards: "propfind",
+  },
 ]);
 
 /** One request site that needs no containment assertion, and why. */

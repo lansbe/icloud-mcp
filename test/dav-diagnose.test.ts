@@ -561,6 +561,84 @@ describe("dav_diagnose, end to end", () => {
     expect(tasks!.resourceTypes).toContain("calendar");
   });
 
+  // -------------------------------------------------------------------------
+  // `schedule-default-calendar-URL` (CALM-07 / D-11)
+  //
+  // These two prove the PARSING, in both directions, and they cannot prove
+  // anything else. RFC 6638 § 9.2 puts the property on the scheduling INBOX,
+  // and the inbox is a child of the calendar home — measured live on
+  // 2026-09-25. Whether iCloud POPULATES it is a question about Apple's server
+  // that no fixture can answer, which is why the phase spends a deploy and a
+  // live `dav_diagnose { refresh: true }` on it rather than a test.
+  // -------------------------------------------------------------------------
+
+  /** One `response` element for the scheduling inbox, with whatever extra props. */
+  function scheduleInbox(extra: string): string {
+    return (
+      `<response><href>${CALDAV_HOME}inbox/</href><propstat>` +
+      `<status>HTTP/1.1 200 OK</status><prop>` +
+      `<resourcetype><collection/><C:schedule-inbox/></resourcetype>` +
+      `<displayname>Inbox</displayname>${extra}` +
+      `</prop></propstat></response>`
+    );
+  }
+
+  it("surfaces the default-calendar href the scheduling inbox row carries", async () => {
+    // The href is RELATIVE, which is how iCloud answers one. An implementation
+    // that stored it raw would put a path where every comparison downstream
+    // expects an absolute URL, and CALM-07's refusal compares raw by design.
+    const body =
+      homeSelfResponse() +
+      calendarCollection(`${CALDAV_HOME}home/`, "Home", componentSetProp("VEVENT")) +
+      scheduleInbox(
+        "<C:schedule-default-calendar-URL><href>/1234567890/calendars/home/</href></C:schedule-default-calendar-URL>",
+      );
+
+    const stub = davStub({
+      onRequest: (url) => (url === CALDAV_HOME ? multistatus(body) : null),
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+    const collections = serviceOf(result, "caldav")
+      .collections as DavCollectionProbe[];
+
+    const inbox = collections.find((one) => one.displayName === "Inbox");
+    expect(inbox).toBeDefined();
+    expect(inbox!.resourceTypes).toContain("scheduleInbox");
+    expect(inbox!.scheduleDefaultCalendarUrl).toBe(`${CALDAV_HOME}home/`);
+
+    // Every other row answers null, and that is the expected shape rather than
+    // a gap: only the inbox can carry the property at all.
+    const home = collections.find((one) => one.displayName === "Home");
+    expect(home!.scheduleDefaultCalendarUrl).toBeNull();
+  });
+
+  it("reports NULL when the inbox row carries no default-calendar property", async () => {
+    // The other direction, and the one the live probe exists to distinguish
+    // from a reader that is simply broken. Absent must read as absent.
+    const body =
+      homeSelfResponse() +
+      calendarCollection(`${CALDAV_HOME}home/`, "Home", componentSetProp("VEVENT")) +
+      scheduleInbox("");
+
+    const stub = davStub({
+      onRequest: (url) => (url === CALDAV_HOME ? multistatus(body) : null),
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+    const collections = serviceOf(result, "caldav")
+      .collections as DavCollectionProbe[];
+
+    const inbox = collections.find((one) => one.displayName === "Inbox");
+    expect(inbox).toBeDefined();
+    expect(inbox!.scheduleDefaultCalendarUrl).toBeNull();
+    // An EMPTY element is the other absent shape, and the one that renders as
+    // nine characters that read like a real URL if it is not narrowed.
+    expect(JSON.stringify(inbox)).not.toContain("[object Object]");
+  });
+
   it("gives a collection with no component set an EMPTY list, not a dropped row", async () => {
     // A server that simply did not answer the property is not a server with no
     // collections. Dropping the row would make the diagnostic quieter than the

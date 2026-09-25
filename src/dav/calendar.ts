@@ -584,6 +584,11 @@ async function fetchCollections(
       // know the property simply omits it from the response rather than
       // refusing the whole PROPFIND.
       "cs:source": {},
+      // Free on the same terms, and asked for so the listing path can reach
+      // the binding CALM-06 seals without a second call shape. `Collection`
+      // deliberately does not carry it onward — a binding is not an answer,
+      // and `CalendarSummary` must never grow one.
+      "cs:getctag": {},
     },
     depth: "1",
     headers: {},
@@ -1167,6 +1172,216 @@ export async function updateCalendarCollection(
     // See the docstring. A retry could only ever reach the containment refusal.
     false,
   );
+}
+
+/**
+ * What a collection is bound to, and how much goes with it (CALM-06, D-09, D-10).
+ *
+ * Three answers from ONE request, and they are together rather than apart
+ * because the row that must be EXCLUDED from the count is the row that carries
+ * the binding. Splitting them would be two requests to read one multi-status.
+ */
+export interface CollectionState {
+  /**
+   * The collection's display name, or `""` when the server sent none this run
+   * can read. **Stranger-authored**, on `CalendarSummary.displayName`'s footing:
+   * a shared calendar's name is chosen by whoever shared it.
+   */
+  displayName: string;
+  /**
+   * The `CS:getctag` the collection answered, or `null` when it answered none.
+   *
+   * Null is a real answer rather than a gap, and it is the answer a delete must
+   * REFUSE on — see `assertCtag`, which owns that argument.
+   */
+  ctag: string | null;
+  /**
+   * How many member resources the collection holds.
+   *
+   * **The collection's own row is not one of them.** A depth-1 PROPFIND against
+   * a collection returns a response element for the collection itself alongside
+   * every member, measured live against this account: a calendar holding zero
+   * objects came back with exactly one href, its own. Counting rows gives a
+   * number one too high, and that number goes in the sentence a user agrees to
+   * before a delete.
+   *
+   * **It counts every member, not every event.** A VTODO, a resource this server
+   * cannot parse, and a `.ics` all count the same, because what the user is
+   * being told is how many things disappear when the collection does — not how
+   * many of them this server understands. A caller putting this number in front
+   * of a person must not name them events unless it knows the collection holds
+   * only events.
+   */
+  memberCount: number;
+}
+
+/**
+ * The `CS:getctag` a collection row carries, or null.
+ *
+ * Narrowed to a STRING and nothing else, which refuses two shapes the library
+ * can hand back. An empty `<CS:getctag/>` yields `{}`, whose string conversion
+ * is the nine characters `[object Object]` — a value that would seal into a
+ * confirmation and compare equal to itself forever. And the XML layer coerces
+ * a numeric-looking value to a NUMBER and `true`/`false` to a boolean before
+ * this sees it, so `01` and `1` arrive as the same number: a binding that moved
+ * would read as unchanged, which is the one direction CALM-06 cannot tolerate.
+ *
+ * Both non-string shapes therefore become `null`, and `assertCtag` turns null
+ * into a refusal. Refusing a collection whose binding this server cannot read
+ * byte-for-byte costs the user a delete; accepting one costs them the events the
+ * delete was supposed to be counted against.
+ */
+function ctagOf(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * Read one collection's binding, its name and its exact member count (CALM-06).
+ *
+ * ## One request, and both answers come out of it
+ *
+ * A depth-1 PROPFIND against the collection returns the collection's own row
+ * alongside one row per member. The self row carries `d:displayname` and
+ * `CS:getctag`; every other row is one member. That is the design rather than a
+ * nuisance — D-09's binding and D-10's count are read from the same
+ * multi-status, so the two numbers a delete preview shows can never describe
+ * different moments.
+ *
+ * No bodies are requested, so the request is cheap; `d:getetag` is asked for
+ * only so a member row has a property to carry and the server has a reason to
+ * return one. Nothing reads it.
+ *
+ * ## Three ways the obvious implementation is wrong
+ *
+ * **The library's calendar-object fetcher is not used**, and must not be. Its
+ * default url filter admits only hrefs containing `.ics`, recorded as a live
+ * hazard in this repository's own debug notes. Routing the count through it
+ * would silently drop any member stored under another name and report a count
+ * that is quietly SHORT — on the one operation where short means events
+ * disappear that the user was never told about.
+ *
+ * **There is no `.ics` filter here either**, for that same reason in reverse. A
+ * resource this server cannot parse still vanishes when the collection does.
+ *
+ * **Hrefs are resolved against the collection URL before the self comparison.**
+ * iCloud answers relative hrefs, so a raw `===` against the absolute collection
+ * URL would match nothing — and the self row would then be counted as a member,
+ * turning an empty calendar into one that previews as holding a thing.
+ *
+ * ## Why no retry
+ *
+ * `allowRediscovery` is `false`, on `updateCalendarCollection`'s reasoning
+ * rather than the create's: the caller's collection URL was minted against the
+ * home this server resolved earlier, so if the shard host moved, a re-resolved
+ * home can only send the retry into the containment refusal above. The retry
+ * would spend a real PROPFIND against iCloud on a request that cannot succeed.
+ *
+ * ## Serial, because every one of these is a socket
+ *
+ * `dav-concurrent-request` names this function. A previewing caller wanting a
+ * member count for every calendar in the home is the most natural fan-out in
+ * this phase and it is exactly what the rule refuses — see ./.claude/CLAUDE.md §3.
+ *
+ * Nothing here is logged. This module contains no logging calls of any kind.
+ */
+export async function readCollectionState(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  collectionUrl: string,
+): Promise<CollectionState> {
+  return withRediscovery(
+    env,
+    principal,
+    davFetch,
+    "caldav",
+    async (resolved) => {
+      // FIRST, and before the credential can be attached to anything. The URL
+      // came out of a caller-supplied token.
+      assertUnderHome(collectionUrl, resolved.homeUrl);
+
+      const responses = await propfind({
+        url: collectionUrl,
+        props: {
+          "d:displayname": {},
+          "d:resourcetype": {},
+          "cs:getctag": {},
+          // Asked for so a member row carries something. Never read.
+          "d:getetag": {},
+        },
+        depth: "1",
+        // Never a credential from here. `./transport.ts` attaches it per call
+        // and is the only place that may.
+        headers: {},
+        fetch: davFetch,
+      });
+
+      // `assertUnderHome` has already parsed this, so it cannot throw here.
+      const selfUrl = new URL(collectionUrl).href;
+
+      let displayName = "";
+      let ctag: string | null = null;
+      let memberCount = 0;
+
+      for (const response of responses) {
+        const rawHref = response.href;
+        if (typeof rawHref !== "string" || rawHref.length === 0) continue;
+
+        let href: string;
+        try {
+          href = new URL(rawHref, collectionUrl).href;
+        } catch {
+          // Nothing is read from the caught value — ./.claude/CLAUDE.md §4. A row
+          // whose href will not resolve names nothing this server could delete,
+          // so it is neither the container nor a countable member.
+          continue;
+        }
+
+        if (href === selfUrl) {
+          const props = response.props ?? {};
+          displayName = narrowDisplayName(props.displayname);
+          ctag = ctagOf(props.getctag);
+          continue;
+        }
+
+        memberCount += 1;
+      }
+
+      return { displayName, ctag, memberCount };
+    },
+    // See the docstring. A retry could only ever reach the containment refusal.
+    false,
+  );
+}
+
+/**
+ * Refuse a collection whose binding this server could not read.
+ *
+ * `assertEtag`'s exact shape one module-region over — an assertion signature
+ * rather than a boolean predicate, so it NARROWS at the call site and the
+ * alternative is not a choice between a failing typecheck and a forbidden cast.
+ *
+ * **The concrete failure it guards, because a reader will otherwise assume the
+ * type system already covers it.** CALM-06's whole claim is that events arriving
+ * between a delete preview and its commit cannot be silently swept up, and that
+ * claim rests on ONE value: the ctag the preview seals and the commit re-reads.
+ * A collection that answered no ctag is a collection this server cannot BIND. A
+ * confirmation carrying `null` there, re-read as `null` at commit, compares
+ * equal — so the delete proceeds having checked nothing, with no error, no
+ * warning and a result that looks exactly like a success. The absence is
+ * therefore refused at the point it is first known rather than carried forward.
+ *
+ * `DavNotFoundError(false)`: the vocabulary is closed, a collection this server
+ * declines to bind is the same class of answer as a resource it declines to
+ * resolve, and re-resolving the account's home URLs cannot make an absent ctag
+ * present.
+ */
+export function assertCtag(
+  value: string | null | undefined,
+): asserts value is string {
+  if (value === undefined || value === null || value.length === 0) {
+    throw new DavNotFoundError(false);
+  }
 }
 
 /**
