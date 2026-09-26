@@ -6788,6 +6788,31 @@ describe("what a collection is bound to and how much goes with it (CALM-06)", ()
     expect(stub.observed[0].headers.depth).toBe("1");
   });
 
+  it("ASKS for the colour, and that is not visible from the answer", async () => {
+    // **The property this case exists for cannot be tested from the outcome, and
+    // the gap was found by mutation rather than by reading.** Deleting
+    // `ca:calendar-color` from the request left every rename-and-recolour case in
+    // this file GREEN, because the stub answers its whole canned body regardless
+    // of what was asked. A real server returns only what a PROPFIND named — so
+    // the colour would silently stop coming back, every recolour would read as
+    // refused, and nothing in the suite would have said so.
+    //
+    // Asserted on the outgoing BODY for that reason. The four properties are
+    // named one by one rather than as a count, because a count passes just as
+    // happily on a request that asked for the wrong four.
+    await warm(stub);
+
+    await readOne(WORK_URL);
+    const body = String(stub.observed[0].body);
+
+    expect(body).toContain("displayname");
+    expect(body).toContain("resourcetype");
+    // The one 17-10 added, and the one a rename is verified against.
+    expect(body).toContain("calendar-color");
+    expect(body).toContain("getctag");
+    expect(body).toContain("getetag");
+  });
+
   it("counts ZERO for an empty collection, because the container is not a member", async () => {
     // **The off-by-one this whole function exists to avoid.** A depth-1
     // PROPFIND against a calendar holding nothing comes back with exactly one
