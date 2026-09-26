@@ -1472,6 +1472,257 @@ function aliasedZoneDefinitionOf(tzid: string): string | null {
 /** The product identifier every resource this server writes carries. */
 const PRODID = "-//icloud-mcp//EN";
 
+/**
+ * One reminder, in the only shape this server writes or reads back (D-01).
+ *
+ * **The narrowness is a decision, not a limitation, and the reason is
+ * fidelity.** An alarm list is replaced as a WHOLE LIST — there is no way to
+ * edit one entry by index and no way to edit one by value — which is the same
+ * rule Phase 16 settled for a contact's emails and phones. Per-entry editing
+ * needs a stable identity for each entry, and an alarm has none this server can
+ * trust: a `VALARM` another client wrote may carry no `UID`, two alarms may be
+ * byte-identical, and an index is a position in bytes somebody else is free to
+ * reorder. Editing by index against bytes that moved edits the wrong alarm; that
+ * is where fidelity gets lost, and it is lost silently.
+ *
+ * So the vocabulary is the smallest one that is honest about what it can
+ * reproduce exactly:
+ *
+ * - **`minutesBefore`** — whole minutes before the event STARTS. An alarm
+ *   expressed any other way (an absolute datetime, a reach from the END, a
+ *   moment AFTER the start, a duration with a seconds remainder) is REPORTED as
+ *   unmodelled by `alarmsOf` and never coerced into this field. See its
+ *   docstring, which owns that argument.
+ * - **`action`** — one literal value this phase, so a second one is a type
+ *   change somebody decides rather than a string that happens to compile. An
+ *   `AUDIO` or `EMAIL` alarm is a real alarm this server cannot express, which
+ *   is exactly what the unmodelled count is for.
+ *
+ * Two shapes are DEFERRED by decision and recorded as such in
+ * `17-CONTEXT.md`, so a later session reads a choice rather than an oversight: a
+ * `VALARM` passed through verbatim, and an absolute `TRIGGER` datetime. Neither
+ * is to be smuggled in as a widening of this type.
+ */
+export interface AlarmSpec {
+  /** Whole minutes before the start. Zero means at the start. */
+  minutesBefore: number;
+  /** The one action this phase writes. */
+  action: "display";
+}
+
+/**
+ * What a component's alarms look like to a server that models only one shape.
+ *
+ * Two numbers rather than one list, because "this server found no reminder" and
+ * "this server found a reminder it cannot express" are different facts and the
+ * user is entitled to the second one. A whole-list replacement removes an
+ * unmodelled alarm along with the rest, so the confirmation line names the count
+ * before the user agrees — see `composeConfirmationLine`'s alarm clause.
+ */
+export interface AlarmReading {
+  /** Every alarm this server could express, in document order. */
+  modelled: AlarmSpec[];
+  /** How many alarms it could not. Their values are deliberately not reported. */
+  unmodelled: number;
+}
+
+/** The wire spelling of the one action `AlarmSpec` admits. */
+const ALARM_ACTION = "DISPLAY";
+
+/**
+ * The text a `DISPLAY` alarm shows.
+ *
+ * RFC 5545 §3.6.6 REQUIRES `DESCRIPTION` on a display alarm, so there is no
+ * "leave it off" option, and it is a fixed string rather than the event's own
+ * title on purpose: the title is stranger-authored on an event that arrived as
+ * an invitation, and copying it here would put third-party text into a second
+ * property of a resource this server writes. A receiving client shows the
+ * event's own summary beside the alert regardless.
+ */
+const ALARM_DESCRIPTION = "Reminder";
+
+/**
+ * Build one `VALARM`, ready to hang on the component that carries it.
+ *
+ * The trigger is written as a literal `-PT{n}M` string through
+ * `addPropertyWithValue`. That was MEASURED against this repository's own
+ * `ical.js@2.2.1` rather than assumed: it is byte-identical to constructing an
+ * `ICAL.Duration` with `isNegative` and setting that, `getFirstProperty("trigger").type`
+ * comes back `"duration"` either way because the library's design table maps
+ * `trigger` to that default type, and no `VALUE=` parameter is emitted on either
+ * route. The literal is the shorter of two identical answers.
+ *
+ * **No `RELATED` parameter.** RFC 5545 §3.8.6.3's default is `RELATED=START`,
+ * expressed by the parameter's ABSENCE — so emitting it would be a claim the
+ * request never made, which is `addParticipants`' own argument for not
+ * substituting a default `ROLE`.
+ *
+ * **A `UID`, and no `X-WR-ALARMUID`.** RFC 9074 §6 sanctions a `UID` on a
+ * `VALARM`, ical.js emits it cleanly, and it costs nothing if unnecessary. The
+ * `X-` form is claimed to be wanted by iCloud only by secondary sources with no
+ * primary Apple documentation, and "an Apple client WRITES a property" does not
+ * establish "an Apple client REQUIRES it". An `X-` property this server invents
+ * is one every future update has to preserve, so none is written; plan 17-09's
+ * read-back answers the question in the data, and if iCloud supplies one of its
+ * own then iCloud is supplying what it needs.
+ *
+ * The identifier is scoped to the ALARM rather than to the event. Two alarms on
+ * one event sharing an identifier would be the defect two components sharing a
+ * `RECURRENCE-ID` is: a receiving client cannot tell which is which.
+ */
+export function buildAlarm(spec: AlarmSpec): IcalComponent {
+  const alarm = new ICAL.Component("valarm");
+  alarm.addPropertyWithValue("action", ALARM_ACTION);
+  alarm.addPropertyWithValue("description", ALARM_DESCRIPTION);
+  alarm.addPropertyWithValue("uid", `${crypto.randomUUID()}@icloud-mcp`);
+  alarm.addPropertyWithValue("trigger", `-PT${spec.minutesBefore}M`);
+  return alarm;
+}
+
+/**
+ * Which of one component's alarms this server can express, and how many it cannot.
+ *
+ * **The trigger is read as `-duration.toSeconds() / 60` and NEVER as
+ * `.minutes`**, and that is the load-bearing line in this function. An alarm
+ * another client wrote as one hour before the event parses to a duration whose
+ * `.minutes` is ZERO — the library puts the hour in `.hours` and folds nothing —
+ * so a reader keyed on that field reports "at the time of the event" for a
+ * reminder the user set an hour early, and nothing anywhere raises. It is the
+ * same shape of defect the `RFC822.SIZE`-versus-`RFC822` distinction in
+ * `./.claude/CLAUDE.md` §5 exists to prevent: a field that looks right and is
+ * wrong. `toSeconds()` folds weeks, days, hours, minutes and seconds into one
+ * number and is the only safe read. Pinned by the `-PT1H` case in
+ * `test/dav-icalendar.test.ts`.
+ *
+ * **REFUSE rather than round.** Five shapes are counted as unmodelled and have
+ * no number reported for them, because a rounded figure would be a claim about
+ * the user's reminder that the user never made:
+ *
+ *   - an absolute `DATE-TIME` trigger, which is anchored to a moment rather than
+ *     to the event and moves differently when the event moves;
+ *   - a trigger reaching from the `END` rather than the start;
+ *   - a trigger AFTER the start, which is a follow-up rather than a reminder;
+ *   - a duration that is not whole minutes;
+ *   - an `ACTION` this server does not write.
+ *
+ * An explicit `RELATED=START` IS accepted, and that is the one place this reader
+ * looks past a spelling. It is the RFC's own default written out, so it names
+ * exactly the alarm `buildAlarm` produces; refusing it would warn a user that
+ * this server cannot express a reminder it can reproduce precisely.
+ *
+ * **What it does NOT see, said plainly because the next reader will ask.** An
+ * alarm whose trigger and action are both expressible is reported as modelled
+ * even when it carries OTHER properties this server does not write — an
+ * `ACKNOWLEDGED`, an `X-` flag, a `RELATED-TO`. Those are lost by a whole-list
+ * replacement, and that is what whole-list replacement MEANS (D-01): a caller
+ * supplying a list has asked for their list and no other. The unmodelled count
+ * is about alarms this server cannot NAME, not about every byte a replacement
+ * costs. An update that says nothing about alarms touches none of it.
+ */
+export function alarmsOf(component: IcalComponent): AlarmReading {
+  const modelled: AlarmSpec[] = [];
+  let unmodelled = 0;
+
+  for (const alarm of component.getAllSubcomponents("valarm")) {
+    const minutes = minutesBeforeOf(alarm);
+    if (minutes === null) {
+      unmodelled += 1;
+      continue;
+    }
+    modelled.push({ minutesBefore: minutes, action: "display" });
+  }
+
+  return { modelled, unmodelled };
+}
+
+/**
+ * Whole minutes before the start, or null when this server cannot say.
+ *
+ * `alarmsOf`'s body, extracted so the five refusals read as five named cases
+ * rather than as a chain of guards inside a loop. Every one of them returns null
+ * and NOT a repaired number; see that function's docstring, which owns the
+ * argument for each.
+ *
+ * The two enumerated values are compared case-INSENSITIVELY through
+ * `toUpperCase`, not the locale-aware form. RFC 5545 §3.8.6.1 and §3.8.6.3
+ * define them as tokens and a real calendar contains both spellings; the
+ * locale-aware fold gives a different answer under a Turkish locale, and the
+ * vitest pool inherits the developer's locale while production runs its own —
+ * `foldAddress` in `../confirm.ts` declines it for exactly this reason.
+ */
+function minutesBeforeOf(alarm: IcalComponent): number | null {
+  const action = alarm.getFirstPropertyValue("action");
+  if (typeof action !== "string") return null;
+  if (action.toUpperCase() !== ALARM_ACTION) return null;
+
+  const trigger = alarm.getFirstProperty("trigger");
+  if (trigger === null) return null;
+
+  const related = trigger.getParameter("related");
+  if (typeof related === "string" && related.toUpperCase() !== "START") {
+    return null;
+  }
+
+  const value = trigger.getFirstValue();
+  // An absolute trigger parses to a TIME rather than a DURATION, so the type
+  // test is what separates "fifteen minutes before whenever this event is" from
+  // "the third of September at half past one", and the two are different claims.
+  if (!(value instanceof ICAL.Duration)) return null;
+
+  const minutes = -value.toSeconds() / 60;
+  if (!Number.isInteger(minutes) || minutes < 0) return null;
+  return minutes;
+}
+
+/**
+ * The alarms on the component a patch of these bytes would TARGET.
+ *
+ * The preview needs this and cannot compute it: it holds the resource as text,
+ * and every byte of iCalendar in this project goes through this module. So the
+ * component-picking rule lives here, beside the two writers that follow it,
+ * rather than being restated at the tool boundary where it could drift.
+ *
+ * It mirrors what `applyEventChange` and `applyOccurrenceOverride` actually
+ * write to, which is the whole point — a diff computed against a component the
+ * write will not touch is a diff about nothing:
+ *
+ *   - **no recurrence identifier** — the one component a non-repeating resource
+ *     holds, which is what `applyEventChange` asserts the change over;
+ *   - **a named date that already has an override** — that override, which
+ *     `applyOccurrenceOverride` modifies in place;
+ *   - **a named date with no override yet** — the MASTER, because a new override
+ *     starts as a copy of the master and therefore inherits the master's alarms.
+ *
+ * **Empty rather than a throw for bytes it cannot read.** A resource this module
+ * cannot parse has no write path at all — `withParsedResource` raises on the way
+ * to every writer — so nothing is agreed to on the strength of this answer. The
+ * caught value is not read, on Conventions §4's rule.
+ */
+export function storedAlarmsOf(
+  icsText: string,
+  recurrenceId: string | null,
+): AlarmReading {
+  const empty: AlarmReading = { modelled: [], unmodelled: 0 };
+
+  try {
+    return withParsedResource(icsText, (resource) => {
+      if (recurrenceId === null) {
+        const target = resource.components[0];
+        return target === undefined ? empty : alarmsOf(target);
+      }
+
+      const existing = resource.components.find(
+        (component) => recurrenceIdStringOf(component) === recurrenceId,
+      );
+      if (existing !== undefined) return alarmsOf(existing);
+
+      return resource.master === null ? empty : alarmsOf(resource.master);
+    });
+  } catch {
+    return empty;
+  }
+}
+
 /** One person an event invites. Caller-supplied, and neither half is repaired. */
 export interface BuildAttendee {
   /** The address, as the caller spelled it. */
@@ -1679,6 +1930,18 @@ export interface BuildEventInput extends TimeAnchor {
    * cannot choose one" in `test/dav-tools.test.ts`.
    */
   sequence: number;
+  /**
+   * The reminders to write, or absent for an event that carries none (CALM-01).
+   *
+   * Absent and an empty array produce the SAME bytes here, and this is the one
+   * place in the project where the two legitimately agree: a resource that does
+   * not exist yet has no stored alarm for an empty list to remove. The
+   * distinction is real on the UPDATE path — see `OverrideChange.alarms`, where
+   * absent means leave every stored alarm alone and `[]` means take them all
+   * away — and the field is optional on both so the two types read the same at
+   * every call site that carries a change between them.
+   */
+  alarms?: AlarmSpec[];
 }
 
 /**
@@ -1781,6 +2044,11 @@ export function buildVEvent(input: BuildEventInput): IcalComponent {
   vevent.addProperty(anchoredTime("dtstart", input.startLocal, input));
   vevent.addProperty(anchoredTime("dtend", input.endLocal, input));
   addParticipants(vevent, input.participants);
+  // AFTER the participants, so the subcomponent ordering a created resource
+  // carries is stable and can be pinned by a byte comparison. A `VALARM` is the
+  // only subcomponent a `VEVENT` this server builds ever has, so "after" is a
+  // property of the source order rather than a sort.
+  setAlarms(vevent, input.alarms);
 
   return vevent;
 }
@@ -2118,6 +2386,25 @@ export interface OverrideChange extends TimeAnchor {
   location: string | null;
   /** Verbatim, or null to REMOVE the property from the override. */
   description: string | null;
+  /**
+   * The reminders to assert, or ABSENT to leave every stored one alone (D-04).
+   *
+   * **Absent and `[]` are different requests, and the difference is in the TYPE
+   * rather than in a convention somebody remembers.** An absent key touches no
+   * `VALARM` at all, so an update that says nothing about reminders keeps the
+   * one the user set — including one this server cannot express. An explicit
+   * empty array removes every `VALARM` on the component. That is `setOrRemove`'s
+   * absent-versus-null pattern one line up, applied to a list: the same claim the
+   * tool boundary makes about `location` and `description`, made about alarms.
+   *
+   * **There is deliberately no `removeAlarms` flag.** A second way to say the
+   * same thing is a second thing to keep consistent, and the two would disagree
+   * the first time somebody set both.
+   *
+   * A supplied list replaces the WHOLE list. See `AlarmSpec`, which owns the
+   * argument for why there is no per-entry edit.
+   */
+  alarms?: AlarmSpec[];
 }
 
 /**
@@ -3248,6 +3535,45 @@ function applyOverrideChange(
   component.removeAllProperties("dtend");
   component.addProperty(anchoredTime("dtstart", change.startLocal, change));
   component.addProperty(anchoredTime("dtend", change.endLocal, change));
+
+  setAlarms(component, change.alarms);
+}
+
+/**
+ * Assert a reminder list on one component, or leave every stored one alone.
+ *
+ * **This is the whole of CALM-02, and it covers every scope because there is
+ * only one place to put it.** All three patch writers converge on
+ * `applyOverrideChange` above — `applyEventChange` for a resource that does not
+ * repeat, and both arms of `applyOccurrenceOverride` for one that does — so a
+ * scopeless update, an occurrence-scoped one and a this-and-future one cannot
+ * disagree about alarms. There is no per-scope alarm code that could.
+ *
+ * `undefined` touches nothing, which is D-04's absent arm and the reason an
+ * update that says nothing about reminders keeps the one the user set. Anything
+ * else replaces the whole list, so `[]` removes every alarm.
+ *
+ * **The name is ALWAYS passed to `removeAllSubcomponents`.** The bare-argument
+ * form takes every subcomponent, `VTIMEZONE` blocks included — and the resource
+ * still serialises afterwards, so the failure is a resource whose times mean
+ * something else with nothing at all going red. It is the exact defect
+ * `serializeOccurrenceResource`'s own `removeAllSubcomponents("vevent")` guards
+ * against, and the hazards fixture's docstring names it there.
+ *
+ * **Nothing branches on the return value.** In `ical.js@2.2.1` that method
+ * returns `undefined` regardless of what it removed, despite the JSDoc at
+ * `node_modules/ical.js/lib/ical/component.js:472` promising a boolean —
+ * measured by running it. A before-and-after count through
+ * `getAllSubcomponents("valarm").length` is the only honest way to ask.
+ */
+function setAlarms(
+  component: IcalComponent,
+  alarms: AlarmSpec[] | undefined,
+): void {
+  if (alarms === undefined) return;
+
+  component.removeAllSubcomponents("valarm");
+  for (const spec of alarms) component.addSubcomponent(buildAlarm(spec));
 }
 
 /** Set a property to a value, or take it away entirely when the value is null. */

@@ -19,6 +19,7 @@ import ICAL from "ical.js";
 import { describe, expect, it } from "vitest";
 import { DavConnectError } from "../src/dav/errors";
 import type {
+  AlarmSpec,
   BuildAttendee,
   BuildEventInput,
   BuildParticipants,
@@ -35,8 +36,11 @@ import {
   UNBOUNDED_OCCURRENCES,
   VTIMEZONE_ALLOWLIST,
   WRITE_SCOPES,
+  alarmsOf,
+  applyEventChange,
   applyExdate,
   applyOccurrenceOverride,
+  buildAlarm,
   buildVEvent,
   collapseAttendees,
   countOccurrences,
@@ -54,6 +58,7 @@ import {
   serializeCalendarResource,
   serializeOccurrenceResource,
   splitSubscriptionFeed,
+  storedAlarmsOf,
   truncateSeries,
   utcToLocalTime,
   withParsedResource,
@@ -3223,5 +3228,545 @@ describe("splitSubscriptionFeed — a UID group with a master and a true overrid
     );
     expect(untouched?.summary).toBe("Feed review");
     expect(untouched?.isOverride).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Alarms: the vocabulary, and the one place every scope converges (CALM-01,
+// CALM-02, D-01, D-04)
+//
+// The alarm shape is deliberately narrow — whole minutes before start, one
+// action — and these cases pin BOTH halves of that: what it writes, and what it
+// refuses to pretend it understands. An alarm this server cannot express is
+// reported as unmodelled and left exactly where it was; it is never rounded,
+// re-anchored, or quietly dropped by an update that said nothing about alarms.
+// ---------------------------------------------------------------------------
+
+/** A one-off event carrying a reminder some OTHER client wrote. */
+const STORED_ALARM_ICS = [
+  "BEGIN:VCALENDAR",
+  "VERSION:2.0",
+  "PRODID:-//Example Org//Another Client//EN",
+  "CALSCALE:GREGORIAN",
+  "BEGIN:VTIMEZONE",
+  `TZID:${DEFINED_TZID}`,
+  "BEGIN:STANDARD",
+  "TZOFFSETFROM:-0500",
+  "TZOFFSETTO:-0600",
+  "TZNAME:CST",
+  "DTSTART:19701101T020000",
+  "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+  "END:STANDARD",
+  "END:VTIMEZONE",
+  "BEGIN:VEVENT",
+  "UID:stored-alarm-0001@example.invalid",
+  "DTSTAMP:20260901T120000Z",
+  "SUMMARY:Coffee with Dev",
+  `DTSTART;TZID=${DEFINED_TZID}:20260903T140000`,
+  `DTEND;TZID=${DEFINED_TZID}:20260903T150000`,
+  "SEQUENCE:4",
+  "BEGIN:VALARM",
+  "ACTION:DISPLAY",
+  "DESCRIPTION:Leave now",
+  "TRIGGER:-PT30M",
+  "X-APPLE-DEFAULT-ALARM:TRUE",
+  "ACKNOWLEDGED:20260903T133000Z",
+  "END:VALARM",
+  "END:VEVENT",
+  "END:VCALENDAR",
+  "",
+].join("\r\n");
+
+/** The same event, whose ONE alarm this server cannot express at all. */
+const UNMODELLED_ALARM_ICS = STORED_ALARM_ICS.replace(
+  "TRIGGER:-PT30M",
+  "TRIGGER;RELATED=END:-PT30M",
+);
+
+/** Every `VALARM` of one component, serialised, in document order. */
+function alarmBlocksOf(
+  component: InstanceType<typeof ICAL.Component>,
+): string[] {
+  return component.getAllSubcomponents("valarm").map((one) => one.toString());
+}
+
+/** The one `VEVENT` a patched one-off resource comes back as. */
+function patchedOneOff(
+  icsText: string,
+  change: Partial<OverrideChange>,
+): InstanceType<typeof ICAL.Component> {
+  const components = withParsedResource(icsText, (resource) =>
+    applyEventChange(resource, {
+      summary: "Coffee with Dev",
+      startLocal: "2026-09-03T14:00:00",
+      endLocal: "2026-09-03T15:00:00",
+      tzid: DEFINED_TZID,
+      allDay: false,
+      location: null,
+      description: null,
+      ...change,
+    }),
+  );
+  expect(components, "the patch refused the resource").not.toBeNull();
+  return components![0]!;
+}
+
+/** One `VEVENT` parsed straight out of literal lines, alarms and all. */
+function parsedVevent(block: string): InstanceType<typeof ICAL.Component> {
+  return new ICAL.Component(ICAL.parse(block));
+}
+
+describe("buildAlarm writes the three properties RFC 5545 requires, and a UID", () => {
+  it("serialises to the measured bytes, and nothing else", () => {
+    // A STRING comparison rather than a property walk, on the byte-identity
+    // rule the override cases above already use: a walk passes on a property it
+    // does not enumerate, and the property most likely to be wrong is the one
+    // nobody thought to enumerate. `UID` is replaced because it is minted.
+    const built = buildAlarm({ minutesBefore: 15, action: "display" })
+      .toString()
+      .replace(/^UID:[^\r\n]*/m, "UID:PLACEHOLDER");
+
+    expect(built).toBe(
+      [
+        "BEGIN:VALARM",
+        "ACTION:DISPLAY",
+        "DESCRIPTION:Reminder",
+        "UID:PLACEHOLDER",
+        "TRIGGER:-PT15M",
+        "END:VALARM",
+      ].join("\r\n"),
+    );
+  });
+
+  it("mints a UID, and a DIFFERENT one per alarm", () => {
+    // RFC 9074 sanctions a `UID` on a `VALARM`, ical.js emits it cleanly, and it
+    // costs nothing if unnecessary. Scoped to the ALARM rather than the event:
+    // two alarms on one event sharing an identifier would be the same defect two
+    // components sharing a `RECURRENCE-ID` is.
+    const first = buildAlarm({ minutesBefore: 15, action: "display" });
+    const second = buildAlarm({ minutesBefore: 15, action: "display" });
+
+    const one = first.getFirstPropertyValue("uid");
+    const two = second.getFirstPropertyValue("uid");
+    expect(typeof one).toBe("string");
+    expect(one).not.toBe(two);
+  });
+
+  it("invents no X- property of its own", () => {
+    // An `X-` property this server invents is one every future update has to
+    // preserve, and nothing has measured that iCloud wants it. Whether iCloud
+    // requires `X-WR-ALARMUID` is claimed only by secondary sources; plan 17-09's
+    // read-back answers it in the data, and until then this server writes none.
+    const built = buildAlarm({ minutesBefore: 15, action: "display" });
+
+    expect(
+      built.getAllProperties().map((one) => one.name),
+    ).toStrictEqual(["action", "description", "uid", "trigger"]);
+  });
+
+  it("emits NO RELATED parameter, because the default is its absence", () => {
+    // RFC 5545 §3.8.6.3's default is `RELATED=START`, expressed by the
+    // parameter's absence. Emitting it would be a claim the request never made —
+    // `addParticipants`' own argument for not substituting a default `ROLE`.
+    const trigger = buildAlarm({
+      minutesBefore: 15,
+      action: "display",
+    }).getFirstProperty("trigger");
+
+    expect(trigger!.getParameter("related")).toBeUndefined();
+    expect(trigger!.toICALString()).toBe("TRIGGER:-PT15M");
+  });
+});
+
+describe("alarmsOf reads a trigger by SECONDS, never by .minutes", () => {
+  it("reads -PT15M as fifteen minutes before", () => {
+    const reading = alarmsOf(
+      parsedVevent(
+        [
+          "BEGIN:VEVENT",
+          "UID:x@example.invalid",
+          "BEGIN:VALARM",
+          "ACTION:DISPLAY",
+          "DESCRIPTION:Reminder",
+          "TRIGGER:-PT15M",
+          "END:VALARM",
+          "END:VEVENT",
+        ].join("\r\n"),
+      ),
+    );
+
+    expect(reading).toStrictEqual({
+      modelled: [{ minutesBefore: 15, action: "display" }],
+      unmodelled: 0,
+    });
+  });
+
+  it("reads -PT1H as SIXTY minutes, which is the whole point of this case", () => {
+    // `.minutes` on a parsed `-PT1H` is ZERO — the library folds nothing into
+    // that field — so a reader keyed on it reports "at the time of the event"
+    // for an alarm the user set an hour early, and nothing anywhere raises. This
+    // is the same shape of bug the `RFC822.SIZE`-versus-`RFC822` distinction in
+    // `.claude/CLAUDE.md` §5 exists to prevent: a field that looks right and is
+    // wrong. `toSeconds()` folds weeks, days, hours, minutes and seconds into one
+    // number and is the only safe read.
+    const reading = alarmsOf(
+      parsedVevent(
+        [
+          "BEGIN:VEVENT",
+          "UID:x@example.invalid",
+          "BEGIN:VALARM",
+          "ACTION:DISPLAY",
+          "DESCRIPTION:Reminder",
+          "TRIGGER:-PT1H",
+          "END:VALARM",
+          "END:VEVENT",
+        ].join("\r\n"),
+      ),
+    );
+
+    expect(reading.modelled).toStrictEqual([
+      { minutesBefore: 60, action: "display" },
+    ]);
+  });
+
+  it.each([
+    ["an absolute DATE-TIME trigger", "TRIGGER;VALUE=DATE-TIME:20260903T133000Z"],
+    ["a trigger anchored to the END", "TRIGGER;RELATED=END:-PT30M"],
+    ["a trigger AFTER the start", "TRIGGER:PT15M"],
+    ["a duration with a seconds remainder", "TRIGGER:-PT90S"],
+  ])("reports %s as unmodelled, and reports no number for it", (_label, line) => {
+    // REFUSE rather than round. An alarm this server cannot express as whole
+    // minutes before start is counted and not coerced — a rounded value would be
+    // a claim about the user's reminder that the user never made, and a silently
+    // dropped one would be worse.
+    const reading = alarmsOf(
+      parsedVevent(
+        [
+          "BEGIN:VEVENT",
+          "UID:x@example.invalid",
+          "BEGIN:VALARM",
+          "ACTION:DISPLAY",
+          "DESCRIPTION:Reminder",
+          line,
+          "END:VALARM",
+          "END:VEVENT",
+        ].join("\r\n"),
+      ),
+    );
+
+    expect(reading.modelled).toStrictEqual([]);
+    expect(reading.unmodelled).toBe(1);
+  });
+
+  it("reports an action this server does not write as unmodelled", () => {
+    // D-01: one action value this phase, spelled as a literal union so a second
+    // one is a type change rather than a string that compiles. An `AUDIO` alarm
+    // is a real alarm this server cannot express, which is exactly what the
+    // unmodelled count is for.
+    const reading = alarmsOf(
+      parsedVevent(
+        [
+          "BEGIN:VEVENT",
+          "UID:x@example.invalid",
+          "BEGIN:VALARM",
+          "ACTION:AUDIO",
+          "TRIGGER:-PT15M",
+          "END:VALARM",
+          "END:VEVENT",
+        ].join("\r\n"),
+      ),
+    );
+
+    expect(reading).toStrictEqual({ modelled: [], unmodelled: 1 });
+  });
+
+  it("counts the modelled and the unmodelled side by side", () => {
+    const reading = alarmsOf(
+      parsedVevent(
+        [
+          "BEGIN:VEVENT",
+          "UID:x@example.invalid",
+          "BEGIN:VALARM",
+          "ACTION:DISPLAY",
+          "DESCRIPTION:Reminder",
+          "TRIGGER:-PT15M",
+          "END:VALARM",
+          "BEGIN:VALARM",
+          "ACTION:DISPLAY",
+          "DESCRIPTION:Reminder",
+          "TRIGGER;RELATED=END:-PT5M",
+          "END:VALARM",
+          "END:VEVENT",
+        ].join("\r\n"),
+      ),
+    );
+
+    expect(reading).toStrictEqual({
+      modelled: [{ minutesBefore: 15, action: "display" }],
+      unmodelled: 1,
+    });
+  });
+
+  it("answers empty for a component carrying no alarm at all", () => {
+    expect(
+      alarmsOf(
+        parsedVevent(
+          ["BEGIN:VEVENT", "UID:x@example.invalid", "END:VEVENT"].join("\r\n"),
+        ),
+      ),
+    ).toStrictEqual({ modelled: [], unmodelled: 0 });
+  });
+});
+
+describe("an absent alarms key leaves every stored alarm alone (D-04)", () => {
+  it("leaves the stored VALARM byte-identical, X- property and all", () => {
+    // D-04's whole point: absent means leave alone. The stored alarm here
+    // carries two properties this server does not model, and both survive —
+    // which is the promise CALM-03 makes for every other property, made for
+    // alarms specifically.
+    const before = withParsedResource(STORED_ALARM_ICS, (resource) =>
+      alarmBlocksOf(resource.components[0]!),
+    );
+
+    expect(alarmBlocksOf(patchedOneOff(STORED_ALARM_ICS, {}))).toStrictEqual(
+      before,
+    );
+  });
+
+  it("leaves an UNMODELLED alarm byte-identical too", () => {
+    // The case that costs nothing under a patch and cost everything under the
+    // rebuild: this server cannot express a `RELATED=END` trigger, and an update
+    // that says nothing about alarms must not be the thing that discovers that.
+    const before = withParsedResource(UNMODELLED_ALARM_ICS, (resource) =>
+      alarmBlocksOf(resource.components[0]!),
+    );
+
+    expect(alarmBlocksOf(patchedOneOff(UNMODELLED_ALARM_ICS, {}))).toStrictEqual(
+      before,
+    );
+    expect(before[0]).toContain("RELATED=END");
+  });
+});
+
+describe("an EXPLICIT empty array removes every alarm and nothing else (D-04)", () => {
+  it("removes every VALARM", () => {
+    expect(
+      alarmBlocksOf(patchedOneOff(STORED_ALARM_ICS, { alarms: [] })),
+    ).toStrictEqual([]);
+  });
+
+  it("leaves every VTIMEZONE and every other calendar-level byte standing", () => {
+    // `removeAllSubcomponents()` with NO argument takes every subcomponent,
+    // `VTIMEZONE` blocks included, and the resource still serialises — so the
+    // failure is a resource whose times mean something else, with nothing red.
+    const written = withParsedResource(STORED_ALARM_ICS, (resource) => {
+      const components = applyEventChange(resource, {
+        summary: "Coffee with Dev",
+        startLocal: "2026-09-03T14:00:00",
+        endLocal: "2026-09-03T15:00:00",
+        tzid: DEFINED_TZID,
+        allDay: false,
+        location: null,
+        description: null,
+        alarms: [],
+      });
+      return serializeOccurrenceResource(resource, components!, DEFINED_TZID);
+    });
+
+    expect(written).not.toContain("BEGIN:VALARM");
+    expect(written.match(/BEGIN:VTIMEZONE/g)).toStrictEqual(["BEGIN:VTIMEZONE"]);
+    expect(written).toContain(`TZID:${DEFINED_TZID}`);
+    expect(written).toContain("PRODID:-//Example Org//Another Client//EN");
+  });
+});
+
+describe("a supplied list replaces the WHOLE list, never one entry of it (D-01)", () => {
+  it("leaves exactly the supplied alarms, and they are the supplied ones", () => {
+    // Whole-list replacement is the same rule Phase 16 settled for emails and
+    // phones, and for the same reason: per-entry editing by index or by value is
+    // where fidelity gets lost.
+    const two = STORED_ALARM_ICS.replace(
+      "END:VEVENT",
+      [
+        "BEGIN:VALARM",
+        "ACTION:DISPLAY",
+        "DESCRIPTION:Second",
+        "TRIGGER:-PT5M",
+        "END:VALARM",
+        "END:VEVENT",
+      ].join("\r\n"),
+    );
+
+    const blocks = alarmBlocksOf(
+      patchedOneOff(two, {
+        alarms: [{ minutesBefore: 45, action: "display" }],
+      }),
+    );
+
+    expect(blocks.length).toBe(1);
+    expect(blocks[0]).toContain("TRIGGER:-PT45M");
+    expect(blocks[0]).not.toContain("Leave now");
+    expect(blocks[0]).not.toContain("Second");
+  });
+
+  it("writes one VALARM per entry, in the supplied order", () => {
+    const blocks = alarmBlocksOf(
+      patchedOneOff(STORED_ALARM_ICS, {
+        alarms: [
+          { minutesBefore: 60, action: "display" },
+          { minutesBefore: 10, action: "display" },
+        ],
+      }),
+    );
+
+    expect(blocks.length).toBe(2);
+    expect(blocks[0]).toContain("TRIGGER:-PT60M");
+    expect(blocks[1]).toContain("TRIGGER:-PT10M");
+  });
+});
+
+describe("every update scope applies alarms identically (CALM-02)", () => {
+  // One conditional block in `applyOverrideChange` is what makes this true:
+  // `applyEventChange` and both arms of `applyOccurrenceOverride` converge on
+  // it, so there is no per-scope alarm code that could disagree.
+  const supplied: AlarmSpec[] = [{ minutesBefore: 25, action: "display" }];
+
+  /** The triggers one scope's write leaves on its target component. */
+  function triggersFor(scope: "scopeless" | "occurrence" | "this-and-future") {
+    if (scope === "scopeless") {
+      return alarmBlocksOf(patchedOneOff(STORED_ALARM_ICS, { alarms: supplied }));
+    }
+    const components = withParsedResource(PLAIN_WEEKLY_SERIES_ICS, (resource) =>
+      applyOccurrenceOverride(
+        resource,
+        PLAIN_SERIES_MOVED_RECURRENCE_ID,
+        { ...movedChange(), alarms: supplied },
+        scope === "this-and-future" ? "this-and-future" : "this-only",
+      ),
+    );
+    expect(components, "the builder refused the slot").not.toBeNull();
+    return alarmBlocksOf(overrideIn(components!));
+  }
+
+  it.each(["scopeless", "occurrence", "this-and-future"] as const)(
+    "writes the same one alarm on %s",
+    (scope) => {
+      const blocks = triggersFor(scope);
+      expect(blocks.length).toBe(1);
+      expect(blocks[0]).toContain("TRIGGER:-PT25M");
+      expect(blocks[0]).toContain("ACTION:DISPLAY");
+    },
+  );
+
+  it.each(["occurrence", "this-and-future"] as const)(
+    "leaves the master's own alarm untouched on %s",
+    (scope) => {
+      const components = withParsedResource(PLAIN_WEEKLY_SERIES_ICS, (resource) =>
+        applyOccurrenceOverride(
+          resource,
+          PLAIN_SERIES_MOVED_RECURRENCE_ID,
+          { ...movedChange(), alarms: supplied },
+          scope === "this-and-future" ? "this-and-future" : "this-only",
+        ),
+      );
+      const master = components!.find((one) => recurrenceIdOf(one) === null);
+      expect(alarmBlocksOf(master!).join("")).toContain("TRIGGER:-PT10M");
+    },
+  );
+
+  it.each(["occurrence", "this-and-future"] as const)(
+    "removes the INHERITED alarm on %s when the list is explicitly empty",
+    (scope) => {
+      // A new override starts as a copy of the master, so it inherits the
+      // master's `VALARM`. An explicit empty list must reach the override rather
+      // than the master: the user asked for this date to have no reminder, not
+      // for the series to lose one.
+      const components = withParsedResource(PLAIN_WEEKLY_SERIES_ICS, (resource) =>
+        applyOccurrenceOverride(
+          resource,
+          PLAIN_SERIES_MOVED_RECURRENCE_ID,
+          { ...movedChange(), alarms: [] },
+          scope === "this-and-future" ? "this-and-future" : "this-only",
+        ),
+      );
+      expect(alarmBlocksOf(overrideIn(components!))).toStrictEqual([]);
+      const master = components!.find((one) => recurrenceIdOf(one) === null);
+      expect(alarmBlocksOf(master!).join("")).toContain("TRIGGER:-PT10M");
+    },
+  );
+});
+
+describe("buildVEvent carries an alarm into a created event (CALM-01)", () => {
+  it("writes a VALARM for each supplied entry, after the participants", () => {
+    const vevent = buildVEvent(
+      buildInput({ alarms: [{ minutesBefore: 15, action: "display" }] }),
+    );
+
+    expect(alarmBlocksOf(vevent).length).toBe(1);
+    expect(alarmBlocksOf(vevent)[0]).toContain("TRIGGER:-PT15M");
+  });
+
+  it("writes NO VALARM when the field is absent", () => {
+    expect(alarmBlocksOf(buildVEvent(buildInput()))).toStrictEqual([]);
+  });
+
+  it("writes NO VALARM when the list is empty", () => {
+    // Nothing to remove on a resource that does not exist yet, so an empty list
+    // and an absent one produce the same bytes on a CREATE — which is the one
+    // place the two legitimately agree.
+    expect(alarmBlocksOf(buildVEvent(buildInput({ alarms: [] })))).toStrictEqual(
+      [],
+    );
+  });
+
+  it("serialises the alarm inside the VEVENT and after the times", () => {
+    const written = build({
+      alarms: [{ minutesBefore: 15, action: "display" }],
+    });
+
+    expect(written.indexOf("BEGIN:VALARM")).toBeGreaterThan(
+      written.indexOf("DTEND"),
+    );
+    expect(written.indexOf("END:VALARM")).toBeLessThan(
+      written.indexOf("END:VEVENT"),
+    );
+  });
+});
+
+describe("storedAlarmsOf reads the component a patch would target", () => {
+  it("reads the one component of a one-off resource", () => {
+    expect(storedAlarmsOf(STORED_ALARM_ICS, null)).toStrictEqual({
+      modelled: [{ minutesBefore: 30, action: "display" }],
+      unmodelled: 0,
+    });
+  });
+
+  it("reads the MASTER when the named date has no override of its own", () => {
+    // An occurrence-scoped write clones the master and applies the change to the
+    // clone, so the alarms the write starts from are the master's.
+    expect(
+      storedAlarmsOf(PLAIN_WEEKLY_SERIES_ICS, PLAIN_SERIES_MOVED_RECURRENCE_ID),
+    ).toStrictEqual({
+      modelled: [{ minutesBefore: 10, action: "display" }],
+      unmodelled: 0,
+    });
+  });
+
+  it("reads the EXISTING override when the named date already has one", () => {
+    const withOverride = PLAIN_WEEKLY_SERIES_MOVED_ICS.replace(
+      "TRIGGER:-PT10M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR",
+      "TRIGGER:-PT20M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR",
+    );
+
+    expect(
+      storedAlarmsOf(withOverride, PLAIN_SERIES_MOVED_RECURRENCE_ID).modelled,
+    ).toStrictEqual([{ minutesBefore: 20, action: "display" }]);
+  });
+
+  it("answers empty rather than throwing for bytes it cannot read", () => {
+    expect(storedAlarmsOf(MALFORMED_ICS, null)).toStrictEqual({
+      modelled: [],
+      unmodelled: 0,
+    });
   });
 });

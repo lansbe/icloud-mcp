@@ -2213,6 +2213,47 @@ describe("getEvent", () => {
     expect(Object.keys(detail)).not.toContain("sortInstant");
   });
 
+  it("leaves EventDetail's key set exactly as it was (D-01)", async () => {
+    // Phase 17 gave the WRITE path an alarm vocabulary and deliberately did not
+    // give the READ path one. `EventDetail` is a published response shape, and
+    // Phase 16 settled the split it rests on: the read-side projection does not
+    // grow for the write path's benefit. Whether a read tool should report
+    // alarms is a separate decision, and plan 17-08 did not take it — so this
+    // pins the key set rather than leaving "no `alarms` key" to be inferred from
+    // an absence nothing asserts.
+    const id = await idFromListing((one) => one.summary.length > 0, {
+      calendarId: HOME_ID,
+    });
+
+    const detail = await getEvent(env, principal, createDavFetch(owner), decodeEventId(id));
+
+    expect(Object.keys(detail).sort()).toStrictEqual([
+      "allDay",
+      "attendeeCount",
+      "attendees",
+      "cacheHit",
+      "calendarId",
+      "description",
+      "endLocal",
+      "endTzid",
+      "id",
+      "isOverride",
+      "isRecurring",
+      "location",
+      "organizer",
+      "recurrenceId",
+      "startLocal",
+      "startTzid",
+      "summary",
+      "timezoneUnresolved",
+    ]);
+    // Said again by name, because the list above is long enough to skim and the
+    // one key that must never appear in it is the whole reason for the case.
+    // `startUtc` and `endUtc` are the two OPTIONAL keys this row does not carry;
+    // their presence and absence are pinned by the two cases above.
+    expect(Object.keys(detail)).not.toContain("alarms");
+  });
+
   it("keeps an all-day event's dates with NO instant field at all", async () => {
     const id = await idFromListing((one) => one.allDay, {
       calendarId: HOME_ID,
