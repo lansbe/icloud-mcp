@@ -16,7 +16,7 @@
 // Apple ID (D-13: live Apple testing is owner-only).
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { ImapNotFoundError } from "../src/errors";
+import { ImapNotFoundError, ImapThrottleError } from "../src/errors";
 import { encodeMessageId } from "../src/mail/ids";
 import type { MessageRef } from "../src/mail/ids";
 import { createSessionGate } from "../src/mail/service";
@@ -506,5 +506,43 @@ describe("the mutating path refuses and reports honestly", () => {
     expect(/\bRFC822(?!\.SIZE)\b/.test(code)).toBe(false);
     // Stronger than the two above: no body item at all, peeking or not.
     expect(/\bBODY(?:\.PEEK)?\[/.test(code)).toBe(false);
+  });
+});
+
+describe("one mark-read per request (D-08, MUTA-05)", () => {
+  it("refuses a second mark-read on the same gate, and writes nothing for it", async () => {
+    // Two verb calls in one request share one gate. The verb reaches the
+    // gate's acquire with no await ahead of it, so the first call already
+    // holds it when the second is made. This is the run-time half that stands
+    // in for listing the verbs in the scan's fan-out rule.
+    const gate = createSessionGate();
+    const firstDuplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      flagEcho("a5", 17, UID, "\\Seen"),
+      logoutExchange("a6"),
+    ]);
+    const secondDuplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      flagEcho("a5", 17, UID, "\\Seen"),
+      logoutExchange("a6"),
+    ]);
+
+    const first = markReadOver(firstDuplex, principal, gate, REF, FAST_BOUNDS);
+    const second = markReadOver(secondDuplex, principal, gate, REF, FAST_BOUNDS);
+
+    await expect(second).rejects.toBeInstanceOf(ImapThrottleError);
+    // Only a count: the login line carries the pool's credential.
+    expect(secondDuplex.writtenLines().length).toBe(0);
+    expect(wroteFlagChange(secondDuplex)).toBe(false);
+
+    await expect(first).resolves.toEqual({
+      applied: true,
+      seen: true,
+      source: "store-echo",
+    });
+    expect(wroteFlagChange(firstDuplex)).toBe(true);
+    expect(gate.held).toBe(false);
   });
 });

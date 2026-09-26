@@ -45,8 +45,10 @@ import {
   listFoldersOver,
   listMessagesOver,
   listUnreadOver,
+  MAILBOX_NOT_WRITABLE,
   searchMessagesOver,
   withMailSessionOver,
+  withMutatingMailboxOver,
 } from "../src/mail/service";
 import * as service from "../src/mail/service";
 import {
@@ -54,6 +56,7 @@ import {
   AUTH_REJECTED_TEXT,
   CONNECTION_LIMIT_TEXT,
   GREETING,
+  INBOX_UIDVALIDITY,
   MUTF7_DISPLAY_NAME,
   MUTF7_WIRE_NAME,
   POST_AUTH_CAPABILITY,
@@ -61,6 +64,7 @@ import {
   base64Bytes,
   capabilityResponse,
   logoutExchange,
+  selectResponse,
   taggedBad,
   taggedNo,
   taggedOk,
@@ -1334,6 +1338,44 @@ describe("nothing awaits ahead of the gate", () => {
     );
   });
 
+  // The mutating pair (20-03) holds the same property the read pair does, over
+  // the same core. A legacy batch holding one read call and one mark-read call
+  // shares one gate, so an await in either mutating wrapper ahead of the
+  // acquire would let both through.
+  it("withMutatingMailbox holds no await ahead of the call that opens the socket", () => {
+    const span = spanAheadOf(source, "withMutatingMailbox", "connectImap(");
+
+    expect(span).not.toBeNull();
+    expect(span).toContain("gate.held");
+    expect(span).toContain("principal: Principal");
+    expect(span).toContain("fn: (session: MutatingMailSession)");
+    expect(awaitsAheadOf(source, "withMutatingMailbox", "connectImap(")).toBe(false);
+  });
+
+  it("withMutatingMailboxOver holds no await ahead of its call into the core", () => {
+    // The call carries a type argument, so the marker is the return that
+    // makes it rather than the name followed by a parenthesis.
+    const marker = "return withMailSessionCore";
+    const span = spanAheadOf(source, "withMutatingMailboxOver", marker);
+
+    expect(span).not.toBeNull();
+    expect(span).toContain("duplex: DuplexLike");
+    expect(span).toContain("fn: (session: MutatingMailSession)");
+    expect(awaitsAheadOf(source, "withMutatingMailboxOver", marker)).toBe(false);
+  });
+
+  it("does not mistake the longer mutating name for the shorter one", () => {
+    // `withMutatingMailbox` is a prefix of `withMutatingMailboxOver`, and the
+    // Over variant sits EARLIER in the file. A finder that matched it would
+    // start there and see its duplex parameter.
+    const found = source.search(/\bfunction\s+withMutatingMailbox\b/);
+    expect(found).toBe(source.indexOf("function withMutatingMailbox<"));
+    expect(found).not.toBe(source.indexOf("function withMutatingMailboxOver<"));
+    expect(spanAheadOf(source, "withMutatingMailbox", "connectImap(")).not.toContain(
+      "duplex: DuplexLike",
+    );
+  });
+
   describe("the matcher can see an await (the control)", () => {
     const madeUp = [
       "export async function madeUp(principal, gate) {",
@@ -1398,9 +1440,9 @@ function signatureOf(source: string, functionName: string): string | null {
 describe("the read orchestrators keep their shape (MUTA-01)", () => {
   const source = Object.values(SERVICE_SOURCE)[0] ?? "";
 
-  it("exports exactly the two read orchestrators, and not the private core", () => {
-    // Plan 20-03 widens this to four, when the mutating pair arrives. The core
-    // stays off the list: exported, it would be a raw escape hatch past both.
+  it("exports exactly the four orchestrators, and not the private core", () => {
+    // Two read and two mutating (20-03). The core stays off the list:
+    // exported, it would be a raw escape hatch past all four.
     const orchestrators = Object.keys(service)
       .filter((name) => name.startsWith("with"))
       .sort();
@@ -1432,11 +1474,62 @@ describe("the read orchestrators keep their shape (MUTA-01)", () => {
     expect(source.slice(coreStart, coreEnd)).not.toContain("EXAMINE");
   });
 
-  it("never spells the mutating open command, comments included", () => {
+  it("spells the mutating open command once, at its own site, comments included", () => {
     // The full source, NOT the comment-stripped one: CLAUDE.md §2 and §5 ask
-    // that this command be described by role. Plan 20-03 changes the expected
-    // count to one, at the mutating orchestrator's own open.
+    // that this command be described by role. The one spelling is the
+    // mutating orchestrator's own open (20-03).
     expect(source.match(/\bSELECT\b/g) ?? []).toHaveLength(1);
+  });
+
+  it("writes the mutating open inside withMutatingMailboxOver's own body, and neither open in the other's", () => {
+    const mutating = "`SELECT ${quoted}`";
+    const readOnly = "`EXAMINE ${quoted}`";
+    const bodyOf = (name: string): string => {
+      const start = source.search(new RegExp(`\\bfunction\\s+${name}\\b`));
+      const end = source.indexOf("\n}\n", start);
+      expect(start, `${name} not found`).toBeGreaterThan(-1);
+      expect(end).toBeGreaterThan(start);
+      return source.slice(start, end);
+    };
+
+    expect(source.split(mutating)).toHaveLength(2);
+    expect(bodyOf("withMutatingMailboxOver")).toContain(mutating);
+    expect(bodyOf("withMutatingMailboxOver")).not.toContain("EXAMINE");
+    expect(bodyOf("withMailSessionOver")).toContain(readOnly);
+    expect(bodyOf("withMailSessionOver")).not.toContain("SELECT");
+    // The socket wrapper opens nothing itself; it delegates.
+    expect(bodyOf("withMutatingMailbox")).not.toContain("SELECT");
+  });
+
+  it("names the mutating orchestrator in code exactly three times: two definitions and one delegation", () => {
+    // Comments stripped, so prose that describes the pair does not count. A
+    // fourth occurrence is a call from somewhere in this module, and every
+    // other function in it is a read path. The one legitimate caller outside
+    // this module is src/mail/triage.ts, which the scan's importer count holds.
+    const code = withoutComments(source);
+    const occurrences = [...code.matchAll(/\bwithMutatingMailbox\w*/g)].map((m) => m[0]);
+    expect(occurrences).toEqual([
+      "withMutatingMailboxOver",
+      "withMutatingMailbox",
+      "withMutatingMailboxOver",
+    ]);
+    // And the delegation sits inside the socket wrapper, not in a read path.
+    const wrapperStart = code.search(/\bfunction\s+withMutatingMailbox\b/);
+    const wrapperEnd = code.indexOf("\n}\n", wrapperStart);
+    const delegation = code.lastIndexOf("withMutatingMailboxOver(");
+    expect(delegation).toBeGreaterThan(wrapperStart);
+    expect(delegation).toBeLessThan(wrapperEnd);
+  });
+
+  it("pins both mutating orchestrators' signatures", () => {
+    // No mode argument, and the mailbox and validity are required. Changing
+    // either string is a decision on the safety boundary, not a refactor.
+    expect(signatureOf(source, "withMutatingMailboxOver")).toBe(
+      "function withMutatingMailboxOver<T>( duplex: DuplexLike, principal: Principal, gate: SessionGate, mailbox: string, expectedUidValidity: number, fn: (session: MutatingMailSession) => Promise<T>, options: MailSessionOptions = {}, ): Promise<T | typeof MAILBOX_NOT_WRITABLE>",
+    );
+    expect(signatureOf(source, "withMutatingMailbox")).toBe(
+      "function withMutatingMailbox<T>( principal: Principal, gate: SessionGate, mailbox: string, expectedUidValidity: number, fn: (session: MutatingMailSession) => Promise<T>, options: MailSessionOptions = {}, ): Promise<T | typeof MAILBOX_NOT_WRITABLE>",
+    );
   });
 
   it("pins both read orchestrators' signatures", () => {
@@ -1603,6 +1696,207 @@ describe("the session gate is request-scoped (D-46)", () => {
     );
 
     expect(gate.held).toBe(false);
+  });
+
+  // D-08. One gate covers both kinds of session. A legacy batch carrying one
+  // read call and one mark-read call shares one gate, and each session is a
+  // socket whichever kind it is.
+
+  /** A mutating conversation that ends in a writable open, then logs out. */
+  const writableDuplex = (): FakeDuplex =>
+    createFakeDuplex([
+      GREETING,
+      capabilityResponse("a1", PRE_AUTH_CAPABILITY),
+      taggedOk("a2", "LOGIN completed"),
+      capabilityResponse("a3", POST_AUTH_CAPABILITY),
+      selectResponse("a4", "[READ-WRITE]"),
+      logoutExchange("a5"),
+    ]);
+
+  /** The same, with the open answered read-only. */
+  const readOnlyOpenDuplex = (): FakeDuplex =>
+    createFakeDuplex([
+      GREETING,
+      capabilityResponse("a1", PRE_AUTH_CAPABILITY),
+      taggedOk("a2", "LOGIN completed"),
+      capabilityResponse("a3", POST_AUTH_CAPABILITY),
+      selectResponse("a4", "[READ-ONLY]"),
+      logoutExchange("a5"),
+    ]);
+
+  // Only a COUNT is asserted, never the lines: the login line carries the
+  // pool's ambient credential, and a failed comparison would print it.
+  const loginCount = (duplex: FakeDuplex): number =>
+    duplex.writtenLines().filter((line) => /^\S+ LOGIN /.test(line)).length;
+
+  it("refuses a mutating session while a read session holds the gate", async () => {
+    const gate = createSessionGate();
+    let releaseFirst: () => void = () => {};
+    const firstIsHolding = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    const readDuplex = happyPathDuplex();
+    const first = withMailSessionOver(
+      readDuplex,
+      principal,
+      gate,
+      MAILBOX,
+      null,
+      async () => {
+        await firstIsHolding;
+        return "read";
+      },
+      FAST_BOUNDS,
+    );
+
+    const refused = writableDuplex();
+    await expect(
+      withMutatingMailboxOver(
+        refused,
+        principal,
+        gate,
+        MAILBOX,
+        INBOX_UIDVALIDITY,
+        async () => "mutating",
+        FAST_BOUNDS,
+      ),
+    ).rejects.toBeInstanceOf(ImapThrottleError);
+    expect(refused.writtenLines().length).toBe(0);
+
+    releaseFirst();
+    await expect(first).resolves.toBe("read");
+    expect(loginCount(readDuplex)).toBe(1);
+    expect(loginCount(refused)).toBe(0);
+  });
+
+  it("refuses a read session while a mutating session holds the gate", async () => {
+    const gate = createSessionGate();
+    let releaseFirst: () => void = () => {};
+    const firstIsHolding = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    const mutatingDuplex = writableDuplex();
+    const first = withMutatingMailboxOver(
+      mutatingDuplex,
+      principal,
+      gate,
+      MAILBOX,
+      INBOX_UIDVALIDITY,
+      async () => {
+        await firstIsHolding;
+        return "mutating";
+      },
+      FAST_BOUNDS,
+    );
+
+    const refused = happyPathDuplex();
+    await expect(
+      withMailSessionOver(
+        refused,
+        principal,
+        gate,
+        MAILBOX,
+        null,
+        async () => "read",
+        FAST_BOUNDS,
+      ),
+    ).rejects.toBeInstanceOf(ImapThrottleError);
+    expect(refused.writtenLines().length).toBe(0);
+
+    releaseFirst();
+    await expect(first).resolves.toBe("mutating");
+    expect(loginCount(mutatingDuplex)).toBe(1);
+    expect(loginCount(refused)).toBe(0);
+  });
+
+  it("lets a read and a mutating session run side by side on TWO gates", async () => {
+    // Two requests, one of each kind, are not a fan-out.
+    const read = withMailSessionOver(
+      happyPathDuplex(),
+      principal,
+      createSessionGate(),
+      MAILBOX,
+      null,
+      async () => "read",
+      FAST_BOUNDS,
+    );
+    const mutating = withMutatingMailboxOver(
+      writableDuplex(),
+      principal,
+      createSessionGate(),
+      MAILBOX,
+      INBOX_UIDVALIDITY,
+      async () => "mutating",
+      FAST_BOUNDS,
+    );
+
+    await expect(Promise.all([read, mutating])).resolves.toEqual([
+      "read",
+      "mutating",
+    ]);
+  });
+
+  it("is free again after a mutating session's work throws", async () => {
+    const gate = createSessionGate();
+
+    await expect(
+      withMutatingMailboxOver(
+        writableDuplex(),
+        principal,
+        gate,
+        MAILBOX,
+        INBOX_UIDVALIDITY,
+        async () => {
+          throw new Error("the change failed");
+        },
+        FAST_BOUNDS,
+      ),
+    ).rejects.toThrow("the change failed");
+
+    expect(gate.held).toBe(false);
+    // Usable again, by the other kind.
+    await expect(
+      withMailSessionOver(
+        happyPathDuplex(),
+        principal,
+        gate,
+        MAILBOX,
+        null,
+        async () => "reused",
+        FAST_BOUNDS,
+      ),
+    ).resolves.toBe("reused");
+  });
+
+  it("is free again after the mutating open is refused as not writable", async () => {
+    const gate = createSessionGate();
+
+    await expect(
+      withMutatingMailboxOver(
+        readOnlyOpenDuplex(),
+        principal,
+        gate,
+        MAILBOX,
+        INBOX_UIDVALIDITY,
+        async () => "unreachable",
+        FAST_BOUNDS,
+      ),
+    ).resolves.toBe(MAILBOX_NOT_WRITABLE);
+
+    expect(gate.held).toBe(false);
+    await expect(
+      withMutatingMailboxOver(
+        writableDuplex(),
+        principal,
+        gate,
+        MAILBOX,
+        INBOX_UIDVALIDITY,
+        async () => "reused",
+        FAST_BOUNDS,
+      ),
+    ).resolves.toBe("reused");
   });
 });
 
