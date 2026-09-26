@@ -57,6 +57,7 @@ import {
   createEvent,
   deleteEvent,
   findFreeSlots,
+  findWindowConflicts,
   getEvent,
   getEventWithEtag,
   listCalendars,
@@ -65,10 +66,13 @@ import {
   matchesKeyword,
   nextCivilDate,
   observedOutcomes,
+  occurrenceWindowsOf,
+  organizerAddressFrom,
   patchEventBody,
   pinnedOccurrencesFor,
   planCreateTarget,
   readCollectionState,
+  resolveCalendarUserAddresses,
   resolveOrganizerAddress,
   searchEvents,
   uidFromObjectUrl,
@@ -88,6 +92,7 @@ import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
 import {
   DavConnectError,
   DavNotFoundError,
+  DavThrottleError,
   DavStaleResourceError,
   DavSubscriptionError,
 } from "../src/dav/errors";
@@ -115,6 +120,8 @@ import {
 import { createDavFetch } from "../src/dav/transport";
 import {
   ALL_DAY_RECURRING_ICS,
+  ATTENDEE_COPY_GENUINE_ICS,
+  ATTENDEE_COPY_SERIES_ICS,
   DEFINED_TZID,
   INVITED_EVENT_HAZARDS_ICS,
   INVITED_WEEKLY_SERIES_ICS,
@@ -3445,6 +3452,13 @@ describe("createEvent", () => {
 // resolved value ends up in.
 // ---------------------------------------------------------------------------
 
+// Phase 18 promoted the address set: the one PROPFIND moved into
+// `resolveCalendarUserAddresses`, and the selection moved verbatim into
+// `organizerAddressFrom`. The two blocks after this one pin each half on its
+// own. THIS block is the create path's regression pin for that promotion, and
+// its six cases are kept byte-identical to how they read before phase 18 on
+// purpose: if the promotion had changed which ORGANIZER an invited create
+// writes, one of them would have gone red without anybody editing it.
 describe("resolveOrganizerAddress", () => {
   it("costs exactly ONE request, a PROPFIND at the principal", async () => {
     await resolveOrganizerAddress(env, principal, createDavFetch(owner));
@@ -3529,6 +3543,125 @@ describe("resolveOrganizerAddress", () => {
     expect(resolved.startsWith("/")).toBe(false);
     expect(resolved.startsWith("urn:")).toBe(false);
     expect(resolved.startsWith("mailto:")).toBe(false);
+  });
+});
+
+describe("resolveCalendarUserAddresses", () => {
+  it("costs ONE PROPFIND at the principal and returns every href verbatim, in server order", async () => {
+    const addresses = await resolveCalendarUserAddresses(
+      env,
+      principal,
+      createDavFetch(owner),
+    );
+
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].method).toBe("PROPFIND");
+    expect(stub.observed[0].url).toBe(`${CALDAV_SERVER}${PRINCIPAL_PATH}`);
+    expect(String(stub.observed[0].body)).toContain("calendar-user-address-set");
+    // The whole set, the principal path and the urn form included, because
+    // answering an invitation matches against every one of them. Nothing is
+    // chosen, folded or reordered here.
+    expect(addresses).toStrictEqual(USER_ADDRESSES);
+    expect(addresses).toContain("/1234567890/principal/");
+    expect(addresses).toContain("urn:uuid:00000000");
+  });
+
+  it("keeps the server's order when the server changes it", async () => {
+    const reversed = [...USER_ADDRESSES].reverse();
+    restub({ userAddresses: reversed });
+
+    expect(
+      await resolveCalendarUserAddresses(env, principal, createDavFetch(owner)),
+    ).toStrictEqual(reversed);
+  });
+
+  it("answers an empty set as empty rather than refusing", async () => {
+    // The refusal for an empty set belongs to the create path's selection, not
+    // to the read: an invitation answer over an empty set is `not-invited`.
+    restub({ userAddresses: [] });
+
+    expect(
+      await resolveCalendarUserAddresses(env, principal, createDavFetch(owner)),
+    ).toStrictEqual([]);
+  });
+
+  it("wraps the library's bare Error as a not-found that is NOT rediscoverable", async () => {
+    // tsdav throws a bare Error when the 207 carries no response for the
+    // principal. Untyped, it would fall through to a connection diagnosis
+    // about a server that answered promptly.
+    const next = restub({
+      onRequest: (_url, method) =>
+        method === "PROPFIND"
+          ? multistatus(
+              `<response><href>/somebody-else/</href><propstat><status>HTTP/1.1 200 OK</status><prop></prop></propstat></response>`,
+            )
+          : null,
+    });
+
+    const err = await capture(() =>
+      resolveCalendarUserAddresses(env, principal, createDavFetch(owner)),
+    );
+
+    expect(err).toBeInstanceOf(DavNotFoundError);
+    expect((err as DavNotFoundError).rediscoverable).toBe(false);
+    // Nothing of the library's message survives: it embeds the principal URL.
+    expect((err as Error).message).toBe("dav-resource-not-found");
+    // Not rediscoverable, so exactly the one request and no second chain.
+    expect(next.observed.length).toBe(1);
+  });
+
+  it("passes a Dav* error through unchanged", async () => {
+    const next = restub({
+      onRequest: (_url, method) =>
+        method === "PROPFIND" ? new Response(null, { status: 429 }) : null,
+    });
+
+    const err = await capture(() =>
+      resolveCalendarUserAddresses(env, principal, createDavFetch(owner)),
+    );
+
+    expect(err).toBeInstanceOf(DavThrottleError);
+    expect(next.observed.length).toBe(1);
+  });
+});
+
+describe("organizerAddressFrom", () => {
+  it("returns the login even though an alias precedes it", () => {
+    // USER_ADDRESSES lists a principal path, a urn form and an alias before
+    // the login, so "the first mailto" and "the login" give different answers.
+    expect(organizerAddressFrom(USER_ADDRESSES, LOGIN_ADDRESS)).toBe(LOGIN_ADDRESS);
+  });
+
+  it("matches the login by a fold, and returns the set's own spelling", () => {
+    expect(
+      organizerAddressFrom(
+        ["mailto:alias.one@example.invalid", "MAILTO:Test@Example.Invalid"],
+        LOGIN_ADDRESS,
+      ),
+    ).toBe("Test@Example.Invalid");
+  });
+
+  it("falls back to the first mailto when the login is not in the set", () => {
+    expect(
+      organizerAddressFrom(
+        ["/1234567890/principal/", `mailto:${ALIAS_BEFORE_LOGIN}`, "mailto:alias.two@example.invalid"],
+        LOGIN_ADDRESS,
+      ),
+    ).toBe(ALIAS_BEFORE_LOGIN);
+  });
+
+  it("skips a mailto with no address after the scheme", () => {
+    expect(
+      organizerAddressFrom(["mailto:", `mailto:${ALIAS_BEFORE_LOGIN}`], LOGIN_ADDRESS),
+    ).toBe(ALIAS_BEFORE_LOGIN);
+  });
+
+  it.each([
+    ["no mailto at all", ["/1234567890/principal/", "urn:uuid:00000000"]],
+    ["an empty set", []],
+    ["only an empty mailto", ["mailto:"]],
+  ])("throws a not-found for %s rather than falling back to the login", (_label, set) => {
+    expect(() => organizerAddressFrom(set, LOGIN_ADDRESS)).toThrow(DavNotFoundError);
   });
 });
 
@@ -3734,7 +3867,7 @@ describe("the calendar_create_event handler", () => {
 });
 
 describe("the calendar registrations", () => {
-  it("records exactly the twelve calendar tools", () => {
+  it("records exactly the thirteen calendar tools", () => {
     // Named explicitly rather than counted, so neither the description loop in
     // `test/dav-tools.test.ts` nor this case can pass by the registrar having
     // been called and registered nothing.
@@ -3753,6 +3886,10 @@ describe("the calendar registrations", () => {
     // coming true: it is the one collection tool that DOES reach
     // `calendar_commit`, because a calendar delete takes every event in it and
     // nothing here or on the owner's own devices can put any of it back.
+    // `calendar_respond_to_invitation` (RSVP-01) is the thirteenth, added in
+    // phase 18, and it reaches `calendar_commit` too rather than growing a
+    // commit of its own: an answer is a preview, a confirmation of its own kind,
+    // and the same one commit tool.
     expect(calendarRegistrations().map((one) => one.name).sort()).toEqual([
       "calendar_commit",
       "calendar_create_calendar",
@@ -3763,6 +3900,7 @@ describe("the calendar registrations", () => {
       "calendar_get_event",
       "calendar_list_calendars",
       "calendar_list_events",
+      "calendar_respond_to_invitation",
       "calendar_search",
       "calendar_update_calendar",
       "calendar_update_event",
@@ -6029,6 +6167,358 @@ describe("findFreeSlots across every calendar", () => {
 });
 
 // ---------------------------------------------------------------------------
+// RSVP-03 — what else is on every calendar in an invitation's window
+//
+// `findWindowConflicts` runs `findFreeSlots`' own sweep over the same
+// three-calendar account, so every case here reuses `setupFindSlots`. The
+// invitation sits on Monday 2026-01-05, 09:00 to 10:00 UTC, and the read range
+// is a day wider on each side, which is what the tool layer passes.
+// ---------------------------------------------------------------------------
+
+describe("findWindowConflicts", () => {
+  const WINDOW = { start: at("2026-01-05T09:00:00Z"), end: at("2026-01-05T10:00:00Z") };
+  const INVITATION_HREF = `${WORK_PATH}invitation.ics`;
+  const INVITATION_URL = new URL(INVITATION_HREF, CALDAV_HOME).href;
+  const INVITATION_UID = "invitation@example.invalid";
+
+  function sweep(overrides: Partial<Parameters<typeof findWindowConflicts>[3]> = {}) {
+    return findWindowConflicts(env, principal, createDavFetch(owner), {
+      rangeStart: WINDOW.start - 86_400,
+      rangeEnd: WINDOW.end + 86_400,
+      windows: [WINDOW],
+      excludeObjectUrl: INVITATION_URL,
+      excludeUid: INVITATION_UID,
+      tzid: "UTC",
+      ...overrides,
+    });
+  }
+
+  it("returns exactly the event that overlaps, from whichever calendar holds it", async () => {
+    setupFindSlots({
+      objects: {
+        [WORK_PATH]: {
+          [`${WORK_PATH}clash.ics`]: timedEventIcs("clash", "20260105T093000Z", "20260105T103000Z"),
+        },
+        [HOME_PATH]: {
+          [`${HOME_PATH}later.ics`]: timedEventIcs("later", "20260105T140000Z", "20260105T150000Z"),
+        },
+      },
+    });
+
+    const found = await sweep();
+
+    expect(found.truncated).toBe(false);
+    expect(found.conflicts).toStrictEqual([
+      {
+        summary: "Busy clash",
+        allDay: false,
+        startLocal: "2026-01-05T09:30:00",
+        endLocal: "2026-01-05T10:30:00",
+        startUtc: at("2026-01-05T09:30:00Z"),
+        endUtc: at("2026-01-05T10:30:00Z"),
+        startTzid: "UTC",
+      },
+    ]);
+  });
+
+  it("does not count an event that only touches the window", async () => {
+    setupFindSlots({
+      objects: {
+        [WORK_PATH]: {
+          [`${WORK_PATH}before.ics`]: timedEventIcs("before", "20260105T080000Z", "20260105T090000Z"),
+          [`${WORK_PATH}after.ics`]: timedEventIcs("after", "20260105T100000Z", "20260105T110000Z"),
+        },
+      },
+    });
+
+    expect((await sweep()).conflicts).toStrictEqual([]);
+  });
+
+  it("excludes the invitation's own resource, and a copy of it on another calendar by UID", async () => {
+    const invitation = ics(
+      ...ICS_HEAD,
+      "BEGIN:VEVENT",
+      `UID:${INVITATION_UID}`,
+      "DTSTAMP:20260101T120000Z",
+      "SUMMARY:The invitation itself",
+      "DTSTART:20260105T090000Z",
+      "DTEND:20260105T100000Z",
+      "END:VEVENT",
+      "END:VCALENDAR",
+    );
+    setupFindSlots({
+      objects: {
+        [WORK_PATH]: { [INVITATION_HREF]: invitation },
+        [HOME_PATH]: { [`${HOME_PATH}copy.ics`]: invitation },
+      },
+    });
+
+    // Both exclusions on: nothing is a conflict with itself.
+    expect((await sweep()).conflicts).toStrictEqual([]);
+
+    // The resource exclusion alone: the copy on the other calendar is found,
+    // and ONLY the copy, so the resource exclusion is doing its own work.
+    const byResourceOnly = await sweep({ excludeUid: null });
+    expect(byResourceOnly.conflicts.map((one) => one.summary)).toStrictEqual([
+      "The invitation itself",
+    ]);
+
+    // The UID exclusion alone catches both.
+    expect((await sweep({ excludeObjectUrl: "https://nowhere.invalid/x.ics" })).conflicts)
+      .toStrictEqual([]);
+  });
+
+  it("reads every calendar serially: no two requests in flight at once", async () => {
+    const stubbed = setupFindSlots({
+      objects: {
+        [WORK_PATH]: {
+          [`${WORK_PATH}clash.ics`]: timedEventIcs("clash", "20260105T093000Z", "20260105T103000Z"),
+        },
+        [HOME_PATH]: {
+          [`${HOME_PATH}clash2.ics`]: timedEventIcs("clash2", "20260105T090000Z", "20260105T091500Z"),
+        },
+      },
+    });
+
+    const found = await sweep();
+
+    expect(stubbed.overlapped, "the sweep fanned out").toBe(false);
+    // Both ordinary calendars were read, and nothing was written.
+    const reported = new Set(
+      stubbed.observed.filter((one) => one.method === "REPORT").map((one) => new URL(one.url).pathname),
+    );
+    expect(reported).toStrictEqual(new Set([WORK_PATH, HOME_PATH]));
+    expect(stubbed.observed.some((one) => one.method === "PUT")).toBe(false);
+    // In time order.
+    expect(found.conflicts.map((one) => one.summary)).toStrictEqual(["Busy clash2", "Busy clash"]);
+  });
+
+  it("marks a sweep that skipped a source-less subscription as truncated, keeping what it found", async () => {
+    setupFindSlots({
+      collections: [
+        {
+          href: WORK_PATH,
+          displayName: "Work",
+          resourceType: ["collection", "calendar"],
+          components: ["VEVENT"],
+        },
+        {
+          href: SUBSCRIBED_PATH,
+          displayName: "Holidays",
+          resourceType: ["collection", "subscribed"],
+          components: ["VEVENT"],
+        },
+      ],
+      objects: {
+        [WORK_PATH]: {
+          [`${WORK_PATH}clash.ics`]: timedEventIcs("clash", "20260105T093000Z", "20260105T103000Z"),
+        },
+      },
+    });
+
+    const found = await sweep();
+
+    expect(found.truncated).toBe(true);
+    expect(found.conflicts.map((one) => one.summary)).toStrictEqual(["Busy clash"]);
+  });
+
+  it("marks a sweep truncated even when it found nothing", async () => {
+    setupFindSlots({
+      collections: [
+        {
+          href: SUBSCRIBED_PATH,
+          displayName: "Holidays",
+          resourceType: ["collection", "subscribed"],
+          components: ["VEVENT"],
+        },
+      ],
+      objects: {},
+    });
+
+    const found = await sweep();
+
+    expect(found.conflicts).toStrictEqual([]);
+    expect(found.truncated).toBe(true);
+  });
+
+  it("counts an all-day event on the invitation's day as a conflict for a timed invitation", async () => {
+    setupFindSlots({
+      objects: {
+        [HOME_PATH]: {
+          [`${HOME_PATH}offsite.ics`]: allDayEventIcs("offsite", "20260105", "20260106"),
+          // The next day's all-day event does not overlap.
+          [`${HOME_PATH}tomorrow.ics`]: allDayEventIcs("tomorrow", "20260106", "20260107"),
+        },
+      },
+    });
+
+    const found = await sweep();
+
+    expect(found.conflicts).toStrictEqual([
+      {
+        summary: "All day offsite",
+        allDay: true,
+        startLocal: "2026-01-05",
+        endLocal: "2026-01-06",
+        startTzid: expect.any(String),
+      },
+    ]);
+  });
+
+  // CR-01 (18-REVIEW). The REPORT returns every resource that OVERLAPS the read
+  // range, and these three start BEFORE it — a day and more before the window.
+  // Each one is still running across the invitation, so each is a conflict. A
+  // sweep that kept only what starts inside the range dropped all three and
+  // still said `truncated: false`, which the tool turns into "Nothing else on
+  // your calendars overlaps it."
+  it("counts a multi-day all-day event that began before the read range", async () => {
+    setupFindSlots({
+      objects: {
+        [HOME_PATH]: {
+          // Saturday the 3rd through Monday the 5th: three days, the last one
+          // the invitation's.
+          [`${HOME_PATH}ooo.ics`]: allDayEventIcs("ooo", "20260103", "20260106"),
+        },
+      },
+    });
+
+    const found = await sweep();
+
+    expect(found.truncated).toBe(false);
+    expect(found.conflicts.map((one) => one.summary)).toStrictEqual(["All day ooo"]);
+  });
+
+  it("counts a timed event that began before the read range and is still running", async () => {
+    setupFindSlots({
+      objects: {
+        [WORK_PATH]: {
+          // From 08:00 on the 3rd, two days before the window, to 17:00 on the 6th.
+          [`${WORK_PATH}conference.ics`]: timedEventIcs(
+            "conference",
+            "20260103T080000Z",
+            "20260106T170000Z",
+          ),
+        },
+      },
+    });
+
+    const found = await sweep();
+
+    expect(found.truncated).toBe(false);
+    expect(found.conflicts.map((one) => one.summary)).toStrictEqual(["Busy conference"]);
+  });
+
+  it("counts a repeating event whose current date began before the read range", async () => {
+    setupFindSlots({
+      objects: {
+        [HOME_PATH]: {
+          // Every Saturday for four days, from 2025-12-27: the date that starts
+          // on the 3rd runs to the end of the 6th, across the invitation.
+          [`${HOME_PATH}weekly.ics`]: ics(
+            ...ICS_HEAD,
+            "BEGIN:VEVENT",
+            "UID:weekly@example.invalid",
+            "DTSTAMP:20260101T120000Z",
+            "SUMMARY:Weekly away",
+            "DTSTART;VALUE=DATE:20251227",
+            "DTEND;VALUE=DATE:20251231",
+            "RRULE:FREQ=WEEKLY;COUNT=4",
+            "END:VEVENT",
+            "END:VCALENDAR",
+          ),
+        },
+      },
+    });
+
+    const found = await sweep();
+
+    expect(found.truncated).toBe(false);
+    expect(found.conflicts).toStrictEqual([
+      {
+        summary: "Weekly away",
+        allDay: true,
+        startLocal: "2026-01-03",
+        endLocal: "2026-01-07",
+        startTzid: expect.any(String),
+      },
+    ]);
+  });
+
+  it("still does not count an event that ended before the window", async () => {
+    setupFindSlots({
+      objects: {
+        [WORK_PATH]: {
+          // Began before the read range and ended an hour before the window.
+          [`${WORK_PATH}earlier.ics`]: timedEventIcs(
+            "earlier",
+            "20260103T080000Z",
+            "20260105T080000Z",
+          ),
+        },
+      },
+    });
+
+    expect((await sweep()).conflicts).toStrictEqual([]);
+  });
+
+  // WR-03 (18-REVIEW). An all-day event has no instant, so the zone it is
+  // placed in decides whether it clashes. The sweep says when one was near
+  // enough a window for that to matter.
+  it("says an all-day event near the window was placed by the zone, and a timed one was not", async () => {
+    setupFindSlots({
+      objects: {
+        [WORK_PATH]: {
+          [`${WORK_PATH}clash.ics`]: timedEventIcs("clash", "20260105T093000Z", "20260105T103000Z"),
+        },
+      },
+    });
+    const timedOnly = await sweep();
+    expect(timedOnly.conflicts.length).toBe(1);
+    expect(timedOnly.placedByZone).toBe(false);
+
+    // The day BEFORE the window: in UTC it ends at midnight, nine hours before
+    // the window starts, so it does not clash here. Placed in a zone ten or
+    // more hours west of UTC it would, so where it was placed decided the answer.
+    setupFindSlots({
+      objects: {
+        [HOME_PATH]: {
+          [`${HOME_PATH}yesterday.ics`]: allDayEventIcs("yesterday", "20260104", "20260105"),
+        },
+      },
+    });
+    const nearby = await sweep();
+    expect(nearby.conflicts).toStrictEqual([]);
+    expect(nearby.placedByZone).toBe(true);
+  });
+
+  it("does not flag an all-day event no zone could move onto the window", async () => {
+    setupFindSlots({
+      objects: {
+        [HOME_PATH]: {
+          // Two days after the window: more than fourteen hours clear of it.
+          [`${HOME_PATH}later.ics`]: allDayEventIcs("later", "20260107", "20260108"),
+        },
+      },
+    });
+    const far = await sweep({ rangeEnd: WINDOW.end + 3 * 86_400 });
+    expect(far.conflicts).toStrictEqual([]);
+    expect(far.placedByZone).toBe(false);
+  });
+
+  it("refuses a range wider than the find-slots cap before any request", async () => {
+    const stubbed = setupFindSlots();
+    stubbed.observed.length = 0;
+
+    const err = await capture(() =>
+      sweep({ rangeStart: WINDOW.start, rangeEnd: WINDOW.start + 91 * 86_400 }),
+    );
+
+    expect(err).toBeInstanceOf(DavNotFoundError);
+    expect(stubbed.observed.length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // CALM-04 — creating a calendar collection
 //
 // The tracer slice, at the service layer. These cases can tell a buildable
@@ -7231,5 +7721,144 @@ describe("an update is byte-identical outside the window it is allowed to touch"
     // And the master's own start is untouched, which is what "the master is read
     // and never written" means on the bytes.
     expect(written).toContain(`DTSTART;TZID=${DEFINED_TZID}:20260406T100000`);
+  });
+});
+
+// ===========================================================================
+// occurrenceWindowsOf — a series' own dates as busy windows (phase 18, 18-05)
+// ===========================================================================
+
+describe("occurrenceWindowsOf", () => {
+  /** 2026-09-26T00:00:00Z and 90 days on: every date of the derived series. */
+  const WIDE_START = 1790380800;
+  const NINETY_DAYS = 90 * 24 * 60 * 60;
+
+  it("returns one window per occurrence in range, the moved date at its moved time", () => {
+    expect(
+      occurrenceWindowsOf(ATTENDEE_COPY_SERIES_ICS, WIDE_START, WIDE_START + NINETY_DAYS, "America/Los_Angeles"),
+    ).toStrictEqual({
+      windows: [
+        { start: 1790708400, end: 1790712000 }, // 2026-09-29 12:00-13:00 in Los Angeles
+        { start: 1791316800, end: 1791320400 }, // 2026-10-06, moved to 13:00-14:00
+        { start: 1791918000, end: 1791921600 }, // 2026-10-13
+        { start: 1792522800, end: 1792526400 }, // 2026-10-20
+      ],
+      truncated: false,
+      placedByZone: false,
+    });
+  });
+
+  it("leaves out the dates before the range", () => {
+    // From 2026-10-10: only the last two dates remain.
+    const { windows, truncated } = occurrenceWindowsOf(
+      ATTENDEE_COPY_SERIES_ICS,
+      1791615600,
+      1791615600 + NINETY_DAYS,
+      "America/Los_Angeles",
+    );
+    expect(windows).toStrictEqual([
+      { start: 1791918000, end: 1791921600 },
+      { start: 1792522800, end: 1792526400 },
+    ]);
+    expect(truncated).toBe(false);
+  });
+
+  it("returns the single window of a one-off event", () => {
+    expect(
+      occurrenceWindowsOf(ATTENDEE_COPY_GENUINE_ICS, WIDE_START, WIDE_START + NINETY_DAYS, "UTC"),
+    ).toStrictEqual({
+      windows: [{ start: 1790708400, end: 1790712000 }],
+      truncated: false,
+      placedByZone: false,
+    });
+  });
+
+  it("reports truncated when the expansion hit its cap", () => {
+    // A rule every minute: two days of it is 2880 occurrences, past the cap.
+    const minutely = ATTENDEE_COPY_SERIES_ICS.replace(
+      "RRULE:FREQ=WEEKLY;COUNT=4",
+      "RRULE:FREQ=MINUTELY",
+    );
+    expect(minutely).not.toBe(ATTENDEE_COPY_SERIES_ICS);
+    const { windows, truncated } = occurrenceWindowsOf(
+      minutely,
+      1790708400,
+      1790708400 + 2 * 24 * 60 * 60,
+      "America/Los_Angeles",
+    );
+    expect(truncated).toBe(true);
+    expect(windows.length).toBeGreaterThan(0);
+  });
+
+  // CR-01 (18-REVIEW). An all-day date has no zone, and the expansion compares
+  // it as midnight UTC. West of UTC that is BEFORE local midnight, which is
+  // where the series check starts — so today's own date was dropped, and today
+  // was never checked against anything.
+  it("keeps today's all-day date when the range starts at local midnight west of UTC", () => {
+    const allDaySeries = ics(
+      ...ICS_HEAD,
+      "BEGIN:VEVENT",
+      "UID:all-day-series@example.invalid",
+      "DTSTAMP:20260101T120000Z",
+      "SUMMARY:Daily stand-down",
+      "DTSTART;VALUE=DATE:20260105",
+      "DTEND;VALUE=DATE:20260106",
+      "RRULE:FREQ=DAILY;COUNT=3",
+      "END:VEVENT",
+      "END:VCALENDAR",
+    );
+    // 2026-01-05T00:00:00 in Los Angeles is 08:00Z.
+    const laMidnight = at("2026-01-05T08:00:00Z");
+
+    const { windows, truncated } = occurrenceWindowsOf(
+      allDaySeries,
+      laMidnight,
+      laMidnight + NINETY_DAYS,
+      "America/Los_Angeles",
+    );
+
+    expect(truncated).toBe(false);
+    // Every one of these dates was placed by the zone: they have no instant.
+    expect(
+      occurrenceWindowsOf(allDaySeries, laMidnight, laMidnight + NINETY_DAYS, "America/Los_Angeles")
+        .placedByZone,
+    ).toBe(true);
+    // Three whole Los Angeles days, the first of them today.
+    expect(windows).toStrictEqual([
+      { start: at("2026-01-05T08:00:00Z"), end: at("2026-01-06T08:00:00Z") },
+      { start: at("2026-01-06T08:00:00Z"), end: at("2026-01-07T08:00:00Z") },
+      { start: at("2026-01-07T08:00:00Z"), end: at("2026-01-08T08:00:00Z") },
+    ]);
+  });
+
+  it("keeps a date that runs across the range's start, cut to the part inside it", () => {
+    const lateSeries = ics(
+      ...ICS_HEAD,
+      "BEGIN:VEVENT",
+      "UID:late-series@example.invalid",
+      "DTSTAMP:20260101T120000Z",
+      "SUMMARY:Late shift",
+      // 22:00 to 01:00 in Los Angeles, so each date crosses local midnight.
+      "DTSTART:20260105T060000Z",
+      "DTEND:20260105T090000Z",
+      "RRULE:FREQ=DAILY;COUNT=2",
+      "END:VEVENT",
+      "END:VCALENDAR",
+    );
+    const laMidnight = at("2026-01-05T08:00:00Z");
+
+    const { windows } = occurrenceWindowsOf(
+      lateSeries,
+      laMidnight,
+      laMidnight + NINETY_DAYS,
+      "America/Los_Angeles",
+    );
+
+    // The first date began before the range, and only the hour after local
+    // midnight is a time this check covers: the read starts there.
+    expect(windows).toStrictEqual([
+      { start: at("2026-01-05T08:00:00Z"), end: at("2026-01-05T09:00:00Z") },
+      { start: at("2026-01-06T06:00:00Z"), end: at("2026-01-06T09:00:00Z") },
+    ]);
   });
 });

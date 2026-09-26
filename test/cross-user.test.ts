@@ -86,8 +86,14 @@ import {
   EVENT_A_ID,
   HOME_A,
   HOME_B,
+  INVITATION_A_ID,
+  INVITATION_A_URL,
+  INVITATION_SUMMARY,
+  PRINCIPAL_PATH_A,
+  invitationIcs,
   twoUserDavStub,
 } from "./fixtures/two-user-dav";
+import { identityRoundTrip, unfoldedDiff } from "./fixtures/dav-bytes";
 import {
   attempt,
   readToolResult,
@@ -1462,5 +1468,288 @@ describe("confirm token: a one-time confirmation belongs to the user who preview
       held,
       "LEAK: B's refused commit wrote A's jti into CONFIRM_KV",
     ).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Answering an invitation, with two people on it (RSVP-04, plan 18-06)
+//
+// Somebody invites A and B to the same meeting, so each holds a copy in their
+// own home and each copy lists them both. A answers. The claims:
+//
+//   - A's answer moves A's line, in A's copy, and nothing else.
+//   - Every request A's preview and A's commit make carries A's credential and
+//     goes to A's home. That includes 18-04's conflict sweep, which walks every
+//     calendar the account has, and so is the widest thing the tool reads.
+//   - The addresses A's line is found by are A's own server answer: a copy that
+//     lists only B is not A's to answer.
+//   - A's confirmation is A's. B presenting it gets nothing, costs nothing, and
+//     does not use up A's one chance to commit it.
+//
+// Runs after 18-05 on purpose, so the preview under test carries the conflict
+// sweep and the scope rule. None of these is an expected fail: the fix for
+// every one of them shipped before the tool did.
+// ---------------------------------------------------------------------------
+
+/** What A's answer preview handed back, both halves. */
+interface ReplyPreviewOfA {
+  readonly trusted: Record<string, unknown>;
+  readonly untrusted: Record<string, unknown>;
+}
+
+/**
+ * A asks to answer A's copy of the invitation, against the two-home stub.
+ *
+ * Installs the stub first and forgets every cached home, so the preview starts
+ * cold and every request it makes, discovery included, is on `observed`.
+ * Gives null when the call gave null or either half would not parse.
+ */
+async function answerPreviewAsA(
+  stub: TwoUserDavStub,
+  answer: "accepted" | "declined" | "tentative",
+): Promise<ReplyPreviewOfA | null> {
+  await forgetEveryDavHome();
+  vi.stubGlobal("fetch", stub.fetch);
+  const result = await toolsFor(USER_A).call("calendar_respond_to_invitation", {
+    id: INVITATION_A_ID,
+    answer,
+  });
+  if (result === null) return null;
+  const parsed = readToolResult(result);
+  if (parsed.isError || parsed.trusted === null || parsed.untrusted === null) {
+    return null;
+  }
+  return { trusted: parsed.trusted, untrusted: parsed.untrusted };
+}
+
+/** The one content line in an unfolded body that carries `needle`, or null. */
+function unfoldedLineWith(body: string, needle: string): string | null {
+  const lines = body.replace(/\r\n[ \t]/g, "").split("\r\n");
+  const found = lines.filter((line) => line.includes(needle));
+  return found.length === 1 ? found[0]! : null;
+}
+
+describe("an invitation answer belongs to the person who gave it", () => {
+  const MAILTO_A = `mailto:${USER_A.appleId}`;
+  const MAILTO_B = `mailto:${USER_B.appleId}`;
+
+  it("control: A previews and commits a decline on A's copy, and the commit succeeds", async () => {
+    const stub = twoUserDavStub({ invitationListing: ["A", "B"] });
+
+    const preview = await answerPreviewAsA(stub, "declined");
+    expect(preview, "A's preview failed or would not parse").not.toBeNull();
+    if (preview === null) throw new Error("unreachable");
+    expect(preview.trusted.refusal, "A's preview was refused").toBeNull();
+    expect(typeof preview.trusted.confirmToken).toBe("string");
+    expect(preview.untrusted.change).toEqual({
+      kind: "reply",
+      scope: null,
+      answer: "declined",
+      // This fixture carries no scheduling marker, so the bytes cannot decide.
+      tells: "organizer-maybe",
+    });
+    // A preview writes nothing, anywhere.
+    expect(stub.writesUnder.A).toEqual([]);
+    expect(stub.writesUnder.B).toEqual([]);
+
+    const result = await toolsFor(USER_A).call("calendar_commit", {
+      confirmToken: preview.trusted.confirmToken,
+      change: preview.untrusted.change,
+    });
+    expect(result, "the tool is missing or its callback threw").not.toBeNull();
+    if (result === null) throw new Error("unreachable");
+    const parsed = readToolResult(result);
+    expect(parsed.isError, "A's own commit was refused").toBe(false);
+    expect(parsed.trusted?.applied).toBe(true);
+    expect(parsed.trusted?.answer).toBe("declined");
+    expect(stub.writesUnder.A.length, "A's commit did not write exactly once").toBe(1);
+  });
+
+  it("A's write goes to A's copy with A's credentials, and moves only A's line", async () => {
+    const stub = twoUserDavStub({ invitationListing: ["A", "B"] });
+
+    const preview = await answerPreviewAsA(stub, "declined");
+    expect(preview, "A's preview failed or would not parse").not.toBeNull();
+    if (preview === null) throw new Error("unreachable");
+    const result = await toolsFor(USER_A).call("calendar_commit", {
+      confirmToken: preview.trusted.confirmToken,
+      change: preview.untrusted.change,
+    });
+    expect(result).not.toBeNull();
+    if (result === null) throw new Error("unreachable");
+    expect(readToolResult(result).isError, "A's own commit was refused").toBe(false);
+
+    const puts = stub.observed.filter((one) => one.method === "PUT");
+    expect(puts.length, "A's commit did not issue exactly one write").toBe(1);
+    const [put] = puts;
+    expect(put!.user, "A's write did not carry A's credentials").toBe("A");
+    expect(put!.url, "A's write did not go to A's copy").toBe(INVITATION_A_URL);
+    expect(put!.url.startsWith(HOME_A)).toBe(true);
+
+    // Against what the writer produces when it changes nothing, over A's own
+    // stored copy. Exactly one line differs, and it is A's.
+    const stored = invitationIcs(["A", "B"]);
+    const identity = identityRoundTrip(stored);
+    const body = put!.body ?? "";
+    const diff = unfoldedDiff(identity, body);
+    expect(diff.length, "A's answer changed more than one line").toBe(1);
+    const [only] = diff;
+    expect(only!.before.startsWith("ATTENDEE;")).toBe(true);
+    expect(only!.before.endsWith(`:${MAILTO_A}`), "the line that moved is not A's").toBe(
+      true,
+    );
+    expect(only!.before).toContain("PARTSTAT=NEEDS-ACTION");
+    expect(only!.after).toBe(
+      only!.before
+        .replace("PARTSTAT=NEEDS-ACTION", "PARTSTAT=DECLINED")
+        .replace(";RSVP=TRUE", ""),
+    );
+
+    // B's line, in the body A wrote, is the line B had: still unanswered and
+    // still asking for an answer.
+    const lineBBefore = unfoldedLineWith(identity, MAILTO_B);
+    const lineBAfter = unfoldedLineWith(body, MAILTO_B);
+    expect(lineBBefore, "the stored copy does not list B exactly once").not.toBeNull();
+    expect(lineBAfter, "B's line moved in the body A wrote").toBe(lineBBefore);
+    expect(lineBAfter).toContain("PARTSTAT=NEEDS-ACTION");
+    expect(lineBAfter).toContain("RSVP=TRUE");
+  });
+
+  it("every request of A's preview and A's commit is A's, the conflict sweep's included, and B's copy is never written", async () => {
+    const stub = twoUserDavStub({ invitationListing: ["A", "B"] });
+
+    const preview = await answerPreviewAsA(stub, "tentative");
+    expect(preview, "A's preview failed or would not parse").not.toBeNull();
+    if (preview === null) throw new Error("unreachable");
+    const previewLeg = [...stub.observed];
+
+    // The sweep ran, and ran against A's home: it found A's own overlapping
+    // event there and read everything it looked at. A sweep that had degraded
+    // would say "failed" and prove nothing about where it went.
+    expect(preview.trusted.conflictsChecked).toBe("complete");
+    expect(preview.trusted.conflictCount).toBe(1);
+    expect(
+      previewLeg.some((one) => one.method === "PROPFIND" && one.url === HOME_A),
+      "the preview never enumerated A's calendars, so the sweep did not run",
+    ).toBe(true);
+    expect(
+      previewLeg.some(
+        (one) => one.method === "REPORT" && (one.body ?? "").includes("calendar-query"),
+      ),
+      "the preview never queried a calendar by time, so the sweep did not run",
+    ).toBe(true);
+
+    const result = await toolsFor(USER_A).call("calendar_commit", {
+      confirmToken: preview.trusted.confirmToken,
+      change: preview.untrusted.change,
+    });
+    expect(result).not.toBeNull();
+    if (result === null) throw new Error("unreachable");
+    expect(readToolResult(result).isError, "A's own commit was refused").toBe(false);
+    expect(stub.observed.length).toBeGreaterThan(previewLeg.length);
+
+    // Both legs, every request.
+    for (const one of stub.observed) {
+      expect(one.user, `${one.method} ${one.url} did not carry A's credentials`).toBe("A");
+      expect(
+        one.url.startsWith(HOME_B),
+        `${one.method} ${one.url} reached B's home`,
+      ).toBe(false);
+      expect(
+        one.url.startsWith(HOME_A) || one.url.startsWith(CALDAV_ENTRY),
+        `${one.method} ${one.url} went somewhere other than A's home or discovery`,
+      ).toBe(true);
+    }
+
+    // B's copy received zero writes, from anybody.
+    expect(stub.writesUnder.B, "B's copy was written").toEqual([]);
+    expect(stub.writesUnder.A.length).toBe(1);
+  });
+
+  it("A's line is found by A's own addresses: a copy listing only B is refused not-invited", async () => {
+    const stub = twoUserDavStub({ invitationListing: ["B"] });
+
+    const preview = await answerPreviewAsA(stub, "accepted");
+    expect(preview, "A's preview failed or would not parse").not.toBeNull();
+    if (preview === null) throw new Error("unreachable");
+
+    expect(preview.trusted.refusal).toBe("not-invited");
+    expect(preview.trusted.confirmToken, "a refusal minted a confirmation").toBeNull();
+    expect(preview.untrusted.change ?? null).toBeNull();
+
+    // The address set the refusal was decided against is A's server answer,
+    // read with A's credentials at A's principal. The stub answers A's
+    // principal with A's own mailto only, so B's line cannot match it.
+    const addressReads = stub.observed.filter((one) =>
+      (one.body ?? "").includes("calendar-user-address-set"),
+    );
+    expect(addressReads.length, "the preview did not read the address set once").toBe(1);
+    expect(addressReads[0]!.user).toBe("A");
+    expect(addressReads[0]!.url.endsWith(PRINCIPAL_PATH_A)).toBe(true);
+
+    // Every request was A's, and nothing was written anywhere.
+    expect(stub.observed.filter((one) => one.user !== "A")).toEqual([]);
+    expect(stub.observed.filter((one) => one.url.startsWith(HOME_B))).toEqual([]);
+    expect(stub.writesUnder.A).toEqual([]);
+    expect(stub.writesUnder.B).toEqual([]);
+  });
+
+  it("B presenting A's reply token is refused, spends no request, and leaves A's slot for A", async () => {
+    const stub = twoUserDavStub({ invitationListing: ["A", "B"] });
+
+    const preview = await answerPreviewAsA(stub, "declined");
+    expect(preview, "A's preview failed or would not parse").not.toBeNull();
+    if (preview === null) throw new Error("unreachable");
+    const confirmToken = preview.trusted.confirmToken;
+    expect(typeof confirmToken).toBe("string");
+    if (typeof confirmToken !== "string") throw new Error("unreachable");
+    const jti = jtiOf(confirmToken);
+    expect(jti, "the token's jti could not be read").not.toBeNull();
+    if (jti === null) throw new Error("unreachable");
+
+    // B's turn, with A's token and A's change exactly as A was handed them.
+    await forgetEveryDavHome();
+    const before = stub.observed.length;
+    const resultB = await toolsFor(USER_B).call("calendar_commit", {
+      confirmToken,
+      change: preview.untrusted.change,
+    });
+    expect(resultB, "the tool is missing or its callback threw").not.toBeNull();
+    if (resultB === null) throw new Error("unreachable");
+    expect(
+      readToolResult(resultB).isError,
+      "B's commit with A's reply token was not refused",
+    ).toBe(true);
+
+    // Refused before any request was built: B reached the network not at all.
+    expect(stub.observed.slice(before), "B's refused commit issued a DAV request").toEqual(
+      [],
+    );
+    expect(stub.writesUnder.A).toEqual([]);
+    expect(stub.writesUnder.B).toEqual([]);
+    // And B's refusal did not take A's one-time slot.
+    expect(
+      await confirmKeysHolding(jti),
+      "B's refused commit wrote A's jti into CONFIRM_KV",
+    ).toEqual([]);
+    expect(JSON.stringify(resultB), "B received the invitation's title").not.toContain(
+      INVITATION_SUMMARY,
+    );
+
+    // A's turn. A's own commit still goes through.
+    await forgetEveryDavHome();
+    const resultA = await toolsFor(USER_A).call("calendar_commit", {
+      confirmToken,
+      change: preview.untrusted.change,
+    });
+    expect(resultA, "the tool is missing or its callback threw").not.toBeNull();
+    if (resultA === null) throw new Error("unreachable");
+    expect(
+      readToolResult(resultA).isError,
+      "B's refused commit spent A's slot, so A's own commit was refused",
+    ).toBe(false);
+    expect(stub.writesUnder.A.length).toBe(1);
+    expect(stub.writesUnder.A[0]!.user).toBe("A");
+    expect(stub.writesUnder.B).toEqual([]);
   });
 });

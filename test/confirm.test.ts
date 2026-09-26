@@ -22,12 +22,15 @@ import {
   ConfirmationInvalidError,
   canonicalChange,
   canonicalContactChange,
+  REPLY_TELLS,
   changeHashMatches,
+  canonicalReplyChange,
   changeHashOf,
   composeConfirmationLine,
   contactChangeHashOf,
   importConfirmationKey,
   mintConfirmation,
+  replyChangeHashOf,
   reserveConfirmation,
   verifyConfirmation,
 } from "../src/confirm";
@@ -44,6 +47,8 @@ import type {
   MailConfirmPayload,
   NormalizedChange,
   NormalizedContactChange,
+  NormalizedReplyChange,
+  ReplyTells,
 } from "../src/confirm";
 import { DavConfirmationError, davToErrorCategory } from "../src/dav/errors";
 import { decodeEventId, encodeEventId } from "../src/dav/ids";
@@ -164,6 +169,15 @@ async function sealAs(payloadPart: string, secret: string): Promise<string> {
   );
   return `${payloadPart}.${toBase64Url(new Uint8Array(mac))}`;
 }
+
+/**
+ * `change()`'s canonical form and hash, as every build before phase 18 computed
+ * them. See "left every existing change hash where it was".
+ */
+const CANONICAL_BEFORE_PHASE_18 =
+  '["update",null,"Coffee with Dana","2026-09-01T09:00:00","America/Chicago",' +
+  '"2026-09-01T09:30:00","America/Chicago",false,"Ludlow",null,[],null]';
+const HASH_BEFORE_PHASE_18 = "LQtSscRG2dHD_UJkW7rpV20Ws4b9V1iug5JlufX20p4";
 
 function change(overrides: Partial<NormalizedChange> = {}): NormalizedChange {
   return {
@@ -1691,6 +1705,72 @@ describe("comparing two canonical change hashes", () => {
 // The canonical CONTACT change
 // ===========================================================================
 
+describe("the reply change hashes in its own domain (phase 18)", () => {
+  function reply(overrides: Partial<NormalizedReplyChange> = {}): NormalizedReplyChange {
+    return { kind: "reply", scope: null, answer: "declined", tells: "organizer", ...overrides };
+  }
+
+  it("is a fixed-order tuple that starts with the kind", () => {
+    // `tells` joined the tuple with 18-REVIEW WR-02, which moved every reply
+    // hash. No update or delete hash moved: see the last case in this block.
+    expect(canonicalReplyChange(reply())).toBe('["reply",null,"declined","organizer"]');
+    // No update or delete tuple starts with `reply`, so no reply hash can be
+    // spent as one and no update hash can be spent as a reply (D-05).
+    expect((JSON.parse(canonicalChange(change())) as unknown[])[0]).toBe("update");
+  });
+
+  it("hashes equal changes equally, across calls and across key order", async () => {
+    const shuffled = {
+      tells: "organizer",
+      answer: "declined",
+      scope: null,
+      kind: "reply",
+    } as NormalizedReplyChange;
+
+    expect(await replyChangeHashOf(reply())).toBe(await replyChangeHashOf(reply()));
+    expect(await replyChangeHashOf(shuffled)).toBe(await replyChangeHashOf(reply()));
+  });
+
+  it("reads an absent scope as null", async () => {
+    const absent = { kind: "reply", answer: "declined", tells: "organizer" } as NormalizedReplyChange;
+    expect(await replyChangeHashOf(absent)).toBe(await replyChangeHashOf(reply()));
+  });
+
+  it("differs when the answer differs, for every pair of the three", async () => {
+    const hashes = await Promise.all(
+      (["accepted", "declined", "tentative"] as const).map((answer) =>
+        replyChangeHashOf(reply({ answer })),
+      ),
+    );
+    expect(new Set(hashes).size).toBe(3);
+  });
+
+  it("differs when the scope differs", async () => {
+    const hashes = await Promise.all(
+      [null, "series", "occurrence"].map((scope) => replyChangeHashOf(reply({ scope }))),
+    );
+    expect(new Set(hashes).size).toBe(3);
+  });
+
+  it("differs when who is told differs, for every pair of the four (WR-02)", async () => {
+    const hashes = await Promise.all(
+      REPLY_TELLS.map((tells) => replyChangeHashOf(reply({ tells }))),
+    );
+    expect(REPLY_TELLS).toStrictEqual(["organizer", "organizer-maybe", "nobody", "narrowed"]);
+    expect(new Set(hashes).size).toBe(4);
+  });
+
+  it("left every existing change hash where it was", async () => {
+    // Pinned literally. `canonicalChange`, `changeHashOf` and
+    // `NormalizedChange` are byte-identical to their pre-phase-18 source, so
+    // this value is the one every update token minted before the phase
+    // carries. A reply field added to `NormalizedChange` would move it.
+    expect(Object.keys(change())).not.toContain("answer");
+    expect(canonicalChange(change())).toBe(CANONICAL_BEFORE_PHASE_18);
+    expect(await changeHashOf(change())).toBe(HASH_BEFORE_PHASE_18);
+  });
+});
+
 describe("the canonical contact change keeps absent and cleared apart", () => {
   // The whole reason this canonical is its own function rather than a reuse of
   // `canonicalChange`'s positional tuple. `JSON.stringify` turns an `undefined`
@@ -2191,15 +2271,22 @@ describe("the server composes the human-facing line", () => {
       fieldCount: null,
       recipientCount: null,
       alarms: null,
+      reply: null,
     };
   }
 
   /**
-   * Every combination of the seven nouns, the three operations and both tenses.
+   * Every combination of the eight nouns, the four operations and both tenses.
    *
-   * Forty-two rows, written out. The `it` below also asserts no two of them are
+   * Sixty-four rows, written out. The `it` below also asserts no two of them are
    * equal, which is what stops a composer that ignored its noun or its tense
-   * from passing forty-two identical assertions.
+   * from passing sixty-four identical assertions.
+   *
+   * Phase 18 added the eighth noun, `invitation`, and the fourth operation,
+   * `reply`. A bare reply row carries no reply detail, so it takes the
+   * strongest of the reply's consequences: a summary that cannot say whether
+   * anybody is told must not under-warn. The sentence an actual answer carries
+   * is pinned in its own table below, because this one drives bare summaries.
    *
    * The seventh noun arrived with the collection delete (CALM-06), which needed a
    * word for a member whose kind this server has not established — see
@@ -2224,6 +2311,8 @@ describe("the server composes the human-facing line", () => {
       ["create", "reminder", "did", "Created the reminder. Undoing it is a separate, explicit request."],
       ["create", "item", "would", "Creating the item. Undoing it is a separate, explicit request."],
       ["create", "item", "did", "Created the item. Undoing it is a separate, explicit request."],
+      ["create", "invitation", "would", "Creating the invitation. Undoing it is a separate, explicit request."],
+      ["create", "invitation", "did", "Created the invitation. Undoing it is a separate, explicit request."],
       ["update", "event", "would", "Overwriting the event. The values it held before cannot be recovered."],
       ["update", "event", "did", "Overwrote the event. The values it held before cannot be recovered."],
       ["update", "calendar", "would", "Overwriting the calendar. The values it held before cannot be recovered."],
@@ -2238,6 +2327,8 @@ describe("the server composes the human-facing line", () => {
       ["update", "reminder", "did", "Overwrote the reminder. The values it held before cannot be recovered."],
       ["update", "item", "would", "Overwriting the item. The values it held before cannot be recovered."],
       ["update", "item", "did", "Overwrote the item. The values it held before cannot be recovered."],
+      ["update", "invitation", "would", "Overwriting the invitation. The values it held before cannot be recovered."],
+      ["update", "invitation", "did", "Overwrote the invitation. The values it held before cannot be recovered."],
       ["delete", "event", "would", "Deleting the event. This cannot be undone."],
       ["delete", "event", "did", "Deleted the event. This cannot be undone."],
       ["delete", "calendar", "would", "Deleting the calendar. This cannot be undone."],
@@ -2252,13 +2343,31 @@ describe("the server composes the human-facing line", () => {
       ["delete", "reminder", "did", "Deleted the reminder. This cannot be undone."],
       ["delete", "item", "would", "Deleting the item. This cannot be undone."],
       ["delete", "item", "did", "Deleted the item. This cannot be undone."],
+      ["delete", "invitation", "would", "Deleting the invitation. This cannot be undone."],
+      ["delete", "invitation", "did", "Deleted the invitation. This cannot be undone."],
+      ["reply", "event", "would", "Answering the event. A reply cannot be unsent."],
+      ["reply", "event", "did", "Answered the event. A reply cannot be unsent."],
+      ["reply", "calendar", "would", "Answering the calendar. A reply cannot be unsent."],
+      ["reply", "calendar", "did", "Answered the calendar. A reply cannot be unsent."],
+      ["reply", "contact", "would", "Answering the contact. A reply cannot be unsent."],
+      ["reply", "contact", "did", "Answered the contact. A reply cannot be unsent."],
+      ["reply", "message", "would", "Answering the message. A reply cannot be unsent."],
+      ["reply", "message", "did", "Answered the message. A reply cannot be unsent."],
+      ["reply", "draft", "would", "Answering the draft. A reply cannot be unsent."],
+      ["reply", "draft", "did", "Answered the draft. A reply cannot be unsent."],
+      ["reply", "reminder", "would", "Answering the reminder. A reply cannot be unsent."],
+      ["reply", "reminder", "did", "Answered the reminder. A reply cannot be unsent."],
+      ["reply", "item", "would", "Answering the item. A reply cannot be unsent."],
+      ["reply", "item", "did", "Answered the item. A reply cannot be unsent."],
+      ["reply", "invitation", "would", "Answering the invitation. A reply cannot be unsent."],
+      ["reply", "invitation", "did", "Answered the invitation. A reply cannot be unsent."],
     ];
 
   it("produces the pinned line for every noun, every operation and both tenses", () => {
     // Non-vacuity first: a table that lost its rows would pass a loop over
     // nothing, which is the failure mode every table in this repository is
     // written against.
-    expect(EVERY_LINE.length).toBe(42);
+    expect(EVERY_LINE.length).toBe(64);
 
     for (const [kind, noun, tense, expected] of EVERY_LINE) {
       expect(
@@ -2268,7 +2377,7 @@ describe("the server composes the human-facing line", () => {
     }
   });
 
-  it("produces forty-two DIFFERENT lines, so neither the noun nor the tense is ignored", () => {
+  it("produces sixty-four DIFFERENT lines, so neither the noun nor the tense is ignored", () => {
     const produced = EVERY_LINE.map(([kind, noun, tense]) =>
       composeConfirmationLine(bare(kind, noun), tense),
     );
@@ -2290,6 +2399,7 @@ describe("the server composes the human-facing line", () => {
           fieldCount: null,
           recipientCount: null,
           alarms: null,
+          reply: null,
         },
         "would",
       ),
@@ -2321,6 +2431,7 @@ describe("the server composes the human-facing line", () => {
           fieldCount: null,
           recipientCount: null,
           alarms: null,
+          reply: null,
         },
         "would",
       ),
@@ -2340,6 +2451,7 @@ describe("the server composes the human-facing line", () => {
           fieldCount: null,
           recipientCount: null,
           alarms: null,
+          reply: null,
         },
         "would",
       ),
@@ -2359,6 +2471,7 @@ describe("the server composes the human-facing line", () => {
           fieldCount: 1,
           recipientCount: null,
           alarms: null,
+          reply: null,
         },
         "would",
       ),
@@ -2378,6 +2491,7 @@ describe("the server composes the human-facing line", () => {
           fieldCount: null,
           recipientCount: 3,
           alarms: null,
+          reply: null,
         },
         "would",
       ),
@@ -2417,6 +2531,7 @@ describe("the server composes the human-facing line", () => {
         fieldCount: null,
         recipientCount: 2,
         alarms: null,
+        reply: null,
       },
       "would",
     );
@@ -2455,6 +2570,7 @@ describe("the server composes the human-facing line", () => {
         fieldCount: 3,
         recipientCount: 3,
         alarms: null,
+        reply: null,
       },
       "would",
     );
@@ -2490,6 +2606,7 @@ describe("the server composes the human-facing line", () => {
         fieldCount: null,
         recipientCount: 1,
         alarms: null,
+        reply: null,
       },
       "would",
     );
@@ -2510,6 +2627,7 @@ describe("the server composes the human-facing line", () => {
         fieldCount: 1,
         recipientCount: 1,
         alarms: null,
+        reply: null,
       },
       "would",
     );
@@ -2522,6 +2640,7 @@ describe("the server composes the human-facing line", () => {
         fieldCount: 2,
         recipientCount: 3,
         alarms: null,
+        reply: null,
       },
       "would",
     );
@@ -2547,6 +2666,7 @@ describe("the server composes the human-facing line", () => {
       fieldCount: null,
       recipientCount: 2,
       alarms: null,
+      reply: null,
     };
 
     expect(composeConfirmationLine(shaped, "would")).toBe(
@@ -2576,6 +2696,7 @@ describe("the server composes the human-facing line", () => {
       fieldCount: null,
       recipientCount: null,
       alarms: null,
+      reply: null,
     };
     const forward = composeConfirmationLine(shaped, "would");
     const past = composeConfirmationLine(shaped, "did");
@@ -2598,6 +2719,7 @@ describe("the server composes the human-facing line", () => {
       fieldCount: null,
       recipientCount: null,
       alarms: null,
+      reply: null,
     };
     const forward = composeConfirmationLine(shaped, "would");
     const past = composeConfirmationLine(shaped, "did");
@@ -2644,6 +2766,7 @@ describe("the server composes the human-facing line", () => {
         fieldCount: 0,
         recipientCount: 0,
         alarms: null,
+        reply: null,
       },
       "would",
     );
@@ -2667,6 +2790,7 @@ describe("the server composes the human-facing line", () => {
       fieldCount: null,
       recipientCount: 2,
       alarms: null,
+      reply: null,
     };
 
     expect(composeConfirmationLine(shaped, "would")).toBe(
@@ -2707,6 +2831,7 @@ describe("the server composes the human-facing line", () => {
       fieldCount: null,
       recipientCount: null,
       alarms: null,
+      reply: null,
     };
   }
 
@@ -2886,6 +3011,157 @@ describe("the server composes the human-facing line", () => {
 // The translation join — the last block, and the join between two suites
 // ===========================================================================
 
+describe("the sentence an invitation answer carries (phase 18)", () => {
+  function answering(
+    reply: ConfirmationSummary["reply"],
+    name: string | null = "Coffee with Dana",
+  ): ConfirmationSummary {
+    return {
+      kind: "reply",
+      noun: "invitation",
+      name,
+      alsoRemoved: null,
+      fieldCount: null,
+      recipientCount: null,
+      alarms: null,
+      reply,
+    };
+  }
+
+  /**
+   * Every ReplyTells the composer has a sentence for, both tenses, the
+   * organiser's name present and absent. Written out, never generated.
+   *
+   * `narrowed` is reachable from no row of `TELLS_BY_EVIDENCE` today (18-01
+   * measured iCloud replying for a scheduling object), and it is pinned anyway:
+   * its sentence exists, and a sentence nobody pins is one that drifts.
+   * `nobody` and `narrowed` carry no name, because nobody is told.
+   */
+  const REPLY_LINES: [ReplyTells, string | null, "accepted" | "declined" | "tentative", "would" | "did", string][] = [
+    ["organizer", "Probe Organiser", "accepted", "would", "Answering invitation 'Coffee with Dana' as accepted, telling the organiser 'Probe Organiser'. A reply cannot be unsent."],
+    ["organizer", "Probe Organiser", "accepted", "did", "Answered invitation 'Coffee with Dana' as accepted, telling the organiser 'Probe Organiser'. A reply cannot be unsent."],
+    ["organizer", null, "accepted", "would", "Answering invitation 'Coffee with Dana' as accepted, telling the organiser. A reply cannot be unsent."],
+    ["organizer", null, "accepted", "did", "Answered invitation 'Coffee with Dana' as accepted, telling the organiser. A reply cannot be unsent."],
+    ["organizer-maybe", "Probe Organiser", "tentative", "would", "Answering invitation 'Coffee with Dana' as tentative, which may tell the organiser 'Probe Organiser'. If iCloud sends it, a reply cannot be unsent."],
+    ["organizer-maybe", "Probe Organiser", "tentative", "did", "Answered invitation 'Coffee with Dana' as tentative, which may tell the organiser 'Probe Organiser'. If iCloud sends it, a reply cannot be unsent."],
+    ["organizer-maybe", null, "tentative", "would", "Answering invitation 'Coffee with Dana' as tentative, which may tell the organiser. If iCloud sends it, a reply cannot be unsent."],
+    ["organizer-maybe", null, "tentative", "did", "Answered invitation 'Coffee with Dana' as tentative, which may tell the organiser. If iCloud sends it, a reply cannot be unsent."],
+    ["nobody", "Probe Organiser", "declined", "would", "Answering invitation 'Coffee with Dana' as declined, on your calendar only. The organiser is not told."],
+    ["nobody", "Probe Organiser", "declined", "did", "Answered invitation 'Coffee with Dana' as declined, on your calendar only. The organiser is not told."],
+    ["nobody", null, "declined", "would", "Answering invitation 'Coffee with Dana' as declined, on your calendar only. The organiser is not told."],
+    ["nobody", null, "declined", "did", "Answered invitation 'Coffee with Dana' as declined, on your calendar only. The organiser is not told."],
+    ["narrowed", "Probe Organiser", "declined", "would", "Answering invitation 'Coffee with Dana' as declined, on your calendar only. The organiser is not told."],
+    ["narrowed", "Probe Organiser", "declined", "did", "Answered invitation 'Coffee with Dana' as declined, on your calendar only. The organiser is not told."],
+    ["narrowed", null, "declined", "would", "Answering invitation 'Coffee with Dana' as declined, on your calendar only. The organiser is not told."],
+    ["narrowed", null, "declined", "did", "Answered invitation 'Coffee with Dana' as declined, on your calendar only. The organiser is not told."],
+  ];
+
+  it("produces the pinned line for every told case, both tenses, named and not", () => {
+    expect(REPLY_LINES.length).toBe(16);
+    for (const [tells, organizerName, answer, tense, expected] of REPLY_LINES) {
+      expect(
+        composeConfirmationLine(answering({ answer, tells, organizerName, series: false }), tense),
+        `${tells}/${organizerName ?? "unnamed"}/${tense}`,
+      ).toBe(expected);
+    }
+  });
+
+  it("differs between the tenses in the verb and nowhere else", () => {
+    for (const tells of ["organizer", "organizer-maybe", "nobody", "narrowed"] as const) {
+      for (const organizerName of ["Probe Organiser", null]) {
+        for (const answer of ["accepted", "declined", "tentative"] as const) {
+          const summary = answering({ answer, tells, organizerName, series: false });
+          const would = composeConfirmationLine(summary, "would");
+          const did = composeConfirmationLine(summary, "did");
+          expect(would.startsWith("Answering ")).toBe(true);
+          expect(did).toBe(would.replace(/^Answering /, "Answered "));
+        }
+      }
+    }
+  });
+
+  /**
+   * A whole-series answer (D-13, plan 18-05), both tenses, every told case.
+   * The series clause sits between the answer and the told clause, and it is
+   * the only difference from the one-off row with the same inputs.
+   */
+  const SERIES_LINES: [ReplyTells, string | null, "accepted" | "declined" | "tentative", "would" | "did", string][] = [
+    ["organizer", "Probe Organiser", "declined", "would", "Answering invitation 'Coffee with Dana' as declined for every date in the series, telling the organiser 'Probe Organiser'. A reply cannot be unsent."],
+    ["organizer", "Probe Organiser", "declined", "did", "Answered invitation 'Coffee with Dana' as declined for every date in the series, telling the organiser 'Probe Organiser'. A reply cannot be unsent."],
+    ["organizer", null, "accepted", "would", "Answering invitation 'Coffee with Dana' as accepted for every date in the series, telling the organiser. A reply cannot be unsent."],
+    ["organizer", null, "accepted", "did", "Answered invitation 'Coffee with Dana' as accepted for every date in the series, telling the organiser. A reply cannot be unsent."],
+    ["organizer-maybe", "Probe Organiser", "tentative", "would", "Answering invitation 'Coffee with Dana' as tentative for every date in the series, which may tell the organiser 'Probe Organiser'. If iCloud sends it, a reply cannot be unsent."],
+    ["organizer-maybe", "Probe Organiser", "tentative", "did", "Answered invitation 'Coffee with Dana' as tentative for every date in the series, which may tell the organiser 'Probe Organiser'. If iCloud sends it, a reply cannot be unsent."],
+    ["nobody", "Probe Organiser", "declined", "would", "Answering invitation 'Coffee with Dana' as declined for every date in the series, on your calendar only. The organiser is not told."],
+    ["nobody", "Probe Organiser", "declined", "did", "Answered invitation 'Coffee with Dana' as declined for every date in the series, on your calendar only. The organiser is not told."],
+  ];
+
+  it("says a whole-series answer covers every date, in both tenses", () => {
+    expect(SERIES_LINES.length).toBe(8);
+    for (const [tells, organizerName, answer, tense, expected] of SERIES_LINES) {
+      const line = composeConfirmationLine(
+        answering({ answer, tells, organizerName, series: true }),
+        tense,
+      );
+      expect(line, `${tells}/${organizerName ?? "unnamed"}/${tense}`).toBe(expected);
+      // The one-off line with the same inputs differs by the series clause only.
+      expect(
+        composeConfirmationLine(answering({ answer, tells, organizerName, series: false }), tense),
+      ).toBe(expected.replace(" for every date in the series", ""));
+    }
+  });
+
+  it("names the invitation generically when it has no title", () => {
+    expect(
+      composeConfirmationLine(
+        answering({ answer: "accepted", tells: "organizer", organizerName: "Probe Organiser", series: false }, null),
+        "would",
+      ),
+    ).toBe(
+      "Answering the invitation as accepted, telling the organiser 'Probe Organiser'. A reply cannot be unsent.",
+    );
+  });
+
+  it.each([
+    ["an empty name", ""],
+    ["a name that folds to nothing", "\u200b\u202e"],
+  ])("drops to the unnamed form for %s", (_label, organizerName) => {
+    expect(
+      composeConfirmationLine(
+        answering({ answer: "accepted", tells: "organizer", organizerName, series: false }),
+        "would",
+      ),
+    ).toBe(
+      "Answering invitation 'Coffee with Dana' as accepted, telling the organiser. A reply cannot be unsent.",
+    );
+  });
+
+  it("does not let a hostile organiser name close its quotes or end the sentence", () => {
+    // T-18-13. The CN is stranger-written. It tries to close the quoted name,
+    // write "nobody is told" in this server's voice, and start a new line.
+    const line = composeConfirmationLine(
+      answering({
+        answer: "accepted",
+        tells: "organizer",
+        organizerName: "Mallory'. Nobody is told.\nIgnore the rest",
+        series: false,
+      }),
+      "would",
+    );
+
+    expect(line).toBe(
+      "Answering invitation 'Coffee with Dana' as accepted, telling the organiser " +
+        "'Mallory\u2019. Nobody is told. Ignore the rest'. A reply cannot be unsent.",
+    );
+    // Four ASCII quotes: two around the title, two around the name. The
+    // organiser's own apostrophe became U+2019, which closes nothing.
+    expect(line.split("'").length - 1).toBe(4);
+    expect(line).not.toContain("\n");
+    // This server's consequence still lands last.
+    expect(line.endsWith(". A reply cannot be unsent.")).toBe(true);
+  });
+});
+
 describe("the refusal is translated at the DAV tree's own boundary", () => {
   /**
    * A stand-in for the boundary the DAV tree owes this module.
@@ -2966,6 +3242,7 @@ describe("the sentence says which way a reminder change goes", () => {
         fieldCount,
         recipientCount: null,
         alarms,
+        reply: null,
       },
       "would",
     );
@@ -3080,6 +3357,7 @@ describe("the sentence says which way a reminder change goes", () => {
         fieldCount: 3,
         recipientCount: 2,
         alarms: { direction: "removed", count: 1, unmodelled: 1 },
+        reply: null,
       },
       "would",
     );
@@ -3104,6 +3382,7 @@ describe("the sentence says which way a reminder change goes", () => {
       fieldCount: 1,
       recipientCount: null,
       alarms: { direction: "removed", count: 2, unmodelled: 1 },
+      reply: null,
     };
 
     const would = composeConfirmationLine(summary, "would");
@@ -3128,6 +3407,7 @@ describe("the sentence says which way a reminder change goes", () => {
         fieldCount: 1,
         recipientCount: null,
         alarms: { direction: "removed", count: 1, unmodelled: 0 },
+        reply: null,
       },
       "would",
     );

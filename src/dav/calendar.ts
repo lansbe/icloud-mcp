@@ -52,9 +52,11 @@ import {
   applyEventChange,
   applyExdate,
   applyOccurrenceOverride,
+  applyReply,
   buildVEvent,
   countOccurrences,
   dropOverride,
+  expandOccurrences,
   expandWithinBudget,
   findOccurrence,
   isRecurringResource,
@@ -77,11 +79,14 @@ import type {
   BuildEventInput,
   BuildParticipants,
   EventParticipant,
+  EventTime,
   Occurrence,
   OccurrenceCounts,
+  OccurrenceKeep,
   OverrideRange,
   ParsedCalendarResource,
   PinnedOccurrences,
+  ReplyAnswer,
   StepBudget,
   WriteScope,
 } from "./icalendar";
@@ -1898,6 +1903,7 @@ async function collectFromFeed(
   rangeEnd: number,
   into: PendingOccurrence[],
   budget: StepBudget,
+  keep: OccurrenceKeep = "starts",
 ): Promise<boolean> {
   if (collection.source === null) throw new DavSubscriptionError();
 
@@ -1915,7 +1921,7 @@ async function collectFromFeed(
     }
 
     const result = withParsedResource(icsText, (resource) =>
-      expandWithinBudget(resource, rangeStart, rangeEnd, budget),
+      expandWithinBudget(resource, rangeStart, rangeEnd, budget, undefined, undefined, keep),
     );
     if (result.truncated) truncated = true;
 
@@ -1968,9 +1974,10 @@ async function collectFrom(
   rangeEnd: number,
   into: PendingOccurrence[],
   budget: StepBudget,
+  keep: OccurrenceKeep = "starts",
 ): Promise<boolean> {
   if (collection.subscribed) {
-    return collectFromFeed(collection, rangeStart, rangeEnd, into, budget);
+    return collectFromFeed(collection, rangeStart, rangeEnd, into, budget, keep);
   }
 
   const objects = await fetchCalendarObjects({
@@ -2003,7 +2010,7 @@ async function collectFrom(
     // claim a zone NAME owns it for the isolate, and a stranger's invitation
     // silently re-anchors the user's own meetings in every later request.
     const result = withParsedResource(data, (resource) =>
-      expandWithinBudget(resource, rangeStart, rangeEnd, budget),
+      expandWithinBudget(resource, rangeStart, rangeEnd, budget, undefined, undefined, keep),
     );
     if (result.truncated) truncated = true;
 
@@ -2455,9 +2462,22 @@ export interface SlotPage {
 }
 
 /** A busy interval, half-open: `[start, end)` in seconds since the epoch. */
-interface BusyInterval {
+export interface BusyInterval {
   start: number;
   end: number;
+}
+
+/**
+ * The parts of an occurrence `busyIntervalOf` reads, and nothing else.
+ *
+ * Structural, so the invitation-answer preview can ask the same question of an
+ * event it read through `getEventWithEtag` — whose detail carries the same
+ * wall clocks and instants — without building an `Occurrence` it does not have.
+ * Every `Occurrence` satisfies it, so the free-slot sweep is unchanged.
+ */
+export interface TimedSpan {
+  start: Pick<EventTime, "allDay" | "local" | "utc">;
+  end: Pick<EventTime, "local" | "utc">;
 }
 
 /**
@@ -2480,7 +2500,7 @@ interface BusyInterval {
  * single named start day — a zero-length or reversed occurrence still blocks its
  * own day rather than vanishing, which is the whole point of not dropping it.
  */
-function busyIntervalOf(occurrence: Occurrence, tzid: string): BusyInterval | null {
+export function busyIntervalOf(occurrence: TimedSpan, tzid: string): BusyInterval | null {
   const start = occurrence.start;
   const end = occurrence.end;
 
@@ -2803,6 +2823,262 @@ export async function findFreeSlots(
   });
 }
 
+/** What one conflict sweep asks for. Every field a resolved, concrete value. */
+export interface WindowConflictOptions {
+  /** The range the calendars are read over, in SECONDS. Capped like find-slots. */
+  rangeStart: number;
+  /** The range end, in SECONDS. Half-open. */
+  rangeEnd: number;
+  /** The windows an occurrence must overlap to count, each half-open. */
+  windows: readonly { start: number; end: number }[];
+  /** The resource the question is ABOUT, which is never its own conflict. */
+  excludeObjectUrl: string;
+  /** Its UID, so a copy of it on another calendar is not a conflict either. */
+  excludeUid: string | null;
+  /** The zone an occurrence with no instant is placed in (`busyIntervalOf`). */
+  tzid: string;
+}
+
+/** One other event overlapping the window. The title is stranger text. */
+export interface WindowConflict {
+  summary: string | null;
+  allDay: boolean;
+  startLocal: string;
+  endLocal: string;
+  startUtc?: number;
+  endUtc?: number;
+  startTzid: string;
+}
+
+/** What the sweep found, and whether it could look everywhere. */
+export interface WindowConflicts {
+  conflicts: WindowConflict[];
+  /**
+   * True when at least one calendar could not be read in full — a subscribed
+   * calendar with no readable source, or a cap that stopped an expansion.
+   *
+   * **Read with `SlotPage.truncated`'s valence, not `EventPage`'s.** A short
+   * conflict list is not a safe answer here: "nothing else is on your calendar
+   * then" is a claim the user acts on, and a calendar this server skipped is
+   * exactly where the clash would be. So a caller must never say "no conflicts"
+   * while this is set (RSVP-03, T-18-22).
+   */
+  truncated: boolean;
+  /**
+   * True when an event with no instant — an all-day date, or a time whose zone
+   * did not resolve — sat close enough to a window that the zone it was placed
+   * in decided whether it counted (18-REVIEW WR-03).
+   *
+   * "Close enough" is within fourteen hours of a window, the widest offset any
+   * zone has from UTC, so no zone could have moved it further. A caller whose
+   * `tzid` was a guess rather than the user's own must not call the answer
+   * complete while this is set.
+   */
+  placedByZone: boolean;
+}
+
+/** The widest offset any zone has from UTC, in seconds (UTC+14). */
+const WIDEST_ZONE_OFFSET_SECONDS = 14 * 60 * 60;
+
+/**
+ * Find every other event, on every calendar the account has, that overlaps an
+ * invitation's window (RSVP-03, D-11).
+ *
+ * ## The sweep is `findFreeSlots`' own
+ *
+ * One PROPFIND enumerates every calendar, then a plain `for...of` reads each one
+ * through the unmodified `collectFrom`, SERIALLY, under one step budget for the
+ * whole sweep. Never a combinator: every calendar is a request against one
+ * account, and iCloud's per-account ceiling is lower than the platform's and
+ * locks the user out of their own mail when exhausted (./.claude/CLAUDE.md §3).
+ * The scan names this function on the `dav-concurrent-request` alternation for
+ * that reason.
+ *
+ * ## What counts
+ *
+ * An occurrence counts when `busyIntervalOf` places it overlapping any window —
+ * start before the window's end and end after its start, so an event that only
+ * TOUCHES the window does not count. An all-day event or one whose zone did not
+ * resolve blocks its whole named day in `tzid`, as it does for free slots: a
+ * whole-day block is the conservative reading of an event with no instant.
+ *
+ * Two things never count: the invitation's own resource, and any resource
+ * carrying the same UID — the same meeting delivered to a second calendar is
+ * the invitation, not a clash with it.
+ *
+ * **An event that began before the read range still counts** (18-REVIEW
+ * CR-01). The read's expansion keeps every occurrence that overlaps the range,
+ * not only those that start in it, so a conference that started two days ago
+ * and runs across the invitation is found. A listing keeps only what starts in
+ * its range, and this sweep used to share that rule; it then said "nothing
+ * else" beside a week out of office.
+ *
+ * ## Fails closed
+ *
+ * A subscribed calendar with no source is skipped and marks the result
+ * truncated, exactly as the free-slot sweep does (CR-02); an expansion cap does
+ * the same. The conflicts found are still returned — a partial list is useful
+ * — but `truncated` says the list may be short, and the caller must say so.
+ *
+ * It takes no caller-supplied URL: every collection comes from the account's
+ * own enumeration, so there is nothing for the home-containment gate to check.
+ */
+export async function findWindowConflicts(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  options: WindowConflictOptions,
+): Promise<WindowConflicts> {
+  assertSlotRange(options.rangeStart, options.rangeEnd);
+
+  return withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
+    const collections = await fetchCollections(davFetch, resolved);
+
+    const budget = newStepBudget();
+    const pending: PendingOccurrence[] = [];
+    let truncated = false;
+
+    // SERIAL, as in `findFreeSlots`: each calendar fully awaited before the next.
+    for (const collection of collections) {
+      // Unreadable, so the sweep is incomplete — never "nothing here" (CR-02).
+      if (collection.subscribed && collection.source === null) {
+        truncated = true;
+        continue;
+      }
+      // `overlaps`, not a listing's `starts`: an event that began before the
+      // read and is still running across the window is a conflict (CR-01).
+      const collectionTruncated = await collectFrom(
+        collection,
+        davFetch,
+        options.rangeStart,
+        options.rangeEnd,
+        pending,
+        budget,
+        "overlaps",
+      );
+      if (collectionTruncated) truncated = true;
+    }
+
+    const conflicts: WindowConflict[] = [];
+    let placedByZone = false;
+    for (const one of pending) {
+      if (one.objectUrl === options.excludeObjectUrl) continue;
+      const { occurrence } = one;
+      if (options.excludeUid !== null && occurrence.uid === options.excludeUid) continue;
+      const interval = busyIntervalOf(occurrence, options.tzid);
+      if (interval === null) continue;
+
+      // An event with no instant was placed by `tzid`. If any zone could have
+      // put it across a window, where it landed decided the answer (WR-03).
+      const noInstant = occurrence.start.utc === undefined || occurrence.end.utc === undefined;
+      if (
+        noInstant &&
+        options.windows.some(
+          (window) =>
+            interval.start - WIDEST_ZONE_OFFSET_SECONDS < window.end &&
+            interval.end + WIDEST_ZONE_OFFSET_SECONDS > window.start,
+        )
+      ) {
+        placedByZone = true;
+      }
+
+      const overlaps = options.windows.some(
+        (window) => interval.start < window.end && interval.end > window.start,
+      );
+      if (!overlaps) continue;
+
+      const row: WindowConflict = {
+        summary: occurrence.summary,
+        allDay: occurrence.start.allDay,
+        startLocal: occurrence.start.local,
+        endLocal: occurrence.end.local,
+        startTzid: occurrence.start.tzid,
+      };
+      // Assigned rather than spread, so an absent instant stays ABSENT — the
+      // rule `summaryFor` follows.
+      if (occurrence.start.utc !== undefined) row.startUtc = occurrence.start.utc;
+      if (occurrence.end.utc !== undefined) row.endUtc = occurrence.end.utc;
+      conflicts.push(row);
+    }
+
+    // In time order, so the list reads the way a day does.
+    conflicts.sort(
+      (a, b) =>
+        (busyIntervalOf(toSpan(a), options.tzid)?.start ?? 0) -
+        (busyIntervalOf(toSpan(b), options.tzid)?.start ?? 0),
+    );
+
+    return { conflicts, truncated, placedByZone };
+  });
+}
+
+/**
+ * A series' own dates inside a range, as busy windows (OQ5).
+ *
+ * Pure: it expands resource text the caller already holds and issues no
+ * request. Each occurrence overlapping `[rangeStart, rangeEnd)` is placed by
+ * `busyIntervalOf` in `tzid`, the same way the conflict sweep places every
+ * other event, so an invitation's dates and the events they might collide with
+ * are measured by one rule. A moved date appears at its moved time.
+ *
+ * **Overlapping, not starting, and cut to the range once placed** (18-REVIEW
+ * CR-01). An all-day date has no zone, and the expansion compares it as
+ * midnight UTC. West of UTC that is before local midnight, so a range that
+ * starts at local midnight dropped today's own date when the rule was "starts
+ * in the range", and today was never checked. The expansion now keeps what
+ * overlaps; the placed window is then cut to the range, because the range is
+ * what the caller reads and states, and a part outside it was checked against
+ * nothing. A window with nothing left inside the range is dropped.
+ *
+ * `truncated` is the expansion's own report that a cap stopped it before the
+ * range was exhausted. The caller must then say the check was partial: dates
+ * this function never produced are dates nothing was checked against (T-18-31).
+ * The occurrence cap and the step cap are the module's own, unchanged.
+ *
+ * `placedByZone` says at least one kept date had no instant — an all-day date,
+ * or a time whose zone did not resolve — so where it lies depends on `tzid`
+ * (18-REVIEW WR-03). A caller whose `tzid` was a guess must say so.
+ */
+export function occurrenceWindowsOf(
+  icsText: string,
+  rangeStart: number,
+  rangeEnd: number,
+  tzid: string,
+): { windows: BusyInterval[]; truncated: boolean; placedByZone: boolean } {
+  return withParsedResource(icsText, (resource) => {
+    const expanded = expandOccurrences(
+      resource,
+      rangeStart,
+      rangeEnd,
+      undefined,
+      undefined,
+      "overlaps",
+    );
+    const windows: BusyInterval[] = [];
+    let placedByZone = false;
+    for (const occurrence of expanded.occurrences) {
+      const placed = busyIntervalOf(occurrence, tzid);
+      if (placed === null) continue;
+      const start = Math.max(placed.start, rangeStart);
+      const end = Math.min(placed.end, rangeEnd);
+      if (end <= start) continue;
+      windows.push({ start, end });
+      if (occurrence.start.utc === undefined || occurrence.end.utc === undefined) {
+        placedByZone = true;
+      }
+    }
+    return { windows, truncated: expanded.truncated, placedByZone };
+  });
+}
+
+/** A conflict row, as the span `busyIntervalOf` reads. */
+function toSpan(row: WindowConflict): TimedSpan {
+  return {
+    start: { allDay: row.allDay, local: row.startLocal, utc: row.startUtc },
+    end: { local: row.endLocal, utc: row.endUtc },
+  };
+}
+
 /**
  * Read one resource's body out of a multi-status, addressed by its own URL.
  *
@@ -2883,6 +3159,47 @@ function etagFor(
         ? (raw as { _cdata?: unknown })._cdata
         : raw;
     if (typeof value === "string" && value.length > 0) return value;
+  }
+  return null;
+}
+
+/**
+ * Read one resource's `schedule-tag` out of the SAME multi-status the body came
+ * from, or null when the server returned none.
+ *
+ * `etagFor`'s double read and href resolution, for its reasons. Two differences,
+ * both about what the XML layer hands back. A property the server answered 404
+ * never reaches here: the library drops a non-2xx propstat before merging, so an
+ * imported copy — which answers exactly that — reads as absent, which is what it
+ * is. And the library converts a value that LOOKS numeric into a number, so a
+ * finite number is read back as its string rather than refused: a tag's spelling
+ * is the server's, and its presence is the fact that is used.
+ */
+function scheduleTagFor(
+  responses: DAVResponse[],
+  calendarUrl: string,
+  objectUrl: string,
+): string | null {
+  for (const response of responses) {
+    const href = response.href;
+    if (typeof href !== "string" || href.length === 0) continue;
+
+    let resolved: string;
+    try {
+      resolved = new URL(href, calendarUrl).href;
+    } catch {
+      // Nothing is read from the caught value.
+      continue;
+    }
+    if (resolved !== objectUrl) continue;
+
+    const raw = response.props?.scheduleTag;
+    const value =
+      raw !== null && typeof raw === "object"
+        ? (raw as { _cdata?: unknown })._cdata
+        : raw;
+    if (typeof value === "string" && value.length > 0) return value;
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
   }
   return null;
 }
@@ -3119,6 +3436,26 @@ export interface EventWithEtag {
    * and this field reports the one that was true.
    */
   sequence: number | null;
+  /**
+   * The resource's `schedule-tag`, exactly as the server spelled it, or null
+   * when the server returned none.
+   *
+   * **The one server-side statement that decides who an answer tells.** Plan
+   * 18-01 measured it on the live account: the copy of an invitation iCloud
+   * itself delivered carried one, and answering it told the organiser; an
+   * imported copy answered the property 404, and answering it told nobody. It
+   * is RFC 6638's own marker for a scheduling object resource, written by the
+   * server rather than by whoever sent the invitation.
+   *
+   * Read from the SAME multi-status as the body and the ETag, on `etagFor`'s
+   * argument: a second request would open a race between the marker and the
+   * bytes it describes. iCloud's answer to the write carries no tag at all, so
+   * this read is the only place it can come from.
+   *
+   * UNTRUSTED and never published. The tool layer reduces it to one of three
+   * literals it computes; the value itself leaves nowhere.
+   */
+  scheduleTag: string | null;
 }
 
 // A NOTE ON THE ALLOW-LIST THAT NO LONGER EXISTS.
@@ -3400,6 +3737,7 @@ interface ReadEvent {
   isScheduling: boolean;
   hasSeriesMaster: boolean;
   sequence: number | null;
+  scheduleTag: string | null;
 }
 
 /**
@@ -3435,7 +3773,11 @@ async function readEvent(
 
     const responses = await calendarMultiGet({
       url: ref.calendarUrl,
-      props: { "d:getetag": {}, "c:calendar-data": {} },
+      // `schedule-tag` rides the same request (18-01): it is what says whether
+      // answering this resource tells the organiser, and a server that holds
+      // none answers it 404 inside this one multi-status rather than failing
+      // the read. See `EventWithEtag.scheduleTag`.
+      props: { "d:getetag": {}, "c:calendar-data": {}, "c:schedule-tag": {} },
       // The path only, matching the form the library's own object fetch sends.
       objectUrls: [new URL(ref.objectUrl).pathname],
       depth: "1",
@@ -3455,6 +3797,8 @@ async function readEvent(
     // then pins as though the two were consistent — which is the precise
     // failure `If-Match` exists to prevent, reintroduced one layer up.
     const etag = etagFor(responses, ref.calendarUrl, ref.objectUrl);
+    // And the scheduling marker, from the same multi-status for the same reason.
+    const scheduleTag = scheduleTagFor(responses, ref.calendarUrl, ref.objectUrl);
 
     // Re-parsed and re-expanded to the ONE occurrence named, rather than to a
     // range. A detail call has no range and no honest way to invent one — see
@@ -3540,6 +3884,7 @@ async function readEvent(
       isScheduling: read.scheduling,
       hasSeriesMaster: read.hasSeriesMaster,
       sequence: read.sequence,
+      scheduleTag,
     };
   });
 }
@@ -3577,6 +3922,7 @@ export async function getEventWithEtag(
     isScheduling: read.isScheduling,
     hasSeriesMaster: read.hasSeriesMaster,
     sequence: read.sequence,
+    scheduleTag: read.scheduleTag,
   };
 }
 
@@ -4370,25 +4716,24 @@ export function deliveryReportOf(
 const MAILTO_SCHEME = "mailto:";
 
 /**
- * The account's OWN address, chosen from the set its principal advertises.
+ * Every calendar-user address the signed-in account's principal advertises.
  *
- * ## Why this exists at all
+ * ## Why the whole set, and why it is its own function
  *
- * RFC 6638 requires an `ORGANIZER` to match one of the calendar user addresses
- * of the collection owner. A resource whose organiser does not match is not an
- * *organizer scheduling object resource*, so the server will not send on its
- * behalf — and it declines SILENTLY: the `PUT` still returns 2xx, the event
- * still appears on the calendar, and no invitation is ever sent. A meeting
- * nobody was told about, reported as a success, is the worst outcome this path
- * has, and it is the one this function exists to make unreachable.
+ * Until phase 18 this request lived inside `resolveOrganizerAddress`, which
+ * kept ONE address out of the answer because the invited create needs exactly
+ * one `ORGANIZER`. Answering an invitation needs the opposite: the user's line
+ * on a stranger's invitation can be written as any of the account's addresses,
+ * or as a principal path with the address only in a parameter (18-01 measured
+ * both), and a match against one address would call the user a stranger on
+ * their own invitation. So the SET became the primary value, this function owns
+ * the one request, and the create path's selection became a pure function over
+ * its answer (`organizerAddressFrom`). The create path's behaviour did not move.
  *
- * ## The selection rule, and what it was written against
+ * ## What the set looks like, and what it was written against
  *
- * Prefer the first `mailto:` entry whose address equals the account's login;
- * otherwise the first `mailto:` entry; otherwise REFUSE. Stated as a rule rather
- * than "take element zero", because probe P-1 measured what this account
- * actually advertises and the set is not a tidy list of addresses. Verbatim,
- * from `05-UAT.md` § P-1 (c):
+ * Probe P-1 measured what this account actually advertises. Verbatim, from
+ * `05-UAT.md` § P-1 (c):
  *
  * ```
  * mailto:user@mac.com      (preferred="1")
@@ -4398,25 +4743,10 @@ const MAILTO_SCHEME = "mailto:";
  * ```
  *
  * plus a principal path, a `urn:uuid:` form, and one opaque per-account
- * principal href. **Four mail addresses, not one** — so any later code deciding
- * "is this attendee the account owner" must match all four, or it will treat
- * the user as a stranger on their own meetings.
- *
- * What P-1 answered for THIS account and for no other: whether an alias works,
- * and whether the principal form is accepted. Neither is established, which is
- * why the fallback is the first `mailto:` rather than the principal href, and
- * why a set with no `mailto:` form at all is refused rather than guessed at.
- *
- * ## Why the refusal, rather than a fallback to the login
- *
- * Falling back to the login address when the set advertises no usable entry would
- * produce a resource that looks correct, writes successfully and returns 2xx —
- * and that iCloud silently declines to send from, for exactly the reason above.
- * A refusal costs the user a puzzled error; the fallback costs them a meeting
- * nobody was told about. `DavNotFoundError(false)`: the vocabulary is closed, an
- * address this server cannot find is the same class of answer as a resource it
- * cannot find, and re-resolving the account's home URLs cannot conjure a
- * `mailto:` entry the principal does not advertise.
+ * principal href. **Four mail addresses, not one** — so any code deciding "is
+ * this attendee the account owner" must match all four, or it will treat the
+ * user as a stranger on their own meetings. Every non-empty href comes back
+ * VERBATIM and in the server's order; choosing among them is the caller's job.
  *
  * ## What it does NOT take
  *
@@ -4424,25 +4754,25 @@ const MAILTO_SCHEME = "mailto:";
  * *the draft From identity is fixed and never a parameter, because a
  * caller-supplied From is a caller-supplied identity* — and the consequence here
  * is worse than a mislabelled draft: an invitation sent under somebody else's
- * name, to a real person, which cannot be unsent.
+ * name, or an answer given on somebody else's line, to a real person, which
+ * cannot be unsent. The set comes from the signed-in principal's own server
+ * answer and from nowhere else.
  *
- * ## What it costs, and why it is paid twice
+ * ## What it costs
  *
- * ONE `PROPFIND` at the principal, on a warm discovery cache. It is called only
- * on a path that carries at least one attendee — a create that reaches nobody
- * pays nothing — and it is resolved on BOTH legs of the gate rather than cached
- * or carried in the confirmation. Caching it beside discovery would change the
- * shape of an already-shipped cache entry, which is a migration on live data to
- * save one request on an already-gated path; putting it in the confirmation
- * payload would bind the identity into the signature, which is genuinely
- * attractive, but grows a payload whose size is deliberately independent of its
- * content. The cost is a serial +1 on each leg, not a fan-out.
+ * ONE `PROPFIND` at the principal, on a warm discovery cache. Resolved on BOTH
+ * legs of a gate rather than cached or carried in the confirmation. Caching it
+ * beside discovery would change the shape of an already-shipped cache entry,
+ * which is a migration on live data to save one request on an already-gated
+ * path; putting it in the confirmation would grow a payload whose size is
+ * deliberately independent of its content. The cost is a serial +1 on each
+ * leg, not a fan-out.
  */
-export async function resolveOrganizerAddress(
+export async function resolveCalendarUserAddresses(
   env: Env,
   principal: Principal,
   davFetch: DavFetch,
-): Promise<string> {
+): Promise<string[]> {
   return withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
     let advertised: string[];
     try {
@@ -4475,39 +4805,140 @@ export async function resolveOrganizerAddress(
       throw new DavNotFoundError(false);
     }
 
-    const addresses = advertised
-      .filter((one) => one.toLowerCase().startsWith(MAILTO_SCHEME))
-      .map((one) => one.slice(MAILTO_SCHEME.length))
-      .filter((one) => one.length > 0);
+    return advertised.filter((one) => one.length > 0);
+  });
+}
 
-    // The login FIRST, by a fold rather than by identity: an address set is
-    // returned by a server and its case is not the user's to control.
-    //
-    // The login is the signed-in principal's Apple ID (Phase 9, D-13). It is
-    // the same identity the DAV fetch logs in as and the cache is keyed by. It
-    // is always a string: a principal cannot be built without one, so the old
-    // branch for an unset login is gone.
-    // `fold` here lowercases and nothing else -- no trim, no ASCII gate, unlike
-    // the one folding function the door and the login share. That is SAFE ONLY
-    // BECAUSE of something invisible at this line: a principal cannot exist
-    // carrying an untrimmed or non-ASCII address, because its constructor
-    // refuses one (D-18). This match is leaning on that refusal. If the
-    // constructor is ever widened to accept more, this comparison starts
-    // silently selecting a different address rather than failing, so widening
-    // it is a decision that has to come back here.
-    //
-    // Nothing folded here reaches a key, a token or a store, which is why this
-    // is a second folding of the same field without being an ISO-05 breach.
-    const folded = fold(principal.appleId);
-    const own = addresses.find((one) => fold(one) === folded);
-    if (own !== undefined) return own;
+/**
+ * The account's OWN address for an `ORGANIZER`, chosen from the advertised set.
+ *
+ * ## Why this exists at all
+ *
+ * RFC 6638 requires an `ORGANIZER` to match one of the calendar user addresses
+ * of the collection owner. A resource whose organiser does not match is not an
+ * *organizer scheduling object resource*, so the server will not send on its
+ * behalf — and it declines SILENTLY: the `PUT` still returns 2xx, the event
+ * still appears on the calendar, and no invitation is ever sent. A meeting
+ * nobody was told about, reported as a success, is the worst outcome the
+ * invited create has, and this selection exists to make it unreachable.
+ *
+ * ## The selection rule
+ *
+ * Prefer the first `mailto:` entry whose address equals the account's login;
+ * otherwise the first `mailto:` entry; otherwise REFUSE. Stated as a rule rather
+ * than "take element zero", because the set P-1 measured is not a tidy list of
+ * addresses — see `resolveCalendarUserAddresses` for what it holds.
+ *
+ * What P-1 answered for THIS account and for no other: whether an alias works,
+ * and whether the principal form is accepted. Neither is established, which is
+ * why the fallback is the first `mailto:` rather than the principal href, and
+ * why a set with no `mailto:` form at all is refused rather than guessed at.
+ *
+ * ## Why the refusal, rather than a fallback to the login
+ *
+ * Falling back to the login address when the set advertises no usable entry would
+ * produce a resource that looks correct, writes successfully and returns 2xx —
+ * and that iCloud silently declines to send from, for exactly the reason above.
+ * A refusal costs the user a puzzled error; the fallback costs them a meeting
+ * nobody was told about. `DavNotFoundError(false)`: the vocabulary is closed, an
+ * address this server cannot find is the same class of answer as a resource it
+ * cannot find, and re-resolving the account's home URLs cannot conjure a
+ * `mailto:` entry the principal does not advertise.
+ *
+ * Pure. It was the second half of `resolveOrganizerAddress` until phase 18
+ * promoted the address set, and it moved verbatim: the create path's organiser
+ * is chosen by the same rule over the same list it always was.
+ */
+export function organizerAddressFrom(
+  advertised: readonly string[],
+  appleId: string,
+): string {
+  const addresses = advertised
+    .filter((one) => one.toLowerCase().startsWith(MAILTO_SCHEME))
+    .map((one) => one.slice(MAILTO_SCHEME.length))
+    .filter((one) => one.length > 0);
 
-    // Then the first advertised address, and a refusal if there is none. Never
-    // the login itself: an address the principal does not advertise is one
-    // iCloud will not send for, and it fails silently when it declines.
-    const first = addresses[0];
-    if (first === undefined) throw new DavNotFoundError(false);
-    return first;
+  // The login FIRST, by a fold rather than by identity: an address set is
+  // returned by a server and its case is not the user's to control.
+  //
+  // The login is the signed-in principal's Apple ID (Phase 9, D-13). It is
+  // the same identity the DAV fetch logs in as and the cache is keyed by. It
+  // is always a string: a principal cannot be built without one, so the old
+  // branch for an unset login is gone.
+  // `fold` here lowercases and nothing else -- no trim, no ASCII gate, unlike
+  // the one folding function the door and the login share. That is SAFE ONLY
+  // BECAUSE of something invisible at this line: a principal cannot exist
+  // carrying an untrimmed or non-ASCII address, because its constructor
+  // refuses one (D-18). This match is leaning on that refusal. If the
+  // constructor is ever widened to accept more, this comparison starts
+  // silently selecting a different address rather than failing, so widening
+  // it is a decision that has to come back here.
+  //
+  // Nothing folded here reaches a key, a token or a store, which is why this
+  // is a second folding of the same field without being an ISO-05 breach.
+  const folded = fold(appleId);
+  const own = addresses.find((one) => fold(one) === folded);
+  if (own !== undefined) return own;
+
+  // Then the first advertised address, and a refusal if there is none. Never
+  // the login itself: an address the principal does not advertise is one
+  // iCloud will not send for, and it fails silently when it declines.
+  const first = addresses[0];
+  if (first === undefined) throw new DavNotFoundError(false);
+  return first;
+}
+
+/**
+ * The account's OWN address, chosen from the set its principal advertises.
+ *
+ * The invited create's entry point, unchanged in signature and in behaviour:
+ * the one request is `resolveCalendarUserAddresses` and the choice is
+ * `organizerAddressFrom`, and each owns its own argument. Kept as a name rather
+ * than inlined at its call sites, because the create path reads it on both legs
+ * of its gate and the containment and fan-out rules already name it.
+ */
+export async function resolveOrganizerAddress(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+): Promise<string> {
+  return organizerAddressFrom(
+    await resolveCalendarUserAddresses(env, principal, davFetch),
+    principal.appleId,
+  );
+}
+
+/** What answering an invitation's stored bytes produced: the body, or why not. */
+export type ReplyBody =
+  | { kind: "ok"; body: string }
+  | { kind: "not-invited" | "organiser" | "ambiguous" | "unchanged" };
+
+/**
+ * The bytes to write for one answer, or the reason there are none.
+ *
+ * `patchEventBody`'s twin, and deliberately NOT a call to it: that builder
+ * asserts new values and advances the revision, and an answer must do neither
+ * (D-07). This one parses the stored resource, runs `applyReply` over it, and
+ * wraps the patched components back up in the resource's own `VCALENDAR` — so
+ * every `VTIMEZONE`, the `PRODID` and anything else the organiser's client wrote
+ * survive byte for byte.
+ *
+ * It returns the plan's refusal arm rather than null, so the caller can refuse
+ * with the right reason. `null` passes to the wrapper because an answer adds no
+ * zone.
+ */
+export function replyBody(
+  icsText: string,
+  addresses: readonly string[],
+  answer: ReplyAnswer,
+): ReplyBody {
+  return withParsedResource(icsText, (resource) => {
+    const plan = applyReply(resource, addresses, answer);
+    if (plan.kind !== "ok") return { kind: plan.kind };
+    return {
+      kind: "ok",
+      body: serializeOccurrenceResource(resource, plan.components, null),
+    };
   });
 }
 

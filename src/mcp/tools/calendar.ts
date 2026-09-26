@@ -41,13 +41,17 @@ import type {
   AlarmReading,
   AlarmSpec,
   BuildEventInput,
+  InvitationFacts,
   OccurrenceCounts,
   OverrideRange,
+  ReplyAnswer,
+  SchedulingEvidence,
   WriteScope,
 } from "../../dav/icalendar";
 import {
   MAX_RANGE_DAYS,
   MAX_SLOT_RANGE_DAYS,
+  occurrenceWindowsOf,
   UNOBSERVED_DELIVERY,
   assertCtag,
   createCalendarCollection,
@@ -55,7 +59,9 @@ import {
   deliveryReportOf,
   deleteCalendarCollection,
   deleteEvent,
+  busyIntervalOf,
   findFreeSlots,
+  findWindowConflicts,
   getEvent,
   getEventWithEtag,
   listCalendars,
@@ -66,6 +72,8 @@ import {
   planCreateTarget,
   planScopedDelete,
   readCollectionState,
+  replyBody,
+  resolveCalendarUserAddresses,
   resolveOrganizerAddress,
   searchEvents,
   uidFromObjectUrl,
@@ -77,10 +85,12 @@ import {
   UNBOUNDED_OCCURRENCES,
   WRITE_SCOPES,
   collapseAttendees,
+  invitationFactsOf,
   isSupportedTimezone,
   isWriteScope,
   localTimeToUtc,
   storedAlarmsOf,
+  utcToLocalTime,
 } from "../../dav/icalendar";
 import {
   decodeCalendarId,
@@ -91,6 +101,7 @@ import {
 import type { EventRef } from "../../dav/ids";
 import {
   DavConfirmationError,
+  DavConnectError,
   DavNotFoundError,
   DavStaleResourceError,
 } from "../../dav/errors";
@@ -100,10 +111,12 @@ import {
   CONFIRM_TTL_SECONDS,
   CONFIRM_VERSION,
   ConfirmationInvalidError,
+  REPLY_TELLS,
   changeHashMatches,
   changeHashOf,
   composeConfirmationLine,
   mintConfirmation,
+  replyChangeHashOf,
   reserveConfirmation,
   verifyConfirmation,
 } from "../../confirm";
@@ -113,6 +126,9 @@ import type {
   AttendeeChange,
   ConfirmationSummary,
   NormalizedChange,
+  NormalizedReplyChange,
+  ReplyAnswerWord,
+  ReplyTells,
 } from "../../confirm";
 import type { ToolResult } from "../untrusted";
 import { untrustedToolResult } from "../untrusted";
@@ -2547,6 +2563,7 @@ async function buildPreview(
         // added reminder, a replaced one and a deleted one alike — and the user
         // who agreed to that and then found their reminder gone was under-told.
         alarms: alarmSummary,
+        reply: null,
       },
       "would",
     ),
@@ -2836,6 +2853,7 @@ async function buildDeletePreview(
         // report — and a clause about them beside a clause about the occurrences
         // going would be the smaller loss stated next to the larger one.
         alarms: null,
+        reply: null,
       },
       "would",
     ),
@@ -3099,6 +3117,7 @@ async function buildCreatePreview(
         // "setting a reminder" on an event that did not exist a moment ago is
         // counting the event rather than describing a change.
         alarms: null,
+        reply: null,
       },
       "would",
     ),
@@ -3155,7 +3174,7 @@ function normalizeSupplied(supplied: SuppliedChange): NormalizedChange {
 
 /** The change shape `calendar_commit` accepts back, before normalisation. */
 interface SuppliedChange {
-  kind: "create" | "update" | "delete";
+  kind: "create" | "update" | "delete" | "reply";
   scope?: string | null;
   summary?: string | null;
   startLocal?: string | null;
@@ -3167,6 +3186,22 @@ interface SuppliedChange {
   description?: string | null;
   attendees?: { email: string; name?: string | null }[];
   alarms?: { minutesBefore: number; action: "display" }[] | null;
+  /**
+   * An invitation answer, carried back from `calendar_respond_to_invitation`.
+   *
+   * Read by `normalizeSuppliedReply` and by nothing else. `normalizeSupplied`
+   * ignores it on purpose: an update carries no answer, and a field that moved
+   * an update's hash would be a way to answer through the update tool (RSVP-06).
+   */
+  answer?: ReplyAnswerWord;
+  /**
+   * Who the reply preview said would be told, carried back with the answer.
+   *
+   * Read by `normalizeSuppliedReply` and by nothing else, on `answer`'s terms.
+   * It is hashed into the reply change (18-REVIEW WR-02), so the commit is
+   * bound to the sentence the user was shown.
+   */
+  tells?: ReplyTells;
 }
 
 /**
@@ -3765,6 +3800,7 @@ async function applyCommit(
           // NULL, on the create preview's own reason: there was nothing there
           // for a reminder to be a change TO.
           alarms: null,
+          reply: null,
         },
         "did",
       ),
@@ -3848,6 +3884,7 @@ async function applyCommit(
           // being read. `CONFIRMATION_CONSEQUENCES` already says it cannot be
           // undone.
           alarms: null,
+          reply: null,
         },
         "did",
       ),
@@ -4054,6 +4091,7 @@ async function applyCommit(
         // so it told nobody, and a line naming people beside an
         // `invitationsSent: false` would contradict the response it rides in.
         recipientCount,
+        reply: null,
       },
       "did",
     ),
@@ -4231,6 +4269,7 @@ async function buildCollectionDeletePreview(
         // is the smaller statement beside it, which is how the clause that
         // matters stops being read.
         alarms: null,
+        reply: null,
       },
       "would",
     ),
@@ -4327,10 +4366,19 @@ function collectionNoticeFor(
 async function targetOfConfirmation(
   userId: string,
   confirmToken: string,
-): Promise<"dav" | "col"> {
+): Promise<"dav" | "col" | "reply"> {
   try {
-    await verifyConfirmation(confirmToken, env.CONFIRM_SECRET, userId, "dav");
-    return "dav";
+    const payload = await verifyConfirmation(
+      confirmToken,
+      env.CONFIRM_SECRET,
+      userId,
+      "dav",
+    );
+    // An invitation answer rides the object arm and has its own commit arm.
+    // Routed on the SIGNED kind and on nothing else; the reply arm verifies for
+    // itself below and checks the kind again, so a routing mistake here would
+    // be refused there rather than written.
+    return payload.k === "reply" ? "reply" : "dav";
   } catch (err) {
     // Nothing is read from the caught value — ./.claude/CLAUDE.md § 4. Only its
     // TYPE is consulted, and anything that is not the neutral confirmation
@@ -4568,10 +4616,1382 @@ async function applyCollectionCommit(
               // is the smaller statement beside it, which is how the clause that
               // matters stops being read.
               alarms: null,
+              reply: null,
             },
             "did",
           )
         : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Answering an invitation (RSVP-01, RSVP-02, RSVP-04, RSVP-05)
+//
+// One preview tool and one commit arm. The preview reads the invitation, finds
+// the user's own line by the account's own addresses, says in this server's own
+// sentence who will be told, and mints a confirmation of the `reply` kind. The
+// commit re-reads, refuses if anything moved, and writes ONE conditional PUT of
+// the user's own copy that changes only their answer. Nothing else is sent: no
+// scheduling-outbox request, no mail, no second write (D-02, ./.claude/CLAUDE.md
+// § 2). Whether iCloud then tells the organiser is iCloud's doing, and 18-01
+// measured when it does.
+// ---------------------------------------------------------------------------
+
+/**
+ * The tool's three answer words, onto the protocol's own spelling.
+ *
+ * A closed table rather than an upper-casing, so the set of things this server
+ * can write into somebody's invitation is the three rows below and nothing a
+ * caller spells.
+ */
+const ANSWER_TO_PARTSTAT: Readonly<Record<ReplyAnswerWord, ReplyAnswer>> =
+  Object.freeze({
+    accepted: "ACCEPTED",
+    declined: "DECLINED",
+    tentative: "TENTATIVE",
+  });
+
+/** The answers a caller may give, in the order the schema lists them. */
+const REPLY_ANSWER_WORDS = ["accepted", "declined", "tentative"] as const;
+
+/**
+ * Who an answer tells, per the evidence the stored bytes carry.
+ *
+ * Filled from plan 18-01's live measurement on 2026-09-26 (18-UAT.md, VERDICT
+ * block), taken against the owner's own account while deployed version
+ * `14278dbf-7461-4ffb-bcc0-4948691e500d` served; the writes themselves went
+ * straight to iCloud, so no build of this server is in that evidence.
+ *
+ * - `scheduling-object` → `organizer`. `genuine_reply=sent`: a PARTSTAT-only
+ *   write on an invitation iCloud delivered was seen on the organiser's own
+ *   account.
+ * - `imported-copy` → `nobody`. `imported_reply=not-sent`: the same write on an
+ *   imported `.ics` reached nobody — the organiser's guest list still said
+ *   "awaiting", with nothing in either mailbox.
+ * - `undetermined` → `organizer-maybe`. The two measured cases DIFFER, so
+ *   neither can stand in for bytes that decide nothing. "Nobody" is never the
+ *   answer here, because a reply cannot be unsent (T-18-16).
+ *
+ * `narrowed` is reachable from no row: 18-01 measured iCloud replying for a
+ * scheduling object, so D-02's narrowing is not needed. One sample of each was
+ * measured, and 18-08 re-reads a live preview's `evidence` to check the row it
+ * took.
+ */
+export const TELLS_BY_EVIDENCE: Readonly<Record<SchedulingEvidence, ReplyTells>> =
+  Object.freeze({
+    "scheduling-object": "organizer",
+    "imported-copy": "nobody",
+    undetermined: "organizer-maybe",
+  });
+
+/**
+ * Why a reply preview declined to mint. A closed set.
+ *
+ * The first four are D-13's rule for how much of an invitation is answered,
+ * and each is a fact about the REQUEST against the event: see `replyScopeRefusal`.
+ */
+export type ReplyRefusal =
+  | "scope-on-single"
+  | "scope-required"
+  | "single-occurrence"
+  | "no-repeating-rule"
+  | "not-invited"
+  | "organiser"
+  | "ambiguous"
+  | "unchanged"
+  | "unsupported-timezone";
+
+/**
+ * The sentence each refusal carries. This server's own words, and the only ones.
+ *
+ * **None names an address, and `ambiguous` in particular counts rather than
+ * names.** A refusal that said which of the user's addresses it found would put
+ * the account's own address into a tool response, which § 4's reconciliation
+ * allows for exactly one tool and this is not it.
+ */
+const REPLY_REFUSAL_REASONS: Readonly<Record<ReplyRefusal, string>> =
+  Object.freeze({
+    "scope-on-single":
+      "This invitation does not repeat, so it takes no scope. Omit scope to " +
+      "answer it. Nothing was prepared.",
+    "scope-required":
+      "This invitation repeats. Say scope series to answer every date in it. " +
+      "Nothing was prepared.",
+    "single-occurrence":
+      "Answering one date of a repeating invitation, or one date onward, is " +
+      "not supported. Scope series, which answers every date, is. Nothing " +
+      "was prepared.",
+    "no-repeating-rule":
+      "This invitation is a set of individually edited dates with no " +
+      "repeating rule behind them. Answering it is not supported, so nothing " +
+      "was prepared.",
+    "not-invited":
+      "You are not invited to this event as a guest, so there is no answer " +
+      "of yours to set.",
+    organiser:
+      "You organise this event. An organiser does not answer their own " +
+      "invitation.",
+    ambiguous:
+      "Two of your addresses are on this invitation, and it is not clear " +
+      "which one the organiser is waiting on. Nothing was prepared.",
+    unchanged:
+      "Your answer is already this one. Nothing would change, so nothing " +
+      "was prepared.",
+    // Names no zone. The zone is the caller's string, and a refusal that
+    // echoed it would put caller text into this server's own sentence.
+    "unsupported-timezone":
+      "This server holds no definition for the requested time zone, so " +
+      "nothing was prepared. Omit the zone to see the event's own.",
+  });
+
+/**
+ * D-13's rule for how much of an invitation one answer reaches (OQ1).
+ *
+ * A repeating invitation is answered only as a whole series, and only when the
+ * caller SAYS so. Nothing is inferred: every id listed from a series carries a
+ * recurrence id, so the id cannot tell "this Tuesday" from "every Tuesday", and
+ * a guess either way sends a reply the user did not choose.
+ *
+ * - One-off, any scope: `scope-on-single`. The caller believes something false
+ *   about the event.
+ * - No master: `no-repeating-rule`, whatever the scope (Pitfall 7). What iCloud
+ *   does with an answer to a lone edited date of somebody else's series is
+ *   unmeasured.
+ * - Repeating, no scope: `scope-required`.
+ * - Repeating, `occurrence` or `this-and-future`: `single-occurrence`.
+ * - Repeating, `series`: answered.
+ *
+ * The preview runs it on its read and the commit runs it again on its re-read
+ * with the SIGNED scope, so the two legs cannot disagree about what was
+ * confirmed.
+ */
+function replyScopeRefusal(
+  isRecurring: boolean,
+  hasSeriesMaster: boolean,
+  scope: WriteScope | null,
+): ReplyRefusal | null {
+  if (!isRecurring) return scope === null ? null : "scope-on-single";
+  if (!hasSeriesMaster) return "no-repeating-rule";
+  if (scope === null) return "scope-required";
+  if (scope !== "series") return "single-occurrence";
+  return null;
+}
+
+/** The user's stored answer, as one of this server's own words. */
+export type CurrentAnswer =
+  | "accepted"
+  | "declined"
+  | "tentative"
+  | "needs-action"
+  | "other";
+
+/**
+ * The stored PARTSTAT values this server recognises, folded to upper case.
+ *
+ * Looked up through `get`, never an index, so a value naming an inherited
+ * member of the object prototype cannot escape the table — `deliveryStatusOf`'s
+ * rule. Anything unmatched is `other`: the value is a stranger's string, and
+ * this server declines to repeat it rather than declining to answer.
+ */
+const CURRENT_ANSWERS: ReadonlyMap<string, CurrentAnswer> = new Map([
+  ["ACCEPTED", "accepted"],
+  ["DECLINED", "declined"],
+  ["TENTATIVE", "tentative"],
+  ["NEEDS-ACTION", "needs-action"],
+]);
+
+/** The stored answer, matched. Null when the line carried no PARTSTAT. */
+function currentAnswerOf(raw: string | null): CurrentAnswer | null {
+  if (raw === null) return null;
+  return CURRENT_ANSWERS.get(raw.toUpperCase()) ?? "other";
+}
+
+/**
+ * Another attendee's stored answer, matched. Never null.
+ *
+ * A line with no PARTSTAT reads as `needs-action`, because RFC 5545 § 3.2.12
+ * makes that the default: a person who has said nothing has not answered.
+ * Unlike the user's own answer, "no value" here is not a separate fact worth a
+ * separate word.
+ */
+function otherAnswerOf(raw: string | null): CurrentAnswer {
+  return currentAnswerOf(raw) ?? "needs-action";
+}
+
+/**
+ * Where the preview's times came from.
+ *
+ * `requested`: this server converted the event's instants into a zone the
+ * caller named and it validated. `event`: the event's own wall clock, in the
+ * zone the event itself names — a stranger's string on the unresolved path.
+ */
+export type TimesZoneSource = "requested" | "event";
+
+/** The organiser as the preview names them (D-12). Stranger text. */
+export interface ReplyOrganizerRow {
+  /**
+   * The CN, else the address, else this server's own fixed phrase. Never null,
+   * so the organiser is never dropped and never printed as nothing.
+   */
+  name: string;
+  /** The address the reply goes to, or null when the invitation carries none. */
+  address: string | null;
+}
+
+/** One other attendee, as the preview lists them (D-10). */
+export interface ReplyAttendeeRow {
+  /** The CN, verbatim. Stranger text. */
+  name: string | null;
+  /** The address, verbatim. Stranger text. */
+  email: string | null;
+  /** Their stored answer, MATCHED against this server's closed table. */
+  answer: CurrentAnswer;
+}
+
+/** One other event overlapping the invitation (RSVP-03). Stranger text. */
+export interface ReplyConflictRow {
+  /** Its title, verbatim. */
+  title: string | null;
+  /** Its start, as a wall clock in `timesZone`. */
+  start: string;
+  /** Its end, on the same terms. */
+  end: string;
+  /** True when it is a date rather than an instant. */
+  allDay: boolean;
+  /** The zone `start` and `end` are in. */
+  timesZone: string;
+}
+
+/**
+ * The range a series' conflicts were checked over (OQ5), in the preview's zone.
+ *
+ * This server's own rendering of two instants it chose, in a zone it holds a
+ * definition for, so it rides in the trusted half.
+ */
+export interface ReplyConflictRange {
+  start: string;
+  end: string;
+  timesZone: string;
+}
+
+/** One date of a series the user answered on their own (OQ6). Stranger-derived. */
+export interface ReplySeparateAnswerRow {
+  /** The date, from the override's RECURRENCE-ID, as a wall clock in `timesZone`. */
+  date: string;
+  /** The zone `date` is in. */
+  timesZone: string;
+  /** The answer that date carries, MATCHED against this server's closed table. */
+  answer: CurrentAnswer;
+}
+
+/** How many days of a series the conflict check covers (OQ5): the slot sweep's own cap. */
+export const SERIES_CONFLICT_DAYS = MAX_SLOT_RANGE_DAYS;
+
+/** The sentence a series' conflict notice starts with. This server's own words. */
+const SERIES_CONFLICT_PREFIX = `Checked the next ${SERIES_CONFLICT_DAYS} days of this series. `;
+
+/**
+ * The one sentence about separate answers (OQ6), or null when there are none.
+ * Interpolates only this server's own count.
+ */
+export function separateAnswerNoticeOf(count: number): string | null {
+  if (count === 0) return null;
+  return count === 1
+    ? "You answered 1 date of this series separately. This answer replaces it."
+    : `You answered ${count} dates of this series separately. This answer replaces them.`;
+}
+
+/**
+ * How much of the account the conflict sweep could read.
+ *
+ * `complete`: every calendar, in full. `partial`: at least one calendar was
+ * skipped or cut short, so the list may be missing something. `no-zone`: every
+ * calendar was read, but no time zone was given and the invitation named none
+ * this server holds, so an all-day event — which has no time of its own —
+ * was placed on a UTC day, and whether it clashes depended on that guess
+ * (18-REVIEW WR-03). `none-in-range`: a series none of whose dates falls in
+ * the range checked, so nothing was compared with anything (18-REVIEW WR-04).
+ * `failed`: the sweep did not finish at all. Only `complete` may ever say
+ * "nothing else".
+ */
+export type ConflictsChecked =
+  | "complete"
+  | "partial"
+  | "no-zone"
+  | "none-in-range"
+  | "failed";
+
+/**
+ * The one sentence about conflicts, from a closed table (RSVP-03, T-18-22).
+ *
+ * **"Nothing else" is reachable from `complete` alone.** A sweep that skipped a
+ * calendar or stopped early says so, and says it whatever it found, because the
+ * calendar it could not read is exactly where the clash would be.
+ */
+export function conflictNoticeOf(checked: ConflictsChecked, count: number): string {
+  switch (checked) {
+    case "complete":
+      if (count === 0) return "Nothing else on your calendars overlaps it.";
+      return count === 1
+        ? "1 other event on your calendars overlaps it."
+        : `${count} other events on your calendars overlap it.`;
+    case "partial":
+      return "Conflicts could not be fully checked: at least one calendar could not be read in full.";
+    case "no-zone":
+      return (
+        "Conflicts could not be fully checked: no time zone was given, so " +
+        "all-day events were placed in UTC and may be on the wrong day."
+      );
+    case "none-in-range":
+      return (
+        `None of this series' dates fall in the next ${SERIES_CONFLICT_DAYS} ` +
+        "days, so none were checked for conflicts."
+      );
+    case "failed":
+      return "Conflicts could not be checked.";
+  }
+}
+
+/**
+ * The organiser's name when the invitation carries neither a name nor an
+ * address. This server's own words, so a preview never shows the organiser as
+ * null and never leaves them out (D-12).
+ */
+export const UNNAMED_ORGANISER = "an organiser whose address this server cannot read";
+
+/** The organiser row: the CN, else the address, else the fixed phrase. */
+function organizerRowOf(facts: InvitationFacts): ReplyOrganizerRow {
+  const { name, address } = facts.organizer;
+  return { name: name ?? address ?? UNNAMED_ORGANISER, address };
+}
+
+/** The name the composer quotes: the CN, else the address, else none. */
+function organizerNameFor(facts: InvitationFacts): string | null {
+  return facts.organizer.name ?? facts.organizer.address;
+}
+
+/** "The other N attendees are not told directly.", in either tense. */
+function othersNotToldOf(count: number, tense: "would" | "did"): string {
+  if (count === 1) {
+    return tense === "would"
+      ? "The other 1 attendee is not told directly."
+      : "The other 1 attendee was not told directly.";
+  }
+  return tense === "would"
+    ? `The other ${count} attendees are not told directly.`
+    : `The other ${count} attendees were not told directly.`;
+}
+
+/**
+ * Who hears about the answer, in plain words (RSVP-02, D-09, D-10).
+ *
+ * **One closed table, decided per event from the data, and no blanket
+ * caveat.** Which sentence is chosen is keyed on `tells` — itself looked up in
+ * `TELLS_BY_EVIDENCE` from what 18-01 measured — on whether the organiser's
+ * address is known, and on how many other people are on the invitation.
+ *
+ * **It holds no stranger text, and must not.** It is published in the TRUSTED
+ * half. The organiser's name is already in the fenced `organizer` row and in the
+ * composed line through the composer's quoting; a trusted sentence that
+ * carried the name would be a stranger's string presented as this server's.
+ * The only interpolations are this server's own answer word and its own count.
+ *
+ * `organizer-maybe` says "may" and never "will not": where the evidence cannot
+ * decide, the one claim that must not be made is that nobody hears, because a
+ * reply cannot be unsent (T-18-21).
+ */
+export function whoIsToldOf(
+  tells: ReplyTells,
+  answer: ReplyAnswerWord,
+  organizerAddressKnown: boolean,
+  othersCount: number,
+): string {
+  let lead: string;
+  switch (tells) {
+    case "organizer":
+      lead = organizerAddressKnown
+        ? "iCloud will tell the organiser your answer."
+        : "iCloud will tell the organiser your answer. This server cannot " +
+          "read the organiser's address, so it cannot show you where the " +
+          "reply goes.";
+      break;
+    case "organizer-maybe":
+      lead =
+        "The organiser may be told your answer by iCloud. This invitation " +
+        "does not show whether iCloud will send it.";
+      break;
+    case "nobody":
+      lead = "Only your calendar changes. Nobody is told.";
+      break;
+    case "narrowed":
+      lead = `Your calendar will show ${answer}; the organiser will not be told.`;
+      break;
+  }
+  return othersCount >= 1 ? `${lead} ${othersNotToldOf(othersCount, "would")}` : lead;
+}
+
+/**
+ * `whoIsToldOf`'s past-tense twin, for the commit.
+ *
+ * The organiser arm reports what this server DID — it handed the answer to
+ * iCloud — unless the delivery report carries a status the server itself
+ * recorded, in which case it says that status and nothing stronger. Today the
+ * report is always the unobserved constant (18-01 measured nothing to read
+ * back), so the first form is the one that ships.
+ */
+export function whoWasToldOf(
+  tells: ReplyTells,
+  answer: ReplyAnswerWord,
+  othersCount: number,
+  delivery: DeliveryReport,
+): string {
+  let lead: string;
+  switch (tells) {
+    case "organizer":
+      lead =
+        delivery.status === "sent" || delivery.status === "delivered"
+          ? `iCloud reports the reply to the organiser as ${delivery.status}.`
+          : "iCloud was asked to tell the organiser your answer.";
+      break;
+    case "organizer-maybe":
+      lead = "The organiser may have been told your answer by iCloud.";
+      break;
+    case "nobody":
+      lead = "Only your calendar changed. Nobody was told.";
+      break;
+    case "narrowed":
+      lead = `Your calendar shows ${answer}; the organiser has not been told.`;
+      break;
+  }
+  return othersCount >= 1 ? `${lead} ${othersNotToldOf(othersCount, "did")}` : lead;
+}
+
+/** The times a reply preview shows, and where they came from. */
+interface ReplyTimes {
+  start: string;
+  end: string;
+  allDay: boolean;
+  timesZone: string;
+  timesZoneSource: TimesZoneSource;
+}
+
+/**
+ * The event's times, in the zone the caller asked for when that is possible.
+ *
+ * `requested` only when a zone was named AND the event has an instant on both
+ * ends: this server then renders those instants itself, in a zone it
+ * validated, so the strings are its own. An all-day date and a time whose zone
+ * the resource never defined have no instant, so they keep the event's own
+ * wall clock and say so with `event` — converting a date nobody anchored would
+ * publish a time nobody chose.
+ *
+ * `tzid` is DISPLAY only. It is not hashed into the change and never reaches
+ * the commit, so the same confirmation is minted whatever zone was asked for.
+ */
+function replyTimesOf(detail: EventDetail, tzid: string | undefined): ReplyTimes {
+  if (
+    tzid !== undefined &&
+    !detail.allDay &&
+    detail.startUtc !== undefined &&
+    detail.endUtc !== undefined
+  ) {
+    const start = utcToLocalTime(detail.startUtc, tzid);
+    const end = utcToLocalTime(detail.endUtc, tzid);
+    if (start !== null && end !== null) {
+      return { start, end, allDay: false, timesZone: tzid, timesZoneSource: "requested" };
+    }
+  }
+  return {
+    start: detail.startLocal,
+    end: detail.endLocal,
+    allDay: detail.allDay,
+    timesZone: detail.startTzid,
+    timesZoneSource: "event",
+  };
+}
+
+/**
+ * What answering one invitation would do, and the confirmation to do it.
+ *
+ * Its own shape rather than an `EventPreview`, on `CollectionDeletePreview`'s
+ * precedent: an answer has no fields, no scope table and no recipient list, and
+ * borrowing that shape would publish a dozen keys that mean nothing here.
+ *
+ * **The user's own address and the user's own line appear nowhere in it**
+ * (RSVP-02). `organizer` and `others` are other people; on every refusal both
+ * are null, because on the `organiser` refusal the organiser IS the user.
+ */
+export interface ReplyPreview {
+  /** The caller's opaque id, echoed. */
+  id: string;
+  /** The answer that would be given. */
+  answer: ReplyAnswerWord;
+  /** The stored answer on the user's line, matched; null when none was read. */
+  currentAnswer: CurrentAnswer | null;
+  /**
+   * Which row of `TELLS_BY_EVIDENCE` this preview took, or null on a refusal.
+   * Published so the row is read off the preview rather than inferred from
+   * `tells`, which two rows could one day share.
+   */
+  evidence: SchedulingEvidence | null;
+  /** Who would be told, or null on a refusal. */
+  tells: ReplyTells | null;
+  /** Why nothing was minted, or null when a confirmation was. */
+  refusal: ReplyRefusal | null;
+  /** This server's sentence for the refusal, or null. */
+  refusalReason: string | null;
+  /** The event's title. Stranger text. */
+  title: string | null;
+  /**
+   * The start, as a wall clock in `timesZone`. Null only when nothing was read
+   * (the zone refusal). This server's own rendering on the `requested` path,
+   * the event's own on the `event` path — see `replyTimesOf`.
+   */
+  start: string | null;
+  /** The end, on the same terms as `start`. */
+  end: string | null;
+  /** True when the event is a date rather than an instant. */
+  allDay: boolean | null;
+  /** The zone `start` and `end` are in: the requested one, or the event's own. */
+  timesZone: string | null;
+  /** Which of the two `timesZone` is. Null only when nothing was read. */
+  timesZoneSource: TimesZoneSource | null;
+  /** The organiser, named by D-12's fallback. Stranger text; null on a refusal. */
+  organizer: ReplyOrganizerRow | null;
+  /** Whether the invitation carries the organiser's address. Null on a refusal. */
+  organizerAddressKnown: boolean | null;
+  /** Everybody else on it, never the user. Stranger text; null on a refusal. */
+  others: ReplyAttendeeRow[] | null;
+  /** How many `others` there are. This server's count; null on a refusal. */
+  othersCount: number | null;
+  /** This server's sentence about who hears the answer. Null on a refusal. */
+  whoIsTold: string | null;
+  /**
+   * Every other event overlapping the invitation, on every calendar, in the
+   * preview's zone. Stranger text; null on a refusal. Present for EVERY answer,
+   * decline included (D-11).
+   */
+  conflicts: ReplyConflictRow[] | null;
+  /** How many `conflicts`. This server's count; null on a refusal. */
+  conflictCount: number | null;
+  /** How much the sweep could read. Null on a refusal. */
+  conflictsChecked: ConflictsChecked | null;
+  /**
+   * This server's sentence about conflicts. Null on a refusal. For a series it
+   * starts by saying how far ahead it looked.
+   */
+  conflictNotice: string | null;
+  /**
+   * The range a series was checked over, or null for a one-off invitation
+   * (checked over its own span) and on a refusal.
+   */
+  conflictRange: ReplyConflictRange | null;
+  /**
+   * How many dates of the series the user answered separately, which this
+   * answer replaces. 0 for a one-off invitation; null on a refusal.
+   */
+  separateAnswerCount: number | null;
+  /** Those dates, in the preview's zone. Stranger-derived; null on a refusal. */
+  separateAnswers: ReplySeparateAnswerRow[] | null;
+  /** This server's sentence about them, or null when there are none. */
+  separateAnswerNotice: string | null;
+  /** The change to pass back to `calendar_commit`, or null on a refusal. */
+  change: NormalizedReplyChange | null;
+  confirmToken: string | null;
+  expiresInSeconds: number | null;
+  /** This server's sentence about the answer, or null on a refusal. */
+  confirmationLine: string | null;
+}
+
+/** What a finished answer did. */
+export interface ReplyCommitOutcome {
+  /** The event's opaque id, re-encoded from the SIGNED reference. */
+  id: string;
+  /** True once the conditional write was accepted. */
+  applied: boolean;
+  /** The answer written, from the signed change. */
+  answer: ReplyAnswerWord;
+  /** Who the answer tells, read off the commit's own re-read. */
+  tells: ReplyTells;
+  /**
+   * What this server observed about the organiser being told. Always
+   * `UNOBSERVED_DELIVERY` today: 18-01 measured no SCHEDULE-STATUS appearing on
+   * the organiser after a reply iCloud did send, so a read-back would observe
+   * nothing and is not spent. The commit reports that the answer was handed to
+   * iCloud, never that it was delivered.
+   */
+  delivery: DeliveryReport;
+  /** `whoIsTold`'s past-tense twin, from this commit's own re-read. */
+  whoWasTold: string;
+  /** This server's sentence, in the past tense. */
+  confirmationLine: string;
+}
+
+/**
+ * The half of a reply preview this server decided, matched or minted.
+ *
+ * Every value is either a literal from one of this module's closed tables or a
+ * capability this server signed. `currentAnswer` and `evidence` are MATCHED
+ * constants: the stored PARTSTAT and the stored scheduling marker are read, and
+ * a word from this server's own list is published in their place.
+ */
+function replyPreviewTrustedPart(preview: ReplyPreview): Record<string, unknown> {
+  return {
+    id: preview.id,
+    answer: preview.answer,
+    currentAnswer: preview.currentAnswer,
+    evidence: preview.evidence,
+    tells: preview.tells,
+    refusal: preview.refusal,
+    refusalReason: preview.refusalReason,
+    allDay: preview.allDay,
+    timesZoneSource: preview.timesZoneSource,
+    // The times ride out here ONLY when this server rendered them itself, from
+    // an instant, in a zone it validated. On the event's own path the zone is
+    // whatever the resource named — a stranger's string when it is one this
+    // server cannot resolve — so the times and the zone ride fenced, on
+    // `eventUntrustedPart`'s precedent for `startTzid`.
+    ...(preview.timesZoneSource === "requested"
+      ? { start: preview.start, end: preview.end, timesZone: preview.timesZone }
+      : {}),
+    organizerAddressKnown: preview.organizerAddressKnown,
+    othersCount: preview.othersCount,
+    whoIsTold: preview.whoIsTold,
+    conflictCount: preview.conflictCount,
+    conflictsChecked: preview.conflictsChecked,
+    conflictNotice: preview.conflictNotice,
+    conflictRange: preview.conflictRange,
+    separateAnswerCount: preview.separateAnswerCount,
+    separateAnswerNotice: preview.separateAnswerNotice,
+    confirmToken: preview.confirmToken,
+    expiresInSeconds: preview.expiresInSeconds,
+  };
+}
+
+/**
+ * The half somebody else wrote: the title, the organiser, everybody else on
+ * it, and the sentence quoting them. Plus the times, on the event-zone path.
+ */
+function replyPreviewUntrustedPart(preview: ReplyPreview): Record<string, unknown> {
+  return {
+    // Repeated from the trusted half so the model joins the two BY IDENTITY.
+    id: preview.id,
+    title: preview.title,
+    ...(preview.timesZoneSource === "requested"
+      ? {}
+      : { start: preview.start, end: preview.end, timesZone: preview.timesZone }),
+    organizer: preview.organizer,
+    others: preview.others,
+    conflicts: preview.conflicts,
+    separateAnswers: preview.separateAnswers,
+    change: preview.change,
+    confirmationLine: preview.confirmationLine,
+  };
+}
+
+/**
+ * Shape an invitation-answer preview into the tool's response.
+ *
+ * Exported for the reason every shaper in this file is: the fence audit walks
+ * the exported shapers, and a test-local copy would prove something about the
+ * copy.
+ */
+export function replyPreviewToolResult(preview: ReplyPreview): ToolResult {
+  return untrustedToolResult(
+    replyPreviewTrustedPart(preview),
+    replyPreviewUntrustedPart(preview),
+  );
+}
+
+/** The half of a reply commit this server did or observed. */
+function replyCommitTrustedPart(outcome: ReplyCommitOutcome): Record<string, unknown> {
+  return {
+    id: outcome.id,
+    applied: outcome.applied,
+    answer: outcome.answer,
+    tells: outcome.tells,
+    delivery: outcome.delivery,
+    whoWasTold: outcome.whoWasTold,
+  };
+}
+
+/** The half quoting the event and the organiser, inside the sentence. */
+function replyCommitUntrustedPart(outcome: ReplyCommitOutcome): Record<string, unknown> {
+  return {
+    id: outcome.id,
+    confirmationLine: outcome.confirmationLine,
+  };
+}
+
+/** Shape a finished invitation answer into the tool's response. */
+export function replyCommitToolResult(outcome: ReplyCommitOutcome): ToolResult {
+  return untrustedToolResult(
+    replyCommitTrustedPart(outcome),
+    replyCommitUntrustedPart(outcome),
+  );
+}
+
+/** One day, in seconds. The margin the conflict read is widened by. */
+const CONFLICT_READ_MARGIN_SECONDS = 24 * 60 * 60;
+
+/**
+ * Render one instant-or-date pair in the zone the preview uses.
+ *
+ * The instants are converted when there are instants and the zone is one this
+ * server holds; otherwise the row keeps its own wall clock and says which zone
+ * that is.
+ */
+function conflictRowOf(
+  row: {
+    summary: string | null;
+    allDay: boolean;
+    startLocal: string;
+    endLocal: string;
+    startUtc?: number;
+    endUtc?: number;
+    startTzid: string;
+  },
+  zone: string,
+): ReplyConflictRow {
+  if (
+    !row.allDay &&
+    row.startUtc !== undefined &&
+    row.endUtc !== undefined &&
+    isSupportedTimezone(zone)
+  ) {
+    const start = utcToLocalTime(row.startUtc, zone);
+    const end = utcToLocalTime(row.endUtc, zone);
+    if (start !== null && end !== null) {
+      return { title: row.summary, start, end, allDay: false, timesZone: zone };
+    }
+  }
+  return {
+    title: row.summary,
+    start: row.startLocal,
+    end: row.endLocal,
+    allDay: row.allDay,
+    timesZone: row.startTzid,
+  };
+}
+
+/**
+ * What else is on the account's calendars in the invitation's window.
+ *
+ * **The window** is the invitation's own interval, placed by the free-slot
+ * sweep's own `busyIntervalOf`: its two instants, or for an all-day date the
+ * whole named day or days. The zone used to place a date is `previewZoneOf`'s:
+ * the requested one, else the event's own when this server holds it, else UTC
+ * as a guess — and a guess that decided anything makes the answer `no-zone`.
+ *
+ * **The read is a day wider than the window on each side.** The window decides
+ * what counts; the range only decides what is fetched. An all-day event is a
+ * date with no instant, so how a server files it against a narrow time range
+ * depends on a zone the server chooses, and a range exactly as wide as a
+ * one-hour meeting can miss the all-day event on that same day. Reading a day
+ * either side and filtering here costs a little more data and cannot miss it.
+ *
+ * **Failures, by type only, and nothing is read off the caught value** (./
+ * .claude/CLAUDE.md § 4). A connection fault or an unreadable resource leaves
+ * the answer still worth giving, so it degrades to `failed` with no rows. An
+ * auth failure or a throttle propagates: those are about the account, not about
+ * one calendar, and the whole preview is refused with nothing minted.
+ */
+/** The zone a preview places times in, and whether it was a guess. */
+interface PreviewZone {
+  zone: string;
+  /**
+   * True when nobody named this zone: no `tzid` was given and the invitation
+   * names none this server holds, or names UTC. An all-day event placed in it
+   * may be on the wrong day for the user (18-REVIEW WR-03).
+   */
+  guessed: boolean;
+}
+
+/**
+ * The zone a preview places and renders its own computed times in.
+ *
+ * The requested one whenever a `tzid` was given — also for an all-day
+ * invitation, whose display keeps its own dates but whose clashes are still
+ * judged on the user's days (WR-03). Else the event's own named zone when this
+ * server holds it. Else UTC, marked as a guess. An event written in UTC
+ * instants reads as naming UTC, which says how it was written and nothing
+ * about where the user is, so it is a guess too. Always one of this server's
+ * allow-listed zones: the boundary refused any other `tzid` before this runs.
+ */
+function previewZoneOf(tzid: string | undefined, detail: EventDetail): PreviewZone {
+  if (tzid !== undefined) return { zone: tzid, guessed: false };
+  if (detail.startTzid !== "UTC" && isSupportedTimezone(detail.startTzid)) {
+    return { zone: detail.startTzid, guessed: false };
+  }
+  return { zone: "UTC", guessed: true };
+}
+
+/** What the conflict check found, how much it could read, and over what range. */
+interface SweptConflicts {
+  conflicts: ReplyConflictRow[];
+  checked: ConflictsChecked;
+  /** The series range, or null for a one-off invitation. */
+  range: ReplyConflictRange | null;
+}
+
+/**
+ * The sweep's own error handling, shared by both shapes of check.
+ *
+ * `windowsPlacedByZone` says the invitation's own window came from a date with
+ * no instant, so the zone decided where it lies. With a guessed zone that, or
+ * any nearby event placed the same way, makes the answer `no-zone` rather than
+ * `complete` (WR-03). A calendar that could not be read still outranks it.
+ */
+async function sweepOrDegrade(
+  principal: Principal,
+  davFetch: DavFetch,
+  options: Parameters<typeof findWindowConflicts>[3],
+  zone: PreviewZone,
+  expansionTruncated: boolean,
+  windowsPlacedByZone: boolean,
+  range: ReplyConflictRange | null,
+): Promise<SweptConflicts> {
+  try {
+    const found = await findWindowConflicts(env, principal, davFetch, options);
+    const zoneDecided = zone.guessed && (windowsPlacedByZone || found.placedByZone);
+    return {
+      conflicts: found.conflicts.map((row) => conflictRowOf(row, zone.zone)),
+      checked:
+        found.truncated || expansionTruncated ? "partial" : zoneDecided ? "no-zone" : "complete",
+      range,
+    };
+  } catch (err) {
+    if (err instanceof DavConnectError || err instanceof DavNotFoundError) {
+      return { conflicts: [], checked: "failed", range };
+    }
+    throw err;
+  }
+}
+
+/**
+ * What else is on the calendar across a SERIES' own dates (OQ5).
+ *
+ * **The dates checked run from the start of today in the preview's zone.** Not
+ * from this instant, because the part of today already past is still today to
+ * a person reading the preview, and a meeting at 09:00 this morning is on the
+ * same day as the one being answered.
+ *
+ * **The read starts a little earlier still, and the read is what is capped.**
+ * An all-day event is a date with no zone, and the expansion compares it as
+ * midnight UTC. In a zone west of UTC that is hours BEFORE local midnight, so
+ * the read starts at whichever of the two midnights comes first, and runs the
+ * slot sweep's own 90-day cap from there. The dates checked end where the read
+ * ends. `conflictRange` states exactly the dates checked: in a US zone that is
+ * 90 days less the zone's offset, and the preview says so by stating it rather
+ * than by rounding it.
+ *
+ * **An event that began before the read and is still running is found**
+ * (18-REVIEW CR-01): the sweep keeps what overlaps its range, not only what
+ * starts in it. So is today's own all-day date of the series, which the same
+ * starts-only rule used to drop west of UTC.
+ *
+ * **The windows are the invitation's own dates in that range**, expanded from
+ * the bytes already read by `occurrenceWindowsOf`. A cap on that expansion
+ * makes the whole answer partial, whatever the sweep found (T-18-31): a date
+ * nobody produced is a date nothing was checked against.
+ *
+ * With no date in range there is nothing to collide with, so no sweep is spent,
+ * and the answer is `none-in-range` rather than a clean `complete` (WR-04).
+ */
+async function seriesConflictsFor(
+  principal: Principal,
+  davFetch: DavFetch,
+  ref: EventRef,
+  read: EventWithEtag,
+  facts: InvitationFacts,
+  where: PreviewZone,
+): Promise<SweptConflicts> {
+  const zone = where.zone;
+  const now = Math.floor(Date.now() / 1000);
+  const today = utcToLocalTime(now, zone)?.slice(0, 10) ?? null;
+  const localMidnight = today === null ? null : localTimeToUtc(`${today}T00:00:00`, zone);
+  const utcMidnight = today === null ? null : localTimeToUtc(`${today}T00:00:00`, "UTC");
+  const rangeStart = localMidnight ?? now;
+  const readStart = Math.min(rangeStart, utcMidnight ?? rangeStart);
+  const rangeEnd = readStart + SERIES_CONFLICT_DAYS * SECONDS_PER_DAY;
+
+  const range: ReplyConflictRange = {
+    start: utcToLocalTime(rangeStart, zone) ?? "",
+    end: utcToLocalTime(rangeEnd, zone) ?? "",
+    timesZone: zone,
+  };
+
+  const expanded = occurrenceWindowsOf(read.body, rangeStart, rangeEnd, zone);
+  // No date in range: nothing to collide with, so no sweep is spent. That is
+  // not a clean result, because nothing was compared with anything, and it
+  // must not read as one (18-REVIEW WR-04).
+  if (expanded.windows.length === 0) {
+    return {
+      conflicts: [],
+      checked: expanded.truncated ? "partial" : "none-in-range",
+      range,
+    };
+  }
+
+  return sweepOrDegrade(
+    principal,
+    davFetch,
+    {
+      rangeStart: readStart,
+      rangeEnd,
+      windows: expanded.windows,
+      excludeObjectUrl: ref.objectUrl,
+      excludeUid: facts.uid,
+      tzid: zone,
+    },
+    where,
+    expanded.truncated,
+    expanded.placedByZone,
+    range,
+  );
+}
+
+async function conflictsFor(
+  principal: Principal,
+  davFetch: DavFetch,
+  ref: EventRef,
+  read: EventWithEtag,
+  facts: InvitationFacts,
+  where: PreviewZone,
+): Promise<SweptConflicts> {
+  const { detail } = read;
+  const zone = where.zone;
+
+  const window = busyIntervalOf(
+    {
+      start: { allDay: detail.allDay, local: detail.startLocal, utc: detail.startUtc },
+      end: { local: detail.endLocal, utc: detail.endUtc },
+    },
+    zone,
+  );
+  // An event this server cannot place has no window to compare against, so
+  // nothing can honestly be said about what overlaps it.
+  if (window === null) return { conflicts: [], checked: "failed", range: null };
+
+  return sweepOrDegrade(
+    principal,
+    davFetch,
+    {
+      rangeStart: window.start - CONFLICT_READ_MARGIN_SECONDS,
+      rangeEnd: window.end + CONFLICT_READ_MARGIN_SECONDS,
+      windows: [window],
+      excludeObjectUrl: ref.objectUrl,
+      excludeUid: facts.uid,
+      tzid: zone,
+    },
+    where,
+    false,
+    // An invitation with no instant on either end was itself placed by the zone.
+    detail.startUtc === undefined || detail.endUtc === undefined,
+    null,
+  );
+}
+
+/**
+ * The refusal of a zone this server holds no definition for.
+ *
+ * Built at the tool boundary, before any request: nothing has been read, so
+ * every field about the event is null, and nothing is minted.
+ */
+function unsupportedZonePreview(id: string, answer: ReplyAnswerWord): ReplyPreview {
+  return {
+    id,
+    answer,
+    currentAnswer: null,
+    evidence: null,
+    tells: null,
+    refusal: "unsupported-timezone",
+    refusalReason: REPLY_REFUSAL_REASONS["unsupported-timezone"],
+    title: null,
+    start: null,
+    end: null,
+    allDay: null,
+    timesZone: null,
+    timesZoneSource: null,
+    organizer: null,
+    organizerAddressKnown: null,
+    others: null,
+    othersCount: null,
+    whoIsTold: null,
+    conflicts: null,
+    conflictCount: null,
+    conflictsChecked: null,
+    conflictNotice: null,
+    conflictRange: null,
+    separateAnswerCount: null,
+    separateAnswers: null,
+    separateAnswerNotice: null,
+    change: null,
+    confirmToken: null,
+    expiresInSeconds: null,
+    confirmationLine: null,
+  };
+}
+
+/**
+ * Preview answering ONE invitation, and mint the confirmation to do it.
+ *
+ * `buildDeletePreview`'s order: read, refuse, mint, compose. Three steps touch
+ * the network, all serial: the multi-get that brings the body, the ETag and the
+ * scheduling marker back together; then, only when D-13's scope rule lets the
+ * answer through, the one PROPFIND that reads the account's own addresses;
+ * then the conflict sweep. Everything else is pure work over bytes in hand.
+ *
+ * **The user's line is found by the account's addresses and by nothing the
+ * caller said.** The tool takes an id, an answer, a scope and a display zone.
+ * No parameter names a person, so there is no value a caller can supply that
+ * aims the answer at somebody else's line (D-04, RSVP-05).
+ *
+ * **A refusal mints nothing.** It carries this server's sentence and no
+ * confirmation, so there is nothing to commit (`nothingMinted`'s precedent).
+ */
+async function buildReplyPreview(
+  principal: Principal,
+  davFetch: DavFetch,
+  ref: EventRef,
+  id: string,
+  answer: ReplyAnswerWord,
+  tzid: string | undefined,
+  scope: WriteScope | undefined,
+): Promise<ReplyPreview> {
+  const read = await getEventWithEtag(env, principal, davFetch, ref);
+  const title = read.detail.summary;
+  const times = replyTimesOf(read.detail, tzid);
+
+  const refused = (
+    refusal: ReplyRefusal,
+    currentAnswer: CurrentAnswer | null,
+  ): ReplyPreview => ({
+    id,
+    answer,
+    currentAnswer,
+    evidence: null,
+    tells: null,
+    refusal,
+    refusalReason: REPLY_REFUSAL_REASONS[refusal],
+    title,
+    ...times,
+    // Null on EVERY refusal, and the organiser refusal is why: there the
+    // organiser is the user, and their name or address must not come back.
+    // The others go with it: on that refusal they are the user's own guests.
+    organizer: null,
+    organizerAddressKnown: null,
+    others: null,
+    othersCount: null,
+    whoIsTold: null,
+    conflicts: null,
+    conflictCount: null,
+    conflictsChecked: null,
+    conflictNotice: null,
+    conflictRange: null,
+    separateAnswerCount: null,
+    separateAnswers: null,
+    separateAnswerNotice: null,
+    change: null,
+    confirmToken: null,
+    expiresInSeconds: null,
+    confirmationLine: null,
+  });
+
+  // D-13, before the address read: a scope refusal holds whatever the
+  // addresses say, so it should cost no request it does not need.
+  const signedScope = scope ?? null;
+  const scopeRefusal = replyScopeRefusal(read.isRecurring, read.hasSeriesMaster, signedScope);
+  if (scopeRefusal !== null) return refused(scopeRefusal, null);
+  const series = signedScope === "series";
+
+  const addresses = await resolveCalendarUserAddresses(env, principal, davFetch);
+  const facts = invitationFactsOf(read.body, addresses, read.scheduleTag);
+  const currentAnswer = currentAnswerOf(facts.ownAnswer);
+
+  // The same pure patch the commit will run, over the same bytes. Its refusal
+  // arms are the preview's refusals, so the preview cannot promise an answer
+  // the commit would then decline to write.
+  const planned = replyBody(read.body, addresses, ANSWER_TO_PARTSTAT[answer]);
+  if (planned.kind !== "ok") return refused(planned.kind, currentAnswer);
+
+  const tells = TELLS_BY_EVIDENCE[facts.evidence];
+  // The scope is hashed with the answer, so the token is bound to how much of
+  // the invitation it reaches. So is who is told (18-REVIEW WR-02): the user
+  // agrees to a sentence naming who hears, and the commit must not tell anyone
+  // that sentence did not name.
+  const change: NormalizedReplyChange = { kind: "reply", scope: signedScope, answer, tells };
+
+  // RSVP-03, for EVERY answer (D-11). Awaited on its own, after the two reads
+  // and the pure work above, and before anything is minted — so an auth or
+  // throttle failure here propagates with nothing signed.
+  const where = previewZoneOf(tzid, read.detail);
+  const zone = where.zone;
+  const swept = series
+    ? await seriesConflictsFor(principal, davFetch, ref, read, facts, where)
+    : await conflictsFor(principal, davFetch, ref, read, facts, where);
+
+  const confirmToken = await mintConfirmation(
+    {
+      v: CONFIRM_VERSION,
+      t: "dav",
+      k: "reply",
+      j: crypto.randomUUID(),
+      c: ref.calendarUrl,
+      o: ref.objectUrl,
+      r: ref.recurrenceId,
+      e: read.etag,
+      // Sealed and never read (D-05): an answer does not revise the event, so
+      // the commit has no use for the stored revision. Recorded because a null
+      // here would be this leg claiming the resource carried none.
+      s: read.sequence,
+      // One tool-owned literal. The answer is the only thing a reply moves.
+      f: ["answer"],
+      h: await replyChangeHashOf(change),
+      x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+      u: principal.userId,
+    },
+    env.CONFIRM_SECRET,
+  );
+
+  const organizer = organizerRowOf(facts);
+  const organizerAddressKnown = facts.organizer.address !== null;
+  const others: ReplyAttendeeRow[] = facts.others.map((one) => ({
+    name: one.name,
+    email: one.email,
+    answer: otherAnswerOf(one.partstat),
+  }));
+  // OQ6. Always empty for a one-off invitation, which has no series to differ
+  // from. Each date in the preview's zone when it has an instant, else its own.
+  const separateAnswers: ReplySeparateAnswerRow[] = facts.separateAnswers.map((one) => {
+    const converted =
+      one.recurrenceUtc === undefined ? null : utcToLocalTime(one.recurrenceUtc, zone);
+    return converted === null
+      ? { date: one.recurrenceLocal, timesZone: one.recurrenceTzid, answer: otherAnswerOf(one.partstat) }
+      : { date: converted, timesZone: zone, answer: otherAnswerOf(one.partstat) };
+  });
+
+  return {
+    id,
+    answer,
+    currentAnswer,
+    evidence: facts.evidence,
+    tells,
+    refusal: null,
+    refusalReason: null,
+    title,
+    ...times,
+    organizer,
+    organizerAddressKnown,
+    others,
+    othersCount: others.length,
+    whoIsTold: whoIsToldOf(tells, answer, organizerAddressKnown, others.length),
+    conflicts: swept.conflicts,
+    conflictCount: swept.conflicts.length,
+    conflictsChecked: swept.checked,
+    // The "Checked the next 90 days" prefix only when a date was checked: a
+    // series with none in range says so in its own sentence (WR-04).
+    conflictNotice:
+      (swept.range === null || swept.checked === "none-in-range" ? "" : SERIES_CONFLICT_PREFIX) +
+      conflictNoticeOf(swept.checked, swept.conflicts.length),
+    conflictRange: swept.range,
+    separateAnswerCount: separateAnswers.length,
+    separateAnswers,
+    separateAnswerNotice: separateAnswerNoticeOf(separateAnswers.length),
+    change,
+    confirmToken,
+    expiresInSeconds: CONFIRM_TTL_SECONDS,
+    confirmationLine: composeConfirmationLine(
+      {
+        kind: "reply",
+        noun: "invitation",
+        name: title,
+        alsoRemoved: null,
+        fieldCount: null,
+        recipientCount: null,
+        alarms: null,
+        reply: { answer, tells, organizerName: organizerNameFor(facts), series },
+      },
+      "would",
+    ),
+  };
+}
+
+/**
+ * The reply change a caller passed back, or the neutral refusal.
+ *
+ * A supplied kind other than `reply`, an answer outside the three words, or any
+ * of an update's own fields present is refused — the last because a reply that
+ * arrived carrying a summary or an attendee list is not the change this tool
+ * previewed, and ignoring the extra keys would let a caller believe they had
+ * done something. Every refusal is the same `ConfirmationInvalidError`, so none
+ * says which check failed.
+ */
+function normalizeSuppliedReply(supplied: SuppliedChange): NormalizedReplyChange {
+  if (supplied.kind !== "reply") throw new ConfirmationInvalidError();
+  const answer = supplied.answer;
+  if (answer !== "accepted" && answer !== "declined" && answer !== "tentative") {
+    throw new ConfirmationInvalidError();
+  }
+  // Absent or outside the closed four is refused on the same terms as a bad
+  // answer. The hash would refuse it anyway; refusing here keeps an unknown
+  // string out of the canonical tuple altogether.
+  const tells = supplied.tells;
+  if (tells === undefined || !(REPLY_TELLS as readonly string[]).includes(tells)) {
+    throw new ConfirmationInvalidError();
+  }
+  const foreign = [
+    supplied.summary,
+    supplied.startLocal,
+    supplied.startTzid,
+    supplied.endLocal,
+    supplied.endTzid,
+    supplied.allDay,
+    supplied.location,
+    supplied.description,
+    supplied.attendees,
+    supplied.alarms,
+  ].some((value) => value !== undefined && value !== null);
+  if (foreign) throw new ConfirmationInvalidError();
+  return { kind: "reply", scope: supplied.scope ?? null, answer, tells };
+}
+
+/**
+ * Apply one confirmed invitation answer: re-read, refuse if it moved, write once.
+ *
+ * `applyCollectionCommit`'s order, and it is not negotiable. Steps 1 to 5 reach
+ * no network, step 6 is a KV read and a KV write, and only step 7 touches
+ * iCloud:
+ *
+ *   1-3. Verify the seal, the version, the target and the user, and the expiry,
+ *        inside `verifyConfirmation`.
+ *   4.   The signed kind is `reply`. An update, create or delete token is
+ *        refused here, and a reply token is refused by `applyCommit`'s own step
+ *        4 in the other direction, so neither can be spent as the other (D-05).
+ *   4b.  The supplied change is a reply change (`normalizeSuppliedReply`).
+ *   5.   Its hash equals the signed one, in the reply's own hash domain.
+ *   6.   Reserve the one-time slot, keyed on the signed-in user.
+ *   7.   Re-read, refuse if the ETag moved, re-resolve the addresses, patch the
+ *        re-read bytes with the SIGNED answer, and write once, conditional on the
+ *        ETag the preview signed.
+ *
+ * Every refusal before step 6 is the same `ConfirmationInvalidError`, so none
+ * burns the slot and none says which check failed.
+ *
+ * **One write, and nothing else that tells anybody anything.** No
+ * scheduling-outbox request and no mail: iCloud decides from the stored bytes
+ * whether the organiser hears, and 18-01 measured when it does.
+ */
+async function applyReplyCommit(
+  principal: Principal,
+  davFetch: DavFetch,
+  confirmToken: string,
+  supplied: SuppliedChange,
+): Promise<ReplyCommitOutcome> {
+  // Steps 1, 2 and 3.
+  const payload = await verifyConfirmation(
+    confirmToken,
+    env.CONFIRM_SECRET,
+    principal.userId,
+    "dav",
+  );
+
+  // Step 4. Read from the SIGNED payload. `reply` is the only kind this arm has
+  // code for.
+  if (payload.k !== "reply") throw new ConfirmationInvalidError();
+
+  // Step 4b.
+  const change = normalizeSuppliedReply(supplied);
+
+  // Step 5.
+  if (!(await changeHashMatches(await replyChangeHashOf(change), payload.h))) {
+    throw new ConfirmationInvalidError();
+  }
+
+  // Step 6. Keyed on the signed-in principal, never on the token's own `u`.
+  await reserveConfirmation(
+    env.CONFIRM_KV,
+    principal.userId,
+    payload.j,
+    payload.x,
+  );
+
+  // Step 7. The target comes from the payload's own `c`, `o` and `r`, and from
+  // nothing the caller supplied.
+  const ref: EventRef = {
+    calendarUrl: payload.c,
+    objectUrl: payload.o,
+    recurrenceId: payload.r,
+  };
+
+  // 7a. The re-read, and the stale guard before anything is built (D-16).
+  const read = await getEventWithEtag(env, principal, davFetch, ref);
+  if (payload.e === null || read.etag !== payload.e) {
+    throw new DavStaleResourceError();
+  }
+
+  // 7a'. D-13 again, on the re-read and with the SIGNED scope. The ETag guard
+  // cannot see a resource that lost its rule under the same tag, and a series
+  // token must never be spent on anything but a series.
+  const signedScope = isWriteScope(change.scope) ? change.scope : null;
+  if (change.scope !== null && signedScope === null) throw new DavStaleResourceError();
+  if (replyScopeRefusal(read.isRecurring, read.hasSeriesMaster, signedScope) !== null) {
+    throw new DavStaleResourceError();
+  }
+
+  // 7b. The account's addresses, read again rather than carried: they are the
+  // signed-in principal's own server answer, and a confirmation is no place for
+  // them.
+  const addresses = await resolveCalendarUserAddresses(env, principal, davFetch);
+
+  // 7c. The patch, over the RE-READ bytes and with the SIGNED answer. Any
+  // refusal now means the resource is not what the preview saw, whatever its
+  // ETag says, so it is reported as stale rather than written.
+  const built = replyBody(read.body, addresses, ANSWER_TO_PARTSTAT[change.answer]);
+  if (built.kind !== "ok") throw new DavStaleResourceError();
+
+  // Read off THIS leg's bytes, so the did-line reports what the commit saw.
+  const facts = invitationFactsOf(read.body, addresses, read.scheduleTag);
+  const tells = TELLS_BY_EVIDENCE[facts.evidence];
+
+  // 7c'. Who is told, against what the preview signed (18-REVIEW WR-02). The
+  // ETag pins the body, but not the scheduling marker or the address set, and
+  // either can move the answer between the two legs. The user agreed to the
+  // preview's sentence about who hears, so a commit that would tell somebody
+  // else is refused as stale, with nothing written.
+  if (tells !== change.tells) throw new DavStaleResourceError();
+
+  // 7d. The one write, conditional on the ETag the preview signed.
+  await updateEvent(env, principal, davFetch, ref, built.body, payload.e);
+
+  // No read-back: 18-01 measured nothing on the organiser's line to read.
+  const delivery = UNOBSERVED_DELIVERY;
+
+  return {
+    id: encodeEventId(ref),
+    applied: true,
+    answer: change.answer,
+    tells,
+    delivery,
+    whoWasTold: whoWasToldOf(tells, change.answer, facts.others.length, delivery),
+    confirmationLine: composeConfirmationLine(
+      {
+        kind: "reply",
+        noun: "invitation",
+        name: read.detail.summary,
+        alsoRemoved: null,
+        fieldCount: null,
+        recipientCount: null,
+        alarms: null,
+        reply: {
+          answer: change.answer,
+          tells,
+          organizerName: organizerNameFor(facts),
+          series: signedScope === "series",
+        },
+      },
+      "did",
+    ),
   };
 }
 
@@ -5588,6 +7008,89 @@ export function registerCalendarTools(
   );
 
   server.registerTool(
+    "calendar_respond_to_invitation",
+    {
+      // Three facts about the TOOL, on 02-18's rule: it answers ONE invitation,
+      // it writes nothing, and the other tool is what does. Who is told is the
+      // preview's own answer, so the description says only that it reports it.
+      description:
+        "Preview answering ONE invitation: accepted, declined or tentative, " +
+        "and who is told. Writes nothing; returns a confirmation for " +
+        `calendar_commit. ${CALENDAR_UNTRUSTED_NOTICE}`,
+      // STRICT, on `calendar_delete_event`'s argument and a sharper one. Zod's
+      // default mode drops an unknown key silently, and the key a caller is
+      // most likely to add here is an address — "answer as this person". That
+      // key must be refused out loud rather than ignored, because the absence
+      // of any such parameter is the whole of D-04 (RSVP-05).
+      inputSchema: z.strictObject({
+        id: z
+          .string()
+          .describe(
+            "Opaque event id from calendar_list_events or calendar_search. " +
+              "Exactly one.",
+          ),
+        answer: z
+          .enum(REPLY_ANSWER_WORDS)
+          .describe(
+            "The user's own answer. Only the user's own answer changes; " +
+              "nobody else's can be set.",
+          ),
+        // Not SCOPE_PARAMETER: there `occurrence` is a supported answer, and
+        // here it is a refused one, so the update tool's sentence would tell a
+        // caller something false about this tool (D-13).
+        scope: z
+          .enum(WRITE_SCOPES)
+          .optional()
+          .describe(
+            "Required for a repeating invitation, and only series is accepted: " +
+              "it answers every date, replacing any date you answered " +
+              "separately, which the preview names first. occurrence and " +
+              "this-and-future are refused. Omit it for a one-off invitation.",
+          ),
+        // The preview's zone, on `calendar_find_free_slots`' own wording. It
+        // changes which zone the preview's times are shown in, and which day an
+        // all-day event falls on when clashes are checked (18-REVIEW WR-03). It
+        // is not hashed into the change and never reaches the commit.
+        tzid: z
+          .string()
+          .optional()
+          .describe(
+            "The user's own IANA zone, e.g. America/Chicago. Pass it. The " +
+              "preview's times are shown in it, and it decides which day an " +
+              "all-day event falls on when checking for clashes. Omitted, the " +
+              "event's own zone is used, else UTC, and the preview says when " +
+              "that guess affected the clash check. A zone this server holds " +
+              "no definition for is refused.",
+          ),
+      }),
+    },
+    async ({ id, answer, scope, tzid }) => {
+      try {
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
+        // Decoded next, before the KV read discovery performs and before any
+        // outbound request. The cheapest possible refusal of a forged id.
+        const ref = decodeEventId(id);
+
+        // The zone next, still before any request: a zone this server cannot
+        // render is refused with nothing read, nothing minted, nothing sent.
+        if (tzid !== undefined && !isSupportedTimezone(tzid)) {
+          return replyPreviewToolResult(unsupportedZonePreview(id, answer));
+        }
+
+        return replyPreviewToolResult(
+          await withConfirmationBoundary(() =>
+            buildReplyPreview(actor, davFetch, ref, id, answer, tzid, scope),
+          ),
+        );
+      } catch (err) {
+        return davErrorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
     "calendar_delete_event",
     {
       // Three facts about the TOOL rather than about any one parameter, which
@@ -5720,8 +7223,8 @@ export function registerCalendarTools(
     "calendar_commit",
     {
       description:
-        "Apply what calendar_update_event, calendar_delete_event or " +
-        "calendar_delete_calendar previewed. Pass its confirmToken and its " +
+        "Apply a previewed calendar change, including a " +
+        "calendar_respond_to_invitation answer. Pass its confirmToken and its " +
         `change back unaltered. ${CALENDAR_UNTRUSTED_NOTICE}`,
       inputSchema: z.object({
         // The disclosure this project owes in exchange for keeping the ETag
@@ -5739,7 +7242,8 @@ export function registerCalendarTools(
         confirmToken: z
           .string()
           .describe(
-            "The confirmToken from calendar_update_event, unaltered. It can " +
+            "The confirmToken from the preview tool that returned it, " +
+              "unaltered. It can " +
               "stop being valid because someone replied to the invitation, " +
               "not only because someone edited the event. Preview again. " +
               "Before you pass this back, the user must have seen the " +
@@ -5751,7 +7255,7 @@ export function registerCalendarTools(
           ),
         change: z
           .object({
-            kind: z.enum(["create", "update", "delete"]),
+            kind: z.enum(["create", "update", "delete", "reply"]),
             scope: z.string().nullable().optional(),
             summary: z.string().nullable().optional(),
             startLocal: z
@@ -5787,9 +7291,15 @@ export function registerCalendarTools(
             // supplying input, whatever it says about where it got it, and the
             // hash comparison refuses a value the preview never minted anyway.
             alarms: ALARMS_PARAMETER.nullable().optional(),
+            // An invitation answer's one value. Read only by the reply arm; the
+            // update arm ignores it, so it cannot move an update (RSVP-06).
+            answer: z.enum(REPLY_ANSWER_WORDS).optional(),
+            // Who the reply preview said would be told. Hashed with the answer
+            // and checked again after the commit's re-read (WR-02).
+            tells: z.enum(REPLY_TELLS).optional(),
           })
           .describe(
-            "The change object calendar_update_event returned, passed back " +
+            "The change object the preview tool returned, passed back " +
               "unaltered. Altering any value is refused before anything is sent.",
           ),
       }),
@@ -5805,20 +7315,25 @@ export function registerCalendarTools(
         // never by a second endpoint whose identity could disagree with the
         // confirmation's. See `targetOfConfirmation`, which carries the whole
         // argument and the two routes that were declined.
-        return await withConfirmationBoundary(async () =>
-          (await targetOfConfirmation(actor.userId, confirmToken)) === "col"
-            ? collectionCommitToolResult(
-                await applyCollectionCommit(
-                  actor,
-                  davFetch,
-                  confirmToken,
-                  change,
-                ),
-              )
-            : commitToolResult(
-                await applyCommit(actor, davFetch, confirmToken, change),
-              ),
-        );
+        return await withConfirmationBoundary(async () => {
+          const target = await targetOfConfirmation(actor.userId, confirmToken);
+          if (target === "col") {
+            return collectionCommitToolResult(
+              await applyCollectionCommit(actor, davFetch, confirmToken, change),
+            );
+          }
+          // The reply arm. `applyCommit`'s own step 4 still admits exactly
+          // create, update and delete, so a reply token that reached it would be
+          // refused there too.
+          if (target === "reply") {
+            return replyCommitToolResult(
+              await applyReplyCommit(actor, davFetch, confirmToken, change),
+            );
+          }
+          return commitToolResult(
+            await applyCommit(actor, davFetch, confirmToken, change),
+          );
+        });
       } catch (err) {
         return davErrorResult(err);
       }

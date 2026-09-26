@@ -519,6 +519,76 @@ const DAV_FAN_OUT_SERVICE = [
   // (this name spells `applyCollectionCommit`), does not contain
   // `applyContactCommit` or `applyNarrowedDelete`, and is contained by nothing.
   "applyCollectionCommit",
+  // Phase 18 (RSVP-04). The read of the account's WHOLE calendar-user address
+  // set, promoted out of `resolveOrganizerAddress` so an invitation answer can
+  // match the user's line against every address the principal advertises. One
+  // PROPFIND at the principal, and now paid on every answer's preview and
+  // commit as well as on the invited create — which makes it the name a sweep
+  // over invitations reaches for.
+  //
+  // Prefix-shadow check RUN: it contains no existing entry contiguously (it does
+  // not spell `resolveOrganizerAddress`, `resolveDavAccount` or `propfind`), and
+  // no entry contains it.
+  "resolveCalendarUserAddresses",
+  // Phase 18 (RSVP-01). The answer's PREVIEW composite. It ends in the event
+  // read and the address read, so it would be covered only by accident through
+  // whichever of the two a later body still called. "Show me what I'd answer on
+  // each of these" is the fan-out it invites, and it feels free because a
+  // preview writes nothing.
+  //
+  // Prefix-shadow check RUN: it does NOT contain `buildPreview` contiguously
+  // (this name spells `buildReplyPreview`), does not contain
+  // `buildDeletePreview`, `buildCreatePreview` or any other entry, and is
+  // contained by nothing.
+  "buildReplyPreview",
+  // Phase 18 (RSVP-01). The answer's COMMIT composite: the event re-read, the
+  // address read and the one conditional write, serial and in that order,
+  // because the re-read decides whether the write may be sent at all. A fan-out
+  // over it is "accept all of these", and each leg may make iCloud send a reply
+  // to a real person that cannot be taken back.
+  //
+  // Prefix-shadow check RUN: it does NOT contain `applyCommit` contiguously
+  // (this name spells `applyReplyCommit`), does not contain
+  // `applyCollectionCommit`, `applyContactCommit` or any other entry, and is
+  // contained by nothing.
+  "applyReplyCommit",
+  // Phase 18 (RSVP-03). The conflict sweep an answer's preview runs: every
+  // calendar the account has, read for what else sits in the invitation's
+  // window. It is `findFreeSlots`' shape a second time — one enumeration, then
+  // `collectFrom` once per calendar in a plain serial loop — and the loop is
+  // exactly where a combinator gets written, because that is what makes nine
+  // round trips fast. It runs on EVERY answer's preview, so "show me what I'd
+  // answer on each of these" now multiplies a whole sweep, not two reads.
+  //
+  // `busyIntervalOf`, which it shares with the free-slot sweep and which the
+  // tool layer calls to place the invitation's own window, is deliberately NOT
+  // here: it places times the caller already holds on the timeline and issues
+  // no request. It carries a written manifest disposition instead.
+  //
+  // Prefix-shadow check RUN against the whole shipped alternation: it contains
+  // no entry contiguously — it does not spell `findFreeSlots`, `collectFrom`,
+  // `getEvent` or `findDuplicateCandidates` — and no entry contains it. So its
+  // per-name loop below can genuinely fail and the recorded prefix-shadow
+  // exception list stays at two.
+  "findWindowConflicts",
+  // Phase 18's code review (WR-05). The three tool-layer composites that end in
+  // the conflict sweep above. None contained a listed name, so
+  // `Promise.all(invitations.map((one) => conflictsFor(...)))` passed the scan
+  // outright: one whole account sweep per invitation, in parallel.
+  //
+  // Prefix-shadow check RUN for all three: none contains an entry, and none is
+  // contained by one. That includes the pair below. The review that filed them
+  // expected `conflictsFor` to cover `seriesConflictsFor`, but the pattern is
+  // case-sensitive and the series name spells `ConflictsFor` with a capital.
+  // So each needs its own entry, and each per-name loop can genuinely fail.
+  "conflictsFor",
+  // The series form: the invitation's own dates over the next 90 days.
+  "seriesConflictsFor",
+  // The error handling both of the above call, and the one that actually awaits
+  // the sweep. On the list because a body refactor could route either caller
+  // around the other, and a guarantee resting on which one survived is the
+  // "covered by accident" shape the COMPOSITE paragraph closes.
+  "sweepOrDegrade",
 ];
 
 /** The request primitive and the tsdav standalone helpers: what a "just do them
@@ -1073,6 +1143,31 @@ describe("the patterns have teeth", () => {
       "the rule does not reach the composite tool-layer entry points, which is the layer its own reason says a fan-out is written at",
     ).toBeGreaterThan(0);
 
+    // 18-REVIEW WR-05's own shape: "check what clashes with each of these
+    // invitations". It names no listed entry point directly, so before the three
+    // conflict composites were added it matched nothing. The serial form of the
+    // same call is the permitted one.
+    for (const composite of ["conflictsFor", "seriesConflictsFor", "sweepOrDegrade"]) {
+      expect(
+        matchRule(
+          rule,
+          index,
+          "src/mcp/tools/calendar.ts",
+          `const swept = await Promise.all(invitations.map((one) => ${composite}(actor, transport, one.ref, one.read, one.facts, where)));`,
+        ).length,
+        `${composite}: a fan-out over the conflict composite passed the scan`,
+      ).toBeGreaterThan(0);
+      expect(
+        matchRule(
+          rule,
+          index,
+          "src/mcp/tools/calendar.ts",
+          `const swept = await ${composite}(actor, transport, ref, read, facts, where);`,
+        ).length,
+        `${composite}: the serial call was refused`,
+      ).toBe(0);
+    }
+
     // Phase 6's own orchestrator. `findFreeSlots` sweeps every calendar the
     // account has, so a "check them all at once" edit is the exact fan-out D-84
     // reintroduces the temptation for — exercised here through the same matcher
@@ -1105,8 +1200,8 @@ describe("the patterns have teeth", () => {
     const rule = FORBIDDEN.find((r) => r.id === "dav-concurrent-request")!;
     expect(
       DAV_FAN_OUT_SERVICE.length,
-      "eleven read entry points, phase 5's four writes, the organiser resolution WINDOWS 60 filed, the eight composite tool-layer entry points 05-REVIEW.md WR-04 filed plus 05-14's scopelessBody, phase 6's findFreeSlots orchestrator and its looped collectFrom, phase 14's two dav_diagnose probes — runCollectionWriteProbe, whose fan-out would leave half-finished collections on a real account and race its own cleanup check, and runTaskCollectionProbe, a loop over collections issuing one calendar-query apiece — and phase 16's three: the CardDAV write createContact, plus the two composites buildContactCreatePreview and applyContactCommit, which end in it and were therefore covered only by accident. planContactCreateTarget and contactUidFromObjectUrl are NOT among them: both are synchronous and issue no request, so they carry a written manifest disposition instead. CONW-05 adds a fourth from phase 16, findDuplicateCandidates — the duplicate scan, and the case this rule's own text describes most directly: two probes over one address book is exactly the loop a combinator gets wrapped around, and the concurrent version returns the same candidates, so nothing about the answer reveals it. duplicateFilter is NOT among them either, on planContactCreateTarget's precedent: it assembles a report body and issues no request. CONW-02 and CONW-06 add the two halves of a conditional update — getContactWithEtag, the read that brings back the version stamp out of the same multi-status the plain read already issued, and updateContact, the overwrite that is conditional on it. Their read and their write are two SERIAL awaits and never a pair to be raced: racing them asks the server about a version nobody has read yet. CONW-02 adds one more composite, buildContactUpdatePreview, and it is the strongest instance of the COMPOSITE paragraph above: it ends in TWO guarded names rather than one, the read-with-a-version and the duplicate scan, so it would be covered only by accident through whichever of the two a later body still happened to call. Its two awaits are serial on purpose and the order is load-bearing, because the card is read first so the scan can be told which card to leave out of its own answer. Phase 17 (CALM-04) adds createCalendarCollection, the collection create and the first entry whose subject is a calendar rather than something inside one: once a calendar can be made, renamed or removed by name, 'tidy up my calendars' is one sentence that means N of them, and a half-completed fan-out over collections leaves whole calendars nobody chose. calendarColorForWire is NOT among them, on planCreateTarget's precedent: it is a synchronous string transformation over an already-validated colour and issues no request, so it carries a written manifest disposition instead. Phase 17 (CALM-05) adds updateCalendarCollection, the rename and recolour, and the first entry on this list whose request target is genuinely CALLER-SUPPLIED rather than built from the account's own resolved home set -- which is why the home-containment gate drives a real hostile case against it where the create beside it is exempt. observedOutcomes is NOT among them, on calendarColorForWire's own precedent: it is a pure comparison between a change the caller asked for and a collection reading the caller already holds, issues no request, and replaced propstatOutcomes when plan 17-10 retired that reader, so it carries a written manifest disposition instead. Phase 17 (CALM-06) adds readCollectionState, the count entry point, and it is the most natural fan-out this phase introduces precisely because it is a READ: 'which of my calendars are empty' is one sentence that means one depth-1 PROPFIND per calendar, the combinator is what makes nine round trips fast, and the concurrent version returns the same counts so nothing about the answer would reveal it. assertCtag is NOT among them, on observedOutcomes' own precedent: it is an assertion over a binding the caller already holds and issues no request, so it carries a written manifest disposition instead. Phase 17 adds resolveDefaultCalendarUrl, the discovery composite, and it is here for the COMPOSITE paragraph's reason alone: it ends in propfind, so it matched by ACCIDENT before it was written down, and the accident evaporates the first time its body is refactored. Its shipped shape is two SERIAL PROPFINDs in one function -- principal, then scheduling inbox -- which is the pair a combinator gets wrapped around because that is what makes two round trips fast, and the concurrent version returns the same URL so nothing about the answer would reveal it. The entry is deliberately NOT arm-specific: the arm a live measurement did not choose carried one request rather than two, and registering only against the sharper body would rest the guarantee on which arm a reader remembered. It also outlived the requirement it arrived for: CALM-07 was withdrawn on 2026-09-26 because the property it asks for is absent everywhere it can be asked, and the function was kept as the instrument of that measurement, so it is still two serial PROPFINDs and still the pair a combinator gets wrapped around. isDefaultCalendar WAS on this list as a NOT-among-them, on assertCtag's precedent, and it is not mentioned any more because the function was deleted with the requirement -- a written exclusion for a name that does not exist is a reason no reader can check. Phase 17 (CALM-06) adds the delete's three: deleteCalendarCollection, the DAV entry point, and the two TOOL-LAYER composites buildCollectionDeletePreview and applyCollectionCommit. The entry point is the most destructive name on this list -- every other write here changes something inside a collection and this one removes the collection and everything in it -- and 'get rid of these three' is the most natural multi-collection sentence this server will ever be handed, which is exactly where a combinator gets written. The two composites are on the COMPOSITE paragraph's terms and each ends in more than one guarded name: the preview in resolveDavAccount and readCollectionState, the commit in readCollectionState AND deleteCalendarCollection, so each would be covered only by accident and by whichever call a later body happened to keep. No new library primitive is needed: deleteObject, the helper the removal is issued through, has been on the library half since phase 14. Phase 17 adds runPropertyNameProbe, the third dav_diagnose probe and the instrument CALM-07's verdict was taken on: four resources, one depth-0 DAV:propname PROPFIND apiece, in a loop -- which is precisely where a combinator gets written, because that is what makes four round trips fast, and the concurrent version returns the same four property-name lists so nothing about the answer would reveal the change. It needs no new library primitive: davRequest, the raw helper it assembles the propname body through, has been on the library half since phase 14. propertyNamesInBody is NOT among them, for the reason every pure reader is left off -- it reads element names out of the raw multistatus BODY the probe already holds and issues no request -- and unlike that one it carries no manifest disposition either, correctly, because it is module-private and the manifest collects export function declarations",
-    ).toBe(43);
+      "eleven read entry points, phase 5's four writes, the organiser resolution WINDOWS 60 filed, the eight composite tool-layer entry points 05-REVIEW.md WR-04 filed plus 05-14's scopelessBody, phase 6's findFreeSlots orchestrator and its looped collectFrom, phase 14's two dav_diagnose probes — runCollectionWriteProbe, whose fan-out would leave half-finished collections on a real account and race its own cleanup check, and runTaskCollectionProbe, a loop over collections issuing one calendar-query apiece — and phase 16's three: the CardDAV write createContact, plus the two composites buildContactCreatePreview and applyContactCommit, which end in it and were therefore covered only by accident. planContactCreateTarget and contactUidFromObjectUrl are NOT among them: both are synchronous and issue no request, so they carry a written manifest disposition instead. CONW-05 adds a fourth from phase 16, findDuplicateCandidates — the duplicate scan, and the case this rule's own text describes most directly: two probes over one address book is exactly the loop a combinator gets wrapped around, and the concurrent version returns the same candidates, so nothing about the answer reveals it. duplicateFilter is NOT among them either, on planContactCreateTarget's precedent: it assembles a report body and issues no request. CONW-02 and CONW-06 add the two halves of a conditional update — getContactWithEtag, the read that brings back the version stamp out of the same multi-status the plain read already issued, and updateContact, the overwrite that is conditional on it. Their read and their write are two SERIAL awaits and never a pair to be raced: racing them asks the server about a version nobody has read yet. CONW-02 adds one more composite, buildContactUpdatePreview, and it is the strongest instance of the COMPOSITE paragraph above: it ends in TWO guarded names rather than one, the read-with-a-version and the duplicate scan, so it would be covered only by accident through whichever of the two a later body still happened to call. Its two awaits are serial on purpose and the order is load-bearing, because the card is read first so the scan can be told which card to leave out of its own answer. Phase 17 (CALM-04) adds createCalendarCollection, the collection create and the first entry whose subject is a calendar rather than something inside one: once a calendar can be made, renamed or removed by name, 'tidy up my calendars' is one sentence that means N of them, and a half-completed fan-out over collections leaves whole calendars nobody chose. calendarColorForWire is NOT among them, on planCreateTarget's precedent: it is a synchronous string transformation over an already-validated colour and issues no request, so it carries a written manifest disposition instead. Phase 17 (CALM-05) adds updateCalendarCollection, the rename and recolour, and the first entry on this list whose request target is genuinely CALLER-SUPPLIED rather than built from the account's own resolved home set -- which is why the home-containment gate drives a real hostile case against it where the create beside it is exempt. observedOutcomes is NOT among them, on calendarColorForWire's own precedent: it is a pure comparison between a change the caller asked for and a collection reading the caller already holds, issues no request, and replaced propstatOutcomes when plan 17-10 retired that reader, so it carries a written manifest disposition instead. Phase 17 (CALM-06) adds readCollectionState, the count entry point, and it is the most natural fan-out this phase introduces precisely because it is a READ: 'which of my calendars are empty' is one sentence that means one depth-1 PROPFIND per calendar, the combinator is what makes nine round trips fast, and the concurrent version returns the same counts so nothing about the answer would reveal it. assertCtag is NOT among them, on observedOutcomes' own precedent: it is an assertion over a binding the caller already holds and issues no request, so it carries a written manifest disposition instead. Phase 17 adds resolveDefaultCalendarUrl, the discovery composite, and it is here for the COMPOSITE paragraph's reason alone: it ends in propfind, so it matched by ACCIDENT before it was written down, and the accident evaporates the first time its body is refactored. Its shipped shape is two SERIAL PROPFINDs in one function -- principal, then scheduling inbox -- which is the pair a combinator gets wrapped around because that is what makes two round trips fast, and the concurrent version returns the same URL so nothing about the answer would reveal it. The entry is deliberately NOT arm-specific: the arm a live measurement did not choose carried one request rather than two, and registering only against the sharper body would rest the guarantee on which arm a reader remembered. It also outlived the requirement it arrived for: CALM-07 was withdrawn on 2026-09-26 because the property it asks for is absent everywhere it can be asked, and the function was kept as the instrument of that measurement, so it is still two serial PROPFINDs and still the pair a combinator gets wrapped around. isDefaultCalendar WAS on this list as a NOT-among-them, on assertCtag's precedent, and it is not mentioned any more because the function was deleted with the requirement -- a written exclusion for a name that does not exist is a reason no reader can check. Phase 17 (CALM-06) adds the delete's three: deleteCalendarCollection, the DAV entry point, and the two TOOL-LAYER composites buildCollectionDeletePreview and applyCollectionCommit. The entry point is the most destructive name on this list -- every other write here changes something inside a collection and this one removes the collection and everything in it -- and 'get rid of these three' is the most natural multi-collection sentence this server will ever be handed, which is exactly where a combinator gets written. The two composites are on the COMPOSITE paragraph's terms and each ends in more than one guarded name: the preview in resolveDavAccount and readCollectionState, the commit in readCollectionState AND deleteCalendarCollection, so each would be covered only by accident and by whichever call a later body happened to keep. No new library primitive is needed: deleteObject, the helper the removal is issued through, has been on the library half since phase 14. Phase 17 adds runPropertyNameProbe, the third dav_diagnose probe and the instrument CALM-07's verdict was taken on: four resources, one depth-0 DAV:propname PROPFIND apiece, in a loop -- which is precisely where a combinator gets written, because that is what makes four round trips fast, and the concurrent version returns the same four property-name lists so nothing about the answer would reveal the change. It needs no new library primitive: davRequest, the raw helper it assembles the propname body through, has been on the library half since phase 14. propertyNamesInBody is NOT among them, for the reason every pure reader is left off -- it reads element names out of the raw multistatus BODY the probe already holds and issues no request -- and unlike that one it carries no manifest disposition either, correctly, because it is module-private and the manifest collects export function declarations. Phase 18 (RSVP-01, RSVP-04) adds three: resolveCalendarUserAddresses, the one PROPFIND that reads the account's whole address set and now runs on every invitation answer's preview and commit as well as on the invited create, so it is the name a sweep over invitations reaches for; and the two tool-layer composites buildReplyPreview and applyReplyCommit, which end in the event read, the address read and — for the commit — the one conditional write, so each would be covered only by accident, and a fan-out over the commit is 'accept all of these', where every leg may make iCloud send a reply to a real person that cannot be unsent. organizerAddressFrom and replyBody are NOT among them, on planCreateTarget's precedent: one is a selection over a list the caller already holds and the other a body builder over bytes already fetched, neither issues a request, and each carries a written manifest disposition instead. Phase 18 (RSVP-03) adds findWindowConflicts, the conflict sweep every answer's preview runs: findFreeSlots' own shape a second time, one enumeration and then collectFrom once per calendar in a serial loop, which is the loop a combinator gets wrapped around. busyIntervalOf is NOT among them: it places times the caller already holds and issues no request, so it carries a written manifest disposition instead. The phase's code review (WR-05) adds the three tool-layer composites that end in that sweep -- conflictsFor, seriesConflictsFor and sweepOrDegrade -- because none contained a listed name and a combinator over any of them passed the scan outright",
+    ).toBe(50);
     for (const entryPoint of DAV_FAN_OUT_SERVICE) {
       const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
       expect(
@@ -1188,6 +1283,10 @@ describe("the patterns have teeth", () => {
     // renaming a service export to satisfy a test's assertion mechanics is worse
     // than recording the mechanics — the name it has is the name `getEventWithEtag`
     // set on the tree this one is a twin of.
+    // 18-REVIEW WR-05 added `conflictsFor` and `seriesConflictsFor` together,
+    // and the review expected the first to cover the second. It does not: the
+    // pattern is case-sensitive, and the series name spells `ConflictsFor` with
+    // a capital. So neither shadows the other, and the list stays at two.
     expect(
       covered,
       "a name in the alternation is matched through another entry, so its per-name loop cannot fail",

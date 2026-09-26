@@ -55,7 +55,12 @@
 // dav-fixtures.test.ts` holds this file to all of that by walking its exports,
 // so a fixture added later without its own assertion is still checked.
 
-import { VTIMEZONE_ALLOWLIST } from "../../src/dav/icalendar";
+import ICAL from "ical.js";
+import {
+  VTIMEZONE_ALLOWLIST,
+  serializeOccurrenceResource,
+  withParsedResource,
+} from "../../src/dav/icalendar";
 
 /**
  * Join content lines with CRLF terminators.
@@ -1377,3 +1382,544 @@ export const BUILT_EVENT_WITH_ATTENDEES_ICS = resource(
   "END:VEVENT",
   "END:VCALENDAR",
 );
+
+// ---------------------------------------------------------------------------
+// Attendee copies of an invitation (phase 18)
+//
+// **THE ONE EXCEPTION TO THIS FILE'S PROVENANCE RULE, and it is written down
+// here rather than left for a reader to find.** The header says every byte in
+// this file is synthesised. The two fixtures below are not: they are the
+// owner's own attendee copies of two invitations, read from the live account in
+// plan 18-01 on 2026-09-26 and recorded in 18-UAT.md's "Fixture source" blocks,
+// then REDACTED here before anything reached git. The owner set both
+// invitations up as throwaway probes, and both were deleted the same day.
+//
+// Why real bytes this time, when 02-09 refused them. 02-09 refused a capture
+// because synthesised bytes were enough to test a PARSER. These test a WRITE
+// whose whole claim is "changes one parameter on one line of what iCloud
+// stores" — and the thing that could make that claim false is exactly the gap
+// between this project's idea of iCloud's bytes and iCloud's bytes. 18-01
+// measured two shapes nobody would have typed: the user's line on a real
+// iCloud invitation carries an opaque principal path with the address ONLY in
+// `EMAIL=`, and the copy carries a stray `TZID` property inside the `VEVENT`.
+//
+// What the redaction did, exhaustively, so a reader can tell measured from
+// replaced:
+//
+//   - Every address became an `.invalid` one: the owner's own becomes
+//     `test@example.invalid` (the address the test pool binds), and the
+//     organiser's becomes `organiser.probe@example.invalid`.
+//   - The organiser's display name became `Probe Organiser`.
+//   - Every principal path became an opaque placeholder of the same form, with
+//     no digits: the real ones encode the account's DSID.
+//   - Each UID became `rsvp-probe-000N@example.invalid`.
+//   - URLs lost their scheme and moved to `.invalid` hosts, and the `PRODID`
+//     naming Apple's CalDAV host names an `.invalid` one instead. The
+//     no-URL and no-provider checks in `test/dav-fixtures.test.ts` hold both.
+//   - One ten-digit value (`X-MICROSOFT-CDO-OWNERAPPTID`) was cut to eight, under
+//     the no-long-digit-run check that guards against a DSID.
+//
+// Nothing else changed: every property, parameter and subcomponent is in the
+// order iCloud stored it. The FOLDING is this file's, not iCloud's. 18-01's
+// evidence files were overwritten before the folding was recorded (deviation 4
+// in 18-01-SUMMARY.md), so the sources are unfolded content lines. They are
+// folded here at 75 octets, which is what RFC 5545 asks for and what a stored
+// body arrives as, with every address kept whole on one line because
+// `test/dav-fixtures.test.ts` reads addresses out of the raw text.
+// ---------------------------------------------------------------------------
+
+/**
+ * The attendee copy of an invitation iCloud itself delivered (18-01 probe C).
+ *
+ * **The copy answering tells the organiser about.** 18-01 read a
+ * `Schedule-Tag` on it, answered it with a PARTSTAT-only write, and saw the
+ * answer on the organiser's own account. A stub serving it should answer a
+ * schedule tag beside it; the bytes carry no marker of their own, because
+ * iCloud writes none into them — `SCHEDULE-STATUS` is absent everywhere.
+ *
+ * The owner's line is the shape that matters: its value is an opaque principal
+ * path, and the address is only in `EMAIL=`. The organiser is a principal path
+ * too, on both its `ORGANIZER` and its own `ATTENDEE` line. `SEQUENCE:1`, so a
+ * writer that resets or advances it is visible. The stray `TZID` property
+ * inside the `VEVENT` and the run-together title are iCloud's, kept.
+ */
+export const ATTENDEE_COPY_GENUINE_ICS = resource(
+  "BEGIN:VCALENDAR",
+  "PRODID:-//caldav.example.invalid//CALDAVJ 2634B920//EN",
+  "VERSION:2.0",
+  "BEGIN:VEVENT",
+  "SUMMARY:New EventRSVP probe C - delete me",
+  "TZID:America/Los_Angeles",
+  "SEQUENCE:1",
+  "UID:rsvp-probe-0002@example.invalid",
+  "CREATED:20260926T190351Z",
+  "DTSTART;TZID=America/Los_Angeles:20260929T120000",
+  "DTEND;TZID=America/Los_Angeles:20260929T130000",
+  "ATTENDEE;CN=test@example.invalid;CUTYPE=INDIVIDUAL;RSVP=TRUE;ROLE=REQ-PARTI",
+  " CIPANT;PARTSTAT=NEEDS-ACTION;EMAIL=test@example.invalid:/aOwnerPrincipalPr",
+  " obe/principal/",
+  "ATTENDEE;CN=Probe Organiser;CUTYPE=INDIVIDUAL;PARTSTAT=ACCEPTED;ROLE=CHAIR;",
+  " EMAIL=organiser.probe@example.invalid:/aOrganiserPrincipalProbe/principal/",
+  "ORGANIZER;CN=Probe Organiser;EMAIL=organiser.probe@example.invalid:/aOrgani",
+  " serPrincipalProbe/principal/",
+  "DTSTAMP:20260926T190352Z",
+  "END:VEVENT",
+  "BEGIN:VTIMEZONE",
+  "TZID:America/Los_Angeles",
+  "X-LIC-LOCATION:America/Los_Angeles",
+  "BEGIN:STANDARD",
+  "DTSTART:18831118T120702",
+  "RDATE:18831118T120702",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-075258",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19180331T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=19190330T100000Z;BYMONTH=3;BYDAY=-1SU",
+  "TZNAME:PDT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:STANDARD",
+  "DTSTART:19181027T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=19191026T090000Z;BYMONTH=10;BYDAY=-1SU",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19420209T020000",
+  "RDATE:19420209T020000",
+  "TZNAME:PWT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19450814T160000",
+  "RDATE:19450814T160000",
+  "TZNAME:PPT",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:STANDARD",
+  "DTSTART:19450930T020000",
+  "RDATE:19450930T020000",
+  "RDATE:19490101T020000",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "BEGIN:STANDARD",
+  "DTSTART:19460101T000000",
+  "RDATE:19460101T000000",
+  "RDATE:19670101T000000",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19480314T020100",
+  "RDATE:19480314T020100",
+  "RDATE:19740106T020000",
+  "RDATE:19750223T020000",
+  "TZNAME:PDT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19500430T010000",
+  "RRULE:FREQ=YEARLY;UNTIL=19660424T090000Z;BYMONTH=4;BYDAY=-1SU",
+  "TZNAME:PDT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:STANDARD",
+  "DTSTART:19500924T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=19610924T090000Z;BYMONTH=9;BYDAY=-1SU",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "BEGIN:STANDARD",
+  "DTSTART:19621028T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=19661030T090000Z;BYMONTH=10;BYDAY=-1SU",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19670430T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=19730429T100000Z;BYMONTH=4;BYDAY=-1SU",
+  "TZNAME:PDT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:STANDARD",
+  "DTSTART:19671029T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=20061029T090000Z;BYMONTH=10;BYDAY=-1SU",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19760425T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=19860427T100000Z;BYMONTH=4;BYDAY=-1SU",
+  "TZNAME:PDT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19870405T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=20060402T100000Z;BYMONTH=4;BYDAY=1SU",
+  "TZNAME:PDT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:20070311T020000",
+  "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+  "TZNAME:PDT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:STANDARD",
+  "DTSTART:20071104T020000",
+  "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "END:VTIMEZONE",
+  "END:VCALENDAR",
+);
+
+/**
+ * The attendee copy of an imported invitation (18-01 probe A).
+ *
+ * **The copy answering tells nobody about.** A Google invitation opened into
+ * Calendar from its `.ics`. 18-01 answered it with a PARTSTAT-only write and saw
+ * nothing on the organiser's side: the guest list still said "awaiting". Its
+ * `schedule-tag` came back 404, and it carries the other marker 18-01 saw on the
+ * imported side only — `SCHEDULE-AGENT=CLIENT` on the organiser and `NONE` on
+ * the owner's line.
+ *
+ * The owner's line is a `mailto:` with the same address in `EMAIL=`, and the
+ * organiser appears as an attendee too. `X-APPLE-NEEDS-REPLY:TRUE` is on it and
+ * must survive an answer (the owner's decision, 18-UAT.md).
+ */
+export const ATTENDEE_COPY_IMPORTED_ICS = resource(
+  "BEGIN:VCALENDAR",
+  "CALSCALE:GREGORIAN",
+  "PRODID:-//Apple Inc.//macOS 27.0//EN",
+  "VERSION:2.0",
+  "BEGIN:VEVENT",
+  "ATTENDEE;CN=Probe Organiser;CUTYPE=INDIVIDUAL;EMAIL=",
+  " organiser.probe@example.invalid;PARTSTAT=ACCEPTED;ROLE=REQ-PARTICIPANT;RSV",
+  " P=TRUE;SCHEDULE-AGENT=NONE;X-NUM-GUESTS=0:mailto:",
+  " organiser.probe@example.invalid",
+  "ATTENDEE;CN=test@example.invalid;CUTYPE=INDIVIDUAL;EMAIL=",
+  " test@example.invalid;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT;RSVP=TRUE;",
+  " SCHEDULE-AGENT=NONE;X-NUM-GUESTS=0:mailto:test@example.invalid",
+  "CREATED:20260926T184536Z",
+  "DESCRIPTION:-::~:~::~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~",
+  " :~:~:~:~:~:~:~:~::~:~::-\\nJoin with Google Meet: meet.example.invalid/aaa-",
+  " bbbb-ccc\\n\\nLearn more about Meet at: support.example.invalid/meet-help\\n\\",
+  " nPlease do not edit this section.\\n-::~:~::~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~",
+  " :~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~::~:~::-",
+  "DTEND;TZID=America/Los_Angeles:20261001T131500",
+  "DTSTAMP:20260926T184615Z",
+  "DTSTART;TZID=America/Los_Angeles:20261001T124500",
+  "LAST-MODIFIED:20260926T184536Z",
+  "LOCATION:meet.example.invalid/aaa-bbbb-ccc",
+  "ORGANIZER;CN=Probe Organiser;EMAIL=organiser.probe@example.invalid;SCHEDULE",
+  " -AGENT=CLIENT:mailto:organiser.probe@example.invalid",
+  "SEQUENCE:0",
+  "STATUS:CONFIRMED",
+  "SUMMARY:RSVP probe A - delete me.",
+  "UID:rsvp-probe-0001@example.invalid",
+  "X-APPLE-NEEDS-REPLY:TRUE",
+  "X-GOOGLE-CONFERENCE:meet.example.invalid/aaa-bbbb-ccc",
+  "X-MICROSOFT-CDO-OWNERAPPTID:13467669",
+  "TRANSP:OPAQUE",
+  "BEGIN:VALARM",
+  "ACTION:DISPLAY",
+  "DESCRIPTION:Reminder",
+  "TRIGGER:-PT15S",
+  "UID:1E71DE0B-B345-4B74-BD3F-6336F68A6975",
+  "X-APPLE-DEFAULT-ALARM:TRUE",
+  "X-WR-ALARMUID:1E71DE0B-B345-4B74-BD3F-6336F68A6975",
+  "END:VALARM",
+  "BEGIN:VALARM",
+  "ACTION:DISPLAY",
+  "DESCRIPTION:This is an event reminder",
+  "TRIGGER:-PT30M",
+  "UID:2BBDEF5B-09F6-42B1-B024-91DBFA58847B",
+  "X-WR-ALARMUID:2BBDEF5B-09F6-42B1-B024-91DBFA58847B",
+  "END:VALARM",
+  "END:VEVENT",
+  "BEGIN:VTIMEZONE",
+  "TZID:America/Los_Angeles",
+  "X-LIC-LOCATION:America/Los_Angeles",
+  "BEGIN:STANDARD",
+  "DTSTART:18831118T120702",
+  "RDATE:18831118T120702",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-075258",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19180331T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=19190330T100000Z;BYMONTH=3;BYDAY=-1SU",
+  "TZNAME:PDT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:STANDARD",
+  "DTSTART:19181027T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=19191026T090000Z;BYMONTH=10;BYDAY=-1SU",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19420209T020000",
+  "RDATE:19420209T020000",
+  "TZNAME:PWT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19450814T160000",
+  "RDATE:19450814T160000",
+  "TZNAME:PPT",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:STANDARD",
+  "DTSTART:19450930T020000",
+  "RDATE:19450930T020000",
+  "RDATE:19490101T020000",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "BEGIN:STANDARD",
+  "DTSTART:19460101T000000",
+  "RDATE:19460101T000000",
+  "RDATE:19670101T000000",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19480314T020100",
+  "RDATE:19480314T020100",
+  "RDATE:19740106T020000",
+  "RDATE:19750223T020000",
+  "TZNAME:PDT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19500430T010000",
+  "RRULE:FREQ=YEARLY;UNTIL=19660424T090000Z;BYMONTH=4;BYDAY=-1SU",
+  "TZNAME:PDT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:STANDARD",
+  "DTSTART:19500924T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=19610924T090000Z;BYMONTH=9;BYDAY=-1SU",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "BEGIN:STANDARD",
+  "DTSTART:19621028T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=19661030T090000Z;BYMONTH=10;BYDAY=-1SU",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19670430T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=19730429T100000Z;BYMONTH=4;BYDAY=-1SU",
+  "TZNAME:PDT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:STANDARD",
+  "DTSTART:19671029T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=20061029T090000Z;BYMONTH=10;BYDAY=-1SU",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19760425T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=19860427T100000Z;BYMONTH=4;BYDAY=-1SU",
+  "TZNAME:PDT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:19870405T020000",
+  "RRULE:FREQ=YEARLY;UNTIL=20060402T100000Z;BYMONTH=4;BYDAY=1SU",
+  "TZNAME:PDT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:DAYLIGHT",
+  "DTSTART:20070311T020000",
+  "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+  "TZNAME:PDT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "END:DAYLIGHT",
+  "BEGIN:STANDARD",
+  "DTSTART:20071104T020000",
+  "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+  "TZNAME:PST",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0800",
+  "END:STANDARD",
+  "END:VTIMEZONE",
+  "END:VCALENDAR",
+);
+
+/**
+ * Replace the one occurrence of `from`, or fail loudly at module load.
+ *
+ * A derivation that silently matched nothing would hand every test built on it
+ * the source fixture unchanged, and they would pass over a series that is not
+ * one. So a missing or a repeated anchor throws here, before any test runs.
+ */
+function replaceExactlyOnce(text: string, from: string, to: string): string {
+  const at = text.indexOf(from);
+  if (at < 0 || text.indexOf(from, at + 1) >= 0) {
+    throw new Error(`series fixture: anchor is not unique: ${from}`);
+  }
+  return text.slice(0, at) + to + text.slice(at + from.length);
+}
+
+/**
+ * The genuine attendee copy turned into a series: a master and one edited date.
+ *
+ * **DERIVED, NOT MEASURED.** 18-01 measured single events only (A7 in its
+ * summary), so no repeating invitation's bytes exist to copy. This is built from
+ * `ATTENDEE_COPY_GENUINE_ICS` by string edits, and the edits are the whole of
+ * the difference:
+ *
+ *   - The master gains `RRULE:FREQ=WEEKLY;COUNT=4` after its `SEQUENCE`.
+ *   - A second `VEVENT` follows it: the same bytes, plus a `RECURRENCE-ID` for
+ *     the second date, moved an hour later, with the user's own line already
+ *     answering `ACCEPTED` where the master's still says `NEEDS-ACTION`.
+ *
+ * Everything else — the principal-path owner line with the address only in
+ * `EMAIL=`, the stray `TZID` property, the calendar-level `VTIMEZONE` after the
+ * events — is the measured copy's, byte for byte. Two components each carrying
+ * their own copy of the user's line is what lets a test see an answer that
+ * reached the master and missed the override, or the reverse. Every address is
+ * still whole on one physical line, because the edits touch none of them.
+ */
+function seriesFromAttendeeCopy(single: string): string {
+  const start = single.indexOf("BEGIN:VEVENT\r\n");
+  const end = single.indexOf("BEGIN:VTIMEZONE\r\n");
+  const vevent = single.slice(start, end);
+
+  const master = replaceExactlyOnce(
+    vevent,
+    "SEQUENCE:1\r\n",
+    "SEQUENCE:1\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n",
+  );
+  const override = [
+    [
+      "SEQUENCE:1\r\n",
+      "SEQUENCE:1\r\nRECURRENCE-ID;TZID=America/Los_Angeles:20261006T120000\r\n",
+    ],
+    [
+      "DTSTART;TZID=America/Los_Angeles:20260929T120000",
+      "DTSTART;TZID=America/Los_Angeles:20261006T130000",
+    ],
+    [
+      "DTEND;TZID=America/Los_Angeles:20260929T130000",
+      "DTEND;TZID=America/Los_Angeles:20261006T140000",
+    ],
+    ["PARTSTAT=NEEDS-ACTION", "PARTSTAT=ACCEPTED"],
+  ].reduce((text, [from, to]) => replaceExactlyOnce(text, from, to), vevent);
+
+  return single.slice(0, start) + master + override + single.slice(end);
+}
+
+/** See `seriesFromAttendeeCopy`: derived from the genuine copy, not measured. */
+export const ATTENDEE_COPY_SERIES_ICS = seriesFromAttendeeCopy(
+  ATTENDEE_COPY_GENUINE_ICS,
+);
+
+/**
+ * An invitation of two individually edited dates with NO repeating rule behind
+ * them: no master component at all (RESEARCH Pitfall 7).
+ *
+ * **DERIVED, NOT MEASURED**, from `ATTENDEE_COPY_SERIES_ICS` by one string
+ * edit: the master's `RRULE:FREQ=WEEKLY;COUNT=4` line becomes a
+ * `RECURRENCE-ID` for its own first date, 2026-09-29 at 12:00 in Los Angeles.
+ * That turns the master into a second edited date, so the resource holds two
+ * `RECURRENCE-ID` components, each carrying the user's own line, and nothing
+ * that repeats. It is the shape a user is left with when invited to single
+ * dates of somebody else's series; what iCloud does with an answer to it is
+ * unmeasured, which is why the tool refuses it.
+ */
+export const ATTENDEE_COPY_MASTERLESS_ICS = replaceExactlyOnce(
+  ATTENDEE_COPY_SERIES_ICS,
+  "RRULE:FREQ=WEEKLY;COUNT=4\r\n",
+  "RECURRENCE-ID;TZID=America/Los_Angeles:20260929T120000\r\n",
+);
+
+/**
+ * What any patch writes when it changes NOTHING: the stored body parsed and
+ * wrapped back up by the same writer every answer goes through.
+ *
+ * **The comparison an answer is held to, and why it is not the raw fixture.**
+ * The writer re-emits the resource through ical.js, which refolds lines and
+ * moves every `VEVENT` after the calendar-level subcomponents, so the written
+ * body differs from the stored one in places the answer never touched. Diffing
+ * against the raw text would measure the serialiser. Diffing against this
+ * measures the answer: anything that differs from it, the answer changed.
+ */
+export function identityRoundTrip(ics: string): string {
+  return withParsedResource(ics, (resource) =>
+    serializeOccurrenceResource(
+      resource,
+      resource.components.map(
+        (component) =>
+          new ICAL.Component(JSON.parse(JSON.stringify(component.toJSON()))),
+      ),
+      null,
+    ),
+  );
+}
+
+/**
+ * Every content line that differs between two bodies, compared after unfolding.
+ *
+ * Lines are compared position by position, so both sides must come from the
+ * same writer — `identityRoundTrip` on one side and a real write on the other.
+ * A line missing from the shorter side reads as `""`.
+ */
+export function unfoldedDiff(
+  before: string,
+  after: string,
+): { before: string; after: string }[] {
+  const unfold = (text: string) =>
+    text.replace(/\r\n[ \t]/g, "").split("\r\n");
+  const left = unfold(before);
+  const right = unfold(after);
+  const changed: { before: string; after: string }[] = [];
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    const one = left[i] ?? "";
+    const two = right[i] ?? "";
+    if (one !== two) changed.push({ before: one, after: two });
+  }
+  return changed;
+}

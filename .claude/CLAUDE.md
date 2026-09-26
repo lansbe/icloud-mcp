@@ -311,6 +311,63 @@ artifact, because a session reading §2 alone would read the calendar write path
 as a violation and remove it — and removing it would break a requirement the
 developer decided on 2026-08-21 rather than fix a breach.
 
+#### Answering an invitation is not this rule's subject either
+
+Phase 18 adds a tool, `calendar_respond_to_invitation`, that answers an
+invitation the user was sent. When iCloud holds the invitation, iCloud then
+tells the organiser the answer. That looks like the thing this rule forbids. It
+is not. The argument is written down here so nobody has to work it out again.
+
+1. **§2's reason is about prose, and an answer is not prose.** §2 exists because
+   a message Claude writes is prose in the user's voice, and a person has to read
+   it before it goes. An answer is one of three values: accepted, declined or
+   tentative. The user picks it. The model writes no words that reach the
+   organiser.
+
+2. **This server still sends no mail.** The write is one conditional PUT of the
+   user's own copy of the event. Only the user's own answer on it changes.
+   Nothing under `src/mail/` changed in this phase. No submission port was
+   opened and no mail library was added. This server never sends the reply
+   itself, by any route. D-02 ruled that out.
+
+3. **Where a reply goes out, iCloud sends it.** This was measured with the owner
+   on 2026-09-26 and is recorded in `18-UAT.md`. For an invitation iCloud itself
+   delivered, iCloud told the organiser. By the time the owner checked the
+   organiser's account, a few minutes after the write, it showed the new answer.
+   For a copy that reached the calendar some other way, nobody was told. The
+   writes went from the owner's terminal straight to iCloud, with no Worker in
+   the path, so this is a measurement of iCloud and not of this server. The
+   Worker deployed at the time was version
+   `14278dbf-7461-4ffb-bcc0-4948691e500d`. Each case was measured once.
+   Answering a repeating invitation was not measured. What tells the two cases
+   apart is whether iCloud returns a Schedule-Tag for the event. When the
+   invitation does not show which case it is, the tool says the organiser may
+   be told. It never says nobody will be. This server does not see the reply
+   arrive, so the tool says it handed the answer to iCloud, not that it was
+   delivered.
+
+4. **PITFALLS #12 still binds.** The tool takes no address of any kind. It finds
+   the user's own line by matching the addresses iCloud lists for the account
+   that is signed in. It never takes an address from the model, and nobody
+   else's answer can be set. The answer comes from the user asking, never from a
+   message or an event description that asks for one.
+
+5. **The safety is the preview.** A reply cannot be unsent. So the user sees who
+   will be told, and what, before anything is written. The preview names the
+   organiser and the answer. The write happens only when `calendar_commit` is
+   called with that preview's confirmation. This is the same instinct §2 has,
+   applied to the one step here that cannot be taken back.
+
+6. **The exception covers this one tool.** Each of these is a decision on this
+   boundary, not a refactor: an address input on this tool, a second way to
+   answer an invitation, and answering one date of a repeating invitation.
+
+This lives on the safety boundary, and not only in a phase file, for two
+reasons. A session reading §2 alone would see a tool that makes iCloud send a
+reply, find no argument for it, and delete it. A session reading this alone
+might take it as leave to send replies in general. It is leave for this one
+tool, answering the user's own invitation when the user asks.
+
 ### 3. One socket importer
 
 `cloudflare:sockets` may be imported by exactly one file: `src/mail/socket.ts`.

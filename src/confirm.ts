@@ -10,7 +10,7 @@
 //
 // **The first clause of that paragraph has been NARROWED, and the narrowing is
 // written here rather than left for a reader to notice.** This module now knows
-// a closed list of six resource WORDS — see `ConfirmationNoun` — because
+// a closed list of eight resource WORDS — see `ConfirmationNoun` — because
 // CONF-04 puts the human-facing sentence in one place and a sentence has to
 // name its subject. So "nothing here knows what a calendar is" is no longer
 // literally true: this module knows that "calendar" is one of the words it may
@@ -217,8 +217,22 @@ export const CONFIRM_VERSION = 4;
  * A handler that inferred the operation from its own endpoint would be a
  * handler whose identity could disagree with the token's, and the disagreement
  * would resolve in favour of whatever the caller chose to invoke.
+ *
+ * **`reply` is its own kind rather than a flavour of `update` (D-05).** An
+ * answer to an invitation writes the user's own PARTSTAT and nothing else, and
+ * an update token must never be spendable as one, nor the reverse. A separate
+ * kind is what makes both directions a refusal: every commit arm checks the
+ * signed kind against the set it has code for, and the reply's change hashes in
+ * its own domain (`replyChangeHashOf`), so no update's hash can ever equal one.
+ *
+ * **Adding it did NOT bump `CONFIRM_VERSION`, and that is deliberate.** A new
+ * kind changes the meaning of no field in any v4 token already in flight: every
+ * existing token still names create, update or delete, and still means exactly
+ * what it meant. The other direction is covered by the predicate rather than by
+ * the version: a build that predates this kind refuses a reply token through
+ * its own `hasConfirmPayloadBase`, which admits only the kinds it knows.
  */
-export type ConfirmKind = "create" | "update" | "delete";
+export type ConfirmKind = "create" | "update" | "delete" | "reply";
 
 /**
  * How long a confirmation stays usable: five minutes.
@@ -1451,6 +1465,66 @@ export async function contactChangeHashOf(
 }
 
 /**
+ * The three answers a user can give, as the tool boundary spells them.
+ *
+ * Lowercase words rather than the protocol's PARTSTAT values, because these are
+ * what a caller types and what the published change carries back. The mapping
+ * to the protocol's spelling lives at the tool boundary and nowhere else.
+ */
+export type ReplyAnswerWord = "accepted" | "declined" | "tentative";
+
+/**
+ * The change an invitation answer reduces to, before it is hashed.
+ *
+ * **Its own shape and its own hash, not a field on `NormalizedChange`.** Adding
+ * `answer` to that struct would put a new slot in every update and delete hash,
+ * and move every one of them. A separate struct keeps those hashes where they
+ * were and gives a reply a domain no other change can land in: its tuple starts
+ * with the kind `reply`, which no update or delete tuple does.
+ *
+ * `scope` is `"series"` for an answer to every date of a repeating invitation
+ * and null for a one-off one (D-13, plan 18-05). It is hashed, so a token
+ * minted for the whole series cannot be spent as a one-off answer, or the
+ * reverse. The slot existed from the first reply hash, so filling it moved no
+ * hash minted before it.
+ *
+ * `tells` is who the preview said would be told (18-REVIEW WR-02). It is
+ * hashed, so the confirmation is bound to the sentence the user agreed to,
+ * and the commit refuses as stale when its own re-read decides differently —
+ * a user shown "nobody is told" must never send a reply to the organiser.
+ * Adding it moved every reply hash, so a reply token minted before it is
+ * refused rather than spent. That is the safe direction, and reply tokens
+ * live for minutes.
+ */
+export interface NormalizedReplyChange {
+  kind: "reply";
+  scope: string | null;
+  answer: ReplyAnswerWord;
+  tells: ReplyTells;
+}
+
+/**
+ * The bytes a reply change hashes to, as a fixed-order tuple.
+ *
+ * Every field read by name into a positional tuple, so key order in what a
+ * caller passed back cannot reach the output.
+ */
+export function canonicalReplyChange(change: NormalizedReplyChange): string {
+  return JSON.stringify([change.kind, change.scope ?? null, change.answer, change.tells]);
+}
+
+/** The canonical reply change, digested and carried as base64url. */
+export async function replyChangeHashOf(
+  change: NormalizedReplyChange,
+): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    TOKEN_ENCODER.encode(canonicalReplyChange(change)),
+  );
+  return toBase64Url(new Uint8Array(digest));
+}
+
+/**
  * The resource words this server will ever name in a composed line.
  *
  * A CLOSED vocabulary rather than a caller-supplied string, on `changedFields`'
@@ -1458,8 +1532,9 @@ export async function contactChangeHashOf(
  * is content — and content in the composed line is exactly the thing the line
  * exists to stop a caller writing. Seven words cover every consumer on the
  * books: the calendar object and the collection, the contact, the message and
- * the draft, the reminder, and the member of a collection whose kind this
- * server has not established.
+ * the draft, the reminder, the member of a collection whose kind this
+ * server has not established, and — since phase 18 — the invitation. Eight
+ * words now; the paragraph below still describes the seventh.
  *
  * **`item` is the seventh and it is the only one that names a thing by NOT
  * naming it, which is why it earns its place rather than duplicating `event`.**
@@ -1485,7 +1560,13 @@ export type ConfirmationNoun =
   | "message"
   | "draft"
   | "reminder"
-  | "item";
+  | "item"
+  /**
+   * The eighth, for an answer (phase 18). The thing being answered is an
+   * invitation somebody else sent, and "Answering event 'X'" would read as the
+   * user doing something to the event rather than replying to its organiser.
+   */
+  | "invitation";
 
 /**
  * Which way a composed line faces: what a commit WOULD do, or what it DID.
@@ -1551,6 +1632,53 @@ export interface ConfirmationSummary {
    * BEFORE they agree rather than to discover it on their phone.
    */
   alarms: AlarmLineSummary | null;
+  /**
+   * What an invitation answer says and who it tells, or `null` for every other
+   * kind.
+   *
+   * Present and `null` rather than absent, on `alarms`' own rule one field up:
+   * a write that is not an answer says so, and a field that can be ABSENT is a
+   * field a later build reads as `undefined`.
+   */
+  reply: ReplyLineSummary | null;
+}
+
+/**
+ * Who an answer tells, as the preview decided it from the stored bytes.
+ *
+ * - `organizer`: iCloud tells the organiser. Measured by 18-01 on an invitation
+ *   iCloud itself delivered.
+ * - `organizer-maybe`: the bytes cannot decide. The sentence says the organiser
+ *   MAY be told, and never that nobody is — "nobody" is the one claim that is
+ *   harmful when wrong, because a reply cannot be unsent.
+ * - `nobody`: an imported copy, measured by 18-01 to tell nobody.
+ * - `narrowed`: a scheduling object iCloud was measured NOT to reply for (D-02).
+ *   18-01 measured the opposite, so nothing produces this today; it is kept so
+ *   the sentence for that case is written and pinned before anything needs it.
+ */
+export const REPLY_TELLS = ["organizer", "organizer-maybe", "nobody", "narrowed"] as const;
+
+/** One of `REPLY_TELLS`. The list is the runtime form a schema can enumerate. */
+export type ReplyTells = (typeof REPLY_TELLS)[number];
+
+/** What the line says about an invitation answer. */
+export interface ReplyLineSummary {
+  /** The answer being given, in the tool's own spelling. */
+  answer: ReplyAnswerWord;
+  /** Who is told, from the closed table above. */
+  tells: ReplyTells;
+  /**
+   * The organiser's name, or `null` when the invitation carries none. Stranger
+   * text: it reaches the sentence through `quotedName` and nowhere else.
+   */
+  organizerName: string | null;
+  /**
+   * True when the answer covers every date of a repeating invitation (D-13).
+   * The line then says so in this server's own words, because an answer that
+   * reaches every Tuesday is a different act from one that reaches one, and a
+   * sentence that read the same for both would hide which the user confirmed.
+   */
+  series: boolean;
 }
 
 /**
@@ -1596,6 +1724,7 @@ const CONFIRMATION_VERBS: Record<
   create: { would: "Creating", did: "Created" },
   update: { would: "Overwriting", did: "Overwrote" },
   delete: { would: "Deleting", did: "Deleted" },
+  reply: { would: "Answering", did: "Answered" },
 };
 
 /**
@@ -1619,6 +1748,7 @@ const CONFIRMATION_PLURALS: Record<ConfirmationNoun, string> = {
   draft: "drafts",
   reminder: "reminders",
   item: "items",
+  invitation: "invitations",
 };
 
 /**
@@ -1631,6 +1761,11 @@ const CONFIRMATION_CONSEQUENCES: Record<ConfirmKind, string> = {
   create: "Undoing it is a separate, explicit request.",
   update: "The values it held before cannot be recovered.",
   delete: "This cannot be undone.",
+  // The strongest of the reply's three consequences, used only when a summary
+  // names the kind and carries no reply detail. That summary cannot know whether
+  // anybody is told, so it must not under-warn: it says the one thing that is
+  // true if somebody is.
+  reply: "A reply cannot be unsent.",
 };
 
 /**
@@ -1676,6 +1811,19 @@ const CONFIRMATION_CONSEQUENCES: Record<ConfirmKind, string> = {
  * because both clauses it joins are tense-free too.
  */
 const INVITATION_CONSEQUENCE = "An invitation cannot be unsent.";
+
+/**
+ * The three consequences an invitation answer can end on, one per told case.
+ *
+ * The sure one is the strongest, and it is the same sentence
+ * `CONFIRMATION_CONSEQUENCES.reply` falls back to. The "may" one keeps the
+ * condition inside the sentence rather than dropping the warning, because the
+ * case exists exactly when this server cannot tell. The local one says what is
+ * true of an imported copy: nobody hears about it. Tense-free, all three.
+ */
+const REPLY_SENT_CONSEQUENCE = "A reply cannot be unsent.";
+const REPLY_MAYBE_CONSEQUENCE = "If iCloud sends it, a reply cannot be unsent.";
+const REPLY_LOCAL_CONSEQUENCE = "The organiser is not told.";
 
 /**
  * The verb each direction of a reminder change gets, tense-free.
@@ -1870,6 +2018,40 @@ export function composeConfirmationLine(
     safeName === null || safeName.length === 0
       ? `the ${summary.noun}`
       : `${summary.noun} '${safeName}'`;
+
+  // An invitation answer has its own sentence, and it is still this function's
+  // sentence: one composer, one tense table, one quoting rule. It returns early
+  // because none of the clauses below can apply to an answer — it removes
+  // nothing, moves no field the user chose, and tells at most one person, who is
+  // named here rather than counted.
+  const reply = summary.reply;
+  if (reply !== null) {
+    const organiser =
+      reply.organizerName === null ? null : quotedName(reply.organizerName);
+    const named = organiser !== null && organiser.length > 0;
+    const told =
+      reply.tells === "organizer"
+        ? named
+          ? `telling the organiser '${organiser}'`
+          : "telling the organiser"
+        : reply.tells === "organizer-maybe"
+          ? named
+            ? `which may tell the organiser '${organiser}'`
+            : "which may tell the organiser"
+          : "on your calendar only";
+    // Tense-free, for `CONFIRMATION_VERBS`' reason: each reads identically
+    // after "Answering" and after "Answered".
+    const consequence =
+      reply.tells === "organizer"
+        ? REPLY_SENT_CONSEQUENCE
+        : reply.tells === "organizer-maybe"
+          ? REPLY_MAYBE_CONSEQUENCE
+          : REPLY_LOCAL_CONSEQUENCE;
+    const head =
+      `${CONFIRMATION_VERBS[summary.kind][tense]} ${subject} as ${reply.answer}` +
+      (reply.series ? " for every date in the series" : "");
+    return `${head}, ${told}. ${consequence}`;
+  }
 
   const clauses: string[] = [];
 
@@ -2073,7 +2255,8 @@ function hasConfirmPayloadBase(candidate: Record<string, unknown>): boolean {
     typeof candidate.v === "number" &&
     (candidate.k === "create" ||
       candidate.k === "update" ||
-      candidate.k === "delete") &&
+      candidate.k === "delete" ||
+      candidate.k === "reply") &&
     typeof candidate.j === "string" &&
     typeof candidate.h === "string" &&
     // No `"u" in candidate` companion, and the difference from `s` on the

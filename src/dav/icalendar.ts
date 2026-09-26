@@ -196,6 +196,7 @@ export function expandWithinBudget(
   budget: StepBudget,
   cap: number = MAX_EXPANDED_OCCURRENCES,
   perResourceSteps: number = MAX_ITERATOR_STEPS,
+  keep: OccurrenceKeep = "starts",
 ): ExpansionResult {
   if (budget.remaining <= 0) {
     return {
@@ -212,6 +213,7 @@ export function expandWithinBudget(
     rangeEndUtc,
     cap,
     Math.min(perResourceSteps, budget.remaining),
+    keep,
   );
 
   // Clamped at zero rather than allowed to go negative. The step cap is checked
@@ -402,6 +404,21 @@ export interface ParsedCalendarResource {
    */
   ownedTzids: string[];
 }
+
+/**
+ * Which occurrences an expansion keeps (18-REVIEW CR-01).
+ *
+ * `starts`: an occurrence whose START is inside the range. A listing wants
+ * this: two abutting pages then return every occurrence exactly once.
+ *
+ * `overlaps`: an occurrence any part of which is inside the range. A conflict
+ * check wants this. An event that began before the range and is still running
+ * — a three-day conference, a week out of office — overlaps the range, and the
+ * server's time-range read returns it for that reason. Keeping only what starts
+ * inside the range drops it, and the check then says nothing else is on the
+ * calendar while it is.
+ */
+export type OccurrenceKeep = "starts" | "overlaps";
 
 /** The result of expanding one resource over one range. */
 export interface ExpansionResult {
@@ -692,6 +709,11 @@ export function withParsedResource<T>(
  * outside it still appears, at its moved time. That falls out of the iterator
  * walking recurrence ids, and it is the correct reading — the caller asked
  * which slots of this series fall in the range.
+ *
+ * `keep` widens the start edge only, and only when asked: under `overlaps` an
+ * occurrence that started before the range but has not ended by its start is
+ * kept too (see `OccurrenceKeep`). The end edge is the same in both modes.
+ * Listings pass nothing and keep the half-open rule above.
  */
 export function expandOccurrences(
   resource: ParsedCalendarResource,
@@ -699,6 +721,7 @@ export function expandOccurrences(
   rangeEndUtc: number,
   cap: number = MAX_EXPANDED_OCCURRENCES,
   maxSteps: number = MAX_ITERATOR_STEPS,
+  keep: OccurrenceKeep = "starts",
 ): ExpansionResult {
   const rangeStart = utcTimeAt(rangeStartUtc);
   const rangeEnd = utcTimeAt(rangeEndUtc);
@@ -711,8 +734,8 @@ export function expandOccurrences(
   // components sat right there. Structural check for the path, flag for the
   // report.
   return resource.master === null
-    ? expandComponents(resource, rangeStart, rangeEnd, cap)
-    : expandSeries(resource, rangeStart, rangeEnd, cap, maxSteps);
+    ? expandComponents(resource, rangeStart, rangeEnd, cap, keep)
+    : expandSeries(resource, rangeStart, rangeEnd, cap, maxSteps, keep);
 }
 
 /**
@@ -908,6 +931,7 @@ function expandSeries(
   rangeEnd: IcalTime,
   cap: number,
   maxSteps: number,
+  keep: OccurrenceKeep = "starts",
 ): ExpansionResult {
   const series = new ICAL.Event(resource.master ?? undefined);
 
@@ -925,6 +949,16 @@ function expandSeries(
   let truncated = false;
   let steps = 0;
 
+  // Under `overlaps`, a slot before the range needs its details only if it
+  // could still be running. With no edited dates, every slot lasts exactly the
+  // series' own duration, so its end is known without reading its details —
+  // and the details read doubles the cost of a walk from a series start years
+  // back. With edited dates, any slot may have been moved or lengthened, so
+  // every early slot is read.
+  const plainSlots = keep === "overlaps" && Object.keys(series.exceptions).length === 0;
+  const slotSeconds = plainSlots ? series.duration.toSeconds() : 0;
+  const rangeStartSeconds = rangeStart.toUnixTime();
+
   // The iterator starts at the series' own start, NOT at the range start, so
   // the caller skips forward and breaks at the end. **That break is what
   // terminates an unbounded rule** — there is nothing else that would.
@@ -936,17 +970,45 @@ function expandSeries(
       break;
     }
     if (next.compare(rangeEnd) >= 0) break;
-    if (next.compare(rangeStart) >= 0) {
+    // A slot before the range is still kept under `overlaps` when the date it
+    // produces has not ended by the range's start. Its details are read only
+    // then, so a listing pays nothing for the mode it does not use.
+    const details =
+      next.compare(rangeStart) >= 0
+        ? series.getOccurrenceDetails(next)
+        : keep === "overlaps" &&
+            (!plainSlots || next.toUnixTime() + slotSeconds > rangeStartSeconds)
+          ? runningAt(series.getOccurrenceDetails(next), rangeStart, rangeEnd)
+          : null;
+    if (details !== null) {
       if (occurrences.length >= cap) {
         truncated = true;
         break;
       }
-      occurrences.push(occurrenceFrom(series.getOccurrenceDetails(next), isRecurring));
+      occurrences.push(occurrenceFrom(details, isRecurring));
     }
     next = iterator.next();
   }
 
   return { occurrences, truncated, steps, preExpanded: resource.preExpanded };
+}
+
+/**
+ * The details of a date that began before the range, when it is still running
+ * inside it, else null.
+ *
+ * Compared as the occurrence actually stands, so a date someone moved is judged
+ * at its moved time. An end exactly at the range's start is out: the date ended
+ * as the range began, which is touching and not overlapping.
+ */
+function runningAt(
+  details: OccurrenceDetails,
+  rangeStart: IcalTime,
+  rangeEnd: IcalTime,
+): OccurrenceDetails | null {
+  if (details.endDate.compare(rangeStart) <= 0) return null;
+  if (details.startDate.compare(rangeEnd) >= 0) return null;
+  return details;
 }
 
 /**
@@ -961,6 +1023,7 @@ function expandComponents(
   rangeStart: IcalTime,
   rangeEnd: IcalTime,
   cap: number,
+  keep: OccurrenceKeep = "starts",
 ): ExpansionResult {
   const occurrences: Occurrence[] = [];
   let truncated = false;
@@ -969,7 +1032,12 @@ function expandComponents(
     const event = new ICAL.Event(component);
     const start = event.startDate;
     if (start.compare(rangeEnd) >= 0) continue;
-    if (start.compare(rangeStart) < 0) continue;
+    // Under `overlaps`, a component that began before the range is kept while
+    // it is still running at the range's start (see `OccurrenceKeep`).
+    if (start.compare(rangeStart) < 0) {
+      if (keep !== "overlaps") continue;
+      if (event.endDate.compare(rangeStart) <= 0) continue;
+    }
     if (occurrences.length >= cap) {
       truncated = true;
       break;
@@ -2701,6 +2769,529 @@ export function serializeOccurrenceResource(
   }
 
   return `${vcalendar.toString()}\r\n`;
+}
+
+// ---------------------------------------------------------------------------
+// Answering an invitation — the one patch that must NOT look like an edit
+//
+// Every other writer in this module is an EDIT of the event: it asserts new
+// values over one component and advances the revision, because a change nobody
+// revised is a change every other client ignores. An answer is the opposite
+// case. It is the attendee saying yes or no to somebody else's meeting, and the
+// meeting is not theirs to revise. So this patch changes two parameters on the
+// user's own attendee line and NOTHING else: no SEQUENCE, no DTSTAMP, no other
+// attendee's line, no other property. D-07 decided that, and plan 18-01
+// measured on the live account that iCloud stores exactly the bytes such a
+// patch writes.
+//
+// Pure and socket-free, like everything else here. Which addresses are the
+// user's is decided by the caller from the signed-in principal's own server
+// answer; nothing in this section reads a caller's claim about who they are.
+// ---------------------------------------------------------------------------
+
+/**
+ * The three answers a user can give, in the protocol's own spelling.
+ *
+ * Closed on purpose. RFC 5545 admits more PARTSTAT values (`DELEGATED`, an
+ * `X-` value), and none of them is a thing this server lets a caller say. The
+ * tool boundary maps its own three lowercase words onto these three.
+ */
+export type ReplyAnswer = "ACCEPTED" | "DECLINED" | "TENTATIVE";
+
+/** The URI scheme an address a person receives mail at carries. */
+const MAILTO_PREFIX = "mailto:";
+
+/**
+ * Whether one calendar-user address on a line is one of the user's own.
+ *
+ * **Three arms, and each one was measured rather than assumed (18-01).**
+ *
+ * - A `mailto:` value, folded. Case in an address is not the user's to
+ *   control; a server or a client may write `MAILTO:` or an upper-case domain.
+ * - The `EMAIL` parameter, folded, against the address part of a `mailto:` in
+ *   the set. **This is the arm a real iCloud invitation needs.** On an
+ *   invitation iCloud itself delivered, the user's line carries an opaque
+ *   principal path as its value and the address ONLY in `EMAIL=`. A matcher
+ *   that read the value alone would call the user a stranger on their own
+ *   invitation. **Consulted only when the value is NOT a `mailto:`**
+ *   (18-REVIEW WR-01). A line whose value is a `mailto:` already says who it
+ *   is, and that is the whole answer. Otherwise an organiser could write the
+ *   user's address in `EMAIL=` on Bob's `mailto:` line, leave the user's own
+ *   line out, and have the user's answer written onto Bob's line. 18-01 only
+ *   ever measured `EMAIL=` beside an opaque path, so this narrows nothing
+ *   that was measured.
+ * - Any other value, EXACTLY. A principal path or a `urn:uuid:` form is an
+ *   opaque identifier, and folding one would be this function inventing an
+ *   equivalence the server never declared. The measured line was a relative
+ *   path, the same form the account's own set advertises, so no path-versus-URL
+ *   comparison is attempted either.
+ *
+ * `addresses` is the account's calendar-user-address-set exactly as its own
+ * principal answered it. Nothing a caller supplied can reach it, and nothing
+ * the stored event says about itself can either — this function only ASKS
+ * whether a stranger-written value names one of them.
+ */
+export function isOwnAddress(
+  value: string | null,
+  emailParameter: string | null,
+  addresses: readonly string[],
+): boolean {
+  const foldedValue = value === null ? null : value.toLowerCase();
+  const valueIsMailto = foldedValue !== null && foldedValue.startsWith(MAILTO_PREFIX);
+  // Never read beside a mailto value: see the second arm above.
+  const foldedEmail =
+    valueIsMailto || emailParameter === null || emailParameter.length === 0
+      ? null
+      : emailParameter.toLowerCase();
+
+  for (const address of addresses) {
+    if (address.length === 0) continue;
+    const folded = address.toLowerCase();
+    if (folded.startsWith(MAILTO_PREFIX)) {
+      if (foldedValue !== null && foldedValue === folded) return true;
+      const part = folded.slice(MAILTO_PREFIX.length);
+      if (foldedEmail !== null && part.length > 0 && foldedEmail === part) {
+        return true;
+      }
+    } else if (value !== null && value === address) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** One property's calendar-user address, as the string the line carries. */
+function calAddressOf(property: IcalProperty): string | null {
+  const value = property.getFirstValue();
+  return typeof value === "string" ? value : null;
+}
+
+/** Whether one `ORGANIZER` or `ATTENDEE` property names the user. */
+function namesUser(property: IcalProperty, addresses: readonly string[]): boolean {
+  return isOwnAddress(
+    calAddressOf(property),
+    firstParameter(property, "email"),
+    addresses,
+  );
+}
+
+/**
+ * What answering an invitation would do, decided before anything is written.
+ *
+ * One arm that carries the patched components and four refusals, on
+ * `SeriesNarrowing`'s pattern: the caller dispatches on the arm and cannot
+ * reach a component list on a refusal.
+ *
+ * - `not-invited`: no line on this resource is the user's, or the line that is
+ *   sits on a component with no organiser — which is an event, not an
+ *   invitation.
+ * - `organiser`: the user organises this meeting. An organiser does not answer
+ *   their own invitation, and a forged `ORGANIZER` that happens to carry the
+ *   user's address is refused the same way (T-18-08).
+ * - `ambiguous`: two of the user's addresses sit on one component. Which one
+ *   the organiser is waiting on is not a question this server can answer, so it
+ *   refuses rather than choosing.
+ * - `unchanged`: the stored answer already IS the requested one. Zero writes is
+ *   the honest cost of a request that changes nothing (D-15).
+ */
+export type ReplyPlan =
+  | {
+      kind: "ok";
+      /** The component list to serialise. Every entry is a clone. */
+      components: IcalComponent[];
+    }
+  | { kind: "not-invited" }
+  | { kind: "organiser" }
+  | { kind: "ambiguous" }
+  | { kind: "unchanged" };
+
+/** The four arms that carry no payload, allocated once. */
+const REPLY_NOT_INVITED: ReplyPlan = Object.freeze({ kind: "not-invited" } as const);
+const REPLY_ORGANISER: ReplyPlan = Object.freeze({ kind: "organiser" } as const);
+const REPLY_AMBIGUOUS: ReplyPlan = Object.freeze({ kind: "ambiguous" } as const);
+const REPLY_UNCHANGED: ReplyPlan = Object.freeze({ kind: "unchanged" } as const);
+
+/**
+ * Set the user's own answer on every component that carries their line.
+ *
+ * **Clone first, then patch the clones**, which is `applyEventChange`'s shape:
+ * the parsed resource is never mutated, so a caller can serialise it twice and
+ * get the same answer both times.
+ *
+ * **Every component, not the first one.** A master and its overrides each
+ * carry their own copy of the attendee list, and an answer set on the master
+ * alone would leave every edited occurrence still waiting for a reply the user
+ * already gave.
+ *
+ * **What it writes, exhaustively: on each of the user's own attendee lines,
+ * `PARTSTAT` becomes the answer and `RSVP` goes.** `RSVP=TRUE` is the organiser
+ * asking for a reply, and a line that has replied no longer asks. Nothing else
+ * is touched. It never calls the override writer, because that writer advances
+ * SEQUENCE and DTSTAMP, and an attendee who bumps the organiser's revision is
+ * editing a meeting that is not theirs (D-07). 18-01 measured that iCloud
+ * stores these bytes unchanged and that SEQUENCE stays where it was.
+ *
+ * The `X-APPLE-NEEDS-REPLY` flag an imported copy carries is left standing too.
+ * The owner decided that on 2026-09-26 (18-UAT.md, `device_flag_decision`), so
+ * D-07 has no exception here.
+ *
+ * The organiser check runs FIRST, across every component, so a resource that
+ * names the user as both organiser and attendee is refused as the organiser's
+ * rather than answered.
+ */
+export function applyReply(
+  resource: ParsedCalendarResource,
+  addresses: readonly string[],
+  answer: ReplyAnswer,
+): ReplyPlan {
+  const components = resource.components.map(cloneComponent);
+
+  for (const component of components) {
+    for (const organizer of component.getAllProperties("organizer")) {
+      if (namesUser(organizer, addresses)) return REPLY_ORGANISER;
+    }
+  }
+
+  const matched: IcalProperty[] = [];
+  for (const component of components) {
+    const own = component
+      .getAllProperties("attendee")
+      .filter((attendee) => namesUser(attendee, addresses));
+    if (own.length > 1) return REPLY_AMBIGUOUS;
+    if (own.length === 0) continue;
+    // A line of the user's on a component nobody organises is an event the user
+    // is listed on, not an invitation somebody is waiting on an answer to.
+    if (component.getAllProperties("organizer").length === 0) {
+      return REPLY_NOT_INVITED;
+    }
+    matched.push(own[0]);
+  }
+  if (matched.length === 0) return REPLY_NOT_INVITED;
+
+  const already = matched.every(
+    (line) => firstParameter(line, "partstat")?.toUpperCase() === answer,
+  );
+  if (already) return REPLY_UNCHANGED;
+
+  for (const line of matched) {
+    line.setParameter("partstat", answer);
+    line.removeParameter("rsvp");
+  }
+  return { kind: "ok", components };
+}
+
+/**
+ * What the stored bytes say about whether iCloud will tell the organiser.
+ *
+ * Three literals, and the third is the one that matters. See
+ * `invitationFactsOf` for how each is read.
+ *
+ * - `scheduling-object`: iCloud holds the organiser relationship. 18-01
+ *   measured a PARTSTAT-only write on one of these reaching the organiser.
+ * - `imported-copy`: a `.ics` somebody opened into Calendar. 18-01 measured the
+ *   same write on one of these reaching nobody.
+ * - `undetermined`: the bytes do not say. The tool layer maps this to "may tell
+ *   the organiser" and never to "nobody is told", because the second is the one
+ *   claim that would let a reply go out that the user was told would not.
+ */
+export type SchedulingEvidence =
+  | "scheduling-object"
+  | "imported-copy"
+  | "undetermined";
+
+/**
+ * Who organises an invitation, as the line carries it (D-12).
+ *
+ * Two fields rather than one display string, because "the organiser's address
+ * is unknown" is a fact the preview states in its own words, and a single
+ * string that fell back from the name to the address would have erased it.
+ */
+export interface InvitationOrganizer {
+  /** The `CN`, verbatim and untrusted. Null when absent or empty. */
+  name: string | null;
+  /**
+   * The address the reply would go to: the `mailto:` value, else the `EMAIL`
+   * parameter, else null. Verbatim and untrusted. 18-01 measured a genuine
+   * iCloud invitation whose organiser value is an opaque principal path with
+   * the address only in `EMAIL=`, which is why the parameter is read too.
+   */
+  address: string | null;
+}
+
+/** One other person on an invitation, verbatim. Every field untrusted. */
+export interface InvitationAttendee {
+  /** The `CN`. Null when absent. */
+  name: string | null;
+  /** The `mailto:` address, else the `EMAIL` parameter, else null. */
+  email: string | null;
+  /** The raw `PARTSTAT`. The tool layer matches it against a closed table. */
+  partstat: string | null;
+}
+
+/** What a preview needs to know about one invitation, read in one parse. */
+export interface InvitationFacts {
+  /**
+   * Who organises it: the first `ORGANIZER` on the resource, or both fields
+   * null when there is none. Untrusted and verbatim.
+   */
+  organizer: InvitationOrganizer;
+  /**
+   * The raw `PARTSTAT` on the user's own line, on the first component carrying
+   * one, or null. Untrusted and verbatim: the tool layer MATCHES it against a
+   * closed table and publishes the table's constant, never this string.
+   */
+  ownAnswer: string | null;
+  /** Which side of 18-01's measurement this resource sits on. */
+  evidence: SchedulingEvidence;
+  /**
+   * Everybody else on the invitation, in document order (D-10).
+   *
+   * Read off ONE component — the master when there is one, else the first —
+   * because a master and its overrides each repeat the list, and reading every
+   * component would list each person once per edited date.
+   *
+   * **Two kinds of line are left out, and both on purpose.** The user's own
+   * line or lines, matched by `isOwnAddress` against the account's own address
+   * set: the user is not "another attendee", and their address must not reach
+   * a response (RSVP-02). And the organiser's own attendee line, when the
+   * organiser also sits on the list (both measured copies carry one): the
+   * preview names the organiser separately and says whether they are told, so
+   * counting them again among the people who are "not told directly" would
+   * make the preview contradict itself.
+   */
+  others: InvitationAttendee[];
+  /**
+   * The resource's UID, off the same component as `others`, or null. Read so a
+   * conflict sweep can recognise a copy of THIS invitation on another calendar
+   * as the invitation rather than as a clash with it. Untrusted, and never
+   * published: it is compared, not shown.
+   */
+  uid: string | null;
+  /**
+   * The dates of a series the user answered on their own (OQ6), in document
+   * order: every override component carrying the user's line whose `PARTSTAT`
+   * differs from the one on the master's line.
+   *
+   * A whole-series answer rewrites every one of these, so the preview names
+   * them before a token is used. Compared with RFC 5545's default applied —
+   * a line with no `PARTSTAT` has not answered, which is `NEEDS-ACTION` — and
+   * case-folded, because the values are case-insensitive. Empty on a one-off
+   * resource and on one with no master: there is no series answer to differ
+   * from. Every field is read verbatim and untrusted.
+   */
+  separateAnswers: SeparateAnswer[];
+}
+
+/** One date of a series the user answered separately. Every field untrusted. */
+export interface SeparateAnswer {
+  /** The override's `RECURRENCE-ID`, as its own wall clock. */
+  recurrenceLocal: string;
+  /** The same instant in seconds since the epoch; absent when it has none. */
+  recurrenceUtc?: number;
+  /** The zone `recurrenceLocal` is in, as `readEventTime` reports it. */
+  recurrenceTzid: string;
+  /** The raw `PARTSTAT` on the user's line of that override, or null. */
+  partstat: string | null;
+}
+
+/**
+ * The scheduling-agent values RFC 6638 § 7.1 defines as "the server does not
+ * schedule for this person". Upper-case, compared after folding.
+ */
+const CLIENT_SCHEDULED = new Set(["CLIENT", "NONE"]);
+
+/**
+ * Read the facts a reply preview states, from the stored bytes and the one
+ * server-side marker that decides who is told.
+ *
+ * ## Which marker decides, and why it is this one
+ *
+ * 18-01 read both sides on the live account on 2026-09-26. The copy iCloud
+ * itself delivered carried a `Schedule-Tag`, and answering it told the
+ * organiser. The copy imported from a `.ics` carried none — the property came
+ * back 404 — and answering it told nobody. `SCHEDULE-STATUS` was absent on
+ * BOTH, before and after, so it is not read here at all: D-09's first wording
+ * would have called a real invitation "nobody is told".
+ *
+ * `scheduleTag` is that marker, read by the caller out of the same multi-status
+ * the body came from. It is a server statement under RFC 6638, not a value the
+ * organiser wrote, which is why it is the one that decides.
+ *
+ * ## Why absence alone does not say "nobody"
+ *
+ * One sample of each was measured. A tag present is the server saying it
+ * schedules this resource, and that side is safe to state. A tag ABSENT is
+ * weaker: it is what an imported copy looked like, and it is also what any
+ * scheduling object would look like if the property were ever not returned.
+ * "Nobody is told" is the one sentence that is harmful when wrong, because a
+ * reply cannot be unsent. So absence becomes `imported-copy` only when the
+ * bytes CORROBORATE it with the other marker 18-01 saw on the imported side: a
+ * `SCHEDULE-AGENT` of `CLIENT` or `NONE` on the organiser or on the user's own
+ * line, which RFC 6638 defines as "the server does not schedule for this
+ * person". Without it the answer is `undetermined`.
+ *
+ * Untrusted values are returned verbatim, on this module's rule.
+ */
+export function invitationFactsOf(
+  icsText: string,
+  addresses: readonly string[],
+  scheduleTag: string | null,
+): InvitationFacts {
+  return withParsedResource(icsText, (resource) => {
+    let organizerLine: IcalProperty | null = null;
+    let ownAnswer: string | null = null;
+    let answered = false;
+    let clientScheduled = false;
+
+    // The master first, then the rest in document order (18-REVIEW WR-06).
+    // RFC 5545 does not put the master first, and an edited date that came
+    // first would otherwise lend the series its own separate answer, while
+    // `separateAnswersOf` compares against the master's. The fallback without
+    // a master is the first component that carries the user's line.
+    const master = resource.components.find((one) => !one.hasProperty("recurrence-id"));
+    const ordered =
+      master === undefined
+        ? resource.components
+        : [master, ...resource.components.filter((one) => one !== master)];
+
+    for (const component of ordered) {
+      for (const organizer of component.getAllProperties("organizer")) {
+        if (organizerLine === null) organizerLine = organizer;
+        if (isClientScheduled(organizer)) clientScheduled = true;
+      }
+      for (const attendee of component.getAllProperties("attendee")) {
+        if (!namesUser(attendee, addresses)) continue;
+        if (!answered) {
+          ownAnswer = firstParameter(attendee, "partstat");
+          answered = true;
+        }
+        if (isClientScheduled(attendee)) clientScheduled = true;
+      }
+    }
+
+    const evidence: SchedulingEvidence =
+      scheduleTag !== null
+        ? "scheduling-object"
+        : clientScheduled
+          ? "imported-copy"
+          : "undetermined";
+
+    const organizer: InvitationOrganizer =
+      organizerLine === null
+        ? { name: null, address: null }
+        : { name: nonEmpty(firstParameter(organizerLine, "cn")), address: addressOf(organizerLine) };
+
+    // The master when there is one: it carries the list every override repeats.
+    const listed =
+      resource.components.find((one) => !one.hasProperty("recurrence-id")) ??
+      resource.components[0] ??
+      null;
+    const others: InvitationAttendee[] = [];
+    for (const attendee of listed?.getAllProperties("attendee") ?? []) {
+      if (namesUser(attendee, addresses)) continue;
+      if (organizerLine !== null && sameParty(attendee, organizerLine)) continue;
+      others.push({
+        name: firstParameter(attendee, "cn"),
+        email: addressOf(attendee),
+        partstat: firstParameter(attendee, "partstat"),
+      });
+    }
+
+    const uid = textOf(listed?.getFirstPropertyValue("uid"));
+
+    return {
+      organizer,
+      ownAnswer,
+      evidence,
+      others,
+      uid,
+      separateAnswers: separateAnswersOf(resource, addresses),
+    };
+  });
+}
+
+/**
+ * The override answers that differ from the master's (OQ6). See
+ * `InvitationFacts.separateAnswers`.
+ */
+function separateAnswersOf(
+  resource: ParsedCalendarResource,
+  addresses: readonly string[],
+): SeparateAnswer[] {
+  const master = resource.components.find((one) => !one.hasProperty("recurrence-id"));
+  if (master === undefined) return [];
+
+  const ownPartstat = (component: IcalComponent): { found: boolean; raw: string | null } => {
+    const line = component
+      .getAllProperties("attendee")
+      .find((attendee) => namesUser(attendee, addresses));
+    return line === undefined
+      ? { found: false, raw: null }
+      : { found: true, raw: firstParameter(line, "partstat") };
+  };
+  const folded = (raw: string | null): string => (raw ?? "NEEDS-ACTION").toUpperCase();
+
+  const masterAnswer = folded(ownPartstat(master).raw);
+  const separate: SeparateAnswer[] = [];
+  for (const component of resource.components) {
+    if (component === master) continue;
+    const value = component.getFirstPropertyValue("recurrence-id");
+    if (!(value instanceof ICAL.Time)) continue;
+    const own = ownPartstat(component);
+    if (!own.found || folded(own.raw) === masterAnswer) continue;
+
+    const time = readEventTime(value, requestedTzidOf(component, "recurrence-id"));
+    const row: SeparateAnswer = {
+      recurrenceLocal: time.local,
+      recurrenceTzid: time.tzid,
+      partstat: own.raw,
+    };
+    // Assigned rather than spread, so an absent instant stays ABSENT.
+    if (time.utc !== undefined) row.recurrenceUtc = time.utc;
+    separate.push(row);
+  }
+  return separate;
+}
+
+/** A string, or null when it is absent or empty. */
+function nonEmpty(value: string | null): string | null {
+  return value !== null && value.length > 0 ? value : null;
+}
+
+/**
+ * The address one `ORGANIZER` or `ATTENDEE` line would be reached at: the
+ * `mailto:` value, else the `EMAIL` parameter, else null. Verbatim.
+ */
+function addressOf(property: IcalProperty): string | null {
+  const value = calAddressOf(property);
+  if (value !== null && value.toLowerCase().startsWith(MAILTO_PREFIX)) {
+    const address = value.slice(MAILTO_PREFIX.length);
+    if (address.length > 0) return address;
+  }
+  return nonEmpty(firstParameter(property, "email"));
+}
+
+/**
+ * Whether an attendee line names the same person as the organiser line.
+ *
+ * The same value exactly (an opaque principal path compares only that way, on
+ * `isOwnAddress`'s rule), or the same address once folded. Used only to keep
+ * the organiser out of the other-attendees list, never to decide who is told.
+ */
+function sameParty(attendee: IcalProperty, organizer: IcalProperty): boolean {
+  const value = calAddressOf(attendee);
+  if (value !== null && value.length > 0 && value === calAddressOf(organizer)) {
+    return true;
+  }
+  const one = addressOf(attendee);
+  const two = addressOf(organizer);
+  return one !== null && two !== null && one.toLowerCase() === two.toLowerCase();
+}
+
+/** Whether a line says the server does not schedule for this person. */
+function isClientScheduled(property: IcalProperty): boolean {
+  const agent = firstParameter(property, "schedule-agent");
+  return agent !== null && CLIENT_SCHEDULED.has(agent.toUpperCase());
 }
 
 // ---------------------------------------------------------------------------
