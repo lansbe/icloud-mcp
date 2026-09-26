@@ -1282,15 +1282,34 @@ describe("nothing awaits ahead of the gate", () => {
     expect(awaitsAheadOf(source, "withMailSession", "connectImap(")).toBe(false);
   });
 
-  it("withMailSessionOver holds no await ahead of gate.acquire()", () => {
-    const span = spanAheadOf(source, "withMailSessionOver", "gate.acquire(");
+  // The acquire lives in the private core now (20-02). So the guard is in two
+  // halves: nothing awaits in the core ahead of the acquire, and nothing awaits
+  // in the read wrapper ahead of its call into the core.
+  it("withMailSessionCore holds no await ahead of gate.acquire()", () => {
+    const span = spanAheadOf(source, "withMailSessionCore", "gate.acquire(");
+
+    expect(span).not.toBeNull();
+    expect(span?.trim().length).toBeGreaterThan(0);
+    expect(span).toContain("duplex: DuplexLike");
+    expect(span).toContain("principal: Principal");
+    expect(awaitsAheadOf(source, "withMailSessionCore", "gate.acquire(")).toBe(
+      false,
+    );
+  });
+
+  it("withMailSessionOver holds no await ahead of its call into the core", () => {
+    const span = spanAheadOf(
+      source,
+      "withMailSessionOver",
+      "withMailSessionCore(",
+    );
 
     expect(span).not.toBeNull();
     expect(span).toContain("duplex: DuplexLike");
     expect(span).toContain("principal: Principal");
-    expect(awaitsAheadOf(source, "withMailSessionOver", "gate.acquire(")).toBe(
-      false,
-    );
+    expect(
+      awaitsAheadOf(source, "withMailSessionOver", "withMailSessionCore("),
+    ).toBe(false);
   });
 
   it("does not mistake the longer name for the shorter one", () => {

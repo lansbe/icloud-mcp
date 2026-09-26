@@ -113,9 +113,9 @@ export const MAX_LITERAL_OCTETS = 2 * 1024 * 1024;
  * This adds a seam rather than replacing a constant.
  *
  * An injectable bound on a safety path is a bound a future caller can set
- * wrong. The mitigation is structural: `withMailSession` in `./service.ts` is
- * the only production construction site, so there is exactly one place to audit
- * an injected value.
+ * wrong. The mitigation is structural: the private session core in
+ * `./service.ts` is the only production construction site, so there is exactly
+ * one place to audit an injected value.
  *
  * `maxLiteralOctets` is the second use of that seam and the first one that is
  * not about a timeout, so it is worth saying what changes and what does not.
