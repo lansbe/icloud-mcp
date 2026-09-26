@@ -25,12 +25,14 @@ import {
   indicatesConnectionLimit,
   indicatesCredentialRefusal,
   isUntagged,
+  parseAccessCode,
   parseCapabilityLine,
   parseListLine,
   parseSearchLine,
   parseStatusLine,
   parseTaggedResponse,
   resolveFolderRole,
+  seenStateOf,
 } from "../src/mail/imap-parser";
 import { ImapChannel, readUntilTag } from "../src/mail/imap-session";
 import { createFakeDuplex } from "./fixtures/fake-duplex";
@@ -980,5 +982,111 @@ describe("parseSearchLine", () => {
       const [first] = await untaggedFrom(line);
       expect(parseSearchLine(first!)).toBeNull();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The mutating path's two parsers (phase 20, plan 20-03)
+// ---------------------------------------------------------------------------
+
+describe("parseAccessCode", () => {
+  it("reads read-write off an OK completion", () => {
+    expect(parseAccessCode("a4 OK [READ-WRITE] SELECT completed")).toBe(
+      "read-write",
+    );
+  });
+
+  it("reads read-only off an OK completion", () => {
+    expect(parseAccessCode("a4 OK [READ-ONLY] SELECT completed")).toBe(
+      "read-only",
+    );
+  });
+
+  it("matches the code in any case, as response codes are case-insensitive", () => {
+    expect(parseAccessCode("a4 OK [read-write] SELECT completed")).toBe(
+      "read-write",
+    );
+    expect(parseAccessCode("a4 OK [Read-Only] done")).toBe("read-only");
+  });
+
+  it("is null when the completion carries no access code", () => {
+    // Absent is its own answer, not read-write (PITFALLS #33).
+    expect(parseAccessCode("a4 OK SELECT completed")).toBeNull();
+    expect(parseAccessCode("a4 OK")).toBeNull();
+  });
+
+  it("is null on a NO, even one carrying the code", () => {
+    expect(parseAccessCode("a4 NO [READ-WRITE] no such mailbox")).toBeNull();
+    expect(parseAccessCode("a4 BAD [READ-WRITE] syntax")).toBeNull();
+  });
+
+  it("is null when the code sits later in the human text", () => {
+    // Only the bracketed code immediately after OK is a response code. The
+    // same letters further along are prose the server chose to write.
+    expect(
+      parseAccessCode("a4 OK SELECT completed [READ-WRITE]"),
+    ).toBeNull();
+    expect(
+      parseAccessCode("a4 OK [UIDVALIDITY 5] then [READ-WRITE]"),
+    ).toBeNull();
+  });
+
+  it("is null on an untagged line", () => {
+    expect(parseAccessCode("* OK [READ-WRITE] mailbox open")).toBeNull();
+  });
+});
+
+describe("seenStateOf", () => {
+  it("finds the reply whose own UID matches, among several", async () => {
+    const untagged = await untaggedFrom(
+      "* 3 FETCH (UID 10 FLAGS ())",
+      "* 4 FETCH (UID 11 FLAGS (\\Seen))",
+      "* 5 FETCH (UID 12 FLAGS ())",
+    );
+
+    expect(seenStateOf(untagged, 11)).toBe(true);
+    expect(seenStateOf(untagged, 10)).toBe(false);
+    expect(seenStateOf(untagged, 12)).toBe(false);
+  });
+
+  it("keys on the UID item, never on the sequence-number prefix", async () => {
+    // The prefix here is 11, and it names a different message. Reading it as
+    // the UID would report another message's state as this one's.
+    const untagged = await untaggedFrom("* 11 FETCH (UID 40 FLAGS (\\Seen))");
+
+    expect(seenStateOf(untagged, 11)).toBeNull();
+    expect(seenStateOf(untagged, 40)).toBe(true);
+  });
+
+  it("skips a reply with no UID item", async () => {
+    const untagged = await untaggedFrom(
+      "* 4 FETCH (FLAGS (\\Seen))",
+      "* 5 FETCH (UID 11 FLAGS ())",
+    );
+
+    expect(seenStateOf(untagged, 11)).toBe(false);
+    expect(seenStateOf(untagged, 4)).toBeNull();
+  });
+
+  it("is null when the matching reply carries no flag list", async () => {
+    const untagged = await untaggedFrom("* 4 FETCH (UID 11 MODSEQ (123))");
+
+    expect(seenStateOf(untagged, 11)).toBeNull();
+  });
+
+  it("is null when there is no reply at all", () => {
+    expect(seenStateOf([], 11)).toBeNull();
+  });
+
+  it("reads the seen flag in any case", async () => {
+    const untagged = await untaggedFrom("* 4 FETCH (UID 11 FLAGS (\\SEEN \\Flagged))");
+
+    expect(seenStateOf(untagged, 11)).toBe(true);
+  });
+
+  it("is false when the list holds other flags but not the seen flag", async () => {
+    const untagged = await untaggedFrom("* 4 FETCH (UID 11 FLAGS (\\Flagged \\Answered))");
+
+    expect(seenStateOf(untagged, 11)).toBe(false);
   });
 });

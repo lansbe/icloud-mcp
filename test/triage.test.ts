@@ -16,6 +16,7 @@
 // Apple ID (D-13: live Apple testing is owner-only).
 
 import { beforeAll, describe, expect, it } from "vitest";
+import { ImapNotFoundError } from "../src/errors";
 import { encodeMessageId } from "../src/mail/ids";
 import type { MessageRef } from "../src/mail/ids";
 import { createSessionGate } from "../src/mail/service";
@@ -30,12 +31,29 @@ import {
   flagEcho,
   logoutExchange,
   selectResponse,
+  taggedNo,
   taggedOk,
+  wire,
 } from "./fixtures/icloud-bytes";
 import { createFakeDuplex } from "./fixtures/fake-duplex";
 import type { FakeDuplex } from "./fixtures/fake-duplex";
 import type { Principal } from "../src/principal";
 import { ownerPrincipal } from "./fixtures/bound-secrets";
+
+// The verbs module's own source, for the no-body guard. Read at build time by
+// Vite, as test/service.test.ts reads the service module: a Workers isolate has
+// no filesystem. The one suppression is proven non-vacuous by `tsc`, which
+// errors on one that suppresses nothing.
+// @ts-expect-error — Vite's `import.meta.glob` has no ambient declaration here; see above.
+const TRIAGE_SOURCE: Record<string, string> = import.meta.glob(
+  "../src/mail/triage.ts",
+  { query: "?raw", import: "default", eager: true },
+);
+
+/** Drop block comments and line comments, so prose cannot count as code. */
+function withoutComments(text: string): string {
+  return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+}
 
 // The owner's principal, from the real env constructor over the pool's
 // ambient environment. Resolved once, and the very same object is handed to
@@ -162,5 +180,331 @@ describe("mark read and unread, end to end", () => {
       state: "unread",
       stateSource: "store-echo",
     });
+  });
+});
+
+/** Whether any written line is a flag change: its second token is the verb. */
+function wroteFlagChange(duplex: FakeDuplex): boolean {
+  return duplex.writtenLines().some((line) => {
+    const tokens = line.split(" ");
+    return tokens[1] === "UID" && tokens[2] === "STORE";
+  });
+}
+
+/** Teardown ran after the readable was done, whatever the call did. */
+function expectClosedAfterRead(duplex: FakeDuplex): void {
+  expect(duplex.firstIndexOf("readable-done")).toBeGreaterThanOrEqual(0);
+  expect(duplex.firstIndexOf("close")).toBeGreaterThan(
+    duplex.firstIndexOf("readable-done"),
+  );
+}
+
+describe("the mutating path refuses and reports honestly", () => {
+  it("refuses a mailbox that opened read-only, and writes no flag change", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-ONLY]"),
+      logoutExchange("a5"),
+    ]);
+
+    const outcome = await markReadOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      REF,
+      FAST_BOUNDS,
+    );
+
+    expect(outcome).toEqual({ applied: false, refusal: "mailbox-read-only" });
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      "a5 LOGOUT",
+    ]);
+    expect(wroteFlagChange(duplex)).toBe(false);
+    expectClosedAfterRead(duplex);
+
+    // The answer says what happened and that retrying will not help.
+    const answer = JSON.parse(
+      readStateToolResult("x", true, outcome).content[0]!.text,
+    ) as Record<string, unknown>;
+    expect(Object.keys(answer).sort()).toEqual([
+      "id",
+      "reason",
+      "refusal",
+      "requested",
+    ]);
+    expect(answer.refusal).toBe("mailbox-read-only");
+    expect(String(answer.reason)).toContain("nothing was changed");
+    expect(String(answer.reason)).toContain("Retrying will not help");
+    expect(readStateToolResult("x", true, outcome).isError).toBeUndefined();
+  });
+
+  it("refuses a mailbox that opened with no access code at all, the same way", async () => {
+    // Absent is not read-write (PITFALLS #33).
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", ""),
+      logoutExchange("a5"),
+    ]);
+
+    const outcome = await markUnreadOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      REF,
+      FAST_BOUNDS,
+    );
+
+    expect(outcome).toEqual({ applied: false, refusal: "mailbox-read-only" });
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      "a5 LOGOUT",
+    ]);
+    expect(wroteFlagChange(duplex)).toBe(false);
+    expectClosedAfterRead(duplex);
+  });
+
+  it("is not_found when the open is answered NO, and writes no flag change", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      taggedNo("a4", "Mailbox does not exist"),
+      logoutExchange("a5"),
+    ]);
+
+    await expect(
+      markReadOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS),
+    ).rejects.toBeInstanceOf(ImapNotFoundError);
+
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      "a5 LOGOUT",
+    ]);
+    expect(wroteFlagChange(duplex)).toBe(false);
+    expectClosedAfterRead(duplex);
+  });
+
+  it("is not_found when the folder's validity changed, before any change (D-10)", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]", 172, INBOX_UIDVALIDITY - 1),
+      logoutExchange("a5"),
+    ]);
+
+    await expect(
+      markReadOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS),
+    ).rejects.toBeInstanceOf(ImapNotFoundError);
+
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      "a5 LOGOUT",
+    ]);
+    expect(wroteFlagChange(duplex)).toBe(false);
+    expectClosedAfterRead(duplex);
+  });
+
+  it("is not_found when the open reports no validity at all", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]", 172, null),
+      logoutExchange("a5"),
+    ]);
+
+    await expect(
+      markUnreadOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS),
+    ).rejects.toBeInstanceOf(ImapNotFoundError);
+
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      "a5 LOGOUT",
+    ]);
+    expect(wroteFlagChange(duplex)).toBe(false);
+    expectClosedAfterRead(duplex);
+  });
+
+  it("is not_found when the flag change is answered NO", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      taggedNo("a5", "STORE failed"),
+      logoutExchange("a6"),
+    ]);
+
+    await expect(
+      markReadOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS),
+    ).rejects.toBeInstanceOf(ImapNotFoundError);
+
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      `a5 UID STORE ${UID} +FLAGS (\\Seen)`,
+      "a6 LOGOUT",
+    ]);
+    expectClosedAfterRead(duplex);
+  });
+
+  it("re-reads the flags when the change had no echo, and reports from the re-read", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      taggedOk("a5", "STORE completed"),
+      wire(`* 17 FETCH (UID ${UID} FLAGS (\\Seen))`, "a6 OK FETCH completed"),
+      logoutExchange("a7"),
+    ]);
+
+    const outcome = await markReadOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      REF,
+      FAST_BOUNDS,
+    );
+
+    expect(outcome).toEqual({ applied: true, seen: true, source: "read-back" });
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      `a5 UID STORE ${UID} +FLAGS (\\Seen)`,
+      `a6 UID FETCH ${UID} (UID FLAGS)`,
+      "a7 LOGOUT",
+    ]);
+    const answer = JSON.parse(
+      readStateToolResult("x", true, outcome).content[0]!.text,
+    ) as Record<string, unknown>;
+    expect(answer.stateSource).toBe("read-back");
+  });
+
+  it("is not_found when neither the change nor the re-read says anything about the message (D-11)", async () => {
+    // A UID that names nothing gets a tagged OK and no reply about it, on both
+    // commands. That is the commonest shape of "the message is gone".
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      taggedOk("a5", "STORE completed"),
+      taggedOk("a6", "FETCH completed"),
+      logoutExchange("a7"),
+    ]);
+
+    await expect(
+      markUnreadOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS),
+    ).rejects.toBeInstanceOf(ImapNotFoundError);
+
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      `a5 UID STORE ${UID} -FLAGS (\\Seen)`,
+      `a6 UID FETCH ${UID} (UID FLAGS)`,
+      "a7 LOGOUT",
+    ]);
+    expectClosedAfterRead(duplex);
+  });
+
+  it("treats an echo for a DIFFERENT UID as no echo at all", async () => {
+    // Keyed by the reply's own UID, not by position. The only reply names
+    // another message, so this one's state is still unknown and is re-read.
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      flagEcho("a5", 17, UID + 1, "\\Seen"),
+      wire(`* 18 FETCH (UID ${UID} FLAGS ())`, "a6 OK FETCH completed"),
+      logoutExchange("a7"),
+    ]);
+
+    const outcome = await markReadOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      REF,
+      FAST_BOUNDS,
+    );
+
+    expect(outcome).toEqual({ applied: true, seen: false, source: "read-back" });
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      `a5 UID STORE ${UID} +FLAGS (\\Seen)`,
+      `a6 UID FETCH ${UID} (UID FLAGS)`,
+      "a7 LOGOUT",
+    ]);
+  });
+
+  it("reports the echo when it disagrees with the request (PITFALLS #33)", async () => {
+    // Asked read; the server's own reply says the flag is not set. The answer
+    // is the server's word, never the request echoed back.
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      flagEcho("a5", 17, UID, "\\Flagged"),
+      logoutExchange("a6"),
+    ]);
+
+    const outcome = await markReadOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      REF,
+      FAST_BOUNDS,
+    );
+
+    expect(outcome).toEqual({ applied: true, seen: false, source: "store-echo" });
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      `a5 UID STORE ${UID} +FLAGS (\\Seen)`,
+      "a6 LOGOUT",
+    ]);
+    const answer = JSON.parse(
+      readStateToolResult("x", true, outcome).content[0]!.text,
+    ) as Record<string, unknown>;
+    expect(answer).toEqual({
+      id: "x",
+      requested: "read",
+      state: "unread",
+      stateSource: "store-echo",
+    });
+  });
+
+  it("quotes the mailbox name on the open line", async () => {
+    const ref: MessageRef = { ...REF, mailbox: 'Work "Q3"' };
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      flagEcho("a5", 1, UID, "\\Seen"),
+      logoutExchange("a6"),
+    ]);
+
+    await markReadOver(duplex, principal, createSessionGate(), ref, FAST_BOUNDS);
+
+    expect(wireOf(duplex)[3]).toBe('a4 SELECT "Work \\"Q3\\""');
+  });
+
+  it("refuses a mailbox name carrying a carriage return before any open line", async () => {
+    const ref: MessageRef = { ...REF, mailbox: "INBOX\r\na9 LOGOUT" };
+    const duplex = createFakeDuplex([...authPrefix(), logoutExchange("a4")]);
+
+    await expect(
+      markReadOver(duplex, principal, createSessionGate(), ref, FAST_BOUNDS),
+    ).rejects.toBeInstanceOf(ImapNotFoundError);
+
+    expect(wireOf(duplex)).toEqual([...SIGN_IN, "a4 LOGOUT"]);
+    expect(wroteFlagChange(duplex)).toBe(false);
+    expectClosedAfterRead(duplex);
+  });
+
+  it("names no body fetch item and no RFC822 item in the verbs module's code", () => {
+    // A body fetch on a mailbox opened for changing is how mail gets marked
+    // read by accident. The verbs send a flag change and a flags-only re-read,
+    // and nothing else. Comments are stripped, so prose cannot pass or fail it.
+    const code = withoutComments(Object.values(TRIAGE_SOURCE)[0] ?? "");
+
+    expect(code).toContain("UID STORE");
+    expect(/BODY(?!\.PEEK)\[/.test(code)).toBe(false);
+    expect(/\bRFC822(?!\.SIZE)\b/.test(code)).toBe(false);
+    // Stronger than the two above: no body item at all, peeking or not.
+    expect(/\bBODY(?:\.PEEK)?\[/.test(code)).toBe(false);
   });
 });
