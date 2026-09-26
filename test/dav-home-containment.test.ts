@@ -147,6 +147,7 @@ import {
 import {
   createCalendarCollection,
   createEvent,
+  deleteCalendarCollection,
   deleteEvent,
   updateCalendarCollection,
   updateEvent,
@@ -569,6 +570,31 @@ export const HOME_CHECKED_CALL_SITES: readonly CheckedSite[] = Object.freeze([
     fn: "readCollectionState",
     field: "collectionUrl",
     guards: "propfind",
+  },
+  // CALM-06's removal — **the most destructive request in this project, and the
+  // one whose target arrives in the STRONGEST position of any entry here.**
+  //
+  // The collection URL reaches it out of a SIGNED confirmation payload rather
+  // than out of a bare opaque id: `applyCollectionCommit` reads it from
+  // `payload.o`, and that payload's seal has already been verified with this
+  // server's own key and checked against the signed-in principal. So a forged id
+  // cannot reach this function at all without first forging an HMAC.
+  //
+  // **It is on the CHECKED list anyway, and the hostile case is written rather
+  // than exempted.** An exemption's reason has to be a claim about where the URL
+  // came from, and the honest claim here stops one step short of what an
+  // exemption needs: the payload is genuine, and a genuine payload minted for one
+  // account and presented on ANOTHER account's connection carries a URL under the
+  // first account's home and not the second's. That is exactly what
+  // `test/cross-user.test.ts` exists to catch, and `assertUnderHome` against THIS
+  // connection's own resolved home is the second layer that catches it here. A
+  // read that leaked would be one-directional; this one sends the credential AND
+  // removes a calendar and everything in it.
+  {
+    file: CALENDAR,
+    fn: "deleteCalendarCollection",
+    field: "collectionUrl",
+    guards: "deleteObject",
   },
 ]);
 
@@ -1551,6 +1577,76 @@ describe("a forged reference is refused before the credential leaves", () => {
         `rename / ${label} reached the network, so the credential went to the forged target`,
       ).toBe(0);
     }
+  });
+
+  it("refuses a forged collection on the DELETE, wrong-origin and same-origin alike", async () => {
+    // **The hostile case for the most destructive request in the project, and
+    // it is written rather than exempted even though its target arrives already
+    // SIGNED.** `applyCollectionCommit` reads the URL out of `payload.o`, whose
+    // seal has been verified with this server's own key and checked against the
+    // signed-in principal — so a forged id cannot reach here without first
+    // forging an HMAC. That is stronger than the rename's position and it is
+    // still not an authorisation: a GENUINE payload minted for one account and
+    // presented on another account's connection carries a URL under the first
+    // account's home and not the second's, which is precisely what
+    // `test/cross-user.test.ts` exists to catch and what this assertion is the
+    // second layer of.
+    //
+    // The cost of getting it wrong is not a leak. `src/dav/transport.ts`
+    // attaches the Apple ID and the app-specific password to whatever URL it is
+    // handed, and this request REMOVES what it addresses — a calendar, and every
+    // event, to-do and unparseable resource inside it, with no way back.
+    for (const [label, collection] of [
+      ["wrong origin", FOREIGN_COLLECTION],
+      ["same-origin sibling path", SIBLING_COLLECTION],
+    ] as const) {
+      live.observed.length = 0;
+      const err = await refusal(() =>
+        deleteCalendarCollection(env, principal, createDavFetch(owner), collection),
+      );
+
+      expect(err, `delete / ${label} was not refused`).toBeInstanceOf(
+        DavNotFoundError,
+      );
+      // `rediscoverable` is FALSE, on the rename's own argument one case up: a
+      // distinguishable refusal would hand this endpoint to the forged id it
+      // exists to refuse as a collection-existence oracle, and `false` is also
+      // what stops a forged id spending one of D-60's two permitted retries on a
+      // real request against iCloud.
+      expect(
+        (err as DavNotFoundError).rediscoverable,
+        `delete / ${label} was refused as rediscoverable, which spends a real request on a forged id`,
+      ).toBe(false);
+      // ZERO. One request here is one credential delivered to the forged origin
+      // AND one collection removed at it.
+      expect(
+        live.observed.length,
+        `delete / ${label} reached the network, so the credential went to the forged target and a collection may be gone`,
+      ).toBe(0);
+    }
+  });
+
+  it("negative control: the delete DOES reach the wire with a legitimate target", async () => {
+    // Without this the zero-count assertions above pass just as happily on a
+    // harness that never issues anything at all — which is the failure mode this
+    // whole file is written against.
+    //
+    // It asserts the REQUEST and not the answer. This stub answers every write a
+    // bare `204`, which is what a real server answers a collection removal it
+    // accepted, and the property THIS gate holds is where the credential went.
+    live.observed.length = 0;
+    const answered = await deleteCalendarCollection(
+      env,
+      principal,
+      createDavFetch(owner),
+      WORK_URL,
+    );
+
+    expect(live.observed.length, "the delete issued nothing at all").toBe(1);
+    expect(live.observed[0]).toBe(WORK_URL);
+    // A STATUS and not a verdict — see `deleteCalendarCollection`, which returns
+    // what the server said and leaves the looking to the commit arm.
+    expect(answered.status).toBe(204);
   });
 
   it("negative control: the rename DOES reach the wire with a legitimate target", async () => {

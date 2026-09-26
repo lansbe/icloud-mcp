@@ -47,13 +47,16 @@ import {
   MAX_RANGE_DAYS,
   MAX_SLOT_RANGE_DAYS,
   UNOBSERVED_DELIVERY,
+  assertCtag,
   createCalendarCollection,
   createEvent,
   deliveryReportOf,
+  deleteCalendarCollection,
   deleteEvent,
   findFreeSlots,
   getEvent,
   getEventWithEtag,
+  isDefaultCalendar,
   listCalendars,
   listEvents,
   nextCivilDate,
@@ -61,6 +64,7 @@ import {
   pinnedOccurrencesFor,
   planCreateTarget,
   planScopedDelete,
+  readCollectionState,
   resolveOrganizerAddress,
   searchEvents,
   uidFromObjectUrl,
@@ -89,6 +93,7 @@ import {
   DavNotFoundError,
   DavStaleResourceError,
 } from "../../dav/errors";
+import { resolveDavAccount } from "../../dav/discovery";
 import type { DavFetch } from "../../dav/transport";
 import {
   CONFIRM_TTL_SECONDS,
@@ -350,6 +355,336 @@ export function calendarUpdatedToolResult(
   return untrustedToolResult(
     calendarUpdatedTrustedPart(result),
     calendarUpdatedUntrustedPart(result, asked),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CALM-06, CALM-07 — deleting a calendar, and the three refusals in front of it
+// ---------------------------------------------------------------------------
+
+/**
+ * What this server says when asked to delete the account's default calendar.
+ *
+ * **A returned field on a SUCCESSFUL result rather than a thrown error**, on
+ * `EventPreview.scopeRequired`'s precedent and for its stronger reason: minting
+ * no confirmation means there is literally nothing to commit, so a caller cannot
+ * proceed by ignoring a message. An error would additionally be the wrong SHAPE
+ * — the four-value error vocabulary is closed and none of its members means
+ * "this is the one calendar the account cannot lose", so the refusal would
+ * arrive wearing `not_found`'s clothes and read as a retryable fault. It is not
+ * retryable: a second preview of the same calendar is refused identically.
+ *
+ * **It names the calendar in the USER'S terms and echoes no URL.** "The
+ * account's default calendar" is a thing a person can check on their own
+ * devices; the collection URL is the account's DSID and shard host, which
+ * ./.claude/CLAUDE.md § 4 keeps out of every response field. Nothing here is
+ * read off a server answer, because nothing was asked — the refusal is a local
+ * comparison against a value memoised with the discovery triple (CALM-07).
+ *
+ * A closed constant rather than a sentence built at the call site, for the same
+ * reason `CalendarProperty` is a two-value vocabulary: one wording, in one
+ * place, so a second refusal path cannot phrase it differently.
+ */
+const DEFAULT_CALENDAR_REFUSAL =
+  "This is the account's default calendar. It cannot be deleted through this " +
+  "server, because new invitations and events with nowhere else to go are " +
+  "filed into it. Nothing was read and nothing was sent. Choose a different " +
+  "calendar, or change the default on one of your own devices first.";
+
+/**
+ * What a calendar-delete preview says. Nothing has been written.
+ *
+ * The split between "what this server counted" and "what somebody named" runs
+ * straight through this shape, exactly as it does through `EventPreview`, and
+ * `collectionPreviewToolResult` is where it is applied.
+ *
+ * **There is no `willDelete` boolean here, and the absence is a decision.**
+ * `EventPreview` carries one because two previews share that shape and it is
+ * what tells them apart. This shape has one producer, so the field could only
+ * ever say `true` — and a field nobody can read a `false` out of is a field that
+ * teaches a reader to skip it. See `calendarCreatedTrustedPart`, which declines
+ * a `created` boolean on the same grounds.
+ */
+export interface CollectionDeletePreview {
+  /** The opaque calendar id, echoed on both sides so the halves join by identity. */
+  id: string;
+  /**
+   * True when this server refused because the calendar is the account's default.
+   *
+   * CALM-07. Refused BEFORE any request — the comparison is local, against a URL
+   * memoised with the discovery triple — so a refusal here costs zero outbound
+   * requests, and `test/dav-tools.test.ts` asserts that off the stub's own
+   * recorded list rather than off this field.
+   */
+  defaultCalendarRefused: boolean;
+  /** This server's own words for the refusal, or `null` when there was none. */
+  refusalReason: string | null;
+  /**
+   * How many member resources go with the calendar.
+   *
+   * **This server's own count, taken by walking the collection's own depth-1
+   * listing, and the collection's own row is NOT one of them.** See
+   * `CollectionState.memberCount`: a depth-1 PROPFIND returns a response element
+   * for the collection itself alongside every member, so counting rows gives a
+   * number one too high — and that number goes in the sentence a user agrees to
+   * before a delete.
+   *
+   * **It counts MEMBERS and not events**, which is why the composed line says
+   * "items". A calendar may hold a to-do or a resource this server cannot parse,
+   * and each of those disappears with the collection exactly as an event does.
+   *
+   * ZERO when no confirmation was minted, on `EventPreview.affectedOccurrences`'
+   * invariant: the number is what a commit would take, and a preview with no
+   * commit to describe describes nothing. On the default-calendar refusal that
+   * zero is additionally the whole truth, because nothing was read.
+   */
+  itemCount: number;
+  /**
+   * How many requests a commit would make that CHANGE the account.
+   *
+   * ONE: the single collection removal. The commit makes three requests — the
+   * binding re-read, the removal, and the fresh look that verifies it — and two
+   * of them change nothing, which is the distinction `EventPreview.writeCount`
+   * already draws and the reason this counts writes rather than requests.
+   *
+   * ZERO when no confirmation was minted.
+   */
+  writeCount: number;
+  /** The confirmation, or `null` when this server declined to mint one. */
+  confirmToken: string | null;
+  /** How long the confirmation lasts, or `null` when there is none. */
+  expiresInSeconds: number | null;
+  /**
+   * The calendar's own name. **Stranger-authored** — a shared calendar is named
+   * by whoever shared it, which the listing's untrusted notice already says is
+   * the least obvious entry on its own list.
+   *
+   * Empty when nothing was read.
+   */
+  displayName: string;
+  /**
+   * The change to hand straight back to `calendar_commit`, or `null`.
+   *
+   * A delete of a whole collection asserts no field values, so this carries the
+   * operation and nothing else. It is still hash-bound and still passed back
+   * unaltered: the confirmation's `h` is computed over it, and the commit
+   * recomputes and compares — so a caller that presented this token beside a
+   * change describing a different operation is refused before anything is sent.
+   */
+  change: NormalizedChange | null;
+  /**
+   * The one human-facing sentence this server wrote, or `null` when nothing was
+   * minted.
+   *
+   * In the UNTRUSTED half, on `EventPreview.confirmationLine`'s argument
+   * unchanged: it quotes the calendar's own name, and a name a stranger chose is
+   * stranger text wherever this server puts it.
+   */
+  confirmationLine: string | null;
+}
+
+/**
+ * What the fresh look after a collection removal found.
+ *
+ * A closed four-value vocabulary rather than a boolean, because the honest
+ * answer has more than two values and the two that are not `gone` are the ones a
+ * boolean would round to the wrong side.
+ *
+ *   - `gone` — the fresh look could not find the collection. The only evidence
+ *     this server accepts that a delete landed.
+ *   - `present` — the fresh look found it. The removal was sent and the
+ *     collection survived, which is the case SPIKE-04's reasoning exists for: a
+ *     `204` is a statement by a server about a request.
+ *   - `unverified` — the removal was sent and the fresh look could not be made.
+ *     A distinct answer rather than a guess in either direction. It covers auth,
+ *     throttle and connection failures on the verification leg and deliberately
+ *     does not tell them apart, on `DeliveryStatus.unreported`'s precedent: all
+ *     three are the same claim to a user — *we could not look* — and splitting
+ *     them would invite reading a diagnosis into a field whose whole point is
+ *     the absence of one.
+ *   - `not-attempted` — nothing was sent at all, because the binding moved. The
+ *     value that makes "zero writes" sayable in the response rather than only
+ *     assertable in a test.
+ */
+export type CollectionRemoval =
+  | "gone"
+  | "present"
+  | "unverified"
+  | "not-attempted";
+
+/** What a finished calendar-delete commit says. */
+export interface CollectionCommitOutcome {
+  /**
+   * Whether the calendar is gone.
+   *
+   * **Derived from `removal` and never from the removal request's own status.**
+   * SPIKE-04's reasoning, transferred without alteration: a delete that answered
+   * `204` is a statement by a server about a request, and the only evidence a
+   * collection is gone is looking again and not finding it. So this is exactly
+   * `removal === "gone"` and is kept beside it because it is the field every
+   * other commit outcome in this project carries and the one a model looks for.
+   */
+  applied: boolean;
+  /**
+   * The opaque calendar id, reported on EVERY outcome including the refusals.
+   *
+   * On the happy path it addresses nothing any more, by construction, which is
+   * what `applied` says. On `present` and `unverified` it is the whole point of
+   * the field: it is how a human can go and look at the calendar this server
+   * could not confirm was removed, WITHOUT this response ever carrying the
+   * collection URL — which is a DSID and a shard host, and belongs in no
+   * response field (./.claude/CLAUDE.md § 4).
+   */
+  id: string;
+  /** What the fresh look found. See `CollectionRemoval`. */
+  removal: CollectionRemoval;
+  /**
+   * True when the collection's binding moved between the preview and now.
+   *
+   * D-09 and D-12. Nothing was sent: the refusal is a decision not to issue the
+   * request rather than a precondition the server rejected, which is what makes
+   * it zero-write. `test/dav-tools.test.ts` asserts the zero off the stub's own
+   * recorded list rather than off this field.
+   */
+  staleBinding: boolean;
+  /**
+   * How many members the PREVIEW counted, read back out of the signed payload.
+   *
+   * This server's own observation at preview time, sealed so a caller could not
+   * choose it — see `DavCollectionConfirmPayload.g`, which owns that argument.
+   */
+  previewedItemCount: number;
+  /** How many members this commit's OWN re-read found. */
+  currentItemCount: number;
+  /**
+   * This server's own sentence about an outcome that is not a plain success, or
+   * `null` when it was one.
+   *
+   * **It is NOT a second confirmation line and must never become one.** A
+   * confirmation line states what a commit would do or did to a named resource,
+   * and `composeConfirmationLine` in `src/confirm.ts` is the single place one is
+   * written — held there by a two-directional count in
+   * `scripts/forbidden-tokens.mjs`, because two registers drift invisibly. This
+   * says why a commit did NOT do that, which is the register `ScopeRefusal`
+   * already occupies one shape over, and it quotes no resource name at all.
+   *
+   * **It carries no ctag, ever.** A ctag is an opaque server token, and echoing
+   * one would be the diagnostic echo ./.claude/CLAUDE.md § 4 forbids —
+   * `DavStaleResourceError` takes no constructor argument for precisely this
+   * reason and `assertCtag` throws a class that carries nothing. What D-12 CAN
+   * honestly name is the DELTA between the two counts, which is this server's
+   * own observation from its own two walks.
+   */
+  notice: string | null;
+  /**
+   * The same sentence the preview carried, in the past tense, or `null`.
+   *
+   * Non-null ONLY when the calendar is confirmed gone. On `present`,
+   * `unverified` and the stale refusal a past-tense "Deleted calendar 'X'" would
+   * be a statement this server has not established, and on the stale refusal it
+   * would be flatly false — which is the failure the pair of lines exists to
+   * make visible rather than to commit.
+   */
+  confirmationLine: string | null;
+}
+
+/**
+ * The half of a delete preview this server counted, decided or minted.
+ *
+ * Every field is a statement about this server's own work: an opaque id it
+ * minted, a boolean it decided by a local comparison, a sentence from its own
+ * closed vocabulary, a count it took by walking the collection's own listing, a
+ * write count it knows because it wrote the commit, the capability it signed, and
+ * that capability's life.
+ *
+ * **Note what is NOT here: `displayName`, `change` and `confirmationLine`.** The
+ * name is chosen by whoever shared the calendar, the change is the object a
+ * caller passes back, and the line quotes the name — Phase 15 decided that split
+ * and this shape inherits it rather than reopening it.
+ */
+function collectionPreviewTrustedPart(
+  preview: CollectionDeletePreview,
+): Record<string, unknown> {
+  return {
+    id: preview.id,
+    defaultCalendarRefused: preview.defaultCalendarRefused,
+    refusalReason: preview.refusalReason,
+    itemCount: preview.itemCount,
+    writeCount: preview.writeCount,
+    confirmToken: preview.confirmToken,
+    expiresInSeconds: preview.expiresInSeconds,
+  };
+}
+
+/** The half somebody named: the calendar's own title, and the sentence quoting it. */
+function collectionPreviewUntrustedPart(
+  preview: CollectionDeletePreview,
+): Record<string, unknown> {
+  return {
+    // Repeated from the trusted half so the model joins the two BY IDENTITY.
+    id: preview.id,
+    displayName: preview.displayName,
+    change: preview.change,
+    confirmationLine: preview.confirmationLine,
+  };
+}
+
+/**
+ * Shape a calendar-delete preview into the tool's response.
+ *
+ * Exported for the reason every shaper in this file is: the fence assertions
+ * over this shape are a WALK and a key-set comparison, and either run against a
+ * test-local copy would prove something about the copy.
+ */
+export function collectionPreviewToolResult(
+  preview: CollectionDeletePreview,
+): ToolResult {
+  return untrustedToolResult(
+    collectionPreviewTrustedPart(preview),
+    collectionPreviewUntrustedPart(preview),
+  );
+}
+
+/**
+ * The half of a collection commit this server did, looked at, or refused.
+ *
+ * Six statements and no identities. A boolean derived from a fresh look; the
+ * fresh look's own verdict from a closed four-value vocabulary; a boolean saying
+ * whether anything was sent; two counts this server took by walking the
+ * collection twice; and a sentence from its own words. Not one of them is a
+ * string somebody else chose, and not one of them is a ctag.
+ */
+function collectionCommitTrustedPart(
+  outcome: CollectionCommitOutcome,
+): Record<string, unknown> {
+  return {
+    applied: outcome.applied,
+    id: outcome.id,
+    removal: outcome.removal,
+    staleBinding: outcome.staleBinding,
+    previewedItemCount: outcome.previewedItemCount,
+    currentItemCount: outcome.currentItemCount,
+    notice: outcome.notice,
+  };
+}
+
+/** The half quoting the calendar's own name, echoed back as data. */
+function collectionCommitUntrustedPart(
+  outcome: CollectionCommitOutcome,
+): Record<string, unknown> {
+  return {
+    id: outcome.id,
+    confirmationLine: outcome.confirmationLine,
+  };
+}
+
+/** Shape a finished calendar-delete commit into the tool's response. */
+export function collectionCommitToolResult(
+  outcome: CollectionCommitOutcome,
+): ToolResult {
+  return untrustedToolResult(
+    collectionCommitTrustedPart(outcome),
+    collectionCommitUntrustedPart(outcome),
   );
 }
 
@@ -3316,6 +3651,525 @@ async function applyCommit(
 }
 
 /**
+ * Build one calendar-delete preview: refuse, count, and seal (CALM-06, CALM-07).
+ *
+ * **The ORDER of what follows is the requirement rather than an implementation
+ * detail**, and it is the cheapest-refusal-first order every write path in this
+ * file already follows:
+ *
+ *   1. The id is decoded at the handler, before this runs — the cheapest
+ *      possible refusal of a token this server did not mint, with no request.
+ *   2. Discovery. On a warm cache this issues NOTHING and hands back the default
+ *      calendar's URL alongside the home set.
+ *   3. **CALM-07, and it is HERE rather than anywhere further down.** A local
+ *      string comparison against a URL memoised with the discovery triple, so
+ *      the account's default calendar is refused with ZERO outbound requests.
+ *      The requirement words the refusal as local, "before any request is sent",
+ *      which is why the value is resolved where the discovery cost already is
+ *      rather than fetched per delete.
+ *   4. The containment assertion, and it runs inside `readCollectionState`
+ *      below, before the credential can be attached to anything. It is NOT
+ *      repeated here: a second copy at this layer would be a second mitigation
+ *      of one thing, drifting from the first the day either is edited, and the
+ *      copy that matters is the one in the module that issues the request.
+ *   5. ONE depth-1 PROPFIND, giving the display name, the binding and the exact
+ *      member count from a single multi-status — so the two numbers this preview
+ *      shows can never describe different moments.
+ *   6. **The binding, or nothing.** `assertCtag` refuses a collection this server
+ *      cannot bind rather than previewing it, and the refusal is a THROW where
+ *      the default-calendar one is a returned field. The asymmetry is deliberate:
+ *      "this is your default calendar" is a permanent fact about WHICH calendar
+ *      was named, so a fresh preview is refused identically and the user needs
+ *      words; "the server answered no binding" is the same class of answer as a
+ *      resource it declines to resolve, which is exactly what
+ *      `DavNotFoundError(false)` already says and what `assertCtag` exists to
+ *      say. D-09.
+ *
+ * Nothing here writes, and nothing here names a writer — `test/dav-tools.test.ts`
+ * says so from outside with a request count, and the absence of
+ * `deleteCalendarCollection` from this function says so from inside.
+ *
+ * ## Why the sentence says "items" and not "events"
+ *
+ * `readCollectionState` counts every MEMBER resource, and CALM-06's number has
+ * to describe what GOES rather than what this server understands. A calendar can
+ * hold a to-do, or a resource this server cannot parse at all, and each of those
+ * disappears with the collection exactly as an event does. "The 4 events in it"
+ * over three events and a to-do is a false statement in the one sentence the
+ * user is asked to agree to — false about a kind of thing the user can check.
+ * See `ConfirmationNoun`, where the seventh word and its argument live.
+ *
+ * A zero count drops the clause entirely rather than reading "the 0 items in
+ * it"; `composeConfirmationLine` already does that and carries the reason.
+ *
+ * ## Serial, because every one of these is a socket
+ *
+ * `dav-concurrent-request` names this function by its OWN name rather than
+ * leaving it covered by the entry point it ends in. "Which of these calendars
+ * can I get rid of" is one sentence that means N previews, and a combinator is
+ * the first thing anybody reaching for it writes.
+ */
+async function buildCollectionDeletePreview(
+  principal: Principal,
+  davFetch: DavFetch,
+  collectionUrl: string,
+  calendarId: string,
+): Promise<CollectionDeletePreview> {
+  // Step 2. Zero requests on a warm cache, which is what makes step 3 local.
+  const resolved = await resolveDavAccount(env, principal, davFetch, "caldav");
+
+  // Step 3. CALM-07.
+  //
+  // **What happens when the account named no default calendar, said plainly
+  // rather than papered over.** `isDefaultCalendar` answers `false` for every
+  // collection when `defaultCalendarUrl` is null, so this refusal does not fire
+  // and a delete of the account's own default calendar proceeds to the preview.
+  // That is a FAIL-OPEN and it is recorded as one here, on
+  // `resolveDefaultCalendarUrl`'s own footing: whether iCloud populates
+  // `schedule-default-calendar-URL` on the scheduling inbox is unmeasured
+  // against the real account as of 2026-09-25, and plan 17-09's UAT is where it
+  // is settled — `dav_diagnose` reports the resolved value so that measurement
+  // costs one call. What remains in that case is the preview the user reads and
+  // the confirmation gate in front of the commit, which is less than CALM-07
+  // asks for and is not nothing.
+  //
+  // **No heuristic is substituted, and that is a decision rather than an
+  // omission.** A display-name or position rule is off the table per D-11: a
+  // rule that is right most of the time on the least reversible operation in the
+  // milestone is the "very nearly right" answer this codebase treats as the
+  // worst kind, because it is the one nobody checks.
+  if (isDefaultCalendar(collectionUrl, resolved.defaultCalendarUrl)) {
+    return {
+      id: calendarId,
+      defaultCalendarRefused: true,
+      refusalReason: DEFAULT_CALENDAR_REFUSAL,
+      // Zero and empty throughout, on `nothingMinted`'s argument: the outcome
+      // fields describe what a commit would do, and there is no commit. Here
+      // they are additionally the whole truth, because nothing was read.
+      itemCount: 0,
+      writeCount: 0,
+      confirmToken: null,
+      expiresInSeconds: null,
+      displayName: "",
+      change: null,
+      confirmationLine: null,
+    };
+  }
+
+  // Steps 4, 5 and 6.
+  const state = await readCollectionState(
+    env,
+    principal,
+    davFetch,
+    collectionUrl,
+  );
+  assertCtag(state.ctag);
+
+  // A whole-collection delete asserts no field values, so the change carries the
+  // operation and nothing else. It is hashed anyway, and the commit recomputes
+  // and compares: a value nothing ever checks is exactly the "bound that is
+  // quietly false" `DavCollectionConfirmPayload.b` argues against.
+  const change = normalizeSupplied({ kind: "delete" });
+
+  const confirmToken = await mintConfirmation(
+    {
+      v: CONFIRM_VERSION,
+      // The kind of resource this confirmation names, immediately after the
+      // version so the discriminator reads before the fields it governs. The
+      // commit does not re-check it: `verifyConfirmation` is handed the same
+      // target and refuses a mismatch itself.
+      t: "col",
+      k: "delete",
+      j: crypto.randomUUID(),
+      // The home set, from THIS connection's own resolved discovery rather than
+      // derived from the target.
+      c: resolved.homeUrl,
+      o: collectionUrl,
+      // The binding, VERBATIM. Not trimmed, not unquoted, not lowercased: the
+      // commit compares raw, and this is the only place the value is written
+      // down.
+      b: state.ctag,
+      // The count this preview observed, sealed so the refusal's delta is this
+      // server's own observation on both sides. See the field's docstring.
+      g: state.memberCount,
+      h: await changeHashOf(change),
+      x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+      // The user this preview belongs to, so another user presenting it is
+      // refused five checks ahead of the reservation and burns no slot.
+      u: principal.userId,
+    },
+    env.CONFIRM_SECRET,
+  );
+
+  return {
+    id: calendarId,
+    defaultCalendarRefused: false,
+    refusalReason: null,
+    itemCount: state.memberCount,
+    // ONE. The commit makes three requests and two of them change nothing.
+    writeCount: 1,
+    confirmToken,
+    expiresInSeconds: CONFIRM_TTL_SECONDS,
+    displayName: state.displayName,
+    change,
+    // The most destructive sentence this server composes. Both facts in it are
+    // this server's own: the name it read off the collection's own row, and the
+    // count it took by walking that same multi-status. `quotedName` inside the
+    // composer folds the name before embedding it, which matters here more than
+    // anywhere else in the phase — a SHARED calendar's title is chosen by
+    // whoever shared it, and a title that could close its own quote would write
+    // a clause into the one sentence the user is asked to read.
+    confirmationLine: composeConfirmationLine(
+      {
+        kind: "delete",
+        noun: "calendar",
+        name: state.displayName,
+        alsoRemoved: { count: state.memberCount, noun: "item" },
+        // A delete asserts no value for any field; it takes the whole thing.
+        fieldCount: null,
+        // Nobody is told. A collection removal sends no invitation and no
+        // cancellation of its own, and this server names no attendee list on
+        // any path that reaches here.
+        recipientCount: null,
+      },
+      "would",
+    ),
+  };
+}
+
+/**
+ * This server's own sentence for an outcome that is not a plain success.
+ *
+ * **Not a confirmation-line composer, and it must never grow into one.** See
+ * `CollectionCommitOutcome.notice`, which carries the whole argument: a
+ * confirmation line states what a commit would do or did to a NAMED resource and
+ * `composeConfirmationLine` is the one place one is written; this states why a
+ * commit did not do that, quotes no resource name, and occupies the register
+ * `ScopeRefusal` already holds one shape over.
+ *
+ * **The stale arm names the DELTA and nothing else.** No ctag, on either side —
+ * a ctag is an opaque server token and echoing one is the diagnostic echo
+ * ./.claude/CLAUDE.md § 4 forbids. The two numbers are this server's own
+ * observations from its own two walks, one sealed into the confirmation and one
+ * taken just now.
+ *
+ * **The two numbers can be EQUAL and the sentence still fires**, which is the
+ * case a reader would otherwise report as a bug. A binding moves when ANY member
+ * of the collection changes, so editing one event moves it and leaves the count
+ * alone. The sentence therefore leads with the fact it is certain of — the
+ * calendar changed — and states the two counts as what they are: how much was
+ * there then, and how much is there now.
+ */
+function collectionNoticeFor(
+  removal: CollectionRemoval,
+  previewedItemCount: number,
+  currentItemCount: number,
+): string | null {
+  if (removal === "gone") return null;
+
+  if (removal === "not-attempted") {
+    return (
+      "This calendar changed after it was previewed, so nothing was deleted " +
+      "and nothing was sent. The preview counted " +
+      `${previewedItemCount} ${previewedItemCount === 1 ? "item" : "items"}` +
+      ` in it; there are now ${currentItemCount}. Preview the delete again to ` +
+      "see what would go with it, and show that preview before committing."
+    );
+  }
+
+  if (removal === "present") {
+    return (
+      "The removal was sent and a fresh look still found this calendar, so " +
+      "nothing is confirmed removed. Its id is reported beside this so it can " +
+      "be looked at directly."
+    );
+  }
+
+  return (
+    "The removal was sent and this server could not look again to find out " +
+    "whether it landed, so neither answer is established. Check this calendar " +
+    "on one of your own devices before assuming either."
+  );
+}
+
+/**
+ * Which target a confirmation names, learnt without inferring it (D-14).
+ *
+ * **`verifyConfirmation` narrows on its `expected` parameter and a confirmation
+ * is opaque, so the target has to be known before the payload can be read.**
+ * Three routes exist and this is route two: try the object arm, and on the
+ * neutral refusal try the collection arm. The reasons are written down here so
+ * they are not re-litigated at the next arm.
+ *
+ *   - **It preserves `applyCommit` step 4's discipline completely.** The target
+ *     still comes from the SIGNED payload and is never inferred from the change
+ *     the caller supplied. What is being probed is the SEAL, not the request.
+ *   - **The failure path costs two HMAC verifies and no network.**
+ *     `verifyConfirmation` is pure: it reaches no KV, issues no request, and the
+ *     one-time reservation happens separately and afterwards. So a forged token
+ *     is refused having spent nothing at all.
+ *   - **It touches one file.** Widening `verifyConfirmation` to take a SET of
+ *     acceptable targets is cleaner in the abstract and changes a signature the
+ *     contacts and mail families share — regression surface this phase has no
+ *     reason to open for a routing decision local to one tool.
+ *   - **Both attempts throw the SAME indistinguishable `ConfirmationInvalidError`**,
+ *     so this endpoint does not become an oracle for a confirmation's structure.
+ *     Six conditions already give one answer; a seventh distinguishable one
+ *     would tell an attacker their guess was well formed. The second attempt's
+ *     refusal is the one that escapes, and it is byte-identical to the first's.
+ *     A test asserts a `mail` token and a forged token produce the same answer.
+ *
+ * It returns the target and NOT the payload, deliberately. Each arm verifies for
+ * itself immediately below, so no arm reads a payload this function narrowed on
+ * its behalf — which is the shape that would let a later arm be handed the wrong
+ * one. The second verify is two more HMAC operations and no requests.
+ */
+async function targetOfConfirmation(
+  userId: string,
+  confirmToken: string,
+): Promise<"dav" | "col"> {
+  try {
+    await verifyConfirmation(confirmToken, env.CONFIRM_SECRET, userId, "dav");
+    return "dav";
+  } catch (err) {
+    // Nothing is read from the caught value — ./.claude/CLAUDE.md § 4. Only its
+    // TYPE is consulted, and anything that is not the neutral confirmation
+    // refusal is rethrown rather than swallowed into a second attempt: a
+    // transport or crypto failure is not a statement about which arm this token
+    // belongs to.
+    if (!(err instanceof ConfirmationInvalidError)) throw err;
+  }
+
+  // The refusal from HERE is the one a forged, expired, wrong-user or
+  // wrong-protocol token leaves by, and it is the same class and the same empty
+  // shape the first attempt would have thrown.
+  await verifyConfirmation(confirmToken, env.CONFIRM_SECRET, userId, "col");
+  return "col";
+}
+
+/**
+ * Apply one confirmed calendar delete: re-read the binding, or refuse (CALM-06).
+ *
+ * **The order is fixed and is not negotiable**, on `applyCommit`'s own argument:
+ * steps 1 to 5 reach no network, step 6 is a KV read and a KV write, and only
+ * step 7 touches iCloud.
+ *
+ *   1-3.  Split, verify the seal, check the version, the TARGET and the USER, and
+ *         check the expiry — all inside `verifyConfirmation`, each refused
+ *         identically.
+ *   4.    The kind is one this arm knows, read from the SIGNED payload and never
+ *         inferred from which tool was called.
+ *   4b.   The SUPPLIED change's kind agrees with the SIGNED one.
+ *   5.    Recompute the change hash and compare it constant-time.
+ *   6.    Claim the one-time slot, keyed on the CALLER and not on the token.
+ *   7.    Only now: re-read the binding, compare it, and either refuse or remove.
+ *
+ * ## The re-read, and why it is simpler than the object path rather than harder
+ *
+ * A collection has no entity tag, so there is no `If-Match` to attach and the
+ * comparison is **not a precondition to send — it is a refusal to issue the
+ * request at all.** That makes this strictly stronger than the object path's
+ * conditional write: a refused precondition is a refusal the server issued after
+ * the request went out, and this one costs zero writes. D-09, D-12.
+ *
+ * The comparison is a raw `!==`. No trim, no lowercase, no quote-stripping.
+ * `assertEtag`'s neighbouring argument holds and holds harder here: normalisation
+ * eventually meets a value it gets wrong, and the direction it gets wrong decides
+ * whether the least reversible operation in this milestone proceeds.
+ *
+ * **A disagreement refuses OUTRIGHT.** It never proceeds and reports afterwards,
+ * because the members that arrived in that window are exactly the ones CALM-06
+ * exists to protect. What comes back names the DELTA between the two counts and
+ * demands a fresh preview, and it names no ctag — see
+ * `CollectionCommitOutcome.notice`.
+ *
+ * ## Why the target is not re-asserted against the payload's own home
+ *
+ * `applyCommit`'s discipline is that everything comes from the signed payload,
+ * and both `payload.o` and `payload.c` do. An `assertUnderHome(payload.o,
+ * payload.c)` here would compare two fields ONE preview wrote in one breath —
+ * `buildCollectionDeletePreview` seals the home it resolved and a collection URL
+ * `readCollectionState` has already asserted under that same home — so it can
+ * only ever pass. The assertion that can FAIL is the one inside
+ * `readCollectionState` and `deleteCalendarCollection` below, against THIS
+ * connection's own resolved home: a payload signed for one account and presented
+ * on another account's connection is refused there, with zero requests, which is
+ * the case `test/cross-user.test.ts` exists to catch.
+ *
+ * ## The removal is verified by LOOKING, never by the removal's status
+ *
+ * SPIKE-04's reasoning, transferred without alteration: a delete that answered
+ * `204` is a statement by a server about a request, and the only evidence a
+ * collection is gone is looking again and not finding it. So the status is
+ * carried no further than `deleteCalendarCollection`'s own return, and what this
+ * reports is what the fresh look found. When the two disagree the response
+ * carries the collection's OWN opaque id so a human can go and look — never the
+ * raw URL, which is a DSID and a shard host.
+ *
+ * ## Serial, because every one of these is a socket
+ *
+ * Three requests, awaited one after another, and `dav-concurrent-request` names
+ * this function by its own name: it ends in three entry points already on that
+ * list, so leaving it off would leave it covered only by accident, and the
+ * accident evaporates the first time this body is refactored.
+ */
+async function applyCollectionCommit(
+  principal: Principal,
+  davFetch: DavFetch,
+  confirmToken: string,
+  supplied: SuppliedChange,
+): Promise<CollectionCommitOutcome> {
+  // Steps 1, 2 and 3. The target is supplied here and checked THERE; nothing
+  // below compares `payload.t` again.
+  const payload = await verifyConfirmation(
+    confirmToken,
+    env.CONFIRM_SECRET,
+    principal.userId,
+    "col",
+  );
+
+  // Step 4. Read from the SIGNED payload. A collection create and a collection
+  // rename do NOT go through this gate at all (D-07), so `delete` is the only
+  // kind this arm has code for and a payload naming another one is refused
+  // rather than falling through to the arm that removes things.
+  if (payload.k !== "delete") throw new ConfirmationInvalidError();
+
+  const change = normalizeSupplied(supplied);
+
+  // Step 4b. A caller can present a payload minted for one operation beside a
+  // change describing another, and the two would then disagree about how
+  // destructive the request is. A disagreement the caller authored resolves in
+  // favour of neither. Before the hash, so the cheapest comparison runs first.
+  if (change.kind !== payload.k) throw new ConfirmationInvalidError();
+
+  // Step 5. Over the CANONICALISED change, so a caller that rebuilt the object
+  // in a different key order is not refused for it and a caller that altered a
+  // value is.
+  if (!(await changeHashMatches(await changeHashOf(change), payload.h))) {
+    throw new ConfirmationInvalidError();
+  }
+
+  // Step 6. A KV read and a KV write, before any DAV request — which is the
+  // whole reason the reservation exists rather than leaning on a precondition:
+  // a precondition IS the request it is supposed to precede, and on this path
+  // there is not even a precondition to lean on.
+  await reserveConfirmation(
+    env.CONFIRM_KV,
+    principal.userId,
+    payload.j,
+    payload.x,
+  );
+
+  // Step 7. The target comes from the payload's own `o`, never from the supplied
+  // change — which carries no URL at all and cannot be made to.
+  const collectionUrl = payload.o;
+  const id = encodeCalendarId({ collectionUrl });
+
+  // 7a. The re-read. ONE request.
+  const fresh = await readCollectionState(
+    env,
+    principal,
+    davFetch,
+    collectionUrl,
+  );
+  // A collection that answered no binding NOW is refused before the removal, on
+  // exactly the preview's footing: an unbound comparison is a comparison that
+  // checked nothing, and `null !== payload.b` would coincidentally refuse today
+  // while a later edit that defaulted it would not.
+  assertCtag(fresh.ctag);
+
+  // 7b. **Raw, and the refusal is a decision not to send.**
+  if (fresh.ctag !== payload.b) {
+    return {
+      applied: false,
+      id,
+      removal: "not-attempted",
+      staleBinding: true,
+      previewedItemCount: payload.g,
+      currentItemCount: fresh.memberCount,
+      notice: collectionNoticeFor(
+        "not-attempted",
+        payload.g,
+        fresh.memberCount,
+      ),
+      // No past-tense line, because nothing happened. A "Deleted calendar 'X'"
+      // beside a refusal would be the exact contradiction the pair of lines
+      // exists to make visible.
+      confirmationLine: null,
+    };
+  }
+
+  // 7c. Only now. The status is deliberately not read: see the docstring, and
+  // `CollectionDeleteAnswer.status`, which is a status and not a verdict.
+  await deleteCalendarCollection(env, principal, davFetch, collectionUrl);
+
+  // 7d. The fresh look. Dispatch on error TYPE and nothing else; no caught value
+  // is read (./.claude/CLAUDE.md § 4).
+  let removal: CollectionRemoval;
+  let currentItemCount = 0;
+  try {
+    const after = await readCollectionState(
+      env,
+      principal,
+      davFetch,
+      collectionUrl,
+    );
+    // The server answered about a collection that is still there.
+    removal = "present";
+    currentItemCount = after.memberCount;
+  } catch (err) {
+    if (err instanceof DavNotFoundError) {
+      // The only evidence this server accepts that the removal landed.
+      removal = "gone";
+    } else {
+      // Auth, throttle, connection — none of them an answer about the
+      // collection, and none of them a reason to claim one. **The removal is
+      // NOT rethrown as a failure**, on `observeDelivery`'s precedent and for
+      // the sharper version of its reason: the delete has already gone, so
+      // reporting a failure here would tell the user their calendar survived a
+      // request that may well have taken it.
+      removal = "unverified";
+    }
+  }
+
+  return {
+    applied: removal === "gone",
+    id,
+    removal,
+    staleBinding: false,
+    previewedItemCount: payload.g,
+    // What the fresh look found. Zero on `gone`, which is the true answer — the
+    // collection holds nothing because it is not there — and zero on
+    // `unverified`, where nothing was counted.
+    currentItemCount,
+    notice: collectionNoticeFor(removal, payload.g, currentItemCount),
+    // **The past-tense line ONLY when the calendar is confirmed gone**, and
+    // built from the count the PREVIEW sealed rather than from the fresh look:
+    // the fresh look found nothing, and "along with the 0 items in it" would
+    // describe the aftermath instead of what the user agreed to lose. The name
+    // is deliberately absent — the collection is gone, so this server has no
+    // current reading of its title and the preview's name is not a fact about
+    // the account any more. See `CommitOutcome.confirmationLine`'s own note on
+    // the two lines differing by more than the verb, which is stated rather
+    // than left to be discovered.
+    confirmationLine:
+      removal === "gone"
+        ? composeConfirmationLine(
+            {
+              kind: "delete",
+              noun: "calendar",
+              name: null,
+              alsoRemoved: { count: payload.g, noun: "item" },
+              fieldCount: null,
+              recipientCount: null,
+            },
+            "did",
+          )
+        : null,
+  };
+}
+
+/**
  * The scope parameter both write previews carry (CALW-02).
  *
  * ## Optional at the SCHEMA and required by the SERVICE
@@ -4361,11 +5215,79 @@ export function registerCalendarTools(
   );
 
   server.registerTool(
+    "calendar_delete_calendar",
+    {
+      // Four facts about the TOOL rather than about its one parameter, which is
+      // 02-18's rule for what belongs in a description: it writes nothing, the
+      // other tool is what does, it removes ONE calendar and everything in it,
+      // and the account's default calendar is refused outright.
+      //
+      // The last two are stated rather than left as absences a later session
+      // fills in. A bulk calendar delete is the single most destructive fan-out
+      // this project could ever be offered — "tidy up my calendars" is one
+      // sentence that means N irreversible requests against one account — and
+      // ./.claude/CLAUDE.md § 3 forbids the concurrent form for a reason that
+      // costs the user access to their own mail. So the answer is to do LESS
+      // work rather than the same work faster.
+      //
+      // It is held under the same 280-character ceiling every DAV description is,
+      // which is why "one per call" lives on the parameter below rather than here:
+      // 02-18's rule puts a parameter's own meaning on the parameter, and the
+      // ceiling is what stops a description becoming a tax paid on every call.
+      description:
+        "Preview deleting ONE calendar and everything in it. Writes nothing; " +
+        "returns a confirmation for calendar_commit. The default calendar is " +
+        `refused. ${CALENDAR_UNTRUSTED_NOTICE}`,
+      // STRICT, on `calendar_delete_event`'s own argument. Zod's default object
+      // mode DROPS an unknown key silently, so a caller that supplied an `ids`
+      // array believing it had asked for a bulk delete would get one preview and
+      // no indication that the rest of its request was discarded. On the most
+      // destructive call in the project the difference between "your other four
+      // calendars are untouched" and "we ignored part of what you asked" must
+      // not be silence.
+      inputSchema: z.strictObject({
+        calendarId: z
+          .string()
+          .min(1)
+          .describe(
+            "The calendar's opaque id from calendar_list_calendars. Pass it " +
+              "back exactly as received; never build or edit one. Exactly " +
+              "one — there is no list form and no name form.",
+          ),
+      }),
+    },
+    async ({ calendarId }) => {
+      try {
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
+        // Decoded next, before the KV read discovery performs and before any
+        // outbound request. The cheapest possible refusal of a forged id.
+        const { collectionUrl } = decodeCalendarId(calendarId);
+
+        return collectionPreviewToolResult(
+          await withConfirmationBoundary(() =>
+            buildCollectionDeletePreview(
+              actor,
+              davFetch,
+              collectionUrl,
+              calendarId,
+            ),
+          ),
+        );
+      } catch (err) {
+        return davErrorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
     "calendar_commit",
     {
       description:
-        "Apply what calendar_update_event or calendar_delete_event previewed. " +
-        `Pass its confirmToken and its change back unaltered. ${CALENDAR_UNTRUSTED_NOTICE}`,
+        "Apply what calendar_update_event, calendar_delete_event or " +
+        "calendar_delete_calendar previewed. Pass its confirmToken and its " +
+        `change back unaltered. ${CALENDAR_UNTRUSTED_NOTICE}`,
       inputSchema: z.object({
         // The disclosure this project owes in exchange for keeping the ETag
         // precondition rather than RFC 6638's schedule-tag one. The
@@ -4432,10 +5354,25 @@ export function registerCalendarTools(
         // Who this call acts for. First, so a refused principal reads
         // `auth_failed` before anything else is looked at (D-27).
         const actor = await principal;
-        return commitToolResult(
-          await withConfirmationBoundary(() =>
-            applyCommit(actor, davFetch, confirmToken, change),
-          ),
+
+        // D-14: ONE commit tool, two arms. The arm is chosen by asking the SEAL
+        // which target it names — never by reading the supplied change, and
+        // never by a second endpoint whose identity could disagree with the
+        // confirmation's. See `targetOfConfirmation`, which carries the whole
+        // argument and the two routes that were declined.
+        return await withConfirmationBoundary(async () =>
+          (await targetOfConfirmation(actor.userId, confirmToken)) === "col"
+            ? collectionCommitToolResult(
+                await applyCollectionCommit(
+                  actor,
+                  davFetch,
+                  confirmToken,
+                  change,
+                ),
+              )
+            : commitToolResult(
+                await applyCommit(actor, davFetch, confirmToken, change),
+              ),
         );
       } catch (err) {
         return davErrorResult(err);

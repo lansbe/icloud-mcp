@@ -580,6 +580,15 @@ const COLLECTION_URL =
  */
 const COLLECTION_BINDING = '"ctag-observed-by-the-preview"';
 
+/**
+ * How many members the preview counted in that collection.
+ *
+ * A number a person can recognise in the refusal sentence the commit composes
+ * from it, rather than a round one: a delta stated as "4 then, 4 now" would
+ * read as correct while proving nothing about which side supplied which.
+ */
+const COLLECTION_MEMBERS = 4;
+
 function collectionPayload(
   overrides: Partial<DavCollectionConfirmPayload> = {},
 ): DavCollectionConfirmPayload {
@@ -591,6 +600,7 @@ function collectionPayload(
     c: HOME_SET,
     o: COLLECTION_URL,
     b: COLLECTION_BINDING,
+    g: COLLECTION_MEMBERS,
     h: "cGxhY2Vob2xkZXItY2hhbmdlLWhhc2g",
     x: soon(),
     u: USER,
@@ -626,6 +636,67 @@ describe("a collection confirmation cannot reach an ETag at all", () => {
 
     expect(read).toEqual(original);
     expect(read.b).toBe(COLLECTION_BINDING);
+    // The count the PREVIEW observed, back out of the seal unaltered. The
+    // commit's stale refusal names it as one half of its delta, so a value that
+    // did not survive the round trip would be a number reported as this server's
+    // own observation that nothing observed.
+    expect(read.g).toBe(COLLECTION_MEMBERS);
+  });
+
+  it("round-trips a ZERO member count, which is an answer and not an absence", async () => {
+    // The empty calendar. Zero has to survive as zero rather than being read as
+    // "no count was recorded", because the two lead to different sentences: a
+    // preview of an empty calendar states no count clause at all, and a commit
+    // whose binding moved must be able to say "the preview counted 0".
+    const empty = collectionPayload({ g: 0 });
+
+    const read = await verifyConfirmation(
+      await mintConfirmation(empty, SECRET),
+      SECRET,
+      USER,
+      "col",
+    );
+
+    expect(read.g).toBe(0);
+  });
+
+  it("refuses a collection payload with NO member count at all", async () => {
+    // A payload from a build that predates the field. Absent must not read as
+    // "the collection held none": it would reach the refusal's own sentence as a
+    // number nobody observed, which is `hasDavObjectArm`'s `"s" in candidate`
+    // argument in its sharper form. The token is five minutes old at most, so
+    // refusing costs one re-preview.
+    const { g: _dropped, ...withoutCount } = collectionPayload();
+
+    await expect(
+      verifyConfirmation(
+        await mintConfirmation(malformed(withoutCount), SECRET),
+        SECRET,
+        USER,
+        "col",
+      ),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it("refuses a member count that is negative, fractional, or not a number", async () => {
+    // Three shapes a cast or a hand-built payload can reach, each of which would
+    // print into the one sentence a refusal exists to say. A negative count is
+    // not a count; a fractional one is not a number of resources; a string is
+    // what a value that went through a form field looks like.
+    for (const g of [-1, 1.5, "4", null, Number.NaN]) {
+      await expect(
+        verifyConfirmation(
+          await mintConfirmation(
+            malformed({ ...collectionPayload(), g }),
+            SECRET,
+          ),
+          SECRET,
+          USER,
+          "col",
+        ),
+        `${JSON.stringify(g)} was admitted as a member count`,
+      ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+    }
   });
 
   it("refuses a collection payload carrying an ETag byte-identical to its binding", async () => {
@@ -1935,11 +2006,18 @@ describe("the server composes the human-facing line", () => {
   }
 
   /**
-   * Every combination of the six nouns, the three operations and both tenses.
+   * Every combination of the seven nouns, the three operations and both tenses.
    *
-   * Thirty-six rows, written out. The `it` below also asserts no two of them are
+   * Forty-two rows, written out. The `it` below also asserts no two of them are
    * equal, which is what stops a composer that ignored its noun or its tense
-   * from passing thirty-six identical assertions.
+   * from passing forty-two identical assertions.
+   *
+   * The seventh noun arrived with the collection delete (CALM-06), which needed a
+   * word for a member whose kind this server has not established — see
+   * `ConfirmationNoun`, which owns that argument. Its six rows are written out
+   * here rather than generated for the reason the header above gives: a table
+   * derived from the same rule the composer applies would agree with the composer
+   * by construction and would keep agreeing after the rule changed.
    */
   const EVERY_LINE: [ConfirmKind, ConfirmationNoun, ConfirmationTense, string][] =
     [
@@ -1955,6 +2033,8 @@ describe("the server composes the human-facing line", () => {
       ["create", "draft", "did", "Created the draft. Undoing it is a separate, explicit request."],
       ["create", "reminder", "would", "Creating the reminder. Undoing it is a separate, explicit request."],
       ["create", "reminder", "did", "Created the reminder. Undoing it is a separate, explicit request."],
+      ["create", "item", "would", "Creating the item. Undoing it is a separate, explicit request."],
+      ["create", "item", "did", "Created the item. Undoing it is a separate, explicit request."],
       ["update", "event", "would", "Overwriting the event. The values it held before cannot be recovered."],
       ["update", "event", "did", "Overwrote the event. The values it held before cannot be recovered."],
       ["update", "calendar", "would", "Overwriting the calendar. The values it held before cannot be recovered."],
@@ -1967,6 +2047,8 @@ describe("the server composes the human-facing line", () => {
       ["update", "draft", "did", "Overwrote the draft. The values it held before cannot be recovered."],
       ["update", "reminder", "would", "Overwriting the reminder. The values it held before cannot be recovered."],
       ["update", "reminder", "did", "Overwrote the reminder. The values it held before cannot be recovered."],
+      ["update", "item", "would", "Overwriting the item. The values it held before cannot be recovered."],
+      ["update", "item", "did", "Overwrote the item. The values it held before cannot be recovered."],
       ["delete", "event", "would", "Deleting the event. This cannot be undone."],
       ["delete", "event", "did", "Deleted the event. This cannot be undone."],
       ["delete", "calendar", "would", "Deleting the calendar. This cannot be undone."],
@@ -1979,13 +2061,15 @@ describe("the server composes the human-facing line", () => {
       ["delete", "draft", "did", "Deleted the draft. This cannot be undone."],
       ["delete", "reminder", "would", "Deleting the reminder. This cannot be undone."],
       ["delete", "reminder", "did", "Deleted the reminder. This cannot be undone."],
+      ["delete", "item", "would", "Deleting the item. This cannot be undone."],
+      ["delete", "item", "did", "Deleted the item. This cannot be undone."],
     ];
 
   it("produces the pinned line for every noun, every operation and both tenses", () => {
     // Non-vacuity first: a table that lost its rows would pass a loop over
     // nothing, which is the failure mode every table in this repository is
     // written against.
-    expect(EVERY_LINE.length).toBe(36);
+    expect(EVERY_LINE.length).toBe(42);
 
     for (const [kind, noun, tense, expected] of EVERY_LINE) {
       expect(
@@ -1995,7 +2079,7 @@ describe("the server composes the human-facing line", () => {
     }
   });
 
-  it("produces thirty-six DIFFERENT lines, so neither the noun nor the tense is ignored", () => {
+  it("produces forty-two DIFFERENT lines, so neither the noun nor the tense is ignored", () => {
     const produced = EVERY_LINE.map(([kind, noun, tense]) =>
       composeConfirmationLine(bare(kind, noun), tense),
     );
@@ -2021,6 +2105,54 @@ describe("the server composes the human-facing line", () => {
       ),
     ).toBe(
       "Deleting calendar 'Job Search', along with the 9 events in it. This cannot be undone.",
+    );
+  });
+
+  it("says ITEMS, not events, for the count a collection delete actually takes", () => {
+    // **The wording the shipped call site uses, and the case above is not it.**
+    // `readCollectionState` counts every MEMBER resource of the collection, so
+    // the number the delete preview states covers a to-do and a resource this
+    // server cannot parse exactly as it covers an event. "The 4 events in it"
+    // over three events and a to-do is a false statement in the one sentence the
+    // user is asked to agree to, and it is false about a kind of thing the user
+    // can check.
+    //
+    // The `event` case above is KEPT rather than replaced: it is PITFALLS #40's
+    // own example and it is correct for a caller that walked a series and knows
+    // what the occurrences are. Both wordings are reachable, and which one is
+    // right is a fact about what the caller established.
+    expect(
+      composeConfirmationLine(
+        {
+          kind: "delete",
+          noun: "calendar",
+          name: "Job Search",
+          alsoRemoved: { count: 4, noun: "item" },
+          fieldCount: null,
+          recipientCount: null,
+        },
+        "would",
+      ),
+    ).toBe(
+      "Deleting calendar 'Job Search', along with the 4 items in it. This cannot be undone.",
+    );
+
+    // The singular, because a one-member calendar is the case a plural rule gets
+    // wrong and the table in `src/confirm.ts` is a table precisely so it cannot.
+    expect(
+      composeConfirmationLine(
+        {
+          kind: "delete",
+          noun: "calendar",
+          name: "Job Search",
+          alsoRemoved: { count: 1, noun: "item" },
+          fieldCount: null,
+          recipientCount: null,
+        },
+        "would",
+      ),
+    ).toBe(
+      "Deleting calendar 'Job Search', along with the 1 item in it. This cannot be undone.",
     );
   });
 

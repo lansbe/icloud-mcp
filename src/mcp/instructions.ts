@@ -87,6 +87,8 @@ Calendar EVENTS can be created, updated and deleted, through the preview-and-com
 
 A CALENDAR itself can be created, and renamed or recoloured afterwards, with a colour as \`#RRGGBB\`. Those two write on the first call and have no preview: both are reversible, and the user can undo either from any of their own devices. Do not offer to preview them, and do not pass their answers to \`calendar_commit\`. A rename or recolour reports WHICH of the two properties actually changed -- iCloud may accept one and refuse the other, so read that answer rather than assuming both landed.
 
+DELETING a calendar is the one collection operation that IS previewed, and it is the most destructive thing here. It takes every event, reminder and item in the calendar, and nothing on this server or on the user's own devices can put any of it back. The preview says how many items go with it; show the user that number and that sentence before you commit. The account's default calendar is refused outright. If the calendar changes between the preview and the commit, the commit refuses and tells you by how much the number moved -- preview again and show the new number rather than retrying.
+
 Contacts can create and update, through the same preview-and-commit shape.
 
 An update replaces the WHOLE card -- CardDAV has no partial update. This server handles that by patching the card it fetched rather than building a new one, so send only the fields that change and everything you did not mention survives. Do not assemble a complete contact object from what you remember: the fields you leave out of one of those would be deletions, on every device the user owns. The preview reports preservedPropertyCount, which is how many properties on the card it is leaving alone.

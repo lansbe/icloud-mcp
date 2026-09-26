@@ -490,8 +490,51 @@ export interface DavCollectionConfirmPayload extends ConfirmPayloadBase {
    * bound that is quietly false is worse than a narrower one that is true, so
    * the narrower one is what is claimed here: the field travels, and nothing in
    * this build yet compares it against anything.
+   *
+   * **THAT LIMIT IS NOW CLOSED.** `applyCollectionCommit` in
+   * `src/mcp/tools/calendar.ts` re-reads the collection's binding and compares
+   * it against this field with a raw `!==` before it sends anything at all, and
+   * a collection whose binding moved is refused with zero writes. The paragraph
+   * above is kept rather than rewritten because it records what the field was
+   * worth before the re-read existed, and the next arm added here starts in
+   * exactly that position.
    */
   b: string;
+  /**
+   * How many member resources the collection held when the preview read it.
+   *
+   * **Here rather than in the change, on `DavObjectConfirmPayload.s`'s exact
+   * footing, and the reason transfers without alteration.** `h` binds what the
+   * USER APPROVED and refuses any alteration of it. This is not that. It is a
+   * fact about the COLLECTION at read time — the binding's own footing, one
+   * field up — and it is not something a caller could sensibly re-supply,
+   * because re-supplying it is re-supplying this server's own observation.
+   *
+   * **Why it has to travel at all.** D-12 requires that a collection whose
+   * binding moved between the preview and the commit be refused with a
+   * statement of HOW MUCH the number moved — "the preview counted 4; there are
+   * now 6" — because that delta is the only honest thing this server can say
+   * about the window CALM-06 exists to protect. The commit re-reads the
+   * collection and therefore knows the fresh count; the previewed count exists
+   * nowhere but in the preview. The confirmation is the only channel between
+   * the two, so the number rides here.
+   *
+   * Sealed rather than re-supplied for the reason `s` gives: a caller that
+   * could choose this number could choose one that makes the delta read as zero,
+   * which turns the one sentence the refusal exists to say into a reassurance.
+   * And a number this server publishes as its own observation must never have
+   * come off a request — the rule `ConfirmationSummary`'s docstring states for
+   * every count in the composed line.
+   *
+   * A whole non-negative integer. Zero is a real answer — the empty collection —
+   * and is not a missing value.
+   *
+   * **It is deliberately NOT part of the binding.** A collection whose count
+   * moved and whose ctag did not is not a state this server refuses on: the ctag
+   * is what D-09 binds, and inventing a second precondition out of the count
+   * would refuse writes the user approved for a reason nobody decided.
+   */
+  g: number;
 }
 
 /**
@@ -1247,9 +1290,27 @@ export async function contactChangeHashOf(
  * A CLOSED vocabulary rather than a caller-supplied string, on `changedFields`'
  * own precedent one module over: a noun a caller could choose is not a noun, it
  * is content — and content in the composed line is exactly the thing the line
- * exists to stop a caller writing. Six words cover every consumer on the books:
- * the calendar object and the collection, the contact, the message and the
- * draft, and the reminder.
+ * exists to stop a caller writing. Seven words cover every consumer on the
+ * books: the calendar object and the collection, the contact, the message and
+ * the draft, the reminder, and the member of a collection whose kind this
+ * server has not established.
+ *
+ * **`item` is the seventh and it is the only one that names a thing by NOT
+ * naming it, which is why it earns its place rather than duplicating `event`.**
+ * A collection delete has to state how many resources go with the collection,
+ * and that number comes from a depth-1 listing of member hrefs — which is a
+ * count of MEMBERS and not of events. A calendar may hold a to-do, or a
+ * resource this server cannot parse at all, and each of those disappears with
+ * the collection exactly as an event does. Saying "the 4 events in it" over
+ * three events and a to-do is a false statement in the one sentence the user is
+ * asked to agree to, and it is false in the direction that matters: it names a
+ * kind of thing the user can check, about resources that are not that kind.
+ * Saying "the 4 items in it" states the number, states the reach, and claims
+ * nothing about kind — which is exactly what this server knows.
+ *
+ * A caller that HAS established the kind still says so: `event` is correct for
+ * a series whose occurrences this server walked, and nothing here makes the
+ * vaguer word the default.
  */
 export type ConfirmationNoun =
   | "event"
@@ -1257,7 +1318,8 @@ export type ConfirmationNoun =
   | "contact"
   | "message"
   | "draft"
-  | "reminder";
+  | "reminder"
+  | "item";
 
 /**
  * Which way a composed line faces: what a commit WOULD do, or what it DID.
@@ -1325,9 +1387,15 @@ const CONFIRMATION_VERBS: Record<
 /**
  * The plural of each noun in the vocabulary.
  *
- * A closed table rather than a suffix rule, even though all six take the same
+ * A closed table rather than a suffix rule, even though all seven take the same
  * letter today. A rule would be this module claiming an opinion about English,
- * and the seventh noun is the one that would break it silently.
+ * and the noun after these is the one that would break it silently.
+ *
+ * The seventh arrived when the collection delete needed a word for a member
+ * whose kind this server has not established — see `ConfirmationNoun`, which
+ * owns that argument. It takes the same letter as the other six, which is
+ * precisely why it is written down: a suffix rule would have been "still
+ * correct" here and would have stayed uncorrected until the noun that is not.
  */
 const CONFIRMATION_PLURALS: Record<ConfirmationNoun, string> = {
   event: "events",
@@ -1336,6 +1404,7 @@ const CONFIRMATION_PLURALS: Record<ConfirmationNoun, string> = {
   message: "messages",
   draft: "drafts",
   reminder: "reminders",
+  item: "items",
 };
 
 /**
@@ -1766,11 +1835,21 @@ function hasDavObjectArm(candidate: Record<string, unknown>): boolean {
  * The three absences are asserted rather than assumed. A collection payload
  * that also carried an ETag would satisfy the object arm, and the whole point
  * of `b` is that a collection target cannot be committed as an object one.
+ *
+ * `g` is REQUIRED, and a payload from a build that predates it is refused here
+ * rather than admitted with the field reading `undefined`. That is
+ * `hasDavObjectArm`'s `"s" in candidate` argument in its sharper form: an
+ * absent count does not read as "the collection held none", it reaches the
+ * refusal's own sentence as a number nobody observed. The token is five minutes
+ * old at most, so refusing costs one re-preview.
  */
 function hasDavCollectionArm(candidate: Record<string, unknown>): boolean {
   return (
     typeof candidate.c === "string" &&
     typeof candidate.o === "string" &&
+    typeof candidate.g === "number" &&
+    Number.isInteger(candidate.g) &&
+    candidate.g >= 0 &&
     // Non-empty, and the emptiness check is not fussiness. An empty binding is
     // the shape a missing header or a blank property answer reaches by
     // accident, and it is not "no binding" — it is a binding that compares

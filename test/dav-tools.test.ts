@@ -656,6 +656,7 @@ describe("the DAV registrations", () => {
       "calendar_commit",
       "calendar_create_calendar",
       "calendar_create_event",
+      "calendar_delete_calendar",
       "calendar_delete_event",
       "calendar_find_free_slots",
       "calendar_get_event",
@@ -713,7 +714,7 @@ describe("the DAV registrations", () => {
     // The loop above iterates the REGISTRATIONS rather than an enumerated list
     // of names, so a tool added to a DAV registrar in a later plan is measured
     // by construction — with no edit to this file and no cross-plan conflict.
-    expect(registeredDav().length).toBe(17);
+    expect(registeredDav().length).toBe(18);
   });
 
   it("carries the untrusted notice on every calendar description that returns stranger content", () => {
@@ -1473,8 +1474,62 @@ interface WriteStubOptions {
    * own — and is the case an off-by-one count reports as holding one event.
    */
   members?: string[];
+  /**
+   * The scheduling inbox the PRINCIPAL advertises, or `null` for none.
+   *
+   * `null` is the default and keeps this conversation exactly as it was: the
+   * principal answers its home set to the inbox question,
+   * `resolveDefaultCalendarUrl` reads no inbox href, and the account's default
+   * calendar resolves to `null`. That is the state CALM-07's refusal cannot fire
+   * in, so every case that needs the refusal has to name an inbox — which is
+   * also, deliberately, what makes the FAIL-OPEN the default in this fixture
+   * rather than something a case has to construct.
+   */
+  scheduleInbox?: string | null;
+  /**
+   * The default calendar that inbox names, or `null` for none.
+   *
+   * Only reachable when `scheduleInbox` is set, because the inbox is the
+   * resource RFC 6638 § 9.2 puts the property on and this stub answers it
+   * nowhere else.
+   */
+  defaultCalendar?: string | null;
   /** Answer this request instead of the canned conversation. `null` defers. */
   onRequest?: (url: string, method: string) => Response | null;
+}
+
+/**
+ * The depth-1 answer a collection gives about ITSELF and its members.
+ *
+ * Extracted from `writeDavStub`'s own branch so the delete cases can answer a
+ * SECOND, different reading of the same collection without owning a second copy
+ * of the shape. A second copy is how the container's own row stops being first,
+ * or stops being present, in one of the two — and the whole off-by-one this
+ * fixture exists to catch lives in that row.
+ *
+ * A `ctag` of `null` emits NO binding element at all, which is what a server
+ * answering no `CS:getctag` produces and the shape a delete must refuse on.
+ */
+function collectionRows(ctag: string | null, members: string[]): string {
+  const rows = members
+    .map(
+      (href) =>
+        `<response><href>${href}</href><propstat>` +
+        `<status>HTTP/1.1 200 OK</status>` +
+        `<prop><getetag>${PREVIEW_ETAG}</getetag></prop>` +
+        `</propstat></response>`,
+    )
+    .join("");
+
+  return (
+    `<response><href>${WORK_PATH}</href><propstat>` +
+    `<status>HTTP/1.1 200 OK</status><prop>` +
+    `<displayname>Work</displayname>` +
+    `<resourcetype><collection/><C:calendar/></resourcetype>` +
+    (ctag === null ? "" : `<CS:getctag>${ctag}</CS:getctag>`) +
+    `</prop></propstat></response>` +
+    rows
+  );
 }
 
 /** The Apple ID the test pool binds, and the set the principal advertises. */
@@ -1577,6 +1632,21 @@ function writeDavStub(options: WriteStubOptions = {}): WriteStub {
           `<response><href>${PRINCIPAL_PATH}</href><propstat><status>HTTP/1.1 200 OK</status><prop><C:calendar-user-address-set>${hrefs}</C:calendar-user-address-set></prop></propstat></response>`,
         );
       }
+      // CALM-07's first leg. Answered by BODY for the same reason the address set
+      // above is: it goes to the SAME principal URL the home-set question does,
+      // so the URL alone cannot tell the two apart. A case that names no inbox
+      // falls through to the home-set branch below, which is what makes the
+      // account's default calendar resolve to `null`.
+      if (String(init?.body ?? "").includes("schedule-inbox-URL")) {
+        const inbox = options.scheduleInbox ?? null;
+        return multistatus(
+          `<response><href>${PRINCIPAL_PATH}</href><propstat><status>HTTP/1.1 200 OK</status><prop>` +
+            (inbox === null
+              ? ""
+              : `<C:schedule-inbox-URL><href>${inbox}</href></C:schedule-inbox-URL>`) +
+            `</prop></propstat></response>`,
+        );
+      }
       if (url.endsWith(PRINCIPAL_PATH)) {
         return multistatus(
           `<response><href>${PRINCIPAL_PATH}</href><propstat><status>HTTP/1.1 200 OK</status><prop><C:calendar-home-set><href>${CALDAV_HOME}</href></C:calendar-home-set></prop></propstat></response>`,
@@ -1584,6 +1654,25 @@ function writeDavStub(options: WriteStubOptions = {}): WriteStub {
       }
       return multistatus(
         `<response><href>${PRINCIPAL_PATH}</href><propstat><status>HTTP/1.1 200 OK</status><prop><current-user-principal><href>${PRINCIPAL_PATH}</href></current-user-principal></prop></propstat></response>`,
+      );
+    }
+
+    // CALM-07's second leg: the depth-0 read against the scheduling INBOX, which
+    // is where RFC 6638 § 9.2 puts the property. Matched on the BODY and placed
+    // ahead of both collection branches, because the inbox is a child of the
+    // calendar home and the generic PROPFIND branch would otherwise answer it
+    // with the work calendar's own row.
+    if (
+      method === "PROPFIND" &&
+      String(init?.body ?? "").includes("schedule-default-calendar-URL")
+    ) {
+      const target = options.defaultCalendar ?? null;
+      return multistatus(
+        `<response><href>${new URL(url).pathname}</href><propstat><status>HTTP/1.1 200 OK</status><prop>` +
+          (target === null
+            ? ""
+            : `<C:schedule-default-calendar-URL><href>${target}</href></C:schedule-default-calendar-URL>`) +
+          `</prop></propstat></response>`,
       );
     }
 
@@ -1597,23 +1686,8 @@ function writeDavStub(options: WriteStubOptions = {}): WriteStub {
     // own. Counting rows gives a number one too high, and on a collection
     // delete that is a number the user agreed to which was never true.
     if (method === "PROPFIND" && new URL(url).pathname === WORK_PATH) {
-      const rows = (options.members ?? WORK_MEMBERS)
-        .map(
-          (href) =>
-            `<response><href>${href}</href><propstat>` +
-            `<status>HTTP/1.1 200 OK</status>` +
-            `<prop><getetag>${PREVIEW_ETAG}</getetag></prop>` +
-            `</propstat></response>`,
-        )
-        .join("");
       return multistatus(
-        `<response><href>${WORK_PATH}</href><propstat>` +
-          `<status>HTTP/1.1 200 OK</status><prop>` +
-          `<displayname>Work</displayname>` +
-          `<resourcetype><collection/><C:calendar/></resourcetype>` +
-          `<CS:getctag>${WORK_CTAG}</CS:getctag>` +
-          `</prop></propstat></response>` +
-          rows,
+        collectionRows(WORK_CTAG, options.members ?? WORK_MEMBERS),
       );
     }
 
@@ -7200,7 +7274,7 @@ describe("a principal that was refused reaches no DAV tool", () => {
   }
 
   it("covers every DAV registration, and the count is pinned", () => {
-    // One diagnostic, TEN calendar tools, five contacts tools. A tool added
+    // One diagnostic, ELEVEN calendar tools, five contacts tools. A tool added
     // later lands in the loop below by itself. This pin is what makes a tool
     // REMOVED from the loop show up.
     //
@@ -7214,7 +7288,14 @@ describe("a principal that was refused reaches no DAV tool", () => {
     // — there is no preview leg to absorb a refusal, so awaiting the principal
     // first is the only thing between a grant that does not check out and a
     // collection write.
-    expect(registeredDav(refused()).length).toBe(17);
+    //
+    // `calendar_delete_calendar` (CALM-06) is the eleventh, and it is the one
+    // that matters most on this list even though it is a PREVIEW: it awaits the
+    // principal before it decodes an id, resolves discovery or mints anything, so
+    // a grant that does not check out never reaches the point where a
+    // confirmation for the most destructive operation in the project could be
+    // signed for it.
+    expect(registeredDav(refused()).length).toBe(18);
   });
 
   it("answers auth_failed from EVERY tool, with the unchanged message and zero requests", async () => {
@@ -8133,5 +8214,767 @@ describe("the calendar_update_calendar call", () => {
       "id",
       "unchanged",
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CALM-06, CALM-07 — the calendar delete, at the tool boundary
+//
+// The first collection-scoped DESTRUCTIVE operation in this project, and the
+// three refusals that stand in front of it. Every case here asserts its
+// zero-write claim off the stub's OWN RECORDED LIST rather than off a returned
+// field, because "refused" is a claim about what left the Worker and a response
+// cannot be evidence about that.
+//
+// The sharpest pair is the binding. `DavCollectionConfirmPayload.b` has
+// travelled since Phase 15 with nothing comparing it to anything — its own
+// docstring said so and assigned the re-read to this phase — so the two cases
+// that matter most are the one where the binding agrees and the delete goes, and
+// the one where it moved and NOTHING goes.
+// ---------------------------------------------------------------------------
+
+/** The scheduling inbox RFC 6638 § 9.2 puts the default-calendar property on. */
+const INBOX_URL = `${CALDAV_HOME}inbox/`;
+
+/** A second collection on the same account, for the negative-control default. */
+const OTHER_COLLECTION_URL = `${CALDAV_HOME}personal/`;
+
+/** The binding the collection answers on the commit's RE-READ when it moved. */
+const MOVED_CTAG = "ctag-work-2";
+
+/**
+ * The JSON a confirmation carries, read back out of the token.
+ *
+ * The seal is not verified here, deliberately: what these cases need to know is
+ * what this server SEALED — the discriminator, the binding, the count — and
+ * verifying would only re-assert what `test/confirm.test.ts` already pins. The
+ * commit cases drive the real gate instead of this reader.
+ */
+function payloadOf(token: string): Record<string, unknown> {
+  const part = token.split(".")[0].replace(/-/g, "+").replace(/_/g, "/");
+  const padded = part.padEnd(part.length + ((4 - (part.length % 4)) % 4), "=");
+  return JSON.parse(atob(padded)) as Record<string, unknown>;
+}
+
+interface DeleteStubOptions {
+  /**
+   * The binding each successive depth-1 read of the collection answers; the last
+   * entry repeats. `null` answers NO binding element at all.
+   *
+   * Successive rather than fixed, because the whole of D-09 is that the PREVIEW
+   * and the COMMIT read the same collection at two different moments. A stub that
+   * could only answer one value could not express the case the binding exists for.
+   */
+  ctags?: (string | null)[];
+  /** The members each successive read answers; the last entry repeats. */
+  memberSets?: string[][];
+  /** What the verification look after the removal finds. */
+  afterDelete?: "gone" | "present" | "unreachable";
+  /** Passed through: the scheduling inbox the principal advertises. */
+  scheduleInbox?: string | null;
+  /** Passed through: the default calendar that inbox names. */
+  defaultCalendar?: string | null;
+}
+
+/**
+ * A stub that answers the collection delete's whole conversation.
+ *
+ * Built ON `writeDavStub` rather than beside it, so the overlap detector, the
+ * method-buildability guard and the recorded request list are the same ones every
+ * other write case in this file uses. What it adds is state: which reading of the
+ * collection this is, and whether the removal has been sent yet.
+ */
+function deletingWriteStub(options: DeleteStubOptions = {}): WriteStub {
+  const ctags = options.ctags ?? [WORK_CTAG];
+  const memberSets = options.memberSets ?? [WORK_MEMBERS];
+  const afterDelete = options.afterDelete ?? "gone";
+  let reads = 0;
+  let deleted = false;
+
+  return writeDavStub({
+    scheduleInbox: options.scheduleInbox,
+    defaultCalendar: options.defaultCalendar,
+    onRequest: (url, method) => {
+      let pathname: string;
+      try {
+        pathname = new URL(url).pathname;
+      } catch {
+        return null;
+      }
+      // Everything that is not the work collection itself — discovery, the home
+      // listing, the inbox chain — falls through to the canned conversation.
+      if (pathname !== WORK_PATH) return null;
+
+      if (method === "DELETE") {
+        deleted = true;
+        // 204, which is what SPIKE-04 measured a real server answering a
+        // collection removal it accepted. Deliberately a SUCCESS, so a case that
+        // reports the calendar still there is reporting what the fresh look
+        // found rather than what the removal's status said.
+        return new Response(null, { status: 204 });
+      }
+      if (method !== "PROPFIND") return null;
+
+      if (deleted) {
+        if (afterDelete === "gone") return new Response(null, { status: 404 });
+        // 503, which `src/dav/transport.ts` maps to the throttle class — a
+        // failure that is not an answer about the collection either way.
+        if (afterDelete === "unreachable") {
+          return new Response(null, { status: 503 });
+        }
+        return multistatus(collectionRows(WORK_CTAG, WORK_MEMBERS));
+      }
+
+      const ctag = ctags[Math.min(reads, ctags.length - 1)];
+      const members = memberSets[Math.min(reads, memberSets.length - 1)];
+      reads += 1;
+      return multistatus(collectionRows(ctag, members));
+    },
+  });
+}
+
+/** Invoke `calendar_delete_calendar` through its SCHEMA, refusal and all. */
+async function invokeDeleteCalendar(
+  calendarId: unknown,
+): Promise<{ isError?: boolean; content: { text: string }[] } | null> {
+  const parsed = schemaFor("calendar_delete_calendar").safeParse({ calendarId });
+  if (!parsed.success) return null;
+  return invokeRegistered(
+    "calendar_delete_calendar",
+    parsed.data as Record<string, unknown>,
+  );
+}
+
+/** The same call, with the two-block success shape asserted and parsed. */
+async function deleteCalendarPreview(calendarId: string): Promise<{
+  trusted: Record<string, unknown>;
+  untrusted: Record<string, unknown>;
+  raw: { trusted: string; untrusted: string };
+}> {
+  const result = await invokeDeleteCalendar(calendarId);
+  if (result === null) throw new Error("the schema refused the calendar id");
+  expect(
+    result.isError,
+    `the delete preview refused: ${result.content[0]?.text}`,
+  ).not.toBe(true);
+  const raw = blocks(result);
+  return {
+    trusted: JSON.parse(raw.trusted) as Record<string, unknown>,
+    untrusted: fencedObject(raw.untrusted),
+    raw,
+  };
+}
+
+/** Commit whatever a delete preview minted, and hand back the raw result. */
+async function commitCollectionDelete(previewed: {
+  trusted: Record<string, unknown>;
+  untrusted: Record<string, unknown>;
+}): Promise<{ isError?: boolean; content: { text: string }[] }> {
+  return invokeRegistered("calendar_commit", {
+    confirmToken: String(previewed.trusted.confirmToken),
+    change: previewed.untrusted.change,
+  });
+}
+
+describe("the calendar_delete_calendar registration", () => {
+  it("takes one opaque calendar id and nothing else, STRICTLY", () => {
+    const schema = schemaFor("calendar_delete_calendar");
+    expect(Object.keys(schema.shape)).toEqual(["calendarId"]);
+
+    // STRICT: an unknown key is REFUSED rather than dropped. A caller that
+    // supplied an `ids` array believing it had asked for a bulk delete must not
+    // get one preview and silence about the rest.
+    expect(
+      schema.safeParse({ calendarId: CALENDAR_ID, ids: [CALENDAR_ID] }).success,
+    ).toBe(false);
+    expect(schema.safeParse({ calendarId: CALENDAR_ID }).success).toBe(true);
+    expect(schema.safeParse({ calendarId: "" }).success).toBe(false);
+  });
+
+  it("says in the description that it writes nothing and that the default is refused", () => {
+    const tool = registeredDav().find(
+      (one) => one.name === "calendar_delete_calendar",
+    );
+    const description = String(tool!.options.description);
+
+    expect(description).toContain("Writes nothing");
+    expect(description).toContain("calendar_commit");
+    expect(description).toContain("default calendar is refused");
+    expect(description).toContain(CALENDAR_UNTRUSTED_NOTICE);
+    // The same ceiling every other DAV description is held under.
+    expect(description.length).toBeLessThan(280);
+  });
+
+  it("states on the parameter that there is no list form", () => {
+    const described = describedParam("calendar_delete_calendar", "calendarId");
+    expect(described).toContain("Exactly");
+    expect(described).toContain("no list form");
+  });
+});
+
+describe("refusing the account's default calendar before anything is sent (CALM-07)", () => {
+  it("refuses it with the recorded request list EMPTY", async () => {
+    const stub = deletingWriteStub({
+      scheduleInbox: INBOX_URL,
+      defaultCalendar: CALENDAR_URL,
+    });
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+
+    // **ZERO. This assertion IS CALM-07.** The requirement words the refusal as
+    // local, before any request is sent, and it is asserted off the stub's own
+    // recorded list rather than off the returned field — a response cannot be
+    // evidence about what left the Worker.
+    expect(
+      stub.observed.length,
+      "the default-calendar refusal reached the network",
+    ).toBe(0);
+
+    expect(previewed.trusted.defaultCalendarRefused).toBe(true);
+    // Nothing minted, so there is literally nothing to commit and a caller
+    // cannot proceed by ignoring the message.
+    expect(previewed.trusted.confirmToken).toBeNull();
+    expect(previewed.trusted.expiresInSeconds).toBeNull();
+    expect(previewed.trusted.itemCount).toBe(0);
+    expect(previewed.trusted.writeCount).toBe(0);
+    expect(previewed.untrusted.change).toBeNull();
+    expect(previewed.untrusted.confirmationLine).toBeNull();
+
+    // It names the calendar in the USER'S terms, and echoes no URL — not the
+    // shard host, not the account's DSID, not the collection path.
+    const reason = String(previewed.trusted.refusalReason);
+    expect(reason).toContain("default calendar");
+    const whole = previewed.raw.trusted + previewed.raw.untrusted;
+    expect(whole).not.toContain("p42-caldav");
+    expect(whole).not.toContain("1234567890");
+    expect(whole).not.toContain("/calendars/");
+  });
+
+  it("negative control: a NON-default calendar on the same armed account previews", async () => {
+    // Without this the case above passes just as happily on a build that refuses
+    // every calendar, which is the failure mode a refusal assertion always has.
+    const stub = deletingWriteStub({
+      scheduleInbox: INBOX_URL,
+      defaultCalendar: OTHER_COLLECTION_URL,
+    });
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+
+    expect(previewed.trusted.defaultCalendarRefused).toBe(false);
+    expect(previewed.trusted.refusalReason).toBeNull();
+    expect(previewed.trusted.confirmToken).not.toBeNull();
+    // ONE request: the collection's own depth-1 read.
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].method).toBe("PROPFIND");
+  });
+
+  it("compares RAW: the default calendar with a different trailing form is not it", async () => {
+    // `isDefaultCalendar` normalises nothing on either side, and the fixture is
+    // what makes that checkable from out here rather than only in
+    // `test/dav-calendar.test.ts`. Both sides were normalised ONCE at store time
+    // by resolving the href against the account's own resolved home.
+    const stub = deletingWriteStub({
+      scheduleInbox: INBOX_URL,
+      defaultCalendar: CALENDAR_URL.replace(/\/$/, ""),
+    });
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+    expect(previewed.trusted.defaultCalendarRefused).toBe(false);
+  });
+
+  it("FAIL-OPEN, asserted rather than assumed: no default named means no refusal", async () => {
+    // **This is the open risk plan 17-05 recorded, pinned as a test so it is
+    // visible rather than latent.** Whether iCloud populates
+    // `schedule-default-calendar-URL` on the scheduling inbox is unmeasured
+    // against the real account; if it answers nothing, `defaultCalendarUrl` is
+    // null, `isDefaultCalendar` answers false for every collection, and CALM-07's
+    // refusal does not fire at all.
+    //
+    // The test exists so that state is a KNOWN behaviour with an assertion behind
+    // it rather than a surprise found during a UAT, and so that a later build
+    // which "fixed" it with a display-name or position heuristic would have to
+    // turn this red on the way — which is exactly the heuristic D-11 rules out.
+    // `dav_diagnose` reports the resolved value so the measurement costs one call.
+    const stub = deletingWriteStub({ scheduleInbox: null });
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+
+    expect(previewed.trusted.defaultCalendarRefused).toBe(false);
+    expect(previewed.trusted.confirmToken).not.toBeNull();
+  });
+});
+
+describe("the calendar_delete_calendar preview", () => {
+  it("issues exactly ONE request, writes nothing, and seals the binding verbatim", async () => {
+    const stub = deletingWriteStub();
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].method).toBe("PROPFIND");
+    // Nothing that changes the account, on any path.
+    expect(
+      stub.observed.filter((one) => one.method !== "PROPFIND"),
+      "the preview sent something other than a read",
+    ).toEqual([]);
+    expect(stub.maxInFlight).toBe(1);
+
+    const payload = payloadOf(String(previewed.trusted.confirmToken));
+    // The COLLECTION arm, not the object one. A `dav` here would mean the commit
+    // read a collection URL out of a field meant for an object.
+    expect(payload.t).toBe("col");
+    expect(payload.k).toBe("delete");
+    // The binding, byte for byte. Unquoted, because a ctag carries no quoting
+    // convention — a build that added or stripped quotes would fail here.
+    expect(payload.b).toBe(WORK_CTAG);
+    expect(payload.o).toBe(CALENDAR_URL);
+    expect(payload.c).toBe(CALDAV_HOME);
+    // NO ETag, no recurrence id, no revision. Each absent rather than null,
+    // because a null would be this arm claiming a fact it does not have.
+    expect("e" in payload).toBe(false);
+    expect("r" in payload).toBe(false);
+    expect("s" in payload).toBe(false);
+  });
+
+  it("counts the MEMBERS and excludes the collection's own row", async () => {
+    const stub = deletingWriteStub();
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+
+    // THREE, not four. The depth-1 answer carries four hrefs — the collection's
+    // own, then three members — and counting rows gives a number one too high on
+    // the one operation where the number is what the user agreed to.
+    expect(WORK_MEMBERS.length).toBe(3);
+    expect(previewed.trusted.itemCount).toBe(3);
+    expect(payloadOf(String(previewed.trusted.confirmToken)).g).toBe(3);
+
+    // The sentence states the same number, and says ITEMS rather than events:
+    // the third member has no `.ics` suffix at all, so this server does not know
+    // what it is and must not name a kind.
+    expect(previewed.untrusted.confirmationLine).toBe(
+      "Deleting calendar 'Work', along with the 3 items in it. This cannot be undone.",
+    );
+  });
+
+  it("drops the count clause entirely on an EMPTY calendar", async () => {
+    // The off-by-one's own case. An empty collection still answers ONE href —
+    // its own — and a build that counted rows would preview it as holding a
+    // thing, and would say "the 1 item in it" about nothing at all.
+    const stub = deletingWriteStub({ memberSets: [[]] });
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+
+    expect(previewed.trusted.itemCount).toBe(0);
+    expect(previewed.untrusted.confirmationLine).toBe(
+      "Deleting calendar 'Work'. This cannot be undone.",
+    );
+    // A confirmation IS minted: an empty calendar is a calendar, and deleting it
+    // is still a change the user has to agree to.
+    expect(previewed.trusted.confirmToken).not.toBeNull();
+  });
+
+  it("refuses a collection answering NO binding, after one read and before any write", async () => {
+    const stub = deletingWriteStub({ ctags: [null] });
+    await warmWrite(stub);
+
+    const result = await invokeDeleteCalendar(CALENDAR_ID);
+    expect(result!.isError).toBe(true);
+
+    // ONE request, and it is the read. The refusal happens on the answer to it,
+    // so one is the floor rather than a leak.
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].method).toBe("PROPFIND");
+
+    // The error shape, so there is no confirmation anywhere in the answer for a
+    // model to present to the commit.
+    expect(result!.content.length).toBe(1);
+    const whole = result!.content[0].text;
+    expect(JSON.parse(whole).category).toBe("not_found");
+    expect(whole).not.toContain("p42");
+    expect(whole).not.toContain(WORK_CTAG);
+  });
+
+  it("refuses an id this server did not mint, with NOTHING recorded", async () => {
+    const stub = deletingWriteStub();
+    await warmWrite(stub);
+
+    const result = await invokeDeleteCalendar("not-a-token-this-server-minted");
+    expect(result!.isError).toBe(true);
+    expect(
+      stub.observed.length,
+      "a forged calendar id reached the network",
+    ).toBe(0);
+  });
+
+  it("keeps the calendar's own name INSIDE the fence", async () => {
+    const stub = writeDavStub({
+      onRequest: (url, method) =>
+        method === "PROPFIND" && new URL(url).pathname === WORK_PATH
+          ? multistatus(
+              collectionRows(WORK_CTAG, WORK_MEMBERS).replace(
+                "<displayname>Work</displayname>",
+                `<displayname>${HOSTILE_CALENDAR_NAME}</displayname>`,
+              ),
+            )
+          : null,
+    });
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+
+    // A SHARED calendar's name is chosen by whoever shared it, which makes it the
+    // cheapest injection vector into the one sentence the user is asked to read.
+    expect(previewed.raw.trusted).not.toContain(HOSTILE_CALENDAR_NAME);
+    expect(previewed.raw.untrusted).toContain(HOSTILE_CALENDAR_NAME);
+
+    // **T-17-29, at this call site rather than only in the composer's own
+    // tests.** The name is FOLDED before it is embedded: the ASCII apostrophe in
+    // this title becomes U+2019, which reads the same to a person and closes
+    // nothing — so a title cannot close its own quote and write a clause into the
+    // sentence the model is told to relay word for word. The `displayName` field
+    // beside it stays byte-exact, which is the point of the two being separate.
+    const line = String(previewed.untrusted.confirmationLine);
+    expect(line).toContain("’s behalf");
+    expect(line).not.toContain("user's behalf");
+    expect(line.endsWith("in it. This cannot be undone.")).toBe(true);
+    expect(previewed.untrusted.displayName).toBe(HOSTILE_CALENDAR_NAME);
+    expect(Object.keys(previewed.trusted).sort()).toEqual([
+      "confirmToken",
+      "defaultCalendarRefused",
+      "expiresInSeconds",
+      "id",
+      "itemCount",
+      "refusalReason",
+      "writeCount",
+    ]);
+  });
+});
+
+describe("the calendar_commit collection arm (CALM-06, D-09, D-12, D-14)", () => {
+  it("re-reads, removes, and verifies by LOOKING — three serial requests in order", async () => {
+    const stub = deletingWriteStub();
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+    stub.observed.length = 0;
+
+    const result = await commitCollectionDelete(previewed);
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+
+    // THREE, in this order and with NO overlap. The re-read decides whether the
+    // removal is sent at all, and the fresh look is the only evidence this
+    // project accepts that the removal landed — so racing either with the removal
+    // would be asking about a collection nobody has decided to delete yet, or
+    // looking before the delete arrived.
+    expect(stub.observed.map((one) => one.method)).toEqual([
+      "PROPFIND",
+      "DELETE",
+      "PROPFIND",
+    ]);
+    expect(stub.maxInFlight).toBe(1);
+    for (const one of stub.observed) {
+      expect(new URL(one.url).pathname).toBe(WORK_PATH);
+    }
+
+    const raw = blocks(result);
+    const trusted = JSON.parse(raw.trusted) as Record<string, unknown>;
+    const untrusted = fencedObject(raw.untrusted);
+
+    expect(trusted.applied).toBe(true);
+    // Derived from the fresh look and never from the removal's own 204.
+    expect(trusted.removal).toBe("gone");
+    expect(trusted.staleBinding).toBe(false);
+    expect(trusted.previewedItemCount).toBe(3);
+    expect(trusted.notice).toBeNull();
+    // The id is still reported, so the two halves join by identity.
+    expect(trusted.id).toBe(previewed.trusted.id);
+    expect(untrusted.id).toBe(previewed.trusted.id);
+
+    // The past-tense line, from the same composer with the verb flipped and the
+    // count the PREVIEW sealed rather than the aftermath's zero.
+    expect(untrusted.confirmationLine).toBe(
+      "Deleted the calendar, along with the 3 items in it. This cannot be undone.",
+    );
+    expect(raw.trusted).not.toContain("Deleted the calendar");
+  });
+
+  it("REFUSES a collection whose binding moved, names the delta, and sends nothing", async () => {
+    const stub = deletingWriteStub({
+      ctags: [WORK_CTAG, MOVED_CTAG],
+      memberSets: [WORK_MEMBERS, [...WORK_MEMBERS, `${WORK_PATH}arrived.ics`]],
+    });
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+    expect(previewed.trusted.itemCount).toBe(3);
+    stub.observed.length = 0;
+
+    const result = await commitCollectionDelete(previewed);
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+
+    // **ZERO writes. This assertion is what CALM-06 rests on.** The refusal is a
+    // decision not to issue the request rather than a precondition the server
+    // rejected, so the only thing that went out is the re-read that discovered it.
+    expect(
+      stub.observed.filter((one) => one.method === "DELETE"),
+      "a collection whose binding moved was deleted anyway",
+    ).toEqual([]);
+    expect(stub.observed.map((one) => one.method)).toEqual(["PROPFIND"]);
+
+    const raw = blocks(result);
+    const trusted = JSON.parse(raw.trusted) as Record<string, unknown>;
+
+    expect(trusted.staleBinding).toBe(true);
+    expect(trusted.applied).toBe(false);
+    expect(trusted.removal).toBe("not-attempted");
+    // The DELTA, both sides this server's own observation: one sealed into the
+    // confirmation at preview, one taken just now.
+    expect(trusted.previewedItemCount).toBe(3);
+    expect(trusted.currentItemCount).toBe(4);
+    const notice = String(trusted.notice);
+    expect(notice).toContain("counted 3");
+    expect(notice).toContain("now 4");
+    expect(notice).toContain("Preview the delete again");
+    // No past-tense line, because nothing happened.
+    expect(fencedObject(raw.untrusted).confirmationLine).toBeNull();
+
+    // **NO CTAG ANYWHERE.** A ctag is an opaque server token and echoing one is
+    // the diagnostic echo § 4 forbids. Both values are checked, because a
+    // refusal that leaked the fresh one would be as bad as one that leaked the
+    // sealed one.
+    const whole = raw.trusted + raw.untrusted;
+    expect(whole).not.toContain(WORK_CTAG);
+    expect(whole).not.toContain(MOVED_CTAG);
+    expect(whole).not.toContain("ctag");
+    expect(whole).not.toContain("getctag");
+  });
+
+  it("compares the binding RAW: a whitespace-only difference is a difference", async () => {
+    // No trim, no case folding, no quote-stripping. `assertEtag`'s neighbouring
+    // argument holds harder here: normalisation eventually meets a value it gets
+    // wrong, and the direction it gets wrong decides whether the least reversible
+    // operation in this milestone proceeds.
+    for (const [label, moved] of [
+      ["an internal double space", "ctag work 1"],
+      ["a case difference", WORK_CTAG.toUpperCase()],
+    ] as const) {
+      const stub = deletingWriteStub({
+        ctags: label === "a case difference" ? [WORK_CTAG, moved] : [moved, "ctag  work 1"],
+      });
+      await warmWrite(stub);
+
+      const previewed = await deleteCalendarPreview(CALENDAR_ID);
+      stub.observed.length = 0;
+      const result = await commitCollectionDelete(previewed);
+
+      const trusted = JSON.parse(blocks(result).trusted) as Record<
+        string,
+        unknown
+      >;
+      expect(trusted.staleBinding, `${label} was normalised away`).toBe(true);
+      expect(
+        stub.observed.filter((one) => one.method === "DELETE"),
+        `${label}: a delete went out`,
+      ).toEqual([]);
+    }
+  });
+
+  it("refuses when the FRESH read answers no binding, before the removal", async () => {
+    const stub = deletingWriteStub({ ctags: [WORK_CTAG, null] });
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+    stub.observed.length = 0;
+
+    const result = await commitCollectionDelete(previewed);
+
+    // An error rather than a structured refusal, on the preview's own footing:
+    // "the server answered no binding" is the same class as a resource it
+    // declines to resolve.
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).category).toBe("not_found");
+    expect(
+      stub.observed.filter((one) => one.method === "DELETE"),
+      "an unbindable collection was deleted",
+    ).toEqual([]);
+  });
+
+  it("reports what the fresh look found when the collection SURVIVED the removal", async () => {
+    const stub = deletingWriteStub({ afterDelete: "present" });
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+    stub.observed.length = 0;
+
+    const result = await commitCollectionDelete(previewed);
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+
+    const raw = blocks(result);
+    const trusted = JSON.parse(raw.trusted) as Record<string, unknown>;
+
+    // The removal answered 204 and the calendar is still there. `applied` follows
+    // the LOOK, not the status — which is the whole of SPIKE-04's reasoning.
+    expect(stub.observed.map((one) => one.method)).toEqual([
+      "PROPFIND",
+      "DELETE",
+      "PROPFIND",
+    ]);
+    expect(trusted.applied).toBe(false);
+    expect(trusted.removal).toBe("present");
+    expect(String(trusted.notice)).toContain("still found");
+    expect(fencedObject(raw.untrusted).confirmationLine).toBeNull();
+    // The id is how a human goes and looks. The raw URL is not in the answer.
+    expect(trusted.id).toBe(previewed.trusted.id);
+    expect(raw.trusted + raw.untrusted).not.toContain("p42-caldav");
+  });
+
+  it("says UNVERIFIED rather than guessing when the fresh look itself fails", async () => {
+    const stub = deletingWriteStub({ afterDelete: "unreachable" });
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+    stub.observed.length = 0;
+
+    const result = await commitCollectionDelete(previewed);
+    // **NOT an error.** The removal has already gone, so reporting a failure here
+    // would tell the user their calendar survived a request that may well have
+    // taken it.
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+
+    const trusted = JSON.parse(blocks(result).trusted) as Record<
+      string,
+      unknown
+    >;
+    expect(trusted.removal).toBe("unverified");
+    expect(trusted.applied).toBe(false);
+    expect(String(trusted.notice)).toContain("could not look again");
+  });
+
+  it("spends a col confirmation ONCE, and the second attempt sends nothing", async () => {
+    const stub = deletingWriteStub();
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+    const payload = payloadOf(String(previewed.trusted.confirmToken));
+
+    // Claim the slot out from under it, exactly as a first commit would have.
+    await reserveConfirmation(
+      env.CONFIRM_KV,
+      principal.userId,
+      String(payload.j),
+      Number(payload.x),
+    );
+    stub.observed.length = 0;
+
+    const result = await commitCollectionDelete(previewed);
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).category).toBe(
+      "confirmation_invalid",
+    );
+    // The reservation is a KV read BEFORE any DAV request, which is what a
+    // precondition structurally cannot be — and on this path there is not even a
+    // precondition to lean on.
+    expect(
+      stub.observed.length,
+      "a spent confirmation reached the network",
+    ).toBe(0);
+  });
+
+  it("still accepts a dav confirmation, unchanged — the routing regression case", async () => {
+    // This task edits the arm that handles the OBJECT path, so the object path is
+    // driven here as well as in its own describe. What could break is the routing
+    // in front of both arms, not the arms themselves, and that is exactly what a
+    // case reaching the object path through the new router proves.
+    const stub = writeDavStub();
+    await warmWrite(stub);
+
+    const previewed = await deletePreview({ id: SIMPLE_EVENT_ID });
+    stub.observed.length = 0;
+
+    const result = await invokeRegistered("calendar_commit", {
+      confirmToken: String(previewed.trusted.confirmToken),
+      change: previewed.untrusted.change,
+    });
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+
+    const trusted = JSON.parse(blocks(result).trusted) as Record<
+      string,
+      unknown
+    >;
+    // The OBJECT outcome shape, so the router did not hand a dav token to the
+    // collection arm: `deliveryStatus` exists on one shape and not the other.
+    expect(trusted.applied).toBe(true);
+    expect(trusted).toHaveProperty("deliveryStatus");
+    expect(trusted).not.toHaveProperty("staleBinding");
+    expect(stub.observed.some((one) => one.method === "DELETE")).toBe(true);
+  });
+
+  it("refuses a mail token and a forged token IDENTICALLY, both sending nothing", async () => {
+    // The router tries two targets, so it is two chances to become an oracle for
+    // a confirmation's structure. Six conditions already give one answer; this
+    // asserts a seventh distinguishable one did not appear.
+    const stub = deletingWriteStub();
+    await warmWrite(stub);
+
+    const previewed = await deleteCalendarPreview(CALENDAR_ID);
+    const change = previewed.untrusted.change;
+
+    const mailToken = await mintConfirmation(
+      {
+        v: CONFIRM_VERSION,
+        t: "mail",
+        k: "delete",
+        j: crypto.randomUUID(),
+        m: "Zm9sZGVyLXRva2VuLUlOQk9Y",
+        uv: 1_700_000_000,
+        i: 4242,
+        z: 18_431,
+        d: 1_800_000_000,
+        q: null,
+        n: "742",
+        h: await changeHashOf(change as NormalizedChange),
+        x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+        // The OWNER, so the refusal is genuinely about the target rather than
+        // about the user — which would make this case green while proving nothing.
+        u: principal.userId,
+      },
+      env.CONFIRM_SECRET,
+    );
+
+    stub.observed.length = 0;
+    const mailResult = await invokeRegistered("calendar_commit", {
+      confirmToken: mailToken,
+      change,
+    });
+    const afterMail = stub.observed.length;
+
+    const forgedResult = await invokeRegistered("calendar_commit", {
+      confirmToken: "bm90LWEtdG9rZW4.bm90LWEtbWFj",
+      change,
+    });
+
+    expect(mailResult.isError).toBe(true);
+    expect(forgedResult.isError).toBe(true);
+    // BYTE-IDENTICAL. Not merely the same category: the same answer, so a caller
+    // cannot tell a well-formed token for the wrong protocol from noise.
+    expect(mailResult.content[0].text).toBe(forgedResult.content[0].text);
+    expect(afterMail, "a mail token reached the network").toBe(0);
+    expect(stub.observed.length, "a forged token reached the network").toBe(0);
+  });
+
+  it("reads the target from the SIGNED payload — the commit schema has nowhere to put one", () => {
+    // The structural half of "the target comes from the payload". A schema with a
+    // calendar id on it would be a schema a caller could aim, and the arm would
+    // then have two sources for one fact.
+    const shape = Object.keys(schemaFor("calendar_commit").shape).sort();
+    expect(shape).toEqual(["change", "confirmToken"]);
   });
 });

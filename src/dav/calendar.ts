@@ -30,6 +30,7 @@ import {
   createCalendarObject,
   davRequest,
   deleteCalendarObject,
+  deleteObject,
   fetchCalendarObjects,
   fetchCalendarUserAddresses,
   propfind,
@@ -1415,6 +1416,118 @@ export function isDefaultCalendar(
   defaultCalendarUrl: string | null,
 ): boolean {
   return defaultCalendarUrl !== null && collectionUrl === defaultCalendarUrl;
+}
+
+/** What the server ANSWERED to a collection removal. Never a verdict. */
+export interface CollectionDeleteAnswer {
+  /**
+   * The HTTP status the removal's own response carried.
+   *
+   * **A status, and deliberately not a boolean.** See
+   * `deleteCalendarCollection`, which owns the argument: a caller that wants to
+   * know whether the collection is gone has to look again, and a `removed: true`
+   * on this shape would be the one field that made looking again feel optional.
+   */
+  status: number;
+}
+
+/**
+ * Remove one calendar collection, and everything inside it (CALM-06).
+ *
+ * The most destructive request this project can send. A collection delete takes
+ * every resource the collection holds — every event, every to-do, every
+ * resource this server cannot parse — and neither this server nor the account's
+ * owner can put any of it back.
+ *
+ * ## There is no precondition header, and that is the shape rather than a gap
+ *
+ * A collection has no entity tag, so there is no `If-Match` to attach and no
+ * conditional form of this request to reach for. `deleteEvent` one region down
+ * asserts its ETag FIRST precisely because the library drops a falsy one and
+ * turns a conditional removal into an unconditional one; here there is nothing
+ * to drop, because the protocol offers nothing to send.
+ *
+ * **So the binding is enforced by REFUSING TO ISSUE THIS REQUEST rather than by
+ * a header on it.** `applyCollectionCommit` in `src/mcp/tools/calendar.ts`
+ * re-reads the collection's `CS:getctag` and compares it against the one the
+ * preview sealed, and a collection whose binding moved never reaches this
+ * function at all. That is strictly stronger than a precondition on the write:
+ * a refused precondition is a refusal the server issued after the request went
+ * out, and this one costs zero requests. D-09, D-12.
+ *
+ * It is also why this function takes no binding parameter. A ctag argument here
+ * would be a value with nowhere to go — it cannot ride on the request — and a
+ * parameter that is accepted and not used is how a caller concludes a check is
+ * happening one layer down when it is happening one layer up.
+ *
+ * ## It reports the STATUS and never a success verdict
+ *
+ * SPIKE-04's own reasoning, transferred without alteration: *a delete that
+ * answered 204 is a statement by a server about a request; the only evidence a
+ * collection is gone is looking again and not finding it.* So this returns what
+ * the server said and stops. The commit arm does the looking, and reports what
+ * the fresh look found rather than what this status implied.
+ *
+ * A `204` is the happy path and is what SPIKE-04 measured against the real
+ * account on 2026-09-24. Every non-2xx has already become a typed error inside
+ * `./transport.ts` before this returns, so the number reaching a caller is
+ * always a success status — which is exactly why it is not a verdict.
+ *
+ * ## No retry
+ *
+ * `allowRediscovery` is `false`, and this is the sharpest instance of the
+ * argument `createCalendarCollection` makes. A retried delete can be reported as
+ * a failure that actually landed, and what landed is a calendar and everything
+ * in it. The caller's collection URL was minted against a home this server
+ * resolved earlier, so a re-resolved home can only send the retry into the
+ * containment refusal anyway.
+ *
+ * ## Serial, because every one of these is a socket
+ *
+ * `dav-concurrent-request` names this function, and it is the entry on that list
+ * whose fan-out costs the most: "tidy up these calendars" is one sentence that
+ * means N destructive requests against one account, every leg is a socket,
+ * iCloud's per-account ceiling is lower than the platform's and deliberately
+ * unmeasured, and a half-completed fan-out leaves whole calendars gone that
+ * nobody chose. A multi-collection delete must be serial, and there is no batch
+ * shape that makes it safe. See ./.claude/CLAUDE.md §3.
+ *
+ * Nothing here is logged. This module contains no logging calls of any kind.
+ */
+export async function deleteCalendarCollection(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  collectionUrl: string,
+): Promise<CollectionDeleteAnswer> {
+  return withRediscovery(
+    env,
+    principal,
+    davFetch,
+    "caldav",
+    async (resolved) => {
+      // FIRST, and before the credential can be attached to anything. The URL
+      // came out of a caller-supplied token — a SIGNED one on the only path
+      // that reaches here, which is a stronger position than the rename's and
+      // still not an authorisation: a payload signed for one account presented
+      // on another account's connection is what this refuses.
+      assertUnderHome(collectionUrl, resolved.homeUrl);
+
+      const response = await deleteObject({
+        url: collectionUrl,
+        // Never a credential from here. `./transport.ts` attaches it per call
+        // and is the only place that may. No `etag` either, and the absence is
+        // the protocol rather than an omission — see the docstring.
+        headers: {},
+        fetch: davFetch,
+      });
+
+      return { status: response.status };
+    },
+    // See the docstring. A retried delete can report a failure that removed a
+    // calendar, and the retry could only ever reach the containment refusal.
+    false,
+  );
 }
 
 /**

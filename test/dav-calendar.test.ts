@@ -3675,7 +3675,7 @@ describe("the calendar_create_event handler", () => {
 });
 
 describe("the calendar registrations", () => {
-  it("records exactly the eleven calendar tools", () => {
+  it("records exactly the twelve calendar tools", () => {
     // Named explicitly rather than counted, so neither the description loop in
     // `test/dav-tools.test.ts` nor this case can pass by the registrar having
     // been called and registered nothing.
@@ -3689,11 +3689,16 @@ describe("the calendar registrations", () => {
     // 17 — and they are the two tools on this list that deliberately do NOT
     // reach `calendar_commit`, because a create and a rename are both
     // reversible and D-07 declines to spend the user's attention on a gate
-    // that does not need spending. CALM-06's delete is where the gate belongs.
+    // that does not need spending. CALM-06's delete is where the gate belongs —
+    // and `calendar_delete_calendar` is the twelfth, which is that sentence
+    // coming true: it is the one collection tool that DOES reach
+    // `calendar_commit`, because a calendar delete takes every event in it and
+    // nothing here or on the owner's own devices can put any of it back.
     expect(calendarRegistrations().map((one) => one.name).sort()).toEqual([
       "calendar_commit",
       "calendar_create_calendar",
       "calendar_create_event",
+      "calendar_delete_calendar",
       "calendar_delete_event",
       "calendar_find_free_slots",
       "calendar_get_event",
