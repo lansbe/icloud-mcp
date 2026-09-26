@@ -350,11 +350,18 @@ export const PLAIN_SERIES_EXCLUDED_RECURRENCE_ID = "20260420T100000";
 /**
  * The same weekly series with an ORGANIZER and one ATTENDEE on it.
  *
- * **The shape a SCOPED DELETE is deliberately open for and a rewrite is not.**
- * `occurrenceBlockerOf` keeps the `scheduling` refusal on the patch path, while
- * `narrowBlockerOf` deliberately does not inherit it (WINDOWS 68) — so this is
- * the one recurring-plus-people resource this server will actually write back,
- * and it clones every participant line byte for byte when it does.
+ * **A recurring resource carrying people, which every write path in this project
+ * is now open for.** Two retired blockers used to make that sentence a much
+ * narrower one — see the retirement notes in `src/dav/calendar.ts` — and what
+ * survives of the argument is the part about the BYTES: whatever writes this
+ * resource clones every participant line byte for byte, because the alternative
+ * would make iCloud send a cancellation to somebody nobody asked to uninvite.
+ *
+ * It is the fixture the scoped halves of CALM-03's byte-identical-outside-a-named
+ * -window comparison are driven against, in `test/dav-calendar.test.ts`. The
+ * scopeless half uses `INVITED_EVENT_HAZARDS_ICS` below, which carries more
+ * hazards and no rule — a one-off event cannot be given an occurrence-scoped
+ * update, so the two fixtures are not interchangeable and neither is redundant.
  *
  * `PARTSTAT=ACCEPTED` is on the attendee line on purpose: it is somebody's
  * acceptance, it is the thing a rebuild would erase, and a narrowing that

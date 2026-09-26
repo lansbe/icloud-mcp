@@ -117,7 +117,10 @@ import { createDavFetch } from "../src/dav/transport";
 import {
   ALL_DAY_RECURRING_ICS,
   DEFINED_TZID,
+  INVITED_EVENT_HAZARDS_ICS,
+  INVITED_WEEKLY_SERIES_ICS,
   NO_END_TIME_ICS,
+  PLAIN_SERIES_UID,
   UNDEFINED_TIMEZONE_ICS,
   WEEKLY_SERIES_DESCRIPTION,
   WEEKLY_SERIES_OVERRIDE_SUMMARY,
@@ -6706,5 +6709,271 @@ describe("refusing the account's default calendar, locally (CALM-07)", () => {
         "https://p42-caldav.icloud.com/1234567890/calendars/work",
       ),
     ).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CALM-03's mechanism — byte-identical OUTSIDE a named window, every scope
+//
+// **This is the assertion CALM-03 is actually stated in terms of, and it is not
+// a containment check.** "The body still contains the attendees" passes on a
+// write that reordered parameters, refolded a line, renumbered a revision or
+// dropped a `VTIMEZONE`. What is asserted below is that every content line
+// OUTSIDE a named window is the stored line, in the stored order, parameters and
+// all — and the window is exactly the properties `applyOverrideChange` asserts.
+//
+// **WHAT THIS DOES NOT PROVE.** The fixture is synthesised, so it is this
+// project's own idea of what iCloud stores, and the gap between that idea and the
+// real thing is precisely what this phase is guarding against. CALM-03 closes on
+// a REAL iCloud event carrying REAL attendees on the owner's account, updated
+// through the shipped tool, with every RSVP read back intact — D-16, plan 17-09.
+// If this block is green and 17-09 has not run, CALM-03 is UNPROVEN. See
+// `INVITED_EVENT_HAZARDS_ICS`'s own docstring, which says the same thing louder.
+//
+// **Folding is normalised on BOTH sides, deliberately.** RFC 5545 §3.1 breaks a
+// line past 75 octets and continues it with a leading space, and the serialiser
+// refolds everything it writes — so a fold boundary carries no meaning and
+// comparing raw bytes would fail for a reason that is not data loss. Every line's
+// CONTENT is compared whole, which is the part that can be lost.
+// ---------------------------------------------------------------------------
+
+/**
+ * The properties a patch is allowed to touch, by name.
+ *
+ * `applyOverrideChange` asserts seven over the component — `DTSTAMP`, `SEQUENCE`,
+ * `SUMMARY`, `LOCATION`, `DESCRIPTION`, `DTSTART`, `DTEND` — and a scoped write
+ * additionally writes `RECURRENCE-ID` on the override it mints, with its `RANGE`
+ * parameter. Anything else that moved is data loss, which is the whole claim.
+ *
+ * A HARDCODED list rather than one read out of the implementation, on the
+ * fixture's own rule: a comparison against the implementation's own idea of what
+ * it touches passes on any pair of agreeing mistakes. Widening this set is
+ * widening what an update is permitted to destroy, so it is a decision.
+ */
+const PATCH_WINDOW: ReadonlySet<string> = new Set([
+  "DTSTAMP",
+  "SEQUENCE",
+  "SUMMARY",
+  "LOCATION",
+  "DESCRIPTION",
+  "DTSTART",
+  "DTEND",
+  "RECURRENCE-ID",
+]);
+
+/**
+ * Every content line of one resource, unfolded, with the window redacted.
+ *
+ * **Depth-aware, and that is load-bearing rather than fastidious.** `DESCRIPTION`
+ * is in the window AND is a property of the `VALARM` this fixture carries, so a
+ * flat name filter would redact the alarm's own text and stop proving it survived.
+ * Only a property sitting directly inside a `VEVENT` is redacted; everything
+ * inside a `VALARM` or a `VTIMEZONE` is compared whole.
+ */
+function outsideThePatchWindow(icsText: string): string[] {
+  const kept: string[] = [];
+  const stack: string[] = [];
+  for (const line of icsText.replace(/\r\n[ \t]/g, "").split("\r\n")) {
+    if (line === "") continue;
+    if (line.startsWith("BEGIN:")) {
+      stack.push(line.slice("BEGIN:".length));
+      kept.push(line);
+      continue;
+    }
+    if (line.startsWith("END:")) {
+      stack.pop();
+      kept.push(line);
+      continue;
+    }
+    const colon = line.indexOf(":");
+    const semi = line.indexOf(";");
+    const cut =
+      semi >= 0 && (colon < 0 || semi < colon) ? semi : colon < 0 ? line.length : colon;
+    const name = line.slice(0, cut).toUpperCase();
+    if (stack[stack.length - 1] === "VEVENT" && PATCH_WINDOW.has(name)) continue;
+    kept.push(line);
+  }
+  return kept;
+}
+
+describe("an update is byte-identical outside the window it is allowed to touch", () => {
+  /** One change's worth of input, in the zone the two fixtures are anchored to. */
+  const moved: BuildEventInput = {
+    summary: "Quarterly planning, moved",
+    startLocal: "2026-06-01T14:00:00",
+    endLocal: "2026-06-01T15:00:00",
+    tzid: DEFINED_TZID,
+    allDay: false,
+    location: "Meeting room three",
+    description: null,
+    participants: null,
+    sequence: 0,
+  };
+
+  it("proves the window itself is not empty, or everything below is vacuous", () => {
+    // The control, first. Every assertion in this block says something did NOT
+    // move, and a writer that sent the stored bytes straight back would satisfy
+    // all of them. So: the window DID move.
+    const written = patchedBody(INVITED_EVENT_HAZARDS_ICS, moved);
+
+    expect(written).toContain("DTSTART;TZID=America/Chicago:20260601T140000");
+    expect(written).toContain("DTEND;TZID=America/Chicago:20260601T150000");
+    expect(written).toContain("LOCATION:Meeting room three");
+    // Four to five, off the resource's own stored value.
+    expect(parsedProperty(written, "sequence")).toBe(4);
+  });
+
+  it("is byte-identical outside the window on a SCOPELESS update", () => {
+    const written = patchedBody(INVITED_EVENT_HAZARDS_ICS, moved);
+
+    // EXACT array equality: same lines, same order, nothing added and nothing
+    // dropped. The strictest of the three, and it is available here because a
+    // scopeless write adds no component and the fixture already defines its own
+    // zone, so there is nothing legitimate for the writer to append.
+    expect(outsideThePatchWindow(written)).toEqual(
+      outsideThePatchWindow(INVITED_EVENT_HAZARDS_ICS),
+    );
+  });
+
+  it("names what that equality is actually carrying, so a reader can see it", () => {
+    // The equality above is one assertion covering nine hazards, which makes it
+    // powerful and unreadable. These are the same bytes, named — so a failure
+    // says WHAT was lost rather than only that a list differed.
+    const written = patchedBody(INVITED_EVENT_HAZARDS_ICS, moved).replace(
+      /\r\n[ \t]/g,
+      "",
+    );
+
+    // The opaque organiser, whole: the `CN`, the `SCHEDULE-STATUS` and a value
+    // with no resolvable address. A rebuild emitted a plain `mailto:` here.
+    expect(written).toContain(
+      "ORGANIZER;CN=Priya Raman;SCHEDULE-STATUS=2.0:urn:uuid:4f1a2b3c-5d6e-4a7b-8c9d-0e1f2a3b4c5d",
+    );
+    expect(written).not.toContain("ORGANIZER:mailto:");
+    // Three attendees, three different answers, every parameter intact. Not
+    // "contains the address" — the whole line, because a rebuild keeps the
+    // address and loses `ROLE`, `CUTYPE`, `RSVP` and `SCHEDULE-STATUS`.
+    expect(written).toContain(
+      "ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALSE;SCHEDULE-STATUS=2.0;CN=Dev Whitaker:mailto:dev.whitaker@example.invalid",
+    );
+    expect(written).toContain("PARTSTAT=DECLINED");
+    expect(written).toContain("PARTSTAT=NEEDS-ACTION");
+    expect(written.match(/^ATTENDEE/gm)?.length).toBe(3);
+    // The unmodelled property, and the alarm with its own text.
+    expect(written).toContain("X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC");
+    expect(written).toContain("TRIGGER:-PT15M");
+    expect(written).toContain("DESCRIPTION:Quarterly planning");
+    // ONE zone definition, the resource's own. Not two, which is what adding a
+    // definition for a name the resource already describes would produce.
+    expect(written.match(/^BEGIN:VTIMEZONE/gm)?.length).toBe(1);
+    expect(written).toContain("TZID:America/Chicago");
+    // **The non-standard PARAMETER on a property the change DID rewrite.** It is
+    // inside the window, so the equality above cannot see it — and it is the case
+    // a property-level allow-list passes by copying the value it recognised and
+    // rebuilding the line around it.
+    //
+    // The comma is ESCAPED in the expected value, and that is the library doing
+    // RFC 5545 §3.3.11 rather than a quirk to work around: a comma inside a TEXT
+    // value separates list items unless it is escaped, so an unescaped one would
+    // turn one title into two. Written out here so nobody "fixes" the test by
+    // dropping the backslash.
+    expect(written).toContain(
+      "SUMMARY;X-APPLE-STRUCTURED-TITLE=planning-block:Quarterly planning\\, moved",
+    );
+  });
+
+  for (const range of ["this-only", "this-and-future"] as const) {
+    const label = range === "this-only" ? "an OCCURRENCE" : "a THIS-AND-FUTURE";
+
+    it(`keeps every stored line outside the window on ${label} update`, () => {
+      // **A different assertion shape from the scopeless one, and the difference
+      // is the operation rather than a weaker standard.** A scoped write does not
+      // rewrite the resource: it leaves the master exactly where it is and APPENDS
+      // an override component cloned from it. So the written body legitimately
+      // holds each of the master's outside-window lines TWICE, and exact equality
+      // would fail on a write that lost nothing.
+      //
+      // Two claims instead, and together they are as tight:
+      //
+      //   1. every stored line outside the window is still there, in order —
+      //      nothing was dropped or reordered;
+      //   2. nothing outside the window is NEW — every such line in the written
+      //      body is one the stored resource already had, so the clone carried
+      //      lines rather than inventing them.
+      const written = String(
+        updateOccurrenceBody(
+          {
+            calendarUrl: WORK_URL,
+            objectUrl: `https://p42-caldav.icloud.com${WORK_PATH}${PLAIN_SERIES_UID}.ics`,
+            recurrenceId: "20260420T100000",
+          },
+          INVITED_WEEKLY_SERIES_ICS,
+          { ...moved, startLocal: "2026-04-20T14:00:00", endLocal: "2026-04-20T15:00:00" },
+          range,
+        ),
+      );
+
+      const stored = outsideThePatchWindow(INVITED_WEEKLY_SERIES_ICS);
+      const after = outsideThePatchWindow(written);
+
+      // 1. In order, as a subsequence.
+      let at = 0;
+      for (const line of stored) {
+        const found = after.indexOf(line, at);
+        expect(found, `dropped or reordered: ${line}`).toBeGreaterThanOrEqual(at);
+        at = found + 1;
+      }
+
+      // 2. Nothing new.
+      const known = new Set(stored);
+      for (const line of after) {
+        expect(known.has(line), `appeared from nowhere: ${line}`).toBe(true);
+      }
+
+      // And the clone is a clone: the organiser and the attendee's ACCEPTED reply
+      // are on BOTH components, so the override this write minted carries the
+      // people rather than starting a meeting with nobody on it.
+      const unfolded = written.replace(/\r\n[ \t]/g, "");
+      expect(unfolded.match(/^ORGANIZER/gm)?.length).toBe(2);
+      expect(unfolded.match(/^ATTENDEE/gm)?.length).toBe(2);
+      expect(unfolded.match(/PARTSTAT=ACCEPTED/g)?.length).toBe(2);
+      // One zone definition still, and the master's rule exactly once — on the
+      // MASTER and not on the override, which is what makes the override one
+      // occurrence rather than a second series. Matched on the rule's own text
+      // rather than on `^RRULE`, because the zone definition's DAYLIGHT and
+      // STANDARD subcomponents each carry one of their own.
+      expect(unfolded.match(/^BEGIN:VTIMEZONE/gm)?.length).toBe(1);
+      expect(
+        unfolded.match(/^RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=4$/gm)?.length,
+      ).toBe(1);
+    });
+  }
+
+  it("moves the occurrence it named and no other, so the clone is not inert", () => {
+    // The control for the two cases above, on the same argument as the first
+    // case in this block: they assert that nothing was lost, and a writer that
+    // returned the stored bytes unchanged would satisfy both.
+    const written = String(
+      updateOccurrenceBody(
+        {
+          calendarUrl: WORK_URL,
+          objectUrl: `https://p42-caldav.icloud.com${WORK_PATH}${PLAIN_SERIES_UID}.ics`,
+          recurrenceId: "20260420T100000",
+        },
+        INVITED_WEEKLY_SERIES_ICS,
+        { ...moved, startLocal: "2026-04-20T14:00:00", endLocal: "2026-04-20T15:00:00" },
+        "this-only",
+      ),
+    );
+
+    // A second component, which the stored resource did not have.
+    expect(written.match(/^BEGIN:VEVENT/gm)?.length).toBe(2);
+    expect(written).toContain(
+      `RECURRENCE-ID;TZID=${DEFINED_TZID}:20260420T100000`,
+    );
+    expect(written).toContain(`DTSTART;TZID=${DEFINED_TZID}:20260420T140000`);
+    // And the master's own start is untouched, which is what "the master is read
+    // and never written" means on the bytes.
+    expect(written).toContain(`DTSTART;TZID=${DEFINED_TZID}:20260406T100000`);
   });
 });
