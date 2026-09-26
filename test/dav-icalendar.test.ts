@@ -4287,6 +4287,7 @@ describe("invitationFactsOf", () => {
       // The only other line is the organiser's own attendee line, which is
       // named once, as the organiser, and not again among the others.
       others: [],
+      uid: "rsvp-probe-0002@example.invalid",
     });
   });
 
@@ -4308,6 +4309,7 @@ describe("invitationFactsOf", () => {
       ownAnswer: "NEEDS-ACTION",
       evidence: "imported-copy",
       others: [],
+      uid: "rsvp-probe-0001@example.invalid",
     });
   });
 
@@ -4367,6 +4369,7 @@ describe("invitationFactsOf", () => {
       others: [
         { name: null, email: OWN_LOGIN, partstat: "NEEDS-ACTION" },
       ],
+      uid: "reply-fixture@example.invalid",
     });
   });
 

@@ -58,7 +58,9 @@ import {
   deliveryReportOf,
   deleteCalendarCollection,
   deleteEvent,
+  busyIntervalOf,
   findFreeSlots,
+  findWindowConflicts,
   getEvent,
   getEventWithEtag,
   listCalendars,
@@ -98,6 +100,7 @@ import {
 import type { EventRef } from "../../dav/ids";
 import {
   DavConfirmationError,
+  DavConnectError,
   DavNotFoundError,
   DavStaleResourceError,
 } from "../../dav/errors";
@@ -4783,6 +4786,50 @@ export interface ReplyAttendeeRow {
   answer: CurrentAnswer;
 }
 
+/** One other event overlapping the invitation (RSVP-03). Stranger text. */
+export interface ReplyConflictRow {
+  /** Its title, verbatim. */
+  title: string | null;
+  /** Its start, as a wall clock in `timesZone`. */
+  start: string;
+  /** Its end, on the same terms. */
+  end: string;
+  /** True when it is a date rather than an instant. */
+  allDay: boolean;
+  /** The zone `start` and `end` are in. */
+  timesZone: string;
+}
+
+/**
+ * How much of the account the conflict sweep could read.
+ *
+ * `complete`: every calendar, in full. `partial`: at least one calendar was
+ * skipped or cut short, so the list may be missing something. `failed`: the
+ * sweep did not finish at all. Only `complete` may ever say "nothing else".
+ */
+export type ConflictsChecked = "complete" | "partial" | "failed";
+
+/**
+ * The one sentence about conflicts, from a closed table (RSVP-03, T-18-22).
+ *
+ * **"Nothing else" is reachable from `complete` alone.** A sweep that skipped a
+ * calendar or stopped early says so, and says it whatever it found, because the
+ * calendar it could not read is exactly where the clash would be.
+ */
+export function conflictNoticeOf(checked: ConflictsChecked, count: number): string {
+  switch (checked) {
+    case "complete":
+      if (count === 0) return "Nothing else on your calendars overlaps it.";
+      return count === 1
+        ? "1 other event on your calendars overlaps it."
+        : `${count} other events on your calendars overlap it.`;
+    case "partial":
+      return "Conflicts could not be fully checked: at least one calendar could not be read in full.";
+    case "failed":
+      return "Conflicts could not be checked.";
+  }
+}
+
 /**
  * The organiser's name when the invitation carries neither a name nor an
  * address. This server's own words, so a preview never shows the organiser as
@@ -4997,6 +5044,18 @@ export interface ReplyPreview {
   othersCount: number | null;
   /** This server's sentence about who hears the answer. Null on a refusal. */
   whoIsTold: string | null;
+  /**
+   * Every other event overlapping the invitation, on every calendar, in the
+   * preview's zone. Stranger text; null on a refusal. Present for EVERY answer,
+   * decline included (D-11).
+   */
+  conflicts: ReplyConflictRow[] | null;
+  /** How many `conflicts`. This server's count; null on a refusal. */
+  conflictCount: number | null;
+  /** How much the sweep could read. Null on a refusal. */
+  conflictsChecked: ConflictsChecked | null;
+  /** This server's sentence about conflicts. Null on a refusal. */
+  conflictNotice: string | null;
   /** The change to pass back to `calendar_commit`, or null on a refusal. */
   change: NormalizedReplyChange | null;
   confirmToken: string | null;
@@ -5059,6 +5118,9 @@ function replyPreviewTrustedPart(preview: ReplyPreview): Record<string, unknown>
     organizerAddressKnown: preview.organizerAddressKnown,
     othersCount: preview.othersCount,
     whoIsTold: preview.whoIsTold,
+    conflictCount: preview.conflictCount,
+    conflictsChecked: preview.conflictsChecked,
+    conflictNotice: preview.conflictNotice,
     confirmToken: preview.confirmToken,
     expiresInSeconds: preview.expiresInSeconds,
   };
@@ -5078,6 +5140,7 @@ function replyPreviewUntrustedPart(preview: ReplyPreview): Record<string, unknow
       : { start: preview.start, end: preview.end, timesZone: preview.timesZone }),
     organizer: preview.organizer,
     others: preview.others,
+    conflicts: preview.conflicts,
     change: preview.change,
     confirmationLine: preview.confirmationLine,
   };
@@ -5142,6 +5205,118 @@ export function replyCommitToolResult(outcome: ReplyCommitOutcome): ToolResult {
  * **A refusal mints nothing.** It carries this server's sentence and no
  * confirmation, so there is nothing to commit (`nothingMinted`'s precedent).
  */
+/** One day, in seconds. The margin the conflict read is widened by. */
+const CONFLICT_READ_MARGIN_SECONDS = 24 * 60 * 60;
+
+/**
+ * Render one instant-or-date pair in the zone the preview uses.
+ *
+ * The instants are converted when there are instants and the zone is one this
+ * server holds; otherwise the row keeps its own wall clock and says which zone
+ * that is.
+ */
+function conflictRowOf(
+  row: {
+    summary: string | null;
+    allDay: boolean;
+    startLocal: string;
+    endLocal: string;
+    startUtc?: number;
+    endUtc?: number;
+    startTzid: string;
+  },
+  zone: string,
+): ReplyConflictRow {
+  if (
+    !row.allDay &&
+    row.startUtc !== undefined &&
+    row.endUtc !== undefined &&
+    isSupportedTimezone(zone)
+  ) {
+    const start = utcToLocalTime(row.startUtc, zone);
+    const end = utcToLocalTime(row.endUtc, zone);
+    if (start !== null && end !== null) {
+      return { title: row.summary, start, end, allDay: false, timesZone: zone };
+    }
+  }
+  return {
+    title: row.summary,
+    start: row.startLocal,
+    end: row.endLocal,
+    allDay: row.allDay,
+    timesZone: row.startTzid,
+  };
+}
+
+/**
+ * What else is on the account's calendars in the invitation's window.
+ *
+ * **The window** is the invitation's own interval, placed by the free-slot
+ * sweep's own `busyIntervalOf`: its two instants, or for an all-day date the
+ * whole named day or days. The zone used to place a date is the requested one,
+ * else the event's own when this server holds it, else UTC.
+ *
+ * **The read is a day wider than the window on each side.** The window decides
+ * what counts; the range only decides what is fetched. An all-day event is a
+ * date with no instant, so how a server files it against a narrow time range
+ * depends on a zone the server chooses, and a range exactly as wide as a
+ * one-hour meeting can miss the all-day event on that same day. Reading a day
+ * either side and filtering here costs a little more data and cannot miss it.
+ *
+ * **Failures, by type only, and nothing is read off the caught value** (./
+ * .claude/CLAUDE.md § 4). A connection fault or an unreadable resource leaves
+ * the answer still worth giving, so it degrades to `failed` with no rows. An
+ * auth failure or a throttle propagates: those are about the account, not about
+ * one calendar, and the whole preview is refused with nothing minted.
+ */
+async function conflictsFor(
+  principal: Principal,
+  davFetch: DavFetch,
+  ref: EventRef,
+  read: EventWithEtag,
+  facts: InvitationFacts,
+  times: ReplyTimes,
+): Promise<{ conflicts: ReplyConflictRow[]; checked: ConflictsChecked }> {
+  const { detail } = read;
+  const zone =
+    times.timesZoneSource === "requested"
+      ? times.timesZone
+      : isSupportedTimezone(detail.startTzid)
+        ? detail.startTzid
+        : "UTC";
+
+  const window = busyIntervalOf(
+    {
+      start: { allDay: detail.allDay, local: detail.startLocal, utc: detail.startUtc },
+      end: { local: detail.endLocal, utc: detail.endUtc },
+    },
+    zone,
+  );
+  // An event this server cannot place has no window to compare against, so
+  // nothing can honestly be said about what overlaps it.
+  if (window === null) return { conflicts: [], checked: "failed" };
+
+  try {
+    const found = await findWindowConflicts(env, principal, davFetch, {
+      rangeStart: window.start - CONFLICT_READ_MARGIN_SECONDS,
+      rangeEnd: window.end + CONFLICT_READ_MARGIN_SECONDS,
+      windows: [window],
+      excludeObjectUrl: ref.objectUrl,
+      excludeUid: facts.uid,
+      tzid: zone,
+    });
+    return {
+      conflicts: found.conflicts.map((row) => conflictRowOf(row, zone)),
+      checked: found.truncated ? "partial" : "complete",
+    };
+  } catch (err) {
+    if (err instanceof DavConnectError || err instanceof DavNotFoundError) {
+      return { conflicts: [], checked: "failed" };
+    }
+    throw err;
+  }
+}
+
 /**
  * The refusal of a zone this server holds no definition for.
  *
@@ -5168,6 +5343,10 @@ function unsupportedZonePreview(id: string, answer: ReplyAnswerWord): ReplyPrevi
     others: null,
     othersCount: null,
     whoIsTold: null,
+    conflicts: null,
+    conflictCount: null,
+    conflictsChecked: null,
+    conflictNotice: null,
     change: null,
     confirmToken: null,
     expiresInSeconds: null,
@@ -5208,6 +5387,10 @@ async function buildReplyPreview(
     others: null,
     othersCount: null,
     whoIsTold: null,
+    conflicts: null,
+    conflictCount: null,
+    conflictsChecked: null,
+    conflictNotice: null,
     change: null,
     confirmToken: null,
     expiresInSeconds: null,
@@ -5231,6 +5414,11 @@ async function buildReplyPreview(
 
   const tells = TELLS_BY_EVIDENCE[facts.evidence];
   const change: NormalizedReplyChange = { kind: "reply", scope: null, answer };
+
+  // RSVP-03, for EVERY answer (D-11). Awaited on its own, after the two reads
+  // and the pure work above, and before anything is minted — so an auth or
+  // throttle failure here propagates with nothing signed.
+  const swept = await conflictsFor(principal, davFetch, ref, read, facts, times);
 
   const confirmToken = await mintConfirmation(
     {
@@ -5278,6 +5466,10 @@ async function buildReplyPreview(
     others,
     othersCount: others.length,
     whoIsTold: whoIsToldOf(tells, answer, organizerAddressKnown, others.length),
+    conflicts: swept.conflicts,
+    conflictCount: swept.conflicts.length,
+    conflictsChecked: swept.checked,
+    conflictNotice: conflictNoticeOf(swept.checked, swept.conflicts.length),
     change,
     confirmToken,
     expiresInSeconds: CONFIRM_TTL_SECONDS,

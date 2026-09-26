@@ -78,6 +78,7 @@ import type {
   BuildEventInput,
   BuildParticipants,
   EventParticipant,
+  EventTime,
   Occurrence,
   OccurrenceCounts,
   OverrideRange,
@@ -2457,9 +2458,22 @@ export interface SlotPage {
 }
 
 /** A busy interval, half-open: `[start, end)` in seconds since the epoch. */
-interface BusyInterval {
+export interface BusyInterval {
   start: number;
   end: number;
+}
+
+/**
+ * The parts of an occurrence `busyIntervalOf` reads, and nothing else.
+ *
+ * Structural, so the invitation-answer preview can ask the same question of an
+ * event it read through `getEventWithEtag` — whose detail carries the same
+ * wall clocks and instants — without building an `Occurrence` it does not have.
+ * Every `Occurrence` satisfies it, so the free-slot sweep is unchanged.
+ */
+export interface TimedSpan {
+  start: Pick<EventTime, "allDay" | "local" | "utc">;
+  end: Pick<EventTime, "local" | "utc">;
 }
 
 /**
@@ -2482,7 +2496,7 @@ interface BusyInterval {
  * single named start day — a zero-length or reversed occurrence still blocks its
  * own day rather than vanishing, which is the whole point of not dropping it.
  */
-function busyIntervalOf(occurrence: Occurrence, tzid: string): BusyInterval | null {
+export function busyIntervalOf(occurrence: TimedSpan, tzid: string): BusyInterval | null {
   const start = occurrence.start;
   const end = occurrence.end;
 
@@ -2803,6 +2817,163 @@ export async function findFreeSlots(
       unsupportedTimezone: null,
     };
   });
+}
+
+/** What one conflict sweep asks for. Every field a resolved, concrete value. */
+export interface WindowConflictOptions {
+  /** The range the calendars are read over, in SECONDS. Capped like find-slots. */
+  rangeStart: number;
+  /** The range end, in SECONDS. Half-open. */
+  rangeEnd: number;
+  /** The windows an occurrence must overlap to count, each half-open. */
+  windows: readonly { start: number; end: number }[];
+  /** The resource the question is ABOUT, which is never its own conflict. */
+  excludeObjectUrl: string;
+  /** Its UID, so a copy of it on another calendar is not a conflict either. */
+  excludeUid: string | null;
+  /** The zone an occurrence with no instant is placed in (`busyIntervalOf`). */
+  tzid: string;
+}
+
+/** One other event overlapping the window. The title is stranger text. */
+export interface WindowConflict {
+  summary: string | null;
+  allDay: boolean;
+  startLocal: string;
+  endLocal: string;
+  startUtc?: number;
+  endUtc?: number;
+  startTzid: string;
+}
+
+/** What the sweep found, and whether it could look everywhere. */
+export interface WindowConflicts {
+  conflicts: WindowConflict[];
+  /**
+   * True when at least one calendar could not be read in full — a subscribed
+   * calendar with no readable source, or a cap that stopped an expansion.
+   *
+   * **Read with `SlotPage.truncated`'s valence, not `EventPage`'s.** A short
+   * conflict list is not a safe answer here: "nothing else is on your calendar
+   * then" is a claim the user acts on, and a calendar this server skipped is
+   * exactly where the clash would be. So a caller must never say "no conflicts"
+   * while this is set (RSVP-03, T-18-22).
+   */
+  truncated: boolean;
+}
+
+/**
+ * Find every other event, on every calendar the account has, that overlaps an
+ * invitation's window (RSVP-03, D-11).
+ *
+ * ## The sweep is `findFreeSlots`' own
+ *
+ * One PROPFIND enumerates every calendar, then a plain `for...of` reads each one
+ * through the unmodified `collectFrom`, SERIALLY, under one step budget for the
+ * whole sweep. Never a combinator: every calendar is a request against one
+ * account, and iCloud's per-account ceiling is lower than the platform's and
+ * locks the user out of their own mail when exhausted (./.claude/CLAUDE.md §3).
+ * The scan names this function on the `dav-concurrent-request` alternation for
+ * that reason.
+ *
+ * ## What counts
+ *
+ * An occurrence counts when `busyIntervalOf` places it overlapping any window —
+ * start before the window's end and end after its start, so an event that only
+ * TOUCHES the window does not count. An all-day event or one whose zone did not
+ * resolve blocks its whole named day in `tzid`, as it does for free slots: a
+ * whole-day block is the conservative reading of an event with no instant.
+ *
+ * Two things never count: the invitation's own resource, and any resource
+ * carrying the same UID — the same meeting delivered to a second calendar is
+ * the invitation, not a clash with it.
+ *
+ * ## Fails closed
+ *
+ * A subscribed calendar with no source is skipped and marks the result
+ * truncated, exactly as the free-slot sweep does (CR-02); an expansion cap does
+ * the same. The conflicts found are still returned — a partial list is useful
+ * — but `truncated` says the list may be short, and the caller must say so.
+ *
+ * It takes no caller-supplied URL: every collection comes from the account's
+ * own enumeration, so there is nothing for the home-containment gate to check.
+ */
+export async function findWindowConflicts(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  options: WindowConflictOptions,
+): Promise<WindowConflicts> {
+  assertSlotRange(options.rangeStart, options.rangeEnd);
+
+  return withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
+    const collections = await fetchCollections(davFetch, resolved);
+
+    const budget = newStepBudget();
+    const pending: PendingOccurrence[] = [];
+    let truncated = false;
+
+    // SERIAL, as in `findFreeSlots`: each calendar fully awaited before the next.
+    for (const collection of collections) {
+      // Unreadable, so the sweep is incomplete — never "nothing here" (CR-02).
+      if (collection.subscribed && collection.source === null) {
+        truncated = true;
+        continue;
+      }
+      const collectionTruncated = await collectFrom(
+        collection,
+        davFetch,
+        options.rangeStart,
+        options.rangeEnd,
+        pending,
+        budget,
+      );
+      if (collectionTruncated) truncated = true;
+    }
+
+    const conflicts: WindowConflict[] = [];
+    for (const one of pending) {
+      if (one.objectUrl === options.excludeObjectUrl) continue;
+      const { occurrence } = one;
+      if (options.excludeUid !== null && occurrence.uid === options.excludeUid) continue;
+      const interval = busyIntervalOf(occurrence, options.tzid);
+      if (interval === null) continue;
+      const overlaps = options.windows.some(
+        (window) => interval.start < window.end && interval.end > window.start,
+      );
+      if (!overlaps) continue;
+
+      const row: WindowConflict = {
+        summary: occurrence.summary,
+        allDay: occurrence.start.allDay,
+        startLocal: occurrence.start.local,
+        endLocal: occurrence.end.local,
+        startTzid: occurrence.start.tzid,
+      };
+      // Assigned rather than spread, so an absent instant stays ABSENT — the
+      // rule `summaryFor` follows.
+      if (occurrence.start.utc !== undefined) row.startUtc = occurrence.start.utc;
+      if (occurrence.end.utc !== undefined) row.endUtc = occurrence.end.utc;
+      conflicts.push(row);
+    }
+
+    // In time order, so the list reads the way a day does.
+    conflicts.sort(
+      (a, b) =>
+        (busyIntervalOf(toSpan(a), options.tzid)?.start ?? 0) -
+        (busyIntervalOf(toSpan(b), options.tzid)?.start ?? 0),
+    );
+
+    return { conflicts, truncated };
+  });
+}
+
+/** A conflict row, as the span `busyIntervalOf` reads. */
+function toSpan(row: WindowConflict): TimedSpan {
+  return {
+    start: { allDay: row.allDay, local: row.startLocal, utc: row.startUtc },
+    end: { local: row.endLocal, utc: row.endUtc },
+  };
 }
 
 /**

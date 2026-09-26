@@ -57,6 +57,7 @@ import {
   createEvent,
   deleteEvent,
   findFreeSlots,
+  findWindowConflicts,
   getEvent,
   getEventWithEtag,
   listCalendars,
@@ -6159,6 +6160,218 @@ describe("findFreeSlots across every calendar", () => {
       page.candidates.some((one) => one.startLocal.startsWith("2026-03-10")),
     ).toBe(false);
     expect(page.truncated).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RSVP-03 — what else is on every calendar in an invitation's window
+//
+// `findWindowConflicts` runs `findFreeSlots`' own sweep over the same
+// three-calendar account, so every case here reuses `setupFindSlots`. The
+// invitation sits on Monday 2026-01-05, 09:00 to 10:00 UTC, and the read range
+// is a day wider on each side, which is what the tool layer passes.
+// ---------------------------------------------------------------------------
+
+describe("findWindowConflicts", () => {
+  const WINDOW = { start: at("2026-01-05T09:00:00Z"), end: at("2026-01-05T10:00:00Z") };
+  const INVITATION_HREF = `${WORK_PATH}invitation.ics`;
+  const INVITATION_URL = new URL(INVITATION_HREF, CALDAV_HOME).href;
+  const INVITATION_UID = "invitation@example.invalid";
+
+  function sweep(overrides: Partial<Parameters<typeof findWindowConflicts>[3]> = {}) {
+    return findWindowConflicts(env, principal, createDavFetch(owner), {
+      rangeStart: WINDOW.start - 86_400,
+      rangeEnd: WINDOW.end + 86_400,
+      windows: [WINDOW],
+      excludeObjectUrl: INVITATION_URL,
+      excludeUid: INVITATION_UID,
+      tzid: "UTC",
+      ...overrides,
+    });
+  }
+
+  it("returns exactly the event that overlaps, from whichever calendar holds it", async () => {
+    setupFindSlots({
+      objects: {
+        [WORK_PATH]: {
+          [`${WORK_PATH}clash.ics`]: timedEventIcs("clash", "20260105T093000Z", "20260105T103000Z"),
+        },
+        [HOME_PATH]: {
+          [`${HOME_PATH}later.ics`]: timedEventIcs("later", "20260105T140000Z", "20260105T150000Z"),
+        },
+      },
+    });
+
+    const found = await sweep();
+
+    expect(found.truncated).toBe(false);
+    expect(found.conflicts).toStrictEqual([
+      {
+        summary: "Busy clash",
+        allDay: false,
+        startLocal: "2026-01-05T09:30:00",
+        endLocal: "2026-01-05T10:30:00",
+        startUtc: at("2026-01-05T09:30:00Z"),
+        endUtc: at("2026-01-05T10:30:00Z"),
+        startTzid: "UTC",
+      },
+    ]);
+  });
+
+  it("does not count an event that only touches the window", async () => {
+    setupFindSlots({
+      objects: {
+        [WORK_PATH]: {
+          [`${WORK_PATH}before.ics`]: timedEventIcs("before", "20260105T080000Z", "20260105T090000Z"),
+          [`${WORK_PATH}after.ics`]: timedEventIcs("after", "20260105T100000Z", "20260105T110000Z"),
+        },
+      },
+    });
+
+    expect((await sweep()).conflicts).toStrictEqual([]);
+  });
+
+  it("excludes the invitation's own resource, and a copy of it on another calendar by UID", async () => {
+    const invitation = ics(
+      ...ICS_HEAD,
+      "BEGIN:VEVENT",
+      `UID:${INVITATION_UID}`,
+      "DTSTAMP:20260101T120000Z",
+      "SUMMARY:The invitation itself",
+      "DTSTART:20260105T090000Z",
+      "DTEND:20260105T100000Z",
+      "END:VEVENT",
+      "END:VCALENDAR",
+    );
+    setupFindSlots({
+      objects: {
+        [WORK_PATH]: { [INVITATION_HREF]: invitation },
+        [HOME_PATH]: { [`${HOME_PATH}copy.ics`]: invitation },
+      },
+    });
+
+    // Both exclusions on: nothing is a conflict with itself.
+    expect((await sweep()).conflicts).toStrictEqual([]);
+
+    // The resource exclusion alone: the copy on the other calendar is found,
+    // and ONLY the copy, so the resource exclusion is doing its own work.
+    const byResourceOnly = await sweep({ excludeUid: null });
+    expect(byResourceOnly.conflicts.map((one) => one.summary)).toStrictEqual([
+      "The invitation itself",
+    ]);
+
+    // The UID exclusion alone catches both.
+    expect((await sweep({ excludeObjectUrl: "https://nowhere.invalid/x.ics" })).conflicts)
+      .toStrictEqual([]);
+  });
+
+  it("reads every calendar serially: no two requests in flight at once", async () => {
+    const stubbed = setupFindSlots({
+      objects: {
+        [WORK_PATH]: {
+          [`${WORK_PATH}clash.ics`]: timedEventIcs("clash", "20260105T093000Z", "20260105T103000Z"),
+        },
+        [HOME_PATH]: {
+          [`${HOME_PATH}clash2.ics`]: timedEventIcs("clash2", "20260105T090000Z", "20260105T091500Z"),
+        },
+      },
+    });
+
+    const found = await sweep();
+
+    expect(stubbed.overlapped, "the sweep fanned out").toBe(false);
+    // Both ordinary calendars were read, and nothing was written.
+    const reported = new Set(
+      stubbed.observed.filter((one) => one.method === "REPORT").map((one) => new URL(one.url).pathname),
+    );
+    expect(reported).toStrictEqual(new Set([WORK_PATH, HOME_PATH]));
+    expect(stubbed.observed.some((one) => one.method === "PUT")).toBe(false);
+    // In time order.
+    expect(found.conflicts.map((one) => one.summary)).toStrictEqual(["Busy clash2", "Busy clash"]);
+  });
+
+  it("marks a sweep that skipped a source-less subscription as truncated, keeping what it found", async () => {
+    setupFindSlots({
+      collections: [
+        {
+          href: WORK_PATH,
+          displayName: "Work",
+          resourceType: ["collection", "calendar"],
+          components: ["VEVENT"],
+        },
+        {
+          href: SUBSCRIBED_PATH,
+          displayName: "Holidays",
+          resourceType: ["collection", "subscribed"],
+          components: ["VEVENT"],
+        },
+      ],
+      objects: {
+        [WORK_PATH]: {
+          [`${WORK_PATH}clash.ics`]: timedEventIcs("clash", "20260105T093000Z", "20260105T103000Z"),
+        },
+      },
+    });
+
+    const found = await sweep();
+
+    expect(found.truncated).toBe(true);
+    expect(found.conflicts.map((one) => one.summary)).toStrictEqual(["Busy clash"]);
+  });
+
+  it("marks a sweep truncated even when it found nothing", async () => {
+    setupFindSlots({
+      collections: [
+        {
+          href: SUBSCRIBED_PATH,
+          displayName: "Holidays",
+          resourceType: ["collection", "subscribed"],
+          components: ["VEVENT"],
+        },
+      ],
+      objects: {},
+    });
+
+    const found = await sweep();
+
+    expect(found.conflicts).toStrictEqual([]);
+    expect(found.truncated).toBe(true);
+  });
+
+  it("counts an all-day event on the invitation's day as a conflict for a timed invitation", async () => {
+    setupFindSlots({
+      objects: {
+        [HOME_PATH]: {
+          [`${HOME_PATH}offsite.ics`]: allDayEventIcs("offsite", "20260105", "20260106"),
+          // The next day's all-day event does not overlap.
+          [`${HOME_PATH}tomorrow.ics`]: allDayEventIcs("tomorrow", "20260106", "20260107"),
+        },
+      },
+    });
+
+    const found = await sweep();
+
+    expect(found.conflicts).toStrictEqual([
+      {
+        summary: "All day offsite",
+        allDay: true,
+        startLocal: "2026-01-05",
+        endLocal: "2026-01-06",
+        startTzid: expect.any(String),
+      },
+    ]);
+  });
+
+  it("refuses a range wider than the find-slots cap before any request", async () => {
+    const stubbed = setupFindSlots();
+    stubbed.observed.length = 0;
+
+    const err = await capture(() =>
+      sweep({ rangeStart: WINDOW.start, rangeEnd: WINDOW.start + 91 * 86_400 }),
+    );
+
+    expect(err).toBeInstanceOf(DavNotFoundError);
+    expect(stubbed.observed.length).toBe(0);
   });
 });
 

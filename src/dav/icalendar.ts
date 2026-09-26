@@ -2984,6 +2984,13 @@ export interface InvitationFacts {
    * make the preview contradict itself.
    */
   others: InvitationAttendee[];
+  /**
+   * The resource's UID, off the same component as `others`, or null. Read so a
+   * conflict sweep can recognise a copy of THIS invitation on another calendar
+   * as the invitation rather than as a clash with it. Untrusted, and never
+   * published: it is compared, not shown.
+   */
+  uid: string | null;
 }
 
 /**
@@ -3078,7 +3085,9 @@ export function invitationFactsOf(
       });
     }
 
-    return { organizer, ownAnswer, evidence, others };
+    const uid = textOf(listed?.getFirstPropertyValue("uid"));
+
+    return { organizer, ownAnswer, evidence, others, uid };
   });
 }
 
