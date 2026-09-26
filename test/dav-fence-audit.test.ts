@@ -109,6 +109,8 @@ import {
   eventPageToolResult,
   eventToolResult,
   previewToolResult,
+  replyCommitToolResult,
+  replyPreviewToolResult,
   slotPageToolResult,
 } from "../src/mcp/tools/calendar";
 import type {
@@ -116,6 +118,8 @@ import type {
   CollectionDeletePreview,
   CommitOutcome,
   EventPreview,
+  ReplyCommitOutcome,
+  ReplyPreview,
 } from "../src/mcp/tools/calendar";
 import type { SlotPage } from "../src/dav/calendar";
 import {
@@ -309,6 +313,47 @@ export const TRUSTED_FIELD_ALLOWLIST: Record<string, AllowedShape> = {
       "previewedItemCount", // server-generated: the count sealed into the confirmation at preview.
       "currentItemCount", // server-generated: the count this commit's own re-read took.
       "notice", // server-generated: this server's own sentence, carrying its own two counts. No ctag, no URL, no server text.
+    ]),
+  },
+
+  // -- calendar_respond_to_invitation (RSVP-01, RSVP-02) ---------------------
+  //
+  // Every trusted value is a word from one of this server's closed tables or a
+  // capability it signed. `currentAnswer` and `evidence` are MATCHED: the stored
+  // PARTSTAT and the stored scheduling marker are read, and a literal from this
+  // server's own list is published in their place — the raw values never leave.
+  //
+  // **Note what is NOT here: `title`, `organizerName`, `change` and
+  // `confirmationLine`.** The title and the organiser's name are chosen by
+  // whoever sent the invitation, the change is the object a caller passes back,
+  // and the line quotes both names, so all four ride inside the fence. The
+  // user's own address is on neither side at all (RSVP-02).
+  replyPreviewToolResult: {
+    top: new Set([
+      "id", // server-generated: the caller's opaque id, echoed — base64url(JSON) this server minted over discovered URLs.
+      "answer", // server-generated: one of three literals the strict schema admitted; the caller chose among this server's words, not the words themselves.
+      "currentAnswer", // server-generated: one of five literals this server MATCHED the stored PARTSTAT against, or null. The raw value is never published.
+      "evidence", // server-generated: one of three literals this server computes from the stored bytes and the server's scheduling marker, never a value copied out of them.
+      "tells", // server-generated: one of four literals, looked up in TELLS_BY_EVIDENCE from the evidence above.
+      "refusal", // server-generated: one of five literals from a closed union, or null.
+      "refusalReason", // server-generated: this server's own sentence from a closed table. Names no address, no title, no organiser.
+      "confirmToken", // server-generated: signed here with this server's own key.
+      "expiresInSeconds", // server-generated: this server's own TTL constant.
+    ]),
+  },
+
+  // -- calendar_commit, the reply arm ---------------------------------------
+  //
+  // `delivery` is `deliveryReportOf`'s matched pair — today always the
+  // unobserved constant, because 18-01 measured nothing on the organiser's line
+  // to read back. No server string reaches it either way.
+  replyCommitToolResult: {
+    top: new Set([
+      "id", // server-generated: base64url(JSON) re-encoded from the SIGNED reference.
+      "applied", // server-generated: true once this server's own conditional write was accepted.
+      "answer", // server-generated: one of three literals, from the signed change.
+      "tells", // server-generated: one of four literals, from this commit's own re-read through TELLS_BY_EVIDENCE.
+      "delivery", // server-generated: a matched status constant and a boolean this server decided. Never a status string a server wrote.
     ]),
   },
 
@@ -1117,6 +1162,51 @@ function collectionCommitOutcome(
   };
 }
 
+/** A reply preview on the minted path, carrying stranger text on both names. */
+function replyPreview(overrides: Partial<ReplyPreview> = {}): ReplyPreview {
+  return {
+    id: encodeEventId({
+      calendarUrl: CALENDAR_URL,
+      objectUrl: `${CALENDAR_URL}invitation.ics`,
+      recurrenceId: null,
+    }),
+    answer: "accepted",
+    currentAnswer: "needs-action",
+    evidence: "scheduling-object",
+    tells: "organizer",
+    refusal: null,
+    refusalReason: null,
+    title: HOSTILE_CALENDAR_TITLE,
+    organizerName: "Probe Organiser",
+    change: { kind: "reply", scope: null, answer: "accepted" },
+    confirmToken: "cGF5bG9hZA.bWFj",
+    expiresInSeconds: 300,
+    confirmationLine:
+      "Answering the invitation as accepted, telling the organiser 'Probe Organiser'. A reply cannot be unsent.",
+    ...overrides,
+  };
+}
+
+/** A reply commit that landed. */
+function replyCommitOutcome(
+  overrides: Partial<ReplyCommitOutcome> = {},
+): ReplyCommitOutcome {
+  return {
+    id: encodeEventId({
+      calendarUrl: CALENDAR_URL,
+      objectUrl: `${CALENDAR_URL}invitation.ics`,
+      recurrenceId: null,
+    }),
+    applied: true,
+    answer: "accepted",
+    tells: "organizer",
+    delivery: { status: "unreported", confirmed: false },
+    confirmationLine:
+      "Answered the invitation as accepted, telling the organiser 'Probe Organiser'. A reply cannot be unsent.",
+    ...overrides,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The comparison
 // ---------------------------------------------------------------------------
@@ -1236,7 +1326,7 @@ describe("the trusted block of every shipped DAV shaper", () => {
     expect(Object.keys(TRUSTED_FIELD_ALLOWLIST).sort()).toEqual(SHIPPED_SHAPERS);
   });
 
-  it("covers all fourteen two-block shapers and nothing else", () => {
+  it("covers all sixteen two-block shapers and nothing else", () => {
     // The allow-list itself is guarded: an entry silently dropped would make
     // its shaper unwatched while the suite stayed green, and a shaper added to
     // this phase without an entry would be invisible here.
@@ -1261,7 +1351,63 @@ describe("the trusted block of every shipped DAV shaper", () => {
       "eventPageToolResult",
       "eventToolResult",
       "previewToolResult",
+      "replyCommitToolResult",
+      "replyPreviewToolResult",
     ]);
+  });
+
+  it("replyPreviewToolResult publishes exactly the audited keys", () => {
+    const shape = TRUSTED_FIELD_ALLOWLIST.replyPreviewToolResult;
+
+    // The minted path and a refusal, because the key set must be the same on
+    // both and a null-valued field is where a shaper is tempted to drop a key.
+    for (const [label, preview] of [
+      ["minted", replyPreview()],
+      [
+        "refused",
+        replyPreview({
+          evidence: null,
+          tells: null,
+          refusal: "not-invited",
+          refusalReason: "You are not invited to this event as a guest.",
+          organizerName: null,
+          change: null,
+          confirmToken: null,
+          expiresInSeconds: null,
+          confirmationLine: null,
+        }),
+      ],
+    ] as const) {
+      const trusted = trustedBlockOf(replyPreviewToolResult(preview));
+      expectExactKeys(trusted, shape.top, `replyPreviewToolResult (${label})`);
+    }
+
+    // The title and the organiser's name are FENCED, and named here rather than
+    // left to the key set: the comparison would also pass if either had been
+    // dropped from the response altogether.
+    const result = replyPreviewToolResult(replyPreview());
+    const trusted = JSON.stringify(trustedBlockOf(result));
+    expect(trusted).not.toContain(HOSTILE_CALENDAR_TITLE);
+    expect(trusted).not.toContain("Probe Organiser");
+    expect(result.content[1].text).toContain(HOSTILE_CALENDAR_TITLE);
+    expect(result.content[1].text).toContain("Probe Organiser");
+    expect(result.content[1].text).toContain("confirmationLine");
+  });
+
+  it("replyCommitToolResult publishes exactly the audited keys", () => {
+    const shape = TRUSTED_FIELD_ALLOWLIST.replyCommitToolResult;
+    const result = replyCommitToolResult(replyCommitOutcome());
+    expectExactKeys(
+      trustedBlockOf(result),
+      shape.top,
+      "replyCommitToolResult",
+    );
+
+    // The past-tense line is FENCED, on the preview's footing.
+    expect(JSON.stringify(trustedBlockOf(result))).not.toContain(
+      "confirmationLine",
+    );
+    expect(result.content[1].text).toContain("confirmationLine");
   });
 
   it("calendarListToolResult publishes exactly the audited keys", () => {

@@ -43,6 +43,8 @@ import type {
   BuildEventInput,
   OccurrenceCounts,
   OverrideRange,
+  ReplyAnswer,
+  SchedulingEvidence,
   WriteScope,
 } from "../../dav/icalendar";
 import {
@@ -66,6 +68,8 @@ import {
   planCreateTarget,
   planScopedDelete,
   readCollectionState,
+  replyBody,
+  resolveCalendarUserAddresses,
   resolveOrganizerAddress,
   searchEvents,
   uidFromObjectUrl,
@@ -77,6 +81,7 @@ import {
   UNBOUNDED_OCCURRENCES,
   WRITE_SCOPES,
   collapseAttendees,
+  invitationFactsOf,
   isSupportedTimezone,
   isWriteScope,
   localTimeToUtc,
@@ -104,6 +109,7 @@ import {
   changeHashOf,
   composeConfirmationLine,
   mintConfirmation,
+  replyChangeHashOf,
   reserveConfirmation,
   verifyConfirmation,
 } from "../../confirm";
@@ -113,6 +119,9 @@ import type {
   AttendeeChange,
   ConfirmationSummary,
   NormalizedChange,
+  NormalizedReplyChange,
+  ReplyAnswerWord,
+  ReplyTells,
 } from "../../confirm";
 import type { ToolResult } from "../untrusted";
 import { untrustedToolResult } from "../untrusted";
@@ -2547,6 +2556,7 @@ async function buildPreview(
         // added reminder, a replaced one and a deleted one alike — and the user
         // who agreed to that and then found their reminder gone was under-told.
         alarms: alarmSummary,
+        reply: null,
       },
       "would",
     ),
@@ -2836,6 +2846,7 @@ async function buildDeletePreview(
         // report — and a clause about them beside a clause about the occurrences
         // going would be the smaller loss stated next to the larger one.
         alarms: null,
+        reply: null,
       },
       "would",
     ),
@@ -3099,6 +3110,7 @@ async function buildCreatePreview(
         // "setting a reminder" on an event that did not exist a moment ago is
         // counting the event rather than describing a change.
         alarms: null,
+        reply: null,
       },
       "would",
     ),
@@ -3155,7 +3167,7 @@ function normalizeSupplied(supplied: SuppliedChange): NormalizedChange {
 
 /** The change shape `calendar_commit` accepts back, before normalisation. */
 interface SuppliedChange {
-  kind: "create" | "update" | "delete";
+  kind: "create" | "update" | "delete" | "reply";
   scope?: string | null;
   summary?: string | null;
   startLocal?: string | null;
@@ -3167,6 +3179,14 @@ interface SuppliedChange {
   description?: string | null;
   attendees?: { email: string; name?: string | null }[];
   alarms?: { minutesBefore: number; action: "display" }[] | null;
+  /**
+   * An invitation answer, carried back from `calendar_respond_to_invitation`.
+   *
+   * Read by `normalizeSuppliedReply` and by nothing else. `normalizeSupplied`
+   * ignores it on purpose: an update carries no answer, and a field that moved
+   * an update's hash would be a way to answer through the update tool (RSVP-06).
+   */
+  answer?: ReplyAnswerWord;
 }
 
 /**
@@ -3765,6 +3785,7 @@ async function applyCommit(
           // NULL, on the create preview's own reason: there was nothing there
           // for a reminder to be a change TO.
           alarms: null,
+          reply: null,
         },
         "did",
       ),
@@ -3848,6 +3869,7 @@ async function applyCommit(
           // being read. `CONFIRMATION_CONSEQUENCES` already says it cannot be
           // undone.
           alarms: null,
+          reply: null,
         },
         "did",
       ),
@@ -4054,6 +4076,7 @@ async function applyCommit(
         // so it told nobody, and a line naming people beside an
         // `invitationsSent: false` would contradict the response it rides in.
         recipientCount,
+        reply: null,
       },
       "did",
     ),
@@ -4231,6 +4254,7 @@ async function buildCollectionDeletePreview(
         // is the smaller statement beside it, which is how the clause that
         // matters stops being read.
         alarms: null,
+        reply: null,
       },
       "would",
     ),
@@ -4327,10 +4351,19 @@ function collectionNoticeFor(
 async function targetOfConfirmation(
   userId: string,
   confirmToken: string,
-): Promise<"dav" | "col"> {
+): Promise<"dav" | "col" | "reply"> {
   try {
-    await verifyConfirmation(confirmToken, env.CONFIRM_SECRET, userId, "dav");
-    return "dav";
+    const payload = await verifyConfirmation(
+      confirmToken,
+      env.CONFIRM_SECRET,
+      userId,
+      "dav",
+    );
+    // An invitation answer rides the object arm and has its own commit arm.
+    // Routed on the SIGNED kind and on nothing else; the reply arm verifies for
+    // itself below and checks the kind again, so a routing mistake here would
+    // be refused there rather than written.
+    return payload.k === "reply" ? "reply" : "dav";
   } catch (err) {
     // Nothing is read from the caught value — ./.claude/CLAUDE.md § 4. Only its
     // TYPE is consulted, and anything that is not the neutral confirmation
@@ -4568,10 +4601,543 @@ async function applyCollectionCommit(
               // is the smaller statement beside it, which is how the clause that
               // matters stops being read.
               alarms: null,
+              reply: null,
             },
             "did",
           )
         : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Answering an invitation (RSVP-01, RSVP-02, RSVP-04, RSVP-05)
+//
+// One preview tool and one commit arm. The preview reads the invitation, finds
+// the user's own line by the account's own addresses, says in this server's own
+// sentence who will be told, and mints a confirmation of the `reply` kind. The
+// commit re-reads, refuses if anything moved, and writes ONE conditional PUT of
+// the user's own copy that changes only their answer. Nothing else is sent: no
+// scheduling-outbox request, no mail, no second write (D-02, ./.claude/CLAUDE.md
+// § 2). Whether iCloud then tells the organiser is iCloud's doing, and 18-01
+// measured when it does.
+// ---------------------------------------------------------------------------
+
+/**
+ * The tool's three answer words, onto the protocol's own spelling.
+ *
+ * A closed table rather than an upper-casing, so the set of things this server
+ * can write into somebody's invitation is the three rows below and nothing a
+ * caller spells.
+ */
+const ANSWER_TO_PARTSTAT: Readonly<Record<ReplyAnswerWord, ReplyAnswer>> =
+  Object.freeze({
+    accepted: "ACCEPTED",
+    declined: "DECLINED",
+    tentative: "TENTATIVE",
+  });
+
+/** The answers a caller may give, in the order the schema lists them. */
+const REPLY_ANSWER_WORDS = ["accepted", "declined", "tentative"] as const;
+
+/**
+ * Who an answer tells, per the evidence the stored bytes carry.
+ *
+ * Filled from plan 18-01's live measurement on 2026-09-26 (18-UAT.md, VERDICT
+ * block), taken against the owner's own account while deployed version
+ * `14278dbf-7461-4ffb-bcc0-4948691e500d` served; the writes themselves went
+ * straight to iCloud, so no build of this server is in that evidence.
+ *
+ * - `scheduling-object` → `organizer`. `genuine_reply=sent`: a PARTSTAT-only
+ *   write on an invitation iCloud delivered was seen on the organiser's own
+ *   account.
+ * - `imported-copy` → `nobody`. `imported_reply=not-sent`: the same write on an
+ *   imported `.ics` reached nobody — the organiser's guest list still said
+ *   "awaiting", with nothing in either mailbox.
+ * - `undetermined` → `organizer-maybe`. The two measured cases DIFFER, so
+ *   neither can stand in for bytes that decide nothing. "Nobody" is never the
+ *   answer here, because a reply cannot be unsent (T-18-16).
+ *
+ * `narrowed` is reachable from no row: 18-01 measured iCloud replying for a
+ * scheduling object, so D-02's narrowing is not needed. One sample of each was
+ * measured, and 18-08 re-reads a live preview's `evidence` to check the row it
+ * took.
+ */
+export const TELLS_BY_EVIDENCE: Readonly<Record<SchedulingEvidence, ReplyTells>> =
+  Object.freeze({
+    "scheduling-object": "organizer",
+    "imported-copy": "nobody",
+    undetermined: "organizer-maybe",
+  });
+
+/** Why a reply preview declined to mint. A closed set. */
+export type ReplyRefusal =
+  | "repeating"
+  | "not-invited"
+  | "organiser"
+  | "ambiguous"
+  | "unchanged";
+
+/**
+ * The sentence each refusal carries. This server's own words, and the only ones.
+ *
+ * **None names an address, and `ambiguous` in particular counts rather than
+ * names.** A refusal that said which of the user's addresses it found would put
+ * the account's own address into a tool response, which § 4's reconciliation
+ * allows for exactly one tool and this is not it.
+ */
+const REPLY_REFUSAL_REASONS: Readonly<Record<ReplyRefusal, string>> =
+  Object.freeze({
+    repeating:
+      "This invitation repeats. Answering a repeating invitation is not " +
+      "available yet, so nothing was prepared.",
+    "not-invited":
+      "You are not invited to this event as a guest, so there is no answer " +
+      "of yours to set.",
+    organiser:
+      "You organise this event. An organiser does not answer their own " +
+      "invitation.",
+    ambiguous:
+      "Two of your addresses are on this invitation, and it is not clear " +
+      "which one the organiser is waiting on. Nothing was prepared.",
+    unchanged:
+      "Your answer is already this one. Nothing would change, so nothing " +
+      "was prepared.",
+  });
+
+/** The user's stored answer, as one of this server's own words. */
+export type CurrentAnswer =
+  | "accepted"
+  | "declined"
+  | "tentative"
+  | "needs-action"
+  | "other";
+
+/**
+ * The stored PARTSTAT values this server recognises, folded to upper case.
+ *
+ * Looked up through `get`, never an index, so a value naming an inherited
+ * member of the object prototype cannot escape the table — `deliveryStatusOf`'s
+ * rule. Anything unmatched is `other`: the value is a stranger's string, and
+ * this server declines to repeat it rather than declining to answer.
+ */
+const CURRENT_ANSWERS: ReadonlyMap<string, CurrentAnswer> = new Map([
+  ["ACCEPTED", "accepted"],
+  ["DECLINED", "declined"],
+  ["TENTATIVE", "tentative"],
+  ["NEEDS-ACTION", "needs-action"],
+]);
+
+/** The stored answer, matched. Null when the line carried no PARTSTAT. */
+function currentAnswerOf(raw: string | null): CurrentAnswer | null {
+  if (raw === null) return null;
+  return CURRENT_ANSWERS.get(raw.toUpperCase()) ?? "other";
+}
+
+/**
+ * What answering one invitation would do, and the confirmation to do it.
+ *
+ * Its own shape rather than an `EventPreview`, on `CollectionDeletePreview`'s
+ * precedent: an answer has no fields, no scope table and no recipient list, and
+ * borrowing that shape would publish a dozen keys that mean nothing here.
+ *
+ * **The user's own address and the user's own line appear nowhere in it**
+ * (RSVP-02). `organizerName` is the organiser's; on every refusal it is null,
+ * because on the `organiser` refusal the organiser IS the user.
+ */
+export interface ReplyPreview {
+  /** The caller's opaque id, echoed. */
+  id: string;
+  /** The answer that would be given. */
+  answer: ReplyAnswerWord;
+  /** The stored answer on the user's line, matched; null when none was read. */
+  currentAnswer: CurrentAnswer | null;
+  /**
+   * Which row of `TELLS_BY_EVIDENCE` this preview took, or null on a refusal.
+   * Published so the row is read off the preview rather than inferred from
+   * `tells`, which two rows could one day share.
+   */
+  evidence: SchedulingEvidence | null;
+  /** Who would be told, or null on a refusal. */
+  tells: ReplyTells | null;
+  /** Why nothing was minted, or null when a confirmation was. */
+  refusal: ReplyRefusal | null;
+  /** This server's sentence for the refusal, or null. */
+  refusalReason: string | null;
+  /** The event's title. Stranger text. */
+  title: string | null;
+  /** The organiser's name. Stranger text; null on every refusal. */
+  organizerName: string | null;
+  /** The change to pass back to `calendar_commit`, or null on a refusal. */
+  change: NormalizedReplyChange | null;
+  confirmToken: string | null;
+  expiresInSeconds: number | null;
+  /** This server's sentence about the answer, or null on a refusal. */
+  confirmationLine: string | null;
+}
+
+/** What a finished answer did. */
+export interface ReplyCommitOutcome {
+  /** The event's opaque id, re-encoded from the SIGNED reference. */
+  id: string;
+  /** True once the conditional write was accepted. */
+  applied: boolean;
+  /** The answer written, from the signed change. */
+  answer: ReplyAnswerWord;
+  /** Who the answer tells, read off the commit's own re-read. */
+  tells: ReplyTells;
+  /**
+   * What this server observed about the organiser being told. Always
+   * `UNOBSERVED_DELIVERY` today: 18-01 measured no SCHEDULE-STATUS appearing on
+   * the organiser after a reply iCloud did send, so a read-back would observe
+   * nothing and is not spent. The commit reports that the answer was handed to
+   * iCloud, never that it was delivered.
+   */
+  delivery: DeliveryReport;
+  /** This server's sentence, in the past tense. */
+  confirmationLine: string;
+}
+
+/**
+ * The half of a reply preview this server decided, matched or minted.
+ *
+ * Every value is either a literal from one of this module's closed tables or a
+ * capability this server signed. `currentAnswer` and `evidence` are MATCHED
+ * constants: the stored PARTSTAT and the stored scheduling marker are read, and
+ * a word from this server's own list is published in their place.
+ */
+function replyPreviewTrustedPart(preview: ReplyPreview): Record<string, unknown> {
+  return {
+    id: preview.id,
+    answer: preview.answer,
+    currentAnswer: preview.currentAnswer,
+    evidence: preview.evidence,
+    tells: preview.tells,
+    refusal: preview.refusal,
+    refusalReason: preview.refusalReason,
+    confirmToken: preview.confirmToken,
+    expiresInSeconds: preview.expiresInSeconds,
+  };
+}
+
+/** The half somebody else wrote: the title, the organiser, and the sentence quoting them. */
+function replyPreviewUntrustedPart(preview: ReplyPreview): Record<string, unknown> {
+  return {
+    // Repeated from the trusted half so the model joins the two BY IDENTITY.
+    id: preview.id,
+    title: preview.title,
+    organizerName: preview.organizerName,
+    change: preview.change,
+    confirmationLine: preview.confirmationLine,
+  };
+}
+
+/**
+ * Shape an invitation-answer preview into the tool's response.
+ *
+ * Exported for the reason every shaper in this file is: the fence audit walks
+ * the exported shapers, and a test-local copy would prove something about the
+ * copy.
+ */
+export function replyPreviewToolResult(preview: ReplyPreview): ToolResult {
+  return untrustedToolResult(
+    replyPreviewTrustedPart(preview),
+    replyPreviewUntrustedPart(preview),
+  );
+}
+
+/** The half of a reply commit this server did or observed. */
+function replyCommitTrustedPart(outcome: ReplyCommitOutcome): Record<string, unknown> {
+  return {
+    id: outcome.id,
+    applied: outcome.applied,
+    answer: outcome.answer,
+    tells: outcome.tells,
+    delivery: outcome.delivery,
+  };
+}
+
+/** The half quoting the event and the organiser, inside the sentence. */
+function replyCommitUntrustedPart(outcome: ReplyCommitOutcome): Record<string, unknown> {
+  return {
+    id: outcome.id,
+    confirmationLine: outcome.confirmationLine,
+  };
+}
+
+/** Shape a finished invitation answer into the tool's response. */
+export function replyCommitToolResult(outcome: ReplyCommitOutcome): ToolResult {
+  return untrustedToolResult(
+    replyCommitTrustedPart(outcome),
+    replyCommitUntrustedPart(outcome),
+  );
+}
+
+/**
+ * Preview answering ONE invitation, and mint the confirmation to do it.
+ *
+ * `buildDeletePreview`'s order: read, refuse, mint, compose. Three steps touch
+ * the network, all serial: the multi-get that brings the body, the ETag and the
+ * scheduling marker back together; then, only for a non-repeating resource,
+ * the one PROPFIND that reads the account's own addresses. Everything after
+ * that is pure work over bytes already in hand.
+ *
+ * **The user's line is found by the account's addresses and by nothing the
+ * caller said.** The tool takes an id and an answer; no parameter names a
+ * person, so there is no value a caller can supply that aims the answer at
+ * somebody else's line (D-04, RSVP-05).
+ *
+ * **A refusal mints nothing.** It carries this server's sentence and no
+ * confirmation, so there is nothing to commit (`nothingMinted`'s precedent).
+ */
+async function buildReplyPreview(
+  principal: Principal,
+  davFetch: DavFetch,
+  ref: EventRef,
+  id: string,
+  answer: ReplyAnswerWord,
+): Promise<ReplyPreview> {
+  const read = await getEventWithEtag(env, principal, davFetch, ref);
+  const title = read.detail.summary;
+
+  const refused = (
+    refusal: ReplyRefusal,
+    currentAnswer: CurrentAnswer | null,
+  ): ReplyPreview => ({
+    id,
+    answer,
+    currentAnswer,
+    evidence: null,
+    tells: null,
+    refusal,
+    refusalReason: REPLY_REFUSAL_REASONS[refusal],
+    title,
+    // Null on EVERY refusal, and the organiser refusal is why: there the
+    // organiser is the user, and their name or address must not come back.
+    organizerName: null,
+    change: null,
+    confirmToken: null,
+    expiresInSeconds: null,
+    confirmationLine: null,
+  });
+
+  // Before the address read, because a repeating invitation is refused whatever
+  // the addresses say, and a refusal should cost no request it does not need.
+  // Plan 18-05 replaces this refusal with the whole-series rule (D-13).
+  if (read.isRecurring) return refused("repeating", null);
+
+  const addresses = await resolveCalendarUserAddresses(env, principal, davFetch);
+  const facts = invitationFactsOf(read.body, addresses, read.scheduleTag);
+  const currentAnswer = currentAnswerOf(facts.ownAnswer);
+
+  // The same pure patch the commit will run, over the same bytes. Its refusal
+  // arms are the preview's refusals, so the preview cannot promise an answer
+  // the commit would then decline to write.
+  const planned = replyBody(read.body, addresses, ANSWER_TO_PARTSTAT[answer]);
+  if (planned.kind !== "ok") return refused(planned.kind, currentAnswer);
+
+  const tells = TELLS_BY_EVIDENCE[facts.evidence];
+  const change: NormalizedReplyChange = { kind: "reply", scope: null, answer };
+
+  const confirmToken = await mintConfirmation(
+    {
+      v: CONFIRM_VERSION,
+      t: "dav",
+      k: "reply",
+      j: crypto.randomUUID(),
+      c: ref.calendarUrl,
+      o: ref.objectUrl,
+      r: ref.recurrenceId,
+      e: read.etag,
+      // Sealed and never read (D-05): an answer does not revise the event, so
+      // the commit has no use for the stored revision. Recorded because a null
+      // here would be this leg claiming the resource carried none.
+      s: read.sequence,
+      // One tool-owned literal. The answer is the only thing a reply moves.
+      f: ["answer"],
+      h: await replyChangeHashOf(change),
+      x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+      u: principal.userId,
+    },
+    env.CONFIRM_SECRET,
+  );
+
+  return {
+    id,
+    answer,
+    currentAnswer,
+    evidence: facts.evidence,
+    tells,
+    refusal: null,
+    refusalReason: null,
+    title,
+    organizerName: facts.organizerName,
+    change,
+    confirmToken,
+    expiresInSeconds: CONFIRM_TTL_SECONDS,
+    confirmationLine: composeConfirmationLine(
+      {
+        kind: "reply",
+        noun: "invitation",
+        name: title,
+        alsoRemoved: null,
+        fieldCount: null,
+        recipientCount: null,
+        alarms: null,
+        reply: { answer, tells, organizerName: facts.organizerName },
+      },
+      "would",
+    ),
+  };
+}
+
+/**
+ * The reply change a caller passed back, or the neutral refusal.
+ *
+ * A supplied kind other than `reply`, an answer outside the three words, or any
+ * of an update's own fields present is refused — the last because a reply that
+ * arrived carrying a summary or an attendee list is not the change this tool
+ * previewed, and ignoring the extra keys would let a caller believe they had
+ * done something. Every refusal is the same `ConfirmationInvalidError`, so none
+ * says which check failed.
+ */
+function normalizeSuppliedReply(supplied: SuppliedChange): NormalizedReplyChange {
+  if (supplied.kind !== "reply") throw new ConfirmationInvalidError();
+  const answer = supplied.answer;
+  if (answer !== "accepted" && answer !== "declined" && answer !== "tentative") {
+    throw new ConfirmationInvalidError();
+  }
+  const foreign = [
+    supplied.summary,
+    supplied.startLocal,
+    supplied.startTzid,
+    supplied.endLocal,
+    supplied.endTzid,
+    supplied.allDay,
+    supplied.location,
+    supplied.description,
+    supplied.attendees,
+    supplied.alarms,
+  ].some((value) => value !== undefined && value !== null);
+  if (foreign) throw new ConfirmationInvalidError();
+  return { kind: "reply", scope: supplied.scope ?? null, answer };
+}
+
+/**
+ * Apply one confirmed invitation answer: re-read, refuse if it moved, write once.
+ *
+ * `applyCollectionCommit`'s order, and it is not negotiable. Steps 1 to 5 reach
+ * no network, step 6 is a KV read and a KV write, and only step 7 touches
+ * iCloud:
+ *
+ *   1-3. Verify the seal, the version, the target and the user, and the expiry,
+ *        inside `verifyConfirmation`.
+ *   4.   The signed kind is `reply`. An update, create or delete token is
+ *        refused here, and a reply token is refused by `applyCommit`'s own step
+ *        4 in the other direction, so neither can be spent as the other (D-05).
+ *   4b.  The supplied change is a reply change (`normalizeSuppliedReply`).
+ *   5.   Its hash equals the signed one, in the reply's own hash domain.
+ *   6.   Reserve the one-time slot, keyed on the signed-in user.
+ *   7.   Re-read, refuse if the ETag moved, re-resolve the addresses, patch the
+ *        re-read bytes with the SIGNED answer, and write once, conditional on the
+ *        ETag the preview signed.
+ *
+ * Every refusal before step 6 is the same `ConfirmationInvalidError`, so none
+ * burns the slot and none says which check failed.
+ *
+ * **One write, and nothing else that tells anybody anything.** No
+ * scheduling-outbox request and no mail: iCloud decides from the stored bytes
+ * whether the organiser hears, and 18-01 measured when it does.
+ */
+async function applyReplyCommit(
+  principal: Principal,
+  davFetch: DavFetch,
+  confirmToken: string,
+  supplied: SuppliedChange,
+): Promise<ReplyCommitOutcome> {
+  // Steps 1, 2 and 3.
+  const payload = await verifyConfirmation(
+    confirmToken,
+    env.CONFIRM_SECRET,
+    principal.userId,
+    "dav",
+  );
+
+  // Step 4. Read from the SIGNED payload. `reply` is the only kind this arm has
+  // code for.
+  if (payload.k !== "reply") throw new ConfirmationInvalidError();
+
+  // Step 4b.
+  const change = normalizeSuppliedReply(supplied);
+
+  // Step 5.
+  if (!(await changeHashMatches(await replyChangeHashOf(change), payload.h))) {
+    throw new ConfirmationInvalidError();
+  }
+
+  // Step 6. Keyed on the signed-in principal, never on the token's own `u`.
+  await reserveConfirmation(
+    env.CONFIRM_KV,
+    principal.userId,
+    payload.j,
+    payload.x,
+  );
+
+  // Step 7. The target comes from the payload's own `c`, `o` and `r`, and from
+  // nothing the caller supplied.
+  const ref: EventRef = {
+    calendarUrl: payload.c,
+    objectUrl: payload.o,
+    recurrenceId: payload.r,
+  };
+
+  // 7a. The re-read, and the stale guard before anything is built (D-16).
+  const read = await getEventWithEtag(env, principal, davFetch, ref);
+  if (payload.e === null || read.etag !== payload.e) {
+    throw new DavStaleResourceError();
+  }
+
+  // 7b. The account's addresses, read again rather than carried: they are the
+  // signed-in principal's own server answer, and a confirmation is no place for
+  // them.
+  const addresses = await resolveCalendarUserAddresses(env, principal, davFetch);
+
+  // 7c. The patch, over the RE-READ bytes and with the SIGNED answer. Any
+  // refusal now means the resource is not what the preview saw, whatever its
+  // ETag says, so it is reported as stale rather than written.
+  const built = replyBody(read.body, addresses, ANSWER_TO_PARTSTAT[change.answer]);
+  if (built.kind !== "ok") throw new DavStaleResourceError();
+
+  // Read off THIS leg's bytes, so the did-line reports what the commit saw.
+  const facts = invitationFactsOf(read.body, addresses, read.scheduleTag);
+  const tells = TELLS_BY_EVIDENCE[facts.evidence];
+
+  // 7d. The one write, conditional on the ETag the preview signed.
+  await updateEvent(env, principal, davFetch, ref, built.body, payload.e);
+
+  return {
+    id: encodeEventId(ref),
+    applied: true,
+    answer: change.answer,
+    tells,
+    // No read-back: 18-01 measured nothing on the organiser's line to read.
+    delivery: UNOBSERVED_DELIVERY,
+    confirmationLine: composeConfirmationLine(
+      {
+        kind: "reply",
+        noun: "invitation",
+        name: read.detail.summary,
+        alsoRemoved: null,
+        fieldCount: null,
+        recipientCount: null,
+        alarms: null,
+        reply: {
+          answer: change.answer,
+          tells,
+          organizerName: facts.organizerName,
+        },
+      },
+      "did",
+    ),
   };
 }
 
@@ -5588,6 +6154,56 @@ export function registerCalendarTools(
   );
 
   server.registerTool(
+    "calendar_respond_to_invitation",
+    {
+      // Three facts about the TOOL, on 02-18's rule: it answers ONE invitation,
+      // it writes nothing, and the other tool is what does. Who is told is the
+      // preview's own answer, so the description says only that it reports it.
+      description:
+        "Preview answering ONE invitation: accepted, declined or tentative, " +
+        "and who is told. Writes nothing; returns a confirmation for " +
+        `calendar_commit. ${CALENDAR_UNTRUSTED_NOTICE}`,
+      // STRICT, on `calendar_delete_event`'s argument and a sharper one. Zod's
+      // default mode drops an unknown key silently, and the key a caller is
+      // most likely to add here is an address — "answer as this person". That
+      // key must be refused out loud rather than ignored, because the absence
+      // of any such parameter is the whole of D-04 (RSVP-05).
+      inputSchema: z.strictObject({
+        id: z
+          .string()
+          .describe(
+            "Opaque event id from calendar_list_events or calendar_search. " +
+              "Exactly one.",
+          ),
+        answer: z
+          .enum(REPLY_ANSWER_WORDS)
+          .describe(
+            "The user's own answer. Only the user's own answer changes; " +
+              "nobody else's can be set.",
+          ),
+      }),
+    },
+    async ({ id, answer }) => {
+      try {
+        // Who this call acts for. First, so a refused principal reads
+        // `auth_failed` before anything else is looked at (D-27).
+        const actor = await principal;
+        // Decoded next, before the KV read discovery performs and before any
+        // outbound request. The cheapest possible refusal of a forged id.
+        const ref = decodeEventId(id);
+
+        return replyPreviewToolResult(
+          await withConfirmationBoundary(() =>
+            buildReplyPreview(actor, davFetch, ref, id, answer),
+          ),
+        );
+      } catch (err) {
+        return davErrorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
     "calendar_delete_event",
     {
       // Three facts about the TOOL rather than about any one parameter, which
@@ -5720,8 +6336,8 @@ export function registerCalendarTools(
     "calendar_commit",
     {
       description:
-        "Apply what calendar_update_event, calendar_delete_event or " +
-        "calendar_delete_calendar previewed. Pass its confirmToken and its " +
+        "Apply a previewed calendar change, including a " +
+        "calendar_respond_to_invitation answer. Pass its confirmToken and its " +
         `change back unaltered. ${CALENDAR_UNTRUSTED_NOTICE}`,
       inputSchema: z.object({
         // The disclosure this project owes in exchange for keeping the ETag
@@ -5751,7 +6367,7 @@ export function registerCalendarTools(
           ),
         change: z
           .object({
-            kind: z.enum(["create", "update", "delete"]),
+            kind: z.enum(["create", "update", "delete", "reply"]),
             scope: z.string().nullable().optional(),
             summary: z.string().nullable().optional(),
             startLocal: z
@@ -5787,6 +6403,9 @@ export function registerCalendarTools(
             // supplying input, whatever it says about where it got it, and the
             // hash comparison refuses a value the preview never minted anyway.
             alarms: ALARMS_PARAMETER.nullable().optional(),
+            // An invitation answer's one value. Read only by the reply arm; the
+            // update arm ignores it, so it cannot move an update (RSVP-06).
+            answer: z.enum(REPLY_ANSWER_WORDS).optional(),
           })
           .describe(
             "The change object calendar_update_event returned, passed back " +
@@ -5805,20 +6424,25 @@ export function registerCalendarTools(
         // never by a second endpoint whose identity could disagree with the
         // confirmation's. See `targetOfConfirmation`, which carries the whole
         // argument and the two routes that were declined.
-        return await withConfirmationBoundary(async () =>
-          (await targetOfConfirmation(actor.userId, confirmToken)) === "col"
-            ? collectionCommitToolResult(
-                await applyCollectionCommit(
-                  actor,
-                  davFetch,
-                  confirmToken,
-                  change,
-                ),
-              )
-            : commitToolResult(
-                await applyCommit(actor, davFetch, confirmToken, change),
-              ),
-        );
+        return await withConfirmationBoundary(async () => {
+          const target = await targetOfConfirmation(actor.userId, confirmToken);
+          if (target === "col") {
+            return collectionCommitToolResult(
+              await applyCollectionCommit(actor, davFetch, confirmToken, change),
+            );
+          }
+          // The reply arm. `applyCommit`'s own step 4 still admits exactly
+          // create, update and delete, so a reply token that reached it would be
+          // refused there too.
+          if (target === "reply") {
+            return replyCommitToolResult(
+              await applyReplyCommit(actor, davFetch, confirmToken, change),
+            );
+          }
+          return commitToolResult(
+            await applyCommit(actor, davFetch, confirmToken, change),
+          );
+        });
       } catch (err) {
         return davErrorResult(err);
       }

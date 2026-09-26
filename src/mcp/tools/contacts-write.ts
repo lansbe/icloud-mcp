@@ -728,6 +728,7 @@ async function buildContactCreatePreview(
         // touch one says so, and a field that can be ABSENT is a field a later
         // build reads as `undefined`.
         alarms: null,
+        reply: null,
       },
       "would",
     ),
@@ -892,6 +893,7 @@ async function buildContactUpdatePreview(
         // touch one says so, and a field that can be ABSENT is a field a later
         // build reads as `undefined`.
         alarms: null,
+        reply: null,
       },
       "would",
     ),
@@ -1053,6 +1055,7 @@ async function applyContactCommit(
           // touch one says so, and a field that can be ABSENT is a field a later
           // build reads as `undefined`.
           alarms: null,
+          reply: null,
         },
         "did",
       ),
@@ -1137,6 +1140,7 @@ async function applyContactCommit(
         // touch one says so, and a field that can be ABSENT is a field a later
         // build reads as `undefined`.
         alarms: null,
+        reply: null,
       },
       "did",
     ),

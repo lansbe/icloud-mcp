@@ -3734,7 +3734,7 @@ describe("the calendar_create_event handler", () => {
 });
 
 describe("the calendar registrations", () => {
-  it("records exactly the twelve calendar tools", () => {
+  it("records exactly the thirteen calendar tools", () => {
     // Named explicitly rather than counted, so neither the description loop in
     // `test/dav-tools.test.ts` nor this case can pass by the registrar having
     // been called and registered nothing.
@@ -3753,6 +3753,10 @@ describe("the calendar registrations", () => {
     // coming true: it is the one collection tool that DOES reach
     // `calendar_commit`, because a calendar delete takes every event in it and
     // nothing here or on the owner's own devices can put any of it back.
+    // `calendar_respond_to_invitation` (RSVP-01) is the thirteenth, added in
+    // phase 18, and it reaches `calendar_commit` too rather than growing a
+    // commit of its own: an answer is a preview, a confirmation of its own kind,
+    // and the same one commit tool.
     expect(calendarRegistrations().map((one) => one.name).sort()).toEqual([
       "calendar_commit",
       "calendar_create_calendar",
@@ -3763,6 +3767,7 @@ describe("the calendar registrations", () => {
       "calendar_get_event",
       "calendar_list_calendars",
       "calendar_list_events",
+      "calendar_respond_to_invitation",
       "calendar_search",
       "calendar_update_calendar",
       "calendar_update_event",

@@ -87,7 +87,7 @@ enforcement, and the module map — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ## Tools
 
-30 tools in four groups. Every tool description carries an untrusted-content
+31 tools in four groups. Every tool description carries an untrusted-content
 notice; event titles, message bodies, and contact fields are treated as data,
 never as instructions.
 
@@ -127,9 +127,10 @@ never as instructions.
 | `calendar_find_free_slots` | Find free slots across all calendars for a duration and range. |
 | `calendar_create_event` | Create an event. **With attendees, previews first** and returns a confirmation. |
 | `calendar_update_event` | **Preview** a change; writes nothing until `calendar_commit`. |
+| `calendar_respond_to_invitation` | **Preview** answering one invitation (accepted, declined or tentative) and who is told; writes nothing until `calendar_commit`. |
 | `calendar_delete_event` | **Preview** deleting one event; writes nothing until `calendar_commit`. |
 | `calendar_delete_calendar` | **Preview** deleting one calendar and every item in it; writes nothing until `calendar_commit`. The default calendar is not exempt. |
-| `calendar_commit` | Apply a previewed create/update/delete, using its confirmation token. |
+| `calendar_commit` | Apply a previewed create/update/delete or invitation answer, using its confirmation token. |
 
 ### Contacts
 

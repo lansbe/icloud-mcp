@@ -2191,6 +2191,7 @@ describe("the server composes the human-facing line", () => {
       fieldCount: null,
       recipientCount: null,
       alarms: null,
+      reply: null,
     };
   }
 
@@ -2290,6 +2291,7 @@ describe("the server composes the human-facing line", () => {
           fieldCount: null,
           recipientCount: null,
           alarms: null,
+          reply: null,
         },
         "would",
       ),
@@ -2321,6 +2323,7 @@ describe("the server composes the human-facing line", () => {
           fieldCount: null,
           recipientCount: null,
           alarms: null,
+          reply: null,
         },
         "would",
       ),
@@ -2340,6 +2343,7 @@ describe("the server composes the human-facing line", () => {
           fieldCount: null,
           recipientCount: null,
           alarms: null,
+          reply: null,
         },
         "would",
       ),
@@ -2359,6 +2363,7 @@ describe("the server composes the human-facing line", () => {
           fieldCount: 1,
           recipientCount: null,
           alarms: null,
+          reply: null,
         },
         "would",
       ),
@@ -2378,6 +2383,7 @@ describe("the server composes the human-facing line", () => {
           fieldCount: null,
           recipientCount: 3,
           alarms: null,
+          reply: null,
         },
         "would",
       ),
@@ -2417,6 +2423,7 @@ describe("the server composes the human-facing line", () => {
         fieldCount: null,
         recipientCount: 2,
         alarms: null,
+        reply: null,
       },
       "would",
     );
@@ -2455,6 +2462,7 @@ describe("the server composes the human-facing line", () => {
         fieldCount: 3,
         recipientCount: 3,
         alarms: null,
+        reply: null,
       },
       "would",
     );
@@ -2490,6 +2498,7 @@ describe("the server composes the human-facing line", () => {
         fieldCount: null,
         recipientCount: 1,
         alarms: null,
+        reply: null,
       },
       "would",
     );
@@ -2510,6 +2519,7 @@ describe("the server composes the human-facing line", () => {
         fieldCount: 1,
         recipientCount: 1,
         alarms: null,
+        reply: null,
       },
       "would",
     );
@@ -2522,6 +2532,7 @@ describe("the server composes the human-facing line", () => {
         fieldCount: 2,
         recipientCount: 3,
         alarms: null,
+        reply: null,
       },
       "would",
     );
@@ -2547,6 +2558,7 @@ describe("the server composes the human-facing line", () => {
       fieldCount: null,
       recipientCount: 2,
       alarms: null,
+      reply: null,
     };
 
     expect(composeConfirmationLine(shaped, "would")).toBe(
@@ -2576,6 +2588,7 @@ describe("the server composes the human-facing line", () => {
       fieldCount: null,
       recipientCount: null,
       alarms: null,
+      reply: null,
     };
     const forward = composeConfirmationLine(shaped, "would");
     const past = composeConfirmationLine(shaped, "did");
@@ -2598,6 +2611,7 @@ describe("the server composes the human-facing line", () => {
       fieldCount: null,
       recipientCount: null,
       alarms: null,
+      reply: null,
     };
     const forward = composeConfirmationLine(shaped, "would");
     const past = composeConfirmationLine(shaped, "did");
@@ -2644,6 +2658,7 @@ describe("the server composes the human-facing line", () => {
         fieldCount: 0,
         recipientCount: 0,
         alarms: null,
+        reply: null,
       },
       "would",
     );
@@ -2667,6 +2682,7 @@ describe("the server composes the human-facing line", () => {
       fieldCount: null,
       recipientCount: 2,
       alarms: null,
+      reply: null,
     };
 
     expect(composeConfirmationLine(shaped, "would")).toBe(
@@ -2707,6 +2723,7 @@ describe("the server composes the human-facing line", () => {
       fieldCount: null,
       recipientCount: null,
       alarms: null,
+      reply: null,
     };
   }
 
@@ -2966,6 +2983,7 @@ describe("the sentence says which way a reminder change goes", () => {
         fieldCount,
         recipientCount: null,
         alarms,
+        reply: null,
       },
       "would",
     );
@@ -3080,6 +3098,7 @@ describe("the sentence says which way a reminder change goes", () => {
         fieldCount: 3,
         recipientCount: 2,
         alarms: { direction: "removed", count: 1, unmodelled: 1 },
+        reply: null,
       },
       "would",
     );
@@ -3104,6 +3123,7 @@ describe("the sentence says which way a reminder change goes", () => {
       fieldCount: 1,
       recipientCount: null,
       alarms: { direction: "removed", count: 2, unmodelled: 1 },
+      reply: null,
     };
 
     const would = composeConfirmationLine(summary, "would");
@@ -3128,6 +3148,7 @@ describe("the sentence says which way a reminder change goes", () => {
         fieldCount: 1,
         recipientCount: null,
         alarms: { direction: "removed", count: 1, unmodelled: 0 },
+        reply: null,
       },
       "would",
     );

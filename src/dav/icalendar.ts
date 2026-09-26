@@ -2704,6 +2704,337 @@ export function serializeOccurrenceResource(
 }
 
 // ---------------------------------------------------------------------------
+// Answering an invitation — the one patch that must NOT look like an edit
+//
+// Every other writer in this module is an EDIT of the event: it asserts new
+// values over one component and advances the revision, because a change nobody
+// revised is a change every other client ignores. An answer is the opposite
+// case. It is the attendee saying yes or no to somebody else's meeting, and the
+// meeting is not theirs to revise. So this patch changes two parameters on the
+// user's own attendee line and NOTHING else: no SEQUENCE, no DTSTAMP, no other
+// attendee's line, no other property. D-07 decided that, and plan 18-01
+// measured on the live account that iCloud stores exactly the bytes such a
+// patch writes.
+//
+// Pure and socket-free, like everything else here. Which addresses are the
+// user's is decided by the caller from the signed-in principal's own server
+// answer; nothing in this section reads a caller's claim about who they are.
+// ---------------------------------------------------------------------------
+
+/**
+ * The three answers a user can give, in the protocol's own spelling.
+ *
+ * Closed on purpose. RFC 5545 admits more PARTSTAT values (`DELEGATED`, an
+ * `X-` value), and none of them is a thing this server lets a caller say. The
+ * tool boundary maps its own three lowercase words onto these three.
+ */
+export type ReplyAnswer = "ACCEPTED" | "DECLINED" | "TENTATIVE";
+
+/** The URI scheme an address a person receives mail at carries. */
+const MAILTO_PREFIX = "mailto:";
+
+/**
+ * Whether one calendar-user address on a line is one of the user's own.
+ *
+ * **Three arms, and each one was measured rather than assumed (18-01).**
+ *
+ * - A `mailto:` value, folded. Case in an address is not the user's to
+ *   control; a server or a client may write `MAILTO:` or an upper-case domain.
+ * - The `EMAIL` parameter, folded, against the address part of a `mailto:` in
+ *   the set. **This is the arm a real iCloud invitation needs.** On an
+ *   invitation iCloud itself delivered, the user's line carries an opaque
+ *   principal path as its value and the address ONLY in `EMAIL=`. A matcher
+ *   that read the value alone would call the user a stranger on their own
+ *   invitation.
+ * - Any other value, EXACTLY. A principal path or a `urn:uuid:` form is an
+ *   opaque identifier, and folding one would be this function inventing an
+ *   equivalence the server never declared. The measured line was a relative
+ *   path, the same form the account's own set advertises, so no path-versus-URL
+ *   comparison is attempted either.
+ *
+ * `addresses` is the account's calendar-user-address-set exactly as its own
+ * principal answered it. Nothing a caller supplied can reach it, and nothing
+ * the stored event says about itself can either — this function only ASKS
+ * whether a stranger-written value names one of them.
+ */
+export function isOwnAddress(
+  value: string | null,
+  emailParameter: string | null,
+  addresses: readonly string[],
+): boolean {
+  const foldedValue = value === null ? null : value.toLowerCase();
+  const foldedEmail =
+    emailParameter === null || emailParameter.length === 0
+      ? null
+      : emailParameter.toLowerCase();
+
+  for (const address of addresses) {
+    if (address.length === 0) continue;
+    const folded = address.toLowerCase();
+    if (folded.startsWith(MAILTO_PREFIX)) {
+      if (foldedValue !== null && foldedValue === folded) return true;
+      const part = folded.slice(MAILTO_PREFIX.length);
+      if (foldedEmail !== null && part.length > 0 && foldedEmail === part) {
+        return true;
+      }
+    } else if (value !== null && value === address) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** One property's calendar-user address, as the string the line carries. */
+function calAddressOf(property: IcalProperty): string | null {
+  const value = property.getFirstValue();
+  return typeof value === "string" ? value : null;
+}
+
+/** Whether one `ORGANIZER` or `ATTENDEE` property names the user. */
+function namesUser(property: IcalProperty, addresses: readonly string[]): boolean {
+  return isOwnAddress(
+    calAddressOf(property),
+    firstParameter(property, "email"),
+    addresses,
+  );
+}
+
+/**
+ * What answering an invitation would do, decided before anything is written.
+ *
+ * One arm that carries the patched components and four refusals, on
+ * `SeriesNarrowing`'s pattern: the caller dispatches on the arm and cannot
+ * reach a component list on a refusal.
+ *
+ * - `not-invited`: no line on this resource is the user's, or the line that is
+ *   sits on a component with no organiser — which is an event, not an
+ *   invitation.
+ * - `organiser`: the user organises this meeting. An organiser does not answer
+ *   their own invitation, and a forged `ORGANIZER` that happens to carry the
+ *   user's address is refused the same way (T-18-08).
+ * - `ambiguous`: two of the user's addresses sit on one component. Which one
+ *   the organiser is waiting on is not a question this server can answer, so it
+ *   refuses rather than choosing.
+ * - `unchanged`: the stored answer already IS the requested one. Zero writes is
+ *   the honest cost of a request that changes nothing (D-15).
+ */
+export type ReplyPlan =
+  | {
+      kind: "ok";
+      /** The component list to serialise. Every entry is a clone. */
+      components: IcalComponent[];
+    }
+  | { kind: "not-invited" }
+  | { kind: "organiser" }
+  | { kind: "ambiguous" }
+  | { kind: "unchanged" };
+
+/** The four arms that carry no payload, allocated once. */
+const REPLY_NOT_INVITED: ReplyPlan = Object.freeze({ kind: "not-invited" } as const);
+const REPLY_ORGANISER: ReplyPlan = Object.freeze({ kind: "organiser" } as const);
+const REPLY_AMBIGUOUS: ReplyPlan = Object.freeze({ kind: "ambiguous" } as const);
+const REPLY_UNCHANGED: ReplyPlan = Object.freeze({ kind: "unchanged" } as const);
+
+/**
+ * Set the user's own answer on every component that carries their line.
+ *
+ * **Clone first, then patch the clones**, which is `applyEventChange`'s shape:
+ * the parsed resource is never mutated, so a caller can serialise it twice and
+ * get the same answer both times.
+ *
+ * **Every component, not the first one.** A master and its overrides each
+ * carry their own copy of the attendee list, and an answer set on the master
+ * alone would leave every edited occurrence still waiting for a reply the user
+ * already gave.
+ *
+ * **What it writes, exhaustively: on each of the user's own attendee lines,
+ * `PARTSTAT` becomes the answer and `RSVP` goes.** `RSVP=TRUE` is the organiser
+ * asking for a reply, and a line that has replied no longer asks. Nothing else
+ * is touched. It never calls the override writer, because that writer advances
+ * SEQUENCE and DTSTAMP, and an attendee who bumps the organiser's revision is
+ * editing a meeting that is not theirs (D-07). 18-01 measured that iCloud
+ * stores these bytes unchanged and that SEQUENCE stays where it was.
+ *
+ * The `X-APPLE-NEEDS-REPLY` flag an imported copy carries is left standing too.
+ * The owner decided that on 2026-09-26 (18-UAT.md, `device_flag_decision`), so
+ * D-07 has no exception here.
+ *
+ * The organiser check runs FIRST, across every component, so a resource that
+ * names the user as both organiser and attendee is refused as the organiser's
+ * rather than answered.
+ */
+export function applyReply(
+  resource: ParsedCalendarResource,
+  addresses: readonly string[],
+  answer: ReplyAnswer,
+): ReplyPlan {
+  const components = resource.components.map(cloneComponent);
+
+  for (const component of components) {
+    for (const organizer of component.getAllProperties("organizer")) {
+      if (namesUser(organizer, addresses)) return REPLY_ORGANISER;
+    }
+  }
+
+  const matched: IcalProperty[] = [];
+  for (const component of components) {
+    const own = component
+      .getAllProperties("attendee")
+      .filter((attendee) => namesUser(attendee, addresses));
+    if (own.length > 1) return REPLY_AMBIGUOUS;
+    if (own.length === 0) continue;
+    // A line of the user's on a component nobody organises is an event the user
+    // is listed on, not an invitation somebody is waiting on an answer to.
+    if (component.getAllProperties("organizer").length === 0) {
+      return REPLY_NOT_INVITED;
+    }
+    matched.push(own[0]);
+  }
+  if (matched.length === 0) return REPLY_NOT_INVITED;
+
+  const already = matched.every(
+    (line) => firstParameter(line, "partstat")?.toUpperCase() === answer,
+  );
+  if (already) return REPLY_UNCHANGED;
+
+  for (const line of matched) {
+    line.setParameter("partstat", answer);
+    line.removeParameter("rsvp");
+  }
+  return { kind: "ok", components };
+}
+
+/**
+ * What the stored bytes say about whether iCloud will tell the organiser.
+ *
+ * Three literals, and the third is the one that matters. See
+ * `invitationFactsOf` for how each is read.
+ *
+ * - `scheduling-object`: iCloud holds the organiser relationship. 18-01
+ *   measured a PARTSTAT-only write on one of these reaching the organiser.
+ * - `imported-copy`: a `.ics` somebody opened into Calendar. 18-01 measured the
+ *   same write on one of these reaching nobody.
+ * - `undetermined`: the bytes do not say. The tool layer maps this to "may tell
+ *   the organiser" and never to "nobody is told", because the second is the one
+ *   claim that would let a reply go out that the user was told would not.
+ */
+export type SchedulingEvidence =
+  | "scheduling-object"
+  | "imported-copy"
+  | "undetermined";
+
+/** What a preview needs to know about one invitation, read in one parse. */
+export interface InvitationFacts {
+  /**
+   * Who organises it, for the sentence. The `CN`, else the `mailto:` address,
+   * else the `EMAIL` parameter, else null. Untrusted and verbatim.
+   */
+  organizerName: string | null;
+  /**
+   * The raw `PARTSTAT` on the user's own line, on the first component carrying
+   * one, or null. Untrusted and verbatim: the tool layer MATCHES it against a
+   * closed table and publishes the table's constant, never this string.
+   */
+  ownAnswer: string | null;
+  /** Which side of 18-01's measurement this resource sits on. */
+  evidence: SchedulingEvidence;
+}
+
+/**
+ * The scheduling-agent values RFC 6638 § 7.1 defines as "the server does not
+ * schedule for this person". Upper-case, compared after folding.
+ */
+const CLIENT_SCHEDULED = new Set(["CLIENT", "NONE"]);
+
+/**
+ * Read the facts a reply preview states, from the stored bytes and the one
+ * server-side marker that decides who is told.
+ *
+ * ## Which marker decides, and why it is this one
+ *
+ * 18-01 read both sides on the live account on 2026-09-26. The copy iCloud
+ * itself delivered carried a `Schedule-Tag`, and answering it told the
+ * organiser. The copy imported from a `.ics` carried none — the property came
+ * back 404 — and answering it told nobody. `SCHEDULE-STATUS` was absent on
+ * BOTH, before and after, so it is not read here at all: D-09's first wording
+ * would have called a real invitation "nobody is told".
+ *
+ * `scheduleTag` is that marker, read by the caller out of the same multi-status
+ * the body came from. It is a server statement under RFC 6638, not a value the
+ * organiser wrote, which is why it is the one that decides.
+ *
+ * ## Why absence alone does not say "nobody"
+ *
+ * One sample of each was measured. A tag present is the server saying it
+ * schedules this resource, and that side is safe to state. A tag ABSENT is
+ * weaker: it is what an imported copy looked like, and it is also what any
+ * scheduling object would look like if the property were ever not returned.
+ * "Nobody is told" is the one sentence that is harmful when wrong, because a
+ * reply cannot be unsent. So absence becomes `imported-copy` only when the
+ * bytes CORROBORATE it with the other marker 18-01 saw on the imported side: a
+ * `SCHEDULE-AGENT` of `CLIENT` or `NONE` on the organiser or on the user's own
+ * line, which RFC 6638 defines as "the server does not schedule for this
+ * person". Without it the answer is `undetermined`.
+ *
+ * Untrusted values are returned verbatim, on this module's rule.
+ */
+export function invitationFactsOf(
+  icsText: string,
+  addresses: readonly string[],
+  scheduleTag: string | null,
+): InvitationFacts {
+  return withParsedResource(icsText, (resource) => {
+    let organizerName: string | null = null;
+    let ownAnswer: string | null = null;
+    let answered = false;
+    let clientScheduled = false;
+
+    for (const component of resource.components) {
+      for (const organizer of component.getAllProperties("organizer")) {
+        if (organizerName === null) organizerName = organizerNameOf(organizer);
+        if (isClientScheduled(organizer)) clientScheduled = true;
+      }
+      for (const attendee of component.getAllProperties("attendee")) {
+        if (!namesUser(attendee, addresses)) continue;
+        if (!answered) {
+          ownAnswer = firstParameter(attendee, "partstat");
+          answered = true;
+        }
+        if (isClientScheduled(attendee)) clientScheduled = true;
+      }
+    }
+
+    const evidence: SchedulingEvidence =
+      scheduleTag !== null
+        ? "scheduling-object"
+        : clientScheduled
+          ? "imported-copy"
+          : "undetermined";
+
+    return { organizerName, ownAnswer, evidence };
+  });
+}
+
+/** An organiser's name for the sentence, from whatever the line carries. */
+function organizerNameOf(organizer: IcalProperty): string | null {
+  const name = firstParameter(organizer, "cn");
+  if (name !== null && name.length > 0) return name;
+  const value = calAddressOf(organizer);
+  if (value !== null && value.toLowerCase().startsWith(MAILTO_PREFIX)) {
+    const address = value.slice(MAILTO_PREFIX.length);
+    if (address.length > 0) return address;
+  }
+  const email = firstParameter(organizer, "email");
+  return email !== null && email.length > 0 ? email : null;
+}
+
+/** Whether a line says the server does not schedule for this person. */
+function isClientScheduled(property: IcalProperty): boolean {
+  const agent = firstParameter(property, "schedule-agent");
+  return agent !== null && CLIENT_SCHEDULED.has(agent.toUpperCase());
+}
+
+// ---------------------------------------------------------------------------
 // Narrowing a series — the two operations a SCOPED DELETE is built from
 //
 // **Neither of these is a delete, and that is the whole subject.** A recurring

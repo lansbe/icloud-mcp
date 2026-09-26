@@ -46,9 +46,12 @@ import {
   encodeEventId,
 } from "../src/dav/ids";
 import {
+  ATTENDEE_COPY_GENUINE_ICS,
   HOSTILE_TIMEZONE_ICS,
   HOSTILE_TZID,
   HOSTILE_TZID_SUMMARY,
+  identityRoundTrip,
+  unfoldedDiff,
 } from "./fixtures/dav-bytes";
 import { SAFE_MESSAGES } from "../src/errors";
 import {
@@ -62,6 +65,7 @@ import type { NormalizedChange } from "../src/confirm";
 import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
 import {
   CALENDAR_UNTRUSTED_NOTICE,
+  TELLS_BY_EVIDENCE,
   affectedOccurrencesFor,
   calendarListToolResult,
   commitToolResult,
@@ -664,6 +668,7 @@ describe("the DAV registrations", () => {
       "calendar_get_event",
       "calendar_list_calendars",
       "calendar_list_events",
+      "calendar_respond_to_invitation",
       "calendar_search",
       "calendar_update_calendar",
       "calendar_update_event",
@@ -716,7 +721,7 @@ describe("the DAV registrations", () => {
     // The loop above iterates the REGISTRATIONS rather than an enumerated list
     // of names, so a tool added to a DAV registrar in a later plan is measured
     // by construction — with no edit to this file and no cross-plan conflict.
-    expect(registeredDav().length).toBe(18);
+    expect(registeredDav().length).toBe(19);
   });
 
   it("carries the untrusted notice on every calendar description that returns stranger content", () => {
@@ -1468,6 +1473,13 @@ interface WriteStubOptions {
   /** `{ [objectHref]: etag }`, spliced in verbatim. */
   etags?: Record<string, string>;
   /**
+   * `{ [objectHref]: scheduleTag }`, answered inside the multi-get beside the
+   * body. An href with no entry answers no tag at all, which is what the
+   * library reads when iCloud answers the property 404 — the imported copy
+   * 18-01 measured.
+   */
+  scheduleTags?: Record<string, string>;
+  /**
    * The hrefs the principal's `calendar-user-address-set` advertises.
    *
    * Answered verbatim and in order, shaped after probe P-1's own answer: a
@@ -1588,6 +1600,7 @@ function writeDavStub(options: WriteStubOptions = {}): WriteStub {
     }),
   };
   const etags = options.etags ?? {};
+  const scheduleTags = options.scheduleTags ?? {};
 
   const state: WriteStub = {
     observed: [],
@@ -1746,8 +1759,10 @@ function writeDavStub(options: WriteStubOptions = {}): WriteStub {
         entries
           .map(([href, data]) => {
             const etag = etags[href] ?? PREVIEW_ETAG;
+            const tag = scheduleTags[href];
             const payload = body.includes("calendar-multiget")
-              ? `<getetag>${etag}</getetag><C:calendar-data><![CDATA[${data}]]></C:calendar-data>`
+              ? `<getetag>${etag}</getetag><C:calendar-data><![CDATA[${data}]]></C:calendar-data>` +
+                (tag === undefined ? "" : `<C:schedule-tag>${tag}</C:schedule-tag>`)
               : `<getetag>${etag}</getetag>`;
             return (
               `<response><href>${href}</href><propstat>` +
@@ -2395,7 +2410,11 @@ describe("the stale-resource race, and what survives it", () => {
 
 describe("the write registrations", () => {
   it("stays inside the description budget and carries the notice verbatim", () => {
-    for (const name of ["calendar_update_event", "calendar_commit"]) {
+    for (const name of [
+      "calendar_update_event",
+      "calendar_respond_to_invitation",
+      "calendar_commit",
+    ]) {
       const description = String(
         registeredDav().find((one) => one.name === name)!.options.description,
       );
@@ -7830,7 +7849,11 @@ describe("a principal that was refused reaches no DAV tool", () => {
     // a grant that does not check out never reaches the point where a
     // confirmation for the most destructive operation in the project could be
     // signed for it.
-    expect(registeredDav(refused()).length).toBe(18);
+    //
+    // `calendar_respond_to_invitation` (RSVP-01) joins on the same footing: it
+    // awaits the principal before it decodes an id, reads the account's
+    // addresses or mints a reply confirmation.
+    expect(registeredDav(refused()).length).toBe(19);
   });
 
   it("answers auth_failed from EVERY tool, with the unchanged message and zero requests", async () => {
@@ -10423,3 +10446,193 @@ describe("what the preview SAYS when the only thing changing is a reminder", () 
     }
   });
 });
+
+// ===========================================================================
+// calendar_respond_to_invitation — the tracer (phase 18, plan 18-02)
+//
+// One path through every layer the answer touches: the preview reads the
+// invitation and the account's own addresses, says in this server's sentence
+// who will be told, and mints a reply confirmation; the commit re-reads and
+// writes ONE conditional PUT that changes only the user's own answer.
+//
+// Driven over the attendee copy of the invitation 18-01 measured iCloud
+// delivering (probe C), because that is the case 18-01 reached: its owner line
+// is an opaque principal path with the address only in EMAIL=, and answering
+// it told the organiser. The stub answers a schedule tag beside it, as iCloud
+// did. The imported copy is asserted in 18-03.
+// ===========================================================================
+
+describe("calendar_respond_to_invitation, end to end", () => {
+  const GENUINE_PATH = `${WORK_PATH}rsvp-probe-0002.ics`;
+  const GENUINE_URL = `https://p42-caldav.icloud.com${GENUINE_PATH}`;
+  const GENUINE_ID = encodeEventId({
+    calendarUrl: CALENDAR_URL,
+    objectUrl: GENUINE_URL,
+    recurrenceId: null,
+  });
+  /** Any tag at all: its presence is the fact, and the value is the server's. */
+  const SCHEDULE_TAG = "probe-schedule-tag-1";
+
+  /** The sentence the preview must carry, pinned whole. */
+  const WOULD_LINE =
+    "Answering invitation 'New EventRSVP probe C - delete me' as tentative, " +
+    "telling the organiser 'Probe Organiser'. A reply cannot be unsent.";
+
+  function genuineStub(): WriteStub {
+    return writeDavStub({
+      objects: { [GENUINE_PATH]: ATTENDEE_COPY_GENUINE_ICS },
+      scheduleTags: { [GENUINE_PATH]: SCHEDULE_TAG },
+    });
+  }
+
+  /** Invoke the preview and return both halves, with the refusal arm failing loudly. */
+  async function answerPreview(answer: string): Promise<{
+    result: { isError?: boolean; content: { text: string }[] };
+    trusted: Record<string, unknown>;
+    untrusted: Record<string, unknown>;
+  }> {
+    const result = await invokeRegistered("calendar_respond_to_invitation", {
+      id: GENUINE_ID,
+      answer,
+    });
+    expect(result.isError, `the preview failed: ${result.content[0]?.text}`).not.toBe(
+      true,
+    );
+    const raw = blocks(result);
+    return {
+      result,
+      trusted: JSON.parse(raw.trusted) as Record<string, unknown>,
+      untrusted: fencedObject(raw.untrusted),
+    };
+  }
+
+  it("previews in exactly two requests, writes nothing, and says who is told", async () => {
+    const stub = genuineStub();
+    await warmWrite(stub);
+    stub.maxInFlight = 0;
+
+    const { trusted, untrusted } = await answerPreview("tentative");
+
+    // The multi-get that brings the body, the ETag and the schedule tag back
+    // together, then the one PROPFIND at the principal for the address set.
+    expect(stub.observed.map((one) => one.method)).toEqual(["REPORT", "PROPFIND"]);
+    expect(stub.observed[1].url.endsWith(PRINCIPAL_PATH)).toBe(true);
+    expect(stub.observed[1].body).toContain("calendar-user-address-set");
+    expect(stub.observed.some((one) => one.method === "PUT")).toBe(false);
+    expect(stub.maxInFlight, "the event read and the address read overlapped").toBe(1);
+
+    // The row of the table this preview took, read off the preview itself.
+    expect(trusted.evidence).toBe("scheduling-object");
+    expect(trusted.tells).toBe(
+      TELLS_BY_EVIDENCE[trusted.evidence as keyof typeof TELLS_BY_EVIDENCE],
+    );
+    expect(trusted.tells).toBe("organizer");
+    // MATCHED against the closed table, never the raw PARTSTAT.
+    expect(trusted.currentAnswer).toBe("needs-action");
+    expect(trusted.refusal).toBeNull();
+    expect(typeof trusted.confirmToken).toBe("string");
+
+    expect(untrusted.confirmationLine).toBe(WOULD_LINE);
+    expect(untrusted.organizerName).toBe("Probe Organiser");
+    expect(untrusted.change).toEqual({
+      kind: "reply",
+      scope: null,
+      answer: "tentative",
+    });
+  });
+
+  it("commits ONE conditional PUT that changes only the user's own answer", async () => {
+    const stub = genuineStub();
+    await warmWrite(stub);
+
+    const preview = await answerPreview("tentative");
+    const previewLeg = [...stub.observed];
+    stub.observed.length = 0;
+    stub.maxInFlight = 0;
+
+    const result = await invokeRegistered("calendar_commit", {
+      confirmToken: preview.trusted.confirmToken,
+      change: preview.untrusted.change,
+    });
+    expect(result.isError, `the commit failed: ${result.content[0]?.text}`).not.toBe(
+      true,
+    );
+
+    // The re-read, the address set, the one write. Serial.
+    expect(stub.observed.map((one) => one.method)).toEqual([
+      "REPORT",
+      "PROPFIND",
+      "PUT",
+    ]);
+    expect(stub.maxInFlight, "the commit's requests overlapped").toBe(1);
+    const puts = stub.observed.filter((one) => one.method === "PUT");
+    expect(puts.length).toBe(1);
+    expect(puts[0].url).toBe(GENUINE_URL);
+    // Conditional on the ETag the PREVIEW signed.
+    expect(puts[0].headers["if-match"]).toBe(PREVIEW_ETAG);
+    // Nothing on either leg that tells anybody anything by another route.
+    expect(
+      [...previewLeg, ...stub.observed].filter((one) => one.method === "POST"),
+    ).toEqual([]);
+
+    // The written body against what any patch writes when it changes nothing.
+    // One component carries the user's line, so exactly one line differs.
+    const diff = unfoldedDiff(
+      identityRoundTrip(ATTENDEE_COPY_GENUINE_ICS),
+      puts[0].body ?? "",
+    );
+    expect(diff.length).toBe(1);
+    const [only] = diff;
+    expect(only.before.startsWith("ATTENDEE;")).toBe(true);
+    expect(only.before).toContain("EMAIL=test@example.invalid");
+    expect(only.before).toContain("PARTSTAT=NEEDS-ACTION");
+    expect(only.before).toContain("RSVP=TRUE");
+    // PARTSTAT set and RSVP removed, and not one other byte of the line moved.
+    expect(only.after).toBe(
+      only.before
+        .replace("PARTSTAT=NEEDS-ACTION", "PARTSTAT=TENTATIVE")
+        .replace(";RSVP=TRUE", ""),
+    );
+    // The revision and the stamp are the organiser's, and stay where they were.
+    expect(
+      diff.some(
+        (one) =>
+          one.before.startsWith("SEQUENCE") || one.before.startsWith("DTSTAMP"),
+      ),
+    ).toBe(false);
+    expect(puts[0].body).toContain("SEQUENCE:1\r\n");
+    expect(puts[0].body).toContain("DTSTAMP:20260926T190352Z\r\n");
+
+    const raw = blocks(result);
+    const trusted = JSON.parse(raw.trusted) as Record<string, unknown>;
+    const fenced = fencedObject(raw.untrusted);
+    expect(trusted.applied).toBe(true);
+    expect(trusted.answer).toBe("tentative");
+    expect(trusted.tells).toBe("organizer");
+    expect(trusted.delivery).toEqual({ status: "unreported", confirmed: false });
+    // The two tenses differ in the verb and nowhere else.
+    expect(fenced.confirmationLine).toBe(
+      WOULD_LINE.replace(/^Answering /, "Answered "),
+    );
+  });
+
+  it("puts neither of the user's own addresses into any response", async () => {
+    const stub = genuineStub();
+    await warmWrite(stub);
+
+    const preview = await answerPreview("accepted");
+    const commit = await invokeRegistered("calendar_commit", {
+      confirmToken: preview.trusted.confirmToken,
+      change: preview.untrusted.change,
+    });
+    expect(commit.isError).not.toBe(true);
+
+    const everything = [...preview.result.content, ...commit.content]
+      .map((one) => one.text)
+      .join("\n")
+      .toLowerCase();
+    expect(everything).not.toContain(LOGIN_ADDRESS.toLowerCase());
+    expect(everything).not.toContain("alias.one@example.invalid");
+  });
+});
+

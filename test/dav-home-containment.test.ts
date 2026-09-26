@@ -631,10 +631,10 @@ export const HOME_EXEMPT_REQUEST_SITES: readonly ExemptSite[] = Object.freeze([
   },
   {
     file: CALENDAR,
-    fn: "resolveOrganizerAddress",
+    fn: "resolveCalendarUserAddresses",
     request: "fetchCalendarUserAddresses",
     reason:
-      "the target is account.principalUrl, built by davAccountFor from the discovery triple this call's own withRediscovery just resolved — the same bootstrap-adjacent URL every other target on this account is derived from, so there is nothing above it to be contained by. The stronger half of the claim is that this function takes NO caller input at all: no identifier, no cursor and no reference reaches it, so there is nothing a token could aim even in principle, which is the same argument the two dav_diagnose sites below make",
+      "the target is account.principalUrl, built by davAccountFor from the discovery triple this call's own withRediscovery just resolved — the same bootstrap-adjacent URL every other target on this account is derived from, so there is nothing above it to be contained by. The stronger half of the claim is that this function takes NO caller input at all: no identifier, no cursor and no reference reaches it, so there is nothing a token could aim even in principle, which is the same argument the two dav_diagnose sites below make. The request moved here from resolveOrganizerAddress in phase 18, when the account's whole address set became the primary value: this function now returns every advertised href, and resolveOrganizerAddress is a pure selection over its answer that issues no request of its own",
   },
   // Phase 17 (CALM-04). The first COLLECTION write in this project, and the
   // sharpest request target the milestone has produced so far — which is
