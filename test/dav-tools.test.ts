@@ -12441,6 +12441,37 @@ describe("calendar_respond_to_invitation, repeating invitations", () => {
     expect(trusted).not.toHaveProperty("separateAnswers");
   });
 
+  it("reports the series' answer from the master when an edited date comes first (WR-06)", async () => {
+    pinNow();
+    const first = ATTENDEE_COPY_SERIES_ICS.indexOf("BEGIN:VEVENT");
+    const second = ATTENDEE_COPY_SERIES_ICS.indexOf("BEGIN:VEVENT", first + 1);
+    const zones = ATTENDEE_COPY_SERIES_ICS.indexOf("BEGIN:VTIMEZONE");
+    const overrideFirst =
+      ATTENDEE_COPY_SERIES_ICS.slice(0, first) +
+      ATTENDEE_COPY_SERIES_ICS.slice(second, zones) +
+      ATTENDEE_COPY_SERIES_ICS.slice(first, second) +
+      ATTENDEE_COPY_SERIES_ICS.slice(zones);
+    expect(overrideFirst.indexOf("RECURRENCE-ID")).toBeLessThan(overrideFirst.indexOf("RRULE:"));
+    await crowdedSeriesStub(overrideFirst);
+
+    const { trusted, untrusted } = halves(
+      await viaSchema("calendar_respond_to_invitation", {
+        id: SERIES_ID,
+        answer: "tentative",
+        scope: "series",
+      }),
+    );
+
+    // The series still waits; the one edited date was accepted on its own.
+    // Taken in file order, the edited date's answer was reported as the
+    // series', and the preview then contradicted itself.
+    expect(trusted.currentAnswer).toBe("needs-action");
+    expect(trusted.separateAnswerCount).toBe(1);
+    expect(untrusted.separateAnswers).toStrictEqual([
+      { date: "2026-10-06T12:00:00", timesZone: "America/Los_Angeles", answer: "accepted" },
+    ]);
+  });
+
   it("counts every differently answered date, in the plural", async () => {
     pinNow();
     // A third component: the fourth date, declined on its own.

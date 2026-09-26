@@ -71,6 +71,7 @@ import {
   ALL_DAY_EXCLUDED_RECURRENCE_ID,
   ATTENDEE_COPY_GENUINE_ICS,
   ATTENDEE_COPY_IMPORTED_ICS,
+  ATTENDEE_COPY_MASTERLESS_ICS,
   ATTENDEE_COPY_SERIES_ICS,
   ALL_DAY_RECURRING_EXCLUDED_ICS,
   ALL_DAY_RECURRING_ICS,
@@ -4301,6 +4302,48 @@ describe("isOwnAddress", () => {
   it("matches nothing against an empty set, or a set of empty strings", () => {
     expect(isOwnAddress(`mailto:${OWN_LOGIN}`, OWN_LOGIN, [])).toBe(false);
     expect(isOwnAddress("", "", ["", "mailto:"])).toBe(false);
+  });
+});
+
+describe("invitationFactsOf reads the user's answer off the master (WR-06)", () => {
+  /** The derived series with its edited date moved AHEAD of the master. */
+  function overrideFirst(): string {
+    const first = ATTENDEE_COPY_SERIES_ICS.indexOf("BEGIN:VEVENT");
+    const second = ATTENDEE_COPY_SERIES_ICS.indexOf("BEGIN:VEVENT", first + 1);
+    const zones = ATTENDEE_COPY_SERIES_ICS.indexOf("BEGIN:VTIMEZONE");
+    expect(first).toBeGreaterThan(0);
+    expect(second).toBeGreaterThan(first);
+    expect(zones).toBeGreaterThan(second);
+    const master = ATTENDEE_COPY_SERIES_ICS.slice(first, second);
+    const override = ATTENDEE_COPY_SERIES_ICS.slice(second, zones);
+    expect(master).toContain("RRULE:");
+    expect(override).toContain("RECURRENCE-ID");
+    return (
+      ATTENDEE_COPY_SERIES_ICS.slice(0, first) +
+      override +
+      master +
+      ATTENDEE_COPY_SERIES_ICS.slice(zones)
+    );
+  }
+
+  it("takes the master's answer when an edited date comes first in the file", () => {
+    // RFC 5545 does not put the master first. The edited date here was
+    // accepted on its own and the series still waits; the series' answer is
+    // the master's, and the edited date is the separate one.
+    const facts = invitationFactsOf(overrideFirst(), OWN_ADDRESSES, null);
+    expect(facts.ownAnswer).toBe("NEEDS-ACTION");
+    expect(facts.separateAnswers.map((one) => one.partstat)).toStrictEqual(["ACCEPTED"]);
+  });
+
+  it("gives the same facts whichever order the components are in", () => {
+    expect(invitationFactsOf(overrideFirst(), OWN_ADDRESSES, null)).toStrictEqual(
+      invitationFactsOf(ATTENDEE_COPY_SERIES_ICS, OWN_ADDRESSES, null),
+    );
+  });
+
+  it("falls back to the first component carrying the user when there is no master", () => {
+    const facts = invitationFactsOf(ATTENDEE_COPY_MASTERLESS_ICS, OWN_ADDRESSES, null);
+    expect(facts.ownAnswer).toBe("NEEDS-ACTION");
   });
 });
 

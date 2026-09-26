@@ -3143,7 +3143,18 @@ export function invitationFactsOf(
     let answered = false;
     let clientScheduled = false;
 
-    for (const component of resource.components) {
+    // The master first, then the rest in document order (18-REVIEW WR-06).
+    // RFC 5545 does not put the master first, and an edited date that came
+    // first would otherwise lend the series its own separate answer, while
+    // `separateAnswersOf` compares against the master's. The fallback without
+    // a master is the first component that carries the user's line.
+    const master = resource.components.find((one) => !one.hasProperty("recurrence-id"));
+    const ordered =
+      master === undefined
+        ? resource.components
+        : [master, ...resource.components.filter((one) => one !== master)];
+
+    for (const component of ordered) {
       for (const organizer of component.getAllProperties("organizer")) {
         if (organizerLine === null) organizerLine = organizer;
         if (isClientScheduled(organizer)) clientScheduled = true;
