@@ -4591,3 +4591,139 @@ describe("invitationFactsOf", () => {
     expect(invitationFactsOf(ics, OWN_ADDRESSES, null).ownAnswer).toBe("X-PONDERING");
   });
 });
+
+// ===========================================================================
+// The overlap mode (18-REVIEW CR-01)
+//
+// A conflict check keeps an occurrence that began before its range and is still
+// running inside it. A listing does not, and its rule is unchanged. Each case
+// runs both modes over the same bytes, so the difference is the mode alone.
+// ===========================================================================
+
+describe("expandOccurrences keeps a date still running at the range's start under 'overlaps'", () => {
+  const JAN_06_00 = Date.UTC(2026, 0, 6, 0, 0, 0) / 1000;
+  const JAN_06_12 = Date.UTC(2026, 0, 6, 12, 0, 0) / 1000;
+
+  function calendar(...lines: string[]): string {
+    return ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Example//Overlap//EN", ...lines, "END:VCALENDAR", ""].join(
+      "\r\n",
+    );
+  }
+
+  function both(ics: string): { starts: ExpansionResult; overlaps: ExpansionResult } {
+    return withParsedResource(ics, (resource) => ({
+      starts: expandOccurrences(resource, JAN_06_00, JAN_06_12),
+      overlaps: expandOccurrences(resource, JAN_06_00, JAN_06_12, undefined, undefined, "overlaps"),
+    }));
+  }
+
+  it("keeps a plain series date that crosses the range's start, and only under 'overlaps'", () => {
+    // 22:00 to 01:00 every day. The 5th's date runs into the range.
+    const { starts, overlaps } = both(
+      calendar(
+        "BEGIN:VEVENT",
+        "UID:late@example.invalid",
+        "DTSTAMP:20260101T000000Z",
+        "SUMMARY:Late",
+        "DTSTART:20260104T220000Z",
+        "DTEND:20260105T010000Z",
+        "RRULE:FREQ=DAILY;COUNT=4",
+        "END:VEVENT",
+      ),
+    );
+
+    expect(starts.occurrences).toStrictEqual([]);
+    // Only the 5th's date: the 4th's ended on the 5th at 01:00, before the range.
+    expect(startsOf(overlaps)).toStrictEqual([Date.UTC(2026, 0, 5, 22, 0, 0) / 1000]);
+    // The mode changes what is kept, never how far the rule is walked.
+    expect(overlaps.steps).toBe(starts.steps);
+  });
+
+  it("keeps an edited date that was lengthened into the range from a slot before it", () => {
+    // Weekly on Monday 09:00 to 10:00; the 5th's date was edited to run to
+    // noon on the 7th. Its slot is before the range, its end is after.
+    const { starts, overlaps } = both(
+      calendar(
+        "BEGIN:VEVENT",
+        "UID:edited@example.invalid",
+        "DTSTAMP:20260101T000000Z",
+        "SUMMARY:Weekly",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        "RRULE:FREQ=WEEKLY;COUNT=3",
+        "END:VEVENT",
+        "BEGIN:VEVENT",
+        "UID:edited@example.invalid",
+        "DTSTAMP:20260101T000000Z",
+        "RECURRENCE-ID:20260105T090000Z",
+        "SUMMARY:Weekly, made long",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260107T120000Z",
+        "END:VEVENT",
+      ),
+    );
+
+    expect(starts.occurrences).toStrictEqual([]);
+    expect(summariesOf(overlaps)).toStrictEqual(["Weekly, made long"]);
+    expect(overlaps.occurrences[0].isOverride).toBe(true);
+  });
+
+  it("keeps a masterless date that crosses the range's start, and only under 'overlaps'", () => {
+    const { starts, overlaps } = both(
+      calendar(
+        "BEGIN:VEVENT",
+        "UID:orphan@example.invalid",
+        "DTSTAMP:20260101T000000Z",
+        "RECURRENCE-ID:20260105T090000Z",
+        "SUMMARY:Orphaned date",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260106T090000Z",
+        "END:VEVENT",
+      ),
+    );
+
+    expect(starts.occurrences).toStrictEqual([]);
+    expect(summariesOf(overlaps)).toStrictEqual(["Orphaned date"]);
+  });
+
+  it("drops a date that ended exactly as the range began, in both modes", () => {
+    const { starts, overlaps } = both(
+      calendar(
+        "BEGIN:VEVENT",
+        "UID:touching@example.invalid",
+        "DTSTAMP:20260101T000000Z",
+        "SUMMARY:Touching",
+        "DTSTART:20260105T200000Z",
+        "DTEND:20260106T000000Z",
+        "END:VEVENT",
+      ),
+    );
+
+    expect(starts.occurrences).toStrictEqual([]);
+    expect(overlaps.occurrences).toStrictEqual([]);
+  });
+
+  it("passes the mode through the listing budget, still spending the same steps", () => {
+    const ics = calendar(
+      "BEGIN:VEVENT",
+      "UID:late@example.invalid",
+      "DTSTAMP:20260101T000000Z",
+      "SUMMARY:Late",
+      "DTSTART:20260104T220000Z",
+      "DTEND:20260105T010000Z",
+      "RRULE:FREQ=DAILY;COUNT=4",
+      "END:VEVENT",
+    );
+    const listing = newStepBudget();
+    const sweep = newStepBudget();
+
+    const [plain, wide] = withParsedResource(ics, (resource) => [
+      expandWithinBudget(resource, JAN_06_00, JAN_06_12, listing),
+      expandWithinBudget(resource, JAN_06_00, JAN_06_12, sweep, undefined, undefined, "overlaps"),
+    ]);
+
+    expect(plain.occurrences).toStrictEqual([]);
+    expect(summariesOf(wide)).toStrictEqual(["Late"]);
+    expect(sweep.remaining).toBe(listing.remaining);
+  });
+});

@@ -82,6 +82,7 @@ import type {
   EventTime,
   Occurrence,
   OccurrenceCounts,
+  OccurrenceKeep,
   OverrideRange,
   ParsedCalendarResource,
   PinnedOccurrences,
@@ -1902,6 +1903,7 @@ async function collectFromFeed(
   rangeEnd: number,
   into: PendingOccurrence[],
   budget: StepBudget,
+  keep: OccurrenceKeep = "starts",
 ): Promise<boolean> {
   if (collection.source === null) throw new DavSubscriptionError();
 
@@ -1919,7 +1921,7 @@ async function collectFromFeed(
     }
 
     const result = withParsedResource(icsText, (resource) =>
-      expandWithinBudget(resource, rangeStart, rangeEnd, budget),
+      expandWithinBudget(resource, rangeStart, rangeEnd, budget, undefined, undefined, keep),
     );
     if (result.truncated) truncated = true;
 
@@ -1972,9 +1974,10 @@ async function collectFrom(
   rangeEnd: number,
   into: PendingOccurrence[],
   budget: StepBudget,
+  keep: OccurrenceKeep = "starts",
 ): Promise<boolean> {
   if (collection.subscribed) {
-    return collectFromFeed(collection, rangeStart, rangeEnd, into, budget);
+    return collectFromFeed(collection, rangeStart, rangeEnd, into, budget, keep);
   }
 
   const objects = await fetchCalendarObjects({
@@ -2007,7 +2010,7 @@ async function collectFrom(
     // claim a zone NAME owns it for the isolate, and a stranger's invitation
     // silently re-anchors the user's own meetings in every later request.
     const result = withParsedResource(data, (resource) =>
-      expandWithinBudget(resource, rangeStart, rangeEnd, budget),
+      expandWithinBudget(resource, rangeStart, rangeEnd, budget, undefined, undefined, keep),
     );
     if (result.truncated) truncated = true;
 
@@ -2889,6 +2892,13 @@ export interface WindowConflicts {
  * carrying the same UID — the same meeting delivered to a second calendar is
  * the invitation, not a clash with it.
  *
+ * **An event that began before the read range still counts** (18-REVIEW
+ * CR-01). The read's expansion keeps every occurrence that overlaps the range,
+ * not only those that start in it, so a conference that started two days ago
+ * and runs across the invitation is found. A listing keeps only what starts in
+ * its range, and this sweep used to share that rule; it then said "nothing
+ * else" beside a week out of office.
+ *
  * ## Fails closed
  *
  * A subscribed calendar with no source is skipped and marks the result
@@ -2921,6 +2931,8 @@ export async function findWindowConflicts(
         truncated = true;
         continue;
       }
+      // `overlaps`, not a listing's `starts`: an event that began before the
+      // read and is still running across the window is a conflict (CR-01).
       const collectionTruncated = await collectFrom(
         collection,
         davFetch,
@@ -2928,6 +2940,7 @@ export async function findWindowConflicts(
         options.rangeEnd,
         pending,
         budget,
+        "overlaps",
       );
       if (collectionTruncated) truncated = true;
     }
@@ -2973,10 +2986,19 @@ export async function findWindowConflicts(
  * A series' own dates inside a range, as busy windows (OQ5).
  *
  * Pure: it expands resource text the caller already holds and issues no
- * request. Each occurrence starting in `[rangeStart, rangeEnd)` is placed by
+ * request. Each occurrence overlapping `[rangeStart, rangeEnd)` is placed by
  * `busyIntervalOf` in `tzid`, the same way the conflict sweep places every
  * other event, so an invitation's dates and the events they might collide with
  * are measured by one rule. A moved date appears at its moved time.
+ *
+ * **Overlapping, not starting, and cut to the range once placed** (18-REVIEW
+ * CR-01). An all-day date has no zone, and the expansion compares it as
+ * midnight UTC. West of UTC that is before local midnight, so a range that
+ * starts at local midnight dropped today's own date when the rule was "starts
+ * in the range", and today was never checked. The expansion now keeps what
+ * overlaps; the placed window is then cut to the range, because the range is
+ * what the caller reads and states, and a part outside it was checked against
+ * nothing. A window with nothing left inside the range is dropped.
  *
  * `truncated` is the expansion's own report that a cap stopped it before the
  * range was exhausted. The caller must then say the check was partial: dates
@@ -2990,11 +3012,21 @@ export function occurrenceWindowsOf(
   tzid: string,
 ): { windows: BusyInterval[]; truncated: boolean } {
   return withParsedResource(icsText, (resource) => {
-    const expanded = expandOccurrences(resource, rangeStart, rangeEnd);
+    const expanded = expandOccurrences(
+      resource,
+      rangeStart,
+      rangeEnd,
+      undefined,
+      undefined,
+      "overlaps",
+    );
     const windows: BusyInterval[] = [];
     for (const occurrence of expanded.occurrences) {
-      const window = busyIntervalOf(occurrence, tzid);
-      if (window !== null) windows.push(window);
+      const placed = busyIntervalOf(occurrence, tzid);
+      if (placed === null) continue;
+      const start = Math.max(placed.start, rangeStart);
+      const end = Math.min(placed.end, rangeEnd);
+      if (end > start) windows.push({ start, end });
     }
     return { windows, truncated: expanded.truncated };
   });

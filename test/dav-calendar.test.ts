@@ -6365,6 +6365,102 @@ describe("findWindowConflicts", () => {
     ]);
   });
 
+  // CR-01 (18-REVIEW). The REPORT returns every resource that OVERLAPS the read
+  // range, and these three start BEFORE it — a day and more before the window.
+  // Each one is still running across the invitation, so each is a conflict. A
+  // sweep that kept only what starts inside the range dropped all three and
+  // still said `truncated: false`, which the tool turns into "Nothing else on
+  // your calendars overlaps it."
+  it("counts a multi-day all-day event that began before the read range", async () => {
+    setupFindSlots({
+      objects: {
+        [HOME_PATH]: {
+          // Saturday the 3rd through Monday the 5th: three days, the last one
+          // the invitation's.
+          [`${HOME_PATH}ooo.ics`]: allDayEventIcs("ooo", "20260103", "20260106"),
+        },
+      },
+    });
+
+    const found = await sweep();
+
+    expect(found.truncated).toBe(false);
+    expect(found.conflicts.map((one) => one.summary)).toStrictEqual(["All day ooo"]);
+  });
+
+  it("counts a timed event that began before the read range and is still running", async () => {
+    setupFindSlots({
+      objects: {
+        [WORK_PATH]: {
+          // From 08:00 on the 3rd, two days before the window, to 17:00 on the 6th.
+          [`${WORK_PATH}conference.ics`]: timedEventIcs(
+            "conference",
+            "20260103T080000Z",
+            "20260106T170000Z",
+          ),
+        },
+      },
+    });
+
+    const found = await sweep();
+
+    expect(found.truncated).toBe(false);
+    expect(found.conflicts.map((one) => one.summary)).toStrictEqual(["Busy conference"]);
+  });
+
+  it("counts a repeating event whose current date began before the read range", async () => {
+    setupFindSlots({
+      objects: {
+        [HOME_PATH]: {
+          // Every Saturday for four days, from 2025-12-27: the date that starts
+          // on the 3rd runs to the end of the 6th, across the invitation.
+          [`${HOME_PATH}weekly.ics`]: ics(
+            ...ICS_HEAD,
+            "BEGIN:VEVENT",
+            "UID:weekly@example.invalid",
+            "DTSTAMP:20260101T120000Z",
+            "SUMMARY:Weekly away",
+            "DTSTART;VALUE=DATE:20251227",
+            "DTEND;VALUE=DATE:20251231",
+            "RRULE:FREQ=WEEKLY;COUNT=4",
+            "END:VEVENT",
+            "END:VCALENDAR",
+          ),
+        },
+      },
+    });
+
+    const found = await sweep();
+
+    expect(found.truncated).toBe(false);
+    expect(found.conflicts).toStrictEqual([
+      {
+        summary: "Weekly away",
+        allDay: true,
+        startLocal: "2026-01-03",
+        endLocal: "2026-01-07",
+        startTzid: expect.any(String),
+      },
+    ]);
+  });
+
+  it("still does not count an event that ended before the window", async () => {
+    setupFindSlots({
+      objects: {
+        [WORK_PATH]: {
+          // Began before the read range and ended an hour before the window.
+          [`${WORK_PATH}earlier.ics`]: timedEventIcs(
+            "earlier",
+            "20260103T080000Z",
+            "20260105T080000Z",
+          ),
+        },
+      },
+    });
+
+    expect((await sweep()).conflicts).toStrictEqual([]);
+  });
+
   it("refuses a range wider than the find-slots cap before any request", async () => {
     const stubbed = setupFindSlots();
     stubbed.observed.length = 0;
@@ -7643,5 +7739,72 @@ describe("occurrenceWindowsOf", () => {
     );
     expect(truncated).toBe(true);
     expect(windows.length).toBeGreaterThan(0);
+  });
+
+  // CR-01 (18-REVIEW). An all-day date has no zone, and the expansion compares
+  // it as midnight UTC. West of UTC that is BEFORE local midnight, which is
+  // where the series check starts — so today's own date was dropped, and today
+  // was never checked against anything.
+  it("keeps today's all-day date when the range starts at local midnight west of UTC", () => {
+    const allDaySeries = ics(
+      ...ICS_HEAD,
+      "BEGIN:VEVENT",
+      "UID:all-day-series@example.invalid",
+      "DTSTAMP:20260101T120000Z",
+      "SUMMARY:Daily stand-down",
+      "DTSTART;VALUE=DATE:20260105",
+      "DTEND;VALUE=DATE:20260106",
+      "RRULE:FREQ=DAILY;COUNT=3",
+      "END:VEVENT",
+      "END:VCALENDAR",
+    );
+    // 2026-01-05T00:00:00 in Los Angeles is 08:00Z.
+    const laMidnight = at("2026-01-05T08:00:00Z");
+
+    const { windows, truncated } = occurrenceWindowsOf(
+      allDaySeries,
+      laMidnight,
+      laMidnight + NINETY_DAYS,
+      "America/Los_Angeles",
+    );
+
+    expect(truncated).toBe(false);
+    // Three whole Los Angeles days, the first of them today.
+    expect(windows).toStrictEqual([
+      { start: at("2026-01-05T08:00:00Z"), end: at("2026-01-06T08:00:00Z") },
+      { start: at("2026-01-06T08:00:00Z"), end: at("2026-01-07T08:00:00Z") },
+      { start: at("2026-01-07T08:00:00Z"), end: at("2026-01-08T08:00:00Z") },
+    ]);
+  });
+
+  it("keeps a date that runs across the range's start, cut to the part inside it", () => {
+    const lateSeries = ics(
+      ...ICS_HEAD,
+      "BEGIN:VEVENT",
+      "UID:late-series@example.invalid",
+      "DTSTAMP:20260101T120000Z",
+      "SUMMARY:Late shift",
+      // 22:00 to 01:00 in Los Angeles, so each date crosses local midnight.
+      "DTSTART:20260105T060000Z",
+      "DTEND:20260105T090000Z",
+      "RRULE:FREQ=DAILY;COUNT=2",
+      "END:VEVENT",
+      "END:VCALENDAR",
+    );
+    const laMidnight = at("2026-01-05T08:00:00Z");
+
+    const { windows } = occurrenceWindowsOf(
+      lateSeries,
+      laMidnight,
+      laMidnight + NINETY_DAYS,
+      "America/Los_Angeles",
+    );
+
+    // The first date began before the range, and only the hour after local
+    // midnight is a time this check covers: the read starts there.
+    expect(windows).toStrictEqual([
+      { start: at("2026-01-05T08:00:00Z"), end: at("2026-01-05T09:00:00Z") },
+      { start: at("2026-01-06T06:00:00Z"), end: at("2026-01-06T09:00:00Z") },
+    ]);
   });
 });

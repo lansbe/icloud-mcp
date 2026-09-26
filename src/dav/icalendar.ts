@@ -196,6 +196,7 @@ export function expandWithinBudget(
   budget: StepBudget,
   cap: number = MAX_EXPANDED_OCCURRENCES,
   perResourceSteps: number = MAX_ITERATOR_STEPS,
+  keep: OccurrenceKeep = "starts",
 ): ExpansionResult {
   if (budget.remaining <= 0) {
     return {
@@ -212,6 +213,7 @@ export function expandWithinBudget(
     rangeEndUtc,
     cap,
     Math.min(perResourceSteps, budget.remaining),
+    keep,
   );
 
   // Clamped at zero rather than allowed to go negative. The step cap is checked
@@ -402,6 +404,21 @@ export interface ParsedCalendarResource {
    */
   ownedTzids: string[];
 }
+
+/**
+ * Which occurrences an expansion keeps (18-REVIEW CR-01).
+ *
+ * `starts`: an occurrence whose START is inside the range. A listing wants
+ * this: two abutting pages then return every occurrence exactly once.
+ *
+ * `overlaps`: an occurrence any part of which is inside the range. A conflict
+ * check wants this. An event that began before the range and is still running
+ * — a three-day conference, a week out of office — overlaps the range, and the
+ * server's time-range read returns it for that reason. Keeping only what starts
+ * inside the range drops it, and the check then says nothing else is on the
+ * calendar while it is.
+ */
+export type OccurrenceKeep = "starts" | "overlaps";
 
 /** The result of expanding one resource over one range. */
 export interface ExpansionResult {
@@ -692,6 +709,11 @@ export function withParsedResource<T>(
  * outside it still appears, at its moved time. That falls out of the iterator
  * walking recurrence ids, and it is the correct reading — the caller asked
  * which slots of this series fall in the range.
+ *
+ * `keep` widens the start edge only, and only when asked: under `overlaps` an
+ * occurrence that started before the range but has not ended by its start is
+ * kept too (see `OccurrenceKeep`). The end edge is the same in both modes.
+ * Listings pass nothing and keep the half-open rule above.
  */
 export function expandOccurrences(
   resource: ParsedCalendarResource,
@@ -699,6 +721,7 @@ export function expandOccurrences(
   rangeEndUtc: number,
   cap: number = MAX_EXPANDED_OCCURRENCES,
   maxSteps: number = MAX_ITERATOR_STEPS,
+  keep: OccurrenceKeep = "starts",
 ): ExpansionResult {
   const rangeStart = utcTimeAt(rangeStartUtc);
   const rangeEnd = utcTimeAt(rangeEndUtc);
@@ -711,8 +734,8 @@ export function expandOccurrences(
   // components sat right there. Structural check for the path, flag for the
   // report.
   return resource.master === null
-    ? expandComponents(resource, rangeStart, rangeEnd, cap)
-    : expandSeries(resource, rangeStart, rangeEnd, cap, maxSteps);
+    ? expandComponents(resource, rangeStart, rangeEnd, cap, keep)
+    : expandSeries(resource, rangeStart, rangeEnd, cap, maxSteps, keep);
 }
 
 /**
@@ -908,6 +931,7 @@ function expandSeries(
   rangeEnd: IcalTime,
   cap: number,
   maxSteps: number,
+  keep: OccurrenceKeep = "starts",
 ): ExpansionResult {
   const series = new ICAL.Event(resource.master ?? undefined);
 
@@ -925,6 +949,16 @@ function expandSeries(
   let truncated = false;
   let steps = 0;
 
+  // Under `overlaps`, a slot before the range needs its details only if it
+  // could still be running. With no edited dates, every slot lasts exactly the
+  // series' own duration, so its end is known without reading its details —
+  // and the details read doubles the cost of a walk from a series start years
+  // back. With edited dates, any slot may have been moved or lengthened, so
+  // every early slot is read.
+  const plainSlots = keep === "overlaps" && Object.keys(series.exceptions).length === 0;
+  const slotSeconds = plainSlots ? series.duration.toSeconds() : 0;
+  const rangeStartSeconds = rangeStart.toUnixTime();
+
   // The iterator starts at the series' own start, NOT at the range start, so
   // the caller skips forward and breaks at the end. **That break is what
   // terminates an unbounded rule** — there is nothing else that would.
@@ -936,17 +970,45 @@ function expandSeries(
       break;
     }
     if (next.compare(rangeEnd) >= 0) break;
-    if (next.compare(rangeStart) >= 0) {
+    // A slot before the range is still kept under `overlaps` when the date it
+    // produces has not ended by the range's start. Its details are read only
+    // then, so a listing pays nothing for the mode it does not use.
+    const details =
+      next.compare(rangeStart) >= 0
+        ? series.getOccurrenceDetails(next)
+        : keep === "overlaps" &&
+            (!plainSlots || next.toUnixTime() + slotSeconds > rangeStartSeconds)
+          ? runningAt(series.getOccurrenceDetails(next), rangeStart, rangeEnd)
+          : null;
+    if (details !== null) {
       if (occurrences.length >= cap) {
         truncated = true;
         break;
       }
-      occurrences.push(occurrenceFrom(series.getOccurrenceDetails(next), isRecurring));
+      occurrences.push(occurrenceFrom(details, isRecurring));
     }
     next = iterator.next();
   }
 
   return { occurrences, truncated, steps, preExpanded: resource.preExpanded };
+}
+
+/**
+ * The details of a date that began before the range, when it is still running
+ * inside it, else null.
+ *
+ * Compared as the occurrence actually stands, so a date someone moved is judged
+ * at its moved time. An end exactly at the range's start is out: the date ended
+ * as the range began, which is touching and not overlapping.
+ */
+function runningAt(
+  details: OccurrenceDetails,
+  rangeStart: IcalTime,
+  rangeEnd: IcalTime,
+): OccurrenceDetails | null {
+  if (details.endDate.compare(rangeStart) <= 0) return null;
+  if (details.startDate.compare(rangeEnd) >= 0) return null;
+  return details;
 }
 
 /**
@@ -961,6 +1023,7 @@ function expandComponents(
   rangeStart: IcalTime,
   rangeEnd: IcalTime,
   cap: number,
+  keep: OccurrenceKeep = "starts",
 ): ExpansionResult {
   const occurrences: Occurrence[] = [];
   let truncated = false;
@@ -969,7 +1032,12 @@ function expandComponents(
     const event = new ICAL.Event(component);
     const start = event.startDate;
     if (start.compare(rangeEnd) >= 0) continue;
-    if (start.compare(rangeStart) < 0) continue;
+    // Under `overlaps`, a component that began before the range is kept while
+    // it is still running at the range's start (see `OccurrenceKeep`).
+    if (start.compare(rangeStart) < 0) {
+      if (keep !== "overlaps") continue;
+      if (event.endDate.compare(rangeStart) <= 0) continue;
+    }
     if (occurrences.length >= cap) {
       truncated = true;
       break;

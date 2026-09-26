@@ -11646,6 +11646,45 @@ describe("calendar_respond_to_invitation, what the preview says", () => {
     expect(none.trusted.conflictNotice).toBe("Nothing else on your calendars overlaps it.");
   });
 
+  it("counts events that began before the read and run across the invitation (CR-01)", async () => {
+    // The read starts a day before the invitation's window. Both of these
+    // started two days before it and are still running: a conference, and an
+    // all-day out-of-office block. Neither may be missed, and the preview must
+    // never say "Nothing else" beside them.
+    await warmWrite(
+      writeDavStub({
+        objects: {
+          [GENUINE_PATH]: ATTENDEE_COPY_GENUINE_ICS,
+          [`${WORK_PATH}conference.ics`]: otherEvent(
+            "conference",
+            "Conference",
+            ":20260927T150000Z",
+            ":20260930T000000Z",
+          ),
+          [`${WORK_PATH}ooo.ics`]: otherEvent(
+            "ooo",
+            "Out of office",
+            ";VALUE=DATE:20260927",
+            ";VALUE=DATE:20260930",
+          ),
+        },
+        scheduleTags: { [GENUINE_PATH]: SCHEDULE_TAG },
+      }),
+    );
+
+    const { trusted, untrusted } = halves(
+      await viaSchema({ id: GENUINE_ID, answer: "accepted" }),
+    );
+
+    expect(trusted.conflictsChecked).toBe("complete");
+    expect(trusted.conflictCount).toBe(2);
+    expect(trusted.conflictNotice).toBe("2 other events on your calendars overlap it.");
+    expect(String(trusted.conflictNotice)).not.toContain("Nothing else");
+    expect(
+      (untrusted.conflicts as { title: string }[]).map((one) => one.title).sort(),
+    ).toStrictEqual(["Conference", "Out of office"]);
+  });
+
   it("says conflicts could not be fully checked when a calendar was skipped, though it found none", async () => {
     // The home listing carries a subscribed calendar with no source beside the
     // work calendar. The sweep cannot read it, so it must never say "nothing".
@@ -12350,6 +12389,48 @@ describe("calendar_respond_to_invitation, repeating invitations", () => {
     expect((trusted.conflictRange as { start: string }).start).toBe("2026-10-13T00:00:00");
     expect(trusted.conflictCount).toBe(1);
     expect((untrusted.conflicts as { title: string }[])[0].title).toBe("Offsite");
+  });
+
+  it("finds an out-of-office block that began before today and runs across a date (CR-01)", async () => {
+    pinNow();
+    // Out of office from 2026-10-08 to the end of 2026-10-14: it began two days
+    // before the dates checked start, and it runs across the series' 2026-10-13
+    // date. A sweep that kept only what starts inside its read dropped it, and
+    // said nothing else was on the calendar.
+    await warmWrite(
+      writeDavStub({
+        objects: {
+          [SERIES_PATH]: ATTENDEE_COPY_SERIES_ICS,
+          [`${WORK_PATH}ooo.ics`]: icsLines(
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//Example Org//Series Conflicts//EN",
+            "BEGIN:VEVENT",
+            "UID:ooo@example.invalid",
+            "DTSTAMP:20260901T120000Z",
+            "DTSTART;VALUE=DATE:20261008",
+            "DTEND;VALUE=DATE:20261015",
+            "SUMMARY:Out of office",
+            "END:VEVENT",
+            "END:VCALENDAR",
+          ),
+        },
+        scheduleTags: { [SERIES_PATH]: SCHEDULE_TAG },
+      }),
+    );
+
+    const { trusted, untrusted } = halves(
+      await viaSchema("calendar_respond_to_invitation", {
+        id: SERIES_ID,
+        answer: "accepted",
+        scope: "series",
+      }),
+    );
+
+    expect(trusted.conflictsChecked).toBe("complete");
+    expect(trusted.conflictCount).toBe(1);
+    expect(String(trusted.conflictNotice)).not.toContain("Nothing else");
+    expect((untrusted.conflicts as { title: string }[])[0].title).toBe("Out of office");
   });
 
   it("says conflicts were only partly checked when the series' own expansion hit its cap", async () => {

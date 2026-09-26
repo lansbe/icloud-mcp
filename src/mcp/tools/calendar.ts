@@ -5411,10 +5411,9 @@ async function sweepOrDegrade(
  * What else is on the calendar across a SERIES' own dates (OQ5).
  *
  * **The dates checked run from the start of today in the preview's zone.** Not
- * from this instant: the local expansion keeps what STARTS in its range, so a
- * range from "now" would drop an all-day event today, and the preview would say
- * nothing else is on the calendar beside today's own meeting. That is the false
- * "nothing else" RSVP-03 exists to prevent.
+ * from this instant, because the part of today already past is still today to
+ * a person reading the preview, and a meeting at 09:00 this morning is on the
+ * same day as the one being answered.
  *
  * **The read starts a little earlier still, and the read is what is capped.**
  * An all-day event is a date with no zone, and the expansion compares it as
@@ -5425,8 +5424,10 @@ async function sweepOrDegrade(
  * 90 days less the zone's offset, and the preview says so by stating it rather
  * than by rounding it.
  *
- * An event that began before today and is still running is the one thing still
- * outside the read.
+ * **An event that began before the read and is still running is found**
+ * (18-REVIEW CR-01): the sweep keeps what overlaps its range, not only what
+ * starts in it. So is today's own all-day date of the series, which the same
+ * starts-only rule used to drop west of UTC.
  *
  * **The windows are the invitation's own dates in that range**, expanded from
  * the bytes already read by `occurrenceWindowsOf`. A cap on that expansion
