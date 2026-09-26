@@ -4909,10 +4909,17 @@ export function separateAnswerNoticeOf(count: number): string | null {
  * calendar was read, but no time zone was given and the invitation named none
  * this server holds, so an all-day event — which has no time of its own —
  * was placed on a UTC day, and whether it clashes depended on that guess
- * (18-REVIEW WR-03). `failed`: the sweep did not finish at all. Only
- * `complete` may ever say "nothing else".
+ * (18-REVIEW WR-03). `none-in-range`: a series none of whose dates falls in
+ * the range checked, so nothing was compared with anything (18-REVIEW WR-04).
+ * `failed`: the sweep did not finish at all. Only `complete` may ever say
+ * "nothing else".
  */
-export type ConflictsChecked = "complete" | "partial" | "no-zone" | "failed";
+export type ConflictsChecked =
+  | "complete"
+  | "partial"
+  | "no-zone"
+  | "none-in-range"
+  | "failed";
 
 /**
  * The one sentence about conflicts, from a closed table (RSVP-03, T-18-22).
@@ -4934,6 +4941,11 @@ export function conflictNoticeOf(checked: ConflictsChecked, count: number): stri
       return (
         "Conflicts could not be fully checked: no time zone was given, so " +
         "all-day events were placed in UTC and may be on the wrong day."
+      );
+    case "none-in-range":
+      return (
+        `None of this series' dates fall in the next ${SERIES_CONFLICT_DAYS} ` +
+        "days, so none were checked for conflicts."
       );
     case "failed":
       return "Conflicts could not be checked.";
@@ -5483,7 +5495,8 @@ async function sweepOrDegrade(
  * makes the whole answer partial, whatever the sweep found (T-18-31): a date
  * nobody produced is a date nothing was checked against.
  *
- * With no date in range there is nothing to collide with, so no sweep is spent.
+ * With no date in range there is nothing to collide with, so no sweep is spent,
+ * and the answer is `none-in-range` rather than a clean `complete` (WR-04).
  */
 async function seriesConflictsFor(
   principal: Principal,
@@ -5509,8 +5522,15 @@ async function seriesConflictsFor(
   };
 
   const expanded = occurrenceWindowsOf(read.body, rangeStart, rangeEnd, zone);
+  // No date in range: nothing to collide with, so no sweep is spent. That is
+  // not a clean result, because nothing was compared with anything, and it
+  // must not read as one (18-REVIEW WR-04).
   if (expanded.windows.length === 0) {
-    return { conflicts: [], checked: expanded.truncated ? "partial" : "complete", range };
+    return {
+      conflicts: [],
+      checked: expanded.truncated ? "partial" : "none-in-range",
+      range,
+    };
   }
 
   return sweepOrDegrade(
@@ -5769,8 +5789,10 @@ async function buildReplyPreview(
     conflicts: swept.conflicts,
     conflictCount: swept.conflicts.length,
     conflictsChecked: swept.checked,
+    // The "Checked the next 90 days" prefix only when a date was checked: a
+    // series with none in range says so in its own sentence (WR-04).
     conflictNotice:
-      (swept.range === null ? "" : SERIES_CONFLICT_PREFIX) +
+      (swept.range === null || swept.checked === "none-in-range" ? "" : SERIES_CONFLICT_PREFIX) +
       conflictNoticeOf(swept.checked, swept.conflicts.length),
     conflictRange: swept.range,
     separateAnswerCount: separateAnswers.length,

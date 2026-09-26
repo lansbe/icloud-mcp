@@ -11955,11 +11955,26 @@ describe("calendar_respond_to_invitation, what the preview says", () => {
     expect(conflictNoticeOf("complete", 0)).toBe("Nothing else on your calendars overlaps it.");
     expect(conflictNoticeOf("complete", 1)).toBe("1 other event on your calendars overlaps it.");
     expect(conflictNoticeOf("complete", 3)).toBe("3 other events on your calendars overlap it.");
+    // WR-04: its own sentence, whatever the count, and never "nothing else".
+    for (const count of [0, 1, 3]) {
+      expect(conflictNoticeOf("none-in-range", count)).toBe(
+        "None of this series' dates fall in the next 90 days, so none were checked for conflicts.",
+      );
+    }
     for (const count of [0, 1, 3]) {
       expect(conflictNoticeOf("partial", count)).toBe(
         "Conflicts could not be fully checked: at least one calendar could not be read in full.",
       );
       expect(conflictNoticeOf("failed", count)).toBe("Conflicts could not be checked.");
+      // WR-03.
+      expect(conflictNoticeOf("no-zone", count)).toBe(
+        "Conflicts could not be fully checked: no time zone was given, so " +
+          "all-day events were placed in UTC and may be on the wrong day.",
+      );
+    }
+    // Only one state of the five can say "nothing else".
+    for (const checked of ["partial", "no-zone", "none-in-range", "failed"] as const) {
+      expect(conflictNoticeOf(checked, 0)).not.toContain("Nothing else");
     }
   });
 
@@ -12671,6 +12686,40 @@ describe("calendar_respond_to_invitation, repeating invitations", () => {
     expect(trusted.conflictCount).toBe(1);
     expect(String(trusted.conflictNotice)).not.toContain("Nothing else");
     expect((untrusted.conflicts as { title: string }[])[0].title).toBe("Lunch today");
+  });
+
+  // WR-04 (18-REVIEW). Zero of the series' dates were compared against
+  // anything, so the preview must not read as a clean result.
+  it.each([
+    ["all of its dates are past", Date.UTC(2027, 0, 15, 17, 0, 0)],
+    ["its first date is more than 90 days out", Date.UTC(2026, 5, 1, 17, 0, 0)],
+  ])("says no date was checked when %s, and never 'nothing else'", async (_label, now) => {
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const stub = await crowdedSeriesStub();
+    stub.observed.length = 0;
+
+    const { trusted, untrusted } = halves(
+      await viaSchema("calendar_respond_to_invitation", {
+        id: SERIES_ID,
+        answer: "accepted",
+        scope: "series",
+      }),
+    );
+
+    expect(trusted.conflictsChecked).toBe("none-in-range");
+    expect(trusted.conflictCount).toBe(0);
+    expect(untrusted.conflicts).toStrictEqual([]);
+    expect(trusted.conflictNotice).toBe(
+      "None of this series' dates fall in the next 90 days, so none were checked for conflicts.",
+    );
+    expect(String(trusted.conflictNotice)).not.toContain("Nothing else");
+    expect(String(trusted.conflictNotice)).not.toContain("Checked the next");
+    // The range it would have checked is still stated.
+    expect(trusted.conflictRange).not.toBeNull();
+    // No sweep was spent: the event read and the address read, nothing more.
+    expect(stub.observed.map((one) => one.method)).toStrictEqual(["REPORT", "PROPFIND"]);
+    // The answer itself is still previewable.
+    expect(typeof trusted.confirmToken).toBe("string");
   });
 
   it("says conflicts were only partly checked when the series' own expansion hit its cap", async () => {
