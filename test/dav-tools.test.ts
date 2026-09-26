@@ -1490,10 +1490,11 @@ interface WriteStubOptions {
    * `null` is the default and keeps this conversation exactly as it was: the
    * principal answers its home set to the inbox question,
    * `resolveDefaultCalendarUrl` reads no inbox href, and the account's default
-   * calendar resolves to `null`. That is the state CALM-07's refusal cannot fire
-   * in, so every case that needs the refusal has to name an inbox — which is
-   * also, deliberately, what makes the FAIL-OPEN the default in this fixture
-   * rather than something a case has to construct.
+   * calendar resolves to `null`. That was the state CALM-07's refusal could not
+   * fire in, so every case that needed the refusal had to name an inbox. The
+   * requirement was withdrawn on 2026-09-26 and one case still names an inbox —
+   * the one that proves a delete of the named default calendar now PROCEEDS — so
+   * the option stays, and the null default stays what the real account answers.
    */
   scheduleInbox?: string | null;
   /**
@@ -9137,8 +9138,34 @@ describe("the calendar_delete_calendar registration", () => {
   });
 });
 
-describe("refusing the account's default calendar before anything is sent (CALM-07)", () => {
-  it("refuses it with the recorded request list EMPTY", async () => {
+// ---------------------------------------------------------------------------
+// The default-calendar refusal (CALM-07) — WITHDRAWN 2026-09-26
+//
+// FOUR cases stood here: the refusal with an empty request list, a negative
+// control on a non-default calendar, a raw-comparison pin, and a fail-open case.
+// They are replaced by ONE, below, and the arithmetic is deliberate: three fewer
+// cases at this boundary, three fewer in `test/dav-calendar.test.ts`, and two
+// field names dropped from each of two shapes in `test/dav-fence-audit.test.ts`.
+//
+// Why one survives rather than none. The deleted fail-open case said it existed
+// "so that a later build which 'fixed' it with a display-name or position
+// heuristic would have to turn this red on the way". That argument OUTLIVED the
+// requirement it was written for and is now the whole reason for the case below:
+// D-11's refusal of any heuristic is retained, CALM-07 is not, and the one thing
+// this boundary can still assert is that a delete of the calendar an account
+// names as its default PROCEEDS to a minted preview. A build that reintroduced a
+// refusal — from a display name, a position, or a re-adopted property read — turns
+// this red. Nothing else would catch it.
+// ---------------------------------------------------------------------------
+
+describe("no default-calendar refusal exists (CALM-07 withdrawn)", () => {
+  it("previews and MINTS for the calendar the account names as its default", async () => {
+    // The stub is armed exactly as the deleted refusal case armed it — the
+    // scheduling inbox answers, and the property it answers names THIS calendar —
+    // so this is the strongest form of the account state CALM-07 was written for.
+    // On the owner's real account no deploy has ever seen this state, because
+    // iCloud serves the property empty; the fixture can produce it and the real
+    // server cannot, which is why the assertion has to be made here.
     const stub = deletingWriteStub({
       scheduleInbox: INBOX_URL,
       defaultCalendar: CALENDAR_URL,
@@ -9147,89 +9174,33 @@ describe("refusing the account's default calendar before anything is sent (CALM-
 
     const previewed = await deleteCalendarPreview(CALENDAR_ID);
 
-    // **ZERO. This assertion IS CALM-07.** The requirement words the refusal as
-    // local, before any request is sent, and it is asserted off the stub's own
-    // recorded list rather than off the returned field — a response cannot be
-    // evidence about what left the Worker.
-    expect(
-      stub.observed.length,
-      "the default-calendar refusal reached the network",
-    ).toBe(0);
+    // MINTED. Not refused, and not refused-quietly either: a token exists, so a
+    // commit is reachable.
+    expect(previewed.trusted.confirmToken).not.toBeNull();
+    expect(previewed.trusted.expiresInSeconds).not.toBeNull();
+    expect(previewed.untrusted.change).not.toBeNull();
+    expect(previewed.untrusted.confirmationLine).not.toBeNull();
 
-    expect(previewed.trusted.defaultCalendarRefused).toBe(true);
-    // Nothing minted, so there is literally nothing to commit and a caller
-    // cannot proceed by ignoring the message.
-    expect(previewed.trusted.confirmToken).toBeNull();
-    expect(previewed.trusted.expiresInSeconds).toBeNull();
-    expect(previewed.trusted.itemCount).toBe(0);
-    expect(previewed.trusted.writeCount).toBe(0);
-    expect(previewed.untrusted.change).toBeNull();
-    expect(previewed.untrusted.confirmationLine).toBeNull();
+    // ONE request: the collection's own depth-1 read, which is what step 5 of
+    // `buildCollectionDeletePreview` costs and all it costs. A build that
+    // re-adopted a default-calendar PROPERTY read at delete time would have to
+    // push this past one on the way.
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].method).toBe("PROPFIND");
 
-    // It names the calendar in the USER'S terms, and echoes no URL — not the
-    // shard host, not the account's DSID, not the collection path.
-    const reason = String(previewed.trusted.refusalReason);
-    expect(reason).toContain("default calendar");
+    // The two withdrawn field names are ABSENT rather than present-and-false. A
+    // `defaultCalendarRefused: false` would read to every later maintainer as a
+    // protection that exists and happened not to fire here.
+    expect(previewed.trusted).not.toHaveProperty("defaultCalendarRefused");
+    expect(previewed.trusted).not.toHaveProperty("refusalReason");
+
+    // And the deleted refusal's own §4 property still has to hold on this path,
+    // because the preview it now produces carries a name and a sentence: no shard
+    // host, no DSID, no collection path anywhere in either half.
     const whole = previewed.raw.trusted + previewed.raw.untrusted;
     expect(whole).not.toContain("p42-caldav");
     expect(whole).not.toContain("1234567890");
     expect(whole).not.toContain("/calendars/");
-  });
-
-  it("negative control: a NON-default calendar on the same armed account previews", async () => {
-    // Without this the case above passes just as happily on a build that refuses
-    // every calendar, which is the failure mode a refusal assertion always has.
-    const stub = deletingWriteStub({
-      scheduleInbox: INBOX_URL,
-      defaultCalendar: OTHER_COLLECTION_URL,
-    });
-    await warmWrite(stub);
-
-    const previewed = await deleteCalendarPreview(CALENDAR_ID);
-
-    expect(previewed.trusted.defaultCalendarRefused).toBe(false);
-    expect(previewed.trusted.refusalReason).toBeNull();
-    expect(previewed.trusted.confirmToken).not.toBeNull();
-    // ONE request: the collection's own depth-1 read.
-    expect(stub.observed.length).toBe(1);
-    expect(stub.observed[0].method).toBe("PROPFIND");
-  });
-
-  it("compares RAW: the default calendar with a different trailing form is not it", async () => {
-    // `isDefaultCalendar` normalises nothing on either side, and the fixture is
-    // what makes that checkable from out here rather than only in
-    // `test/dav-calendar.test.ts`. Both sides were normalised ONCE at store time
-    // by resolving the href against the account's own resolved home.
-    const stub = deletingWriteStub({
-      scheduleInbox: INBOX_URL,
-      defaultCalendar: CALENDAR_URL.replace(/\/$/, ""),
-    });
-    await warmWrite(stub);
-
-    const previewed = await deleteCalendarPreview(CALENDAR_ID);
-    expect(previewed.trusted.defaultCalendarRefused).toBe(false);
-  });
-
-  it("FAIL-OPEN, asserted rather than assumed: no default named means no refusal", async () => {
-    // **This is the open risk plan 17-05 recorded, pinned as a test so it is
-    // visible rather than latent.** Whether iCloud populates
-    // `schedule-default-calendar-URL` on the scheduling inbox is unmeasured
-    // against the real account; if it answers nothing, `defaultCalendarUrl` is
-    // null, `isDefaultCalendar` answers false for every collection, and CALM-07's
-    // refusal does not fire at all.
-    //
-    // The test exists so that state is a KNOWN behaviour with an assertion behind
-    // it rather than a surprise found during a UAT, and so that a later build
-    // which "fixed" it with a display-name or position heuristic would have to
-    // turn this red on the way — which is exactly the heuristic D-11 rules out.
-    // `dav_diagnose` reports the resolved value so the measurement costs one call.
-    const stub = deletingWriteStub({ scheduleInbox: null });
-    await warmWrite(stub);
-
-    const previewed = await deleteCalendarPreview(CALENDAR_ID);
-
-    expect(previewed.trusted.defaultCalendarRefused).toBe(false);
-    expect(previewed.trusted.confirmToken).not.toBeNull();
   });
 });
 
@@ -9370,13 +9341,15 @@ describe("the calendar_delete_calendar preview", () => {
     expect(line).not.toContain("user's behalf");
     expect(line.endsWith("in it. This cannot be undone.")).toBe(true);
     expect(previewed.untrusted.displayName).toBe(HOSTILE_CALENDAR_NAME);
+    // FIVE, down from seven on 2026-09-26: `defaultCalendarRefused` and
+    // `refusalReason` went with CALM-07. This is an exact-set assertion rather
+    // than a containment one, so the two names cannot come back without turning it
+    // red — which is the point of asserting the whole set here.
     expect(Object.keys(previewed.trusted).sort()).toEqual([
       "confirmToken",
-      "defaultCalendarRefused",
       "expiresInSeconds",
       "id",
       "itemCount",
-      "refusalReason",
       "writeCount",
     ]);
   });

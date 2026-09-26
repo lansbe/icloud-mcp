@@ -1601,38 +1601,56 @@ export function assertCtag(
   }
 }
 
-/**
- * Whether a collection URL is the account's default calendar (CALM-07).
+/*
+ * `isDefaultCalendar` stood here until 2026-09-26, when CALM-07 was WITHDRAWN on
+ * a measurement and the function went with it. The note stays because this is
+ * where a reader asks "where is the default-calendar refusal", and the answer is
+ * that the requirement asked the server for a fact that does not live there.
  *
- * A comparison between two strings the caller already holds. It reaches no
- * network, and that is the requirement rather than a happy property: CALM-07
- * words the refusal as local, "before any request is sent", so the default
- * calendar's URL is memoised with the discovery triple by
- * `resolveDefaultCalendarUrl` and this is the entire cost at delete time.
+ * What was measured, against the owner's real account:
  *
- * **Raw `===`, and no normalisation of any kind** — no trailing-slash fixing, no
- * case folding, no percent-decoding. `assertEtag`'s neighbouring argument about
- * comparing a revision byte-for-byte holds here and holds harder: normalisation
- * eventually meets a value it gets wrong, and the direction it gets wrong decides
- * whether the least reversible operation in this milestone proceeds. Both sides
- * are already normalised ONCE, at store time, by resolving the href against the
- * account's own resolved home URL. Comparing raw thereafter is what keeps that
- * the only normalisation there is.
+ * - `CALDAV:schedule-default-calendar-URL` on the calendar home — null on all 13
+ *   collection rows (deploy 027d4140).
+ * - The same property asked DIRECTLY on the scheduling inbox at depth 0, which is
+ *   where RFC 6638 § 9.2 defines it, through `resolveDefaultCalendarUrl` — null
+ *   (deploy 7c0afd3a onward).
+ * - `DAV:propname` is NOT IMPLEMENTED by iCloud (deploy 1fce400b). A
+ *   correctly-formed `propname` request — the element as a CHILD of `propfind`,
+ *   verified against the source — comes back 207 with an empty 200 block and a
+ *   404 block naming `propname` ITSELF. iCloud read it as the name of a property
+ *   being requested. See `runPropertyNameProbe`, which holds that measurement.
+ * - `DAV:allprop` cannot substitute. RFC 4918 § 9.1 returns dead properties plus
+ *   the live properties RFC 4918 itself defines; `schedule-default-calendar-URL`
+ *   is CalDAV's live property, so reaching it needs `<include>`, and `include`
+ *   requires NAMING it — which is the targeted ask already made twice above.
+ *   There is therefore no WebDAV mechanism to enumerate live properties
+ *   exhaustively, and the targeted ask at the RFC-defined location is the
+ *   strongest evidence the protocol permits.
  *
- * A `null` default means the account named none, so nothing is the default and
- * this answers false. That is the honest answer AND a fail-open one, which is why
- * `resolveDefaultCalendarUrl` stores a null it read and re-throws rather than
- * storing one it merely guessed at.
+ * The domain fact that explains every null: Apple's "Default Calendar" is a
+ * PER-DEVICE setting (Settings → Calendar, on each device), not account state. A
+ * phone and a Mac can point at different calendars and the account does not know.
+ * No server property carries it because there is no server-side value to carry.
+ * Deleting every calendar on the account also appears to be a valid state, so no
+ * collection structurally requires protection either.
  *
- * Exported so the tool layer has one named thing to call and one named thing to
- * drive, rather than an inline `===` a later refactor can quietly widen.
+ * So CALM-07's PREMISE was false rather than its implementation incomplete. This
+ * is the same treatment SPIKE-02 got when reminders failed: withdrawn on a
+ * measurement, recorded, not deferred. A predicate that could only ever answer
+ * `false`, wired to a refusal that could never fire, is the "bound that is
+ * quietly false" this project's own CLAUDE.md warns about — it would read to
+ * every later maintainer as a protection that exists.
+ *
+ * NO HEURISTIC REPLACED IT, and that stays a decision rather than an omission.
+ * D-11 put a display-name or position rule off the table: a rule that is right
+ * most of the time, on the least reversible operation in this milestone, is the
+ * "very nearly right" answer nobody checks. What guards the delete is what always
+ * guarded it — the preview the user reads, and the confirmation gate in front of
+ * the commit. That gate is untouched by this withdrawal.
+ *
+ * `resolveDefaultCalendarUrl` and `ResolvedDavAccount.defaultCalendarUrl` were
+ * KEPT; the reason is written down at the function itself.
  */
-export function isDefaultCalendar(
-  collectionUrl: string,
-  defaultCalendarUrl: string | null,
-): boolean {
-  return defaultCalendarUrl !== null && collectionUrl === defaultCalendarUrl;
-}
 
 /** What the server ANSWERED to a collection removal. Never a verdict. */
 export interface CollectionDeleteAnswer {

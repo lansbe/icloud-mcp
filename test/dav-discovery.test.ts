@@ -1260,12 +1260,20 @@ describe("assertUnderHome, against the adversarial URL corpus (03-13)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The account's default calendar (CALM-07, D-11)
+// The account's default calendar (D-11)
 //
-// Resolved on a cache MISS and stored with the triple, so a delete-time refusal
-// is a string comparison and costs no request at all. Two requests get it —
-// principal, then inbox — and they are serial because the second addresses a URL
-// the first one supplies.
+// Resolved on a cache MISS and stored with the triple, so reading it costs no
+// request at all on a warm call. Two requests get it — principal, then inbox — and
+// they are serial because the second addresses a URL the first one supplies.
+//
+// **CALM-07 is WITHDRAWN as of 2026-09-26 and this block is KEPT.** The requirement
+// asked for a local refusal of the account's default calendar; the property that
+// refusal needed is absent everywhere it can be asked for, because Apple's
+// "Default Calendar" is a per-DEVICE setting. The resolver survived the requirement
+// as the instrument that measured that, with `dav_diagnose` as its reader — the
+// decision is written at `resolveDefaultCalendarUrl` — so every case below still
+// describes live behaviour. What no case below asserts any more is a REFUSAL,
+// because there is not one.
 //
 // D-11 originally assumed the property would ride free on a listing the account
 // already sends. It was measured against the real account on 2026-09-25, on a
@@ -1274,7 +1282,7 @@ describe("assertUnderHome, against the adversarial URL corpus (03-13)", () => {
 // not exist and this is the owner's fallback, decided the same day.
 // ---------------------------------------------------------------------------
 
-describe("the account's default calendar (CALM-07)", () => {
+describe("the account's default calendar (D-11)", () => {
   beforeEach(async () => {
     await clearDavCache(env, principal);
   });
@@ -1343,8 +1351,9 @@ describe("the account's default calendar (CALM-07)", () => {
 
     expect(second.cacheHit).toBe(true);
     expect(second.defaultCalendarUrl).toBe(CALDAV_DEFAULT_CALENDAR);
-    // The whole of CALM-07 in one assertion. The comparand is in hand before the
-    // delete tool is ever called, so refusing the default calendar sends nothing.
+    // The property CALM-07 needed, in one assertion: the value is in hand on a warm
+    // call and costs nothing. The requirement is withdrawn; the property is what
+    // makes the standing measurement free, which is why nobody removes it for cost.
     expect(warm.observed).toEqual([]);
   });
 
@@ -1436,8 +1445,11 @@ describe("the account's default calendar (CALM-07)", () => {
 
   it("fails the resolve rather than caching a guess when the inbox throttles", async () => {
     // The other direction, and the one that matters. A 429 is not an answer about
-    // the account. Storing a null here would disarm the CALM-07 refusal for a
-    // day on the strength of one throttled request.
+    // the account. Storing a null here would have disarmed CALM-07's refusal for a
+    // day on the strength of one throttled request; with the requirement withdrawn
+    // it would instead cache a FALSE MEASUREMENT for a day — a null that says "this
+    // account names no default calendar" when nobody asked it. That is the worse of
+    // the two, because the measurement is now the only thing the value is for.
     const stub = davStub({
       scheduling: "full",
       onRequest: (url) =>

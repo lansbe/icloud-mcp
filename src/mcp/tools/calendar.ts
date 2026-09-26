@@ -58,7 +58,6 @@ import {
   findFreeSlots,
   getEvent,
   getEventWithEtag,
-  isDefaultCalendar,
   listCalendars,
   listEvents,
   nextCivilDate,
@@ -376,37 +375,31 @@ export function calendarUpdatedToolResult(
 }
 
 // ---------------------------------------------------------------------------
-// CALM-06, CALM-07 — deleting a calendar, and the three refusals in front of it
+// CALM-06 — deleting a calendar, and the refusals in front of it
 // ---------------------------------------------------------------------------
 
-/**
- * What this server says when asked to delete the account's default calendar.
+/*
+ * `DEFAULT_CALENDAR_REFUSAL` stood here, alongside a `defaultCalendarRefused`
+ * boolean and a `refusalReason` string on the delete preview, until 2026-09-26.
+ * All three went when CALM-07 was WITHDRAWN on a measurement: iCloud exposes no
+ * server-side default-calendar property, because Apple's "Default Calendar" is a
+ * per-DEVICE setting. The measurement, the three deploys it was taken against and
+ * the protocol argument that closes the question are recorded at the deleted
+ * predicate's own site in `src/dav/calendar.ts`.
  *
- * **A returned field on a SUCCESSFUL result rather than a thrown error**, on
- * `EventPreview.scopeRequired`'s precedent and for its stronger reason: minting
- * no confirmation means there is literally nothing to commit, so a caller cannot
- * proceed by ignoring a message. An error would additionally be the wrong SHAPE
- * — the four-value error vocabulary is closed and none of its members means
- * "this is the one calendar the account cannot lose", so the refusal would
- * arrive wearing `not_found`'s clothes and read as a retryable fault. It is not
- * retryable: a second preview of the same calendar is refused identically.
+ * The heading above lost "CALM-07" and its count of refusals with them. It said
+ * THREE; a heading that keeps counting a refusal that was removed is the same
+ * defect as a docstring describing old routing — nothing fails when the prose
+ * stops matching the code, so the count is now a plain plural.
  *
- * **It names the calendar in the USER'S terms and echoes no URL.** "The
- * account's default calendar" is a thing a person can check on their own
- * devices; the collection URL is the account's DSID and shard host, which
- * ./.claude/CLAUDE.md § 4 keeps out of every response field. Nothing here is
- * read off a server answer, because nothing was asked — the refusal is a local
- * comparison against a value memoised with the discovery triple (CALM-07).
- *
- * A closed constant rather than a sentence built at the call site, for the same
- * reason `CalendarProperty` is a two-value vocabulary: one wording, in one
- * place, so a second refusal path cannot phrase it differently.
+ * Two response fields therefore no longer exist, and that is deliberate rather
+ * than an oversight to be restored. A boolean that could only ever read `false`
+ * teaches a reader to skip it, exactly as `CollectionDeletePreview`'s own
+ * docstring argues about the `willDelete` it declines to carry — and worse here,
+ * because a reader would take the field's presence as evidence that a protection
+ * exists. What guards the delete is the preview and the confirmation gate, which
+ * this change does not touch.
  */
-const DEFAULT_CALENDAR_REFUSAL =
-  "This is the account's default calendar. It cannot be deleted through this " +
-  "server, because new invitations and events with nowhere else to go are " +
-  "filed into it. Nothing was read and nothing was sent. Choose a different " +
-  "calendar, or change the default on one of your own devices first.";
 
 /**
  * What a calendar-delete preview says. Nothing has been written.
@@ -425,17 +418,6 @@ const DEFAULT_CALENDAR_REFUSAL =
 export interface CollectionDeletePreview {
   /** The opaque calendar id, echoed on both sides so the halves join by identity. */
   id: string;
-  /**
-   * True when this server refused because the calendar is the account's default.
-   *
-   * CALM-07. Refused BEFORE any request — the comparison is local, against a URL
-   * memoised with the discovery triple — so a refusal here costs zero outbound
-   * requests, and `test/dav-tools.test.ts` asserts that off the stub's own
-   * recorded list rather than off this field.
-   */
-  defaultCalendarRefused: boolean;
-  /** This server's own words for the refusal, or `null` when there was none. */
-  refusalReason: string | null;
   /**
    * How many member resources go with the calendar.
    *
@@ -609,10 +591,11 @@ export interface CollectionCommitOutcome {
  * The half of a delete preview this server counted, decided or minted.
  *
  * Every field is a statement about this server's own work: an opaque id it
- * minted, a boolean it decided by a local comparison, a sentence from its own
- * closed vocabulary, a count it took by walking the collection's own listing, a
- * write count it knows because it wrote the commit, the capability it signed, and
- * that capability's life.
+ * minted, a count it took by walking the collection's own listing, a write count
+ * it knows because it wrote the commit, the capability it signed, and that
+ * capability's life. The sentence read "a boolean it decided by a local
+ * comparison, a sentence from its own closed vocabulary" until 2026-09-26, when
+ * CALM-07's withdrawal removed both of those fields.
  *
  * **Note what is NOT here: `displayName`, `change` and `confirmationLine`.** The
  * name is chosen by whoever shared the calendar, the change is the object a
@@ -624,8 +607,6 @@ function collectionPreviewTrustedPart(
 ): Record<string, unknown> {
   return {
     id: preview.id,
-    defaultCalendarRefused: preview.defaultCalendarRefused,
-    refusalReason: preview.refusalReason,
     itemCount: preview.itemCount,
     writeCount: preview.writeCount,
     confirmToken: preview.confirmToken,
@@ -4081,7 +4062,7 @@ async function applyCommit(
 }
 
 /**
- * Build one calendar-delete preview: refuse, count, and seal (CALM-06, CALM-07).
+ * Build one calendar-delete preview: refuse, count, and seal (CALM-06).
  *
  * **The ORDER of what follows is the requirement rather than an implementation
  * detail**, and it is the cheapest-refusal-first order every write path in this
@@ -4089,14 +4070,16 @@ async function applyCommit(
  *
  *   1. The id is decoded at the handler, before this runs — the cheapest
  *      possible refusal of a token this server did not mint, with no request.
- *   2. Discovery. On a warm cache this issues NOTHING and hands back the default
- *      calendar's URL alongside the home set.
- *   3. **CALM-07, and it is HERE rather than anywhere further down.** A local
- *      string comparison against a URL memoised with the discovery triple, so
- *      the account's default calendar is refused with ZERO outbound requests.
- *      The requirement words the refusal as local, "before any request is sent",
- *      which is why the value is resolved where the discovery cost already is
- *      rather than fetched per delete.
+ *   2. Discovery. On a warm cache this issues NOTHING and hands back the home
+ *      set the confirmation seals.
+ *   3. **WAS CALM-07's local default-calendar refusal. Withdrawn on 2026-09-26
+ *      and deleted, not disabled.** iCloud serves no default-calendar property
+ *      anywhere it can be asked for, because Apple's "Default Calendar" is a
+ *      per-DEVICE setting — the measurement is at the deleted predicate's own site
+ *      in `src/dav/calendar.ts`. The step is listed and empty rather than removed,
+ *      because the numbers below are how the body and `test/dav-tools.test.ts`
+ *      refer to these stages and sliding four of them down by one would break
+ *      every reference that names a step by number, silently.
  *   4. The containment assertion, and it runs inside `readCollectionState`
  *      below, before the credential can be attached to anything. It is NOT
  *      repeated here: a second copy at this layer would be a second mitigation
@@ -4106,14 +4089,14 @@ async function applyCommit(
  *      member count from a single multi-status — so the two numbers this preview
  *      shows can never describe different moments.
  *   6. **The binding, or nothing.** `assertCtag` refuses a collection this server
- *      cannot bind rather than previewing it, and the refusal is a THROW where
- *      the default-calendar one is a returned field. The asymmetry is deliberate:
- *      "this is your default calendar" is a permanent fact about WHICH calendar
- *      was named, so a fresh preview is refused identically and the user needs
- *      words; "the server answered no binding" is the same class of answer as a
- *      resource it declines to resolve, which is exactly what
- *      `DavNotFoundError(false)` already says and what `assertCtag` exists to
- *      say. D-09.
+ *      cannot bind rather than previewing it, and the refusal is a THROW. It used
+ *      to be argued here as an ASYMMETRY against step 3's returned field, on the
+ *      grounds that "this is your default calendar" is a permanent fact needing
+ *      words while "the server answered no binding" is the same class of answer as
+ *      a resource it declines to resolve. Step 3 is gone, so there is no asymmetry
+ *      left — every refusal this function makes is now a throw, and the second
+ *      half of that argument is the whole of it: `DavNotFoundError(false)` already
+ *      says it and `assertCtag` exists to say it. D-09.
  *
  * Nothing here writes, and nothing here names a writer — `test/dav-tools.test.ts`
  * says so from outside with a request count, and the absence of
@@ -4148,43 +4131,27 @@ async function buildCollectionDeletePreview(
   // Step 2. Zero requests on a warm cache, which is what makes step 3 local.
   const resolved = await resolveDavAccount(env, principal, davFetch, "caldav");
 
-  // Step 3. CALM-07.
+  // Step 3 was CALM-07's local default-calendar refusal, and it is GONE as of
+  // 2026-09-26 rather than merely disabled. The requirement was withdrawn on a
+  // measurement: iCloud answers null for `schedule-default-calendar-URL` both on
+  // the calendar home and on the scheduling inbox where RFC 6638 § 9.2 defines
+  // it, does not implement `DAV:propname` at all, and offers no other mechanism
+  // to enumerate live properties — because Apple's "Default Calendar" is a
+  // per-DEVICE setting and no account-side value exists to read. The full
+  // measurement is recorded at the deleted predicate's own site in
+  // `src/dav/calendar.ts`.
   //
-  // **What happens when the account named no default calendar, said plainly
-  // rather than papered over.** `isDefaultCalendar` answers `false` for every
-  // collection when `defaultCalendarUrl` is null, so this refusal does not fire
-  // and a delete of the account's own default calendar proceeds to the preview.
-  // That is a FAIL-OPEN and it is recorded as one here, on
-  // `resolveDefaultCalendarUrl`'s own footing: whether iCloud populates
-  // `schedule-default-calendar-URL` on the scheduling inbox is unmeasured
-  // against the real account as of 2026-09-25, and plan 17-09's UAT is where it
-  // is settled — `dav_diagnose` reports the resolved value so that measurement
-  // costs one call. What remains in that case is the preview the user reads and
-  // the confirmation gate in front of the commit, which is less than CALM-07
-  // asks for and is not nothing.
+  // The step is not renumbered. The numbers are how this function's docstring and
+  // `test/dav-tools.test.ts` refer to its stages, and silently sliding four of
+  // them down by one would break every reference that names a step by number
+  // while nothing failed to say so.
   //
-  // **No heuristic is substituted, and that is a decision rather than an
-  // omission.** A display-name or position rule is off the table per D-11: a
-  // rule that is right most of the time on the least reversible operation in the
-  // milestone is the "very nearly right" answer this codebase treats as the
-  // worst kind, because it is the one nobody checks.
-  if (isDefaultCalendar(collectionUrl, resolved.defaultCalendarUrl)) {
-    return {
-      id: calendarId,
-      defaultCalendarRefused: true,
-      refusalReason: DEFAULT_CALENDAR_REFUSAL,
-      // Zero and empty throughout, on `nothingMinted`'s argument: the outcome
-      // fields describe what a commit would do, and there is no commit. Here
-      // they are additionally the whole truth, because nothing was read.
-      itemCount: 0,
-      writeCount: 0,
-      confirmToken: null,
-      expiresInSeconds: null,
-      displayName: "",
-      change: null,
-      confirmationLine: null,
-    };
-  }
+  // **No heuristic replaced it, and that stays a decision rather than an
+  // omission.** A display-name or position rule is off the table per D-11: a rule
+  // that is right most of the time on the least reversible operation in the
+  // milestone is the "very nearly right" answer this codebase treats as the worst
+  // kind, because it is the one nobody checks. `resolved` is still read above,
+  // and still for its home URL, which the confirmation seals.
 
   // Steps 4, 5 and 6.
   const state = await readCollectionState(
@@ -4233,8 +4200,6 @@ async function buildCollectionDeletePreview(
 
   return {
     id: calendarId,
-    defaultCalendarRefused: false,
-    refusalReason: null,
     itemCount: state.memberCount,
     // ONE. The commit makes three requests and two of them change nothing.
     writeCount: 1,

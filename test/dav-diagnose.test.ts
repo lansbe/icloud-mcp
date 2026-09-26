@@ -407,9 +407,10 @@ function davStub(
      * `null` is the default and keeps this conversation exactly as it was: the
      * principal answers its home set to the inbox question,
      * `resolveDefaultCalendarUrl` reads no inbox href, and the account's default
-     * calendar resolves to `null`. That is the FAIL-OPEN state CALM-07's refusal
-     * cannot fire in, and `dav_diagnose` exists to say which state a real account
-     * is in.
+     * calendar resolves to `null`. That was the FAIL-OPEN state CALM-07's refusal
+     * could not fire in; the requirement was withdrawn on 2026-09-26 because the
+     * real account is in that state UNCONDITIONALLY, and `dav_diagnose` reporting
+     * which state an account is in is what keeps the withdrawal checkable.
      */
     scheduleInboxUrl?: string | null;
     /** The default calendar that inbox names, or `null` for none. */
@@ -790,13 +791,17 @@ describe("dav_diagnose, end to end", () => {
     );
   }
 
-  it("reports the RESOLVED default calendar on the CalDAV half (CALM-07)", async () => {
+  it("reports the RESOLVED default calendar on the CalDAV half", async () => {
     // **The whole reason this field exists, and the reason it is on the resolved
-    // half rather than only on a collection row.** `isDefaultCalendar` is handed
-    // `ResolvedDavAccount.defaultCalendarUrl` at delete time, and until this field
-    // shipped that value was reachable from no response at all — so whether
-    // iCloud populates the property could only be answered by deploying another
-    // probe. Plan 17-09's UAT reads it in one call instead.
+    // half rather than only on a collection row.** Until it shipped, the value
+    // discovery stored was reachable from no response at all — so whether iCloud
+    // populates the property could only be answered by deploying another probe.
+    // Plan 17-09's UAT read it in one call instead, and got null.
+    //
+    // A delete-time predicate consumed the same value until CALM-07 was withdrawn
+    // on 2026-09-26. This report is now the ONLY reader, which does not weaken the
+    // case — it is what turns the field from a debugging aid into the standing
+    // measurement that would notice Apple starting to populate the property.
     const stub = davStub({
       scheduleInboxUrl: `${CALDAV_HOME}inbox/`,
       defaultCalendarUrl: `${CALDAV_HOME}home/`,
@@ -815,12 +820,14 @@ describe("dav_diagnose, end to end", () => {
     expect(serviceOf(result, "carddav").defaultCalendarUrl).toBeNull();
   });
 
-  it("reports NULL when the account names no default calendar — the fail-open", async () => {
-    // **This is the state the phase's one open risk is about, and the value that
-    // makes it legible.** A null here means `isDefaultCalendar` answers false for
-    // every collection, which means `calendar_delete_calendar` does not refuse the
-    // account's own default calendar. A reader of this response can tell that
-    // state from the other one, which is the entire point of surfacing the field.
+  it("reports NULL when the account names no default calendar", async () => {
+    // **This is the state the real account is always in, and the value that makes
+    // it legible.** It was the phase's one open risk while a delete-time refusal
+    // consumed the value: a null meant the refusal fired for no collection. CALM-07
+    // was withdrawn on that measurement on 2026-09-26, so a null is no longer a
+    // fail-open — it is the answer. A reader of this response can still tell this
+    // state from the other one, which is the entire point of surfacing the field,
+    // and is what would make Apple ever populating the property visible.
     const stub = davStub({ scheduleInboxUrl: null });
     vi.stubGlobal("fetch", stub.fetch);
 
@@ -2204,21 +2211,28 @@ describe("the to-do probe when one collection is refused", () => {
 // ---------------------------------------------------------------------------
 // The property-name probe (phase 17)
 //
-// WHY IT EXISTS, stated here because a reader arriving at a failing case needs
-// it. CALM-07 refuses the account's own default calendar as a delete target,
-// "locally, before any request is sent". Measured live on 2026-09-25 the guard is
+// WHY IT EXISTS, and WHAT IT SETTLED — stated here because a reader arriving at a
+// failing case needs both. CALM-07 asked for a local refusal of the account's own
+// default calendar as a delete target. Measured live on 2026-09-25 the guard was
 // INERT: `CALDAV:schedule-default-calendar-URL` is absent from all thirteen home
-// rows AND from the scheduling inbox, which is where RFC 6638 § 9.2 defines it.
-// The likely explanation is that Apple's "Default Calendar" is a per-DEVICE
-// setting rather than account state — in which case no server property exists to
-// find, and the requirement should be withdrawn.
+// rows AND from the scheduling inbox, which is where RFC 6638 § 9.2 defines it. The
+// likely explanation — Apple's "Default Calendar" is a per-DEVICE setting rather
+// than account state, so no server property exists to find — was plausible and
+// still an INFERENCE, because both probes so far asked for ONE NAMED property,
+// which is a different question from asking what properties exist.
 //
-// That explanation may well be right, and it is still an INFERENCE. Both probes
-// so far asked for ONE NAMED property, which is a different question from asking
-// what properties exist. `DAV:propname` (RFC 4918 § 9.1) is the second question,
-// and these cases are what make it safe to ask a real account: the guarantee that
-// no VALUE can come back through it is pinned against a fixture that sends values
-// anyway, rather than assumed from the RFC.
+// `DAV:propname` (RFC 4918 § 9.1) is the second question, and **iCloud does not
+// implement it.** Measured on deploy `1fce400b`: a correctly-formed request comes
+// back 207 with an empty 200 block and a 404 block naming `propname` ITSELF, the
+// server having read the request MODE as a property name. So the exhaustive route
+// does not exist here, `allprop` cannot substitute for it, and the targeted ask is
+// the strongest evidence the protocol permits. CALM-07 was WITHDRAWN on 2026-09-26.
+//
+// These cases are kept because the probe is kept — it is the instrument that
+// established a permanent fact about this server. They are also what makes it safe
+// to point at a real account: the guarantee that no VALUE can come back through it
+// is pinned against a fixture that sends values anyway, rather than assumed from
+// the RFC.
 // ---------------------------------------------------------------------------
 
 /** One property-name target, as the report carries it. */

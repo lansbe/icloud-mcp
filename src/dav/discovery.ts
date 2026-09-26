@@ -49,18 +49,23 @@ export interface ResolvedDavAccount {
   principalUrl: string;
   homeUrl: string;
   /**
-   * The account's default calendar URL, or `null` when it named none (CALM-07).
+   * The account's default calendar URL, or `null` when it named none.
    *
    * **Resolved for CalDAV only.** On CardDAV it is `null` because the property
    * has no meaning against a contacts home, not because it could not be read.
    *
-   * **`null` is a real stored answer rather than a gap**, and the distinction
-   * matters because of what the value is FOR: a collection delete refuses the
-   * account's default calendar by a local comparison, so the URL has to already
-   * be in hand when the tool is called. A null therefore means "this account
-   * named no default calendar", a caller comparing against it gets `false`, and
-   * the refusal does not fire — which is why `resolveDefaultCalendarUrl` stores a
-   * null it READ and re-throws rather than storing one it merely guessed at.
+   * **On this account it is ALWAYS null, and that is a measurement rather than a
+   * defect.** It arrived for CALM-07, which was withdrawn on 2026-09-26 when the
+   * property was measured absent everywhere it could be asked for. The field was
+   * KEPT; the reason is at `resolveDefaultCalendarUrl`, and the reader that keeps
+   * it honest is `dav_diagnose`, which reports it.
+   *
+   * **`null` is a real stored answer rather than a gap.** A null means "this
+   * account named no default calendar", which is a different statement from "this
+   * server could not find out" — so `resolveDefaultCalendarUrl` stores a null it
+   * READ and re-throws rather than storing one it merely guessed at. That
+   * distinction is what makes the measurement above worth anything: a cached
+   * guess from a throttled request would have looked exactly like the answer.
    */
   defaultCalendarUrl: string | null;
   /** True when no outbound request was made to produce this. */
@@ -101,8 +106,12 @@ export const DISCOVERY_TTL_SECONDS = 86400;
  * URL — and an entry written under the previous version carries every URL the
  * reader wants except that one. Read as the current shape, the missing field
  * would present as `null`, which is indistinguishable from an account that
- * genuinely named no default calendar; and null is precisely the value that
- * makes a delete's refusal not fire. Moving the namespace makes the older
+ * genuinely named no default calendar — and at the time that null was the value
+ * that made a delete's refusal not fire, so reading one where none was stored was
+ * a safety question rather than a tidiness one. CALM-07 has since been withdrawn
+ * and the field reports rather than guards, but the version bump already happened
+ * and is not being unwound: an entry of the older shape is still a value of a
+ * shape this reader does not describe. Moving the namespace makes the older
  * entries unreachable instead, so the first call per user after deploy pays one
  * full rediscovery and every call after it reads a value of the current shape.
  *
@@ -277,7 +286,36 @@ function hrefPropOf(value: unknown, base: string): string | null {
 }
 
 /**
- * The account's default calendar URL, resolved once per discovery (CALM-07, D-11).
+ * The account's default calendar URL, resolved once per discovery (D-11).
+ *
+ * ## KEPT after CALM-07 was withdrawn, and this is the decision
+ *
+ * This function arrived to serve one caller: a local refusal of the account's
+ * default calendar as a delete target. That requirement was WITHDRAWN on
+ * 2026-09-26 and its predicate deleted, so the caller is gone. The choice was
+ * between retiring this with it and keeping it. It was KEPT, for three reasons
+ * worth more than the two requests it costs on a cache miss.
+ *
+ * 1. **It is the instrument that took the measurement that closed the question.**
+ *    The home-listing null was suggestive; THIS function's null is the one that
+ *    settles it, because it asks at the location RFC 6638 § 9.2 actually defines
+ *    the property on. Deleting the instrument makes the fact unre-measurable, and
+ *    the fact — iCloud serves no default-calendar property — is permanent and
+ *    reusable. `runPropertyNameProbe` is kept on exactly this footing.
+ * 2. **It has a live consumer, which is what keeps it honest.** `dav_diagnose`
+ *    reports `caldav.defaultCalendarUrl`. That is not decoration: it means if
+ *    Apple ever starts populating the property, ONE diagnostic call says so,
+ *    against a real account, without a deploy. A kept function with no reader
+ *    would be dead code; a kept function whose value is reported is a standing
+ *    measurement.
+ * 3. **The cost is bounded and already paid for.** Two PROPFINDs, only on a
+ *    discovery MISS, never per operation — already fenced by the home-containment
+ *    check below and already named in `dav-concurrent-request`.
+ *
+ * What this function must NOT acquire is a second consumer that acts on the
+ * value. It reports a fact; it no longer guards anything. Wiring it back to a
+ * refusal would be re-adopting CALM-07, which is a decision rather than a
+ * refactor.
  *
  * ## Why this is two requests rather than none
  *
@@ -293,10 +331,12 @@ function hrefPropOf(value: unknown, base: string): string | null {
  * then ask that inbox directly. RFC 6638 § 9.2 defines the property ON the inbox,
  * so asking the inbox is where the question belongs.
  *
- * **Two extra requests on a cache MISS, and none per delete.** That is the
- * distinction D-11's "zero extra requests" was always about: CALM-07 words the
- * refusal as local, "before any request is sent", so the cost has to land where
- * the discovery cost already is rather than on the operation being refused.
+ * **Two extra requests on a cache MISS, and none per operation.** That is the
+ * distinction D-11's "zero extra requests" was always about: CALM-07 worded its
+ * refusal as local, "before any request is sent", so the cost had to land where
+ * the discovery cost already is rather than on the operation being refused. The
+ * requirement is gone and the shape stays right — a standing measurement that
+ * costs nothing on a warm cache is the only kind worth keeping.
  *
  * ## Serial, and not merely as a connection-budget matter
  *
@@ -422,9 +462,11 @@ export async function resolveDefaultCalendarUrl(
  *
  * On a miss it runs tsdav's three-stage chain, resolves the account's default
  * calendar, and stores all of it under one key. The default-calendar resolution
- * costs two further requests on the miss and NONE on every hit afterwards, which
- * is what makes a collection delete's CALM-07 refusal a local string comparison
- * — see `resolveDefaultCalendarUrl`. **Neither
+ * costs two further requests on the miss and NONE on every hit afterwards. That
+ * property arrived to make a collection delete's CALM-07 refusal local; the
+ * requirement was withdrawn on 2026-09-26 and the resolution was kept as a
+ * standing measurement — see `resolveDefaultCalendarUrl`, which holds the
+ * decision. **Neither
  * of `createAccount`'s two eager-load flags is ever passed**, and they are
  * described here rather than spelled, on `src/mail/socket.ts`'s own precedent:
  * a future scan rule bans those two token names under `src/dav/`, so a comment
@@ -475,8 +517,10 @@ export async function resolveDavAccount(
   }
 
   // Resolved HERE, on the miss, and stored with the triple — so a warm call
-  // hands the delete path its comparand for zero outbound requests, which is the
-  // whole of what CALM-07's "locally, before any request is sent" asks for.
+  // costs zero outbound requests for it. That was the whole of what CALM-07's
+  // "locally, before any request is sent" asked for; the requirement was
+  // withdrawn on 2026-09-26 and the placement is kept, because a measurement
+  // that is free on a warm cache is one nobody is tempted to remove for cost.
   // CardDAV skips it outright: the property is a CalDAV one and there is nothing
   // to ask a contacts home about.
   const defaultCalendarUrl =

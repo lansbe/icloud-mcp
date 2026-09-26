@@ -124,21 +124,23 @@ export interface DavServiceReport {
   /**
    * CalDAV only: the account's default calendar URL, as discovery resolved it.
    *
-   * **Here so CALM-07 can be MEASURED in one call rather than in a second
-   * deploy.** `resolveDefaultCalendarUrl` asks the principal for its scheduling
-   * inbox and then asks that inbox for `CALDAV:schedule-default-calendar-URL`,
-   * and whether iCloud POPULATES that property on the inbox is unmeasured
-   * against the real account as of 2026-09-25 — the depth-1 home listing
-   * answered it empty on all thirteen rows, which says nothing about what the
-   * inbox itself answers. Until this field existed the resolved value was
-   * reachable from no response at all, so the question could only be answered by
-   * shipping another probe.
+   * **It was added so CALM-07 could be MEASURED in one call rather than in a
+   * second deploy, and the measurement came back NULL.** On this account, on
+   * every deploy since `7c0afd3a`, this field reads `null`:
+   * `resolveDefaultCalendarUrl` asks the principal for its scheduling inbox and
+   * then asks that inbox for `CALDAV:schedule-default-calendar-URL`, which is
+   * where RFC 6638 § 9.2 defines the property, and iCloud answers nothing. The
+   * depth-1 home listing answered it empty on all thirteen rows as well.
+   * `runPropertyNameProbe` then closed the remaining "is there some OTHER
+   * property" by measuring that iCloud does not implement `DAV:propname` at all.
+   * CALM-07 was withdrawn on that evidence on 2026-09-26.
    *
-   * **What hangs on the answer, stated rather than left to be found.** A `null`
-   * here means `isDefaultCalendar` answers `false` for every collection, which
-   * means `calendar_delete_calendar` does not refuse the account's own default
-   * calendar. That is a fail-open on the least reversible operation in the
-   * milestone, and it is recorded as one on the guard, on the resolver, and here.
+   * **It is KEPT, and reporting it is what keeps the withdrawal honest.** Nothing
+   * acts on the value any more — the delete-time predicate it fed is deleted — so
+   * this field is now a STANDING MEASUREMENT. If Apple ever begins populating the
+   * property, one `dav_diagnose` call against a real account says so, with no
+   * deploy and no new probe. That is the whole reason the resolver survived the
+   * requirement; see `resolveDefaultCalendarUrl`, which holds the decision.
    *
    * It is a URL under the account's OWN resolved home set and it is not a
    * credential — the same class of value as `homeUrl` and `principalUrl` beside
@@ -525,20 +527,24 @@ export interface PropertyNameTarget {
 /**
  * What property NAMES iCloud carries on four resources of this account.
  *
- * **It exists because two targeted probes came back null and a requirement is
- * about to be deleted on the strength of that.** CALM-07 refuses the account's
- * default calendar as a delete target, and the refusal is inert: measured live on
+ * **It existed because two targeted probes came back null and a requirement was
+ * about to be deleted on the strength of that, and it ANSWERED.** CALM-07 asked
+ * for a local refusal of the account's default calendar; measured live on
  * 2026-09-25, `CALDAV:schedule-default-calendar-URL` is absent from all thirteen
  * home rows AND from the scheduling inbox, which is where RFC 6638 § 9.2 defines
- * it. The likely explanation is that Apple's "Default Calendar" is a per-DEVICE
- * setting rather than account state, in which case no server property exists to
- * find. That explanation may well be right, and it is still an INFERENCE: both
- * probes so far asked for ONE NAMED property, which is a different question from
- * asking what properties exist.
+ * it. The likely explanation — Apple's "Default Calendar" is a per-DEVICE setting
+ * rather than account state, so no server property exists to find — was plausible
+ * and still an INFERENCE, because both probes so far asked for ONE NAMED property,
+ * which is a different question from asking what properties exist.
  *
  * `DAV:propname` is that second question. RFC 4918 § 9.1 defines a PROPFIND whose
  * body is `<D:propfind><D:propname/></D:propfind>` as returning the name of every
- * property the resource carries, WITH NO VALUES. So this is the exhaustive ask.
+ * property the resource carries, WITH NO VALUES. So this was the exhaustive ask —
+ * and **iCloud does not implement it.** Measured on deploy `1fce400b`: the server
+ * answers 207 with an empty 200 block and a 404 block naming `propname` itself,
+ * having read the request MODE as the name of a property being requested. The
+ * measurement, and why `allprop` cannot substitute for it, are recorded in full on
+ * `runPropertyNameProbe` below. CALM-07 was withdrawn on 2026-09-26.
  *
  * **What makes it safe to point at a real account is the READING and not the
  * RFC, and that distinction was earned rather than chosen.** The first version of
@@ -559,12 +565,13 @@ export interface PropertyNameTarget {
  * before. See the section above `propertyNamesInBody` for the rule that follows
  * from it, which is the part that generalises past this probe.
  *
- * **Nothing here decides anything.** The probe reports names; whether Apple
- * exposes a default-calendar property, and what CALM-07 should therefore say, is
- * the owner's call on this reading. A verdict computed in this file would be this
- * file deciding CALM-07. That is unchanged by the defect above, and so is the
- * current state of the question: the earlier reading settled NOTHING, because a
- * broken instrument's silence is not evidence of absence.
+ * **Nothing here decides anything, and that held right through the verdict.** The
+ * probe reports names; what CALM-07 should therefore say was the owner's call on
+ * this reading, and the owner made it on 2026-09-26. A verdict computed in this
+ * file would have been this file deciding CALM-07. Note which reading counted: the
+ * first one, before the parse defect was fixed, settled NOTHING, because a broken
+ * instrument's silence is not evidence of absence. The reading that counted is the
+ * one taken after the fix, on deploy `1fce400b`.
  */
 export interface PropertyNameProbe {
   /** One entry per target, in the fixed order the probe asks them. */
@@ -656,8 +663,11 @@ function fillResolved(
   report.shardHost = shardHostOf(resolved.homeUrl);
   report.cacheHit = resolved.cacheHit;
   // Read off the RESOLVED account rather than re-derived, so what this reports is
-  // the value `isDefaultCalendar` will actually be handed at delete time. On the
-  // CardDAV half it is null because `resolveDavAccount` never asks.
+  // the value discovery actually stored rather than a second reading of it. That
+  // mattered when a delete-time predicate consumed the same value; since CALM-07's
+  // withdrawal on 2026-09-26 this report is the ONLY reader, which makes reading
+  // it off the resolved account the whole of the measurement rather than a check
+  // on it. On the CardDAV half it is null because `resolveDavAccount` never asks.
   report.defaultCalendarUrl = resolved.defaultCalendarUrl;
 }
 
@@ -958,7 +968,7 @@ async function runOneService(
 
 // ---------------------------------------------------------------------------
 // The opt-in probes (Phase 14: SPIKE-04 and SPIKE-02's object-level half;
-// phase 17: the property-name reading CALM-07's verdict is waiting on).
+// phase 17: the property-name reading that CALM-07's verdict was taken on).
 //
 // Every one of them is OFF by default, every one is reached only through its own
 // named boolean on `dav_diagnose`, and none takes a URL, an identifier or a name
@@ -1838,13 +1848,46 @@ interface PropertyNameAsk {
 /**
  * Ask four of this account's resources what property NAMES they carry.
  *
+ * ## WHAT IT MEASURED: iCloud does not implement `DAV:propname`
+ *
+ * This probe was built to answer an open question and the question is CLOSED. Run
+ * against the owner's real account on deploy `1fce400b`, it sends a
+ * correctly-formed `<d:propfind xmlns:d="DAV:"><d:propname/></d:propfind>` at
+ * `Depth: 0` — the element as a CHILD of `propfind` and not inside `prop`,
+ * verified against the request the library actually assembles — and iCloud answers
+ * **207 with an empty 200 block and a 404 block naming `propname` ITSELF**. The
+ * server read `propname` as the NAME OF A PROPERTY BEING REQUESTED. RFC 4918 § 9.1
+ * defines it as a request MODE; iCloud treats it as a property name.
+ *
+ * So the exhaustive-enumeration route does not exist on this server, and
+ * `DAV:allprop` cannot substitute: § 9.1 returns dead properties plus the live
+ * properties RFC 4918 ITSELF defines, so a CalDAV live property needs `<include>`,
+ * and `include` requires NAMING the property — which is a targeted ask and not an
+ * enumeration. **There is therefore no WebDAV mechanism to enumerate live
+ * properties exhaustively against iCloud, and a targeted ask at the location the
+ * relevant RFC defines is the strongest evidence this protocol permits.**
+ *
+ * That measurement is what withdrew CALM-07, on 2026-09-26: the requirement asked
+ * for a local refusal of the account's default calendar, iCloud answers null for
+ * `schedule-default-calendar-URL` both on the calendar home and on the scheduling
+ * inbox where RFC 6638 § 9.2 defines it, and this probe closed the remaining "but
+ * is there some OTHER property" by showing the question cannot be asked. The
+ * domain fact behind every null: Apple's "Default Calendar" is a PER-DEVICE
+ * setting, so there is no account-side value to serve.
+ *
+ * **It is KEPT rather than retired with the requirement it settled**, and that is
+ * the point of this section. The finding above is a permanent, reusable fact about
+ * THIS server — the next time anyone wonders what properties an iCloud resource
+ * carries, the answer is "it will not tell you, and here is the instrument that
+ * established that". Deleting the instrument would leave the fact as a claim in
+ * prose with nothing behind it, and the first session to doubt it would rebuild
+ * this probe from scratch. `resolveDefaultCalendarUrl` is kept on the same
+ * footing.
+ *
  * READ-ONLY. `DAV:propname` (RFC 4918 § 9.1) asks for names, this reading takes
  * names, and no text content or attribute value is read out of the answer at any
  * point — so there is no value in the response for this code to mishandle even if
- * the server sends one. It writes nothing, it goes nowhere near `src/mail/`, and
- * `PropertyNameProbe`'s own docstring records why it exists — a requirement is
- * about to be deleted on an inference, and this is the measurement that either
- * confirms the inference or refutes it.
+ * the server sends one. It writes nothing, and it goes nowhere near `src/mail/`.
  *
  * **The ANSWER is read out of the raw body, never out of the library's parse.**
  * That is the whole of plan 17-05's fix and the section above

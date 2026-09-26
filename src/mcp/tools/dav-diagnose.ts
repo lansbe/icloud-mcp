@@ -149,11 +149,14 @@ export function davDiagnosticResult(outcome: DavDiagnosticOutcome): ToolResult {
  *
  * `probePropertyNames` asks four of this account's resources — the principal, the
  * calendar home, the scheduling inbox and one real calendar — which property
- * NAMES they carry, through `DAV:propname` (RFC 4918 § 9.1). It exists because
- * CALM-07's refusal of the account's default calendar is currently inert: two
- * probes asking for ONE NAMED property each came back null, and a requirement is
- * about to be deleted on the inference that Apple therefore exposes nothing. This
- * is the exhaustive form of the question. Four things bound it. It is OFF unless
+ * NAMES they carry, through `DAV:propname` (RFC 4918 § 9.1). It was added because
+ * CALM-07's refusal of the account's default calendar was inert: two probes asking
+ * for ONE NAMED property each came back null, and a requirement was about to be
+ * deleted on the inference that Apple therefore exposes nothing. It ANSWERED — by
+ * measuring that iCloud does not implement `propname` at all, so the exhaustive
+ * form of the question cannot be asked here; the requirement was withdrawn on that
+ * on 2026-09-26, and the probe is kept because the finding is a permanent fact
+ * about this server. See `runPropertyNameProbe`. Four things bound it. It is OFF unless
  * asked for by name. It is READ-ONLY in the strongest form available, because the
  * server answers a `propname` request with names and NO VALUES — so no calendar
  * title, colour, URL or other property content can ride out through it, and the

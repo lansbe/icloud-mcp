@@ -259,15 +259,17 @@ export const TRUSTED_FIELD_ALLOWLIST: Record<string, AllowedShape> = {
     // array is a real answer rather than an absent one.
   },
 
-  // -- calendar_delete_calendar (CALM-06, CALM-07) --------------------------
+  // -- calendar_delete_calendar (CALM-06) -----------------------------------
   //
-  // The preview for the most destructive operation in the project, and the
-  // entries worth arguing here are the two STRINGS. `refusalReason` is prose and
-  // it is out here anyway, because it is drawn from ONE closed constant this
-  // server declares — `DEFAULT_CALENDAR_REFUSAL` in `src/mcp/tools/calendar.ts` —
-  // and quotes nothing at all: no calendar name, no URL, no server answer. The
-  // closed constant IS the mitigation § 4 asks for, exactly as
-  // `calendarUpdatedToolResult`'s two arrays are one entry up.
+  // The preview for the most destructive operation in the project. **There is no
+  // STRING on the trusted half of this shape any more**, and that is the change
+  // CALM-07's withdrawal on 2026-09-26 made here. Two entries went: a
+  // `defaultCalendarRefused` boolean and a `refusalReason` drawn from one closed
+  // constant. The constant was the mitigation § 4 asks for, exactly as
+  // `calendarUpdatedToolResult`'s two arrays are one entry up — it is gone because
+  // the refusal it worded is gone, not because the mitigation was relaxed. iCloud
+  // serves no default-calendar property; the measurement is in
+  // `src/dav/calendar.ts`.
   //
   // **Note what is NOT here: `displayName` and `confirmationLine`.** The name is
   // chosen by whoever shared the calendar, and the line quotes it, so both ride
@@ -276,8 +278,6 @@ export const TRUSTED_FIELD_ALLOWLIST: Record<string, AllowedShape> = {
   collectionPreviewToolResult: {
     top: new Set([
       "id", // server-generated: base64url(JSON) minted here over a collection URL.
-      "defaultCalendarRefused", // server-generated: a boolean this server decided by a LOCAL comparison against a memoised URL. No request, no server text.
-      "refusalReason", // server-generated: one closed constant this server declares, or null. Quotes no name, no URL and no server answer.
       "itemCount", // server-generated: a count this server took by walking the collection's own depth-1 listing, container row excluded.
       "writeCount", // server-generated: a number this server knows because it wrote the commit.
       "confirmToken", // server-generated: signed here with this server's own key.
@@ -1076,8 +1076,6 @@ function collectionDeletePreview(
 ): CollectionDeletePreview {
   return {
     id: encodeCalendarId({ collectionUrl: CALENDAR_URL }),
-    defaultCalendarRefused: false,
-    refusalReason: null,
     itemCount: 9,
     writeCount: 1,
     confirmToken: "cGF5bG9hZA.bWFj",
@@ -1332,18 +1330,26 @@ describe("the trusted block of every shipped DAV shaper", () => {
   it("collectionPreviewToolResult publishes exactly the audited keys", () => {
     const shape = TRUSTED_FIELD_ALLOWLIST.collectionPreviewToolResult;
 
-    // Driven on the MINTED path and on the REFUSAL, because the key set must be
-    // the same on both and the refusal is where a shaper would be tempted to drop
-    // a key rather than publish a null. A field that appears only when it is
-    // interesting teaches a reader to treat its absence as the absence of the
+    // Driven on the MINTED path and on an ALL-NULLS one, because the key set must
+    // be the same on both and a null-valued field is where a shaper would be
+    // tempted to drop a key rather than publish it. A field that appears only when
+    // it is interesting teaches a reader to treat its absence as the absence of the
     // question rather than as an answer to it.
+    //
+    // **The second row was labelled "refused" until 2026-09-26** and carried
+    // CALM-07's `defaultCalendarRefused: true` plus its reason string. That
+    // requirement was withdrawn and its two fields deleted, so there is no refusal
+    // shape at this layer any longer — every refusal `buildCollectionDeletePreview`
+    // makes is now a throw. The row is KEPT rather than deleted with the fields,
+    // because the property it pins was never about CALM-07: the shape's nullable
+    // fields are nullable in the TYPE, and this is the only case that proves the
+    // shaper publishes them as keys carrying null rather than omitting them. Naming
+    // it after the requirement is what made it look otherwise.
     for (const [label, preview] of [
       ["minted", collectionDeletePreview()],
       [
-        "refused",
+        "all-nulls",
         collectionDeletePreview({
-          defaultCalendarRefused: true,
-          refusalReason: "This is the account's default calendar.",
           itemCount: 0,
           writeCount: 0,
           confirmToken: null,
