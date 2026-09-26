@@ -250,11 +250,24 @@ const FIRST_CALENDAR = `${CALDAV_HOME}home/`;
 /**
  * A `DAV:propname` answer: one `response`, every property NAMED and EMPTY.
  *
- * Empty elements, because that is what the RFC says a server sends — the whole
- * safety argument for pointing this probe at a real account is that there is no
- * value in the response to mishandle. `valuedPropNameBody` below is the
- * non-conformant twin that carries values anyway, and the two together are what
- * pin the names-only guarantee rather than assume it.
+ * Empty elements, because that is what the RFC says a server sends.
+ *
+ * **THIS IS RFC 4918 § 9.1's SHAPE AND NOT A MEASURED ONE, and that limit is
+ * stated here because not stating it is what shipped a broken probe.** Nothing in
+ * this repository has ever seen iCloud's actual answer to this request. The first
+ * version of the probe passed ten cases against fixtures of exactly this shape and
+ * returned an empty name list for all four targets in production, twice. So the
+ * cases below prove the reader handles the SPECIFIED shape; they cannot prove
+ * iCloud sends it, and no fixture written here ever will.
+ *
+ * What closes that gap is on the probe's own side rather than in this file: a
+ * target whose answer carries no propstat now reports `unreadable_response`
+ * together with the element names the body DID carry, so the next live run says
+ * what shape the real answer has. See `PropertyNameTarget.bodyElements`.
+ *
+ * `valuedPropNameBody` below is the non-conformant twin that carries values
+ * anyway, and the two together are what pin the names-only guarantee rather than
+ * assume it.
  */
 function propNameBody(href: string, ...names: string[]): string {
   const props = names.map((name) => `<${name}/>`).join("");
@@ -271,11 +284,16 @@ function propNameBody(href: string, ...names: string[]): string {
  * the interesting property could not show which resource carries it, which is the
  * entire question this probe exists to answer.
  *
- * Spelled the way iCloud spells them, on the wire: the DAV library strips the
- * namespace prefix and camel-cases the remainder, so `C:schedule-default-
- * calendar-URL` arrives as `scheduleDefaultCalendarURL`. Asserting the CAMELCASED
- * form against a fixture written in the WIRE form is what makes these cases read
- * the real transformation rather than a restatement of it.
+ * **Written in the WIRE form, and now ASSERTED in the wire form too.** These
+ * cases used to assert the DAV library's spelling — the namespace prefix stripped
+ * and the remainder camel-cased, so `C:schedule-default-calendar-URL` read back as
+ * `scheduleDefaultCalendarURL`. That transformation is gone because the reading it
+ * belonged to is gone: the probe reads names out of the raw body now, so a name
+ * comes back exactly as the server wrote it, prefix and all. The mixed prefixes
+ * below are deliberate for that reason — `C:`-prefixed properties beside bare ones
+ * in the document's default namespace — because a fixture where every name carried
+ * a prefix could not show that a bare one survives, and one where none did could
+ * not show that a prefix is kept rather than stripped.
  */
 function defaultPropNames(url: string): Response {
   if (url === CALDAV_PRINCIPAL) {
@@ -2207,7 +2225,12 @@ describe("the to-do probe when one collection is refused", () => {
 interface NameTarget {
   target: string;
   href: string;
+  reading: string;
   names: string[] | null;
+  blocks: { status: number | null; names: string[] }[] | null;
+  status: number | null;
+  bodyChars: number | null;
+  bodyElements: string[] | null;
   category: string | null;
 }
 
@@ -2330,18 +2353,21 @@ describe("what property NAMES iCloud carries, asked exhaustively", () => {
       FIRST_CALENDAR,
     ]);
 
-    // Sorted, de-duplicated, and spelled as the DAV library hands them back: the
-    // namespace prefix stripped and the remainder camel-cased. The fixture is
-    // written in the WIRE form, so these lists read the real transformation.
+    // Sorted, de-duplicated, and spelled AS THE SERVER WROTE THEM — prefix and
+    // all. These lists used to assert the DAV library's camel-cased spelling, and
+    // they changed because the reading changed: the probe takes names out of the
+    // raw body now, because the library's parse could not answer this question at
+    // all. A `C:`-prefixed name beside a bare one in every list is what proves the
+    // prefix is KEPT rather than stripped, and that a bare name survives too.
     expect(targetNamed(probe, "principal")!.names).toEqual([
-      "calendarHomeSet",
-      "currentUserPrincipal",
-      "principalURL",
-      "scheduleInboxURL",
-      "scheduleOutboxURL",
+      "C:calendar-home-set",
+      "C:schedule-inbox-URL",
+      "C:schedule-outbox-URL",
+      "current-user-principal",
+      "principal-URL",
     ]);
     expect(targetNamed(probe, "home")!.names).toEqual([
-      "currentUserPrivilegeSet",
+      "current-user-privilege-set",
       "displayname",
       "owner",
       "resourcetype",
@@ -2350,16 +2376,41 @@ describe("what property NAMES iCloud carries, asked exhaustively", () => {
     // property on the scheduling inbox, and this is the reading that would show
     // it there if iCloud carried it.
     expect(targetNamed(probe, "schedule-inbox")!.names).toEqual([
+      "C:schedule-default-calendar-URL",
       "getctag",
       "resourcetype",
-      "scheduleDefaultCalendarURL",
     ]);
     expect(targetNamed(probe, "calendar")!.names).toEqual([
+      "C:supported-calendar-component-set",
       "displayname",
       "resourcetype",
-      "supportedCalendarComponentSet",
     ]);
     for (const one of probe.targets) expect(one.category).toBeNull();
+
+    // Every target ANSWERED, and says so with the discriminator rather than
+    // leaving a reader to infer it from three nullable fields.
+    for (const one of probe.targets) {
+      expect(one.reading).toBe("names_read");
+      expect(one.status).toBe(207);
+      expect(one.bodyChars).toBeGreaterThan(0);
+      // Only an unreadable answer reports the body's shape.
+      expect(one.bodyElements).toBeNull();
+    }
+
+    // The propstat each name was found under, carried as a NUMBER. The fixture
+    // sends one all-200 block per target, which is what a conformant `propname`
+    // answer is — the non-2xx case has its own case below.
+    expect(targetNamed(probe, "home")!.blocks).toEqual([
+      {
+        status: 200,
+        names: [
+          "current-user-privilege-set",
+          "displayname",
+          "owner",
+          "resourcetype",
+        ],
+      },
+    ]);
 
     // FOUR requests, one per target, each a depth-0 PROPFIND.
     const asked = propNameRequests(stub);
@@ -2418,10 +2469,14 @@ describe("what property NAMES iCloud carries, asked exhaustively", () => {
     expect(probe.targets.length).toBe(4);
     for (const one of probe.targets) {
       expect(one.names).toEqual([
-        "calendarColor",
+        "C:schedule-default-calendar-URL",
+        "ca:calendar-color",
         "displayname",
-        "scheduleDefaultCalendarURL",
       ]);
+      // A propstat WAS found, so the body's shape is not reported — which also
+      // means the `href` element nested inside the third property's VALUE never
+      // reaches the response under any field.
+      expect(one.bodyElements).toBeNull();
     }
 
     // Non-vacuity first: the values really were sent, so a probe that carried
@@ -2475,9 +2530,9 @@ describe("what property NAMES iCloud carries, asked exhaustively", () => {
 
     // And the target after it was still asked, which is the "keeps going" half.
     expect(targetNamed(probe, "calendar")!.names).toEqual([
+      "C:supported-calendar-component-set",
       "displayname",
       "resourcetype",
-      "supportedCalendarComponentSet",
     ]);
     expect(propNameRequests(stub).length).toBe(4);
 
@@ -2569,9 +2624,252 @@ describe("what property NAMES iCloud carries, asked exhaustively", () => {
     const probe = nameProbeOf(result)!;
     expect(targetNamed(probe, "schedule-inbox")!.names).toBeNull();
     expect(targetNamed(probe, "schedule-inbox")!.category).toBe("not_found");
+    expect(targetNamed(probe, "schedule-inbox")!.reading).toBe("refused");
     // Asked, answered, and named nothing. An EMPTY ARRAY, not a null.
     expect(targetNamed(probe, "calendar")!.names).toEqual([]);
     expect(targetNamed(probe, "calendar")!.category).toBeNull();
+    // And the state is `names_read` rather than the unreadable one: the answer
+    // carried a propstat with an EMPTY prop element, which is a server saying
+    // "nothing" rather than an answer this run could not read. Those two used to
+    // be the same reading, and telling them apart is the whole of this fix.
+    expect(targetNamed(probe, "calendar")!.reading).toBe("names_read");
+    expect(targetNamed(probe, "calendar")!.blocks).toEqual([
+      { status: 200, names: [] },
+    ]);
+  });
+
+  it("says a target ANSWERED but could not be READ, and reports the body's shape", async () => {
+    // THE STATE THIS PLAN EXISTS FOR, and it is the one the report could not
+    // express when the probe shipped. Measured live on 2026-09-25, all four
+    // targets came back with an EMPTY name list and a null category against an
+    // account that unquestionably carries `displayname` and `resourcetype` on
+    // every one of them — and there was no field that could say "the server
+    // answered and this run could not read the answer", because that reading and
+    // "the server named nothing" were the same two characters.
+    //
+    // Two shapes, because they lead to DIFFERENT fixes and the report has to tell
+    // them apart: a body with nothing in it, and a body with something in it that
+    // is not a multistatus. The second is what reveals whether the next live run
+    // is looking at a reader problem or an instrument problem.
+    const EMPTY = new Response(null, { status: 200, headers: XML_HEADERS });
+    const NOT_MULTISTATUS = new Response(
+      `<?xml version="1.0" encoding="UTF-8"?><D:error xmlns:D="DAV:"><D:propfind-finite-depth/></D:error>`,
+      { status: 200, headers: XML_HEADERS },
+    );
+    const stub = davStub({
+      caldavHomeBody: calendarListWithInboxBody,
+      propNames: (url) => {
+        if (url === CALDAV_PRINCIPAL) return EMPTY;
+        if (url === SCHEDULE_INBOX) return NOT_MULTISTATUS;
+        return defaultPropNames(url);
+      },
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probePropertyNames: true,
+    });
+
+    expect(result.isError).toBeUndefined();
+    const probe = nameProbeOf(result)!;
+
+    // Nothing at all came back. A zero length is what separates this from the
+    // shape below, and it is the safest diagnostic there is: a count of nothing.
+    const empty = targetNamed(probe, "principal")!;
+    expect(empty.reading).toBe("unreadable_response");
+    expect(empty.names).toBeNull();
+    expect(empty.blocks).toBeNull();
+    expect(empty.category).toBeNull();
+    expect(empty.status).toBe(200);
+    expect(empty.bodyChars).toBe(0);
+    expect(empty.bodyElements).toEqual([]);
+
+    // Something came back and it was not a multistatus. The ELEMENT NAMES say so,
+    // which is what the next live run needs in order to distinguish "the reader is
+    // wrong" from "the request got a different kind of answer".
+    const other = targetNamed(probe, "schedule-inbox")!;
+    expect(other.reading).toBe("unreadable_response");
+    expect(other.names).toBeNull();
+    expect(other.category).toBeNull();
+    expect(other.bodyElements).toEqual(["D:error", "D:propfind-finite-depth"]);
+    expect(other.bodyChars).toBeGreaterThan(0);
+
+    // Neither cost the targets around them, which is this probe's standing rule.
+    expect(targetNamed(probe, "home")!.reading).toBe("names_read");
+    expect(targetNamed(probe, "calendar")!.names).not.toBeNull();
+    expect(propNameRequests(stub).length).toBe(4);
+  });
+
+  it("reads the names a NON-2xx propstat carried, and says which block", async () => {
+    // A property a resource knows but will not disclose to this caller arrives in
+    // a 403 block; one it has never heard of arrives in a 404 block. Both ANSWER
+    // "what properties exist here", and the DAV library's parse discards every
+    // non-2xx block outright — so through that parse these names do not exist.
+    // Reading the raw body is what makes them visible, and this case is the half
+    // of the fix that the four conformant fixtures cannot show.
+    const split = (href: string): Response =>
+      multistatus(
+        `<response><href>${href}</href>` +
+          `<propstat><prop><displayname/><resourcetype/></prop><status>HTTP/1.1 200 OK</status></propstat>` +
+          `<propstat><prop><C:schedule-default-calendar-URL/></prop><status>HTTP/1.1 404 Not Found</status></propstat>` +
+          `</response>`,
+      );
+    const stub = davStub({
+      caldavHomeBody: calendarListWithInboxBody,
+      propNames: (url) =>
+        url === SCHEDULE_INBOX ? split(SCHEDULE_INBOX) : defaultPropNames(url),
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probePropertyNames: true,
+    });
+
+    const inbox = targetNamed(nameProbeOf(result)!, "schedule-inbox")!;
+    expect(inbox.reading).toBe("names_read");
+    // The union, across both blocks. The name in the 404 block is the one the
+    // whole probe is looking for, so dropping it would be the worst possible
+    // place for this reader to be silently short.
+    expect(inbox.names).toEqual([
+      "C:schedule-default-calendar-URL",
+      "displayname",
+      "resourcetype",
+    ]);
+    // And split by the block each was named under, so "has it and will not say"
+    // reads differently from "has never heard of it".
+    expect(inbox.blocks).toEqual([
+      { status: 200, names: ["displayname", "resourcetype"] },
+      { status: 404, names: ["C:schedule-default-calendar-URL"] },
+    ]);
+  });
+
+  it("keeps a status LINE out of the report and only its NUMBER in", async () => {
+    // ./.claude/CLAUDE.md § 4: no diagnostic field may echo a server's status
+    // line. Reading the propstat's status is the ONE text read in this whole
+    // reading, so it is the one place that rule could be broken by accident, and
+    // the statusText below is written to be unmistakable in a serialised report.
+    const chatty = (href: string): Response =>
+      multistatus(
+        `<response><href>${href}</href>` +
+          `<propstat><prop><displayname/></prop>` +
+          `<status>HTTP/1.1 403 Forbidden for Russell on this shard</status>` +
+          `</propstat></response>`,
+      );
+    const stub = davStub({
+      caldavHomeBody: calendarListWithInboxBody,
+      propNames: (url) => chatty(url),
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probePropertyNames: true,
+    });
+
+    const probe = nameProbeOf(result)!;
+    // Non-vacuity first: the line really was parsed, so a reader that carried it
+    // through would have had it in hand at that moment.
+    expect(targetNamed(probe, "home")!.blocks).toEqual([
+      { status: 403, names: ["displayname"] },
+    ]);
+
+    const whole = result.content[0].text;
+    for (const fragment of [
+      "Forbidden for Russell on this shard",
+      "HTTP/1.1",
+    ]) {
+      expect(
+        whole.includes(fragment),
+        `a status LINE reached the response: ${fragment}`,
+      ).toBe(false);
+    }
+  });
+
+  it("reads a body whose STRUCTURAL elements are prefixed and indented", async () => {
+    // THE CASE CLOSEST TO THE REAL ACCOUNT, and the one whose absence would repeat
+    // this plan's own defect. Every other fixture in this file writes `response`,
+    // `propstat`, `prop` and `status` BARE in a default namespace and on one line,
+    // because that is how this repository has always written them. A real server
+    // may prefix all four and pretty-print the whole body — iCloud prefixes
+    // structural elements throughout its discovery answers — and a reader that
+    // matched on the bare spelling, or that assumed a status line sits immediately
+    // after its tag, would find nothing and report an empty list. Which is exactly
+    // the reading production returned on 2026-09-25.
+    //
+    // **This shape is a reasoned guess and is NOT a measurement.** Nothing in this
+    // repository has seen iCloud's answer to this request. What the case pins is
+    // that the reader does not depend on the one spelling this file happens to use.
+    const prefixedIndented = (href: string): Response =>
+      new Response(
+        `<?xml version="1.0" encoding="UTF-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/">
+  <D:response>
+    <D:href>${href}</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:displayname/>
+        <D:resourcetype/>
+        <CS:getctag/>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>`,
+        { status: 207, headers: XML_HEADERS },
+      );
+    const stub = davStub({
+      caldavHomeBody: calendarListWithInboxBody,
+      propNames: (url) => prefixedIndented(url),
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probePropertyNames: true,
+    });
+
+    const probe = nameProbeOf(result)!;
+    for (const one of probe.targets) {
+      expect(one.reading).toBe("names_read");
+      // The prefix is kept, and the two namespaces stay distinguishable.
+      expect(one.names).toEqual([
+        "CS:getctag",
+        "D:displayname",
+        "D:resourcetype",
+      ]);
+      // The status line survived the indentation and the prefix, as a NUMBER.
+      expect(one.blocks).toEqual([
+        {
+          status: 200,
+          names: ["CS:getctag", "D:displayname", "D:resourcetype"],
+        },
+      ]);
+    }
+  });
+
+  it("says the reading is SHORT when the library caps the body", async () => {
+    // The DAV library truncates a raw body it hands back, and a truncated body
+    // means names are MISSING from the reading. Silence there is exactly the
+    // failure class this whole plan exists to remove — a short answer that does
+    // not say it is short — so it gets its own value on the discriminator rather
+    // than being folded into the ordinary one.
+    const many = Array.from({ length: 400 }, (_, index) => `d:property-${index}`);
+    const stub = davStub({
+      caldavHomeBody: calendarListWithInboxBody,
+      propNames: (url) => multistatus(propNameBody(url, ...many)),
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probePropertyNames: true,
+    });
+
+    const home = targetNamed(nameProbeOf(result)!, "home")!;
+    expect(home.reading).toBe("names_read_truncated");
+    // Names WERE read — the reading is short, not absent. Both halves matter: a
+    // truncation reported as unreadable would throw away a usable partial answer,
+    // and one reported as complete would be the silent short answer.
+    expect(home.names!.length).toBeGreaterThan(0);
+    expect(home.names!.length).toBeLessThan(many.length);
+    expect(home.blocks).not.toBeNull();
   });
 
   it("keeps the report when NOTHING could be derived at all", async () => {

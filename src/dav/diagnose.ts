@@ -387,33 +387,137 @@ export interface TaskCollectionProbe {
 }
 
 /**
+ * One propstat block, and the property names it NAMED — never a value.
+ *
+ * **A propstat whose status is NOT 2xx still names properties, and those names
+ * are exactly the interesting ones for this probe's question.** A resource that
+ * knows a property but will not disclose it to this caller says so in a `403`
+ * block; a resource that has never heard of it says so in a `404` block. Both
+ * are answers to "what properties exist here", and the DAV library's own parse
+ * discards every non-2xx block outright — which is one of the two reasons the
+ * reading below works off the raw body instead.
+ *
+ * `status` is a NUMBER and never the status line it was read out of. The line is
+ * prose a server wrote and `./../../.claude/CLAUDE.md` § 4 forbids echoing one;
+ * three digits carry none of it, and a status NUMBER is already what
+ * `CollectionWriteStep.status` beside this reports.
+ */
+export interface PropertyNameBlock {
+  /** The propstat's own status, as a number. `null` when none could be read. */
+  status: number | null;
+  /** The names that block carried, as written on the wire, sorted. */
+  names: string[];
+}
+
+/**
  * One resource, and every property NAME it carries — never a value.
  *
- * **The names are the ones the DAV library hands back, which are the namespace
- * prefix stripped and the remainder camel-cased.** So `CALDAV:schedule-default-
- * calendar-URL` arrives as `scheduleDefaultCalendarURL`, and that is the useful
- * spelling rather than a lossy one: it is exactly the key a reader of this report
- * would then look up in `DAVResponse.props`, which is how every property in this
- * module is already read. Two consequences are worth writing down rather than
- * discovering. Two properties from DIFFERENT namespaces sharing a local name
- * collapse to one key, so a name appearing once here does not prove one property.
- * And a property the server named only inside a non-2xx propstat is not here at
- * all, because the library keeps only the 2xx ones — a `propname` answer is
- * normally all-200, so this is a caveat rather than a gap.
+ * **The names are the ones the SERVER WROTE, prefix and all.** `d:displayname`,
+ * `CS:getctag`, `ca:calendar-color`. This used to report the DAV library's own
+ * spelling — the prefix stripped and the remainder camel-cased — and the wire
+ * form replaced it for one reason: the library's parse could not answer this
+ * question at all (see the section above `propertyNamesInBody`), so the reading
+ * moved to the raw body, and the raw body spells a property the way the server
+ * spelled it. That is better, because it is what was actually sent. Three
+ * consequences are worth writing down rather than discovering.
  *
- * `names` is `null` in two distinguishable cases, and `category` is what
- * separates them: a category means this target was ASKED and refused, while a
- * null category with an empty `href` means the target could not be found in the
- * account's own home listing, so nothing was asked. An EMPTY array is a third,
- * different answer — the resource was asked and named no properties at all.
+ * A PREFIX IS THE SERVER'S OWN ABBREVIATION AND NOT THE NAMESPACE. Two servers
+ * may write the same property as `d:displayname` and `D:displayname`, and a
+ * property in the document's default namespace arrives BARE, with no prefix at
+ * all. So a name here identifies a property within one response and is not a
+ * stable cross-server identifier. Nothing in this project matches on one.
+ *
+ * NOTHING IS RESOLVED AGAINST THE NAMESPACE DECLARATIONS, deliberately. Doing so
+ * would mean reading attribute VALUES off the body, and every safety claim this
+ * probe makes rests on reading element NAMES and nothing else.
+ *
+ * TWO PROPERTIES SHARING A BARE LOCAL NAME IN DIFFERENT NAMESPACES still collapse
+ * if both arrive unprefixed. That is narrower than the collapse the library's
+ * camel-casing caused — which merged them whatever their prefixes — but it is not
+ * zero, so a name appearing once does not prove one property.
+ *
+ * ## `reading` is the discriminator, and there are five states
+ *
+ * It is always set, and exactly one value holds, so the states are mutually
+ * exclusive by construction rather than by a reader cross-checking three nullable
+ * fields. The state that forced it into existence is the third one: on 2026-09-25
+ * all four targets answered `names: []` with a null category against an account
+ * that unquestionably carries `displayname` on all four, and the report had no way
+ * to say "answered, but this run could not read the answer".
+ *
+ * | `reading`               | `names` | what it says                                     |
+ * | ----------------------- | ------- | ------------------------------------------------ |
+ * | `names_read`            | array   | asked, answered, and these are the names          |
+ * | `names_read_truncated`  | array   | the same, but the body was capped, so names may be missing |
+ * | `unreadable_response`   | `null`  | asked, answered, and no propstat could be found in the answer |
+ * | `refused`               | `null`  | asked and refused; `category` says how             |
+ * | `not_asked`             | `null`  | no such row in the account's own listing, so nothing was asked |
+ *
+ * `names` and `blocks` are non-null exactly for the first two. `category` is
+ * non-null exactly for `refused`. An EMPTY `names` under `names_read` is a real
+ * answer and a different fact from all four of the others: the resource was
+ * asked, it answered with a propstat, and that propstat named nothing.
  */
 export interface PropertyNameTarget {
   /** Which resource: `principal`, `home`, `schedule-inbox`, `calendar`. */
   target: string;
   /** The href actually asked, or `""` when none could be derived. */
   href: string;
-  /** Every property name carried, sorted. `null` when nothing was asked. */
+  /** Which of the five states this target is in. See the table above. */
+  reading: string;
+  /** Every property name carried, sorted. `null` unless names were read. */
   names: string[] | null;
+  /** The same names, split by the propstat status each was named under. */
+  blocks: PropertyNameBlock[] | null;
+  /**
+   * The HTTP status number the response carried, or `null` when none arrived.
+   *
+   * A number, never a status line — the same claim `PropertyNameBlock.status`
+   * makes and for the same § 4 reason.
+   */
+  status: number | null;
+  /**
+   * How many characters of the answer this run read, or `null` when none arrived.
+   *
+   * A LENGTH, which is the safest diagnostic there is: it carries no character of
+   * the body. It is here to separate "the server sent nothing" from "the server
+   * sent something this run could not read", which are different fixes.
+   *
+   * It is what was READ rather than what was sent: the DAV library caps a raw
+   * body at `RAW_BODY_CAP`, and `reading` says `names_read_truncated` when it did.
+   */
+  bodyChars: number | null;
+  /**
+   * Every ELEMENT NAME the answer carried, deduped, sorted and capped — reported
+   * only when `reading` is `unreadable_response`.
+   *
+   * **This is the capture mechanism, and it exists because the previous version
+   * of this probe passed ten tests and was wrong in production.** Every fixture
+   * behind it was this repository's own idea of a `propname` answer, so nothing in
+   * the suite could show that the real one has a different shape. When no propstat
+   * can be found, this says what the body's shape actually WAS, and the next live
+   * run therefore distinguishes the two fixes: element names including `propstat`
+   * and `prop` mean the reader is wrong, element names with neither mean the
+   * request got a different kind of answer than `propname` is defined to give, and
+   * no element names at all with a zero `bodyChars` mean the answer was empty.
+   *
+   * **WHY THIS RATHER THAN AN EXCERPT OF THE BODY, argued because § 4 is the rule
+   * it is in tension with.** An excerpt was the obvious route and it is refused: if
+   * the reason no propstat was found is that iCloud answered as though asked for
+   * every property with its VALUE, then an excerpt of that body carries calendar
+   * titles, colours and hrefs, and § 4 forbids a diagnostic field echoing a server
+   * body. This reports the body's SHAPE instead. It reads element names and never
+   * one character of text content or of an attribute value, which is the same
+   * guarantee `names` beside it rests on — so it cannot carry a property value, a
+   * calendar title, an address or a URL, because every one of those is text.
+   * Bounded by construction as well: deduped, and capped at `MAX_BODY_ELEMENTS`.
+   *
+   * The residual is stated rather than waved away: an element NAME is chosen by
+   * the server, so a server that named an element after a secret would put it
+   * here. That is the identical residual `names` carries, and it is the one this
+   * whole probe already accepts in order to exist at all.
+   */
+  bodyElements: string[] | null;
   /** The refusal's category, from the fixed vocabulary. `null` when none. */
   category: string | null;
 }
@@ -434,14 +538,33 @@ export interface PropertyNameTarget {
  *
  * `DAV:propname` is that second question. RFC 4918 § 9.1 defines a PROPFIND whose
  * body is `<D:propfind><D:propname/></D:propfind>` as returning the name of every
- * property the resource carries, WITH NO VALUES. So this is the exhaustive ask,
- * and it cannot leak a value because the server sends none — which is what makes
- * it safe to point at a real account.
+ * property the resource carries, WITH NO VALUES. So this is the exhaustive ask.
+ *
+ * **What makes it safe to point at a real account is the READING and not the
+ * RFC, and that distinction was earned rather than chosen.** The first version of
+ * this docstring said it cannot leak a value because the server sends none. That
+ * is a guarantee resting on a server behaving, which is not a guarantee at all —
+ * and the very next live run proved the server does something this repository did
+ * not predict. The reading below takes element NAMES out of the raw body and reads
+ * no text content and no attribute value at all, so the safety holds against a
+ * server that answers with values, with something else entirely, or with nothing.
+ *
+ * **IT DID NOT WORK THE FIRST TIME, and the reason is written down one section
+ * below rather than only in a plan file.** Shipped on 2026-09-25, this probe
+ * reported an EMPTY name list for all four targets against an account that
+ * unquestionably carries `displayname` and `resourcetype` on every one of them —
+ * twice, the second time with the discovery cache cleared. The cause was the DAV
+ * library's parse, not iCloud, and it is the same cause that had made
+ * `calendar_update_calendar` report a landed write as a connection fault the day
+ * before. See the section above `propertyNamesInBody` for the rule that follows
+ * from it, which is the part that generalises past this probe.
  *
  * **Nothing here decides anything.** The probe reports names; whether Apple
  * exposes a default-calendar property, and what CALM-07 should therefore say, is
  * the owner's call on this reading. A verdict computed in this file would be this
- * file deciding CALM-07.
+ * file deciding CALM-07. That is unchanged by the defect above, and so is the
+ * current state of the question: the earlier reading settled NOTHING, because a
+ * broken instrument's silence is not evidence of absence.
  */
 export interface PropertyNameProbe {
   /** One entry per target, in the fixed order the probe asks them. */
@@ -1431,33 +1554,272 @@ export async function runTaskCollectionProbe(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Reading property NAMES out of the RAW multistatus body
+//
+// THE RULE THIS SECTION EXISTS FOR. **The DAV library's parsed property region is
+// the EMPTY OBJECT whenever the library could not parse a multistatus out of the
+// answer at all.** An empty body, a content type that does not say xml, or a root
+// element that is not `multistatus`: in every one of those cases `davRequest`
+// returns an ordinary-looking SUCCESSFUL response object carrying a `raw` field
+// and no `props` at all, so `Object.keys(response.props ?? {})` is `[]` — which is
+// the identical reading to a server that answered properly and named nothing. The
+// two cannot be told apart through the parse, in either direction. The parse also
+// discards every propstat whose status is not 2xx, which is a second way for the
+// region to come back empty while the server named plenty.
+//
+// TWO SYMPTOMS, ONE DAY APART, ONE CAUSE.
+//
+//  1. Plan 17-04's PROPPATCH reader in `./calendar.ts` decided which properties a
+//     rename-and-recolour had landed by looking for their keys in that region.
+//     Measured live on 2026-09-25: the region was empty on every SUCCESSFUL write,
+//     so `calendar_update_calendar` reported `connection_failed` three times in a
+//     row while the calendar was renamed and recoloured each time.
+//     `CollectionWriteStep.propKeys` above is that measurement;
+//     `./calendar.ts`'s house note above `observedOutcomes` carries the retirement.
+//  2. This probe, measured live on 2026-09-25 and again with the discovery cache
+//     cleared: all four `DAV:propname` targets answered `names: []` with a null
+//     category, against an account that unquestionably carries `displayname` and
+//     `resourcetype` on all four. Same empty region, same null-looking health.
+//
+// WHAT THE CAUSE IS NOT, recorded because the obvious guess is wrong and was
+// believed on the way here. It is NOT that the parse drops a property carrying no
+// value. That was CHECKED, by driving the library's own parse with a conformant
+// valueless propstat: the keys survive it intact. So asking the parse more
+// carefully cannot work, and neither can a table of key spellings — 17-04 already
+// retired one of those.
+//
+// SO: ANY DAV QUESTION OF THE FORM "WHAT PROPERTIES EXIST HERE" MUST READ THE RAW
+// BODY. A question of the form "what is this property's VALUE" may keep using the
+// parse, because a value that arrives at all arrives parsed, and the whole rest of
+// this module does exactly that.
+// ---------------------------------------------------------------------------
+
 /**
- * Every property NAME one multistatus carried, sorted and de-duplicated.
+ * The length at which the DAV library truncates a raw body it hands back.
  *
- * **NAMES ONLY, and that is the safety property rather than a convenience.** It
- * reads `Object.keys` off the parsed property object and never indexes into it,
- * so no value can ride out through this function no matter what the server put
- * in the response body. A conformant `DAV:propname` answer carries empty
- * elements and there is nothing to read; a server that answered with values
- * anyway would still be reported as names, because a key is all this function
- * can see.
- *
- * Hand-narrowed for the reason everything else in this module is: the library
- * types this whole region `any`, so the compiler is not watching, and a response
- * carrying no property region at all must contribute nothing rather than throw.
- * Sorted, so two runs against the same account produce the same reading and a
- * diff between two accounts is a diff rather than a reordering.
+ * A library constant restated here rather than imported, because it is not
+ * exported. It is used for ONE thing: deciding whether `reading` should say the
+ * names are short. Being wrong about it can only mislabel a boundary case, never
+ * drop a name, and a body that long against a `propname` answer has never been
+ * seen — but silent truncation is exactly the failure class this whole fix exists
+ * to remove, so it is detected rather than assumed away.
  */
-function propertyNamesIn(responses: DAVResponse[]): string[] {
-  const names = new Set<string>();
-  for (const response of responses) {
-    const props: unknown = response.props;
-    if (props === null || typeof props !== "object") continue;
-    for (const key of Object.keys(props as Record<string, unknown>)) {
-      names.add(key);
+const RAW_BODY_CAP = 4096;
+
+/** The ceiling on element names one unreadable body may report back. */
+const MAX_BODY_ELEMENTS = 40;
+
+/** `reading`: asked, answered, and `names` holds what the answer named. */
+const READING_NAMES = "names_read";
+/** `reading`: the same, but the body was capped, so `names` may be short. */
+const READING_TRUNCATED = "names_read_truncated";
+/** `reading`: asked and answered, and no propstat was found in the answer. */
+const READING_UNREADABLE = "unreadable_response";
+/** `reading`: asked and refused. `category` says how. */
+const READING_REFUSED = "refused";
+/** `reading`: no such row in the account's own listing, so nothing was asked. */
+const READING_NOT_ASKED = "not_asked";
+
+/**
+ * The status NUMBER inside a DAV status line, and nothing else from it.
+ *
+ * Three digits out, everything else discarded on the spot. This is the one place
+ * in this reading that looks at an element's text content, and it is confined to
+ * the `DAV:status` element of a propstat — never to a property element, whose text
+ * is where a VALUE would be. `./../../.claude/CLAUDE.md` § 4 forbids a diagnostic
+ * field echoing a server's status line; a number is not one, and it is already what
+ * `CollectionWriteStep.status` reports.
+ *
+ * `null` when the text does not carry a status line this run can read, which is a
+ * fact worth reporting rather than a reason to guess at one.
+ */
+function statusNumberOf(text: string): number | null {
+  const match = /HTTP\/\d(?:\.\d)?\s+(\d{3})\b/i.exec(text);
+  if (match === null) return null;
+  const status = Number.parseInt(match[1], 10);
+  return Number.isNaN(status) ? null : status;
+}
+
+/** An element's local name — the namespace prefix, if any, removed. */
+function localNameOf(name: string): string {
+  const colon = name.indexOf(":");
+  return colon === -1 ? name : name.slice(colon + 1);
+}
+
+/** What one walk over a raw multistatus body found. */
+interface BodyReading {
+  /** One entry per propstat that carried a `prop` element, in document order. */
+  propstats: PropertyNameBlock[];
+  /** Every element name the body carried, deduped, capped, in document order. */
+  elements: string[];
+}
+
+/**
+ * Every property NAME a raw multistatus body carried, by propstat block.
+ *
+ * **NAMES ONLY, and that is the safety property rather than a convenience.** The
+ * walk records an element's NAME and steps over everything between one tag and the
+ * next. The single exception is `statusNumberOf` above, which reads the text of a
+ * propstat's own `DAV:status` element and keeps three digits from it. No other text
+ * content and no attribute value is read anywhere, so no property value can ride
+ * out of this function no matter what the server put in the body — which is what
+ * makes the whole probe safe to point at a real account, and it now holds against
+ * a server that answered with values rather than only against one that did not.
+ *
+ * **A property name is a DIRECT child of a `prop` element that is itself a direct
+ * child of a `propstat`.** That is what excludes the contents of a property: an
+ * href inside `schedule-default-calendar-URL` is a grandchild of `prop`, so it is
+ * never mistaken for a property, and its text is never read either way.
+ *
+ * **Every propstat is reported, whatever its status**, which is the second reason
+ * this reads the body rather than the parse — see the section above. The status is
+ * carried on the block so a reader can tell "this resource has the property and
+ * will not disclose it" from "this resource has never heard of it", and the union
+ * across blocks is what the target's own `names` reports.
+ *
+ * Hand-rolled rather than handed to an XML parser, and the reason is not
+ * preference: the only parser in this dependency tree is the one whose parse this
+ * fix exists to stop trusting, and adding a second XML library to read four
+ * diagnostic responses would be a larger decision than the defect warrants. The
+ * walk handles the four things a real body contains that a naive scan gets wrong —
+ * comments, CDATA, processing instructions and a `>` inside a quoted attribute
+ * value — and stops cleanly at a tag with no end, which is what a capped body ends
+ * in. A propstat left unterminated by that stop is still reported, because its
+ * names were already read and dropping them would under-report a truncation
+ * instead of labelling it.
+ */
+function propertyNamesInBody(body: string): BodyReading {
+  const propstats: PropertyNameBlock[] = [];
+  const elements = new Set<string>();
+  /** The LOCAL names of the elements currently open, outermost first. */
+  const open: string[] = [];
+  /** The propstat being read, or `null` between them. */
+  let current: { status: number | null; names: Set<string>; sawProp: boolean } | null =
+    null;
+
+  /** Close the propstat being read, keeping it only if it carried a `prop`. */
+  const flush = (): void => {
+    if (current !== null && current.sawProp) {
+      propstats.push({
+        status: current.status,
+        names: [...current.names].sort(),
+      });
     }
+    current = null;
+  };
+
+  let at = 0;
+  while (at < body.length) {
+    const next = body.indexOf("<", at);
+    if (next === -1) break;
+    at = next;
+
+    // The four non-element constructs, stepped over without reading anything out
+    // of them. A comment or a CDATA section may contain any characters at all,
+    // including whole tags, so skipping them is correctness rather than tidiness.
+    if (body.startsWith("<!--", at)) {
+      const close = body.indexOf("-->", at);
+      if (close === -1) break;
+      at = close + 3;
+      continue;
+    }
+    if (body.startsWith("<![CDATA[", at)) {
+      const close = body.indexOf("]]>", at);
+      if (close === -1) break;
+      at = close + 3;
+      continue;
+    }
+    if (body.startsWith("<?", at)) {
+      const close = body.indexOf("?>", at);
+      if (close === -1) break;
+      at = close + 2;
+      continue;
+    }
+    if (body.startsWith("<!", at)) {
+      const close = body.indexOf(">", at);
+      if (close === -1) break;
+      at = close + 1;
+      continue;
+    }
+
+    const closing = body.startsWith("</", at);
+    let cursor = at + (closing ? 2 : 1);
+    const nameStart = cursor;
+    while (cursor < body.length && !/[\s/>]/.test(body[cursor])) cursor += 1;
+    const name = body.slice(nameStart, cursor);
+
+    // The end of the tag, honouring quoted attribute values: `>` is legal inside
+    // one, so scanning for the next `>` alone would end the tag early.
+    let quote = "";
+    let tagEnd = -1;
+    while (cursor < body.length) {
+      const char = body[cursor];
+      if (quote !== "") {
+        if (char === quote) quote = "";
+      } else if (char === '"' || char === "'") {
+        quote = char;
+      } else if (char === ">") {
+        tagEnd = cursor;
+        break;
+      }
+      cursor += 1;
+    }
+    // A tag with no end. The body was cut mid-tag, so there is nothing further to
+    // read and nothing half-read is recorded.
+    if (tagEnd === -1) break;
+    const selfClosing = body[tagEnd - 1] === "/";
+    at = tagEnd + 1;
+    if (name === "") continue;
+
+    const local = localNameOf(name);
+
+    if (closing) {
+      // Pop to the matching open element rather than popping one, so a body with
+      // an unclosed element cannot leave the stack permanently out of step.
+      const found = open.lastIndexOf(local);
+      if (found !== -1) open.length = found;
+      if (local === "propstat") flush();
+      continue;
+    }
+
+    if (elements.size < MAX_BODY_ELEMENTS) elements.add(name);
+
+    const parent = open[open.length - 1];
+    const grandparent = open[open.length - 2];
+
+    if (local === "propstat") {
+      // A malformed body could nest one; the outer one's names are kept.
+      flush();
+      current = { status: null, names: new Set<string>(), sawProp: false };
+      // `<propstat/>` carries no prop and therefore no names.
+      if (selfClosing) current = null;
+    } else if (current !== null && local === "prop" && parent === "propstat") {
+      // Recorded on entry rather than on a name, so `<prop/>` and `<prop></prop>`
+      // both mean "answered, and named nothing" instead of "unreadable".
+      current.sawProp = true;
+    } else if (current !== null && parent === "prop" && grandparent === "propstat") {
+      current.names.add(name);
+    } else if (
+      current !== null &&
+      local === "status" &&
+      parent === "propstat" &&
+      !selfClosing
+    ) {
+      // The one text read in this walk, and only three digits survive it.
+      const textEnd = body.indexOf("<", at);
+      current.status = statusNumberOf(
+        textEnd === -1 ? body.slice(at) : body.slice(at, textEnd),
+      );
+    }
+
+    if (!selfClosing) open.push(local);
   }
-  return [...names].sort();
+
+  // A propstat the stop above left open. See the docstring: its names were read.
+  flush();
+
+  return { propstats, elements: [...elements].sort() };
 }
 
 /**
@@ -1476,12 +1838,19 @@ interface PropertyNameAsk {
 /**
  * Ask four of this account's resources what property NAMES they carry.
  *
- * READ-ONLY, and read-only in the strongest form this project has: `DAV:propname`
- * (RFC 4918 § 9.1) asks for names and the server answers with names, so there is
- * no value in the response for this code to mishandle. It writes nothing, it goes
- * nowhere near `src/mail/`, and `PropertyNameProbe`'s own docstring records why it
- * exists — a requirement is about to be deleted on an inference, and this is the
- * measurement that either confirms the inference or refutes it.
+ * READ-ONLY. `DAV:propname` (RFC 4918 § 9.1) asks for names, this reading takes
+ * names, and no text content or attribute value is read out of the answer at any
+ * point — so there is no value in the response for this code to mishandle even if
+ * the server sends one. It writes nothing, it goes nowhere near `src/mail/`, and
+ * `PropertyNameProbe`'s own docstring records why it exists — a requirement is
+ * about to be deleted on an inference, and this is the measurement that either
+ * confirms the inference or refutes it.
+ *
+ * **The ANSWER is read out of the raw body, never out of the library's parse.**
+ * That is the whole of plan 17-05's fix and the section above
+ * `propertyNamesInBody` carries the rule behind it. The REQUEST is untouched: the
+ * library still assembles the `propname` body from the object below, so the bytes
+ * that leave this Worker are the bytes the two live runs on 2026-09-25 sent.
  *
  * **Four targets, depth 0 each, and every one derived from the account's own
  * resolved discovery.** The principal, the calendar home, the scheduling inbox,
@@ -1588,13 +1957,19 @@ export async function runPropertyNameProbe(
   // resembles one.
   for (const ask of asks) {
     if (ask.href === "") {
-      // The listing held no such row, so nothing was asked. A null `names` with
-      // a null `category` is that state, and it is a different fact from a
-      // refusal and a different fact again from an empty list of names.
+      // The listing held no such row, so nothing was asked. `not_asked` is that
+      // state, and it is a different fact from a refusal, a different fact again
+      // from an answer nobody could read, and a different fact again from an
+      // empty list of names.
       targets.push({
         target: ask.target,
         href: "",
+        reading: READING_NOT_ASKED,
         names: null,
+        blocks: null,
+        status: null,
+        bodyChars: null,
+        bodyElements: null,
         category: null,
       });
       continue;
@@ -1604,6 +1979,13 @@ export async function runPropertyNameProbe(
       if (ask.contained) assertUnderHome(ask.href, resolved.homeUrl);
       const responses = await davRequest({
         url: ask.href,
+        // The library must NOT parse the answer. Its parse is what lost the
+        // reading — see the section above `propertyNamesInBody` — and with this
+        // false it hands back the response text instead, which is what the
+        // property names are read out of. The REQUEST is unchanged: the body is
+        // still assembled by the library from the object below, so the bytes that
+        // go out are the same bytes the live runs on 2026-09-25 sent.
+        parseOutgoing: false,
         init: {
           method: "PROPFIND",
           // The WebDAV depth header, and nothing else. Never a credential from
@@ -1624,10 +2006,53 @@ export async function runPropertyNameProbe(
         },
         fetch: davFetch,
       });
+      // The RAW body, and the answer is read out of it rather than out of the
+      // library's parse. `parseOutgoing: false` is what makes the library hand it
+      // over: the section above `propertyNamesInBody` records why the parse cannot
+      // answer this question, and the two symptoms that proved it. Hand-narrowed,
+      // because the library types `raw` as `any` and an absent one must read as an
+      // empty answer rather than throw.
+      const first = responses[0];
+      const raw: unknown = first?.raw;
+      const body = typeof raw === "string" ? raw : "";
+      const status = typeof first?.status === "number" ? first.status : null;
+      const reading = propertyNamesInBody(body);
+
+      if (reading.propstats.length === 0) {
+        // Answered, and this run could not find a propstat in the answer. The
+        // state that had no name before 2026-09-25, when four targets reported an
+        // empty list of names and nothing said the list was not a reading.
+        targets.push({
+          target: ask.target,
+          href: ask.href,
+          reading: READING_UNREADABLE,
+          names: null,
+          blocks: null,
+          status,
+          bodyChars: body.length,
+          // Element names only. See `PropertyNameTarget.bodyElements` for the § 4
+          // argument, and for why an excerpt of the body was refused.
+          bodyElements: reading.elements,
+          category: null,
+        });
+        continue;
+      }
+
+      // The union across every propstat, whatever its status, sorted.
+      const names = new Set<string>();
+      for (const block of reading.propstats) {
+        for (const name of block.names) names.add(name);
+      }
       targets.push({
         target: ask.target,
         href: ask.href,
-        names: propertyNamesIn(responses),
+        reading:
+          body.length > RAW_BODY_CAP ? READING_TRUNCATED : READING_NAMES,
+        names: [...names].sort(),
+        blocks: reading.propstats,
+        status,
+        bodyChars: body.length,
+        bodyElements: null,
         category: null,
       });
     } catch (err) {
@@ -1638,7 +2063,12 @@ export async function runPropertyNameProbe(
       targets.push({
         target: ask.target,
         href: ask.href,
+        reading: READING_REFUSED,
         names: null,
+        blocks: null,
+        status: null,
+        bodyChars: null,
+        bodyElements: null,
         category: davToErrorCategory(err).category,
       });
     }

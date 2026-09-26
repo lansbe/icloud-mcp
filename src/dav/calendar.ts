@@ -1045,6 +1045,32 @@ export interface UpdateCalendarInput extends CalendarPropertyChange {
 //
 // `observedOutcomes` below replaces it, and the replacement is not a better
 // reader of the same answer — it stops reading that answer entirely.
+//
+// THE GENERAL RULE, WHICH ONLY BECAME VISIBLE WHEN A SECOND SYMPTOM ARRIVED.
+// **The DAV library's parsed property region is the EMPTY OBJECT whenever the
+// library could not parse a multistatus out of the answer at all** — an empty
+// body, a content type that does not say xml, or a root that is not
+// `multistatus`. In those cases `davRequest` hands back an ordinary-looking
+// SUCCESSFUL response object carrying a raw body and no property region, so
+// `Object.keys(props ?? {})` is `[]`, which is the identical reading to a server
+// that answered properly and named nothing. It also discards every propstat whose
+// status is not 2xx, which is a second way for the region to come back empty
+// while the server named plenty.
+//
+// Both of this project's symptoms are that one cause, one day apart. On
+// 2026-09-25 the property update above reported a landed rename as
+// `connection_failed`. Later the same day `dav_diagnose`'s property-name probe
+// reported an EMPTY name list for all four targets against an account that
+// unquestionably carries `displayname` on every one of them — twice, the second
+// time with the discovery cache cleared. Neither was iCloud declining to answer.
+//
+// So: ANY DAV QUESTION OF THE FORM "WHAT PROPERTIES EXIST HERE" MUST READ THE RAW
+// BODY, and no amount of asking the parse more carefully substitutes for it.
+// `propertyNamesInBody` in `./diagnose.ts` is where that reading lives, and its
+// own section carries the fuller argument — including the fact that the obvious
+// explanation is WRONG: the parse does NOT drop a property carrying no value.
+// That was checked against the library's own parse with a conformant valueless
+// propstat and the keys survive intact.
 
 /**
  * Judge a change by what a FRESH READ of the collection now holds (CALM-05).
