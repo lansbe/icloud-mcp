@@ -10696,11 +10696,26 @@ describe("calendar_respond_to_invitation, boundaries", () => {
   const ALIAS_ADDRESS = "alias.one@example.invalid";
 
   /**
-   * Every stub this block installed, so the last case can say that NO request
-   * across all of them was a POST. Tests in one file run in order, and the
-   * last case asserts it saw commits at all, so it cannot pass over nothing.
+   * Every stub this block installed, so each case can be checked for a POST.
+   *
+   * Checked AFTER EACH case, over the stubs that case installed (18-REVIEW
+   * IN-04). One case at the end used to read the whole list, which held only
+   * when every case before it had run first: alone, or shuffled, it failed.
+   * An after-each check holds in any order and under any filter. That the
+   * check is not vacuous is shown by the last case in this block, which makes
+   * its own preview and commit and counts the write.
    */
   const everyStub: WriteStub[] = [];
+  let checkedThrough = 0;
+
+  afterEach(() => {
+    const installed = everyStub.slice(checkedThrough);
+    checkedThrough = everyStub.length;
+    expect(
+      installed.flatMap((stub) => stub.observed).filter((one) => one.method === "POST"),
+      "a case in this block issued a POST",
+    ).toStrictEqual([]);
+  });
 
   function tracked(options: WriteStubOptions): WriteStub {
     const stub = writeDavStub(options);
@@ -10896,8 +10911,7 @@ describe("calendar_respond_to_invitation, boundaries", () => {
     // organiser refusal and the ambiguous one being the two that hold them.
     const text = textOf(result);
     expect(text).not.toContain(LOGIN_ADDRESS);
-    expect(text).not.toContain(ALIAS_ADDRESS);
-  });
+    expect(text).not.toContain(ALIAS_ADDRESS);  });
 
   // -------------------------------------------------------------------------
   // D-16: the event moved between preview and commit
@@ -11221,11 +11235,24 @@ describe("calendar_respond_to_invitation, boundaries", () => {
   // No outbound POST, anywhere in this block
   // -------------------------------------------------------------------------
 
-  it("issued no POST across every preview and commit in this block", () => {
-    const all = everyStub.flatMap((stub) => stub.observed);
-    // Non-vacuity: the block above wrote, so this is not a loop over nothing.
-    expect(all.filter((one) => one.method === "PUT").length).toBeGreaterThanOrEqual(6);
-    expect(all.filter((one) => one.method === "POST")).toStrictEqual([]);
+  it("issues no POST on a preview and a commit, and the write shows it looked", async () => {
+    // Self-contained, so it holds alone and in any order (IN-04). Every other
+    // case in this block is checked for a POST by the after-each hook above.
+    const stub = await genuineStub();
+    const preview = halves(
+      await viaSchema("calendar_respond_to_invitation", { id: GENUINE_ID, answer: "accepted" }),
+    );
+    const committed = halves(
+      await viaSchema("calendar_commit", {
+        confirmToken: preview.trusted.confirmToken,
+        change: preview.untrusted.change,
+      }),
+    );
+
+    expect(committed.trusted.applied).toBe(true);
+    // Non-vacuity: this stub saw the write, so it was watching the commit.
+    expect(stub.observed.filter((one) => one.method === "PUT").length).toBe(1);
+    expect(stub.observed.filter((one) => one.method === "POST")).toStrictEqual([]);
   });
 });
 
