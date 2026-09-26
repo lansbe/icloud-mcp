@@ -1789,6 +1789,75 @@ export const ATTENDEE_COPY_IMPORTED_ICS = resource(
 );
 
 /**
+ * Replace the one occurrence of `from`, or fail loudly at module load.
+ *
+ * A derivation that silently matched nothing would hand every test built on it
+ * the source fixture unchanged, and they would pass over a series that is not
+ * one. So a missing or a repeated anchor throws here, before any test runs.
+ */
+function replaceExactlyOnce(text: string, from: string, to: string): string {
+  const at = text.indexOf(from);
+  if (at < 0 || text.indexOf(from, at + 1) >= 0) {
+    throw new Error(`series fixture: anchor is not unique: ${from}`);
+  }
+  return text.slice(0, at) + to + text.slice(at + from.length);
+}
+
+/**
+ * The genuine attendee copy turned into a series: a master and one edited date.
+ *
+ * **DERIVED, NOT MEASURED.** 18-01 measured single events only (A7 in its
+ * summary), so no repeating invitation's bytes exist to copy. This is built from
+ * `ATTENDEE_COPY_GENUINE_ICS` by string edits, and the edits are the whole of
+ * the difference:
+ *
+ *   - The master gains `RRULE:FREQ=WEEKLY;COUNT=4` after its `SEQUENCE`.
+ *   - A second `VEVENT` follows it: the same bytes, plus a `RECURRENCE-ID` for
+ *     the second date, moved an hour later, with the user's own line already
+ *     answering `ACCEPTED` where the master's still says `NEEDS-ACTION`.
+ *
+ * Everything else — the principal-path owner line with the address only in
+ * `EMAIL=`, the stray `TZID` property, the calendar-level `VTIMEZONE` after the
+ * events — is the measured copy's, byte for byte. Two components each carrying
+ * their own copy of the user's line is what lets a test see an answer that
+ * reached the master and missed the override, or the reverse. Every address is
+ * still whole on one physical line, because the edits touch none of them.
+ */
+function seriesFromAttendeeCopy(single: string): string {
+  const start = single.indexOf("BEGIN:VEVENT\r\n");
+  const end = single.indexOf("BEGIN:VTIMEZONE\r\n");
+  const vevent = single.slice(start, end);
+
+  const master = replaceExactlyOnce(
+    vevent,
+    "SEQUENCE:1\r\n",
+    "SEQUENCE:1\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\n",
+  );
+  const override = [
+    [
+      "SEQUENCE:1\r\n",
+      "SEQUENCE:1\r\nRECURRENCE-ID;TZID=America/Los_Angeles:20261006T120000\r\n",
+    ],
+    [
+      "DTSTART;TZID=America/Los_Angeles:20260929T120000",
+      "DTSTART;TZID=America/Los_Angeles:20261006T130000",
+    ],
+    [
+      "DTEND;TZID=America/Los_Angeles:20260929T130000",
+      "DTEND;TZID=America/Los_Angeles:20261006T140000",
+    ],
+    ["PARTSTAT=NEEDS-ACTION", "PARTSTAT=ACCEPTED"],
+  ].reduce((text, [from, to]) => replaceExactlyOnce(text, from, to), vevent);
+
+  return single.slice(0, start) + master + override + single.slice(end);
+}
+
+/** See `seriesFromAttendeeCopy`: derived from the genuine copy, not measured. */
+export const ATTENDEE_COPY_SERIES_ICS = seriesFromAttendeeCopy(
+  ATTENDEE_COPY_GENUINE_ICS,
+);
+
+/**
  * What any patch writes when it changes NOTHING: the stored body parsed and
  * wrapped back up by the same writer every answer goes through.
  *

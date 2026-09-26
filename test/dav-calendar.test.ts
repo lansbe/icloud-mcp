@@ -65,10 +65,12 @@ import {
   matchesKeyword,
   nextCivilDate,
   observedOutcomes,
+  organizerAddressFrom,
   patchEventBody,
   pinnedOccurrencesFor,
   planCreateTarget,
   readCollectionState,
+  resolveCalendarUserAddresses,
   resolveOrganizerAddress,
   searchEvents,
   uidFromObjectUrl,
@@ -88,6 +90,7 @@ import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
 import {
   DavConnectError,
   DavNotFoundError,
+  DavThrottleError,
   DavStaleResourceError,
   DavSubscriptionError,
 } from "../src/dav/errors";
@@ -3445,6 +3448,13 @@ describe("createEvent", () => {
 // resolved value ends up in.
 // ---------------------------------------------------------------------------
 
+// Phase 18 promoted the address set: the one PROPFIND moved into
+// `resolveCalendarUserAddresses`, and the selection moved verbatim into
+// `organizerAddressFrom`. The two blocks after this one pin each half on its
+// own. THIS block is the create path's regression pin for that promotion, and
+// its six cases are kept byte-identical to how they read before phase 18 on
+// purpose: if the promotion had changed which ORGANIZER an invited create
+// writes, one of them would have gone red without anybody editing it.
 describe("resolveOrganizerAddress", () => {
   it("costs exactly ONE request, a PROPFIND at the principal", async () => {
     await resolveOrganizerAddress(env, principal, createDavFetch(owner));
@@ -3529,6 +3539,125 @@ describe("resolveOrganizerAddress", () => {
     expect(resolved.startsWith("/")).toBe(false);
     expect(resolved.startsWith("urn:")).toBe(false);
     expect(resolved.startsWith("mailto:")).toBe(false);
+  });
+});
+
+describe("resolveCalendarUserAddresses", () => {
+  it("costs ONE PROPFIND at the principal and returns every href verbatim, in server order", async () => {
+    const addresses = await resolveCalendarUserAddresses(
+      env,
+      principal,
+      createDavFetch(owner),
+    );
+
+    expect(stub.observed.length).toBe(1);
+    expect(stub.observed[0].method).toBe("PROPFIND");
+    expect(stub.observed[0].url).toBe(`${CALDAV_SERVER}${PRINCIPAL_PATH}`);
+    expect(String(stub.observed[0].body)).toContain("calendar-user-address-set");
+    // The whole set, the principal path and the urn form included, because
+    // answering an invitation matches against every one of them. Nothing is
+    // chosen, folded or reordered here.
+    expect(addresses).toStrictEqual(USER_ADDRESSES);
+    expect(addresses).toContain("/1234567890/principal/");
+    expect(addresses).toContain("urn:uuid:00000000");
+  });
+
+  it("keeps the server's order when the server changes it", async () => {
+    const reversed = [...USER_ADDRESSES].reverse();
+    restub({ userAddresses: reversed });
+
+    expect(
+      await resolveCalendarUserAddresses(env, principal, createDavFetch(owner)),
+    ).toStrictEqual(reversed);
+  });
+
+  it("answers an empty set as empty rather than refusing", async () => {
+    // The refusal for an empty set belongs to the create path's selection, not
+    // to the read: an invitation answer over an empty set is `not-invited`.
+    restub({ userAddresses: [] });
+
+    expect(
+      await resolveCalendarUserAddresses(env, principal, createDavFetch(owner)),
+    ).toStrictEqual([]);
+  });
+
+  it("wraps the library's bare Error as a not-found that is NOT rediscoverable", async () => {
+    // tsdav throws a bare Error when the 207 carries no response for the
+    // principal. Untyped, it would fall through to a connection diagnosis
+    // about a server that answered promptly.
+    const next = restub({
+      onRequest: (_url, method) =>
+        method === "PROPFIND"
+          ? multistatus(
+              `<response><href>/somebody-else/</href><propstat><status>HTTP/1.1 200 OK</status><prop></prop></propstat></response>`,
+            )
+          : null,
+    });
+
+    const err = await capture(() =>
+      resolveCalendarUserAddresses(env, principal, createDavFetch(owner)),
+    );
+
+    expect(err).toBeInstanceOf(DavNotFoundError);
+    expect((err as DavNotFoundError).rediscoverable).toBe(false);
+    // Nothing of the library's message survives: it embeds the principal URL.
+    expect((err as Error).message).toBe("dav-resource-not-found");
+    // Not rediscoverable, so exactly the one request and no second chain.
+    expect(next.observed.length).toBe(1);
+  });
+
+  it("passes a Dav* error through unchanged", async () => {
+    const next = restub({
+      onRequest: (_url, method) =>
+        method === "PROPFIND" ? new Response(null, { status: 429 }) : null,
+    });
+
+    const err = await capture(() =>
+      resolveCalendarUserAddresses(env, principal, createDavFetch(owner)),
+    );
+
+    expect(err).toBeInstanceOf(DavThrottleError);
+    expect(next.observed.length).toBe(1);
+  });
+});
+
+describe("organizerAddressFrom", () => {
+  it("returns the login even though an alias precedes it", () => {
+    // USER_ADDRESSES lists a principal path, a urn form and an alias before
+    // the login, so "the first mailto" and "the login" give different answers.
+    expect(organizerAddressFrom(USER_ADDRESSES, LOGIN_ADDRESS)).toBe(LOGIN_ADDRESS);
+  });
+
+  it("matches the login by a fold, and returns the set's own spelling", () => {
+    expect(
+      organizerAddressFrom(
+        ["mailto:alias.one@example.invalid", "MAILTO:Test@Example.Invalid"],
+        LOGIN_ADDRESS,
+      ),
+    ).toBe("Test@Example.Invalid");
+  });
+
+  it("falls back to the first mailto when the login is not in the set", () => {
+    expect(
+      organizerAddressFrom(
+        ["/1234567890/principal/", `mailto:${ALIAS_BEFORE_LOGIN}`, "mailto:alias.two@example.invalid"],
+        LOGIN_ADDRESS,
+      ),
+    ).toBe(ALIAS_BEFORE_LOGIN);
+  });
+
+  it("skips a mailto with no address after the scheme", () => {
+    expect(
+      organizerAddressFrom(["mailto:", `mailto:${ALIAS_BEFORE_LOGIN}`], LOGIN_ADDRESS),
+    ).toBe(ALIAS_BEFORE_LOGIN);
+  });
+
+  it.each([
+    ["no mailto at all", ["/1234567890/principal/", "urn:uuid:00000000"]],
+    ["an empty set", []],
+    ["only an empty mailto", ["mailto:"]],
+  ])("throws a not-found for %s rather than falling back to the login", (_label, set) => {
+    expect(() => organizerAddressFrom(set, LOGIN_ADDRESS)).toThrow(DavNotFoundError);
   });
 });
 

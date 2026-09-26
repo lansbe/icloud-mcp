@@ -26,6 +26,7 @@ import type {
   ExpansionResult,
   Occurrence,
   OverrideChange,
+  ReplyAnswer,
   SeriesNarrowing,
   StepBudget,
 } from "../src/dav/icalendar";
@@ -40,6 +41,7 @@ import {
   applyEventChange,
   applyExdate,
   applyOccurrenceOverride,
+  applyReply,
   buildAlarm,
   buildVEvent,
   collapseAttendees,
@@ -47,6 +49,8 @@ import {
   dropOverride,
   expandOccurrences,
   expandWithinBudget,
+  invitationFactsOf,
+  isOwnAddress,
   isRecurringResource,
   isSupportedTimezone,
   isWriteScope,
@@ -65,6 +69,9 @@ import {
 } from "../src/dav/icalendar";
 import {
   ALL_DAY_EXCLUDED_RECURRENCE_ID,
+  ATTENDEE_COPY_GENUINE_ICS,
+  ATTENDEE_COPY_IMPORTED_ICS,
+  ATTENDEE_COPY_SERIES_ICS,
   ALL_DAY_RECURRING_EXCLUDED_ICS,
   ALL_DAY_RECURRING_ICS,
   BUILT_EVENT_DTSTAMP,
@@ -106,6 +113,8 @@ import {
   WEEKLY_SERIES_SUMMARY,
   WEEKLY_SERIES_UID,
   WEEKLY_SERIES_WITH_OVERRIDE_ICS,
+  identityRoundTrip,
+  unfoldedDiff,
 } from "./fixtures/dav-bytes";
 
 // ---------------------------------------------------------------------------
@@ -3823,5 +3832,545 @@ describe("storedAlarmsOf reads the component a patch would target", () => {
       modelled: [],
       unmodelled: 0,
     });
+  });
+});
+
+// ===========================================================================
+// Answering an invitation (phase 18, plan 18-03)
+//
+// Every byte comparison below is against `identityRoundTrip` of the SAME input,
+// never against the raw fixture string. The writer re-emits a resource through
+// ical.js, which refolds lines and moves each VEVENT after the calendar-level
+// VTIMEZONE, so the raw text differs from any written body in places no answer
+// touched. The claim these cases hold is narrower and checkable: an answer
+// changes one parameter on one line COMPARED WITH WHAT ANY PATCH WRITES when it
+// changes nothing (RESEARCH Pitfall 3).
+// ===========================================================================
+
+/** The account the attendee-copy fixtures belong to, shaped after probe P-1. */
+const OWN_LOGIN = "test@example.invalid";
+const OWN_ALIAS = "alias.one@example.invalid";
+const OWN_PRINCIPAL = "/aOwnerPrincipalProbe/principal/";
+const OWN_URN = "urn:uuid:00000000";
+const OWN_ADDRESSES: readonly string[] = [
+  OWN_PRINCIPAL,
+  OWN_URN,
+  `mailto:${OWN_ALIAS}`,
+  `mailto:${OWN_LOGIN}`,
+];
+
+const REPLY_ORGANISER_LINE =
+  "ORGANIZER;CN=Probe Organiser:mailto:organiser.probe@example.invalid";
+const STRANGER_LINE = "ATTENDEE;CN=Dana;PARTSTAT=ACCEPTED:mailto:dana@example.invalid";
+
+/** A one-component invitation carrying exactly the lines a case names. */
+function invitationIcs(
+  attendees: string[],
+  organizer: string | null = REPLY_ORGANISER_LINE,
+): string {
+  return `${[
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Example Org//Reply Fixture//EN",
+    "BEGIN:VEVENT",
+    "UID:reply-fixture@example.invalid",
+    "DTSTAMP:20260901T120000Z",
+    "DTSTART:20261001T160000Z",
+    "DTEND:20261001T170000Z",
+    "SEQUENCE:3",
+    "SUMMARY:Coffee with Dana",
+    ...(organizer === null ? [] : [organizer]),
+    ...attendees,
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ].join("\r\n")}\r\n`;
+}
+
+/** What `applyReply` decided, and the body it would write on the ok arm. */
+function answered(
+  ics: string,
+  addresses: readonly string[],
+  answer: ReplyAnswer,
+): { kind: string; body: string | null } {
+  return withParsedResource(ics, (resource) => {
+    const plan = applyReply(resource, addresses, answer);
+    return plan.kind === "ok"
+      ? {
+          kind: plan.kind,
+          body: serializeOccurrenceResource(resource, plan.components, null),
+        }
+      : { kind: plan.kind, body: null };
+  });
+}
+
+/** The written body, with the ok arm asserted first so a refusal fails loudly. */
+function answeredBody(
+  ics: string,
+  addresses: readonly string[],
+  answer: ReplyAnswer,
+): string {
+  const result = answered(ics, addresses, answer);
+  expect(result.kind).toBe("ok");
+  return String(result.body);
+}
+
+/** Content lines after unfolding. */
+function unfoldedLines(text: string): string[] {
+  return text.replace(/\r\n[ \t]/g, "").split("\r\n");
+}
+
+/** Every unfolded line starting with one prefix, in order. */
+function linesStarting(text: string, prefix: string): string[] {
+  return unfoldedLines(text).filter((line) => line.startsWith(prefix));
+}
+
+/** Every `BEGIN:<name>` … `END:<name>` block, verbatim. */
+function blocksNamed(text: string, name: string): string[] {
+  return text.match(new RegExp(`BEGIN:${name}\\r\\n[\\s\\S]*?END:${name}\\r\\n`, "g")) ?? [];
+}
+
+/** What an answered line must read: PARTSTAT set, RSVP gone, nothing else. */
+function answeredLine(before: string, answer: ReplyAnswer): string {
+  return before
+    .replace(/PARTSTAT=[A-Z-]+/, `PARTSTAT=${answer}`)
+    .replace(/;RSVP=TRUE/, "");
+}
+
+describe("applyReply", () => {
+  it("changes exactly the user's own line on the genuine copy, compared with what any patch writes", () => {
+    const identity = identityRoundTrip(ATTENDEE_COPY_GENUINE_ICS);
+    const body = answeredBody(ATTENDEE_COPY_GENUINE_ICS, OWN_ADDRESSES, "DECLINED");
+
+    const diff = unfoldedDiff(identity, body);
+    expect(diff).toHaveLength(1);
+    const [only] = diff;
+    // The user's line: principal path as the value, address only in EMAIL=.
+    expect(only.before.startsWith("ATTENDEE;")).toBe(true);
+    expect(only.before).toContain(`EMAIL=${OWN_LOGIN}`);
+    expect(only.before.endsWith(`:${OWN_PRINCIPAL}`)).toBe(true);
+    expect(only.before).toContain("PARTSTAT=NEEDS-ACTION");
+    expect(only.before).toContain(";RSVP=TRUE");
+    expect(only.after).toBe(answeredLine(only.before, "DECLINED"));
+
+    // The organiser's revision, stamp and product, and every zone line, are
+    // the same lines in the same places.
+    for (const prefix of ["SEQUENCE:", "DTSTAMP:", "PRODID:", "TZID:", "X-"]) {
+      const kept = linesStarting(identity, prefix);
+      expect(kept.length, prefix).toBeGreaterThan(0);
+      expect(linesStarting(body, prefix), prefix).toStrictEqual(kept);
+    }
+    expect(linesStarting(body, "SEQUENCE:")).toStrictEqual(["SEQUENCE:1"]);
+    expect(linesStarting(body, "DTSTAMP:")).toStrictEqual(["DTSTAMP:20260926T190352Z"]);
+    const zones = blocksNamed(identity, "VTIMEZONE");
+    expect(zones).toHaveLength(1);
+    expect(blocksNamed(body, "VTIMEZONE")).toStrictEqual(zones);
+  });
+
+  it("keeps every alarm, the zone, the product and every X- property on the imported copy", () => {
+    const identity = identityRoundTrip(ATTENDEE_COPY_IMPORTED_ICS);
+    const body = answeredBody(ATTENDEE_COPY_IMPORTED_ICS, OWN_ADDRESSES, "ACCEPTED");
+
+    const diff = unfoldedDiff(identity, body);
+    expect(diff).toHaveLength(1);
+    const [only] = diff;
+    expect(only.before.endsWith(`:mailto:${OWN_LOGIN}`)).toBe(true);
+    expect(only.after).toBe(answeredLine(only.before, "ACCEPTED"));
+    // The other parameters on the user's own line stay, the scheduling agent
+    // included: it is the organiser's statement, not the user's.
+    expect(only.after).toContain("SCHEDULE-AGENT=NONE");
+    expect(only.after).toContain("X-NUM-GUESTS=0");
+
+    const alarms = blocksNamed(identity, "VALARM");
+    expect(alarms).toHaveLength(2);
+    expect(blocksNamed(body, "VALARM")).toStrictEqual(alarms);
+    expect(blocksNamed(body, "VTIMEZONE")).toStrictEqual(blocksNamed(identity, "VTIMEZONE"));
+    for (const prefix of ["SEQUENCE:", "DTSTAMP:", "PRODID:", "X-"]) {
+      const kept = linesStarting(identity, prefix);
+      expect(kept.length, prefix).toBeGreaterThan(0);
+      expect(linesStarting(body, prefix), prefix).toStrictEqual(kept);
+    }
+    // The device flag the owner decided to leave (18-UAT.md) is still there.
+    expect(linesStarting(body, "X-APPLE-NEEDS-REPLY")).toStrictEqual([
+      "X-APPLE-NEEDS-REPLY:TRUE",
+    ]);
+  });
+
+  it("answers on BOTH components of a series, and changes nothing else", () => {
+    const identity = identityRoundTrip(ATTENDEE_COPY_SERIES_ICS);
+    const body = answeredBody(ATTENDEE_COPY_SERIES_ICS, OWN_ADDRESSES, "DECLINED");
+
+    const diff = unfoldedDiff(identity, body);
+    expect(diff).toHaveLength(2);
+    // One is the master's line, still waiting; the other is the edited date's,
+    // already answered. Both are the user's, and both now say DECLINED.
+    expect(diff.map((one) => /PARTSTAT=([A-Z-]+)/.exec(one.before)?.[1]).sort()).toStrictEqual([
+      "ACCEPTED",
+      "NEEDS-ACTION",
+    ]);
+    for (const one of diff) {
+      expect(one.before).toContain(`EMAIL=${OWN_LOGIN}`);
+      expect(one.after).toBe(answeredLine(one.before, "DECLINED"));
+    }
+    // The series is still a series, and the organiser's revision on each
+    // component is where it was.
+    expect(linesStarting(body, "RRULE:")).toStrictEqual(linesStarting(identity, "RRULE:"));
+    expect(linesStarting(body, "RECURRENCE-ID")).toStrictEqual([
+      "RECURRENCE-ID;TZID=America/Los_Angeles:20261006T120000",
+    ]);
+    expect(linesStarting(body, "SEQUENCE:")).toStrictEqual(["SEQUENCE:1", "SEQUENCE:1"]);
+    expect(linesStarting(body, "DTSTAMP:")).toStrictEqual(linesStarting(identity, "DTSTAMP:"));
+  });
+
+  it("drops RSVP on a line whose answer is already the requested one, when another line still waits", () => {
+    // Not `unchanged`: the master still says NEEDS-ACTION. The edited date
+    // already says ACCEPTED, so its line moves by the RSVP parameter alone.
+    const identity = identityRoundTrip(ATTENDEE_COPY_SERIES_ICS);
+    const body = answeredBody(ATTENDEE_COPY_SERIES_ICS, OWN_ADDRESSES, "ACCEPTED");
+
+    const diff = unfoldedDiff(identity, body);
+    expect(diff).toHaveLength(2);
+    for (const one of diff) {
+      expect(one.after).toBe(answeredLine(one.before, "ACCEPTED"));
+      expect(one.after).toContain("PARTSTAT=ACCEPTED");
+      expect(one.after).not.toContain("RSVP");
+    }
+  });
+
+  it("does not mutate the parsed resource it was handed", () => {
+    withParsedResource(ATTENDEE_COPY_SERIES_ICS, (resource) => {
+      const plan = applyReply(resource, OWN_ADDRESSES, "TENTATIVE");
+      expect(plan.kind).toBe("ok");
+      expect(
+        serializeOccurrenceResource(resource, resource.components, null),
+      ).toBe(identityRoundTrip(ATTENDEE_COPY_SERIES_ICS));
+    });
+  });
+
+  it("the series fixture really is two components carrying two copies of the user's line", () => {
+    withParsedResource(ATTENDEE_COPY_SERIES_ICS, (resource) => {
+      expect(resource.components).toHaveLength(2);
+      expect(isRecurringResource(resource)).toBe(true);
+    });
+    expect(
+      unfoldedLines(ATTENDEE_COPY_SERIES_ICS).filter((line) =>
+        line.includes(`EMAIL=${OWN_LOGIN}`),
+      ),
+    ).toHaveLength(2);
+  });
+
+  describe("the user's line matches in every form 18-01 measured, and a stranger's never does", () => {
+    it.each([
+      [
+        "an upper-case mailto value",
+        "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:MAILTO:TEST@EXAMPLE.INVALID",
+      ],
+      [
+        "an EMAIL parameter on a urn:uuid value",
+        "ATTENDEE;EMAIL=Test@Example.Invalid;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:urn:uuid:5b1c0d2e-0001",
+      ],
+      [
+        "an exact non-mailto href",
+        `ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:${OWN_PRINCIPAL}`,
+      ],
+      ["the urn form the set advertises", `ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:${OWN_URN}`],
+      [
+        "an alias rather than the login",
+        `ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:${OWN_ALIAS}`,
+      ],
+    ])("matches %s, and changes only that line", (_label, line) => {
+      const ics = invitationIcs([STRANGER_LINE, line]);
+      const body = answeredBody(ics, OWN_ADDRESSES, "TENTATIVE");
+
+      const diff = unfoldedDiff(identityRoundTrip(ics), body);
+      expect(diff).toHaveLength(1);
+      expect(diff[0].after).toBe(answeredLine(diff[0].before, "TENTATIVE"));
+      // The stranger's line is untouched, answer and all.
+      expect(body).toContain(STRANGER_LINE);
+    });
+
+    it.each([
+      ["a stranger's mailto", "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:dana@example.invalid"],
+      [
+        "a stranger's principal path with a stranger's EMAIL",
+        "ATTENDEE;EMAIL=dana@example.invalid;PARTSTAT=NEEDS-ACTION:/aDanaPrincipal/principal/",
+      ],
+      [
+        "the user's principal path in another case, since an href is never folded",
+        "ATTENDEE;PARTSTAT=NEEDS-ACTION:/AOWNERPRINCIPALPROBE/PRINCIPAL/",
+      ],
+      ["a urn the set does not advertise", "ATTENDEE;PARTSTAT=NEEDS-ACTION:urn:uuid:00000001"],
+      ["an address that merely starts with the user's", "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:test@example.invalidx"],
+      ["an address that merely ends with the user's", "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:xtest@example.invalid"],
+      [
+        "the user's address as a display name only",
+        `ATTENDEE;CN=${OWN_LOGIN};PARTSTAT=NEEDS-ACTION:mailto:dana@example.invalid`,
+      ],
+      [
+        "the user's bare address without a scheme",
+        `ATTENDEE;PARTSTAT=NEEDS-ACTION:${OWN_LOGIN}`,
+      ],
+    ])("never matches %s", (_label, line) => {
+      expect(answered(invitationIcs([line]), OWN_ADDRESSES, "DECLINED")).toStrictEqual({
+        kind: "not-invited",
+        body: null,
+      });
+    });
+  });
+
+  describe("every refusal arm", () => {
+    it("refuses as the organiser's when ORGANIZER is the user, even though an ATTENDEE matches too", () => {
+      const ics = invitationIcs(
+        [`ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:${OWN_LOGIN}`],
+        `ORGANIZER;CN=Me:mailto:${OWN_LOGIN}`,
+      );
+      expect(answered(ics, OWN_ADDRESSES, "ACCEPTED").kind).toBe("organiser");
+    });
+
+    it("refuses a FORGED organiser that carries the user's address only in EMAIL=", () => {
+      // T-18-08: the stranger wrote the ORGANIZER line, and wrote the user's
+      // address into it. Answering would be the user replying to themselves.
+      const ics = invitationIcs(
+        [`ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:${OWN_LOGIN}`],
+        `ORGANIZER;EMAIL=${OWN_LOGIN}:/aSomebodyElse/principal/`,
+      );
+      expect(answered(ics, OWN_ADDRESSES, "ACCEPTED").kind).toBe("organiser");
+    });
+
+    it("refuses as the organiser's when only the EDITED date names the user as organiser", () => {
+      // The organiser check runs across every component before any line is
+      // matched, so a forged override cannot be answered through the master.
+      const marker = "ORGANIZER;CN=Probe Organiser;EMAIL=organiser.probe@example.invalid";
+      const at = ATTENDEE_COPY_SERIES_ICS.lastIndexOf(marker);
+      expect(at).toBeGreaterThan(ATTENDEE_COPY_SERIES_ICS.indexOf(marker));
+      const forged =
+        ATTENDEE_COPY_SERIES_ICS.slice(0, at) +
+        `ORGANIZER;CN=Probe Organiser;EMAIL=${OWN_LOGIN}` +
+        ATTENDEE_COPY_SERIES_ICS.slice(at + marker.length);
+
+      expect(answered(forged, OWN_ADDRESSES, "ACCEPTED").kind).toBe("organiser");
+    });
+
+    it("refuses as not-invited when no line is the user's", () => {
+      expect(
+        answered(invitationIcs([STRANGER_LINE]), OWN_ADDRESSES, "ACCEPTED").kind,
+      ).toBe("not-invited");
+    });
+
+    it("refuses as not-invited when the address set is empty", () => {
+      expect(answered(ATTENDEE_COPY_GENUINE_ICS, [], "ACCEPTED").kind).toBe("not-invited");
+    });
+
+    it("refuses as not-invited when the user's line sits on a component nobody organises", () => {
+      const ics = invitationIcs(
+        [`ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:${OWN_LOGIN}`],
+        null,
+      );
+      expect(answered(ics, OWN_ADDRESSES, "ACCEPTED").kind).toBe("not-invited");
+    });
+
+    it("refuses as ambiguous when two of the user's addresses sit on one component", () => {
+      const ics = invitationIcs([
+        `ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:${OWN_LOGIN}`,
+        `ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:${OWN_ALIAS}`,
+      ]);
+      expect(answered(ics, OWN_ADDRESSES, "ACCEPTED").kind).toBe("ambiguous");
+    });
+
+    it("refuses as ambiguous when the SAME address appears twice in two forms", () => {
+      const ics = invitationIcs([
+        `ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:${OWN_LOGIN}`,
+        `ATTENDEE;EMAIL=${OWN_LOGIN};PARTSTAT=NEEDS-ACTION:${OWN_PRINCIPAL}`,
+      ]);
+      expect(answered(ics, OWN_ADDRESSES, "ACCEPTED").kind).toBe("ambiguous");
+    });
+
+    it("refuses as unchanged when the stored answer already is the requested one", () => {
+      const ics = invitationIcs([
+        STRANGER_LINE,
+        `ATTENDEE;PARTSTAT=DECLINED:mailto:${OWN_LOGIN}`,
+      ]);
+      expect(answered(ics, OWN_ADDRESSES, "DECLINED").kind).toBe("unchanged");
+      // And a different answer on the same bytes is not refused.
+      expect(answered(ics, OWN_ADDRESSES, "ACCEPTED").kind).toBe("ok");
+    });
+
+    it("reads a stored answer in lower case as the same answer", () => {
+      const ics = invitationIcs([`ATTENDEE;PARTSTAT=declined:mailto:${OWN_LOGIN}`]);
+      expect(answered(ics, OWN_ADDRESSES, "DECLINED").kind).toBe("unchanged");
+    });
+  });
+
+  it("each href in the address set matches only the user's own ATTENDEE line (D-06)", () => {
+    // The user's own line is identified here by its display name, which every
+    // attendee-copy fixture sets to the login — a marker independent of the
+    // matcher under test. Every other ORGANIZER and ATTENDEE line must match
+    // NO href in the set, one href at a time.
+    const matchedBy: Record<string, string[][]> = {};
+    for (const [name, fixture] of [
+      ["genuine", ATTENDEE_COPY_GENUINE_ICS],
+      ["imported", ATTENDEE_COPY_IMPORTED_ICS],
+      ["series", ATTENDEE_COPY_SERIES_ICS],
+    ] as const) {
+      matchedBy[name] = [];
+      withParsedResource(fixture, (resource) => {
+        for (const component of resource.components) {
+          for (const kind of ["attendee", "organizer"]) {
+            for (const property of component.getAllProperties(kind)) {
+              const rawValue = property.getFirstValue();
+              const value = typeof rawValue === "string" ? rawValue : null;
+              const rawEmail = property.getParameter("email");
+              const email = Array.isArray(rawEmail)
+                ? (rawEmail[0] ?? null)
+                : typeof rawEmail === "string"
+                  ? rawEmail
+                  : null;
+              const rawName = property.getParameter("cn");
+              const isUsersLine = kind === "attendee" && rawName === OWN_LOGIN;
+
+              const hits = OWN_ADDRESSES.filter((href) =>
+                isOwnAddress(value, email, [href]),
+              );
+              if (isUsersLine) {
+                matchedBy[name].push(hits);
+              } else {
+                expect(hits, `${name}: ${kind} ${String(value)}`).toStrictEqual([]);
+              }
+            }
+          }
+        }
+      });
+    }
+
+    // Which hrefs reach the user's line, per copy. The genuine copy is reached
+    // two ways (its value and its EMAIL=); the imported copy one way.
+    expect(matchedBy).toStrictEqual({
+      genuine: [[OWN_PRINCIPAL, `mailto:${OWN_LOGIN}`]],
+      imported: [[`mailto:${OWN_LOGIN}`]],
+      series: [
+        [OWN_PRINCIPAL, `mailto:${OWN_LOGIN}`],
+        [OWN_PRINCIPAL, `mailto:${OWN_LOGIN}`],
+      ],
+    });
+  });
+});
+
+describe("isOwnAddress", () => {
+  it.each([
+    ["mailto, folded", "MAILTO:Test@Example.INVALID", null, true],
+    ["EMAIL=, folded, against a mailto entry", "/x/principal/", "TEST@example.invalid", true],
+    ["an exact href", OWN_PRINCIPAL, null, true],
+    ["an exact urn", OWN_URN, null, true],
+    ["an href in another case", OWN_PRINCIPAL.toUpperCase(), null, false],
+    ["an empty EMAIL= on a stranger", "mailto:dana@example.invalid", "", false],
+    ["a null value and no EMAIL=", null, null, false],
+    ["EMAIL= never compared with a non-mailto entry", "mailto:dana@example.invalid", OWN_PRINCIPAL, false],
+  ] as const)("%s", (_label, value, email, expected) => {
+    expect(isOwnAddress(value, email, OWN_ADDRESSES)).toBe(expected);
+  });
+
+  it("matches nothing against an empty set, or a set of empty strings", () => {
+    expect(isOwnAddress(`mailto:${OWN_LOGIN}`, OWN_LOGIN, [])).toBe(false);
+    expect(isOwnAddress("", "", ["", "mailto:"])).toBe(false);
+  });
+});
+
+describe("invitationFactsOf", () => {
+  it("reads a schedule tag as a scheduling object, which tells the organiser", () => {
+    expect(
+      invitationFactsOf(ATTENDEE_COPY_GENUINE_ICS, OWN_ADDRESSES, "probe-schedule-tag-1"),
+    ).toStrictEqual({
+      organizerName: "Probe Organiser",
+      ownAnswer: "NEEDS-ACTION",
+      evidence: "scheduling-object",
+    });
+  });
+
+  // 18-02's deviation 1, pinned in both directions. A missing tag says
+  // "imported" ONLY when the bytes corroborate it with SCHEDULE-AGENT=CLIENT or
+  // NONE on the organiser or the user's own line. Otherwise the bytes decide
+  // nothing, and the tool layer says the organiser MAY be told.
+  it("reads NO tag and no corroborating marker as undetermined, never as imported", () => {
+    expect(
+      invitationFactsOf(ATTENDEE_COPY_GENUINE_ICS, OWN_ADDRESSES, null).evidence,
+    ).toBe("undetermined");
+  });
+
+  it("reads NO tag plus the imported markers as an imported copy", () => {
+    expect(
+      invitationFactsOf(ATTENDEE_COPY_IMPORTED_ICS, OWN_ADDRESSES, null),
+    ).toStrictEqual({
+      organizerName: "Probe Organiser",
+      ownAnswer: "NEEDS-ACTION",
+      evidence: "imported-copy",
+    });
+  });
+
+  it("lets a tag win over the imported markers", () => {
+    expect(
+      invitationFactsOf(ATTENDEE_COPY_IMPORTED_ICS, OWN_ADDRESSES, "some-tag").evidence,
+    ).toBe("scheduling-object");
+  });
+
+  it.each([
+    [
+      "CLIENT on the organiser alone",
+      "ORGANIZER;CN=Probe Organiser;SCHEDULE-AGENT=CLIENT:mailto:organiser.probe@example.invalid",
+      `ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:${OWN_LOGIN}`,
+      "imported-copy",
+    ],
+    [
+      "client in lower case",
+      "ORGANIZER;CN=Probe Organiser;SCHEDULE-AGENT=client:mailto:organiser.probe@example.invalid",
+      `ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:${OWN_LOGIN}`,
+      "imported-copy",
+    ],
+    [
+      "NONE on the user's own line alone",
+      REPLY_ORGANISER_LINE,
+      `ATTENDEE;PARTSTAT=NEEDS-ACTION;SCHEDULE-AGENT=NONE:mailto:${OWN_LOGIN}`,
+      "imported-copy",
+    ],
+    [
+      "SERVER on the organiser",
+      "ORGANIZER;CN=Probe Organiser;SCHEDULE-AGENT=SERVER:mailto:organiser.probe@example.invalid",
+      `ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:${OWN_LOGIN}`,
+      "undetermined",
+    ],
+    [
+      "NONE on a STRANGER's line only",
+      REPLY_ORGANISER_LINE,
+      "ATTENDEE;PARTSTAT=ACCEPTED;SCHEDULE-AGENT=NONE:mailto:dana@example.invalid",
+      "undetermined",
+    ],
+  ])("with no tag, reads %s as %s", (_label, organizer, attendee, expected) => {
+    const ics = invitationIcs([attendee], organizer);
+    expect(invitationFactsOf(ics, OWN_ADDRESSES, null).evidence).toBe(expected);
+  });
+
+  it("does not count the user's own NONE when the address set does not name them", () => {
+    const ics = invitationIcs([
+      `ATTENDEE;PARTSTAT=NEEDS-ACTION;SCHEDULE-AGENT=NONE:mailto:${OWN_LOGIN}`,
+    ]);
+    expect(invitationFactsOf(ics, [], null)).toStrictEqual({
+      organizerName: "Probe Organiser",
+      ownAnswer: null,
+      evidence: "undetermined",
+    });
+  });
+
+  it.each([
+    ["the CN", "ORGANIZER;CN=Probe Organiser:mailto:organiser.probe@example.invalid", "Probe Organiser"],
+    ["the mailto address when there is no CN", "ORGANIZER:mailto:organiser.probe@example.invalid", "organiser.probe@example.invalid"],
+    ["the EMAIL= when the value is a path", "ORGANIZER;EMAIL=organiser.probe@example.invalid:/aOrg/principal/", "organiser.probe@example.invalid"],
+    ["null when nothing names them", "ORGANIZER:/aOrg/principal/", null],
+    ["null when there is no organiser", null, null],
+  ])("names the organiser by %s", (_label, organizer, expected) => {
+    const ics = invitationIcs([`ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:${OWN_LOGIN}`], organizer);
+    expect(invitationFactsOf(ics, OWN_ADDRESSES, null).organizerName).toBe(expected);
+  });
+
+  it("returns the user's stored answer verbatim, however strange", () => {
+    const ics = invitationIcs([`ATTENDEE;PARTSTAT=X-PONDERING:mailto:${OWN_LOGIN}`]);
+    expect(invitationFactsOf(ics, OWN_ADDRESSES, null).ownAnswer).toBe("X-PONDERING");
   });
 });
