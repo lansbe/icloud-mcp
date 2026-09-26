@@ -713,6 +713,11 @@ async function buildContactCreatePreview(
         // no invitation leaves the building on this path, so the clause the user
         // must read is the one about undoing it.
         recipientCount: null,
+        // NULL. A contact has no reminders. Present and null rather than
+        // absent, on `ConfirmationSummary`'s own rule: an operation that cannot
+        // touch one says so, and a field that can be ABSENT is a field a later
+        // build reads as `undefined`.
+        alarms: null,
       },
       "would",
     ),
@@ -863,6 +868,11 @@ async function buildContactUpdatePreview(
         // leaves the building on this path, so the clause the user must read is
         // the one saying the previous values cannot be recovered.
         recipientCount: null,
+        // NULL. A contact has no reminders. Present and null rather than
+        // absent, on `ConfirmationSummary`'s own rule: an operation that cannot
+        // touch one says so, and a field that can be ABSENT is a field a later
+        // build reads as `undefined`.
+        alarms: null,
       },
       "would",
     ),
@@ -1019,6 +1029,11 @@ async function applyContactCommit(
           alsoRemoved: null,
           fieldCount: null,
           recipientCount: null,
+          // NULL. A contact has no reminders. Present and null rather than
+          // absent, on `ConfirmationSummary`'s own rule: an operation that cannot
+          // touch one says so, and a field that can be ABSENT is a field a later
+          // build reads as `undefined`.
+          alarms: null,
         },
         "did",
       ),
@@ -1098,6 +1113,11 @@ async function applyContactCommit(
         alsoRemoved: null,
         fieldCount: fields.length,
         recipientCount: null,
+        // NULL. A contact has no reminders. Present and null rather than
+        // absent, on `ConfirmationSummary`'s own rule: an operation that cannot
+        // touch one says so, and a field that can be ABSENT is a field a later
+        // build reads as `undefined`.
+        alarms: null,
       },
       "did",
     ),

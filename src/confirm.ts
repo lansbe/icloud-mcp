@@ -1425,6 +1425,54 @@ export interface ConfirmationSummary {
   fieldCount: number | null;
   /** How many people the write tells, or `null` when it tells nobody. */
   recipientCount: number | null;
+  /**
+   * What happens to the target's reminders, or `null` when nothing does.
+   *
+   * Present and `null` rather than absent, on this struct's own rule: an
+   * operation that cannot touch a reminder says so, and a field that can be
+   * ABSENT is a field a later build reads as `undefined`.
+   *
+   * **The DIRECTION is here because the three cases are not interchangeable to
+   * the person reading the sentence.** "Changing 1 field" is true of an added
+   * reminder, a replaced one and a deleted one, and a user who agreed to that
+   * and then found their reminder gone has been under-told. Under-warning is the
+   * one direction this path must never fail in — `occurrencesGoingWith`'s
+   * docstring in `src/mcp/tools/calendar.ts` states it as the governing rule —
+   * so the line names which of the three it is.
+   *
+   * `unmodelled` is the count of stored reminders this server could not express
+   * and which a whole-list replacement therefore takes away. It is the one place
+   * the narrow alarm shape has a cost, and the user is entitled to know about it
+   * BEFORE they agree rather than to discover it on their phone.
+   */
+  alarms: AlarmLineSummary | null;
+}
+
+/**
+ * Which way a reminder change goes.
+ *
+ * Three literals rather than a pair of booleans or a signed count, for
+ * `ConfirmationTense`'s reason: a call site reading `direction: "removed"` says
+ * what the sentence will say, and nothing has to be decoded to check it.
+ */
+export type AlarmDirection = "added" | "changed" | "removed";
+
+/** What the line says about a change to the target's reminders. */
+export interface AlarmLineSummary {
+  /** Added, replaced, or taken away. */
+  direction: AlarmDirection;
+  /**
+   * How many reminders the clause's verb acts on, and always a MODELLED count.
+   *
+   * The number being set for `added` and `changed`; the number going away for
+   * `removed`. It can legitimately be zero — a removal whose only stored
+   * reminder was one this server cannot express — and the clause is then
+   * dropped, on `alsoRemoved`'s own rule that a zero is not a smaller version
+   * of nine. The `unmodelled` clause below still states what happens.
+   */
+  count: number;
+  /** How many stored reminders this server cannot express go with the change. */
+  unmodelled: number;
 }
 
 /**
@@ -1523,6 +1571,31 @@ const CONFIRMATION_CONSEQUENCES: Record<ConfirmKind, string> = {
  * because both clauses it joins are tense-free too.
  */
 const INVITATION_CONSEQUENCE = "An invitation cannot be unsent.";
+
+/**
+ * The verb each direction of a reminder change gets, tense-free.
+ *
+ * Three different verbs rather than one with a modifier, and none of them is
+ * "changing" — that word is already spoken two clauses earlier by the field
+ * count, and a sentence saying "changing 1 field, changing its reminder" reads
+ * as two changes rather than as one described twice.
+ *
+ * **No minutes in any of them, and that is a decision rather than an
+ * omission.** A sentence the user has to parse is a sentence the user skims,
+ * and the whole value of this line is that it gets read. The figures are in the
+ * preview's `fields` row beside it — an `alarms` entry whose `from` and `to`
+ * name the minute counts — where they can be read at leisure and where a longer
+ * list costs the sentence nothing. A clause that grew with the list would be a
+ * clause that stops being read exactly when there is most to read.
+ *
+ * Tense-free, for `CONFIRMATION_VERBS`' reason: each reads identically after
+ * "Overwriting" and after "Overwrote".
+ */
+const ALARM_VERBS: Record<AlarmDirection, string> = {
+  added: "setting",
+  changed: "replacing",
+  removed: "removing",
+};
 
 /**
  * How long a resource's own name may be inside a sentence this server authors.
@@ -1720,6 +1793,51 @@ export function composeConfirmationLine(
   if (summary.fieldCount !== null && summary.fieldCount > 0) {
     const word = summary.fieldCount === 1 ? "field" : "fields";
     clauses.push(`changing ${summary.fieldCount} ${word}`);
+  }
+
+  // The reminders, AFTER the field count and before the recipients. The count
+  // above already includes this change as one of its fields — an alarm-only
+  // edit reads "changing 1 field" rather than "changing 0 fields", which would
+  // be a sentence about nothing attached to a write that does something — so
+  // what these clauses add is WHICH way it goes.
+  const alarms = summary.alarms;
+  if (alarms !== null) {
+    // Zero on a removal whose only stored reminder was one this server cannot
+    // express. The clause goes rather than reading "removing its 0 reminders",
+    // on `alsoRemoved`'s own rule above; the unmodelled clause below still says
+    // what happens to it, so nothing is left unsaid.
+    if (alarms.count > 0) {
+      const noun =
+        alarms.count === 1 ? "reminder" : CONFIRMATION_PLURALS.reminder;
+      // **"its" on the two directions that act on reminders the event ALREADY
+      // had, and an indefinite article on the one that does not.** "setting its
+      // reminder" would claim the event already had the thing being put on it,
+      // and "removing a reminder" would leave which one open on an event that
+      // has exactly one. The count replaces the determiner wherever there is
+      // more than one, because a figure is what a person checks against.
+      const determiner =
+        alarms.direction === "added"
+          ? alarms.count === 1
+            ? "a "
+            : `${alarms.count} `
+          : alarms.count === 1
+            ? "its "
+            : `its ${alarms.count} `;
+      clauses.push(`${ALARM_VERBS[alarms.direction]} ${determiner}${noun}`);
+    }
+
+    // **The one place the narrow alarm shape has a cost, said out loud.** A
+    // whole-list replacement takes every stored reminder, including one this
+    // server could not express and therefore could not offer to keep. Silence
+    // here would be under-warning on an irreversible loss the user could not
+    // have predicted from the request they made.
+    if (alarms.unmodelled > 0) {
+      const noun =
+        alarms.unmodelled === 1 ? "reminder" : CONFIRMATION_PLURALS.reminder;
+      clauses.push(
+        `discarding ${alarms.unmodelled} stored ${noun} this server cannot express`,
+      );
+    }
   }
 
   const tells = summary.recipientCount !== null && summary.recipientCount > 0;

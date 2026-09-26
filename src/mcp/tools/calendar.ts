@@ -38,6 +38,7 @@ import type {
   UpdatedCalendar,
 } from "../../dav/calendar";
 import type {
+  AlarmReading,
   AlarmSpec,
   BuildEventInput,
   OccurrenceCounts,
@@ -109,6 +110,7 @@ import {
 } from "../../confirm";
 import type {
   AlarmChange,
+  AlarmLineSummary,
   AttendeeChange,
   ConfirmationSummary,
   NormalizedChange,
@@ -1660,6 +1662,114 @@ function diffOf(
 }
 
 /**
+ * What an alarm change does to the stored reminders, or null when it does nothing.
+ *
+ * **Computed by comparing the MODELLED list read off the stored bytes against
+ * the list the caller supplied**, which is the only comparison that can be made
+ * honestly: the read side reports what this server can name, and the write side
+ * replaces the whole list, so those are the two ends of what actually happens.
+ *
+ * Four answers, and the fourth is the one worth arguing:
+ *
+ *   - **The request said nothing** (`requested === null`) — nothing happens to
+ *     any reminder, so there is nothing to report. D-04's absent arm.
+ *   - **An empty list over nothing stored** — also nothing. A removal of no
+ *     reminders is not a smaller removal; it is not a change at all.
+ *   - **The two lists agree and nothing was unmodelled** — nothing again. A
+ *     caller who re-sent the reminder that was already there has not changed it,
+ *     and reporting a change would put a field count on a no-op.
+ *   - **Anything else** — a direction, plus the count of stored reminders this
+ *     server could NOT express. That last number is why an agreeing list can
+ *     still be a change: an unmodelled alarm is removed by the whole-list
+ *     replacement even when every modelled one matches, and the user has to be
+ *     told before they agree rather than after it is gone.
+ *
+ * The comparison is on `minutesBefore` alone because `action` has one value
+ * this phase (D-01); a second value would have to join the comparison here, and
+ * the literal union on `AlarmSpec` is what makes adding one a decision rather
+ * than a string that compiles.
+ */
+function alarmLineSummaryOf(
+  stored: AlarmReading,
+  requested: AlarmChange[] | null,
+): AlarmLineSummary | null {
+  if (requested === null) return null;
+
+  const storedCount = stored.modelled.length + stored.unmodelled;
+
+  if (requested.length === 0) {
+    if (storedCount === 0) return null;
+    return {
+      direction: "removed",
+      count: stored.modelled.length,
+      unmodelled: stored.unmodelled,
+    };
+  }
+
+  if (storedCount === 0) {
+    return { direction: "added", count: requested.length, unmodelled: 0 };
+  }
+
+  const unchanged =
+    stored.unmodelled === 0 &&
+    stored.modelled.length === requested.length &&
+    stored.modelled.every(
+      (one, index) => one.minutesBefore === requested[index]!.minutesBefore,
+    );
+  if (unchanged) return null;
+
+  return {
+    direction: "changed",
+    count: requested.length,
+    unmodelled: stored.unmodelled,
+  };
+}
+
+/**
+ * The alarm entry in the per-field diff, or null when no reminder moves.
+ *
+ * **It is a `FieldChange` like every other row, which is what makes the count
+ * true without a second counter.** `changedFields` and the line's `fieldCount`
+ * both come off the diff, so an alarm-only edit reports "changing 1 field"
+ * rather than "changing 0 fields" — a sentence about nothing attached to a write
+ * that does something — and it does so because the row is THERE rather than
+ * because two places were each taught to add one.
+ *
+ * The values ARE the minute counts, and this is where they belong: the sentence
+ * deliberately names none of them (see `ALARM_VERBS`), and this row is the
+ * structured half beside it where a longer list costs nothing to read.
+ *
+ * `null` on either side means "no reminder this server can name", which is a
+ * different statement from "no reminder at all" when an unmodelled one is
+ * present — the line is what carries that, because a value field is no place for
+ * a caveat.
+ *
+ * Emitted from the DIRECTION rather than from a comparison of the two strings.
+ * A removal whose only stored reminder was unmodelled has `null` on both sides
+ * and is still a real change, so a string comparison would drop the row and
+ * under-report the field count on exactly the case that costs the user most.
+ */
+function alarmFieldChange(
+  stored: AlarmReading,
+  requested: AlarmChange[] | null,
+  summary: AlarmLineSummary | null,
+): FieldChange | null {
+  if (summary === null) return null;
+  return {
+    field: "alarms",
+    from: minutesList(stored.modelled),
+    to: minutesList(requested ?? []),
+  };
+}
+
+/** A reminder list as minute counts, or null when there are none to name. */
+function minutesList(alarms: readonly AlarmChange[]): string | null {
+  return alarms.length === 0
+    ? null
+    : alarms.map((one) => String(one.minutesBefore)).join(", ");
+}
+
+/**
  * The fields a change ASSERTS a value for, which is not the same as a diff.
  *
  * Said plainly because the name invites the other reading: a commit
@@ -1668,7 +1778,16 @@ function diffOf(
  * the thing the user was asked to read.
  */
 function assertedFields(change: NormalizedChange): string[] {
-  return CHANGE_FIELDS.filter((field) => change[field] !== null);
+  const fields: string[] = CHANGE_FIELDS.filter(
+    (field) => change[field] !== null,
+  );
+  // Alarms are NOT in `CHANGE_FIELDS` — that tuple's values are strings and
+  // booleans, and a list is neither — so the one field this plan added is
+  // appended by name. A non-null value is an ASSERTION about reminders, which
+  // is exactly what this function counts; whether it MOVED anything is the
+  // preview's question and is answered by `alarmLineSummaryOf`.
+  if (change.alarms !== null) fields.push("alarms");
+  return fields;
 }
 
 /**
@@ -2213,7 +2332,16 @@ async function buildPreview(
     // attendee list this server READ still cannot become one it WROTE.
     attendees: recipientsOf(read.detail),
   };
-  const fields = diffOf(current, desired);
+  // The reminders as they stand, read off the component the WRITE would target
+  // — the lone component, the existing override, or the master a new override
+  // is cloned from. It costs no request: the body is already in hand.
+  const storedAlarms = storedAlarmsOf(read.body, ref.recurrenceId);
+  const alarmSummary = alarmLineSummaryOf(storedAlarms, desired.alarms);
+  const alarmRow = alarmFieldChange(storedAlarms, desired.alarms, alarmSummary);
+  // The alarm row joins the diff rather than being counted beside it, so
+  // `changedFields`, the `fields` rows and the line's own count all come off ONE
+  // list and cannot disagree about how many fields move.
+  const fields = [...diffOf(current, desired), ...(alarmRow === null ? [] : [alarmRow])];
 
   const isRecurring = read.isRecurring;
   // **ONE arm survived D-02's collapse, and this comment exists because "why
@@ -2388,6 +2516,10 @@ async function buildPreview(
         // so it can report what it wrote and cannot report what moved.
         fieldCount: fields.length,
         recipientCount: desired.attendees.length,
+        // WHICH way the reminders go, because "changing 1 field" is true of an
+        // added reminder, a replaced one and a deleted one alike — and the user
+        // who agreed to that and then found their reminder gone was under-told.
+        alarms: alarmSummary,
       },
       "would",
     ),
@@ -2664,6 +2796,11 @@ async function buildDeletePreview(
         // A delete asserts no value for any field; it takes the whole thing.
         fieldCount: null,
         recipientCount: recipients.length,
+        // NULL, for the field count's own reason one line up. A delete takes the
+        // event and every reminder on it, so the reminders are not a change to
+        // report — and a clause about them beside a clause about the occurrences
+        // going would be the smaller loss stated next to the larger one.
+        alarms: null,
       },
       "would",
     ),
@@ -2915,6 +3052,11 @@ async function buildCreatePreview(
         // invitation.
         fieldCount: null,
         recipientCount: recipients.length,
+        // NULL, on the field count's own reason directly above. A create brings
+        // an event into being, so a reminder on it is not a CHANGE to anything:
+        // "setting a reminder" on an event that did not exist a moment ago is
+        // counting the event rather than describing a change.
+        alarms: null,
       },
       "would",
     ),
@@ -3075,7 +3217,12 @@ async function occurrenceBody(
   signedEtag: string | null,
   input: BuildEventInput,
   scope: WriteScope,
-): Promise<{ body: string; affected: number | string; scheduling: boolean }> {
+): Promise<{
+  body: string;
+  affected: number | string;
+  scheduling: boolean;
+  storedAlarms: AlarmReading;
+}> {
   const read = await getEventWithEtag(env, principal, davFetch, ref);
   if (signedEtag === null || read.etag !== signedEtag) {
     throw new DavStaleResourceError();
@@ -3092,6 +3239,12 @@ async function occurrenceBody(
 
   return {
     body,
+    // Read off THIS leg's own bytes, for the reason `affected` below gives:
+    // carrying the preview's figure forward would make the regression matrix
+    // comparing the two a tautology. It costs no request — the body above is
+    // the one the patch was just built from — and the ETag comparison four
+    // lines up is what makes the two legs' answers necessarily agree.
+    storedAlarms: storedAlarmsOf(read.body, ref.recurrenceId),
     // Read off THIS leg's bytes rather than carried in the confirmation, which
     // is safe for the reason the ETag comparison four lines up makes: the
     // resource the commit is about to write is byte-for-byte the resource the
@@ -3184,7 +3337,7 @@ async function scopelessBody(
   ref: EventRef,
   signedEtag: string | null,
   input: BuildEventInput,
-): Promise<{ body: string; scheduling: boolean }> {
+): Promise<{ body: string; scheduling: boolean; storedAlarms: AlarmReading }> {
   const read = await getEventWithEtag(env, principal, davFetch, ref);
   if (signedEtag === null || read.etag !== signedEtag) {
     throw new DavStaleResourceError();
@@ -3197,7 +3350,14 @@ async function scopelessBody(
   // one arm of `buildPreview`'s blocker that survived D-02's collapse — but the
   // alternative is a non-null assertion about a caller this cannot see.
   if (body === null) throw new DavNotFoundError(false);
-  return { body, scheduling: read.isScheduling };
+  return {
+    body,
+    scheduling: read.isScheduling,
+    // THIS leg's own reading, on `occurrenceBody`'s argument: the commit reports
+    // what it did rather than repeating what the preview promised, and the two
+    // agree because the ETag comparison above refused anything else.
+    storedAlarms: storedAlarmsOf(read.body, null),
+  };
 }
 
 /**
@@ -3556,6 +3716,9 @@ async function applyCommit(
           alsoRemoved: null,
           fieldCount: null,
           recipientCount: change.attendees.length,
+          // NULL, on the create preview's own reason: there was nothing there
+          // for a reminder to be a change TO.
+          alarms: null,
         },
         "did",
       ),
@@ -3632,6 +3795,12 @@ async function applyCommit(
           alsoRemoved: occurrencesGoingWith(removed.affected),
           fieldCount: null,
           recipientCount: change.attendees.length,
+          // NULL. A delete takes the whole event and every reminder on it, and
+          // naming the reminders beside that would be the smaller loss stated
+          // next to the larger one — which is how the clause that matters stops
+          // being read. `CONFIRMATION_CONSEQUENCES` already says it cannot be
+          // undone.
+          alarms: null,
         },
         "did",
       ),
@@ -3804,6 +3973,11 @@ async function applyCommit(
         name: change.summary,
         alsoRemoved: null,
         fieldCount: assertedFields(change).length,
+        // Computed over the bytes THIS leg re-read, not over the preview's
+        // figure — the same discipline `affectedOccurrences` follows, and for
+        // the same reason: a commit restating the preview's own answer proves
+        // nothing about what it did. It costs no request.
+        alarms: alarmLineSummaryOf(rewrite.storedAlarms, change.alarms),
         // The count keyed on what the RESOURCE carries, on the same argument
         // the four fields above it use: a rebuild wrote no participant at all,
         // so it told nobody, and a line naming people beside an
@@ -3996,6 +4170,12 @@ async function buildCollectionDeletePreview(
         // cancellation of its own, and this server names no attendee list on
         // any path that reaches here.
         recipientCount: null,
+        // NULL. A calendar delete takes every event in the collection and
+        // every reminder on every one of them, and the clause naming the
+        // members is already the larger loss — a second one about reminders
+        // is the smaller statement beside it, which is how the clause that
+        // matters stops being read.
+        alarms: null,
       },
       "would",
     ),
@@ -4327,6 +4507,12 @@ async function applyCollectionCommit(
               alsoRemoved: { count: payload.g, noun: "item" },
               fieldCount: null,
               recipientCount: null,
+              // NULL. A calendar delete takes every event in the collection and
+              // every reminder on every one of them, and the clause naming the
+              // members is already the larger loss — a second one about reminders
+              // is the smaller statement beside it, which is how the clause that
+              // matters stops being read.
+              alarms: null,
             },
             "did",
           )

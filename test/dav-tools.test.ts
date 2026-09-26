@@ -9958,3 +9958,235 @@ describe("an alarm the schema will not accept is refused before any request (D-0
     expect(names.filter((one) => one.includes("reminder"))).toStrictEqual([]);
   });
 });
+
+describe("what the preview SAYS when the only thing changing is a reminder", () => {
+  /** Preview one update of a fixture and hand back both halves. */
+  async function previewOver(
+    ics: string,
+    args: Record<string, unknown>,
+  ): Promise<{ trusted: Record<string, unknown>; untrusted: Record<string, unknown> }> {
+    const stub = writeDavStub({ objects: { [PLAIN_HAZARDS_PATH]: ics } });
+    await warmWrite(stub);
+    const { trusted, untrusted } = await preview({
+      id: PLAIN_HAZARDS_EVENT_ID,
+      ...args,
+    });
+    return { trusted, untrusted };
+  }
+
+  it("counts an alarm-only change as a CHANGED FIELD, never as zero", async () => {
+    // "changing 0 fields" beside a write that removes the user's reminder is a
+    // sentence about nothing attached to something. The count comes off the diff
+    // rather than from a second counter, so the row being there is what makes it
+    // true.
+    const { trusted, untrusted } = await previewOver(plainHazardsIcs(), {
+      alarms: [reminder(45)],
+    });
+
+    expect(trusted.changedFields).toStrictEqual(["alarms"]);
+    expect(String(untrusted.confirmationLine)).toContain("changing 1 field");
+  });
+
+  it("names the DIRECTION for each of the three cases", async () => {
+    const changed = await previewOver(plainHazardsIcs(), {
+      alarms: [reminder(45)],
+    });
+    const removed = await previewOver(plainHazardsIcs(), { alarms: [] });
+
+    // Added needs an event with no reminder, so it uses the plain fixture.
+    const plainStub = writeDavStub();
+    await warmWrite(plainStub);
+    const added = await preview({
+      id: SIMPLE_EVENT_ID,
+      alarms: [reminder(15)],
+    });
+
+    expect(String(changed.untrusted.confirmationLine)).toContain(
+      "replacing its reminder",
+    );
+    expect(String(removed.untrusted.confirmationLine)).toContain(
+      "removing its reminder",
+    );
+    expect(String(added.untrusted.confirmationLine)).toContain(
+      "setting a reminder",
+    );
+  });
+
+  it("says NOTHING about reminders when the update does not mention them", async () => {
+    const { trusted, untrusted } = await previewOver(plainHazardsIcs(), {
+      startLocal: "2026-02-10T16:00:00",
+    });
+
+    expect(trusted.changedFields).toStrictEqual(["startLocal"]);
+    expect(String(untrusted.confirmationLine)).not.toContain("reminder");
+  });
+
+  it("says nothing when the supplied list is the one already stored", async () => {
+    // Re-sending the reminder that is already there changes nothing, so a field
+    // count and a direction clause would both be claims about a no-op. The
+    // fixture's stored reminder is fifteen minutes before.
+    const { trusted, untrusted } = await previewOver(plainHazardsIcs(), {
+      alarms: [reminder(15)],
+    });
+
+    expect(trusted.changedFields).toStrictEqual([]);
+    expect(String(untrusted.confirmationLine)).not.toContain("reminder");
+  });
+
+  it("puts the MINUTES in the structured row and never in the sentence", async () => {
+    // The recorded decision: the sentence names the direction and the count, and
+    // the figures live beside it where a longer list costs the sentence nothing.
+    const { trusted, untrusted } = await previewOver(plainHazardsIcs(), {
+      alarms: [reminder(45), reminder(120)],
+    });
+
+    expect(untrusted.fields).toContainEqual({
+      field: "alarms",
+      from: "15",
+      to: "45, 120",
+    });
+    const line = String(untrusted.confirmationLine);
+    expect(line).toContain("replacing its 2 reminders");
+    expect(line).not.toContain("45");
+    expect(line).not.toContain("120");
+  });
+
+  it("WARNS that an unmodelled reminder goes, before the user agrees", async () => {
+    // The one case where the narrow alarm shape costs the user something. This
+    // server cannot express a trigger anchored to the END of an event, so a
+    // whole-list replacement takes it — and silence about that is under-warning
+    // on a loss the request could not have predicted.
+    const unmodelled = plainHazardsIcs().replace(
+      "TRIGGER:-PT15M",
+      "TRIGGER;RELATED=END:-PT15M",
+    );
+
+    const { trusted, untrusted } = await previewOver(unmodelled, {
+      alarms: [reminder(30)],
+    });
+
+    expect(String(untrusted.confirmationLine)).toContain(
+      "discarding 1 stored reminder this server cannot express",
+    );
+    // A field count too: the write really does change the reminders, even though
+    // this server could name none of what was there.
+    expect(trusted.changedFields).toStrictEqual(["alarms"]);
+  });
+
+  it("counts an unmodelled-only REMOVAL as a change, with no zero clause", async () => {
+    const unmodelled = plainHazardsIcs().replace(
+      "TRIGGER:-PT15M",
+      "TRIGGER;RELATED=END:-PT15M",
+    );
+
+    const { trusted, untrusted } = await previewOver(unmodelled, { alarms: [] });
+    const line = String(untrusted.confirmationLine);
+
+    expect(trusted.changedFields).toStrictEqual(["alarms"]);
+    expect(line).toContain(
+      "discarding 1 stored reminder this server cannot express",
+    );
+    expect(line).not.toContain("0 reminder");
+  });
+
+  it("leaves an unmodelled reminder UNMENTIONED when the update says nothing", async () => {
+    // Under an absent `alarms` the unmodelled reminder is byte-identical
+    // afterwards, so there is nothing to warn about — and a warning here would
+    // be over-warning on a write that costs the user nothing.
+    const unmodelled = plainHazardsIcs().replace(
+      "TRIGGER:-PT15M",
+      "TRIGGER;RELATED=END:-PT15M",
+    );
+
+    const { trusted, untrusted } = await previewOver(unmodelled, {
+      startLocal: "2026-02-10T16:00:00",
+    });
+
+    expect(String(untrusted.confirmationLine)).not.toContain("reminder");
+  });
+
+  it("still folds a title that could write its own clause", async () => {
+    // The fixture's title is the hostile one, and `quotedName` folds it. Asserted
+    // beside the reminder clauses because the clause list is what the title is
+    // embedded ahead of: a title that closed its own quote would land a clause
+    // between the name and "removing its reminder".
+    const { trusted, untrusted } = await previewOver(plainHazardsIcs(), { alarms: [] });
+    const line = String(untrusted.confirmationLine);
+
+    expect(line.match(/'/g)?.length).toBe(2);
+    expect(line.indexOf("removing its reminder")).toBeGreaterThan(
+      line.lastIndexOf("'"),
+    );
+  });
+
+  it("says the same thing in the past tense once the write has landed", async () => {
+    // The commit's own line, from the bytes THIS leg re-read rather than from
+    // the preview's figure — so the two agree because they are both true rather
+    // than because one was copied.
+    const stub = writeDavStub({
+      objects: { [PLAIN_HAZARDS_PATH]: plainHazardsIcs() },
+    });
+    await warmWrite(stub);
+
+    const previewed = await preview({
+      id: PLAIN_HAZARDS_EVENT_ID,
+      alarms: [],
+    });
+    const result = await invokeRegistered("calendar_commit", {
+      confirmToken: String(previewed.trusted.confirmToken),
+      change: previewed.untrusted.change,
+    });
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+
+    const outcome = JSON.parse(blocks(result).trusted) as Record<string, unknown>;
+    const previewLine = String(previewed.untrusted.confirmationLine);
+    // Fenced on BOTH legs, because both quote the resource's own title.
+    const commitLine = String(fencedObject(blocks(result).untrusted).confirmationLine);
+
+    expect(previewLine).toContain("Overwriting");
+    expect(commitLine).toContain("Overwrote");
+
+    // **Both legs say the same thing about the reminders**, and each computed it
+    // for itself: the preview over the bytes it read, the commit over the bytes
+    // its own re-read returned. Carrying the preview's answer forward would have
+    // made this comparison a tautology, which is the argument
+    // `affectedOccurrences` already makes one field over.
+    expect(previewLine).toContain("removing its reminder");
+    expect(commitLine).toContain("removing its reminder");
+    expect(outcome.changedFields).toContain("alarms");
+
+    // The FIELD COUNT legitimately differs, and this pins that rather than
+    // pretending the two lines match. A preview answers "how many fields move"
+    // and a commit answers "how many did I assert a value for" — a commit
+    // re-reads nothing, so it cannot report what moved. The alarm clause is
+    // present on both sides regardless, which is what the user needs.
+    expect(previewLine).toContain("changing 1 field");
+    expect(commitLine).toContain("changing 8 fields");
+  });
+
+  it("produces every sentence through the ONE composer", () => {
+    // The count constraint in `scripts/forbidden-tokens.mjs` holds the composer
+    // at exactly one definition site, zero as much a violation as two. Asserted
+    // from the source here as well: an alarm clause assembled at a call site
+    // would be a second composer the scan's count cannot see, because it would
+    // not look like one.
+    const source = withoutComments(CALENDAR_TOOL_SOURCE);
+
+    // The three verbs and the warning clause exist in exactly one module, and
+    // it is not this one. A clause assembled at a call site would be a second
+    // composer the scan's count constraint cannot see, because it would not
+    // look like a composer.
+    for (const clause of [
+      "setting a reminder",
+      "setting ${",
+      "replacing its",
+      "removing its",
+      "cannot express",
+      "discarding",
+    ]) {
+      expect(source, `the tool module composes "${clause}" itself`).not.toContain(
+        clause,
+      );
+    }
+  });
+});

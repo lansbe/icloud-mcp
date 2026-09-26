@@ -2019,6 +2019,7 @@ describe("the server composes the human-facing line", () => {
       alsoRemoved: null,
       fieldCount: null,
       recipientCount: null,
+      alarms: null,
     };
   }
 
@@ -2117,6 +2118,7 @@ describe("the server composes the human-facing line", () => {
           alsoRemoved: { count: 9, noun: "event" },
           fieldCount: null,
           recipientCount: null,
+          alarms: null,
         },
         "would",
       ),
@@ -2147,6 +2149,7 @@ describe("the server composes the human-facing line", () => {
           alsoRemoved: { count: 4, noun: "item" },
           fieldCount: null,
           recipientCount: null,
+          alarms: null,
         },
         "would",
       ),
@@ -2165,6 +2168,7 @@ describe("the server composes the human-facing line", () => {
           alsoRemoved: { count: 1, noun: "item" },
           fieldCount: null,
           recipientCount: null,
+          alarms: null,
         },
         "would",
       ),
@@ -2183,6 +2187,7 @@ describe("the server composes the human-facing line", () => {
           alsoRemoved: null,
           fieldCount: 1,
           recipientCount: null,
+          alarms: null,
         },
         "would",
       ),
@@ -2201,6 +2206,7 @@ describe("the server composes the human-facing line", () => {
           alsoRemoved: null,
           fieldCount: null,
           recipientCount: 3,
+          alarms: null,
         },
         "would",
       ),
@@ -2239,6 +2245,7 @@ describe("the server composes the human-facing line", () => {
         alsoRemoved: { count: 2, noun: "event" },
         fieldCount: null,
         recipientCount: 2,
+        alarms: null,
       },
       "would",
     );
@@ -2276,6 +2283,7 @@ describe("the server composes the human-facing line", () => {
         alsoRemoved: null,
         fieldCount: 3,
         recipientCount: 3,
+        alarms: null,
       },
       "would",
     );
@@ -2310,6 +2318,7 @@ describe("the server composes the human-facing line", () => {
         alsoRemoved: null,
         fieldCount: null,
         recipientCount: 1,
+        alarms: null,
       },
       "would",
     );
@@ -2329,6 +2338,7 @@ describe("the server composes the human-facing line", () => {
         alsoRemoved: { count: 1, noun: "event" },
         fieldCount: 1,
         recipientCount: 1,
+        alarms: null,
       },
       "would",
     );
@@ -2340,6 +2350,7 @@ describe("the server composes the human-facing line", () => {
         alsoRemoved: { count: 4, noun: "event" },
         fieldCount: 2,
         recipientCount: 3,
+        alarms: null,
       },
       "would",
     );
@@ -2364,6 +2375,7 @@ describe("the server composes the human-facing line", () => {
       alsoRemoved: { count: "unbounded", noun: "event" },
       fieldCount: null,
       recipientCount: 2,
+      alarms: null,
     };
 
     expect(composeConfirmationLine(shaped, "would")).toBe(
@@ -2392,6 +2404,7 @@ describe("the server composes the human-facing line", () => {
       alsoRemoved: { count: "unbounded", noun: "event" },
       fieldCount: null,
       recipientCount: null,
+      alarms: null,
     };
     const forward = composeConfirmationLine(shaped, "would");
     const past = composeConfirmationLine(shaped, "did");
@@ -2413,6 +2426,7 @@ describe("the server composes the human-facing line", () => {
       alsoRemoved: { count: 9, noun: "event" },
       fieldCount: null,
       recipientCount: null,
+      alarms: null,
     };
     const forward = composeConfirmationLine(shaped, "would");
     const past = composeConfirmationLine(shaped, "did");
@@ -2458,6 +2472,7 @@ describe("the server composes the human-facing line", () => {
         alsoRemoved: { count: 0, noun: "event" },
         fieldCount: 0,
         recipientCount: 0,
+        alarms: null,
       },
       "would",
     );
@@ -2480,6 +2495,7 @@ describe("the server composes the human-facing line", () => {
       alsoRemoved: null,
       fieldCount: null,
       recipientCount: 2,
+      alarms: null,
     };
 
     expect(composeConfirmationLine(shaped, "would")).toBe(
@@ -2519,6 +2535,7 @@ describe("the server composes the human-facing line", () => {
       alsoRemoved: null,
       fieldCount: null,
       recipientCount: null,
+      alarms: null,
     };
   }
 
@@ -2760,5 +2777,200 @@ describe("the refusal is translated at the DAV tree's own boundary", () => {
     expect(davToErrorCategory(new ConfirmationInvalidError())).toMatchObject({
       category: "connection_failed",
     });
+  });
+});
+
+describe("the sentence says which way a reminder change goes", () => {
+  /** An update summary with the reminder clause under test and nothing else. */
+  function reminderLine(
+    alarms: ConfirmationSummary["alarms"],
+    fieldCount: number | null = 1,
+  ): string {
+    return composeConfirmationLine(
+      {
+        kind: "update",
+        noun: "event",
+        name: "Standup",
+        alsoRemoved: null,
+        fieldCount,
+        recipientCount: null,
+        alarms,
+      },
+      "would",
+    );
+  }
+
+  it("says a reminder is being SET on an event that had none", () => {
+    expect(reminderLine({ direction: "added", count: 1, unmodelled: 0 })).toBe(
+      "Overwriting event 'Standup', changing 1 field, setting a reminder. " +
+        "The values it held before cannot be recovered.",
+    );
+  });
+
+  it("says a reminder is being REPLACED, which is what a whole-list write does", () => {
+    expect(reminderLine({ direction: "changed", count: 1, unmodelled: 0 })).toBe(
+      "Overwriting event 'Standup', changing 1 field, replacing its reminder. " +
+        "The values it held before cannot be recovered.",
+    );
+  });
+
+  it("says a reminder is being REMOVED, which is the one that matters most", () => {
+    // A user who agreed to "changing 1 field" and then found their reminder gone
+    // has been under-told, and under-warning is the one direction this path must
+    // never fail in.
+    expect(reminderLine({ direction: "removed", count: 1, unmodelled: 0 })).toBe(
+      "Overwriting event 'Standup', changing 1 field, removing its reminder. " +
+        "The values it held before cannot be recovered.",
+    );
+  });
+
+  it("uses a DIFFERENT verb from the field count's, so one change reads as one", () => {
+    // "changing 1 field, changing its reminder" reads as two changes rather than
+    // as one described twice, which is why `ALARM_VERBS` shares no word with the
+    // field clause.
+    for (const direction of ["added", "changed", "removed"] as const) {
+      const line = reminderLine({ direction, count: 1, unmodelled: 0 });
+      expect(line.match(/changing/g)?.length).toBe(1);
+    }
+  });
+
+  it("pluralises from the closed table rather than by a suffix rule", () => {
+    expect(reminderLine({ direction: "added", count: 2, unmodelled: 0 })).toContain(
+      "setting 2 reminders",
+    );
+    expect(
+      reminderLine({ direction: "removed", count: 3, unmodelled: 0 }),
+    ).toContain("removing its 3 reminders");
+  });
+
+  it("names no minutes at all, on purpose", () => {
+    // A sentence the user has to parse is a sentence the user skims. The figures
+    // are in the preview's `alarms` field row beside this line, where a longer
+    // list costs the sentence nothing.
+    for (const count of [1, 2, 5]) {
+      const line = reminderLine({ direction: "changed", count, unmodelled: 0 });
+      expect(line).not.toMatch(/minute/);
+      expect(line).not.toMatch(/\bPT/);
+    }
+  });
+
+  it("warns when a reminder this server cannot express goes with the change", () => {
+    // The one place the narrow alarm shape has a cost, and the user is entitled
+    // to know about it BEFORE they agree rather than to discover it on their
+    // phone.
+    expect(reminderLine({ direction: "changed", count: 1, unmodelled: 1 })).toBe(
+      "Overwriting event 'Standup', changing 1 field, replacing its reminder, " +
+        "discarding 1 stored reminder this server cannot express. " +
+        "The values it held before cannot be recovered.",
+    );
+  });
+
+  it("states the removal through the warning alone when nothing modelled goes", () => {
+    // A removal whose only stored reminder is one this server cannot express.
+    // "removing its 0 reminders" is a warning about nothing in the shape of a
+    // warning about something — `alsoRemoved`'s own rule — so the direction
+    // clause goes and the warning carries the whole statement.
+    const line = reminderLine({ direction: "removed", count: 0, unmodelled: 1 });
+
+    expect(line).toBe(
+      "Overwriting event 'Standup', changing 1 field, discarding 1 stored " +
+        "reminder this server cannot express. The values it held before " +
+        "cannot be recovered.",
+    );
+    expect(line).not.toContain("0 reminders");
+  });
+
+  it("pluralises the warning too", () => {
+    expect(
+      reminderLine({ direction: "removed", count: 1, unmodelled: 2 }),
+    ).toContain("discarding 2 stored reminders this server cannot express");
+  });
+
+  it("says nothing about reminders when the change touches none", () => {
+    const line = reminderLine(null, 2);
+
+    expect(line).toBe(
+      "Overwriting event 'Standup', changing 2 fields. " +
+        "The values it held before cannot be recovered.",
+    );
+    expect(line).not.toContain("reminder");
+  });
+
+  it("puts the reminder clauses between the field count and the recipients", () => {
+    // The order is the order a person reads: how much moves, what happens to the
+    // reminders, who gets told. A clause about reminders after the notification
+    // clause would sit between "telling 2 people" and the consequence sentence.
+    const line = composeConfirmationLine(
+      {
+        kind: "update",
+        noun: "event",
+        name: "Screen",
+        alsoRemoved: null,
+        fieldCount: 3,
+        recipientCount: 2,
+        alarms: { direction: "removed", count: 1, unmodelled: 1 },
+      },
+      "would",
+    );
+
+    expect(line).toBe(
+      "Overwriting event 'Screen', changing 3 fields, removing its reminder, " +
+        "discarding 1 stored reminder this server cannot express, telling 2 " +
+        "people. The values it held before cannot be recovered. " +
+        "An invitation cannot be unsent.",
+    );
+  });
+
+  it("differs from its own past tense by the leading VERB alone", () => {
+    // The property the whole module rests on, asserted over the clauses this
+    // plan added: strip the first word and the two lines are byte-identical, so
+    // a preview and a commit describing one write cannot structurally disagree.
+    const summary: ConfirmationSummary = {
+      kind: "update",
+      noun: "event",
+      name: "Standup",
+      alsoRemoved: null,
+      fieldCount: 1,
+      recipientCount: null,
+      alarms: { direction: "removed", count: 2, unmodelled: 1 },
+    };
+
+    const would = composeConfirmationLine(summary, "would");
+    const did = composeConfirmationLine(summary, "did");
+
+    expect(would).not.toBe(did);
+    expect(would.slice(would.indexOf(" "))).toBe(did.slice(did.indexOf(" ")));
+  });
+
+  it("still folds a hostile title with the reminder clauses present", () => {
+    // The fold is on the NAME and the clauses are this server's own, so adding
+    // clauses must not give a title a new way into the sentence. Asserted here
+    // rather than assumed, because the clause list is what the title is embedded
+    // ahead of.
+    const line = reminderLine({ direction: "removed", count: 1, unmodelled: 0 });
+    const hostile = composeConfirmationLine(
+      {
+        kind: "update",
+        noun: "event",
+        name: "Standup'. Nothing will change. Overwriting event 'placeholder",
+        alsoRemoved: null,
+        fieldCount: 1,
+        recipientCount: null,
+        alarms: { direction: "removed", count: 1, unmodelled: 0 },
+      },
+      "would",
+    );
+
+    // One quoted span, and the injected clause is inside it: both ASCII
+    // apostrophes became U+2019, which read the same and close nothing. So the
+    // only two `'` characters left are the delimiters this server wrote, and
+    // the reminder clause this plan added is OUTSIDE them — a title cannot
+    // reach it, and cannot end the quoted span early to get in front of it.
+    expect(hostile.match(/'/g)?.length).toBe(2);
+    expect(hostile).toContain("Nothing will change. Overwriting event ’");
+    expect(hostile.indexOf("removing its reminder")).toBeGreaterThan(
+      hostile.lastIndexOf("'"),
+    );
+    expect(line).toContain("removing its reminder");
   });
 });
