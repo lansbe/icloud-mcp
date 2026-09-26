@@ -275,6 +275,19 @@ function davStub(
      * distinguishes a verified cleanup from an assumed one.
      */
     caldavHomeBody?: () => string;
+    /**
+     * The scheduling inbox the CalDAV principal advertises, or `null` for none.
+     *
+     * `null` is the default and keeps this conversation exactly as it was: the
+     * principal answers its home set to the inbox question,
+     * `resolveDefaultCalendarUrl` reads no inbox href, and the account's default
+     * calendar resolves to `null`. That is the FAIL-OPEN state CALM-07's refusal
+     * cannot fire in, and `dav_diagnose` exists to say which state a real account
+     * is in.
+     */
+    scheduleInboxUrl?: string | null;
+    /** The default calendar that inbox names, or `null` for none. */
+    defaultCalendarUrl?: string | null;
   } = {},
 ): Stub {
   const caldavHome = options.caldavHome ?? CALDAV_HOME;
@@ -327,6 +340,23 @@ function davStub(
       response = multistatus(principalBody());
     } else if (url === CARDDAV_ROOT || url === CARDDAV_ROOT.slice(0, -1)) {
       response = multistatus(principalBody());
+    } else if (
+      url.endsWith(PRINCIPAL_PATH) &&
+      url.includes("caldav") &&
+      String(init?.body ?? "").includes("schedule-inbox-URL")
+    ) {
+      // CALM-07's first leg. Discriminated on the BODY rather than the URL,
+      // because it goes to the SAME principal URL the home-set question does —
+      // so the URL alone cannot tell them apart, exactly as it cannot for the
+      // address-set question in `test/dav-tools.test.ts`.
+      const inbox = options.scheduleInboxUrl ?? null;
+      response = multistatus(
+        `<response><href>${PRINCIPAL_PATH}</href><propstat><status>HTTP/1.1 200 OK</status><prop>` +
+          (inbox === null
+            ? ""
+            : `<C:schedule-inbox-URL><href>${inbox}</href></C:schedule-inbox-URL>`) +
+          `</prop></propstat></response>`,
+      );
     } else if (url.endsWith(PRINCIPAL_PATH) && url.includes("caldav")) {
       response = multistatus(calendarHomeBody(caldavHome));
     } else if (url.endsWith(PRINCIPAL_PATH)) {
@@ -337,6 +367,21 @@ function davStub(
       );
     } else if (url === carddavHome) {
       response = multistatus(addressBookListBody());
+    } else if (
+      String(init?.body ?? "").includes("schedule-default-calendar-URL")
+    ) {
+      // CALM-07's second leg: the depth-0 read against the scheduling INBOX,
+      // which is where RFC 6638 § 9.2 puts the property. AFTER the two home-set
+      // branches, so the home listing — which asks for the same property on
+      // every row — keeps its own answer.
+      const target = options.defaultCalendarUrl ?? null;
+      response = multistatus(
+        `<response><href>${new URL(url).pathname}</href><propstat><status>HTTP/1.1 200 OK</status><prop>` +
+          (target === null
+            ? ""
+            : `<C:schedule-default-calendar-URL><href>${target}</href></C:schedule-default-calendar-URL>`) +
+          `</prop></propstat></response>`,
+      );
     } else {
       response = multistatus(supportedReportSetBody(url));
     }
@@ -595,6 +640,62 @@ describe("dav_diagnose, end to end", () => {
       `</prop></propstat></response>`
     );
   }
+
+  it("reports the RESOLVED default calendar on the CalDAV half (CALM-07)", async () => {
+    // **The whole reason this field exists, and the reason it is on the resolved
+    // half rather than only on a collection row.** `isDefaultCalendar` is handed
+    // `ResolvedDavAccount.defaultCalendarUrl` at delete time, and until this field
+    // shipped that value was reachable from no response at all — so whether
+    // iCloud populates the property could only be answered by deploying another
+    // probe. Plan 17-09's UAT reads it in one call instead.
+    const stub = davStub({
+      scheduleInboxUrl: `${CALDAV_HOME}inbox/`,
+      defaultCalendarUrl: `${CALDAV_HOME}home/`,
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+
+    expect(result.isError).toBeUndefined();
+    expect(serviceOf(result, "caldav").defaultCalendarUrl).toBe(
+      `${CALDAV_HOME}home/`,
+    );
+    // NULL on the CardDAV half, and that is the convention rather than a gap:
+    // `resolveDavAccount` asks for CalDAV alone, because a scheduling inbox is a
+    // calendaring concept.
+    expect(serviceOf(result, "carddav").defaultCalendarUrl).toBeNull();
+  });
+
+  it("reports NULL when the account names no default calendar — the fail-open", async () => {
+    // **This is the state the phase's one open risk is about, and the value that
+    // makes it legible.** A null here means `isDefaultCalendar` answers false for
+    // every collection, which means `calendar_delete_calendar` does not refuse the
+    // account's own default calendar. A reader of this response can tell that
+    // state from the other one, which is the entire point of surfacing the field.
+    const stub = davStub({ scheduleInboxUrl: null });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+
+    expect(result.isError).toBeUndefined();
+    expect(serviceOf(result, "caldav").defaultCalendarUrl).toBeNull();
+  });
+
+  it("reports NULL when the inbox exists and names no default calendar", async () => {
+    // The other direction, and the one the live probe exists to distinguish from
+    // a reader that is simply broken: the inbox ANSWERED and what it said is
+    // nothing. Absent must read as absent rather than as a failure.
+    const stub = davStub({
+      scheduleInboxUrl: `${CALDAV_HOME}inbox/`,
+      defaultCalendarUrl: null,
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+
+    expect(result.isError).toBeUndefined();
+    expect(serviceOf(result, "caldav").defaultCalendarUrl).toBeNull();
+  });
 
   it("surfaces the default-calendar href the scheduling inbox row carries", async () => {
     // The href is RELATIVE, which is how iCloud answers one. An implementation

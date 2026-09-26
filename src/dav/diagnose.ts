@@ -120,6 +120,33 @@ export interface DavServiceReport {
   shardHost: string | null;
   /** True when the three URLs came from KV and no request was made. */
   cacheHit: boolean | null;
+  /**
+   * CalDAV only: the account's default calendar URL, as discovery resolved it.
+   *
+   * **Here so CALM-07 can be MEASURED in one call rather than in a second
+   * deploy.** `resolveDefaultCalendarUrl` asks the principal for its scheduling
+   * inbox and then asks that inbox for `CALDAV:schedule-default-calendar-URL`,
+   * and whether iCloud POPULATES that property on the inbox is unmeasured
+   * against the real account as of 2026-09-25 — the depth-1 home listing
+   * answered it empty on all thirteen rows, which says nothing about what the
+   * inbox itself answers. Until this field existed the resolved value was
+   * reachable from no response at all, so the question could only be answered by
+   * shipping another probe.
+   *
+   * **What hangs on the answer, stated rather than left to be found.** A `null`
+   * here means `isDefaultCalendar` answers `false` for every collection, which
+   * means `calendar_delete_calendar` does not refuse the account's own default
+   * calendar. That is a fail-open on the least reversible operation in the
+   * milestone, and it is recorded as one on the guard, on the resolver, and here.
+   *
+   * It is a URL under the account's OWN resolved home set and it is not a
+   * credential — the same class of value as `homeUrl` and `principalUrl` beside
+   * it, which this report has carried since Phase 3 — and the only caller is the
+   * account's own owner. `null` on the CardDAV half, per this interface's own
+   * convention: `resolveDavAccount` resolves it for CalDAV alone, because a
+   * scheduling inbox is a calendaring concept.
+   */
+  defaultCalendarUrl: string | null;
   /** CalDAV only: how many calendar collections the home set holds. */
   calendarCount: number | null;
   /** CardDAV only: how many address books the home set holds. */
@@ -352,6 +379,7 @@ function emptyServiceReport(): DavServiceReport {
     homeUrl: null,
     shardHost: null,
     cacheHit: null,
+    defaultCalendarUrl: null,
     calendarCount: null,
     addressBookCount: null,
     reports: null,
@@ -393,6 +421,10 @@ function fillResolved(
   report.homeUrl = resolved.homeUrl;
   report.shardHost = shardHostOf(resolved.homeUrl);
   report.cacheHit = resolved.cacheHit;
+  // Read off the RESOLVED account rather than re-derived, so what this reports is
+  // the value `isDefaultCalendar` will actually be handed at delete time. On the
+  // CardDAV half it is null because `resolveDavAccount` never asks.
+  report.defaultCalendarUrl = resolved.defaultCalendarUrl;
 }
 
 /**
