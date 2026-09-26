@@ -434,8 +434,7 @@ export interface CollectionDeletePreview {
    *
    * ZERO when no confirmation was minted, on `EventPreview.affectedOccurrences`'
    * invariant: the number is what a commit would take, and a preview with no
-   * commit to describe describes nothing. On the default-calendar refusal that
-   * zero is additionally the whole truth, because nothing was read.
+   * commit to describe describes nothing.
    */
   itemCount: number;
   /**
@@ -5650,7 +5649,7 @@ export function registerCalendarTools(
       // Four facts about the TOOL rather than about its one parameter, which is
       // 02-18's rule for what belongs in a description: it writes nothing, the
       // other tool is what does, it removes ONE calendar and everything in it,
-      // and the account's default calendar is refused outright.
+      // and the account's default calendar is not exempt.
       //
       // The last two are stated rather than left as absences a later session
       // fills in. A bulk calendar delete is the single most destructive fan-out
@@ -5660,6 +5659,12 @@ export function registerCalendarTools(
       // costs the user access to their own mail. So the answer is to do LESS
       // work rather than the same work faster.
       //
+      // The default-calendar fact is stated as an absence on purpose. Until
+      // 2026-09-26 this description said the opposite: that the default was
+      // refused. CALM-07 was withdrawn that day on a measurement, and its guard
+      // was deleted. A model or a later session that remembers the old claim has
+      // to read here that the protection is gone. Per D-11, nothing replaced it.
+      //
       // It is held under the same 280-character ceiling every DAV description is,
       // which is why "one per call" lives on the parameter below rather than here:
       // 02-18's rule puts a parameter's own meaning on the parameter, and the
@@ -5667,7 +5672,7 @@ export function registerCalendarTools(
       description:
         "Preview deleting ONE calendar and everything in it. Writes nothing; " +
         "returns a confirmation for calendar_commit. The default calendar is " +
-        `refused. ${CALENDAR_UNTRUSTED_NOTICE}`,
+        `not exempt. ${CALENDAR_UNTRUSTED_NOTICE}`,
       // STRICT, on `calendar_delete_event`'s own argument. Zod's default object
       // mode DROPS an unknown key silently, so a caller that supplied an `ids`
       // array believing it had asked for a bulk delete would get one preview and

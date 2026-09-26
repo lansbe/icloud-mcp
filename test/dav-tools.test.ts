@@ -9117,7 +9117,7 @@ describe("the calendar_delete_calendar registration", () => {
     expect(schema.safeParse({ calendarId: "" }).success).toBe(false);
   });
 
-  it("says in the description that it writes nothing and that the default is refused", () => {
+  it("says in the description that it writes nothing and that the default is not exempt", () => {
     const tool = registeredDav().find(
       (one) => one.name === "calendar_delete_calendar",
     );
@@ -9125,7 +9125,7 @@ describe("the calendar_delete_calendar registration", () => {
 
     expect(description).toContain("Writes nothing");
     expect(description).toContain("calendar_commit");
-    expect(description).toContain("default calendar is refused");
+    expect(description).toContain("default calendar is not exempt");
     expect(description).toContain(CALENDAR_UNTRUSTED_NOTICE);
     // The same ceiling every other DAV description is held under.
     expect(description.length).toBeLessThan(280);
