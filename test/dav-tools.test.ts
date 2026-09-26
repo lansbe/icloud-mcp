@@ -12273,11 +12273,13 @@ describe("calendar_respond_to_invitation, repeating invitations", () => {
       }),
     );
 
-    // From the start of today in the preview's zone, for 90 days. The end
-    // reads an hour earlier on the clock because daylight saving ends inside it.
+    // The dates checked run from the start of today in the preview's zone. The
+    // read starts at midnight UTC on that date, seven hours earlier here, so an
+    // all-day event today is read; it runs the 90-day cap from there, and the
+    // dates checked end where the read ends. Stated exactly, not rounded.
     expect(trusted.conflictRange).toStrictEqual({
       start: "2026-10-10T00:00:00",
-      end: "2027-01-07T23:00:00",
+      end: "2027-01-07T16:00:00",
       timesZone: "America/Los_Angeles",
     });
     expect(trusted.conflictsChecked).toBe("complete");
@@ -12303,11 +12305,51 @@ describe("calendar_respond_to_invitation, repeating invitations", () => {
     );
     expect(ranged.length).toBeGreaterThan(0);
     for (const one of ranged) {
-      expect(one.body).toContain('start="20261010T070000Z"');
-      expect(one.body).toContain('end="20270108T070000Z"');
+      expect(one.body).toContain('start="20261010T000000Z"');
+      expect(one.body).toContain('end="20270108T000000Z"');
     }
     expect(stub.maxInFlight).toBe(1);
     expect(stub.observed.some((one) => one.method === "PUT")).toBe(false);
+  });
+
+  it("catches an all-day event on today's own date, which began before this moment", async () => {
+    // 08:00 in Los Angeles on 2026-10-13, the morning of the series' third
+    // date. An all-day event today starts at midnight, before this instant; a
+    // range starting now would not read it, and the preview would say nothing
+    // else is on the calendar beside today's meeting.
+    vi.spyOn(Date, "now").mockReturnValue(Date.UTC(2026, 9, 13, 15, 0, 0));
+    await warmWrite(
+      writeDavStub({
+        objects: {
+          [SERIES_PATH]: ATTENDEE_COPY_SERIES_ICS,
+          [`${WORK_PATH}offsite.ics`]: icsLines(
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//Example Org//Series Conflicts//EN",
+            "BEGIN:VEVENT",
+            "UID:offsite@example.invalid",
+            "DTSTAMP:20260901T120000Z",
+            "DTSTART;VALUE=DATE:20261013",
+            "DTEND;VALUE=DATE:20261014",
+            "SUMMARY:Offsite",
+            "END:VEVENT",
+            "END:VCALENDAR",
+          ),
+        },
+        scheduleTags: { [SERIES_PATH]: SCHEDULE_TAG },
+      }),
+    );
+
+    const { trusted, untrusted } = halves(
+      await viaSchema("calendar_respond_to_invitation", {
+        id: SERIES_ID,
+        answer: "accepted",
+        scope: "series",
+      }),
+    );
+    expect((trusted.conflictRange as { start: string }).start).toBe("2026-10-13T00:00:00");
+    expect(trusted.conflictCount).toBe(1);
+    expect((untrusted.conflicts as { title: string }[])[0].title).toBe("Offsite");
   });
 
   it("says conflicts were only partly checked when the series' own expansion hit its cap", async () => {

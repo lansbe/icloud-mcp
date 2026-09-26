@@ -354,7 +354,7 @@ export const TRUSTED_FIELD_ALLOWLIST: Record<string, AllowedShape> = {
       "conflictCount", // server-generated: a count this server took of the conflict list it built. The titles stay fenced.
       "conflictsChecked", // server-generated: one of three literals naming how much of the account this server's own sweep could read, or null. No server text.
       "conflictNotice", // server-generated: one sentence from a closed table keyed on the two fields above. Interpolates only this server's count; no title, no calendar name. A series' notice is prefixed by one fixed sentence of this server's own (plan 18-05).
-      "conflictRange", // server-generated (plan 18-05): two instants this server chose (local midnight today and 90 days on), rendered by utcToLocalTime in a zone it holds a definition for, plus that zone's allow-listed name. Null for a one-off invitation and on a refusal. No resource text.
+      "conflictRange", // server-generated (plan 18-05): two instants this server chose (the start of today in the preview's zone, and the end of its own 90-day capped read), rendered by utcToLocalTime in a zone it holds a definition for, plus that zone's allow-listed name. Null for a one-off invitation and on a refusal. No resource text.
       "separateAnswerCount", // server-generated (plan 18-05): a count this server took of the separately answered dates it found. The dates themselves stay fenced.
       "separateAnswerNotice", // server-generated (plan 18-05): one fixed sentence chosen by that count, or null. Interpolates only the count; no date, no title.
       "confirmToken", // server-generated: signed here with this server's own key.

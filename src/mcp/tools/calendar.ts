@@ -5410,13 +5410,23 @@ async function sweepOrDegrade(
 /**
  * What else is on the calendar across a SERIES' own dates (OQ5).
  *
- * **The range is 90 days from the start of today in the preview's zone.** The
- * slot sweep's own cap, so the read costs no more than one find-slots call.
- * It starts at local midnight rather than at this instant, because the local
- * expansion keeps what STARTS in the range: from "now", an all-day event today
- * would start before the range and be missed beside today's own date, which is
- * the false "nothing else" RSVP-03 exists to prevent. An event that began
- * before today and is still running is the one thing still outside the read.
+ * **The dates checked run from the start of today in the preview's zone.** Not
+ * from this instant: the local expansion keeps what STARTS in its range, so a
+ * range from "now" would drop an all-day event today, and the preview would say
+ * nothing else is on the calendar beside today's own meeting. That is the false
+ * "nothing else" RSVP-03 exists to prevent.
+ *
+ * **The read starts a little earlier still, and the read is what is capped.**
+ * An all-day event is a date with no zone, and the expansion compares it as
+ * midnight UTC. In a zone west of UTC that is hours BEFORE local midnight, so
+ * the read starts at whichever of the two midnights comes first, and runs the
+ * slot sweep's own 90-day cap from there. The dates checked end where the read
+ * ends. `conflictRange` states exactly the dates checked: in a US zone that is
+ * 90 days less the zone's offset, and the preview says so by stating it rather
+ * than by rounding it.
+ *
+ * An event that began before today and is still running is the one thing still
+ * outside the read.
  *
  * **The windows are the invitation's own dates in that range**, expanded from
  * the bytes already read by `occurrenceWindowsOf`. A cap on that expansion
@@ -5435,9 +5445,11 @@ async function seriesConflictsFor(
 ): Promise<SweptConflicts> {
   const now = Math.floor(Date.now() / 1000);
   const today = utcToLocalTime(now, zone)?.slice(0, 10) ?? null;
-  const midnight = today === null ? null : localTimeToUtc(`${today}T00:00:00`, zone);
-  const rangeStart = midnight ?? now;
-  const rangeEnd = rangeStart + SERIES_CONFLICT_DAYS * SECONDS_PER_DAY;
+  const localMidnight = today === null ? null : localTimeToUtc(`${today}T00:00:00`, zone);
+  const utcMidnight = today === null ? null : localTimeToUtc(`${today}T00:00:00`, "UTC");
+  const rangeStart = localMidnight ?? now;
+  const readStart = Math.min(rangeStart, utcMidnight ?? rangeStart);
+  const rangeEnd = readStart + SERIES_CONFLICT_DAYS * SECONDS_PER_DAY;
 
   const range: ReplyConflictRange = {
     start: utcToLocalTime(rangeStart, zone) ?? "",
@@ -5454,7 +5466,7 @@ async function seriesConflictsFor(
     principal,
     davFetch,
     {
-      rangeStart,
+      rangeStart: readStart,
       rangeEnd,
       windows: expanded.windows,
       excludeObjectUrl: ref.objectUrl,
