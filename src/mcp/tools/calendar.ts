@@ -51,6 +51,7 @@ import type {
 import {
   MAX_RANGE_DAYS,
   MAX_SLOT_RANGE_DAYS,
+  occurrenceWindowsOf,
   UNOBSERVED_DELIVERY,
   assertCtag,
   createCalendarCollection,
@@ -4853,6 +4854,45 @@ export interface ReplyConflictRow {
 }
 
 /**
+ * The range a series' conflicts were checked over (OQ5), in the preview's zone.
+ *
+ * This server's own rendering of two instants it chose, in a zone it holds a
+ * definition for, so it rides in the trusted half.
+ */
+export interface ReplyConflictRange {
+  start: string;
+  end: string;
+  timesZone: string;
+}
+
+/** One date of a series the user answered on their own (OQ6). Stranger-derived. */
+export interface ReplySeparateAnswerRow {
+  /** The date, from the override's RECURRENCE-ID, as a wall clock in `timesZone`. */
+  date: string;
+  /** The zone `date` is in. */
+  timesZone: string;
+  /** The answer that date carries, MATCHED against this server's closed table. */
+  answer: CurrentAnswer;
+}
+
+/** How many days of a series the conflict check covers (OQ5): the slot sweep's own cap. */
+export const SERIES_CONFLICT_DAYS = MAX_SLOT_RANGE_DAYS;
+
+/** The sentence a series' conflict notice starts with. This server's own words. */
+const SERIES_CONFLICT_PREFIX = `Checked the next ${SERIES_CONFLICT_DAYS} days of this series. `;
+
+/**
+ * The one sentence about separate answers (OQ6), or null when there are none.
+ * Interpolates only this server's own count.
+ */
+export function separateAnswerNoticeOf(count: number): string | null {
+  if (count === 0) return null;
+  return count === 1
+    ? "You answered 1 date of this series separately. This answer replaces it."
+    : `You answered ${count} dates of this series separately. This answer replaces them.`;
+}
+
+/**
  * How much of the account the conflict sweep could read.
  *
  * `complete`: every calendar, in full. `partial`: at least one calendar was
@@ -5106,8 +5146,25 @@ export interface ReplyPreview {
   conflictCount: number | null;
   /** How much the sweep could read. Null on a refusal. */
   conflictsChecked: ConflictsChecked | null;
-  /** This server's sentence about conflicts. Null on a refusal. */
+  /**
+   * This server's sentence about conflicts. Null on a refusal. For a series it
+   * starts by saying how far ahead it looked.
+   */
   conflictNotice: string | null;
+  /**
+   * The range a series was checked over, or null for a one-off invitation
+   * (checked over its own span) and on a refusal.
+   */
+  conflictRange: ReplyConflictRange | null;
+  /**
+   * How many dates of the series the user answered separately, which this
+   * answer replaces. 0 for a one-off invitation; null on a refusal.
+   */
+  separateAnswerCount: number | null;
+  /** Those dates, in the preview's zone. Stranger-derived; null on a refusal. */
+  separateAnswers: ReplySeparateAnswerRow[] | null;
+  /** This server's sentence about them, or null when there are none. */
+  separateAnswerNotice: string | null;
   /** The change to pass back to `calendar_commit`, or null on a refusal. */
   change: NormalizedReplyChange | null;
   confirmToken: string | null;
@@ -5173,6 +5230,9 @@ function replyPreviewTrustedPart(preview: ReplyPreview): Record<string, unknown>
     conflictCount: preview.conflictCount,
     conflictsChecked: preview.conflictsChecked,
     conflictNotice: preview.conflictNotice,
+    conflictRange: preview.conflictRange,
+    separateAnswerCount: preview.separateAnswerCount,
+    separateAnswerNotice: preview.separateAnswerNotice,
     confirmToken: preview.confirmToken,
     expiresInSeconds: preview.expiresInSeconds,
   };
@@ -5193,6 +5253,7 @@ function replyPreviewUntrustedPart(preview: ReplyPreview): Record<string, unknow
     organizer: preview.organizer,
     others: preview.others,
     conflicts: preview.conflicts,
+    separateAnswers: preview.separateAnswers,
     change: preview.change,
     confirmationLine: preview.confirmationLine,
   };
@@ -5304,6 +5365,108 @@ function conflictRowOf(
  * auth failure or a throttle propagates: those are about the account, not about
  * one calendar, and the whole preview is refused with nothing minted.
  */
+/**
+ * The zone a preview places and renders its own computed times in: the
+ * requested one, else the event's own when this server holds it, else UTC.
+ * Always one of this server's allow-listed zones.
+ */
+function previewZoneOf(times: ReplyTimes, detail: EventDetail): string {
+  if (times.timesZoneSource === "requested") return times.timesZone;
+  return isSupportedTimezone(detail.startTzid) ? detail.startTzid : "UTC";
+}
+
+/** What the conflict check found, how much it could read, and over what range. */
+interface SweptConflicts {
+  conflicts: ReplyConflictRow[];
+  checked: ConflictsChecked;
+  /** The series range, or null for a one-off invitation. */
+  range: ReplyConflictRange | null;
+}
+
+/** The sweep's own error handling, shared by both shapes of check. */
+async function sweepOrDegrade(
+  principal: Principal,
+  davFetch: DavFetch,
+  options: Parameters<typeof findWindowConflicts>[3],
+  zone: string,
+  expansionTruncated: boolean,
+  range: ReplyConflictRange | null,
+): Promise<SweptConflicts> {
+  try {
+    const found = await findWindowConflicts(env, principal, davFetch, options);
+    return {
+      conflicts: found.conflicts.map((row) => conflictRowOf(row, zone)),
+      checked: found.truncated || expansionTruncated ? "partial" : "complete",
+      range,
+    };
+  } catch (err) {
+    if (err instanceof DavConnectError || err instanceof DavNotFoundError) {
+      return { conflicts: [], checked: "failed", range };
+    }
+    throw err;
+  }
+}
+
+/**
+ * What else is on the calendar across a SERIES' own dates (OQ5).
+ *
+ * **The range is 90 days from the start of today in the preview's zone.** The
+ * slot sweep's own cap, so the read costs no more than one find-slots call.
+ * It starts at local midnight rather than at this instant, because the local
+ * expansion keeps what STARTS in the range: from "now", an all-day event today
+ * would start before the range and be missed beside today's own date, which is
+ * the false "nothing else" RSVP-03 exists to prevent. An event that began
+ * before today and is still running is the one thing still outside the read.
+ *
+ * **The windows are the invitation's own dates in that range**, expanded from
+ * the bytes already read by `occurrenceWindowsOf`. A cap on that expansion
+ * makes the whole answer partial, whatever the sweep found (T-18-31): a date
+ * nobody produced is a date nothing was checked against.
+ *
+ * With no date in range there is nothing to collide with, so no sweep is spent.
+ */
+async function seriesConflictsFor(
+  principal: Principal,
+  davFetch: DavFetch,
+  ref: EventRef,
+  read: EventWithEtag,
+  facts: InvitationFacts,
+  zone: string,
+): Promise<SweptConflicts> {
+  const now = Math.floor(Date.now() / 1000);
+  const today = utcToLocalTime(now, zone)?.slice(0, 10) ?? null;
+  const midnight = today === null ? null : localTimeToUtc(`${today}T00:00:00`, zone);
+  const rangeStart = midnight ?? now;
+  const rangeEnd = rangeStart + SERIES_CONFLICT_DAYS * SECONDS_PER_DAY;
+
+  const range: ReplyConflictRange = {
+    start: utcToLocalTime(rangeStart, zone) ?? "",
+    end: utcToLocalTime(rangeEnd, zone) ?? "",
+    timesZone: zone,
+  };
+
+  const expanded = occurrenceWindowsOf(read.body, rangeStart, rangeEnd, zone);
+  if (expanded.windows.length === 0) {
+    return { conflicts: [], checked: expanded.truncated ? "partial" : "complete", range };
+  }
+
+  return sweepOrDegrade(
+    principal,
+    davFetch,
+    {
+      rangeStart,
+      rangeEnd,
+      windows: expanded.windows,
+      excludeObjectUrl: ref.objectUrl,
+      excludeUid: facts.uid,
+      tzid: zone,
+    },
+    zone,
+    expanded.truncated,
+    range,
+  );
+}
+
 async function conflictsFor(
   principal: Principal,
   davFetch: DavFetch,
@@ -5311,14 +5474,9 @@ async function conflictsFor(
   read: EventWithEtag,
   facts: InvitationFacts,
   times: ReplyTimes,
-): Promise<{ conflicts: ReplyConflictRow[]; checked: ConflictsChecked }> {
+): Promise<SweptConflicts> {
   const { detail } = read;
-  const zone =
-    times.timesZoneSource === "requested"
-      ? times.timesZone
-      : isSupportedTimezone(detail.startTzid)
-        ? detail.startTzid
-        : "UTC";
+  const zone = previewZoneOf(times, detail);
 
   const window = busyIntervalOf(
     {
@@ -5329,27 +5487,23 @@ async function conflictsFor(
   );
   // An event this server cannot place has no window to compare against, so
   // nothing can honestly be said about what overlaps it.
-  if (window === null) return { conflicts: [], checked: "failed" };
+  if (window === null) return { conflicts: [], checked: "failed", range: null };
 
-  try {
-    const found = await findWindowConflicts(env, principal, davFetch, {
+  return sweepOrDegrade(
+    principal,
+    davFetch,
+    {
       rangeStart: window.start - CONFLICT_READ_MARGIN_SECONDS,
       rangeEnd: window.end + CONFLICT_READ_MARGIN_SECONDS,
       windows: [window],
       excludeObjectUrl: ref.objectUrl,
       excludeUid: facts.uid,
       tzid: zone,
-    });
-    return {
-      conflicts: found.conflicts.map((row) => conflictRowOf(row, zone)),
-      checked: found.truncated ? "partial" : "complete",
-    };
-  } catch (err) {
-    if (err instanceof DavConnectError || err instanceof DavNotFoundError) {
-      return { conflicts: [], checked: "failed" };
-    }
-    throw err;
-  }
+    },
+    zone,
+    false,
+    null,
+  );
 }
 
 /**
@@ -5382,6 +5536,10 @@ function unsupportedZonePreview(id: string, answer: ReplyAnswerWord): ReplyPrevi
     conflictCount: null,
     conflictsChecked: null,
     conflictNotice: null,
+    conflictRange: null,
+    separateAnswerCount: null,
+    separateAnswers: null,
+    separateAnswerNotice: null,
     change: null,
     confirmToken: null,
     expiresInSeconds: null,
@@ -5444,6 +5602,10 @@ async function buildReplyPreview(
     conflictCount: null,
     conflictsChecked: null,
     conflictNotice: null,
+    conflictRange: null,
+    separateAnswerCount: null,
+    separateAnswers: null,
+    separateAnswerNotice: null,
     change: null,
     confirmToken: null,
     expiresInSeconds: null,
@@ -5475,7 +5637,10 @@ async function buildReplyPreview(
   // RSVP-03, for EVERY answer (D-11). Awaited on its own, after the two reads
   // and the pure work above, and before anything is minted — so an auth or
   // throttle failure here propagates with nothing signed.
-  const swept = await conflictsFor(principal, davFetch, ref, read, facts, times);
+  const zone = previewZoneOf(times, read.detail);
+  const swept = series
+    ? await seriesConflictsFor(principal, davFetch, ref, read, facts, zone)
+    : await conflictsFor(principal, davFetch, ref, read, facts, times);
 
   const confirmToken = await mintConfirmation(
     {
@@ -5507,6 +5672,15 @@ async function buildReplyPreview(
     email: one.email,
     answer: otherAnswerOf(one.partstat),
   }));
+  // OQ6. Always empty for a one-off invitation, which has no series to differ
+  // from. Each date in the preview's zone when it has an instant, else its own.
+  const separateAnswers: ReplySeparateAnswerRow[] = facts.separateAnswers.map((one) => {
+    const converted =
+      one.recurrenceUtc === undefined ? null : utcToLocalTime(one.recurrenceUtc, zone);
+    return converted === null
+      ? { date: one.recurrenceLocal, timesZone: one.recurrenceTzid, answer: otherAnswerOf(one.partstat) }
+      : { date: converted, timesZone: zone, answer: otherAnswerOf(one.partstat) };
+  });
 
   return {
     id,
@@ -5526,7 +5700,13 @@ async function buildReplyPreview(
     conflicts: swept.conflicts,
     conflictCount: swept.conflicts.length,
     conflictsChecked: swept.checked,
-    conflictNotice: conflictNoticeOf(swept.checked, swept.conflicts.length),
+    conflictNotice:
+      (swept.range === null ? "" : SERIES_CONFLICT_PREFIX) +
+      conflictNoticeOf(swept.checked, swept.conflicts.length),
+    conflictRange: swept.range,
+    separateAnswerCount: separateAnswers.length,
+    separateAnswers,
+    separateAnswerNotice: separateAnswerNoticeOf(separateAnswers.length),
     change,
     confirmToken,
     expiresInSeconds: CONFIRM_TTL_SECONDS,

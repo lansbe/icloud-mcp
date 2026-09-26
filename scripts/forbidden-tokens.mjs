@@ -1675,6 +1675,8 @@ export const DAV_WRITE_MODULES = Object.freeze({
         "A civil-date calculation over a date string. Takes no transport and issues no request.",
       findFreeSlots: "guarded",
       findWindowConflicts: "guarded",
+      occurrenceWindowsOf:
+        "An expansion of already-fetched resource text into time windows. Returns windows; no request.",
       busyIntervalOf:
         "A computation over an occurrence's times the caller already holds. Places it on the timeline, as an instant pair or a whole named day in a zone this server holds; takes no transport and issues no request.",
       getEvent: "guarded",

@@ -66,6 +66,7 @@ import {
   matchesKeyword,
   nextCivilDate,
   observedOutcomes,
+  occurrenceWindowsOf,
   organizerAddressFrom,
   patchEventBody,
   pinnedOccurrencesFor,
@@ -119,6 +120,8 @@ import {
 import { createDavFetch } from "../src/dav/transport";
 import {
   ALL_DAY_RECURRING_ICS,
+  ATTENDEE_COPY_GENUINE_ICS,
+  ATTENDEE_COPY_SERIES_ICS,
   DEFINED_TZID,
   INVITED_EVENT_HAZARDS_ICS,
   INVITED_WEEKLY_SERIES_ICS,
@@ -7578,5 +7581,67 @@ describe("an update is byte-identical outside the window it is allowed to touch"
     // And the master's own start is untouched, which is what "the master is read
     // and never written" means on the bytes.
     expect(written).toContain(`DTSTART;TZID=${DEFINED_TZID}:20260406T100000`);
+  });
+});
+
+// ===========================================================================
+// occurrenceWindowsOf — a series' own dates as busy windows (phase 18, 18-05)
+// ===========================================================================
+
+describe("occurrenceWindowsOf", () => {
+  /** 2026-09-26T00:00:00Z and 90 days on: every date of the derived series. */
+  const WIDE_START = 1790380800;
+  const NINETY_DAYS = 90 * 24 * 60 * 60;
+
+  it("returns one window per occurrence in range, the moved date at its moved time", () => {
+    expect(
+      occurrenceWindowsOf(ATTENDEE_COPY_SERIES_ICS, WIDE_START, WIDE_START + NINETY_DAYS, "America/Los_Angeles"),
+    ).toStrictEqual({
+      windows: [
+        { start: 1790708400, end: 1790712000 }, // 2026-09-29 12:00-13:00 in Los Angeles
+        { start: 1791316800, end: 1791320400 }, // 2026-10-06, moved to 13:00-14:00
+        { start: 1791918000, end: 1791921600 }, // 2026-10-13
+        { start: 1792522800, end: 1792526400 }, // 2026-10-20
+      ],
+      truncated: false,
+    });
+  });
+
+  it("leaves out the dates before the range", () => {
+    // From 2026-10-10: only the last two dates remain.
+    const { windows, truncated } = occurrenceWindowsOf(
+      ATTENDEE_COPY_SERIES_ICS,
+      1791615600,
+      1791615600 + NINETY_DAYS,
+      "America/Los_Angeles",
+    );
+    expect(windows).toStrictEqual([
+      { start: 1791918000, end: 1791921600 },
+      { start: 1792522800, end: 1792526400 },
+    ]);
+    expect(truncated).toBe(false);
+  });
+
+  it("returns the single window of a one-off event", () => {
+    expect(
+      occurrenceWindowsOf(ATTENDEE_COPY_GENUINE_ICS, WIDE_START, WIDE_START + NINETY_DAYS, "UTC"),
+    ).toStrictEqual({ windows: [{ start: 1790708400, end: 1790712000 }], truncated: false });
+  });
+
+  it("reports truncated when the expansion hit its cap", () => {
+    // A rule every minute: two days of it is 2880 occurrences, past the cap.
+    const minutely = ATTENDEE_COPY_SERIES_ICS.replace(
+      "RRULE:FREQ=WEEKLY;COUNT=4",
+      "RRULE:FREQ=MINUTELY",
+    );
+    expect(minutely).not.toBe(ATTENDEE_COPY_SERIES_ICS);
+    const { windows, truncated } = occurrenceWindowsOf(
+      minutely,
+      1790708400,
+      1790708400 + 2 * 24 * 60 * 60,
+      "America/Los_Angeles",
+    );
+    expect(truncated).toBe(true);
+    expect(windows.length).toBeGreaterThan(0);
   });
 });

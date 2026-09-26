@@ -56,6 +56,7 @@ import {
   buildVEvent,
   countOccurrences,
   dropOverride,
+  expandOccurrences,
   expandWithinBudget,
   findOccurrence,
   isRecurringResource,
@@ -2965,6 +2966,37 @@ export async function findWindowConflicts(
     );
 
     return { conflicts, truncated };
+  });
+}
+
+/**
+ * A series' own dates inside a range, as busy windows (OQ5).
+ *
+ * Pure: it expands resource text the caller already holds and issues no
+ * request. Each occurrence starting in `[rangeStart, rangeEnd)` is placed by
+ * `busyIntervalOf` in `tzid`, the same way the conflict sweep places every
+ * other event, so an invitation's dates and the events they might collide with
+ * are measured by one rule. A moved date appears at its moved time.
+ *
+ * `truncated` is the expansion's own report that a cap stopped it before the
+ * range was exhausted. The caller must then say the check was partial: dates
+ * this function never produced are dates nothing was checked against (T-18-31).
+ * The occurrence cap and the step cap are the module's own, unchanged.
+ */
+export function occurrenceWindowsOf(
+  icsText: string,
+  rangeStart: number,
+  rangeEnd: number,
+  tzid: string,
+): { windows: BusyInterval[]; truncated: boolean } {
+  return withParsedResource(icsText, (resource) => {
+    const expanded = expandOccurrences(resource, rangeStart, rangeEnd);
+    const windows: BusyInterval[] = [];
+    for (const occurrence of expanded.occurrences) {
+      const window = busyIntervalOf(occurrence, tzid);
+      if (window !== null) windows.push(window);
+    }
+    return { windows, truncated: expanded.truncated };
   });
 }
 

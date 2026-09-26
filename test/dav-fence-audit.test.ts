@@ -353,7 +353,10 @@ export const TRUSTED_FIELD_ALLOWLIST: Record<string, AllowedShape> = {
       "whoIsTold", // server-generated: one sentence from a closed table, keyed on tells, the boolean above and the count. Interpolates only this server's answer word and its own count; no name, no address.
       "conflictCount", // server-generated: a count this server took of the conflict list it built. The titles stay fenced.
       "conflictsChecked", // server-generated: one of three literals naming how much of the account this server's own sweep could read, or null. No server text.
-      "conflictNotice", // server-generated: one sentence from a closed table keyed on the two fields above. Interpolates only this server's count; no title, no calendar name.
+      "conflictNotice", // server-generated: one sentence from a closed table keyed on the two fields above. Interpolates only this server's count; no title, no calendar name. A series' notice is prefixed by one fixed sentence of this server's own (plan 18-05).
+      "conflictRange", // server-generated (plan 18-05): two instants this server chose (local midnight today and 90 days on), rendered by utcToLocalTime in a zone it holds a definition for, plus that zone's allow-listed name. Null for a one-off invitation and on a refusal. No resource text.
+      "separateAnswerCount", // server-generated (plan 18-05): a count this server took of the separately answered dates it found. The dates themselves stay fenced.
+      "separateAnswerNotice", // server-generated (plan 18-05): one fixed sentence chosen by that count, or null. Interpolates only the count; no date, no title.
       "confirmToken", // server-generated: signed here with this server's own key.
       "expiresInSeconds", // server-generated: this server's own TTL constant.
     ]),
@@ -1219,6 +1222,12 @@ function replyPreview(overrides: Partial<ReplyPreview> = {}): ReplyPreview {
     conflictCount: 1,
     conflictsChecked: "complete",
     conflictNotice: "1 other event on your calendars overlaps it.",
+    conflictRange: null,
+    separateAnswerCount: 1,
+    separateAnswers: [
+      { date: "2026-10-06T12:00:00", timesZone: "America/Los_Angeles", answer: "accepted" },
+    ],
+    separateAnswerNotice: "You answered 1 date of this series separately. This answer replaces it.",
     change: { kind: "reply", scope: null, answer: "accepted" },
     confirmToken: "cGF5bG9hZA.bWFj",
     expiresInSeconds: 300,
@@ -1431,6 +1440,10 @@ describe("the trusted block of every shipped DAV shaper", () => {
           conflictCount: null,
           conflictsChecked: null,
           conflictNotice: null,
+          conflictRange: null,
+          separateAnswerCount: null,
+          separateAnswers: null,
+          separateAnswerNotice: null,
           change: null,
           confirmToken: null,
           expiresInSeconds: null,
@@ -1456,6 +1469,10 @@ describe("the trusted block of every shipped DAV shaper", () => {
           conflictCount: null,
           conflictsChecked: null,
           conflictNotice: null,
+          conflictRange: null,
+          separateAnswerCount: null,
+          separateAnswers: null,
+          separateAnswerNotice: null,
           change: null,
           confirmToken: null,
           expiresInSeconds: null,

@@ -2991,6 +2991,31 @@ export interface InvitationFacts {
    * published: it is compared, not shown.
    */
   uid: string | null;
+  /**
+   * The dates of a series the user answered on their own (OQ6), in document
+   * order: every override component carrying the user's line whose `PARTSTAT`
+   * differs from the one on the master's line.
+   *
+   * A whole-series answer rewrites every one of these, so the preview names
+   * them before a token is used. Compared with RFC 5545's default applied —
+   * a line with no `PARTSTAT` has not answered, which is `NEEDS-ACTION` — and
+   * case-folded, because the values are case-insensitive. Empty on a one-off
+   * resource and on one with no master: there is no series answer to differ
+   * from. Every field is read verbatim and untrusted.
+   */
+  separateAnswers: SeparateAnswer[];
+}
+
+/** One date of a series the user answered separately. Every field untrusted. */
+export interface SeparateAnswer {
+  /** The override's `RECURRENCE-ID`, as its own wall clock. */
+  recurrenceLocal: string;
+  /** The same instant in seconds since the epoch; absent when it has none. */
+  recurrenceUtc?: number;
+  /** The zone `recurrenceLocal` is in, as `readEventTime` reports it. */
+  recurrenceTzid: string;
+  /** The raw `PARTSTAT` on the user's line of that override, or null. */
+  partstat: string | null;
 }
 
 /**
@@ -3087,8 +3112,58 @@ export function invitationFactsOf(
 
     const uid = textOf(listed?.getFirstPropertyValue("uid"));
 
-    return { organizer, ownAnswer, evidence, others, uid };
+    return {
+      organizer,
+      ownAnswer,
+      evidence,
+      others,
+      uid,
+      separateAnswers: separateAnswersOf(resource, addresses),
+    };
   });
+}
+
+/**
+ * The override answers that differ from the master's (OQ6). See
+ * `InvitationFacts.separateAnswers`.
+ */
+function separateAnswersOf(
+  resource: ParsedCalendarResource,
+  addresses: readonly string[],
+): SeparateAnswer[] {
+  const master = resource.components.find((one) => !one.hasProperty("recurrence-id"));
+  if (master === undefined) return [];
+
+  const ownPartstat = (component: IcalComponent): { found: boolean; raw: string | null } => {
+    const line = component
+      .getAllProperties("attendee")
+      .find((attendee) => namesUser(attendee, addresses));
+    return line === undefined
+      ? { found: false, raw: null }
+      : { found: true, raw: firstParameter(line, "partstat") };
+  };
+  const folded = (raw: string | null): string => (raw ?? "NEEDS-ACTION").toUpperCase();
+
+  const masterAnswer = folded(ownPartstat(master).raw);
+  const separate: SeparateAnswer[] = [];
+  for (const component of resource.components) {
+    if (component === master) continue;
+    const value = component.getFirstPropertyValue("recurrence-id");
+    if (!(value instanceof ICAL.Time)) continue;
+    const own = ownPartstat(component);
+    if (!own.found || folded(own.raw) === masterAnswer) continue;
+
+    const time = readEventTime(value, requestedTzidOf(component, "recurrence-id"));
+    const row: SeparateAnswer = {
+      recurrenceLocal: time.local,
+      recurrenceTzid: time.tzid,
+      partstat: own.raw,
+    };
+    // Assigned rather than spread, so an absent instant stays ABSENT.
+    if (time.utc !== undefined) row.recurrenceUtc = time.utc;
+    separate.push(row);
+  }
+  return separate;
 }
 
 /** A string, or null when it is absent or empty. */

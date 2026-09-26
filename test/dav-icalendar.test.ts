@@ -4274,6 +4274,88 @@ describe("isOwnAddress", () => {
   });
 });
 
+describe("invitationFactsOf, separate answers (OQ6)", () => {
+  /** The user's own answer on the master line and on the override line. */
+  function answeredSeries(master: string, override: string): string {
+    // The override's line first: its ACCEPTED is unique until the master's
+    // NEEDS-ACTION is rewritten, and the organiser's own line carries no
+    // "CIPANT;" prefix before its PARTSTAT.
+    const withOverride = ATTENDEE_COPY_SERIES_ICS.replace(
+      "CIPANT;PARTSTAT=ACCEPTED;",
+      `CIPANT;PARTSTAT=${override};`,
+    );
+    const both = withOverride.replace(
+      "CIPANT;PARTSTAT=NEEDS-ACTION;",
+      `CIPANT;PARTSTAT=${master};`,
+    );
+    expect(both).not.toBe(ATTENDEE_COPY_SERIES_ICS);
+    return both;
+  }
+
+  it("names an override whose answer differs from the master's, dated by its RECURRENCE-ID", () => {
+    // The derived series: the master still waits, the second date was accepted.
+    expect(
+      invitationFactsOf(ATTENDEE_COPY_SERIES_ICS, OWN_ADDRESSES, null).separateAnswers,
+    ).toStrictEqual([
+      {
+        recurrenceLocal: "2026-10-06T12:00:00",
+        recurrenceUtc: 1791313200,
+        recurrenceTzid: "America/Los_Angeles",
+        partstat: "ACCEPTED",
+      },
+    ]);
+  });
+
+  it("reads the override's answer verbatim when the master accepted and the override declined", () => {
+    const facts = invitationFactsOf(
+      answeredSeries("ACCEPTED", "DECLINED"),
+      OWN_ADDRESSES,
+      null,
+    );
+    expect(facts.ownAnswer).toBe("ACCEPTED");
+    expect(facts.separateAnswers).toStrictEqual([
+      {
+        recurrenceLocal: "2026-10-06T12:00:00",
+        recurrenceUtc: 1791313200,
+        recurrenceTzid: "America/Los_Angeles",
+        partstat: "DECLINED",
+      },
+    ]);
+  });
+
+  it.each([
+    ["the same answer", "ACCEPTED", "ACCEPTED"],
+    ["the same answer in another case", "ACCEPTED", "accepted"],
+  ])("names nothing when the override carries %s", (_label, master, override) => {
+    expect(
+      invitationFactsOf(answeredSeries(master, override), OWN_ADDRESSES, null).separateAnswers,
+    ).toStrictEqual([]);
+  });
+
+  it("names nothing on a one-off invitation, or when the user is on no line", () => {
+    expect(
+      invitationFactsOf(ATTENDEE_COPY_GENUINE_ICS, OWN_ADDRESSES, null).separateAnswers,
+    ).toStrictEqual([]);
+    expect(invitationFactsOf(ATTENDEE_COPY_SERIES_ICS, [], null).separateAnswers).toStrictEqual(
+      [],
+    );
+  });
+
+  it("does not count a stranger's line on the override", () => {
+    // The organiser's own attendee line says ACCEPTED on both components; only
+    // the user's line is compared, so moving the organiser's answer on the
+    // override alone changes nothing here.
+    const strangerMoved = answeredSeries("ACCEPTED", "ACCEPTED").replace(
+      /(RECURRENCE-ID[\s\S]*?)CN=Probe Organiser;CUTYPE=INDIVIDUAL;PARTSTAT=ACCEPTED/,
+      "$1CN=Probe Organiser;CUTYPE=INDIVIDUAL;PARTSTAT=DECLINED",
+    );
+    expect(strangerMoved).toContain("PARTSTAT=DECLINED");
+    expect(
+      invitationFactsOf(strangerMoved, OWN_ADDRESSES, null).separateAnswers,
+    ).toStrictEqual([]);
+  });
+});
+
 describe("invitationFactsOf", () => {
   it("reads a schedule tag as a scheduling object, which tells the organiser", () => {
     expect(
@@ -4288,6 +4370,7 @@ describe("invitationFactsOf", () => {
       // named once, as the organiser, and not again among the others.
       others: [],
       uid: "rsvp-probe-0002@example.invalid",
+      separateAnswers: [],
     });
   });
 
@@ -4310,6 +4393,7 @@ describe("invitationFactsOf", () => {
       evidence: "imported-copy",
       others: [],
       uid: "rsvp-probe-0001@example.invalid",
+      separateAnswers: [],
     });
   });
 
@@ -4370,6 +4454,7 @@ describe("invitationFactsOf", () => {
         { name: null, email: OWN_LOGIN, partstat: "NEEDS-ACTION" },
       ],
       uid: "reply-fixture@example.invalid",
+      separateAnswers: [],
     });
   });
 
