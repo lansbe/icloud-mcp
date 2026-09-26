@@ -48,6 +48,7 @@ import {
   searchMessagesOver,
   withMailSessionOver,
 } from "../src/mail/service";
+import * as service from "../src/mail/service";
 import {
   AUTH_REJECTED_LEGACY_TEXT,
   AUTH_REJECTED_TEXT,
@@ -1320,6 +1321,19 @@ describe("nothing awaits ahead of the gate", () => {
     );
   });
 
+  it("does not mistake the private core's name for the shorter one either", () => {
+    // `withMailSession` is a prefix of `withMailSessionCore` too, and the core
+    // sits EARLIER in the file than the socket wrapper. A finder that matched
+    // the core would start at the core and see its duplex parameter.
+    const found = source.search(/\bfunction\s+withMailSession\b/);
+    expect(found).toBe(source.indexOf("function withMailSession<"));
+    expect(found).not.toBe(source.indexOf("function withMailSessionCore<"));
+    expect(found).not.toBe(source.indexOf("function withMailSessionOver<"));
+    expect(spanAheadOf(source, "withMailSession", "connectImap(")).not.toContain(
+      "open: OpenStep",
+    );
+  });
+
   describe("the matcher can see an await (the control)", () => {
     const madeUp = [
       "export async function madeUp(principal, gate) {",
@@ -1361,6 +1375,84 @@ describe("nothing awaits ahead of the gate", () => {
       expect(awaitsAheadOf(madeUp, "notThere", "connectImap(")).toBeNull();
       expect(awaitsAheadOf(madeUp, "madeUp", "notThere(")).toBeNull();
     });
+  });
+});
+
+/**
+ * One function's header, from its `function` keyword up to the brace that
+ * opens its body, with whitespace collapsed. The body brace is the first `{`
+ * that ends a line; the `= {}` default on the options parameter does not.
+ */
+function signatureOf(source: string, functionName: string): string | null {
+  const start = source.search(new RegExp(`\\bfunction\\s+${functionName}\\b`));
+  if (start === -1) return null;
+  const rest = source.slice(start);
+  const end = rest.search(/\{\n/);
+  return end === -1 ? null : rest.slice(0, end).replace(/\s+/g, " ").trim();
+}
+
+// MUTA-01. The read path stays read-only because its orchestrators have no way
+// to ask for anything else. These guards pin that shape. A new parameter, an
+// exported core, or a second read-only open elsewhere is a decision on the
+// safety boundary (CLAUDE.md §3 and §5, PITFALLS #32), not a refactor.
+describe("the read orchestrators keep their shape (MUTA-01)", () => {
+  const source = Object.values(SERVICE_SOURCE)[0] ?? "";
+
+  it("exports exactly the two read orchestrators, and not the private core", () => {
+    // Plan 20-03 widens this to four, when the mutating pair arrives. The core
+    // stays off the list: exported, it would be a raw escape hatch past both.
+    const orchestrators = Object.keys(service)
+      .filter((name) => name.startsWith("with"))
+      .sort();
+    expect(orchestrators).toEqual(["withMailSession", "withMailSessionOver"]);
+    expect(source).toContain("async function withMailSessionCore<");
+  });
+
+  it("writes the read-only open inside withMailSessionOver's own body, once", () => {
+    const literal = "`EXAMINE ${quoted}`";
+    const start = source.search(/\bfunction\s+withMailSessionOver\b/);
+    const end = source.indexOf("\n}\n", start);
+    const at = source.indexOf(literal);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(at).toBeGreaterThan(start);
+    expect(at).toBeLessThan(end);
+    expect(source.split(literal)).toHaveLength(2);
+
+    // The core holds no open of its own.
+    const coreStart = source.search(/\bfunction\s+withMailSessionCore\b/);
+    const coreEnd = source.indexOf("\n}\n", coreStart);
+    expect(coreStart).toBeGreaterThan(-1);
+    expect(source.slice(coreStart, coreEnd)).not.toContain("EXAMINE");
+  });
+
+  it("never spells the mutating open command, comments included", () => {
+    // The full source, NOT the comment-stripped one: CLAUDE.md §2 and §5 ask
+    // that this command be described by role. Plan 20-03 changes the expected
+    // count to one, at the mutating orchestrator's own open.
+    expect(source.match(/\bSELECT\b/g) ?? []).toHaveLength(0);
+  });
+
+  it("pins both read orchestrators' signatures", () => {
+    // A new parameter here is how a mode flag arrives (PITFALLS #32). Changing
+    // either string is a decision on the safety boundary, not a refactor.
+    expect(signatureOf(source, "withMailSessionOver")).toBe(
+      "function withMailSessionOver<T>( duplex: DuplexLike, principal: Principal, gate: SessionGate, mailbox: string | null, expectedUidValidity: number | null, fn: (session: MailSession) => Promise<T>, options: MailSessionOptions = {}, ): Promise<T>",
+    );
+    expect(signatureOf(source, "withMailSession")).toBe(
+      "function withMailSession<T>( principal: Principal, gate: SessionGate, mailbox: string | null, expectedUidValidity: number | null, fn: (session: MailSession) => Promise<T>, options: MailSessionOptions = {}, ): Promise<T>",
+    );
+  });
+
+  it("the signature reader sees a change (the control)", () => {
+    const widened = source.replace(
+      "  options: MailSessionOptions = {},\n): Promise<T> {\n  return withMailSessionCore(",
+      "  options: MailSessionOptions = {},\n  mode?: string,\n): Promise<T> {\n  return withMailSessionCore(",
+    );
+    expect(widened).not.toBe(source);
+    expect(signatureOf(widened, "withMailSessionOver")).toContain("mode?: string");
+    expect(signatureOf(source, "notThere")).toBeNull();
   });
 });
 
