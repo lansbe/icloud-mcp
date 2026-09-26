@@ -2392,6 +2392,18 @@ describe("what property NAMES iCloud carries, asked exhaustively", () => {
     // Asserted against the WHOLE serialised response rather than against the
     // `names` field, because a value that leaked into any other field would pass
     // a field-scoped check while still reaching a model's context.
+    //
+    // **WHY THIS CANNOT PASS VACUOUSLY, written down because the obvious
+    // mutation test for it is itself the leak.** Proving this case has teeth by
+    // editing the reader to carry values would mean committing, however briefly,
+    // the exact code the case exists to forbid, so the argument is recorded
+    // instead. The trio asserted below — `calendarColor`, `displayname` and
+    // `scheduleDefaultCalendarURL` — appears on NO other fixture in this file:
+    // `defaultPropNames` produces four different sets and none of them is this
+    // one. So a green run proves the valued body really was parsed and its three
+    // properties really were seen. A reader that indexed into the property object
+    // would have had all three values in hand at that moment, and the absence
+    // assertion below is what says none of them came out.
     const stub = davStub({
       caldavHomeBody: calendarListWithInboxBody,
       propNames: (url) => multistatus(valuedPropNameBody(url)),
