@@ -4905,10 +4905,14 @@ export function separateAnswerNoticeOf(count: number): string | null {
  * How much of the account the conflict sweep could read.
  *
  * `complete`: every calendar, in full. `partial`: at least one calendar was
- * skipped or cut short, so the list may be missing something. `failed`: the
- * sweep did not finish at all. Only `complete` may ever say "nothing else".
+ * skipped or cut short, so the list may be missing something. `no-zone`: every
+ * calendar was read, but no time zone was given and the invitation named none
+ * this server holds, so an all-day event — which has no time of its own —
+ * was placed on a UTC day, and whether it clashes depended on that guess
+ * (18-REVIEW WR-03). `failed`: the sweep did not finish at all. Only
+ * `complete` may ever say "nothing else".
  */
-export type ConflictsChecked = "complete" | "partial" | "failed";
+export type ConflictsChecked = "complete" | "partial" | "no-zone" | "failed";
 
 /**
  * The one sentence about conflicts, from a closed table (RSVP-03, T-18-22).
@@ -4926,6 +4930,11 @@ export function conflictNoticeOf(checked: ConflictsChecked, count: number): stri
         : `${count} other events on your calendars overlap it.`;
     case "partial":
       return "Conflicts could not be fully checked: at least one calendar could not be read in full.";
+    case "no-zone":
+      return (
+        "Conflicts could not be fully checked: no time zone was given, so " +
+        "all-day events were placed in UTC and may be on the wrong day."
+      );
     case "failed":
       return "Conflicts could not be checked.";
   }
@@ -5358,8 +5367,9 @@ function conflictRowOf(
  *
  * **The window** is the invitation's own interval, placed by the free-slot
  * sweep's own `busyIntervalOf`: its two instants, or for an all-day date the
- * whole named day or days. The zone used to place a date is the requested one,
- * else the event's own when this server holds it, else UTC.
+ * whole named day or days. The zone used to place a date is `previewZoneOf`'s:
+ * the requested one, else the event's own when this server holds it, else UTC
+ * as a guess — and a guess that decided anything makes the answer `no-zone`.
  *
  * **The read is a day wider than the window on each side.** The window decides
  * what counts; the range only decides what is fetched. An all-day event is a
@@ -5374,14 +5384,34 @@ function conflictRowOf(
  * auth failure or a throttle propagates: those are about the account, not about
  * one calendar, and the whole preview is refused with nothing minted.
  */
+/** The zone a preview places times in, and whether it was a guess. */
+interface PreviewZone {
+  zone: string;
+  /**
+   * True when nobody named this zone: no `tzid` was given and the invitation
+   * names none this server holds, or names UTC. An all-day event placed in it
+   * may be on the wrong day for the user (18-REVIEW WR-03).
+   */
+  guessed: boolean;
+}
+
 /**
- * The zone a preview places and renders its own computed times in: the
- * requested one, else the event's own when this server holds it, else UTC.
- * Always one of this server's allow-listed zones.
+ * The zone a preview places and renders its own computed times in.
+ *
+ * The requested one whenever a `tzid` was given — also for an all-day
+ * invitation, whose display keeps its own dates but whose clashes are still
+ * judged on the user's days (WR-03). Else the event's own named zone when this
+ * server holds it. Else UTC, marked as a guess. An event written in UTC
+ * instants reads as naming UTC, which says how it was written and nothing
+ * about where the user is, so it is a guess too. Always one of this server's
+ * allow-listed zones: the boundary refused any other `tzid` before this runs.
  */
-function previewZoneOf(times: ReplyTimes, detail: EventDetail): string {
-  if (times.timesZoneSource === "requested") return times.timesZone;
-  return isSupportedTimezone(detail.startTzid) ? detail.startTzid : "UTC";
+function previewZoneOf(tzid: string | undefined, detail: EventDetail): PreviewZone {
+  if (tzid !== undefined) return { zone: tzid, guessed: false };
+  if (detail.startTzid !== "UTC" && isSupportedTimezone(detail.startTzid)) {
+    return { zone: detail.startTzid, guessed: false };
+  }
+  return { zone: "UTC", guessed: true };
 }
 
 /** What the conflict check found, how much it could read, and over what range. */
@@ -5392,20 +5422,30 @@ interface SweptConflicts {
   range: ReplyConflictRange | null;
 }
 
-/** The sweep's own error handling, shared by both shapes of check. */
+/**
+ * The sweep's own error handling, shared by both shapes of check.
+ *
+ * `windowsPlacedByZone` says the invitation's own window came from a date with
+ * no instant, so the zone decided where it lies. With a guessed zone that, or
+ * any nearby event placed the same way, makes the answer `no-zone` rather than
+ * `complete` (WR-03). A calendar that could not be read still outranks it.
+ */
 async function sweepOrDegrade(
   principal: Principal,
   davFetch: DavFetch,
   options: Parameters<typeof findWindowConflicts>[3],
-  zone: string,
+  zone: PreviewZone,
   expansionTruncated: boolean,
+  windowsPlacedByZone: boolean,
   range: ReplyConflictRange | null,
 ): Promise<SweptConflicts> {
   try {
     const found = await findWindowConflicts(env, principal, davFetch, options);
+    const zoneDecided = zone.guessed && (windowsPlacedByZone || found.placedByZone);
     return {
-      conflicts: found.conflicts.map((row) => conflictRowOf(row, zone)),
-      checked: found.truncated || expansionTruncated ? "partial" : "complete",
+      conflicts: found.conflicts.map((row) => conflictRowOf(row, zone.zone)),
+      checked:
+        found.truncated || expansionTruncated ? "partial" : zoneDecided ? "no-zone" : "complete",
       range,
     };
   } catch (err) {
@@ -5451,8 +5491,9 @@ async function seriesConflictsFor(
   ref: EventRef,
   read: EventWithEtag,
   facts: InvitationFacts,
-  zone: string,
+  where: PreviewZone,
 ): Promise<SweptConflicts> {
+  const zone = where.zone;
   const now = Math.floor(Date.now() / 1000);
   const today = utcToLocalTime(now, zone)?.slice(0, 10) ?? null;
   const localMidnight = today === null ? null : localTimeToUtc(`${today}T00:00:00`, zone);
@@ -5483,8 +5524,9 @@ async function seriesConflictsFor(
       excludeUid: facts.uid,
       tzid: zone,
     },
-    zone,
+    where,
     expanded.truncated,
+    expanded.placedByZone,
     range,
   );
 }
@@ -5495,10 +5537,10 @@ async function conflictsFor(
   ref: EventRef,
   read: EventWithEtag,
   facts: InvitationFacts,
-  times: ReplyTimes,
+  where: PreviewZone,
 ): Promise<SweptConflicts> {
   const { detail } = read;
-  const zone = previewZoneOf(times, detail);
+  const zone = where.zone;
 
   const window = busyIntervalOf(
     {
@@ -5522,8 +5564,10 @@ async function conflictsFor(
       excludeUid: facts.uid,
       tzid: zone,
     },
-    zone,
+    where,
     false,
+    // An invitation with no instant on either end was itself placed by the zone.
+    detail.startUtc === undefined || detail.endUtc === undefined,
     null,
   );
 }
@@ -5661,10 +5705,11 @@ async function buildReplyPreview(
   // RSVP-03, for EVERY answer (D-11). Awaited on its own, after the two reads
   // and the pure work above, and before anything is minted — so an auth or
   // throttle failure here propagates with nothing signed.
-  const zone = previewZoneOf(times, read.detail);
+  const where = previewZoneOf(tzid, read.detail);
+  const zone = where.zone;
   const swept = series
-    ? await seriesConflictsFor(principal, davFetch, ref, read, facts, zone)
-    : await conflictsFor(principal, davFetch, ref, read, facts, times);
+    ? await seriesConflictsFor(principal, davFetch, ref, read, facts, where)
+    : await conflictsFor(principal, davFetch, ref, read, facts, where);
 
   const confirmToken = await mintConfirmation(
     {
@@ -6980,16 +7025,20 @@ export function registerCalendarTools(
               "separately, which the preview names first. occurrence and " +
               "this-and-future are refused. Omit it for a one-off invitation.",
           ),
-        // Display only, on `calendar_find_free_slots`' own wording: it changes
-        // which zone the preview's times are shown in and nothing else. It is
-        // not hashed into the change and never reaches the commit.
+        // The preview's zone, on `calendar_find_free_slots`' own wording. It
+        // changes which zone the preview's times are shown in, and which day an
+        // all-day event falls on when clashes are checked (18-REVIEW WR-03). It
+        // is not hashed into the change and never reaches the commit.
         tzid: z
           .string()
           .optional()
           .describe(
-            "The IANA zone to show the preview's times in, e.g. " +
-              "America/Chicago. Omit it to see the event's own zone. A zone " +
-              "this server holds no definition for is refused.",
+            "The user's own IANA zone, e.g. America/Chicago. Pass it. The " +
+              "preview's times are shown in it, and it decides which day an " +
+              "all-day event falls on when checking for clashes. Omitted, the " +
+              "event's own zone is used, else UTC, and the preview says when " +
+              "that guess affected the clash check. A zone this server holds " +
+              "no definition for is refused.",
           ),
       }),
     },

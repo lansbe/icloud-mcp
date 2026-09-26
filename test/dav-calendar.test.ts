@@ -6461,6 +6461,50 @@ describe("findWindowConflicts", () => {
     expect((await sweep()).conflicts).toStrictEqual([]);
   });
 
+  // WR-03 (18-REVIEW). An all-day event has no instant, so the zone it is
+  // placed in decides whether it clashes. The sweep says when one was near
+  // enough a window for that to matter.
+  it("says an all-day event near the window was placed by the zone, and a timed one was not", async () => {
+    setupFindSlots({
+      objects: {
+        [WORK_PATH]: {
+          [`${WORK_PATH}clash.ics`]: timedEventIcs("clash", "20260105T093000Z", "20260105T103000Z"),
+        },
+      },
+    });
+    const timedOnly = await sweep();
+    expect(timedOnly.conflicts.length).toBe(1);
+    expect(timedOnly.placedByZone).toBe(false);
+
+    // The day BEFORE the window: in UTC it ends at midnight, nine hours before
+    // the window starts, so it does not clash here. Placed in a zone ten or
+    // more hours west of UTC it would, so where it was placed decided the answer.
+    setupFindSlots({
+      objects: {
+        [HOME_PATH]: {
+          [`${HOME_PATH}yesterday.ics`]: allDayEventIcs("yesterday", "20260104", "20260105"),
+        },
+      },
+    });
+    const nearby = await sweep();
+    expect(nearby.conflicts).toStrictEqual([]);
+    expect(nearby.placedByZone).toBe(true);
+  });
+
+  it("does not flag an all-day event no zone could move onto the window", async () => {
+    setupFindSlots({
+      objects: {
+        [HOME_PATH]: {
+          // Two days after the window: more than fourteen hours clear of it.
+          [`${HOME_PATH}later.ics`]: allDayEventIcs("later", "20260107", "20260108"),
+        },
+      },
+    });
+    const far = await sweep({ rangeEnd: WINDOW.end + 3 * 86_400 });
+    expect(far.conflicts).toStrictEqual([]);
+    expect(far.placedByZone).toBe(false);
+  });
+
   it("refuses a range wider than the find-slots cap before any request", async () => {
     const stubbed = setupFindSlots();
     stubbed.observed.length = 0;
@@ -7700,6 +7744,7 @@ describe("occurrenceWindowsOf", () => {
         { start: 1792522800, end: 1792526400 }, // 2026-10-20
       ],
       truncated: false,
+      placedByZone: false,
     });
   });
 
@@ -7721,7 +7766,11 @@ describe("occurrenceWindowsOf", () => {
   it("returns the single window of a one-off event", () => {
     expect(
       occurrenceWindowsOf(ATTENDEE_COPY_GENUINE_ICS, WIDE_START, WIDE_START + NINETY_DAYS, "UTC"),
-    ).toStrictEqual({ windows: [{ start: 1790708400, end: 1790712000 }], truncated: false });
+    ).toStrictEqual({
+      windows: [{ start: 1790708400, end: 1790712000 }],
+      truncated: false,
+      placedByZone: false,
+    });
   });
 
   it("reports truncated when the expansion hit its cap", () => {
@@ -7769,6 +7818,11 @@ describe("occurrenceWindowsOf", () => {
     );
 
     expect(truncated).toBe(false);
+    // Every one of these dates was placed by the zone: they have no instant.
+    expect(
+      occurrenceWindowsOf(allDaySeries, laMidnight, laMidnight + NINETY_DAYS, "America/Los_Angeles")
+        .placedByZone,
+    ).toBe(true);
     // Three whole Los Angeles days, the first of them today.
     expect(windows).toStrictEqual([
       { start: at("2026-01-05T08:00:00Z"), end: at("2026-01-06T08:00:00Z") },

@@ -2864,7 +2864,21 @@ export interface WindowConflicts {
    * while this is set (RSVP-03, T-18-22).
    */
   truncated: boolean;
+  /**
+   * True when an event with no instant — an all-day date, or a time whose zone
+   * did not resolve — sat close enough to a window that the zone it was placed
+   * in decided whether it counted (18-REVIEW WR-03).
+   *
+   * "Close enough" is within fourteen hours of a window, the widest offset any
+   * zone has from UTC, so no zone could have moved it further. A caller whose
+   * `tzid` was a guess rather than the user's own must not call the answer
+   * complete while this is set.
+   */
+  placedByZone: boolean;
 }
+
+/** The widest offset any zone has from UTC, in seconds (UTC+14). */
+const WIDEST_ZONE_OFFSET_SECONDS = 14 * 60 * 60;
 
 /**
  * Find every other event, on every calendar the account has, that overlaps an
@@ -2946,12 +2960,28 @@ export async function findWindowConflicts(
     }
 
     const conflicts: WindowConflict[] = [];
+    let placedByZone = false;
     for (const one of pending) {
       if (one.objectUrl === options.excludeObjectUrl) continue;
       const { occurrence } = one;
       if (options.excludeUid !== null && occurrence.uid === options.excludeUid) continue;
       const interval = busyIntervalOf(occurrence, options.tzid);
       if (interval === null) continue;
+
+      // An event with no instant was placed by `tzid`. If any zone could have
+      // put it across a window, where it landed decided the answer (WR-03).
+      const noInstant = occurrence.start.utc === undefined || occurrence.end.utc === undefined;
+      if (
+        noInstant &&
+        options.windows.some(
+          (window) =>
+            interval.start - WIDEST_ZONE_OFFSET_SECONDS < window.end &&
+            interval.end + WIDEST_ZONE_OFFSET_SECONDS > window.start,
+        )
+      ) {
+        placedByZone = true;
+      }
+
       const overlaps = options.windows.some(
         (window) => interval.start < window.end && interval.end > window.start,
       );
@@ -2978,7 +3008,7 @@ export async function findWindowConflicts(
         (busyIntervalOf(toSpan(b), options.tzid)?.start ?? 0),
     );
 
-    return { conflicts, truncated };
+    return { conflicts, truncated, placedByZone };
   });
 }
 
@@ -3004,13 +3034,17 @@ export async function findWindowConflicts(
  * range was exhausted. The caller must then say the check was partial: dates
  * this function never produced are dates nothing was checked against (T-18-31).
  * The occurrence cap and the step cap are the module's own, unchanged.
+ *
+ * `placedByZone` says at least one kept date had no instant — an all-day date,
+ * or a time whose zone did not resolve — so where it lies depends on `tzid`
+ * (18-REVIEW WR-03). A caller whose `tzid` was a guess must say so.
  */
 export function occurrenceWindowsOf(
   icsText: string,
   rangeStart: number,
   rangeEnd: number,
   tzid: string,
-): { windows: BusyInterval[]; truncated: boolean } {
+): { windows: BusyInterval[]; truncated: boolean; placedByZone: boolean } {
   return withParsedResource(icsText, (resource) => {
     const expanded = expandOccurrences(
       resource,
@@ -3021,14 +3055,19 @@ export function occurrenceWindowsOf(
       "overlaps",
     );
     const windows: BusyInterval[] = [];
+    let placedByZone = false;
     for (const occurrence of expanded.occurrences) {
       const placed = busyIntervalOf(occurrence, tzid);
       if (placed === null) continue;
       const start = Math.max(placed.start, rangeStart);
       const end = Math.min(placed.end, rangeEnd);
-      if (end > start) windows.push({ start, end });
+      if (end <= start) continue;
+      windows.push({ start, end });
+      if (occurrence.start.utc === undefined || occurrence.end.utc === undefined) {
+        placedByZone = true;
+      }
     }
-    return { windows, truncated: expanded.truncated };
+    return { windows, truncated: expanded.truncated, placedByZone };
   });
 }
 

@@ -11748,6 +11748,85 @@ describe("calendar_respond_to_invitation, what the preview says", () => {
     expect(none.trusted.conflictNotice).toBe("Nothing else on your calendars overlaps it.");
   });
 
+  // WR-03 (18-REVIEW). Written in UTC instants, this invitation names no zone
+  // but UTC, which says how it was written and nothing about the user. The
+  // meeting is 18:00 in Los Angeles on 2026-10-01; out of office is all of that
+  // day. On a UTC day the block ends seven hours before the meeting, so a sweep
+  // in UTC said "Nothing else" beside it.
+  function evening(): string {
+    return invitationBody(ORGANISER, [MINE, DANA], [
+      "DTSTART:20261002T010000Z",
+      "DTEND:20261002T020000Z",
+    ]);
+  }
+  const OOO_ON_THE_DAY = {
+    [`${WORK_PATH}ooo.ics`]: otherEvent("ooo", "Out of office", ";VALUE=DATE:20261001", ";VALUE=DATE:20261002"),
+  };
+
+  it("never says 'nothing else' when an all-day event was placed on a guessed UTC day (WR-03)", async () => {
+    await probe(evening(), { objects: { [PROBE_PATH]: evening(), ...OOO_ON_THE_DAY } });
+
+    const { trusted } = halves(await viaSchema({ id: PROBE_ID, answer: "accepted" }));
+
+    expect(trusted.conflictsChecked).toBe("no-zone");
+    expect(trusted.conflictNotice).toBe(
+      "Conflicts could not be fully checked: no time zone was given, so " +
+        "all-day events were placed in UTC and may be on the wrong day.",
+    );
+    expect(String(trusted.conflictNotice)).not.toContain("Nothing else");
+    // The answer itself is still previewable.
+    expect(typeof trusted.confirmToken).toBe("string");
+  });
+
+  it("places the all-day event on the user's own day when a zone is given (WR-03)", async () => {
+    await probe(evening(), { objects: { [PROBE_PATH]: evening(), ...OOO_ON_THE_DAY } });
+
+    const { trusted, untrusted } = halves(
+      await viaSchema({ id: PROBE_ID, answer: "accepted", tzid: "America/Los_Angeles" }),
+    );
+
+    expect(trusted.conflictsChecked).toBe("complete");
+    expect(trusted.conflictCount).toBe(1);
+    expect((untrusted.conflicts as { title: string }[])[0].title).toBe("Out of office");
+  });
+
+  it("stays complete with a guessed zone when only timed events were near (WR-03)", async () => {
+    await probe(evening(), {
+      objects: {
+        [PROBE_PATH]: evening(),
+        [`${WORK_PATH}call.ics`]: otherEvent("call", "Call", ":20261002T013000Z", ":20261002T023000Z"),
+      },
+    });
+
+    const { trusted } = halves(await viaSchema({ id: PROBE_ID, answer: "accepted" }));
+
+    expect(trusted.conflictsChecked).toBe("complete");
+    expect(trusted.conflictCount).toBe(1);
+  });
+
+  it("says an all-day invitation's own day was a guess without a zone, and uses the zone given (WR-03)", async () => {
+    const allDay = invitationBody(ORGANISER, [MINE, DANA], [
+      "DTSTART;VALUE=DATE:20261001",
+      "DTEND;VALUE=DATE:20261002",
+    ]);
+    // 23:30 in Los Angeles on 2026-10-01: inside the user's day, outside the UTC one.
+    const late = { [`${WORK_PATH}late.ics`]: otherEvent("late", "Late call", ":20261002T063000Z", ":20261002T070000Z") };
+
+    await probe(allDay, { objects: { [PROBE_PATH]: allDay, ...late } });
+    const guessed = halves(await viaSchema({ id: PROBE_ID, answer: "tentative" }));
+    expect(guessed.trusted.conflictsChecked).toBe("no-zone");
+    expect(String(guessed.trusted.conflictNotice)).not.toContain("Nothing else");
+
+    await probe(allDay, { objects: { [PROBE_PATH]: allDay, ...late } });
+    const given = halves(
+      await viaSchema({ id: PROBE_ID, answer: "tentative", tzid: "America/Los_Angeles" }),
+    );
+    expect(given.trusted.conflictsChecked).toBe("complete");
+    expect(given.trusted.conflictCount).toBe(1);
+    // The invitation's own dates are still shown as the dates it carries.
+    expect(given.trusted.start ?? given.untrusted.start).toBe("2026-10-01");
+  });
+
   it("counts events that began before the read and run across the invitation (CR-01)", async () => {
     // The read starts a day before the invitation's window. Both of these
     // started two days before it and are still running: a conference, and an
@@ -12543,6 +12622,55 @@ describe("calendar_respond_to_invitation, repeating invitations", () => {
     expect(trusted.conflictCount).toBe(1);
     expect(String(trusted.conflictNotice)).not.toContain("Nothing else");
     expect((untrusted.conflicts as { title: string }[])[0].title).toBe("Out of office");
+  });
+
+  it("checks today's own date of an all-day series west of UTC (CR-01, WR-03)", async () => {
+    // 08:00 in Los Angeles on 2026-10-13, the first date of an all-day series.
+    // The expansion compares that date as midnight UTC, which is before local
+    // midnight here; a starts-only rule dropped it, and lunch today was never
+    // compared against anything.
+    vi.spyOn(Date, "now").mockReturnValue(Date.UTC(2026, 9, 13, 15, 0, 0));
+    const allDaySeries = [
+      ["DTSTART;TZID=America/Los_Angeles:20260929T120000", "DTSTART;VALUE=DATE:20261013"],
+      ["DTEND;TZID=America/Los_Angeles:20260929T130000", "DTEND;VALUE=DATE:20261014"],
+      ["SEQUENCE:1\r\n", "SEQUENCE:1\r\nRRULE:FREQ=DAILY;COUNT=3\r\n"],
+    ].reduce((text, [from, to]) => {
+      expect(text.split(from).length, from).toBe(2);
+      return text.replace(from, to);
+    }, ATTENDEE_COPY_GENUINE_ICS);
+    await warmWrite(
+      writeDavStub({
+        objects: {
+          [SERIES_PATH]: allDaySeries,
+          [`${WORK_PATH}lunch.ics`]: otherEvent(
+            "lunch",
+            "Lunch today",
+            "20261013T193000Z",
+            "20261013T203000Z",
+          ),
+        },
+        scheduleTags: { [SERIES_PATH]: SCHEDULE_TAG },
+      }),
+    );
+
+    const { trusted, untrusted } = halves(
+      await viaSchema("calendar_respond_to_invitation", {
+        // The id names one date of the series, as a listing hands it out.
+        id: encodeEventId({
+          calendarUrl: CALENDAR_URL,
+          objectUrl: SERIES_URL,
+          recurrenceId: "20261013",
+        }),
+        answer: "accepted",
+        scope: "series",
+        tzid: "America/Los_Angeles",
+      }),
+    );
+
+    expect(trusted.conflictsChecked).toBe("complete");
+    expect(trusted.conflictCount).toBe(1);
+    expect(String(trusted.conflictNotice)).not.toContain("Nothing else");
+    expect((untrusted.conflicts as { title: string }[])[0].title).toBe("Lunch today");
   });
 
   it("says conflicts were only partly checked when the series' own expansion hit its cap", async () => {
