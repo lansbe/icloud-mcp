@@ -2221,7 +2221,7 @@ describe("getEvent", () => {
     // alarms is a separate decision, and plan 17-08 did not take it — so this
     // pins the key set rather than leaving "no `alarms` key" to be inferred from
     // an absence nothing asserts.
-    const id = await idFromListing((one) => one.summary.length > 0, {
+    const id = await idFromListing((one) => one.summary !== null, {
       calendarId: HOME_ID,
     });
 

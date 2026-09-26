@@ -172,6 +172,7 @@ function change(overrides: Partial<NormalizedChange> = {}): NormalizedChange {
     location: "Ludlow",
     description: null,
     attendees: [],
+    alarms: null,
     ...overrides,
   };
 }
@@ -1332,9 +1333,11 @@ describe("the canonical change is stable under everything that is not a change",
       location: "Ludlow",
       description: null,
       attendees: [],
+      alarms: null,
     };
     const second: NormalizedChange = {
       attendees: [],
+      alarms: null,
       description: null,
       location: "Ludlow",
       allDay: false,
@@ -1412,6 +1415,12 @@ describe("the canonical change differs on every field it covers", () => {
     attendees: {
       attendees: [{ email: "ana@example.invalid", name: "Ana" }],
     },
+    // NULL to EMPTY, deliberately, rather than null to a populated list. It is
+    // the pair D-04 turns on and the one a `?? []` anywhere on the path would
+    // silently merge: "leave every reminder alone" and "remove every reminder"
+    // are different requests, so a confirmation minted for the second must not
+    // be spendable on the first.
+    alarms: { alarms: [] },
   };
 
   it("covers every field of a canonical NormalizedChange, with none left out", () => {
@@ -1442,9 +1451,17 @@ describe("the canonical change makes two deliberate choices visible", () => {
 
     // The collapsed count is the number CALW-08 reports, because that is how
     // many people are actually told.
-    const attendees = JSON.parse(canonicalChange(duplicated)).at(
-      -1,
-    ) as string[][];
+    //
+    // Read by INDEX with the arity pinned beside it, rather than by `.at(-1)`.
+    // This case took the LAST element until plan 17-08 appended the alarm slot
+    // after the attendee one, at which point `.at(-1)` went on passing while
+    // asserting about an entirely different value — a positional read against a
+    // tuple somebody else is free to extend. Naming the index and pinning the
+    // length makes the next extension go red here instead of quietly
+    // re-pointing the assertion.
+    const tuple = JSON.parse(canonicalChange(duplicated)) as unknown[];
+    expect(tuple).toHaveLength(12);
+    const attendees = tuple[10] as string[][];
     expect(attendees).toHaveLength(1);
     expect(attendees[0][1]).toBe("Ana Ramirez");
     expect(await changeHashOf(duplicated)).toBe(await changeHashOf(single));

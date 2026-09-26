@@ -917,6 +917,22 @@ export interface AttendeeChange {
 }
 
 /**
+ * One reminder a change would set.
+ *
+ * `AttendeeChange`'s twin, and declared HERE rather than imported from
+ * `src/dav/icalendar.ts` for this module's own stated reason: it imports nothing
+ * from a protocol tree, because the next consumer of a confirmation is a mail
+ * delete rather than a calendar write. It is structurally the DAV tree's
+ * `AlarmSpec` and assignable to it in both directions, which is what keeps one
+ * shape travelling from the tool boundary to the bytes without a translation
+ * anybody has to keep correct.
+ */
+export interface AlarmChange {
+  minutesBefore: number;
+  action: "display";
+}
+
+/**
  * The shape a preview and a commit both reduce their request to.
  *
  * Every optional field is already resolved to `null` rather than absent by the
@@ -950,6 +966,21 @@ export interface NormalizedChange {
   location: string | null;
   description: string | null;
   attendees: AttendeeChange[];
+  /**
+   * The reminders to set, or `null` to leave every stored one alone (D-04).
+   *
+   * **The one field here where `null` and `[]` are DIFFERENT requests, and the
+   * difference is carried in the type rather than in a convention.** Null means
+   * the request said nothing about reminders, so the write touches no `VALARM`
+   * at all; an empty array means remove every one. Both are resolved values
+   * rather than an absent key, which is what "normalized" means above — the
+   * resolution just has three destinations here instead of two.
+   *
+   * `canonicalChange` hashes the two distinctly, so a confirmation minted for
+   * "remove all reminders" cannot be spent on "leave them alone". Pinned by a
+   * test comparing the two hashes.
+   */
+  alarms: AlarmChange[] | null;
 }
 
 /**
@@ -1024,6 +1055,21 @@ export function canonicalChange(change: NormalizedChange): string {
     change.location ?? null,
     change.description ?? null,
     attendees,
+    // **`?? null` and NOT `?? []`, and the one character is the whole
+    // guarantee.** Absent and empty are different requests for this field
+    // (D-04): the first leaves every stored reminder alone, the second removes
+    // all of them. `JSON.stringify` writes `null` for one and `[]` for the
+    // other, so the two digests differ and a confirmation minted for a removal
+    // cannot be spent on a change that leaves them standing. Coalescing to an
+    // empty array here would make the two hash IDENTICALLY, which is the shape
+    // of failure a hash exists to prevent and is invisible to every other check.
+    //
+    // Positional pairs rather than objects, on the attendee list's own reason:
+    // a key order is an insertion order, and two call sites that built their
+    // object differently would disagree about a change they both describe.
+    (change.alarms ?? null)?.map(
+      (alarm) => [alarm.minutesBefore, alarm.action] as const,
+    ) ?? null,
   ]);
 }
 

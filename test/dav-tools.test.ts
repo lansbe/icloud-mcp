@@ -29,6 +29,7 @@ import type {
   EventPage,
   EventSummary,
 } from "../src/dav/calendar";
+import { patchEventBody } from "../src/dav/calendar";
 import {
   MAX_EXPANDED_OCCURRENCES,
   UNBOUNDED_OCCURRENCES,
@@ -36,6 +37,7 @@ import {
   expandOccurrences,
   withParsedResource,
 } from "../src/dav/icalendar";
+import type { BuildEventInput } from "../src/dav/icalendar";
 import { createDavFetch } from "../src/dav/transport";
 import {
   decodeCalendarId,
@@ -1010,7 +1012,15 @@ describe("the calendar_create_event registration", () => {
     // writes. Everything else on the list is a value; that one is a
     // discriminator, and it is the only discriminator — there is deliberately
     // no flag beside it that a model could set to route around the preview.
+    //
+    // `alarms` joined it in plan 17-08 and is the opposite of `attendees` in the
+    // one way that matters here: it changes what the tool WRITES and not what it
+    // returns. A reminder tells nobody, so it does not trip the preview gate and
+    // must not be read as a second discriminator. It rides on this tool rather
+    // than on one of its own (D-13) precisely so a reminder can be set at
+    // creation — a separate tool would make that impossible without two calls.
     expect(Object.keys(schemaFor("calendar_create_event").shape).sort()).toEqual([
+      "alarms",
       "allDay",
       "attendees",
       "calendarId",
@@ -2939,6 +2949,7 @@ describe("the calendar_commit delete", () => {
           location: null,
           description: null,
           attendees: [],
+          alarms: null,
         };
         const confirmToken = await mintConfirmation(
           {
@@ -3597,6 +3608,7 @@ function previewFixture(overrides: Partial<EventPreview> = {}): EventPreview {
       location: "Room nine",
       description: null,
       attendees: [],
+      alarms: null,
     },
     ...overrides,
   };
@@ -5139,6 +5151,7 @@ describe("an attendee list this server read cannot reach one it writes", () => {
         { email: GUEST_TWO, name: null },
         { email: ORGANISER_ADDRESS, name: ORGANISER_NAME },
       ],
+      alarms: null,
     };
     const token = await mintConfirmation(
       {
@@ -5922,6 +5935,7 @@ describe("the scope a write against a series must supply", () => {
       location: "Room nine",
       description: null,
       attendees: [],
+      alarms: null,
     };
 
     const hashes = await Promise.all(
@@ -6869,6 +6883,7 @@ describe("no update path emits an ATTENDEE, whatever the change carries", () => 
         { email: GUEST_TWO, name: null },
         { email: ORGANISER_ADDRESS, name: ORGANISER_NAME },
       ],
+      alarms: null,
     };
 
     const confirmToken = await mintConfirmation(
@@ -7010,6 +7025,7 @@ describe("a series-scoped update is refused at PREVIEW, and must stay so", () =>
       location: null,
       description: null,
       attendees: [],
+      alarms: null,
     };
     const confirmToken = await mintConfirmation(
       {
@@ -9434,5 +9450,511 @@ describe("the calendar_commit collection arm (CALM-06, D-09, D-12, D-14)", () =>
     // then have two sources for one fact.
     const shape = Object.keys(schemaFor("calendar_commit").shape).sort();
     expect(shape).toEqual(["change", "confirmToken"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reminders, on the two tools that already exist (CALM-01, CALM-02, D-01, D-04,
+// D-13)
+//
+// Alarms ride on `calendar_create_event` and `calendar_update_event` rather than
+// on a tool of their own, because an alarm is a property of an event and a
+// separate tool would make setting one AT CREATION impossible without two calls.
+//
+// **Every case below exists because of ONE character.** Absent and `[]` are
+// different requests — leave every reminder alone, and remove every reminder —
+// and they travel through six hops between the tool boundary and the bytes. A
+// single `?? []` at any one of them would turn every update that did not mention
+// reminders into one that deletes them, silently, on every event the user owns.
+// So the hops are asserted individually rather than only end to end: an
+// end-to-end case proves the path is right TODAY and says nothing about which
+// hop broke when it stops being.
+// ---------------------------------------------------------------------------
+
+/** One reminder, in the shape both tools take. */
+function reminder(minutesBefore: number): Record<string, unknown> {
+  return { minutesBefore, action: "display" };
+}
+
+/** Every `TRIGGER` line one written body carries, in document order. */
+function triggersIn(body: string): string[] {
+  return body.replace(/\r\n[ \t]/g, "").match(/^TRIGGER[^\r\n]*/gm) ?? [];
+}
+
+describe("setting a reminder when the event is created (CALM-01)", () => {
+  it("writes a VALARM into the body the ungated create PUTs", async () => {
+    const stub = writeDavStub();
+    await warmWrite(stub);
+
+    await createCall(createArgs({ alarms: [reminder(15)] }));
+
+    const body = writtenBody(stub);
+    expect(body).toContain("BEGIN:VALARM");
+    expect(body).toContain("ACTION:DISPLAY");
+    expect(body).toContain("DESCRIPTION:Reminder");
+    expect(triggersIn(body)).toStrictEqual(["TRIGGER:-PT15M"]);
+  });
+
+  it("writes NO VALARM when the caller asked for none", async () => {
+    const stub = writeDavStub();
+    await warmWrite(stub);
+
+    await createCall(createArgs());
+
+    expect(writtenBody(stub)).not.toContain("BEGIN:VALARM");
+  });
+
+  it("writes one VALARM per entry, in the order supplied", async () => {
+    const stub = writeDavStub();
+    await warmWrite(stub);
+
+    await createCall(createArgs({ alarms: [reminder(60), reminder(5)] }));
+
+    expect(triggersIn(writtenBody(stub))).toStrictEqual([
+      "TRIGGER:-PT60M",
+      "TRIGGER:-PT5M",
+    ]);
+  });
+
+  it("carries the reminder through the GATED create's confirmation too", async () => {
+    // The attendee gate routes a create with recipients through a preview and a
+    // commit, so the alarm has to survive the hash and the round trip rather
+    // than only the direct call. Setting a reminder on an invited event must not
+    // cost a second tool call, which is D-13's whole reason.
+    const stub = writeDavStub();
+    await warmWrite(stub);
+
+    const { trusted, untrusted } = await createCall(
+      createArgs({
+        attendees: [{ email: GUEST_ONE }],
+        alarms: [reminder(30)],
+      }),
+    );
+    expect(trusted.confirmToken, "the gate minted nothing").not.toBeNull();
+    expect(
+      (untrusted.change as Record<string, unknown>).alarms,
+    ).toStrictEqual([reminder(30)]);
+
+    stub.observed.length = 0;
+    const result = await invokeRegistered("calendar_commit", {
+      confirmToken: String(trusted.confirmToken),
+      change: untrusted.change,
+    });
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+
+    expect(triggersIn(writtenBody(stub))).toStrictEqual(["TRIGGER:-PT30M"]);
+  });
+});
+
+describe("adding, changing and removing a reminder afterwards (CALM-02)", () => {
+  /** Preview an update of the hazards fixture, commit it, return the write. */
+  async function updateWith(
+    args: Record<string, unknown>,
+  ): Promise<{ body: string; previewed: Record<string, unknown> }> {
+    const stub = writeDavStub({
+      objects: { [PLAIN_HAZARDS_PATH]: plainHazardsIcs() },
+    });
+    await warmWrite(stub);
+
+    const previewed = await preview({ id: PLAIN_HAZARDS_EVENT_ID, ...args });
+    expect(
+      previewed.trusted.confirmToken,
+      "the preview minted nothing",
+    ).not.toBeNull();
+
+    stub.observed.length = 0;
+    const result = await invokeRegistered("calendar_commit", {
+      confirmToken: String(previewed.trusted.confirmToken),
+      change: previewed.untrusted.change,
+    });
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+
+    return {
+      body: writtenBody(stub).replace(/\r\n[ \t]/g, ""),
+      previewed: previewed.trusted,
+    };
+  }
+
+  it("CHANGES the stored reminder to the one supplied", async () => {
+    const { body } = await updateWith({ alarms: [reminder(45)] });
+
+    expect(triggersIn(body)).toStrictEqual(["TRIGGER:-PT45M"]);
+    expect(body.match(/^BEGIN:VALARM/gm)?.length).toBe(1);
+  });
+
+  it("REMOVES every reminder on an explicit empty array", async () => {
+    const { body } = await updateWith({ alarms: [] });
+
+    expect(body).not.toContain("BEGIN:VALARM");
+    expect(triggersIn(body)).toStrictEqual([]);
+  });
+
+  it("ADDS reminders to an event that carried none", async () => {
+    const stub = writeDavStub();
+    await warmWrite(stub);
+
+    const previewed = await preview({
+      id: SIMPLE_EVENT_ID,
+      alarms: [reminder(10), reminder(120)],
+    });
+    stub.observed.length = 0;
+    const result = await invokeRegistered("calendar_commit", {
+      confirmToken: String(previewed.trusted.confirmToken),
+      change: previewed.untrusted.change,
+    });
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+
+    expect(triggersIn(writtenBody(stub))).toStrictEqual([
+      "TRIGGER:-PT10M",
+      "TRIGGER:-PT120M",
+    ]);
+  });
+
+  it("leaves the stored VALARM byte-identical when the update omits alarms", async () => {
+    // **The case the whole absent-versus-empty rule exists for.** This is the
+    // ordinary update — a caller moving an event and saying nothing about
+    // reminders — and one `?? []` anywhere on the path turns it into a deletion.
+    // Compared as WHOLE BLOCKS rather than by containment: a write that kept the
+    // trigger and dropped the alarm's own description would pass a containment
+    // check and leave a reminder that fires with no text.
+    const { body } = await updateWith({ startLocal: "2026-02-10T16:00:00" });
+
+    const block = body.slice(
+      body.indexOf("BEGIN:VALARM"),
+      body.indexOf("END:VALARM") + "END:VALARM".length,
+    );
+    expect(block.split("\r\n")).toStrictEqual([
+      "BEGIN:VALARM",
+      "ACTION:DISPLAY",
+      "DESCRIPTION:Quarterly planning",
+      "TRIGGER:-PT15M",
+      "END:VALARM",
+    ]);
+  });
+
+  it("leaves every OTHER subcomponent and property standing when alarms go", async () => {
+    // An empty list is a claim about ALARMS and about nothing else. The bare
+    // `removeAllSubcomponents()` form would take every `VTIMEZONE` with it and
+    // the resource would still serialise, so the failure is a resource whose
+    // times mean something else with nothing at all going red.
+    const { body } = await updateWith({ alarms: [] });
+
+    expect(body).toContain("X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC");
+    expect(body).toContain("SUMMARY;X-APPLE-STRUCTURED-TITLE=planning-block:");
+    expect(body).toContain("PRODID:-//Apple Inc.//iOS 26.0//EN");
+    expect(body).toContain(`UID:${PLAIN_HAZARDS_UID}`);
+    // The zone definition the writer adds for the change's own zone survives
+    // the removal, which is what a bare `removeAllSubcomponents()` would take.
+    expect(body).toContain("BEGIN:VTIMEZONE");
+  });
+
+  it("emits no ATTENDEE, whatever the alarm change carries", async () => {
+    // The invitation boundary, re-asserted on the path this plan added. An alarm
+    // change must not be the thing that puts a person on an event.
+    const { body } = await updateWith({ alarms: [reminder(45)] });
+
+    expect(body).not.toContain("ATTENDEE");
+    expect(body).not.toContain("ORGANIZER");
+  });
+});
+
+describe("every update scope sets a reminder identically (CALM-02)", () => {
+  /** Preview and commit one scoped alarm change, and return the written body. */
+  async function scopedUpdate(
+    scope: "occurrence" | "this-and-future",
+    alarms: unknown,
+  ): Promise<string> {
+    const stub = seriesStub();
+    await warmWrite(stub);
+
+    const previewed = await preview({
+      id: SERIES_EVENT_ID,
+      scope,
+      startLocal: "2026-04-20T16:00:00",
+      endLocal: "2026-04-20T16:30:00",
+      ...(alarms === undefined ? {} : { alarms }),
+    });
+    expect(
+      previewed.trusted.confirmToken,
+      "the scoped preview minted nothing",
+    ).not.toBeNull();
+
+    stub.observed.length = 0;
+    const result = await invokeRegistered("calendar_commit", {
+      confirmToken: String(previewed.trusted.confirmToken),
+      change: previewed.untrusted.change,
+    });
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+
+    return writtenBody(stub).replace(/\r\n[ \t]/g, "");
+  }
+
+  it.each(["occurrence", "this-and-future"] as const)(
+    "writes the supplied reminder on the override and leaves the master's alone on %s",
+    async (scope) => {
+      const body = await scopedUpdate(scope, [reminder(25)]);
+
+      // TWO alarms in the resource: the master keeps its own ten-minute one and
+      // the override carries the twenty-five the caller asked for. A write that
+      // reached the master instead would show one.
+      expect(triggersIn(body)).toStrictEqual([
+        "TRIGGER:-PT10M",
+        "TRIGGER:-PT25M",
+      ]);
+    },
+  );
+
+  it.each(["occurrence", "this-and-future"] as const)(
+    "removes only the override's INHERITED reminder on %s when the list is empty",
+    async (scope) => {
+      const body = await scopedUpdate(scope, []);
+
+      // The master's survives. The user asked for THIS date to have no reminder,
+      // not for the series to lose one.
+      expect(triggersIn(body)).toStrictEqual(["TRIGGER:-PT10M"]);
+    },
+  );
+
+  it.each(["occurrence", "this-and-future"] as const)(
+    "leaves both reminders standing on %s when the update omits alarms",
+    async (scope) => {
+      const body = await scopedUpdate(scope, undefined);
+
+      // The master's, and the one the new override inherited from it.
+      expect(triggersIn(body)).toStrictEqual([
+        "TRIGGER:-PT10M",
+        "TRIGGER:-PT10M",
+      ]);
+    },
+  );
+});
+
+describe("absent and empty stay apart at EVERY hop (D-04)", () => {
+  // One case per hop, not one end-to-end case. A single `?? []` merges the two
+  // at whichever hop it sits on, and an end-to-end assertion says only that
+  // SOMETHING on the path is wrong.
+
+  it("hop 1, the schema: an omitted key parses to undefined and [] to []", () => {
+    const schema = schemaFor("calendar_update_event");
+    const base = { id: SIMPLE_EVENT_ID, summary: "Moved" };
+
+    const omitted = schema.safeParse(base);
+    const emptied = schema.safeParse({ ...base, alarms: [] });
+    expect(omitted.success && emptied.success).toBe(true);
+    expect(
+      (omitted.data as Record<string, unknown>).alarms,
+    ).toBeUndefined();
+    expect((emptied.data as Record<string, unknown>).alarms).toStrictEqual([]);
+  });
+
+  it("hop 2, the preview's change: an omitted key becomes null and [] stays []", async () => {
+    const stub = writeDavStub({
+      objects: { [PLAIN_HAZARDS_PATH]: plainHazardsIcs() },
+    });
+    await warmWrite(stub);
+
+    const omitted = await preview({
+      id: PLAIN_HAZARDS_EVENT_ID,
+      summary: "Moved",
+    });
+    const emptied = await preview({
+      id: PLAIN_HAZARDS_EVENT_ID,
+      summary: "Moved",
+      alarms: [],
+    });
+
+    // NULL rather than absent, which is what "normalized" means: an absent key
+    // and an explicit null are different bytes for the same meaning, so a
+    // caller that omitted one could otherwise move the hash. Three states
+    // resolved into three VALUES, none of them missing.
+    expect((omitted.untrusted.change as Record<string, unknown>).alarms).toBeNull();
+    expect(
+      (emptied.untrusted.change as Record<string, unknown>).alarms,
+    ).toStrictEqual([]);
+  });
+
+  it("hop 3, the change hash: null and [] do NOT hash the same", async () => {
+    // Without this the two are one confirmation: a token minted for "remove
+    // every reminder" would verify against a commit that leaves them standing,
+    // and the other way round. The hash is the only thing crossing the gap
+    // between the two tool calls, so a collision here is a collision in the
+    // whole guarantee.
+    const base: NormalizedChange = {
+      kind: "update",
+      scope: null,
+      summary: "Moved",
+      startLocal: "2026-02-10T16:00:00",
+      startTzid: "UTC",
+      endLocal: "2026-02-10T17:00:00",
+      endTzid: "UTC",
+      allDay: false,
+      location: null,
+      description: null,
+      attendees: [],
+      alarms: null,
+    };
+
+    const leaveAlone = await changeHashOf(base);
+    const removeAll = await changeHashOf({ ...base, alarms: [] });
+    const setOne = await changeHashOf({
+      ...base,
+      alarms: [{ minutesBefore: 15, action: "display" }],
+    });
+
+    expect(leaveAlone).not.toBe(removeAll);
+    expect(removeAll).not.toBe(setOne);
+    expect(leaveAlone).not.toBe(setOne);
+  });
+
+  it("hop 3b, the change hash: the ORDER of the list is part of it", async () => {
+    // A reminder list is ordered and is written in the caller's order, unlike
+    // the attendee list beside it which is sorted before hashing. So two
+    // spellings of "fifteen and sixty" are two different requests here.
+    const base: NormalizedChange = {
+      kind: "update",
+      scope: null,
+      summary: "Moved",
+      startLocal: "2026-02-10T16:00:00",
+      startTzid: "UTC",
+      endLocal: "2026-02-10T17:00:00",
+      endTzid: "UTC",
+      allDay: false,
+      location: null,
+      description: null,
+      attendees: [],
+      alarms: [
+        { minutesBefore: 15, action: "display" },
+        { minutesBefore: 60, action: "display" },
+      ],
+    };
+
+    expect(await changeHashOf(base)).not.toBe(
+      await changeHashOf({
+        ...base,
+        alarms: [
+          { minutesBefore: 60, action: "display" },
+          { minutesBefore: 15, action: "display" },
+        ],
+      }),
+    );
+  });
+
+  it("hop 4, the commit's re-supplied change: an omitted key normalises to null", async () => {
+    // The model hands the change object back, and a model is free to drop a key
+    // whose value is null. That must be refused rather than read as "remove
+    // every reminder" — which is what it would become under a `?? []`.
+    const stub = writeDavStub({
+      objects: { [PLAIN_HAZARDS_PATH]: plainHazardsIcs() },
+    });
+    await warmWrite(stub);
+
+    const previewed = await preview({
+      id: PLAIN_HAZARDS_EVENT_ID,
+      alarms: [],
+    });
+    const stripped = { ...(previewed.untrusted.change as Record<string, unknown>) };
+    delete stripped.alarms;
+
+    const result = await invokeRegistered("calendar_commit", {
+      confirmToken: String(previewed.trusted.confirmToken),
+      change: stripped,
+    });
+
+    // REFUSED, and with zero writes. The stripped object normalises to null,
+    // which is a different change from the `[]` the confirmation was minted
+    // for — so the hashes disagree and nothing is sent.
+    expect(result.isError).toBe(true);
+    expect(stub.observed.filter((one) => one.method === "PUT").length).toBe(0);
+  });
+
+  it("hop 5, the writers: an omitted key reaches the bytes as no VALARM change", async () => {
+    // The last hop, driven at the DAV writer rather than through the tools, so
+    // a failure here names `patchEventBody` rather than the whole path. Both
+    // writers translate a `BuildEventInput` into an `OverrideChange` field by
+    // field, and that translation is where a `??` would sit.
+    const input: BuildEventInput = {
+      summary: "Moved",
+      startLocal: "2026-02-10T16:00:00",
+      endLocal: "2026-02-10T17:00:00",
+      tzid: "UTC",
+      allDay: false,
+      location: null,
+      description: null,
+      participants: null,
+      sequence: 0,
+    };
+
+    const untouched = patchEventBody(plainHazardsIcs(), input);
+    const cleared = patchEventBody(plainHazardsIcs(), { ...input, alarms: [] });
+
+    expect(triggersIn(String(untouched))).toStrictEqual(["TRIGGER:-PT15M"]);
+    expect(triggersIn(String(cleared))).toStrictEqual([]);
+  });
+});
+
+describe("an alarm the schema will not accept is refused before any request (D-01)", () => {
+  it.each([
+    ["a negative minutesBefore", { minutesBefore: -5, action: "display" }],
+    ["a fractional minutesBefore", { minutesBefore: 7.5, action: "display" }],
+    ["an over-bound minutesBefore", { minutesBefore: 40321, action: "display" }],
+    ["an action this server does not write", { minutesBefore: 15, action: "email" }],
+    ["a missing action", { minutesBefore: 15 }],
+  ])("refuses %s on the update tool, spending ZERO requests", async (_label, alarm) => {
+    const stub = writeDavStub();
+    await warmWrite(stub);
+
+    const parsed = schemaFor("calendar_update_event").safeParse({
+      id: SIMPLE_EVENT_ID,
+      alarms: [alarm],
+    });
+
+    // Refused at the SCHEMA, so the handler body never runs — which means the
+    // KV read discovery performs never happens and nothing reaches the wire.
+    // The recorded request list is what says so from OUTSIDE the schema.
+    expect(parsed.success).toBe(false);
+    expect(stub.observed.length).toBe(0);
+  });
+
+  it("refuses a list longer than the cap, on both tools", () => {
+    const tooMany = Array.from({ length: 6 }, (_, index) => reminder(index + 1));
+
+    expect(
+      schemaFor("calendar_update_event").safeParse({
+        id: SIMPLE_EVENT_ID,
+        alarms: tooMany,
+      }).success,
+    ).toBe(false);
+    expect(
+      schemaFor("calendar_create_event").safeParse(
+        createArgs({ alarms: tooMany }),
+      ).success,
+    ).toBe(false);
+  });
+
+  it("ACCEPTS the boundary values, so the cap refuses nothing anybody wants", () => {
+    // A bound that refused a reminder four weeks ahead, or one AT the start,
+    // would be a bound nobody could use. Pinned in the accepting direction too,
+    // because a cap tightened by one is invisible to a refusal-only test.
+    for (const minutes of [0, 40320]) {
+      expect(
+        schemaFor("calendar_update_event").safeParse({
+          id: SIMPLE_EVENT_ID,
+          alarms: [reminder(minutes)],
+        }).success,
+      ).toBe(true);
+    }
+    expect(
+      schemaFor("calendar_update_event").safeParse({
+        id: SIMPLE_EVENT_ID,
+        alarms: Array.from({ length: 5 }, (_, index) => reminder(index + 1)),
+      }).success,
+    ).toBe(true);
+  });
+
+  it("adds NO third tool: alarms ride on the two that already exist (D-13)", () => {
+    const names = registeredDav().map((one) => one.name);
+
+    expect(names.filter((one) => one.includes("alarm"))).toStrictEqual([]);
+    expect(names.filter((one) => one.includes("reminder"))).toStrictEqual([]);
   });
 });

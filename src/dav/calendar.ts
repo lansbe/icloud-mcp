@@ -73,6 +73,7 @@ import {
   withParsedResource,
 } from "./icalendar";
 import type {
+  AlarmSpec,
   BuildEventInput,
   BuildParticipants,
   EventParticipant,
@@ -3500,6 +3501,12 @@ export function updateOccurrenceBody(
         allDay: input.allDay,
         location: input.location,
         description: input.description,
+        // Carried ACROSS rather than defaulted. `input.alarms` is `undefined`
+        // when the caller said nothing about reminders and `[]` when they asked
+        // for none, and the two are different requests all the way down to
+        // `applyOverrideChange` (D-04). A `?? []` on this line would turn every
+        // update that did not mention alarms into one that deletes them.
+        alarms: input.alarms,
       },
       range,
     );
@@ -3573,6 +3580,10 @@ export function patchEventBody(
       allDay: input.allDay,
       location: input.location,
       description: input.description,
+      // Carried ACROSS, never defaulted. See `updateOccurrenceBody`, which makes
+      // the same hop and owns the argument: absent and empty are different
+      // requests (D-04), and a `??` here would silently merge them.
+      alarms: input.alarms,
     });
     if (components === null) return null;
 
@@ -4358,6 +4369,16 @@ export interface CreateEventInput {
    * calls with byte-identical input mint two UIDs and leave two events behind.
    */
   uid?: string;
+  /**
+   * The reminders to write, or absent for an event that carries none (CALM-01).
+   *
+   * Reaches both create paths — the ungated one straight off the tool's own
+   * arguments, and the gated one out of the hash-bound change — so setting a
+   * reminder at creation costs one call either way. That is D-13's whole reason
+   * for putting alarms on the tools that already exist: a tool of their own
+   * would make the create case impossible without two.
+   */
+  alarms?: AlarmSpec[];
 }
 
 /**
@@ -4463,6 +4484,11 @@ export async function createEvent(
     location,
     description: input.description ?? null,
     participants: input.participants ?? null,
+    // Carried straight across, and NOT coerced to an empty array. A resource
+    // that does not exist yet has no stored alarm, so absent and empty produce
+    // the same bytes HERE — but the field keeps its three-state shape so the
+    // create path and the update path read identically at every call site.
+    alarms: input.alarms,
     // ZERO, and a literal rather than a parameter. RFC 5545 §3.8.7.4 defines
     // zero as a new event's first revision, and there is nothing to advance
     // past: this resource does not exist yet. An UPDATE reads a stored value

@@ -728,6 +728,7 @@ function eventPreview(overrides: Partial<EventPreview> = {}): EventPreview {
       location: "Room nine",
       description: null,
       attendees: [],
+      alarms: null,
     },
     ...overrides,
   };
@@ -1087,6 +1088,7 @@ function collectionDeletePreview(
       location: null,
       description: null,
       attendees: [],
+      alarms: null,
     },
     confirmationLine: `Deleting calendar '${HOSTILE_CALENDAR_TITLE}', along with the 9 items in it. This cannot be undone.`,
     ...overrides,

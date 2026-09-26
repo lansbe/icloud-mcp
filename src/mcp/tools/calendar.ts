@@ -38,6 +38,7 @@ import type {
   UpdatedCalendar,
 } from "../../dav/calendar";
 import type {
+  AlarmSpec,
   BuildEventInput,
   OccurrenceCounts,
   OverrideRange,
@@ -79,6 +80,7 @@ import {
   isSupportedTimezone,
   isWriteScope,
   localTimeToUtc,
+  storedAlarmsOf,
 } from "../../dav/icalendar";
 import {
   decodeCalendarId,
@@ -106,6 +108,7 @@ import {
   verifyConfirmation,
 } from "../../confirm";
 import type {
+  AlarmChange,
   AttendeeChange,
   ConfirmationSummary,
   NormalizedChange,
@@ -1465,6 +1468,71 @@ const CHANGE_FIELDS = [
   "description",
 ] as const;
 
+/**
+ * The furthest ahead a reminder may be set, in minutes.
+ *
+ * Four weeks. A reminder weeks before an event is legitimate — a conference, a
+ * renewal, a filing deadline — so a bound tight enough to be "obviously safe"
+ * would refuse real use. What it bounds is a caller reaching for a number that
+ * makes the resource absurd rather than the reminder early: RFC 5545 admits a
+ * duration of any size, and an alarm forty thousand years before an event is a
+ * value nobody meant and a `TRIGGER` line nobody can read.
+ *
+ * The NUMBER is in the parameter's description, so a caller past it is refused
+ * with a reason rather than a shrug.
+ */
+const MAX_ALARM_MINUTES_BEFORE = 40320;
+
+/**
+ * The most reminders one event may carry.
+ *
+ * An unbounded list is an unbounded resource body, and a resource body is what
+ * this server `PUT`s at somebody's real calendar. Five is past what any client
+ * this project has seen offers to set, so the cap refuses nothing anybody wants.
+ */
+const MAX_ALARMS = 5;
+
+/**
+ * The `alarms` parameter, written ONCE and shared by the two tools that take it.
+ *
+ * D-13 puts reminders on `calendar_create_event` and `calendar_update_event`
+ * rather than on a tool of their own, because an alarm is a property of an event
+ * and a separate tool would make setting one AT CREATION impossible without two
+ * calls. One schema constant rather than two copies follows from that: two
+ * copies of a bound are two bounds that drift, and the drift is invisible until
+ * somebody compares the two descriptions side by side.
+ *
+ * Every refusal happens HERE, at the tool boundary, before any request is sent —
+ * which is where the Architectural Responsibility Map puts input validation, and
+ * why the DAV tree below takes an already-narrowed type and re-checks nothing.
+ *
+ * **Optional and NOT nullable, and that is D-04 expressed in the type.** Omitting
+ * the key leaves every stored reminder alone; supplying `[]` removes them all.
+ * Zod gives exactly those two states as `undefined` and `[]`, and every hop
+ * between here and `applyOverrideChange` carries them apart.
+ */
+const ALARMS_PARAMETER = z
+  .array(
+    z.object({
+      minutesBefore: z
+        .number()
+        .int("minutesBefore must be a whole number of minutes")
+        .min(0, "minutesBefore must not be negative")
+        .max(
+          MAX_ALARM_MINUTES_BEFORE,
+          `minutesBefore must not exceed ${MAX_ALARM_MINUTES_BEFORE}`,
+        )
+        .describe(
+          "Whole minutes before the event starts, 0 to " +
+            `${MAX_ALARM_MINUTES_BEFORE} (four weeks). 0 means at the start.`,
+        ),
+      action: z
+        .literal("display")
+        .describe("The only alarm kind this server writes: an on-screen alert."),
+    }),
+  )
+  .max(MAX_ALARMS, `no more than ${MAX_ALARMS} reminders`);
+
 /** One wall clock in the form the target's own all-day-ness requires. */
 function wallClockFor(value: string, allDay: boolean): string {
   const date = value.slice(0, 10);
@@ -1496,6 +1564,13 @@ function currentChange(detail: EventDetail): NormalizedChange {
     location: detail.location,
     description: detail.description,
     attendees: [],
+    // NULL, and that is a fact about this SHAPE rather than about the resource.
+    // This is the baseline the request is merged over, and the merge's rule is
+    // "absent means leave alone" — so the baseline has to say "nothing asked".
+    // Reading the stored alarms in here would make an update mentioning no
+    // reminders REPLACE them with what was already there, turning a no-op into a
+    // whole-list rewrite that drops every unmodelled alarm the event carried.
+    alarms: null,
   };
 }
 
@@ -1508,6 +1583,17 @@ interface UpdateRequest {
   allDay?: boolean;
   location?: string | null;
   description?: string | null;
+  /**
+   * The reminders to set, or ABSENT to leave every stored one alone (D-04).
+   *
+   * Optional and NOT nullable, which is the difference from `location` and
+   * `description` beside it. Those two have a single value to clear, so `null`
+   * is how a caller clears one; a LIST clears itself by being empty. Two ways to
+   * say "remove every reminder" would be two things to keep consistent, and they
+   * would disagree the first time somebody set both — which is D-04's own reason
+   * for there being no `removeAlarms` flag either.
+   */
+  alarms?: AlarmChange[];
 }
 
 /**
@@ -1549,6 +1635,12 @@ function desiredChange(
         ? current.description
         : requested.description,
     attendees: [],
+    // Compared against `undefined` rather than coalesced, on the same rule the
+    // two fields above it follow — and here it matters MORE, because the value a
+    // `??` would swallow is an empty array, which is a real request (remove every
+    // reminder) rather than a missing one. `current.alarms` is null by
+    // construction, so an omitted key resolves to "leave them alone".
+    alarms: requested.alarms === undefined ? current.alarms : requested.alarms,
   };
 }
 
@@ -2619,6 +2711,8 @@ interface CreateRequest {
   allDay?: boolean;
   location?: string;
   description?: string;
+  /** The reminders to write, or absent for an event that carries none. */
+  alarms?: AlarmChange[];
 }
 
 /**
@@ -2652,6 +2746,12 @@ function createChange(
     location: requested.location ?? null,
     description: requested.description ?? null,
     attendees,
+    // `?? null` and never `?? []`. A resource that does not exist yet has no
+    // stored reminder, so the two produce the same BYTES on a create — but they
+    // produce different HASHES, and the hash is what the commit is checked
+    // against. Coalescing here would let a confirmation minted for one be spent
+    // on the other, and this field carries that distinction everywhere else.
+    alarms: requested.alarms ?? null,
   };
 }
 
@@ -2858,6 +2958,14 @@ function normalizeSupplied(supplied: SuppliedChange): NormalizedChange {
         name: one.name ?? null,
       })),
     ),
+    // `?? null`, so an omitted key resolves to "leave every reminder alone" and
+    // a supplied `[]` stays an empty array meaning "remove them all". This is the
+    // LAST hop before the hash comparison, and an `?? []` here would make the
+    // commit hash a change the preview never described: every alarm-silent
+    // update would then be refused, and the obvious "fix" would be to stop
+    // comparing. Nothing is collapsed or sorted — a reminder list is ordered and
+    // has no duplicate rule to apply.
+    alarms: supplied.alarms ?? null,
   };
 }
 
@@ -2874,6 +2982,7 @@ interface SuppliedChange {
   location?: string | null;
   description?: string | null;
   attendees?: { email: string; name?: string | null }[];
+  alarms?: { minutesBefore: number; action: "display" }[] | null;
 }
 
 /**
@@ -3381,6 +3490,12 @@ async function applyCommit(
       location: change.location,
       description: change.description,
       participants: { organizer, attendees: change.attendees },
+      // From the HASH-BOUND change, so the reminder the user approved is the
+      // reminder that gets written. `null` back to `undefined`, written out
+      // rather than coalesced, on the update arm's own reason below — the two
+      // values this separates are different requests everywhere else and a
+      // `??` here would read as a default somebody could later "tidy" to `[]`.
+      alarms: change.alarms === null ? undefined : change.alarms,
     });
 
     // Unreachable: the preview refused an unsupported zone before minting
@@ -3561,6 +3676,15 @@ async function applyCommit(
     // of the patched component's OWN stored value, on every scope — so a caller
     // cannot choose one, and neither can this field.
     sequence: 0,
+    // **`null` back to `undefined`, written out rather than coalesced.** This is
+    // the last hop before the writers, and the two values it separates are
+    // "leave every stored reminder alone" and "remove them all" (D-04). A
+    // `change.alarms ?? undefined` would be CORRECT — an empty array is not
+    // nullish — but it reads as a default, and a later edit that "tidied" it to
+    // `?? []` would silently delete a reminder on every update that did not
+    // mention one, with nothing going red. The explicit comparison cannot be
+    // tidied into that.
+    alarms: change.alarms === null ? undefined : change.alarms,
   };
 
   // The dispatch, on the hash-bound scope. **All three arms PATCH now** (D-02),
@@ -5018,6 +5142,10 @@ export function registerCalendarTools(
                 "result says SENT, never delivered: iCloud reports that it " +
                 "sent, not that anyone received it.",
             ),
+          alarms: ALARMS_PARAMETER.optional().describe(
+            "Reminders to set on the event, e.g. " +
+              "[{minutesBefore:15,action:'display'}]. Omit for none.",
+          ),
         })
         // Refused at the SCHEMA, so an inverted range never reaches the handler
         // body — which means it never reaches the KV read discovery performs or
@@ -5038,6 +5166,7 @@ export function registerCalendarTools(
       location,
       description,
       attendees,
+      alarms,
     }) => {
       try {
         // Who this call acts for. First, so a refused principal reads
@@ -5069,6 +5198,7 @@ export function registerCalendarTools(
               allDay,
               location,
               description,
+              alarms,
             }),
           );
         }
@@ -5091,6 +5221,7 @@ export function registerCalendarTools(
                 allDay,
                 location,
                 description,
+                alarms,
               },
               recipients,
             ),
@@ -5151,6 +5282,10 @@ export function registerCalendarTools(
           .nullable()
           .optional()
           .describe("New body text. Null clears it; omit to leave it."),
+        alarms: ALARMS_PARAMETER.optional().describe(
+          "The event's reminders, REPLACED as a whole list. Omit to leave " +
+            "them exactly as they are; pass [] to remove every one.",
+        ),
         scope: SCOPE_PARAMETER,
       }),
     },
@@ -5163,6 +5298,7 @@ export function registerCalendarTools(
       allDay,
       location,
       description,
+      alarms,
       scope,
     }) => {
       try {
@@ -5188,6 +5324,7 @@ export function registerCalendarTools(
                 allDay,
                 location,
                 description,
+                alarms,
               },
               scope,
             ),
@@ -5383,6 +5520,16 @@ export function registerCalendarTools(
                 }),
               )
               .optional(),
+            // NULLABLE here and merely optional on the two preview tools, and
+            // the divergence is deliberate. This is the change object being
+            // handed BACK, so it carries the resolved value the preview
+            // published — which is `null` for "leave every reminder alone" — and
+            // a schema that refused null would refuse the very object it told
+            // the caller to return unaltered. The bounds are re-asserted rather
+            // than widened to a bare array: a caller supplying a change is
+            // supplying input, whatever it says about where it got it, and the
+            // hash comparison refuses a value the preview never minted anyway.
+            alarms: ALARMS_PARAMETER.nullable().optional(),
           })
           .describe(
             "The change object calendar_update_event returned, passed back " +
