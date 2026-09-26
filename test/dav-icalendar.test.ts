@@ -3311,6 +3311,11 @@ function patchedOneOff(
   return components![0]!;
 }
 
+/** One reminder spec, so the literal is not spelled out at every call. */
+function reminderSpec(minutesBefore: number): AlarmSpec {
+  return { minutesBefore, action: "display" };
+}
+
 /** One `VEVENT` parsed straight out of literal lines, alarms and all. */
 function parsedVevent(block: string): InstanceType<typeof ICAL.Component> {
   return new ICAL.Component(ICAL.parse(block));
@@ -3553,6 +3558,56 @@ describe("an EXPLICIT empty array removes every alarm and nothing else (D-04)", 
     expect(
       alarmBlocksOf(patchedOneOff(STORED_ALARM_ICS, { alarms: [] })),
     ).toStrictEqual([]);
+  });
+
+  it("removes ONLY the alarms, and leaves a foreign subcomponent standing", () => {
+    // **The case that makes passing the `"valarm"` name load-bearing rather than
+    // merely tidy, and it was found by MUTATION.** Replacing the call with the
+    // bare `removeAllSubcomponents()` passed every other case in the suite: a
+    // `VTIMEZONE` is never inside a `VEVENT`, so the reason the plan gave for the
+    // name — that the bare form would take the zone definitions — does not apply
+    // at this call site at all.
+    //
+    // What it DOES take is this: `X-APPLE-STRUCTURED-LOCATION` is a component
+    // Apple Calendar writes inside a `VEVENT` to hold a geocoded place. The bare
+    // form removes it, the resource still serialises, and the user's event
+    // quietly loses its map pin because they changed a reminder.
+    const withForeign = STORED_ALARM_ICS.replace(
+      "END:VEVENT",
+      [
+        "BEGIN:X-APPLE-STRUCTURED-LOCATION",
+        "X-TITLE:Ludlow Coffee",
+        "END:X-APPLE-STRUCTURED-LOCATION",
+        "END:VEVENT",
+      ].join("\r\n"),
+    );
+
+    const patched = patchedOneOff(withForeign, { alarms: [reminderSpec(45)] });
+
+    expect(
+      patched.getAllSubcomponents().map((one) => one.name),
+    ).toStrictEqual(["x-apple-structured-location", "valarm"]);
+    expect(
+      patched.getFirstSubcomponent("x-apple-structured-location")!.toString(),
+    ).toContain("X-TITLE:Ludlow Coffee");
+  });
+
+  it("removes a foreign subcomponent for NOBODY, not even an empty list", () => {
+    const withForeign = STORED_ALARM_ICS.replace(
+      "END:VEVENT",
+      [
+        "BEGIN:X-APPLE-STRUCTURED-LOCATION",
+        "X-TITLE:Ludlow Coffee",
+        "END:X-APPLE-STRUCTURED-LOCATION",
+        "END:VEVENT",
+      ].join("\r\n"),
+    );
+
+    const patched = patchedOneOff(withForeign, { alarms: [] });
+
+    expect(
+      patched.getAllSubcomponents().map((one) => one.name),
+    ).toStrictEqual(["x-apple-structured-location"]);
   });
 
   it("leaves every VTIMEZONE and every other calendar-level byte standing", () => {

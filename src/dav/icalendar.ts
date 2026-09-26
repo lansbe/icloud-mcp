@@ -3553,12 +3553,26 @@ function applyOverrideChange(
  * update that says nothing about reminders keeps the one the user set. Anything
  * else replaces the whole list, so `[]` removes every alarm.
  *
- * **The name is ALWAYS passed to `removeAllSubcomponents`.** The bare-argument
- * form takes every subcomponent, `VTIMEZONE` blocks included — and the resource
- * still serialises afterwards, so the failure is a resource whose times mean
- * something else with nothing at all going red. It is the exact defect
- * `serializeOccurrenceResource`'s own `removeAllSubcomponents("vevent")` guards
- * against, and the hazards fixture's docstring names it there.
+ * **The name is ALWAYS passed to `removeAllSubcomponents`, and what that buys is
+ * narrower than it first looks — which is why it is written down rather than
+ * inherited.** The plan for this work said the bare form "would take every
+ * `VTIMEZONE` with it". That is true of
+ * `serializeOccurrenceResource`'s own call, which operates on the `VCALENDAR`
+ * where the zone definitions live. It is FALSE here: this operates on a
+ * `VEVENT`, and a `VTIMEZONE` is never inside one. Recorded as having been wrong
+ * rather than quietly restated, because a reason that overclaims is a reason the
+ * next reader stops believing.
+ *
+ * What the name actually protects is every OTHER subcomponent a `VEVENT` can
+ * carry, and that set is not empty on a real calendar:
+ * `X-APPLE-STRUCTURED-LOCATION` is a component Apple Calendar writes inside a
+ * `VEVENT` to hold a geocoded place, and RFC 9074 defines more `VALARM`-adjacent
+ * structure. The bare form takes all of it, the resource still serialises, and
+ * the user's event quietly loses its map pin because they changed a reminder.
+ * Measured, and pinned by "removes ONLY the alarms, and leaves a foreign
+ * subcomponent standing" in `test/dav-icalendar.test.ts` — the bare form passed
+ * every other case in the suite, which is exactly the shape of gap a rule
+ * believed on inherited prose leaves behind.
  *
  * **Nothing branches on the return value.** In `ical.js@2.2.1` that method
  * returns `undefined` regardless of what it removed, despite the JSDoc at
