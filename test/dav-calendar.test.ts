@@ -72,9 +72,9 @@ import {
   readCollectionState,
   resolveOrganizerAddress,
   searchEvents,
+  uidFromObjectUrl,
   updateCalendarCollection,
   updateEvent,
-  updateEventBody,
   updateOccurrenceBody,
 } from "../src/dav/calendar";
 import type {
@@ -98,7 +98,11 @@ import {
   expandOccurrences,
   withParsedResource,
 } from "../src/dav/icalendar";
-import type { BuildEventInput, Occurrence } from "../src/dav/icalendar";
+import type {
+  BuildEventInput,
+  BuildParticipants,
+  Occurrence,
+} from "../src/dav/icalendar";
 import {
   DAV_TOKEN_VERSION,
   decodeCalendarCursor,
@@ -3553,62 +3557,62 @@ describe("createEvent with people on it", () => {
   });
 });
 
-describe("the rewrite body cannot carry a person", () => {
-  it("emits no ORGANIZER and no ATTENDEE, whatever the resource held", async () => {
-    // The laundering direction, at the layer where the bytes are made. A
-    // rewrite REBUILDS the resource from the confirmed change and never sees
-    // the stored bytes, so an attendee the read side found could only reach a
-    // written resource by being passed in here — and there is no participants
-    // value the update path can supply, because it supplies null.
-    const body = updateEventBody(
-      SIMPLE_REF,
-      {
-        summary: "Interview with Northwind",
-        startLocal: "2026-09-03T14:00:00",
-        endLocal: "2026-09-03T15:00:00",
-        tzid: DEFINED_TZID,
-        allDay: false,
-        location: null,
-        description: null,
-        participants: null,
-        sequence: 0,
-      },
-      null,
-    );
+describe("the update body cannot carry a person", () => {
+  // **These two cases drove `updateEventBody` until plan 17-07.** They asserted
+  // that its `participants: null` OVERRIDE worked -- an override that existed
+  // because the builder underneath it could perfectly well emit an `ORGANIZER`
+  // and an `ATTENDEE`, so a rewrite that merely forgot to pass null would have
+  // compiled and shipped. D-02 deleted that writer, so the cases are pointed at
+  // the writer that replaced it rather than deleted with it, and what they assert
+  // got STRONGER: a patch has no participants field to override, because it never
+  // constructs a participant at all.
+  //
+  // The end-to-end pin is at the tool layer, in "no update path emits an
+  // ATTENDEE, whatever the change carries", which drives all three scopes through
+  // the real commit. These two are the unit-level floor under it.
+  const writeInput = (participants: BuildParticipants | null): BuildEventInput => ({
+    summary: "Interview with Northwind",
+    startLocal: "2026-02-10T16:00:00",
+    endLocal: "2026-02-10T17:00:00",
+    tzid: "UTC",
+    allDay: false,
+    location: null,
+    description: null,
+    participants,
+    sequence: 0,
+  });
+
+  it("emits no ORGANIZER and no ATTENDEE, whatever the resource held", () => {
+    // The laundering direction, at the layer where the bytes are made. An
+    // attendee the read side found could only reach a written resource by being
+    // passed in here.
+    const body = patchedBody(REVISED_ICS, writeInput(null));
 
     expect(body).not.toContain("ORGANIZER");
     expect(body).not.toContain("ATTENDEE");
+    // And the write happened, so neither assertion is about a body that was
+    // never built.
+    expect(parsedProperty(body, "summary")).toBe("Interview with Northwind");
   });
 
-  it("emits no ORGANIZER even when the caller hands one in", async () => {
+  it("emits no ORGANIZER even when the caller hands one in", () => {
     // The other direction, and the one the type system cannot refuse: the field
-    // EXISTS on the builder's input, so a rewrite that merely forgot to pass
-    // null would compile. `updateEventBody` overrides it, so there is no value
-    // a caller can put here that reaches the wire — which is what keeps the
-    // server-assigned organiser iCloud writes onto a scheduling resource (probe
-    // P-1 (d)) safe from a rebuild that would replace it with a plain address.
-    const body = updateEventBody(
-      SIMPLE_REF,
-      {
-        summary: "Interview with Northwind",
-        startLocal: "2026-09-03T14:00:00",
-        endLocal: "2026-09-03T15:00:00",
-        tzid: DEFINED_TZID,
-        allDay: false,
-        location: null,
-        description: null,
-        participants: {
-          organizer: "user@example.invalid",
-          attendees: [{ email: "dev.whitaker@example.invalid", name: "Dev" }],
-        },
-        sequence: 0,
-      },
-      null,
+    // EXISTS on the builder's input type, so a caller can always supply one. The
+    // patch does not read it -- which is what keeps the server-assigned organiser
+    // iCloud writes onto a scheduling resource (probe P-1 (d)) safe from being
+    // replaced with a plain address.
+    const body = patchedBody(
+      REVISED_ICS,
+      writeInput({
+        organizer: "user@example.invalid",
+        attendees: [{ email: "dev.whitaker@example.invalid", name: "Dev" }],
+      }),
     );
 
     expect(body).not.toContain("ORGANIZER");
     expect(body).not.toContain("ATTENDEE");
     expect(body).not.toContain("dev.whitaker@example.invalid");
+    expect(body).not.toContain("user@example.invalid");
   });
 });
 
@@ -3902,16 +3906,22 @@ describe("the etag read", () => {
     expect("etag" in detail).toBe(false);
   });
 
-  it("reports a rewritable resource as carrying no blocker at all", async () => {
+  it("reports a writable resource as carrying no blocker at all", async () => {
+    // **This asserted `unsupportedTarget` until plan 17-07 and now asserts the
+    // one blocker field that is left.** The rewrite blocker went with the rewrite
+    // (D-02) -- see the retirement note above `deleteBlockerOf` -- so the claim
+    // narrowed rather than the case being deleted: a plain one-off event is
+    // writable AND removable, and the field that says the second is the only one
+    // there is.
     restub({ objects: SIMPLE_OBJECTS });
 
     const read = await getEventWithEtag(env, principal, createDavFetch(owner), SIMPLE_REF);
 
-    expect(read.unsupportedTarget).toBeNull();
+    expect(read.unsupportedDeleteTarget).toBeNull();
   });
 });
 
-describe("what the etag read refuses to let a rewrite touch", () => {
+describe("what the etag read refuses to let a write touch", () => {
   /**
    * Read one hand-built resource, served under a UID-named href.
    *
@@ -3934,12 +3944,21 @@ describe("what the etag read refuses to let a rewrite touch", () => {
     });
   }
 
+  /**
+   * The one bytes-level verdict this read still produces.
+   *
+   * It read `unsupportedTarget` until plan 17-07, when the REWRITE blocker was
+   * retired along with the rewrite (D-02). `deleteBlockerOf` is what is left, and
+   * `recurring` is its only answer -- so a case below asserting something else
+   * was asserting a verdict nothing produces and is rewritten accordingly rather
+   * than left agreeing with itself.
+   */
   async function readBody(
     uid: string,
     body: string,
     recurrenceId: string | null = null,
   ): Promise<string | null> {
-    return (await readWith(uid, body, recurrenceId)).unsupportedTarget;
+    return (await readWith(uid, body, recurrenceId)).unsupportedDeleteTarget;
   }
 
   it("classifies a recurrence rule as recurring", async () => {
@@ -3991,10 +4010,14 @@ describe("what the etag read refuses to let a rewrite touch", () => {
     );
 
     expect(read.isScheduling).toBe(true);
-    expect(read.unsupportedTarget).toBeNull();
+    // The companion claim, narrowed in 17-07 from the rewrite blocker to the
+    // delete one: an invited one-off event is still removable. Asserting only the
+    // boolean above would pass against a build where the recognition itself had
+    // been deleted, which is the pair this case exists to keep apart.
+    expect(read.unsupportedDeleteTarget).toBeNull();
   });
 
-  it("routes a SEQUENCE:3 resource whose attendee ACCEPTED to the patch, not the rebuild", async () => {
+  it("reports a SEQUENCE:3 resource whose attendee ACCEPTED as scheduling, with its revision", async () => {
     // **This case was `STILL refuses a scheduling resource, which is what
     // protects the ORGANIZER`, pinned by 05-08 to fail loudly at the moment
     // somebody lifted the refusal. Plan 05-14 lifted it, and this is the
@@ -4027,11 +4050,14 @@ describe("what the etag read refuses to let a rewrite touch", () => {
     // bytes and asserts only the confirmed fields over them, so all three
     // hazards are answered rather than accepted.
     //
-    // What this case now pins is the ROUTING, which is the property that keeps
-    // those answers reachable: the resource is recognised as one iCloud sends
-    // mail for, and a build that stopped recognising it would send it to the
-    // rebuild and lose all three. The byte-level preservation is asserted
-    // directly in "an invited event is PATCHED rather than rebuilt" below.
+    // **Plan 17-07 retired the rebuild entirely (D-02), so this case no longer
+    // pins a ROUTING decision -- there is only one writer now and every resource
+    // reaches it.** What it pins instead is the two FACTS that writer and the
+    // response depend on: the resource is recognised as one iCloud sends mail for,
+    // which is what makes the outcome name the recipients, and the stored revision
+    // is read, which is what the patch advances FROM. The byte-level preservation
+    // is asserted directly in "an invited event is PATCHED rather than rebuilt"
+    // below.
     const uid = "invited-0031";
     const read = await readWith(
       uid,
@@ -4054,9 +4080,9 @@ describe("what the etag read refuses to let a rewrite touch", () => {
     );
 
     expect(read.isScheduling).toBe(true);
-    expect(read.unsupportedTarget).toBeNull();
-    // The stored revision, so whichever writer runs has a number to advance
-    // FROM rather than a zero to fall back to.
+    expect(read.unsupportedDeleteTarget).toBeNull();
+    // The stored revision, so the writer has a number to advance FROM rather than
+    // a zero to fall back to.
     expect(read.sequence).toBe(3);
   });
 
@@ -4068,12 +4094,12 @@ describe("what the etag read refuses to let a rewrite touch", () => {
     // lives on the ORGANIZER line and a rebuild would replace it with a plain
     // address regardless of who else is on the event.
     //
-    // **It is also the case that rules out keying the commit's routing on the
-    // change's own recipient list.** This resource has NOBODY whose address this
-    // server can report — the organiser is an opaque href, so `recipientsOf`
-    // yields an empty list — and yet it is exactly the resource a rebuild would
-    // destroy. A router that asked "does the change name anyone" would send it
-    // to the rebuild. This one asks the bytes.
+    // **It is also the case that rules out reading the RESPONSE's recipient
+    // reporting off the change's own list.** This resource has NOBODY whose
+    // address this server can report -- the organiser is an opaque href, so
+    // `recipientsOf` yields an empty list -- and yet it is exactly the resource a
+    // rebuild would have destroyed. The recognition asks the BYTES, which is what
+    // keeps that true of a resource nobody can be named on.
     const uid = "organised-0032";
     const read = await readWith(
       uid,
@@ -4094,15 +4120,25 @@ describe("what the etag read refuses to let a rewrite touch", () => {
     );
 
     expect(read.isScheduling).toBe(true);
-    expect(read.unsupportedTarget).toBeNull();
+    expect(read.unsupportedDeleteTarget).toBeNull();
     // Nobody this server could name, on the very resource the patch protects.
     expect(read.detail.attendees).toEqual([]);
   });
 
-  it("classifies a reminder this server cannot rebuild as unsupported", async () => {
-    // A VALARM is the ordinary case, not an exotic one: every event a person
-    // sets a reminder on carries one, and a rewrite that dropped it would take
-    // the reminder away without ever saying so.
+  it("classifies a reminder as NO blocker at all, which is the D-02 inversion", async () => {
+    // **This case asserted `unsupported-properties` until plan 17-07, and the
+    // assertion is INVERTED rather than deleted.** A VALARM is the ordinary case
+    // and not an exotic one -- every event somebody sets a reminder on carries
+    // one -- and while a rewrite was the writer, a resource holding one had to be
+    // REFUSED, because the rewrite would have taken the reminder away without
+    // saying so. D-02 made every update a patch, which leaves the reminder exactly
+    // where it found it, so the ordinary case for a VALARM is now that it is
+    // PRESERVED and the resource is perfectly writable.
+    //
+    // Inverting rather than deleting is what keeps the claim falsifiable: a build
+    // that reintroduced the verdict turns this red. What the preservation itself
+    // looks like on the wire is asserted at the tool layer, in "a plain event
+    // carrying a reminder is PATCHED, not refused (D-02)".
     const uid = "alarmed-0012";
     expect(
       await readBody(
@@ -4124,10 +4160,18 @@ describe("what the etag read refuses to let a rewrite touch", () => {
           "END:VCALENDAR",
         ),
       ),
-    ).toBe("unsupported-properties");
+    ).toBeNull();
   });
 
-  it("classifies a resource whose URL does not name its UID", async () => {
+  it("no longer refuses a resource whose URL does not name its UID", async () => {
+    // **Inverted in plan 17-07 for the same reason as the case above.** It
+    // asserted `unnamed-resource`, and that verdict existed because a REWRITE had
+    // to DERIVE the UID from the object URL and write it back -- so a URL naming
+    // something else meant writing the resource under a UID this server guessed,
+    // which is worse than refusing, because a UID is how every other client on the
+    // account recognises the same event. A patch keeps the resource's own `UID`
+    // property untouched and addresses the resource by its own URL, so there is
+    // nothing to derive and nothing to disagree with.
     const href = `${WORK_PATH}not-the-uid.ics`;
     restub({ objects: { [WORK_PATH]: { [href]: SIMPLE_ICS } } });
 
@@ -4137,13 +4181,26 @@ describe("what the etag read refuses to let a rewrite touch", () => {
       recurrenceId: null,
     });
 
-    expect(read.unsupportedTarget).toBe("unnamed-resource");
+    expect(read.unsupportedDeleteTarget).toBeNull();
+    // And the resource's own UID is untouched by the disagreement, which is the
+    // value the patch will carry back out.
+    expect(uidFromObjectUrl(`https://p42-caldav.icloud.com${href}`)).toBe(
+      "not-the-uid",
+    );
   });
 
-  it("accepts a UID whose href is PERCENT-ENCODED, which is the real shape", async () => {
+  it("decodes a UID whose href is PERCENT-ENCODED, which is the real shape", async () => {
     // Every UID iCloud mints carries an `@`, so the href that names it is
-    // percent-encoded. A derivation that did not decode would refuse every
-    // real event on the account while passing on the tidy fixture above.
+    // percent-encoded. A derivation that did not decode would refuse every real
+    // event on the account while passing on the tidy fixture above.
+    //
+    // **Driven at `uidFromObjectUrl` directly since plan 17-07, and the move is
+    // the point rather than a tidy-up.** It used to be asserted through
+    // `getEventWithEtag`'s rewrite blocker, and that blocker went with the rewrite
+    // (D-02) -- so the decode's ONLY remaining reader is the gated create's commit
+    // arm, which derives the UID it writes from the signed object URL. Leaving the
+    // case where it was would have deleted the decode's only cover along with a
+    // verdict that had nothing to do with creates.
     const uid = "d1e2f3a4@example.invalid";
     const href = `${WORK_PATH}${encodeURIComponent(uid)}.ics`;
     const body = ics(
@@ -4159,13 +4216,19 @@ describe("what the etag read refuses to let a rewrite touch", () => {
     );
     restub({ objects: { [WORK_PATH]: { [href]: body } } });
 
+    // The resource still reads, blocker-free.
     const read = await getEventWithEtag(env, principal, createDavFetch(owner), {
       calendarUrl: WORK_URL,
       objectUrl: `https://p42-caldav.icloud.com${href}`,
       recurrenceId: null,
     });
+    expect(read.unsupportedDeleteTarget).toBeNull();
 
-    expect(read.unsupportedTarget).toBeNull();
+    // And the href decodes back to the UID the resource carries, whole. Not
+    // `d1e2f3a4%40example.invalid`, which is what a derivation that skipped the
+    // decode would hand a create to write.
+    expect(uidFromObjectUrl(`https://p42-caldav.icloud.com${href}`)).toBe(uid);
+    expect(read.detail.summary).toBe("Interview");
   });
 });
 
@@ -4531,9 +4594,11 @@ describe("deleteEvent and its conditional etag header", () => {
 /**
  * The same plain event, already revised twice by whoever edited it before.
  *
- * No attendee and no organiser, so it is a resource a rewrite is ALLOWED to
- * touch — which is what makes the sequence assertions reachable at all. The
- * scheduling refusal is asserted separately and is unchanged.
+ * No attendee and no organiser. That used to matter -- it is what made these
+ * assertions reachable while a rewrite was the writer and a resource carrying
+ * people was refused outright -- and since D-02 it does not: every resource is
+ * patched. The fixture is kept plain anyway, so that what these cases measure is
+ * the REVISION and nothing else.
  */
 const REVISED_UID = "revised-0009";
 const REVISED_ICS = ics(
@@ -4580,7 +4645,21 @@ const UNREVISED_REF = {
   recurrenceId: null,
 };
 
-/** One rewrite's worth of build input, with the sequence the caller is testing. */
+/**
+ * The bytes one patch writes, with the non-null the caller would otherwise assert.
+ *
+ * `patchEventBody` answers null for a resource that is not a single
+ * non-repeating event, and every fixture below is one -- so a null here is a
+ * broken fixture rather than an outcome under test, and saying so once is better
+ * than six non-null assertions.
+ */
+function patchedBody(icsText: string, input: BuildEventInput): string {
+  const body = patchEventBody(icsText, input);
+  expect(body, "the fixture is not a single non-repeating event").not.toBeNull();
+  return String(body);
+}
+
+/** One update's worth of build input, with the sequence the caller is testing. */
 function rewriteInput(sequence: number) {
   return {
     summary: "Interview with Northwind",
@@ -4609,7 +4688,7 @@ function parsedProperty(icsText: string, name: string): unknown {
   });
 }
 
-describe("the revision a rewrite emits", () => {
+describe("the revision an update emits", () => {
   it("reports the sequence the FETCHED resource carried", async () => {
     restub({ objects: { [WORK_PATH]: { [REVISED_HREF]: REVISED_ICS } } });
 
@@ -4641,13 +4720,18 @@ describe("the revision a rewrite emits", () => {
       env, principal,
       createDavFetch(owner),
       REVISED_REF,
-      updateEventBody(REVISED_REF, rewriteInput(0), 3),
+      patchedBody(REVISED_ICS, rewriteInput(0)),
       '"etag-1"',
     );
 
     // PARSED off the captured body. A resource whose revision went from three
     // back to zero is discarded as stale by every receiving client, and nothing
     // anywhere reports a problem.
+    //
+    // **The number now comes off the STORED BYTES rather than a parameter**, and
+    // that is the D-02 change: the rewrite was handed the revision the preview
+    // had sealed, and the patch reads it off the component it is about to write.
+    // Same answer, one fewer hop, and nothing a caller can reach.
     expect(parsedProperty(sentUpdateBody(one), "sequence")).toBe(4);
   });
 
@@ -4660,7 +4744,7 @@ describe("the revision a rewrite emits", () => {
       env, principal,
       createDavFetch(owner),
       UNREVISED_REF,
-      updateEventBody(UNREVISED_REF, rewriteInput(0), null),
+      patchedBody(UNREVISED_ICS, rewriteInput(0)),
       '"etag-1"',
     );
 
@@ -4668,10 +4752,15 @@ describe("the revision a rewrite emits", () => {
   });
 
   it("IGNORES a sequence the caller put in the build input", async () => {
-    // The rewrite path takes its revision from the FETCHED resource and from
+    // The update path takes its revision from the FETCHED resource and from
     // nowhere else. A build input carrying a different one must not reach the
     // wire, or "read from the resource, never counted locally" would be true of
     // the arithmetic and false of the plumbing.
+    //
+    // **Stronger since D-02 than it was.** The rewrite OVERRODE `input.sequence`
+    // with a value it was handed, so this asserted that one override worked. The
+    // patch never reads the field at all -- it reads the component's own stored
+    // value -- so there is no override to forget.
     const one = restub({
       objects: { [WORK_PATH]: { [REVISED_HREF]: REVISED_ICS } },
     });
@@ -4680,7 +4769,7 @@ describe("the revision a rewrite emits", () => {
       env, principal,
       createDavFetch(owner),
       REVISED_REF,
-      updateEventBody(REVISED_REF, rewriteInput(99), 3),
+      patchedBody(REVISED_ICS, rewriteInput(99)),
       '"etag-1"',
     );
 
@@ -4696,7 +4785,7 @@ describe("the revision a rewrite emits", () => {
       env, principal,
       createDavFetch(owner),
       REVISED_REF,
-      updateEventBody(REVISED_REF, rewriteInput(0), 3),
+      patchedBody(REVISED_ICS, rewriteInput(0)),
       '"etag-1"',
     );
 
@@ -5074,19 +5163,19 @@ describe("what the etag read refuses to let a DELETE touch", () => {
     ).toBe("recurring");
   });
 
-  it("ADMITS an event carrying attendees, and so does the rewrite since 05-14", async () => {
-    // The two classifications used to DISAGREE here, and this case existed to
-    // pin the disagreement: a rewrite that dropped an `ATTENDEE` would make
+  it("ADMITS an event carrying attendees, and reports that it carries them", async () => {
+    // Two classifications DISAGREED here until plan 05-14, and this case existed
+    // to pin the disagreement: a rewrite that dropped an `ATTENDEE` would make
     // iCloud send that person a cancellation nobody asked for, while a delete
     // removing the whole resource is the operation the user actually requested.
     //
-    // They now agree, and the agreement is what plan 05-14 built. The rewrite
-    // stopped dropping attendees — it PATCHES such a resource instead of
-    // rebuilding it — so the reason for the divergence went away. What is
-    // asserted below is that BOTH paths admit it and that the resource is still
-    // recognised as one iCloud sends mail for, which is what selects the
-    // patching writer. A build where the recognition was deleted would satisfy
-    // both nulls and destroy the organiser on the next write.
+    // 05-14 removed the disagreement by making such a resource PATCHED, and
+    // plan 17-07 removed the second classification outright -- there is no rewrite
+    // blocker left to compare with (D-02). So what this case asserts now is the
+    // delete verdict and the FACT beside it: the resource is admitted, and it is
+    // still recognised as one iCloud sends mail for. A build where the recognition
+    // was deleted would satisfy the null and then report an update to an invited
+    // event as having told nobody.
     const uid = "invited-0021";
     const body = ics(
       ...ICS_HEAD,
@@ -5111,18 +5200,20 @@ describe("what the etag read refuses to let a DELETE touch", () => {
     });
 
     expect(read.unsupportedDeleteTarget).toBeNull();
-    expect(read.unsupportedTarget).toBeNull();
-    // The recognition that routes the rewrite to the patch. Without this line
-    // the two nulls above are indistinguishable from a build that forgot the
-    // resource carries people at all.
+    // The recognition the RESPONSE depends on. Without this line the null above
+    // is indistinguishable from a build that forgot the resource carries people
+    // at all.
     expect(read.isScheduling).toBe(true);
   });
 
-  it("ADMITS a reminder, a foreign UID and a zone it cannot anchor to", async () => {
-    // Three rewrite blockers in one case, all of them absent on the delete
-    // path. Each is a "the rebuild would silently drop this" argument, and a
-    // delete drops the resource entire — deliberately, and at the user's
-    // request.
+  it("ADMITS a reminder and a foreign UID, which no longer block anything", async () => {
+    // Two rewrite blockers in one case, and they are named here for what they
+    // WERE. Each was a "the rebuild would silently drop this" argument -- a
+    // reminder it could not re-emit, a UID it had to derive from a URL that names
+    // something else -- and neither ever applied to a delete, which drops the
+    // resource entire, deliberately and at the user's request. Plan 17-07 retired
+    // both verdicts on the update path as well (D-02), so what this asserts now is
+    // that the shape is admitted by the one blocker that is left.
     const uid = "alarmed-0022";
     const href = `${WORK_PATH}not-the-uid-0022.ics`;
     const body = ics(
@@ -5150,7 +5241,9 @@ describe("what the etag read refuses to let a DELETE touch", () => {
     });
 
     expect(read.unsupportedDeleteTarget).toBeNull();
-    expect(read.unsupportedTarget).toBe("unsupported-properties");
+    // And the reminder is genuinely there, so the null above is about a resource
+    // that actually carries the thing that used to be refused.
+    expect(read.body).toContain("BEGIN:VALARM");
   });
 
   it("reports NO delete blocker on the plain event, so the case above is not vacuous", async () => {
@@ -5159,7 +5252,6 @@ describe("what the etag read refuses to let a DELETE touch", () => {
     const read = await getEventWithEtag(env, principal, createDavFetch(owner), SIMPLE_REF);
 
     expect(read.unsupportedDeleteTarget).toBeNull();
-    expect(read.unsupportedTarget).toBeNull();
   });
 });
 

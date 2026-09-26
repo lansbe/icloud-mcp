@@ -70,7 +70,6 @@ import {
   uidFromObjectUrl,
   updateCalendarCollection,
   updateEvent,
-  updateEventBody,
   updateOccurrenceBody,
 } from "../../dav/calendar";
 import {
@@ -2239,9 +2238,13 @@ async function buildPreview(
       r: ref.recurrenceId,
       e: read.etag,
       // The revision the resource carried, sealed beside the ETag it was read
-      // with. The commit never sees the bytes, so this is the only way the
-      // rewrite can emit a revision PAST the stored one rather than back to
-      // zero — see `ConfirmPayload.s`.
+      // with, and — since D-02 — never read. It was how the rewrite emitted a
+      // revision PAST the stored one rather than back to zero; the patch that
+      // replaced the rewrite re-reads the resource and takes the revision off the
+      // component it is about to write. Still recorded, on the DELETE arm's
+      // precedent below: the fact is true of the resource either way, a null here
+      // would be this leg claiming the resource had no revision, and it costs one
+      // number already in hand. See `ConfirmPayload.s`, which carries the argument.
       s: read.sequence,
       h: await changeHashOf(scoped),
       x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,

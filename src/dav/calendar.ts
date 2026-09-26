@@ -2702,7 +2702,7 @@ export async function getEvent(
 }
 
 /**
- * Why this server would refuse to REWRITE a resource it can happily read.
+ * Why this server would refuse to WRITE a resource it can happily read.
  *
  * A closed vocabulary this server chooses from, on `matchPath`'s footing: it
  * describes a decision this server made about its own capability, admits no
@@ -2710,31 +2710,50 @@ export async function getEvent(
  * the TRUSTED half of a preview — the identifier of an unsupported zone, which
  * a stranger DID write, is deliberately not reported beside it (03-09).
  *
- * **The reason there is a list at all is that a commit deliberately does not
- * re-read the resource.** It has exactly one outbound request, the write, so
- * the body it sends is BUILT from the confirmed change rather than patched into
- * the bytes that are there. Anything on the resource that this server's own
- * builder cannot reproduce would therefore be silently deleted by a commit —
- * and a preview whose whole promise is "exactly what would change" must not
- * omit "and your reminder disappears".
+ * **Most of this list existed because a commit REBUILT the resource, and that is
+ * no longer how anything is written (D-02).** A commit used to send a body BUILT
+ * from the confirmed change, so anything on the resource its builder could not
+ * reproduce would have been deleted by omission — and a preview whose whole
+ * promise is "exactly what would change" must not omit "and your reminder
+ * disappears". Every update patches now: the stored bytes with the confirmed
+ * fields over them. There is nothing for a patch to drop, so most of these
+ * verdicts have nothing left to protect.
  *
- * So this is a floor that later plans raise rather than a permanent limit. Each
- * member names a capability that arrives with a plan:
+ * **Members with no producer are KEPT rather than removed, and the count is not
+ * a claim about reachability.** `scheduling` has had no producer since 05-14 and
+ * stayed; the two that joined it in 17-07 stay on the same footing. This is a
+ * PUBLISHED vocabulary — it reaches the model through
+ * `EventPreview.unsupportedTarget` — and narrowing a vocabulary between releases
+ * is one a model relearns, while a member nothing produces costs a reader one
+ * sentence below. What each member's sentence must say is whether anything
+ * produces it, because a docstring that reads as current is worse than none:
  *
- *   - `recurring` — 05-10, 05-11 and 05-12 own the three write scopes. Until
- *     then a rewrite of a series would flatten it to one event, which is the
- *     exact "rewritten by omission" failure the phase's assumption-delta names.
- *   - `scheduling` — CALW-06 owns attendees. Rewriting a resource that carries
- *     them without carrying them back is not merely lossy: dropping an
- *     `ATTENDEE` makes iCloud send a CANCELLATION to that person.
- *   - `unsupported-properties` — a reminder, a category, a status, an `X-`
- *     property. Ordinary rather than exotic; every event a person set a
- *     reminder on carries a `VALARM`.
- *   - `unnamed-resource` — the resource's own UID is not what its URL names, so
- *     the commit cannot derive the UID to write back. See `uidFromObjectUrl`.
- *   - `unsupported-timezone` — the zone the event is anchored to is one this
- *     server holds no `VTIMEZONE` for, so it could not re-anchor the rewritten
- *     resource to it. `VTIMEZONE_ALLOWLIST` is where that is widened.
+ *   - `recurring` — STILL PRODUCED, twice. `deleteBlockerOf` answers it for a
+ *     scopeless delete, which would remove every occurrence while the preview
+ *     described one; and `buildPreview`'s own blocker answers it for a
+ *     series-scoped UPDATE, because that moves the master's `DTSTART` and orphans
+ *     every override stored against the old slots. Plans 05-10 and 05-11 built
+ *     the two scopes that make "just this Tuesday" and "from here on" sayable;
+ *     the whole series remains unwritable and this is how that is said.
+ *   - `unsupported-timezone` — STILL PRODUCED, by `requestedZoneBlocker` at the
+ *     tool boundary, over the zone the CHANGE names rather than the one the
+ *     resource carried. A patch re-anchors `DTSTART` and `DTEND` to that zone, so
+ *     it is the one this server must hold a `VTIMEZONE` for.
+ *     `VTIMEZONE_ALLOWLIST` is where that is widened.
+ *   - `scheduling` — NO PRODUCER since plan 05-14. It refused any resource
+ *     carrying `ATTENDEE` or `ORGANIZER`, because a rebuild that dropped an
+ *     `ATTENDEE` makes iCloud send that person a CANCELLATION. Such a resource is
+ *     patched instead, and `EventWithEtag.isScheduling` is the FACT that replaced
+ *     the verdict.
+ *   - `unsupported-properties` — NO PRODUCER since plan 17-07. It refused a
+ *     reminder, a category, a status, an `X-` property — ordinary rather than
+ *     exotic, since every event somebody set a reminder on carries a `VALARM`. A
+ *     patch leaves all of it exactly where it found it, which is the guarantee
+ *     CALM-03 asks for and the reason the verdict has nothing to protect.
+ *   - `unnamed-resource` — NO PRODUCER since plan 17-07. It refused a resource
+ *     whose own UID is not what its URL names, because a rebuild had to DERIVE
+ *     the UID to write back. A patch keeps the resource's own `UID` property and
+ *     addresses the resource by its own URL, so there is nothing to derive.
  */
 export type UnsupportedTarget =
   | "recurring"
@@ -2753,12 +2772,16 @@ export type UnsupportedTarget =
  * publish it, and the two fence gates would then have to decide which half it
  * rides in for a value that should ride in neither.
  *
- * `unsupportedTarget` is the third field and it was not in the plan's sketch of
- * this type. It is here because the classification is a property of the RAW
- * RESOURCE — the property names on the `VEVENT`, its subcomponents, and whether
- * its URL names its UID — none of which survives into `EventDetail`. Computing
- * it anywhere else would mean reading the resource twice, which is the one
- * thing this function exists to avoid.
+ * **Every field beyond the detail and the ETag is here for one reason: it is a
+ * property of the RAW RESOURCE and nothing about it survives into
+ * `EventDetail`.** The component count, the recurrence properties, whether any
+ * component carries a person, whether one of them has no recurrence identifier,
+ * the stored revision — reading any of that anywhere else would mean reading the
+ * resource twice, which is the one thing this function exists to avoid.
+ *
+ * `unsupportedTarget` was one of those fields until plan 17-07. It carried the
+ * REWRITE's blocker, and it went when the rewrite did (D-02); the retirement note
+ * above `deleteBlockerOf` records where each of its answers lives now.
  */
 export interface EventWithEtag {
   detail: EventDetail;
@@ -2768,10 +2791,11 @@ export interface EventWithEtag {
    * The resource's own bytes, exactly as the server sent them.
    *
    * **Here because a PATCH cannot be built without them, and this read is the
-   * only place they exist.** A rebuild assembles its body from the confirmed
-   * change and needs nothing from the stored resource; an occurrence-scoped
-   * write clones the resource and changes one component, so it needs the whole
-   * thing. Carrying the bytes on this shape is what lets the commit leg use the
+   * only place they exist.** Every writer patches since D-02: it clones the
+   * resource and asserts the confirmed fields over one component, so it needs the
+   * whole thing. The rewrite that needed nothing from the stored resource is the
+   * one that was retired. Carrying the bytes on this shape is what lets the
+   * commit leg use the
    * SAME contained, ETag-bearing read the preview leg uses rather than growing
    * a second entry point that would need its own containment assertions.
    *
@@ -2800,8 +2824,6 @@ export interface EventWithEtag {
    * number and a later assertion check that number against the write.
    */
   counts: OccurrenceCounts;
-  /** Why a rewrite is refused, or null when the resource is rewritable. */
-  unsupportedTarget: UnsupportedTarget | null;
   /**
    * Whether the resource is a scheduling object resource — it carries people.
    *
@@ -2865,34 +2887,26 @@ export interface EventWithEtag {
   sequence: number | null;
 }
 
-/**
- * Every property `buildVEvent` emits, plus the two the server re-derives.
- *
- * `created` and `last-modified` are tolerated rather than reproduced: they are
- * the server's own bookkeeping about the resource and iCloud sets them on the
- * write. Everything else absent from this set is a value the user or the
- * organiser put there, so a rewrite that dropped it would be data loss.
- *
- * `sequence` is on the list and is CARRIED FORWARD by the rebuild rather than
- * reset — `updateEventBody` emits `nextSequence` of what the fetched resource
- * held. It was reset to zero until 05-09, which was inert only because a
- * resource carrying scheduling properties is refused two lines below; the fix
- * is here rather than deferred to whoever lifts that refusal, because a
- * revision that goes backwards is silent at every layer and a latent landmine
- * is a poor thing to hand forward.
- */
-const REWRITABLE_EVENT_PROPERTIES: ReadonlySet<string> = new Set([
-  "uid",
-  "dtstamp",
-  "sequence",
-  "summary",
-  "location",
-  "description",
-  "dtstart",
-  "dtend",
-  "created",
-  "last-modified",
-]);
+// A NOTE ON THE ALLOW-LIST THAT NO LONGER EXISTS.
+//
+// `REWRITABLE_EVENT_PROPERTIES` listed every property `buildVEvent` emitted plus
+// the two the server re-derived, and `structuralBlockerOf` refused any resource
+// carrying anything outside it. That was the only way to make a REBUILD safe: a
+// rebuild assembles the resource from the fields this server models, so anything
+// it did not list it dropped, and a preview promising "exactly what would change"
+// could not stay silent about a reminder disappearing.
+//
+// Plan 17-07 made every update a PATCH (D-02), and a patch reproduces nothing —
+// it keeps the stored bytes and asserts the confirmed fields over them. So the
+// list had exactly one reader and that reader's question stopped being askable.
+//
+// **Widening it to admit a `VALARM` was considered and REJECTED**, which is the
+// decision worth recording rather than the deletion. It would have fixed alarms
+// and nothing else: the next unmodelled property would have arrived as the same
+// silent refusal, and the one after that as silent data loss the day somebody
+// added a field to the builder without adding it here. An allow-list is a
+// guarantee somebody has to keep remembering; the patch is a guarantee about the
+// writer. CALM-03 asks for the second kind.
 
 /** The properties that make a resource a series rather than an event. */
 const RECURRENCE_PROPERTIES: ReadonlySet<string> = new Set([
@@ -2911,30 +2925,31 @@ const SCHEDULING_PROPERTIES: ReadonlySet<string> = new Set([
 /**
  * The UID a resource's own URL names, or null when the URL does not name one.
  *
- * **The commit leg has one outbound request and it is the write, so it never
- * sees the resource's bytes.** The UID it must write back therefore has to come
- * from the only thing it holds: the object URL inside the signed confirmation.
- * CalDAV's convention — and Apple's practice — is that an object resource is
- * named for its UID with a `.ics` suffix, and `createEvent` in this very module
- * follows it when it mints a filename.
+ * **Used by ONE caller now, and it is a CREATE (D-02).** The gated create's commit
+ * arm holds a signed object URL and must write the resource its own preview named,
+ * so it reads the UID out of that URL rather than minting a fresh one — which is
+ * what makes "the resource that was previewed is the resource that is created"
+ * true rather than merely likely. CalDAV's convention, and Apple's practice, is
+ * that an object resource is named for its UID with a `.ics` suffix, and
+ * `createEvent` in this very module follows it when it mints a filename.
  *
- * A convention is not a guarantee, which is why this is DERIVE-AND-VERIFY
- * rather than derive: the preview compares this against the UID the resource
- * actually carries and refuses to mint a confirmation when the two disagree.
- * Writing a resource under a UID this server guessed would be worse than
- * refusing, because a UID is how every other client on the account recognises
- * the same event.
+ * **It used to be DERIVE-AND-VERIFY, and the verify half went with the rewrite.**
+ * An UPDATE that rebuilt the resource had to derive the UID from the object URL
+ * and write it back, so a convention not being a guarantee mattered: the preview
+ * compared this against the UID the resource actually carried and answered
+ * `unnamed-resource` when the two disagreed, because writing a resource under a
+ * UID this server GUESSED would be worse than refusing — a UID is how every other
+ * client on the account recognises the same event. Every update patches now. It
+ * keeps the resource's own `UID` property untouched and addresses the resource by
+ * its own URL, so there is nothing derived and nothing to disagree with. See the
+ * retirement note further down, which records that verdict's departure.
+ *
+ * A create has no such exposure: the URL and the UID come from the SAME
+ * `planCreateTarget` call, sealed together into one confirmation.
  *
  * The decode is what makes it work on a real account rather than only on a tidy
  * fixture: every UID iCloud mints carries an `@`, so the href naming it is
  * percent-encoded.
- *
- * **Exported for the commit leg of a gated CREATE, and for nothing else.** That
- * leg holds a signed object URL and must write the resource the preview named,
- * so it needs the same derivation this module already performs twice. Reading
- * the UID out of the signed URL rather than re-minting one is what makes "the
- * resource that was previewed is the resource that is created" true rather than
- * merely likely.
  */
 export function uidFromObjectUrl(objectUrl: string): string | null {
   let path: string;
@@ -2956,95 +2971,48 @@ export function uidFromObjectUrl(objectUrl: string): string | null {
   }
 }
 
-/**
- * What about the RESOURCE'S OWN BYTES would stop a rewrite, or null.
- *
- * Read inside the parse scope, because it walks the component tree. The order
- * is recurrence, then scheduling, then everything else — a series carrying
- * attendees is reported as a series, which is the larger of the two facts and
- * the one whose plan lands first.
- *
- * **Three passes rather than one, and that is a FIX rather than a style
- * choice** (`.planning/WINDOWS.md` entry 57). A single pass reports the first
- * matching property in DOCUMENT order, so a `VEVENT` whose `ATTENDEE` happens
- * to be written above its `RRULE` came back `scheduling` while the docstring
- * above promised `recurring`. An invited recurring series is exactly that
- * shape, and document order is the organiser's client's choice rather than a
- * fact about the resource — so the classification depended on which app created
- * the event. `deleteBlockerOf` below already checked every property before
- * classifying, for the same reason; this now matches it.
- *
- * ## `scheduling` is no longer one of the verdicts, and the narrowing is the
- * whole subject of plan 05-14
- *
- * It was, from 05-06 until 05-14, and it was RIGHT for as long as a scopeless
- * update had only one way to write a resource. 05-RESEARCH § F-1 recorded it as
- * measured necessary — *"Do not relax that refusal"* — on three hazards a
- * rebuild causes and none of which has gone away: the opaque principal-href
- * `ORGANIZER` iCloud substitutes (probe P-1 (d)) re-emitted as a plain
- * `mailto:`, every `SCHEDULE-STATUS` dropped, and every `PARTSTAT` reset from
- * `ACCEPTED` to `NEEDS-ACTION` — which erases a reply rather than merely failing
- * to carry it.
- *
- * What changed is not the argument but the ALTERNATIVE. 05-10 built a commit
- * that reads the resource and PATCHES it, and `applyEventChange` is that
- * discipline applied to a one-off event: the bytes are the stored resource's own
- * and only the confirmed fields are asserted over them. So a resource carrying
- * `ATTENDEE` or `ORGANIZER` is not refused here — it is written by a different
- * writer, and `EventWithEtag.isScheduling` is the fact the commit routes on.
- *
- * **The three verdicts BELOW this line are skipped for such a resource, and that
- * is deliberate rather than a shortcut.** Each of them exists because a rebuild
- * cannot reproduce something, and a patch reproduces nothing — it keeps the
- * bytes. `unsupported-properties` is a `VALARM` or an `X-` property the patch
- * leaves where it found it; `unnamed-resource` is a UID the rebuild must derive
- * from the object URL and write back, which the patch never derives at all. It
- * is the same argument the occurrence-scoped patch path has always made.
- *
- * `recurring` is checked FIRST and still fires for an invited series, so a
- * scopeless rewrite of one is refused exactly as it was. `unsupported-timezone`
- * is not this function's verdict at all — `readEvent` applies `timezoneBlockerOf`
- * as the fallback, and it still applies to a scheduling resource, because the
- * patch re-anchors `DTSTART` and `DTEND` to the zone the change names.
- */
-function structuralBlockerOf(
-  resource: ParsedCalendarResource,
-  objectUrl: string,
-): UnsupportedTarget | null {
-  // A master plus its overrides is more than one component, and it is a series
-  // whether or not this particular component carries the rule.
-  if (resource.components.length !== 1) return "recurring";
-
-  const names: string[] = [];
-  for (const component of resource.components) {
-    for (const property of component.getAllProperties()) {
-      names.push(property.name);
-    }
-  }
-
-  if (names.some((name) => RECURRENCE_PROPERTIES.has(name))) return "recurring";
-  // Written by PATCH rather than by rebuild, so none of the three rebuild
-  // verdicts below describes it. See the docstring, which carries the argument
-  // and the three hazards the patch is what answers.
-  if (names.some((name) => SCHEDULING_PROPERTIES.has(name))) return null;
-  if (names.some((name) => !REWRITABLE_EVENT_PROPERTIES.has(name))) {
-    return "unsupported-properties";
-  }
-
-  for (const component of resource.components) {
-    // A `VALARM` is the ordinary case here, not an exotic one.
-    if (component.getAllSubcomponents().length > 0) {
-      return "unsupported-properties";
-    }
-  }
-
-  if (resource.uid === null || uidFromObjectUrl(objectUrl) !== resource.uid) {
-    return "unnamed-resource";
-  }
-
-  return null;
-}
-
+// A NOTE ON THE FIFTH BLOCKER, WHICH NO LONGER EXISTS.
+//
+// `structuralBlockerOf` answered "what about these bytes would stop a REWRITE",
+// and it was the oldest of the five: it shipped with the first write path in
+// 05-06 and outlived the other four. Plan 17-07 retired it, and it is the third
+// time this file has made the same move, so read it beside the two notes below
+// rather than as something new. Every one of its verdicts is accounted for:
+//
+//   - `recurring` — still the right answer and no longer a verdict. It is
+//     published as the FACT `EventWithEtag.isRecurring`, which the tool boundary
+//     already read, and the judgement lives there: a recurring resource with no
+//     scope is asked for one, and a series-scoped update is refused by the one arm
+//     of `buildPreview`'s blocker that D-02's collapse deliberately kept. That is
+//     `isSchedulingResource`'s move and `hasSeriesMaster`'s, for the third time —
+//     the fact is a property of the bytes and the refusal is a property of the
+//     REQUEST, and only the tool boundary can see both.
+//   - `scheduling` — retired in 05-14, recorded below.
+//   - `unsupported-properties` and `unnamed-resource` — retired in 17-07 by D-02,
+//     and they go together because they had one reason between them. Each existed
+//     because a REBUILD could not reproduce something: a reminder or an `X-`
+//     property it would have dropped by omission, and a UID it had to DERIVE from
+//     the object URL and write back. Every update patches now, so there is nothing
+//     to drop and nothing to derive. This is the same argument the
+//     occurrence-scoped patch path has made since 05-10, arriving at the scopeless
+//     path five plans later.
+//   - `unsupported-timezone` — never this function's verdict. `readEvent` applied
+//     `timezoneBlockerOf` as the fallback, asking whether this server could
+//     RE-ANCHOR a rewritten resource to the zone the stored bytes named. A patch
+//     anchors `DTSTART` and `DTEND` to the zone the CHANGE names, and
+//     `requestedZoneBlocker` at the tool boundary refuses an unsupported or absent
+//     one before anything is minted — which is what the scoped patch path has
+//     relied on alone since 05-10. So the fallback went with the function.
+//
+// **What D-03 asked for, and it is prose rather than code.** This function's own
+// comment said *"A `VALARM` is the ordinary case here, not an exotic one"* — and
+// it was true, which is exactly why leaving it standing would have been the
+// defect. A reader finding that sentence would conclude that a reminder still
+// stops an update, and stop looking. A reminder is now the ordinary case for
+// something being PRESERVED. `UnsupportedTarget`'s own docstring above is where
+// each retired verdict says so per member; `deleteBlockerOf` below carries the
+// same rewrite for the delete path, where the asymmetry it used to describe has
+// gone because there is no longer a rebuild to be narrower than.
 /**
  * Whether the resource is a SCHEDULING object resource (RFC 6638).
  *
@@ -3056,13 +3024,20 @@ function structuralBlockerOf(
  * answer is no longer a refusal, so a field shaped like a refusal would be a
  * docstring promising something the code no longer does.
  *
- * What it decides now is WHICH WRITER, not whether to write. A resource carrying
- * `ATTENDEE` or `ORGANIZER` is patched — its own bytes with the confirmed fields
- * asserted over them — because iCloud rewrote it on the way in and a rebuild
- * would destroy what iCloud put there: the opaque principal-href `ORGANIZER`
- * (probe P-1 (d)), every `SCHEDULE-STATUS`, and every `PARTSTAT`. See
- * `applyEventChange`, which owns that argument, and `structuralBlockerOf` above,
- * which records why the refusal narrowed rather than disappeared.
+ * What it decides now is what the RESPONSE says, not whether to write and no
+ * longer which writer. It chose between two writers from 05-14 until 17-07, and
+ * D-02 removed the choice by removing the rewrite — every resource is patched, its
+ * own bytes with the confirmed fields asserted over them. The reason that is the
+ * right writer for a resource carrying `ATTENDEE` or `ORGANIZER` has not changed:
+ * iCloud rewrote it on the way in, and a rebuild would destroy what iCloud put
+ * there — the opaque principal-href `ORGANIZER` (probe P-1 (d)), every
+ * `SCHEDULE-STATUS`, and every `PARTSTAT`. See `applyEventChange`, which owns that
+ * argument, and the retirement note above, which records why the refusal narrowed
+ * to nothing rather than disappearing in one step.
+ *
+ * What reads it now is the OUTCOME: whether anybody was told about this change is
+ * a question about what the resource carries, so `scopelessBody` returns this
+ * fact beside the bytes and `applyCommit` reports it.
  *
  * Checked over EVERY property of EVERY component rather than stopping at the
  * first hit, so document order — the organiser's client's choice — cannot change
@@ -3080,7 +3055,12 @@ function isSchedulingResource(resource: ParsedCalendarResource): boolean {
   return false;
 }
 
-// A NOTE ON THE TWO BLOCKERS THAT NO LONGER EXIST.
+// A NOTE ON THE TWO EARLIER BLOCKERS THAT NO LONGER EXIST.
+//
+// Two of four, at the time this note was written. The fifth and last is retired
+// in the note further up, which is the one to read first — it is the one whose
+// departure left `deleteBlockerOf` below as the only bytes-level verdict in this
+// module.
 //
 // `occurrenceBlockerOf` was the second of them, retired by plan 05-14 for the
 // reason `isSchedulingResource` above records: its one surviving verdict,
@@ -3096,9 +3076,11 @@ function isSchedulingResource(resource: ParsedCalendarResource): boolean {
 // so for three plans it had a blocker of its own. Read the other two with
 // that in mind and every one of their verdicts falls away:
 //
-//   - `structuralBlockerOf`'s rebuild verdicts evaporate for exactly the reason
-//     a patch has none of them: a narrowing clones the resource and changes one
-//     thing, so there is nothing for it to drop, derive or re-anchor.
+//   - the REWRITE blocker's verdicts evaporate for exactly the reason a patch has
+//     none of them: a narrowing clones the resource and changes one thing, so
+//     there is nothing for it to drop, derive or re-anchor. (That blocker was
+//     `structuralBlockerOf`, and plan 17-07 retired it entirely for the same
+//     reason, one level up — see the note above.)
 //   - `deleteBlockerOf`'s one verdict, `recurring`, evaporates too — and that
 //     is the whole point. It exists because a scopeless removal takes every
 //     occurrence while the preview describes one, and a scoped delete is the
@@ -3121,35 +3103,34 @@ function isSchedulingResource(resource: ParsedCalendarResource): boolean {
 /**
  * What about the resource's own bytes would stop a DELETE, or null.
  *
- * **The delete's answer is deliberately NARROWER than `structuralBlockerOf`'s,
- * and the divergence is the decision this plan had to make rather than an
- * inconsistency to be tidied away.** Four of that function's five verdicts exist
- * for one reason: a commit REBUILDS the resource from the confirmed change and
- * never sees its current bytes, so anything the builder cannot reproduce would
- * be silently dropped by an update. Read them back with that in mind and every
- * one of them evaporates here:
+ * **`recurring` is its ONE verdict, and the asymmetry this docstring used to
+ * describe has gone rather than been resolved.** Until plan 17-07 the delete's
+ * answer was deliberately NARROWER than the rewrite blocker's: four of that
+ * function's five verdicts existed because a commit REBUILT the resource from the
+ * confirmed change and never saw its current bytes, so anything its builder could
+ * not reproduce would be silently dropped by an UPDATE — while a delete drops the
+ * whole resource on purpose and therefore had nothing to lose by it. D-02 made
+ * every update a patch, so those four verdicts have no producer on either path
+ * now and the two answers are no longer narrower and wider; they are one verdict
+ * and one verdict. `UnsupportedTarget`'s own docstring records each retirement
+ * per member, and the note directly above records where they went.
  *
- *   - `scheduling` — a rewrite that dropped an `ATTENDEE` makes iCloud send
- *     that person a cancellation nobody asked for. A delete removes the whole
- *     resource at the user's explicit request; there is no dropped attendee,
- *     only a deletion the preview names the recipients of. Refusing here would
- *     additionally make CALW-08's "name everyone who will be told" unreachable,
- *     because an event with attendees is exactly this case.
- *   - `unsupported-properties` — a `VALARM` a rebuild would take away. A delete
- *     takes the event away, reminder included, which is what was asked for.
- *   - `unnamed-resource` — the UID a rebuild must write back. A delete writes
- *     no body and derives no UID; it addresses the resource by its own URL.
- *   - `unsupported-timezone` — the zone a rebuild must re-anchor to. Nothing is
- *     re-anchored.
+ * **One sentence in particular had to be rewritten rather than left standing
+ * (D-03).** It read *"`unsupported-properties` — a `VALARM` a rebuild would take
+ * away. A delete takes the event away, reminder included, which is what was asked
+ * for."* The second half is still true and the first half is not: no writer in
+ * this project takes a reminder away by omission any more, so a reader finding
+ * that sentence would conclude a reminder still stops an update somewhere. The
+ * ordinary case for a `VALARM` is now that it is PRESERVED.
  *
- * **`recurring` survives, and it survives for the opposite reason to the four
- * above.** A resource carrying a rule holds every occurrence of the series, so
- * a scopeless `DELETE` removes all of them — while the preview, which describes
- * the ONE occurrence the caller's identifier named, says a single meeting is
+ * **Why `recurring` survives here is unchanged, and it is not the four's
+ * reason.** A resource carrying a rule holds every occurrence of the series, so a
+ * scopeless `DELETE` removes all of them — while the preview, which describes the
+ * ONE occurrence the caller's identifier named, says a single meeting is
  * disappearing. That is not a lossy write; it is a preview that lies about what
  * it is about to do, on the one operation in this phase that cannot be undone.
- * `EventPreview.scope` is null until 05-10, 05-11 and 05-12 introduce the write
- * scopes that let "just this Tuesday" be said at all, so until then the honest
+ * Plans 05-10, 05-11 and 05-12 introduced the scopes that let "just this Tuesday"
+ * be said at all; a scopeless delete still has no way to say it, so the honest
  * answer is a refusal that still shows what was asked about.
  *
  * Read inside the parse scope, because it walks the component tree. Both arms
@@ -3174,25 +3155,6 @@ function deleteBlockerOf(
   return null;
 }
 
-/**
- * Whether this server could re-anchor a rewritten resource to the same zone.
- *
- * Read off the DETAIL rather than off the bytes, because that is where the
- * parse has already resolved which zone each end is expressed in — including
- * the case where the resource NAMED a zone it never defined, which comes back
- * as the identifier the resource asked for and is by definition not one this
- * server holds a definition for.
- *
- * An all-day date is anchored to nothing by definition and needs no zone, so it
- * is not asked the question.
- */
-function timezoneBlockerOf(detail: EventDetail): UnsupportedTarget | null {
-  if (detail.allDay) return null;
-  if (!isSupportedTimezone(detail.startTzid)) return "unsupported-timezone";
-  if (!isSupportedTimezone(detail.endTzid)) return "unsupported-timezone";
-  return null;
-}
-
 /** One resource read once: the detail, its ETag if it carried one, and the blocker. */
 interface ReadEvent {
   detail: EventDetail;
@@ -3200,7 +3162,6 @@ interface ReadEvent {
   body: string;
   isRecurring: boolean;
   counts: OccurrenceCounts;
-  unsupportedTarget: UnsupportedTarget | null;
   unsupportedDeleteTarget: UnsupportedTarget | null;
   isScheduling: boolean;
   hasSeriesMaster: boolean;
@@ -3268,20 +3229,19 @@ async function readEvent(
     //
     // One scope again, for the reason `collectFrom` gives: the selection reads
     // times off the components, so the timezones must still be registered
-    // while it runs and gone the moment it returns (CR-03). The structural
+    // while it runs and gone the moment it returns (CR-03). The delete
     // classification rides inside the same scope because it walks the same
     // component tree, and doing it here is what keeps the resource read once.
     const read = withParsedResource(body, (resource) => {
       const isRecurring = isRecurringResource(resource);
       return {
         found: findOccurrence(resource, ref.recurrenceId),
-        structural: structuralBlockerOf(resource, ref.objectUrl),
-        // Computed in the SAME scope and over the same component tree, so the
-        // second classification costs no second parse and no second request —
-        // which is the property `getEventWithEtag` exists to hold.
+        // The ONE remaining bytes-level verdict. A second one sat beside it until
+        // plan 17-07 — see the retirement note above `deleteBlockerOf`, which
+        // records where each of its answers went.
         deletable: deleteBlockerOf(resource),
-        // Not a third classification but a FACT, on `hasSeriesMaster`'s footing
-        // below: it decides WHICH WRITER the commit uses rather than whether one
+        // Not a second classification but a FACT, on `hasSeriesMaster`'s footing
+        // below: it reports what the resource CARRIES rather than whether a write
         // may run at all. See `isSchedulingResource`.
         scheduling: isSchedulingResource(resource),
         // Not a fourth classification but a FACT, and the difference is the
@@ -3338,10 +3298,10 @@ async function readEvent(
       body,
       isRecurring: read.isRecurring,
       counts: read.counts,
-      unsupportedTarget: read.structural ?? timezoneBlockerOf(detail),
-      // No `timezoneBlockerOf` fallback, and its absence is the point: that
-      // check asks whether this server could RE-ANCHOR a rewritten resource,
-      // and a delete rewrites nothing.
+      // The only blocker field left. A second one sat beside it — the rewrite's,
+      // with a zone fallback under it — and both went in plan 17-07 with the
+      // rewrite itself; see the retirement note above `deleteBlockerOf`, which
+      // records where every one of their answers went.
       unsupportedDeleteTarget: read.deletable,
       isScheduling: read.scheduling,
       hasSeriesMaster: read.hasSeriesMaster,
@@ -3379,7 +3339,6 @@ export async function getEventWithEtag(
     body: read.body,
     isRecurring: read.isRecurring,
     counts: read.counts,
-    unsupportedTarget: read.unsupportedTarget,
     unsupportedDeleteTarget: read.unsupportedDeleteTarget,
     isScheduling: read.isScheduling,
     hasSeriesMaster: read.hasSeriesMaster,
@@ -3415,110 +3374,65 @@ export function assertEtag(
   }
 }
 
-/**
- * The `.ics` a commit writes back, built rather than patched.
- *
- * **Built, and that is a consequence of the request budget rather than a
- * preference.** A commit has exactly one outbound request — the write — so it
- * never sees the resource's current bytes and has nothing to patch INTO. The
- * body is therefore assembled from the confirmed change, which is why the
- * preview carries the whole end state rather than a delta, and why
- * `getEventWithEtag` refuses to confirm a resource carrying anything this
- * builder cannot reproduce.
- *
- * The UID comes from the object URL and is asserted rather than assumed: a
- * write under a UID this server guessed would be worse than a refusal, because
- * a UID is how every other client on the account recognises the same event.
- * That check ran once already at preview time; this is the second, at the last
- * moment before the bytes exist.
- *
- * `DavNotFoundError(false)` on a URL that names no UID, on `assertEtag`'s
- * reasoning: the vocabulary is closed, and re-resolving the account's home URLs
- * cannot make a URL name something it does not.
- *
- * Lives here rather than at the tool boundary because every byte of iCalendar
- * in this project goes through `./icalendar.ts`, and this module is the one
- * that calls it. It takes the BUILDER's own input type rather than a
- * confirmation's change, so the DAV tree stays ignorant of confirmations.
- *
- * ## The participants are forced to null, and that is a boundary rather than a
- * default
- *
- * A REWRITE may not carry a person, in either direction, and both directions
- * are real:
- *
- *   - **Outward.** An attendee list this server READ — off an event description,
- *     off the stored resource, off anywhere — must not survive into a resource
- *     it WROTE. That is PITFALLS #12 and Conventions §2 point 5: an attendee
- *     list the user supplies is a request, and one derived from content this
- *     server read is the autonomous-schedule shape the rule forbids. The
- *     override below makes it unspeakable rather than merely unwritten: there
- *     is no value a caller can put in `input.participants` that reaches the
- *     bytes.
- *   - **Inward.** iCloud REWRITES a scheduling resource on the way in (probe
- *     P-1 (d)): it replaces the organiser's `mailto:` with an opaque
- *     per-account principal href and stamps `SCHEDULE-STATUS` onto every
- *     attendee. A rebuild that emitted a plain `mailto:` organiser would
- *     therefore DESTROY the identity iCloud assigned. That is not reachable
- *     today, because `structuralBlockerOf` refuses any resource carrying
- *     `ATTENDEE` or `ORGANIZER` before a confirmation is ever minted, and
- *     05-RESEARCH.md § F-1 records that refusal as MEASURED necessary rather
- *     than merely cautious — *"Do not relax that refusal."* This override is
- *     the second layer under it, not a substitute for it.
- *
- * ## The revision is taken from the RESOURCE, and that override is the second
- * hazard F-1 named
- *
- * This function used to emit whatever `buildVEvent` minted, which is zero —
- * correct for a new event and wrong for a replacement of an old one. A
- * `SEQUENCE` that goes BACKWARDS makes every other calendar client treat the
- * update as stale and ignore it, and it raises nothing anywhere: not here, not
- * at iCloud, not in the receiving client. So the value is read off the FETCHED
- * resource — the same multi-get `getEventWithEtag` already made, so it costs no
- * extra request — carried to this leg inside the SIGNED confirmation, and
- * advanced by `nextSequence`.
- *
- * `carriedSequence` is a PARAMETER rather than a field on `input` for the same
- * reason `participants` is overridden below: there must be no value a caller
- * can put in the builder's own input that reaches the wire. Whatever
- * `input.sequence` holds is discarded here.
- */
-export function updateEventBody(
-  ref: EventRef,
-  input: BuildEventInput,
-  carriedSequence: number | null,
-): string {
-  const uid = uidFromObjectUrl(ref.objectUrl);
-  if (uid === null) throw new DavNotFoundError(false);
-
-  // Both overridden rather than trusted. See the docstring: a rewrite may not
-  // carry a person, and it may not carry a revision the caller chose — so
-  // neither field is the caller's to set on this path.
-  const vevent = buildVEvent({
-    ...input,
-    participants: null,
-    sequence: nextSequence(carriedSequence),
-  });
-  // `buildVEvent` mints a fresh UID, which is what makes a CREATE
-  // non-idempotent and is exactly wrong for a replacement. Updated rather than
-  // added, so there is one `UID` property and it is the resource's own.
-  vevent.updatePropertyWithValue("uid", uid);
-
-  return serializeCalendarResource(vevent, input.allDay ? null : input.tzid);
-}
+// A NOTE ON THE WRITER THAT NO LONGER EXISTS.
+//
+// `updateEventBody` was the first write path this project shipped (05-06) and it
+// assembled the `.ics` a commit sent from the confirmed change: a fresh `VEVENT`
+// from `buildVEvent`, the UID derived from the signed object URL and asserted
+// against the resource's own, everything else the change did not mention simply
+// absent. Plan 17-07 deleted it, because D-02 made every update a PATCH and it
+// had exactly one production caller -- the branch that chose it.
+//
+// **Its two overrides were the reason to be careful, and both got STRONGER
+// rather than leaving with it.** Each was an override precisely because this
+// builder COULD have carried the wrong thing:
+//
+//   - `participants: null`, unconditionally, so an attendee list this server READ
+//     could not survive into a resource it WROTE (PITFALLS #12, Conventions §2
+//     point 5) and so a rebuild could not replace the opaque per-account
+//     principal-href `ORGANIZER` iCloud assigns with a plain `mailto:` (probe
+//     P-1 (d)). A patch never CONSTRUCTS a participant: `applyOverrideChange`
+//     asserts seven named properties over the component the resource already had
+//     and neither `ORGANIZER` nor `ATTENDEE` is among them. So the boundary is now
+//     a property of the writer rather than a value forced on a builder that could
+//     have emitted one. Pinned by "no update path emits an ATTENDEE, whatever the
+//     change carries" in `test/dav-tools.test.ts`, driven through all three
+//     scopes with three people in the confirmed change.
+//   - `sequence: nextSequence(carriedSequence)`, from the revision the PREVIEW
+//     observed and sealed, so no caller could choose one and no rewrite could
+//     emit a revision that went BACKWARDS -- which raises nothing anywhere and
+//     makes every other client treat the update as stale. A patch reads
+//     `nextSequence` off the patched component's OWN stored value, which is one
+//     fewer hop for the same guarantee: the number never leaves this server at
+//     all, sealed or otherwise. Pinned by "takes the revision off the stored
+//     component, so a caller cannot choose one" in the same file.
+//
+// So `ConfirmPayload.s` lost its only reader. It is still sealed, and its own
+// docstring records why -- on the precedent of the delete arm, which has sealed
+// it while never reading it since 05-11.
+//
+// `uidFromObjectUrl` did NOT lose its only reader and is still exported: the
+// gated CREATE's commit arm derives the UID it writes from the signed object URL,
+// for the same reason this function did. What went with this function is the
+// DERIVE-AND-VERIFY half -- the preview's comparison against the UID the resource
+// actually carried, and the `unnamed-resource` refusal when the two disagreed.
+// A patch keeps the resource's own `UID` property and addresses the resource by
+// its own URL, so there is nothing to derive and nothing to disagree with.
 
 /**
  * The `.ics` an OCCURRENCE-scoped commit writes back, PATCHED rather than built.
  *
- * ## Patched, and that is the difference this whole plan turns on
+ * ## Patched, and this was the first path to be
  *
- * `updateEventBody` above assembles a resource from the confirmed change and
- * therefore drops everything the change does not mention — which is correct for
- * a one-off event and catastrophic for a series, where "everything the change
- * does not mention" is the rule and every other occurrence's override. So this
- * one starts from the resource's own bytes, changes exactly one component, and
- * leaves the rest where they were. The master is read and never written, which
- * `test/dav-icalendar.test.ts` asserts by serialising it before and after.
+ * The rewrite the note above retires assembled a resource from the confirmed
+ * change and therefore dropped everything the change did not mention — which was
+ * merely lossy for a one-off event and catastrophic for a series, where
+ * "everything the change does not mention" is the rule and every other
+ * occurrence's override. So this one starts from the resource's own bytes,
+ * changes exactly one component, and leaves the rest where they were. The master
+ * is read and never written, which `test/dav-icalendar.test.ts` asserts by
+ * serialising it before and after. Plan 17-07 generalised the discipline: every
+ * update writes this way now, and there is no rewrite left to contrast with.
  *
  * ## Where the bytes come from, and why that is a SECOND request
  *
@@ -3600,16 +3514,20 @@ export function updateOccurrenceBody(
 }
 
 /**
- * The `.ics` a scopeless commit writes back for an INVITED event, PATCHED.
+ * The `.ics` a SCOPELESS commit writes back, PATCHED.
  *
- * ## The third writer, and why there had to be one
+ * ## It arrived as the third writer and is now one of two
  *
- * `updateEventBody` rebuilds and `updateOccurrenceBody` patches one date of a
- * series. Neither can write a one-off event that carries people: the rebuild
- * destroys what iCloud put on the resource, and the occurrence patch needs a
- * recurrence identifier a non-repeating event does not have. So the whole update
- * half of CALW-07 shipped REFUSED from 05-06 until this existed
- * (`.planning/WINDOWS.md` entry 61).
+ * It was built in 05-14 for the one case neither existing writer could take: a
+ * one-off event carrying people. The rewrite destroyed what iCloud put on such a
+ * resource, and `updateOccurrenceBody` needs a recurrence identifier a
+ * non-repeating event does not have — so the whole update half of CALW-07 shipped
+ * REFUSED from 05-06 until this existed (`.planning/WINDOWS.md` entry 61).
+ *
+ * **Plan 17-07 made it the writer for EVERY scopeless update, invited or not
+ * (D-02).** Nothing about it changed; what changed is that the rewrite it was
+ * built alongside no longer exists, so there is no longer a resource shape this
+ * function is chosen FOR. It is simply what a scopeless update does.
  *
  * What survives, byte for byte, is everything the change does not name — and on
  * this path that list is the point rather than a nicety. `applyEventChange`
@@ -4547,15 +4465,16 @@ export async function createEvent(
     participants: input.participants ?? null,
     // ZERO, and a literal rather than a parameter. RFC 5545 §3.8.7.4 defines
     // zero as a new event's first revision, and there is nothing to advance
-    // past: this resource does not exist yet. The rewrite path is the one that
-    // reads a stored value; see `updateEventBody`.
+    // past: this resource does not exist yet. An UPDATE reads a stored value
+    // instead; see `applyOverrideChange`, which reads it off the component it is
+    // about to patch.
     sequence: 0,
   });
   // `buildVEvent` mints a UID, which is what makes an UNGATED create
   // non-idempotent. A GATED one arrives carrying the UID its own preview
   // planned and put inside the signed confirmation, so the resource the user
-  // approved is the one that gets written. Updated rather than added, exactly
-  // as `updateEventBody` does it, so there is one `UID` property either way.
+  // approved is the one that gets written. Updated rather than added, so there is
+  // one `UID` property either way.
   if (input.uid !== undefined) {
     vevent.updatePropertyWithValue("uid", input.uid);
   }

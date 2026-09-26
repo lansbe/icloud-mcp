@@ -417,18 +417,33 @@ export interface DavObjectConfirmPayload extends ConfirmPayloadBase {
    * footing, one field up — and it is not something a caller was ever shown,
    * asked about, or could sensibly re-supply.
    *
-   * **Why it has to travel at all.** A commit has exactly one outbound request
-   * and it is the write, so it never sees the resource's bytes. The rewrite
-   * must nevertheless emit a revision PAST the stored one: a `SEQUENCE` that
-   * goes backwards makes every other calendar client treat the update as stale
-   * and ignore it, and it raises nothing anywhere — not in this server, not at
-   * iCloud, not in the receiving client. The preview's multi-get is the last
-   * moment the stored value exists in this server's hands, so it is sealed here
-   * and read back at the write. See `nextSequence` in `src/dav/icalendar.ts`.
+   * **Why it travelled, and why NOTHING READS IT NOW (D-02).** A commit used to
+   * have exactly one outbound request — the write — so it never saw the
+   * resource's bytes, and the REWRITE it sent still had to emit a revision PAST
+   * the stored one: a `SEQUENCE` that goes backwards makes every other calendar
+   * client treat the update as stale and ignore it, and it raises nothing
+   * anywhere — not in this server, not at iCloud, not in the receiving client.
+   * The preview's multi-get was the last moment the stored value existed in this
+   * server's hands, so it was sealed here and read back at the write.
    *
-   * Sealed rather than re-supplied for the obvious reason: a caller that could
-   * choose the revision could choose one BELOW the stored value, which is
-   * exactly the silent failure the field exists to prevent.
+   * Plan 17-07 made every update a PATCH, and a patch re-reads the resource
+   * before it writes. So the revision comes off the patched component's own
+   * stored value — `nextSequence` in `src/dav/icalendar.ts`, called from
+   * `applyOverrideChange` — and this field lost its only reader.
+   *
+   * **It is still SEALED, and that is a precedent rather than an oversight.** The
+   * DELETE arm has sealed it while never reading it since 05-11, with a comment
+   * at the write site saying exactly that: a confirmation whose shape changes per
+   * operation is a confirmation whose verification has per-operation cases, and
+   * the fact is true of the resource either way. Filling it costs one number that
+   * was already in hand.
+   *
+   * Sealed rather than re-supplied for the reason that has not changed: a caller
+   * that could choose the revision could choose one BELOW the stored value, which
+   * is exactly the silent failure this field was added to prevent. Nothing reads
+   * it, so nothing can be moved by it — and if a later plan needs the previewed
+   * revision again, it is here, bound, rather than something that has to be
+   * reintroduced into a signature.
    */
   s: number | null;
 }

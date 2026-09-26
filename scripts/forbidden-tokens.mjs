@@ -1679,8 +1679,6 @@ export const DAV_WRITE_MODULES = Object.freeze({
       getEventWithEtag: "guarded",
       assertEtag:
         "An assertion over a header value the caller already holds. Throws or returns; no request.",
-      updateEventBody:
-        "A body builder. Assembles the resource text a write will carry, and does not issue the write.",
       updateOccurrenceBody:
         "A body builder over already-fetched resource text. Returns the text or null; no request.",
       patchEventBody:
