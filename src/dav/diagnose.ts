@@ -236,6 +236,36 @@ export interface CollectionWriteStep {
   ok: boolean;
   /** The failure's category, from the fixed vocabulary. `null` when it did not fail. */
   category: string | null;
+  /**
+   * The property-name keys tsdav parsed out of a multistatus, or `null` for a
+   * step that reads no propstat.
+   *
+   * **Here because the ONE thing nobody had ever measured about iCloud's
+   * property-update answer is what its propstat keys are spelled as, and that
+   * gap shipped a defect.** Plan 17-04 built a reader in `src/dav/calendar.ts` to
+   * decide which properties a rename-and-recolour landed, and it decided by
+   * looking for keys in `DAVResponse.props`. Every test behind it drove a fixture
+   * built from RFC 4918 section 9.2's example shape, because no test in this
+   * repository had ever seen a real one -- 17-04's own summary says so in as many
+   * words. Measured live on 2026-09-25 against version
+   * `8c7f848f-d6e3-4e44-b1bb-088f1dcb2c72`: iCloud accepted the update and
+   * `calendar_update_calendar` reported `connection_failed` anyway, because
+   * `changed` came back empty and the empty case threw. The write had landed.
+   *
+   * **AND THE ANSWER IS THE EMPTY ARRAY.** Not differently-spelled keys: none at
+   * all. A refused update answers the same way, so through this library's parse a
+   * success and a refusal are the same bytes -- which is why plan 17-10 retires
+   * that reader outright rather than fixing its spellings, and verifies the
+   * rename by reading the collection BACK instead. `./calendar.ts` carries that
+   * change and the retirement note under it; this field is the evidence beneath
+   * both, and it is committed first because the measurement came first.
+   *
+   * So the keys are reported here rather than inferred anywhere: an answer a
+   * reader has to guess at is how the guess became a defect the first time.
+   * Reporting DAV property NAMES and nothing else -- no value is read, so no
+   * calendar title, colour or URL can ride out through this field.
+   */
+  propKeys: string[] | null;
 }
 
 /**
@@ -869,7 +899,7 @@ async function recordWriteStep(
   try {
     const status = await run();
     const ok = succeeded(status);
-    steps.push({ step, method, status, ok, category: null });
+    steps.push({ step, method, status, ok, category: null, propKeys: null });
     return ok;
   } catch (err) {
     // The TYPE is read; the value never is.
@@ -879,6 +909,7 @@ async function recordWriteStep(
       status: null,
       ok: false,
       category: davToErrorCategory(err).category,
+      propKeys: null,
     });
     return false;
   }
@@ -1039,9 +1070,12 @@ export async function runCollectionWriteProbe(
   // 3. Rename and recolour, in one property update. tsdav ships no PROPPATCH
   //    helper, so the request is assembled by hand through its raw request
   //    helper — which is why `davRequest` is named on the fan-out alternation.
-  await recordWriteStep(steps, "rename-and-recolour", "PROPPATCH", async () =>
-    firstStatusOf(
-      await davRequest({
+  // The propstat keys iCloud actually answers with, captured on the way past.
+  // See `CollectionWriteStep.propKeys`: this is the measurement whose absence
+  // shipped a defect, so it is recorded rather than re-guessed.
+  let renamePropKeys: string[] | null = null;
+  await recordWriteStep(steps, "rename-and-recolour", "PROPPATCH", async () => {
+    const responses = await davRequest({
         url,
         init: {
           method: "PROPPATCH",
@@ -1062,10 +1096,21 @@ export async function runCollectionWriteProbe(
             },
           },
         },
-        fetch: davFetch,
-      }),
-    ),
-  );
+      fetch: davFetch,
+    });
+    const keys = new Set<string>();
+    for (const response of responses) {
+      const props: unknown = response.props;
+      if (props === null || typeof props !== "object") continue;
+      for (const key of Object.keys(props as Record<string, unknown>)) {
+        keys.add(key);
+      }
+    }
+    renamePropKeys = [...keys].sort();
+    return firstStatusOf(responses);
+  });
+  const renameStep = steps[steps.length - 1];
+  if (renameStep !== undefined) renameStep.propKeys = renamePropKeys;
 
   // 4. Delete. Reached whether or not step 3 was accepted, because a collection
   //    that exists has to be removed either way.

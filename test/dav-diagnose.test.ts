@@ -1032,6 +1032,18 @@ interface WriteStep {
   status: number | null;
   ok: boolean;
   category: string | null;
+  /**
+   * The property-name keys the DAV library parsed out of a multistatus, or null
+   * for a step that reads no propstat.
+   *
+   * **The one thing nobody had measured about iCloud's answer to a property
+   * update, and the gap that shipped a defect.** Plan 17-04 decided which half of
+   * a rename-and-recolour had landed by looking for those keys; against the real
+   * account there are none, so `calendar_update_calendar` reported
+   * `connection_failed` on writes that succeeded. It is reported here rather than
+   * inferred anywhere, and the cases below pin both shapes.
+   */
+  propKeys: string[] | null;
 }
 
 interface WriteProbe {
@@ -1079,9 +1091,21 @@ function stepNamed(probe: WriteProbe, step: string): WriteStep | undefined {
   return probe.steps.find((one) => one.step === step);
 }
 
-/** A PROPPATCH answer: one `response`, every property accepted. */
+/** A PROPPATCH answer: one `response`, every property named and accepted. */
 function propertyUpdateBody(href: string): string {
   return `<response><href>${href}</href><propstat><status>HTTP/1.1 200 OK</status><prop><displayname/><ca:calendar-color xmlns:ca="http://apple.com/ns/ical/"/></prop></propstat></response>`;
+}
+
+/**
+ * The same answer with an EMPTY property region — iCloud's own measured shape.
+ *
+ * A propstat, a `200`, and no property named inside it. Measured live on
+ * 2026-09-25: the DAV library parses this to no keys at all, which is what
+ * `propKeys: []` reports and what made the retired reader in `src/dav/calendar.ts`
+ * find nothing on every successful write.
+ */
+function emptyPropertyUpdateBody(href: string): string {
+  return `<response><href>${href}</href><propstat><status>HTTP/1.1 200 OK</status><prop/></propstat></response>`;
 }
 
 /**
@@ -1096,6 +1120,8 @@ function writeProbeStub(
   options: {
     createStatus?: number;
     patchStatus?: number;
+    /** What the property update answers, when it answers a multistatus at all. */
+    patchBody?: (href: string) => string;
     deleteStatus?: number;
     lingers?: boolean;
     /** Extra rows on the calendar-home listing — the to-do collections. */
@@ -1126,7 +1152,7 @@ function writeProbeStub(
       if (method === "PROPPATCH") {
         const status = options.patchStatus ?? 207;
         return status === 207
-          ? multistatus(propertyUpdateBody(url))
+          ? multistatus((options.patchBody ?? propertyUpdateBody)(url))
           : new Response(null, { status });
       }
       if (method === "DELETE") {
@@ -1215,6 +1241,69 @@ describe("dav_diagnose, the collection write probe (SPIKE-04)", () => {
     expect(probe!.cleanupVerified).toBe(true);
     expect(probe!.url).toBe(probeUrl());
     expect(stub.overlapped).toBe(false);
+  });
+
+  it("reports the property-update keys, and reports them on THAT step only", async () => {
+    // **The measurement whose absence shipped a defect.** Nothing in this
+    // repository had ever asked what a property update's answer parses to, so
+    // `src/dav/calendar.ts` decided which half of a rename had landed by looking
+    // for keys nobody had checked were there. This step reports them.
+    //
+    // `null` on every other step is the other half of the claim: it distinguishes
+    // "this step read a propstat and it was empty" from "this step reads no
+    // propstat at all", and those two must not collapse into one another — an
+    // empty array on a step that never looked would read as a measurement.
+    const { stub } = writeProbeStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const probe = writeProbeOf(
+      await diagnoseHandler(createDavFetch(owner))({
+        probeCollectionWrite: true,
+      }),
+    )!;
+
+    // Sorted, so two runs agree. This body NAMES both properties, which is the
+    // shape every fixture in the repository used to assume iCloud sends.
+    expect(stepNamed(probe, "rename-and-recolour")!.propKeys).toEqual([
+      "calendarColor",
+      "displayname",
+    ]);
+    for (const step of ["resolve", "create", "delete", "verify"]) {
+      expect(
+        stepNamed(probe, step)!.propKeys,
+        `${step} reported property keys it never read`,
+      ).toBeNull();
+    }
+  });
+
+  it("reports NO keys for iCloud's own answer, which is the measured shape", async () => {
+    // **The shape measured live on 2026-09-25, and the whole reason this field
+    // exists.** A `207` whose propstat names no property parses to an empty
+    // region — so `changed` was always empty in the reader plan 17-04 shipped, and
+    // the "nothing landed" arm behind it threw on every successful write.
+    //
+    // A REFUSED update answers the same way, which is why no reader of this
+    // region can tell success from refusal and why the rename is now verified by
+    // reading the collection back instead. That argument is recorded on
+    // `observedOutcomes`; this case is the evidence under it.
+    const { stub } = writeProbeStub({ patchBody: emptyPropertyUpdateBody });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const probe = writeProbeOf(
+      await diagnoseHandler(createDavFetch(owner))({
+        probeCollectionWrite: true,
+      }),
+    )!;
+    const step = stepNamed(probe, "rename-and-recolour")!;
+
+    // EMPTY, and not null. The step looked and found nothing, which is a
+    // measurement — the distinction the case above pins from the other side.
+    expect(step.propKeys).toEqual([]);
+    // And the step still reports the envelope as accepted, which is exactly how a
+    // successful write came to be reported as a connection fault: the status says
+    // yes and the region says nothing.
+    expect(step.status).toBe(207);
+    expect(step.ok).toBe(true);
   });
 
   it("reports cleanup NOT verified and names the URL when the delete is refused", async () => {
