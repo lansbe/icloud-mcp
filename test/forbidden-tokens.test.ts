@@ -30,8 +30,12 @@ import {
   DAV_WRITE_MODULES,
   EXCLUDED,
   FORBIDDEN,
+  MUTATING_OPEN_COMMAND,
   MUTATING_OPEN_OWNER,
+  MUTATING_OPEN_SCOPE,
+  MUTATING_SESSION_IMPORT,
   MUTATING_SESSION_OWNER,
+  MUTATING_SESSION_SCOPE,
   OWNERSHIP_VIOLATION_IDS,
   PASSWORD_READER_IMPORT,
   PASSWORD_READER_OWNERS,
@@ -696,7 +700,7 @@ const NO_EXCLUSIONS = { excluded: new Set<string>() };
 // name as stale.
 // @ts-expect-error — Vite's `import.meta.glob` has no ambient declaration here; see above.
 const RAW_SOURCES: Record<string, string> = import.meta.glob(
-  ["../src/dav/*.ts", "../scripts/forbidden-tokens.mjs"],
+  ["../src/dav/*.ts", "../src/mail/service.ts", "../scripts/forbidden-tokens.mjs"],
   { query: "?raw", import: "default", eager: true },
 );
 
@@ -1036,6 +1040,103 @@ describe("the patterns have teeth", () => {
       const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
       expect(fresh.test(permitted), `rule ${rule.id} false-positived`).toBe(false);
     }
+  });
+
+  // Phase 20, D-07. The mutating orchestrator is a second session opener over
+  // the same gate. Its name does not begin with the read orchestrator's, so the
+  // rule as it shipped before plan 20-04 did not see a fan-out around it.
+  const MUTATING_FAN_OUTS = [
+    "await Promise.all(refs.map((ref) => withMutatingMailbox(principal, gate, ref.mailbox, ref.uidValidity, one)));",
+    "await Promise.allSettled(refs.map((ref) => withMutatingMailboxOver(sock, principal, gate, ref.mailbox, ref.uidValidity, one)));",
+  ];
+
+  /** `concurrent-session` exactly as it shipped before plan 20-04, typed out so
+   *  the widening has something to be measured against. */
+  const CONCURRENT_SESSION_BEFORE_20_04 =
+    /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?withMailSession/g;
+
+  it("catches a fan-out around either mutating orchestrator (D-07)", () => {
+    const rule = FORBIDDEN.find((r) => r.id === "concurrent-session")!;
+    for (const fanOut of MUTATING_FAN_OUTS) {
+      expect(
+        matchRule(rule, FORBIDDEN.indexOf(rule), "src/mail/triage.ts", fanOut).length,
+        `missed ${fanOut}`,
+      ).toBeGreaterThan(0);
+    }
+  });
+
+  it("the rule as it shipped before 20-04 misses both mutating fan-outs, so the widening has teeth", () => {
+    // Guards the guard. If the old text already saw these lines, the case
+    // above would pass with the widening reverted and would prove nothing.
+    for (const fanOut of MUTATING_FAN_OUTS) {
+      const old = new RegExp(
+        CONCURRENT_SESSION_BEFORE_20_04.source,
+        CONCURRENT_SESSION_BEFORE_20_04.flags,
+      );
+      expect(old.test(fanOut), `the old pattern already saw ${fanOut}`).toBe(false);
+    }
+    // And the typed-out text really was the rule: it fires on the rule's own
+    // standing sample, and the widened rule still does too.
+    const standing = violatingSamples["concurrent-session"]!;
+    expect(
+      new RegExp(
+        CONCURRENT_SESSION_BEFORE_20_04.source,
+        CONCURRENT_SESSION_BEFORE_20_04.flags,
+      ).test(standing),
+      "the typed-out old pattern misses the rule's own sample, so it is not the old rule",
+    ).toBe(true);
+    const rule = FORBIDDEN.find((r) => r.id === "concurrent-session")!;
+    expect(new RegExp(rule.pattern.source, rule.pattern.flags).test(standing)).toBe(true);
+  });
+
+  it("does not fire on a single awaited call to either mutating orchestrator", () => {
+    // The shape src/mail/triage.ts writes: one verb, one session.
+    for (const permitted of [
+      "const outcome = await withMutatingMailbox(principal, gate, ref.mailbox, ref.uidValidity, work);",
+      "return withMutatingMailboxOver(duplex, principal, gate, ref.mailbox, ref.uidValidity, work, options);",
+    ]) {
+      for (const rule of FORBIDDEN) {
+        const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
+        expect(fresh.test(permitted), `rule ${rule.id} false-positived on ${permitted}`).toBe(
+          false,
+        );
+      }
+    }
+  });
+
+  it("covers every session-opening function in the service module, read from the source", () => {
+    // Measured, not listed: a hand-written list would agree with the rule by
+    // construction and miss the next orchestrator somebody adds. Every ASYNC
+    // function whose name begins `with` is collected, because every session
+    // opener is async. The one synchronous `with*` function in the module is a
+    // pure transform over attachment rows and opens nothing, so it is not a
+    // fan-out hazard and is asserted to stay synchronous below.
+    const source = rawSourceOf("src/mail/service.ts");
+    const names = [...source.matchAll(/\basync\s+function\s+(with\w+)/g)].map((m) => m[1]!);
+    expect(names.length).toBeGreaterThan(0);
+    for (const expected of [
+      "withMailSessionCore",
+      "withMailSession",
+      "withMailSessionOver",
+      "withMutatingMailbox",
+      "withMutatingMailboxOver",
+    ]) {
+      expect(names, `${expected} was not read from the source`).toContain(expected);
+    }
+    const rule = FORBIDDEN.find((r) => r.id === "concurrent-session")!;
+    for (const name of names) {
+      const fanOut = `await Promise.all(refs.map((ref) => ${name}(principal, gate, ref)));`;
+      expect(
+        matchRule(rule, FORBIDDEN.indexOf(rule), "src/mcp/tools/mail.ts", fanOut).length,
+        `a fan-out around ${name} is not refused`,
+      ).toBeGreaterThan(0);
+    }
+    // The synchronous helper the collection above leaves out, pinned so a
+    // change that made it open a session would have to make it async first.
+    const syncWith = [...source.matchAll(/(?<!async\s+)\bfunction\s+(with\w+)/g)].map(
+      (m) => m[1]!,
+    );
+    expect(syncWith).toEqual(["withAttachmentIds"]);
   });
 
   it("does not fire on a fetch item list that uses the peeking form", () => {
@@ -4142,6 +4243,258 @@ describe("one function composes the human-facing line (CONF-04)", () => {
   });
 });
 
+describe("the mutating open is a count constraint too (Phase 20, D-06)", () => {
+  // The command is spelled out here on purpose. The count is collected from
+  // src/ only, and this file is skipped by path for every rule, so nothing here
+  // can trip it. In src/ it is described by role.
+  const owner = { file: MUTATING_OPEN_OWNER, line: 746, column: 9 };
+  // The realistic second site: the verbs module, which already holds a
+  // mutating session and is one line away from opening a mailbox itself.
+  const elsewhere = { file: "src/mail/triage.ts", line: 120, column: 7 };
+
+  /** A fresh copy per probe, so no state can carry between samples. */
+  const fires = (sample: string): boolean =>
+    new RegExp(MUTATING_OPEN_COMMAND.source, MUTATING_OPEN_COMMAND.flags).test(sample);
+
+  it("names the service module as the owner, and collects from the source tree only", () => {
+    expect(MUTATING_OPEN_OWNER).toBe("src/mail/service.ts");
+    expect(MUTATING_OPEN_SCOPE).toBe("src/");
+  });
+
+  it("passes when only the service module builds the mutating open, once", () => {
+    expect(checkMutatingOpenOwnership([owner])).toEqual([]);
+  });
+
+  it("reports a violation naming the second file when another module builds one", () => {
+    const violations = checkMutatingOpenOwnership([owner, elsewhere]);
+    expect(violations.map((v) => v.pattern)).toEqual(["mutating-open-duplicated"]);
+    expect(violations[0]!.file).toBe(elsewhere.file);
+    expect(violations[0]!.line).toBe(elsewhere.line);
+    expect(violations[0]!.column).toBe(elsewhere.column);
+  });
+
+  it("reports the SECOND site inside the owner file, not the first", () => {
+    // "One site" is about sites, not files. A second open written inside the
+    // service module itself is a second way to reach a mailbox opened for
+    // changing, exactly as one in another file is.
+    const second = { file: MUTATING_OPEN_OWNER, line: 1402, column: 11 };
+    const violations = checkMutatingOpenOwnership([owner, second]);
+    expect(violations.map((v) => v.pattern)).toEqual(["mutating-open-duplicated"]);
+    expect(violations[0]!.file).toBe(MUTATING_OPEN_OWNER);
+    expect(violations[0]!.line).toBe(second.line);
+    expect(violations[0]!.column).toBe(second.column);
+    // The reason the hook prints says an in-owner duplicate counts, so it does
+    // not read as a false alarm.
+    expect(violations[0]!.why).toContain(MUTATING_OPEN_OWNER);
+  });
+
+  it("reports a violation naming the owner when nothing builds it", () => {
+    // The quieter direction: a deleted mutating path fails no test on the way
+    // out, because the tests that covered it leave with it.
+    const violations = checkMutatingOpenOwnership([]);
+    expect(violations.map((v) => v.pattern)).toEqual(["mutating-open-missing"]);
+    expect(violations[0]!.file).toBe(MUTATING_OPEN_OWNER);
+    expect(violations[0]!.line).toBe(0);
+    expect(violations[0]!.column).toBe(0);
+  });
+
+  it("is wired into scan(): scripts/ alone reports it missing, the real tree reports neither", () => {
+    expect(scan("scripts").map((v) => v.pattern)).toContain("mutating-open-missing");
+    const patterns = scan().map((v) => v.pattern);
+    expect(patterns).not.toContain("mutating-open-missing");
+    expect(patterns).not.toContain("mutating-open-duplicated");
+  });
+
+  it("finds exactly one site in the shipped service module", () => {
+    // The real file, read off disk, with the collector's own construction: a
+    // fresh global copy of the exported pattern.
+    const source = rawSourceOf(MUTATING_OPEN_OWNER);
+    expect([...source.matchAll(new RegExp(MUTATING_OPEN_COMMAND, "g"))]).toHaveLength(1);
+  });
+
+  it("matches the two shapes a command line is built in here", () => {
+    for (const sample of [
+      // The shipped site: the command at the head of a template literal, with
+      // the tag supplied by the sender.
+      "        `SELECT ${quoted}`,",
+      // After an interpolated tag.
+      "const line = `${tag} SELECT ${quoted}`;",
+      // At the head of a plain quoted string.
+      'const line = "SELECT INBOX";',
+      "const line = 'SELECT \"Archive\"';",
+    ]) {
+      expect(fires(sample), `missed ${sample}`).toBe(true);
+    }
+  });
+
+  it("does not fire on the server's completions or on prose that names the command bare", () => {
+    for (const sample of [
+      // The tagged completion carrying the read-write code: the reply the open
+      // step reads, not a command it builds.
+      'const done = "a4 OK [READ-WRITE] SELECT completed";',
+      // The read-only open's completion.
+      'const done = "a4 OK [READ-ONLY] EXAMINE completed";',
+      // Prose naming the command with no argument after it.
+      " * The mutating open (SELECT) is built in one place.",
+      "// SELECT is the mutating form; the read form is the other one.",
+      // A lowercase English word, which is why the pattern is case-sensitive.
+      'const label = "select a folder";',
+    ]) {
+      expect(fires(sample), `false-positived on ${sample}`).toBe(false);
+    }
+  });
+
+  it("does fire on prose that spells the command with a quoted argument", () => {
+    // The executable form of "describe it by role" in src/. A comment written
+    // like this would fail the very check it was explaining.
+    expect(fires(' * a `SELECT "INBOX"` here would open the mailbox for changing.')).toBe(true);
+  });
+
+  it("carries no global flag, and the collector stays safe across files", () => {
+    expect(MUTATING_OPEN_COMMAND.flags).toBe("");
+    expect(MUTATING_OPEN_COMMAND.global).toBe(false);
+    const fresh = () => new RegExp(MUTATING_OPEN_COMMAND, "g");
+    const two = ["`SELECT ${a}`", "`SELECT ${b}`"];
+    for (const contents of two) {
+      expect([...contents.matchAll(fresh())]).toHaveLength(1);
+    }
+    // Two in ONE file are two, which `search()` could not have seen.
+    expect([...two.join("\n").matchAll(fresh())]).toHaveLength(2);
+  });
+
+  it("gives the two ids distinct sort keys, straight after the confirm-line count's", () => {
+    const violations = [
+      ...checkMutatingOpenOwnership([owner, elsewhere]),
+      ...checkMutatingOpenOwnership([]),
+    ];
+    const duplicated = violations.find((v) => v.pattern === "mutating-open-duplicated")!;
+    const missing = violations.find((v) => v.pattern === "mutating-open-missing")!;
+    expect(duplicated.patternIndex).toBe(FORBIDDEN.length + 23);
+    expect(missing.patternIndex).toBe(FORBIDDEN.length + 24);
+  });
+});
+
+describe("the mutating session has one importer (Phase 20, D-05, D-06)", () => {
+  const owner = { file: MUTATING_SESSION_OWNER, line: 31, column: 1 };
+  // The realistic second importer: the tool layer, which holds the user's
+  // request and could skip the verbs.
+  const outsider = { file: "src/mcp/tools/mail.ts", line: 12, column: 1 };
+
+  /** A fresh copy per probe, so no state can carry between samples. */
+  const fires = (sample: string): boolean =>
+    new RegExp(MUTATING_SESSION_IMPORT.source, MUTATING_SESSION_IMPORT.flags).test(sample);
+
+  it("names the verbs module as the owner, and collects from the source tree only", () => {
+    expect(MUTATING_SESSION_OWNER).toBe("src/mail/triage.ts");
+    expect(MUTATING_SESSION_SCOPE).toBe("src/");
+  });
+
+  it("passes when only the verbs module imports the mutating orchestrator", () => {
+    expect(checkMutatingSessionImportOwnership([owner])).toEqual([]);
+  });
+
+  it("reports a second importer, naming its file", () => {
+    const violations = checkMutatingSessionImportOwnership([owner, outsider]);
+    expect(violations.map((v) => v.pattern)).toEqual([
+      "mutating-session-importer-outside-triage",
+    ]);
+    expect(violations[0]!.file).toBe(outsider.file);
+    expect(violations[0]!.line).toBe(outsider.line);
+  });
+
+  it("reports the owner as missing when nothing imports it", () => {
+    const violations = checkMutatingSessionImportOwnership([]);
+    expect(violations.map((v) => v.pattern)).toEqual(["mutating-session-importer-missing"]);
+    expect(violations[0]!.file).toBe(MUTATING_SESSION_OWNER);
+  });
+
+  it("is wired into scan(): scripts/ alone reports it missing, the real tree reports neither", () => {
+    expect(scan("scripts").map((v) => v.pattern)).toContain(
+      "mutating-session-importer-missing",
+    );
+    const patterns = scan().map((v) => v.pattern);
+    expect(patterns).not.toContain("mutating-session-importer-missing");
+    expect(patterns).not.toContain("mutating-session-importer-outside-triage");
+  });
+
+  it("matches the real import, and the other ways to write one", () => {
+    for (const sample of [
+      // The owner's import, byte for byte.
+      'import {\n  MAILBOX_NOT_WRITABLE,\n  withMutatingMailbox,\n  withMutatingMailboxOver,\n} from "./service";',
+      // One name, on one line.
+      'import { withMutatingMailbox } from "./service";',
+      'import { withMutatingMailboxOver } from "../mail/service";',
+      // Type-only.
+      'import type { withMutatingMailboxOver } from "./service";',
+      'import { type withMutatingMailbox } from "./service";',
+      // A renamed binding still spells the orchestrator's name in the braces.
+      'import { withMutatingMailbox as open } from "./service";',
+      // An explicit extension, single quotes.
+      "import { withMutatingMailbox } from './service.ts';",
+      'import { withMutatingMailbox } from "../../mail/service.js";',
+    ]) {
+      expect(fires(sample), `missed ${JSON.stringify(sample)}`).toBe(true);
+    }
+  });
+
+  it("does not match another name, another module, or the bare word", () => {
+    for (const sample of [
+      // The type-only import of the session type, which the owner also carries.
+      'import type {\n  MailSessionOptions,\n  MutatingMailSession,\n  SessionGate,\n} from "./service";',
+      // The read orchestrator.
+      'import { withMailSession } from "./service";',
+      // A longer identifier that merely begins with the name.
+      'import { withMutatingMailboxes } from "./service";',
+      // The orchestrator's name from another module.
+      'import { withMutatingMailbox } from "./services";',
+      'import { withMutatingMailbox } from "./service-helpers";',
+      // A call and a definition.
+      "return withMutatingMailbox(principal, gate, ref.mailbox, ref.uidValidity, work);",
+      "export async function withMutatingMailbox<T>(",
+    ]) {
+      expect(fires(sample), `false-positived on ${JSON.stringify(sample)}`).toBe(false);
+    }
+  });
+
+  it("pins the known evasions as unseen, so nobody believes they are covered", () => {
+    // Each of these DOES reach the orchestrator, and the constant's docstring
+    // lists them. If the pattern later sees one, this goes red: move the row
+    // out and update the docstring.
+    for (const sample of [
+      // A namespace import, then a call through it.
+      'import * as service from "./service";',
+      // A dynamic import.
+      'const { withMutatingMailbox } = await import("./service");',
+      // A re-export through another module.
+      'export { withMutatingMailbox } from "./service";',
+      // A path alias that does not end in /service.
+      'import { withMutatingMailbox } from "#mail";',
+    ]) {
+      expect(fires(sample), `now sees ${JSON.stringify(sample)}`).toBe(false);
+    }
+  });
+
+  it("collects a file that imports it twice once, at its first import", () => {
+    const first = 'import { withMutatingMailbox } from "./service";';
+    const twice = `// header\n${first}\nimport { withMutatingMailboxOver } from "./service";\n`;
+    expect(MUTATING_SESSION_IMPORT.flags).toBe("");
+    expect(twice.search(MUTATING_SESSION_IMPORT)).toBe(twice.indexOf(first));
+  });
+
+  it("gives the two ids distinct sort keys, straight after the mutating open's", () => {
+    const violations = [
+      ...checkMutatingSessionImportOwnership([owner, outsider]),
+      ...checkMutatingSessionImportOwnership([]),
+    ];
+    const outside = violations.find(
+      (v) => v.pattern === "mutating-session-importer-outside-triage",
+    )!;
+    const missing = violations.find((v) => v.pattern === "mutating-session-importer-missing")!;
+    expect(outside.patternIndex).toBe(FORBIDDEN.length + 25);
+    expect(missing.patternIndex).toBe(FORBIDDEN.length + 26);
+  });
+});
+
 describe("the count constraints as a set", () => {
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
@@ -4297,6 +4650,9 @@ describe("the count constraints as a set", () => {
     // the service module, already covered above as the write's owner.
     expect(EXCLUDED.has(MUTATING_SESSION_OWNER)).toBe(false);
     expect(MUTATING_OPEN_OWNER).toBe(APPEND_OWNER);
+    // Asserted directly as well, so the check above does not rest on the two
+    // owners staying the same file.
+    expect(EXCLUDED.has(MUTATING_OPEN_OWNER)).toBe(false);
     // And for both minting sites. These two are the files that hold a live
     // credential longest — the door holds a decrypted grant, the login page
     // holds a value somebody just typed — so they are the two that most need

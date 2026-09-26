@@ -419,14 +419,30 @@ export const FORBIDDEN = [
   // and the arrow function's own `()` would end a `[^)]*` span before the
   // guarded call was ever reached.
   //
-  // The `withMailSessionOver` variant is covered by the same pattern, being a
-  // prefix match -- deliberately, since it opens a session over an already-open
-  // stream and N of those is still N conversations against one budget.
+  // Phase 20 (D-07) added a second orchestrator, the mutating one, over the
+  // same private core and the same request gate. So there are two prefixes
+  // now, and both are named in the alternation. Each is still a prefix match:
+  // the over-a-stream variants (`...Over`) are covered by the same name,
+  // because a session over an already-open stream is still one conversation
+  // against the account, and N of them is N. The private core's name begins
+  // with the read prefix on purpose, so a fan-out written around the core is
+  // covered too. A test reads every session-opening function name out of
+  // src/mail/service.ts and runs a fan-out around each through this rule, so
+  // a new orchestrator whose name escapes both prefixes goes red there.
+  //
+  // The triage verbs are NOT listed. A fan-out written around a verb at the
+  // tool layer is refused at run time by the shared gate, which the verbs
+  // reach through the mutating orchestrator. Listing names is also not free: a
+  // name missing from an alternation is invisible to every set check, which
+  // is the hole `DAV_WRITE_MODULES` exists to close for the DAV rule below.
+  // Phase 21, which adds list operations over several messages, is where
+  // listing the verbs gets revisited.
   {
     id: "concurrent-session",
     scope: "src/",
-    pattern: /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?withMailSession/g,
-    why: "A concurrent combinator wrapped around the one mail session orchestrator. Every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial.",
+    pattern:
+      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox)/g,
+    why: "A concurrent combinator wrapped around either mail session orchestrator (read-only or mutating) or the core under them. Every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial.",
   },
   // The same property one protocol over, and the reason is deliberately NOT the
   // same. The two rules above lean on the six-connection platform cap. That cap
@@ -607,8 +623,10 @@ export const FORBIDDEN = [
 
   // ---------------------------------------------------------------- read-only
   // D-47. The convention half of "Claude reading your mail is not you reading
-  // your mail". The structural half is that every mailbox is opened read-only,
-  // which makes the mutation refusable by the server for a whole session.
+  // your mail". The structural half is that every mailbox opened on a READ
+  // path is opened read-only, which makes the mutation refusable by the server
+  // for a whole session. Phase 20 added one separate mutating path, used only
+  // by explicit triage verbs, and it fetches no message body at all.
   //
   // Anchored on the fetch-item context rather than on the spelling alone, and
   // that is precision rather than leniency: the server spells the RESPONSE key
@@ -646,7 +664,7 @@ export const FORBIDDEN = [
     scope: "src/",
     pattern:
       /(?:\bFETCH|["'`]\()[^;\n]{0,120}?\b(?:BODY(?!\.PEEK)(?:\.\w+)?\[|RFC822(?!\.(?:SIZE|HEADER))\b)/gi,
-    why: "A body fetch item written without the peeking form (or its RFC822 synonym, which RFC 3501 makes functionally equivalent). Fetching this way sets the seen flag as a side effect, and the page-listing path touches every message on a page -- so one slip marks a whole page read in a single call, and read status is a field the user relies on. The structural half of the guarantee is that every mailbox is opened read-only, so the server refuses the mutation for the whole session; this rule is the convention half, and it catches the slip before it reaches a server that might not refuse it. Reading the server's reply is unaffected: the response key is spelled without the peek, which is why this rule is anchored on the fetch item list rather than on the spelling alone.",
+    why: "A body fetch item written without the peeking form (or its RFC822 synonym, which RFC 3501 makes functionally equivalent). Fetching this way sets the seen flag as a side effect, and the page-listing path touches every message on a page -- so one slip marks a whole page read in a single call, and read status is a field the user relies on. The structural half of the guarantee is that every mailbox opened on a read path is opened read-only, so the server refuses the mutation for the whole session, and the one mutating path fetches no body at all; this rule is the convention half, and it catches the slip before it reaches a server that might not refuse it. Reading the server's reply is unaffected: the response key is spelled without the peek, which is why this rule is anchored on the fetch item list rather than on the spelling alone.",
   },
 
   // ------------------------------------------------------------- store scoping
