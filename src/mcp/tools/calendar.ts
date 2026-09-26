@@ -7242,7 +7242,8 @@ export function registerCalendarTools(
         confirmToken: z
           .string()
           .describe(
-            "The confirmToken from calendar_update_event, unaltered. It can " +
+            "The confirmToken from the preview tool that returned it, " +
+              "unaltered. It can " +
               "stop being valid because someone replied to the invitation, " +
               "not only because someone edited the event. Preview again. " +
               "Before you pass this back, the user must have seen the " +
@@ -7298,7 +7299,7 @@ export function registerCalendarTools(
             tells: z.enum(REPLY_TELLS).optional(),
           })
           .describe(
-            "The change object calendar_update_event returned, passed back " +
+            "The change object the preview tool returned, passed back " +
               "unaltered. Altering any value is refused before anything is sent.",
           ),
       }),
