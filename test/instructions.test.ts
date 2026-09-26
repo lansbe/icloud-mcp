@@ -329,6 +329,229 @@ describe("the tool set is pinned against the instructions", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The capability claims, pinned against the live tool surface
+// ---------------------------------------------------------------------------
+//
+// The set pin above answers "did a tool arrive or leave". It does NOT answer
+// "is the sentence about that tool still here", and those are different
+// questions with different failure modes: the set pin goes red when the tool
+// list changes and stays green forever afterwards, including on the very next
+// commit that deletes the sentence somebody added to make it green. The
+// "What it can do today" section is the half of this string with a short shelf
+// life and it is the half nothing was watching clause by clause.
+//
+// So each capability sentence is pinned to the TOOLS it is a claim about, and
+// the pin is made in both directions:
+//
+//   forward  -- every tool a row names is in the live `tools/list`, so a
+//               sentence about a tool that does not exist is red;
+//   backward -- every live tool on the surfaces these rows cover is named by
+//               some row, so a tool added to one of those surfaces without a
+//               sentence is red.
+//
+// "The surfaces these rows cover" is deliberately narrow and mechanical rather
+// than "all thirty tools": the collection tools, matched by name shape, and the
+// tools whose input schema actually takes reminders, read off the live schema.
+// A backward direction over the whole tool list would be the set pin again
+// under another name, and would force a row for every tool whose behaviour this
+// string states as a GROUP property ("listings are cursor-paginated") rather
+// than one tool at a time.
+
+/**
+ * Every claim the capability section makes about the calendar write surface,
+ * and the live tools each claim is about.
+ *
+ * `clause` is a SUBSTRING and not a paraphrase, for the reason the boundary
+ * table above records: a rule matched by paraphrase survives having its point
+ * removed. Each one is the load-bearing fragment of its sentence -- the
+ * fragment that, deleted, leaves a model acting on something false.
+ *
+ * The reminder rows are two rather than one on purpose. The whole-list rule and
+ * the refusal to promise that an alarm FIRES are separate claims that fail
+ * separately: the first protects the user's stored reminders from a model that
+ * guesses, and the second is the one the plan forbids this file to assert,
+ * because whether iCloud delivers the alert is measured against the real
+ * account and not decided here.
+ */
+const CAPABILITY_CLAIMS = [
+  {
+    claim: "reminders are a whole list, and an empty one clears them",
+    clause: "supplying an EMPTY list removes every one",
+    tools: ["calendar_create_event", "calendar_update_event"],
+  },
+  {
+    claim: "a reminder is written, never promised to fire",
+    clause: "whether a device then alerts is the calendar's own affair",
+    tools: ["calendar_create_event", "calendar_update_event"],
+  },
+  {
+    claim: "a calendar itself can be created",
+    clause: "A CALENDAR itself can be created",
+    tools: ["calendar_create_calendar"],
+  },
+  {
+    claim: "a rename and a recolour are not previewed, and why",
+    clause:
+      "Those two write on the first call and have no preview: both are reversible",
+    tools: ["calendar_update_calendar"],
+  },
+  {
+    claim: "a colour arrives as #RRGGBB",
+    clause: "with a colour as `#RRGGBB`",
+    tools: ["calendar_create_calendar", "calendar_update_calendar"],
+  },
+  {
+    claim: "deleting a calendar IS previewed",
+    clause:
+      "DELETING a calendar is the one collection operation that IS previewed",
+    tools: ["calendar_delete_calendar", "calendar_commit"],
+  },
+  {
+    claim: "the delete's count is everything stored, not only events",
+    clause:
+      "that count is EVERYTHING STORED in the calendar rather than only its events",
+    tools: ["calendar_delete_calendar"],
+  },
+  {
+    claim: "the account's default calendar is refused",
+    clause: "The account's default calendar is refused outright",
+    tools: ["calendar_delete_calendar"],
+  },
+] as const;
+
+/**
+ * The collection surface, by name shape.
+ *
+ * Matched rather than listed, so a fourth collection tool is caught by the
+ * backward direction below the moment it is registered. A listed set would have
+ * to be edited to notice one, which is the edit nobody makes.
+ */
+const COLLECTION_TOOL_SHAPE = /^calendar_(create|update|delete)_calendar$/;
+
+/** The parameter name the two reminder rows are a claim about. */
+const REMINDERS_PARAMETER = "alarms";
+
+/** The live tools, and the top-level parameter names of each one's schema. */
+async function liveToolParameters(): Promise<Map<string, string[]>> {
+  const result = resultFor(await askTheServer([INITIALIZE, TOOLS_LIST]), 2);
+  const tools = result.tools as
+    | { name: string; inputSchema?: { properties?: Record<string, unknown> } }[]
+    | undefined;
+
+  expect(tools, "tools/list answered with no tools array").toBeDefined();
+  expect(tools!.length).toBeGreaterThan(0);
+
+  return new Map(
+    tools!.map((tool) => [
+      tool.name,
+      Object.keys(tool.inputSchema?.properties ?? {}),
+    ]),
+  );
+}
+
+describe("every capability claim is pinned to the tools it is about", () => {
+  it("has a claim per row, each named once", () => {
+    // The count lives in an assertion and nowhere in the prose above, for the
+    // reason the boundary table's own docstring records.
+    expect(CAPABILITY_CLAIMS.length).toBe(8);
+    expect(new Set(CAPABILITY_CLAIMS.map((row) => row.claim)).size).toBe(
+      CAPABILITY_CLAIMS.length,
+    );
+  });
+
+  for (const { claim, clause } of CAPABILITY_CLAIMS) {
+    it(`states the claim: ${claim}`, () => {
+      expect(
+        SERVER_INSTRUCTIONS,
+        `the instructions no longer state "${claim}". A model that cannot ` +
+          "read this reaches for the tool and finds out by being refused, or " +
+          "worse, by not being refused.",
+      ).toContain(clause);
+    });
+  }
+
+  it("names no tool that does not exist", async () => {
+    const live = await liveToolParameters();
+    const claimed = [
+      ...new Set(CAPABILITY_CLAIMS.flatMap((row) => [...row.tools])),
+    ].sort();
+    const missing = claimed.filter((name) => !live.has(name));
+
+    expect(
+      missing,
+      "the capability claims are about tools this server does not register. " +
+        "Either the tool was removed and the sentence must go, or the name " +
+        "here is wrong.",
+    ).toEqual([]);
+  });
+
+  it("leaves no collection tool without a claim", async () => {
+    const live = await liveToolParameters();
+    const claimed = new Set<string>(
+      CAPABILITY_CLAIMS.flatMap((row) => [...row.tools]),
+    );
+    const collection = [...live.keys()]
+      .filter((name) => COLLECTION_TOOL_SHAPE.test(name))
+      .sort();
+
+    // Non-vacuity: a regex that matched nothing would leave the filter below
+    // comparing two empty arrays and asserting nothing at all.
+    expect(
+      collection.length,
+      "no tool matches the collection name shape. Either the tools were " +
+        "renamed, in which case COLLECTION_TOOL_SHAPE must follow them, or " +
+        "the surface this direction watches no longer exists.",
+    ).toBeGreaterThan(0);
+
+    expect(
+      collection.filter((name) => !claimed.has(name)),
+      "a collection tool is registered with no sentence about it in " +
+        "SERVER_INSTRUCTIONS. " +
+        ALSO_EDIT_THE_STRING,
+    ).toEqual([]);
+  });
+
+  it("claims reminders for exactly the tools whose schema takes them", async () => {
+    const live = await liveToolParameters();
+
+    // Read off the LIVE schema rather than listed here, so a third tool
+    // growing the parameter turns this red without anybody remembering to.
+    const takesReminders = [...live.entries()]
+      .filter(([, parameters]) => parameters.includes(REMINDERS_PARAMETER))
+      .map(([name]) => name)
+      .sort();
+
+    // Non-vacuity: if the parameter were renamed, this would be empty and the
+    // comparison below would pass over two empty sets while every reminder
+    // sentence in the string had quietly become a claim about nothing.
+    expect(
+      takesReminders.length,
+      `no registered tool takes a "${REMINDERS_PARAMETER}" parameter. Either ` +
+        "the parameter was renamed -- in which case REMINDERS_PARAMETER must " +
+        "follow it -- or reminders were removed and the two reminder claims " +
+        "in SERVER_INSTRUCTIONS must go with them.",
+    ).toBeGreaterThan(0);
+
+    const claimedForReminders = [
+      ...new Set(
+        CAPABILITY_CLAIMS.filter((row) => row.claim.includes("reminder")).flatMap(
+          (row) => [...row.tools],
+        ),
+      ),
+    ].sort();
+
+    expect(
+      takesReminders,
+      "the tools that take reminders and the tools the instructions claim " +
+        "reminders for are not the same set. A tool that takes them with no " +
+        "sentence leaves a model guessing at the whole-list rule, which is " +
+        "the guess that deletes the user's reminders. " +
+        ALSO_EDIT_THE_STRING,
+    ).toEqual(claimedForReminders);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // README source
 // ---------------------------------------------------------------------------
 //
