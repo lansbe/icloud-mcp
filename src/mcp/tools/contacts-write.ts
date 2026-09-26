@@ -675,6 +675,16 @@ async function buildContactCreatePreview(
       // null means "no resource yet", here it means the concept does not exist
       // on this protocol at all — and `createContact` never reads it.
       s: null,
+      // The fields this preview named, sealed — **and the contact commit does NOT
+      // read it back, on `ConfirmPayload.s`'s own precedent.** It cannot drift:
+      // `changedContactFields` reads nothing but the change, and the hash binds
+      // the change, so both legs call one function over one bound value and
+      // arrive at the same list by construction. That is the property the
+      // calendar's update leg does not have, which is why `f` exists at all. The
+      // fact is true of this preview either way and it costs a list already in
+      // hand; a null or an omission here would be this leg claiming the preview
+      // named nothing.
+      f: fields,
       h: await contactChangeHashOf(change),
       x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
       // NOT null, unlike the three fields above it. A contact create has no
@@ -834,6 +844,15 @@ async function buildContactUpdatePreview(
       // NULL: a vCard has no `SEQUENCE`. The concept does not exist on this
       // protocol, and `updateContact` never reads it.
       s: null,
+      // Sealed and not read back, for the create leg's stated reason. **And the
+      // contrast with the calendar's update leg is worth naming here, because
+      // this is the leg that looks most like it.** A contact change distinguishes
+      // "not mentioned" from "clear this" in the TYPE — `ContactTextEdit`'s outer
+      // null — so the confirmed change still says which fields the caller spoke
+      // about, and `changedContactFields` reads exactly that. A calendar update
+      // resolves an unmentioned field to the stored value instead, which is what
+      // erased the distinction there and produced eight where one moved.
+      f: fields,
       h: await contactChangeHashOf(change),
       x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
       u: principal.userId,

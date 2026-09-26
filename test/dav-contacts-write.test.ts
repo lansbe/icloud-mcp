@@ -961,6 +961,9 @@ describe("the contacts_commit write", () => {
         // operation this is.
         e: '"an-etag"',
         s: null,
+        // Present and plausible, so the refusal below is attributable to the
+        // ETag and not to a payload this build would have rejected anyway.
+        f: ["formattedName"],
         h: await contactChangeHashOf(change),
         x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
         u: principal.userId,
@@ -1769,6 +1772,9 @@ describe("the contacts_update commit", () => {
         r: null,
         e: null,
         s: null,
+        // Present and plausible, so the refusal below is attributable to the
+        // missing ETag and not to a payload this build would have rejected anyway.
+        f: ["note"],
         h: await contactChangeHashOf(change),
         x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
         u: principal.userId,

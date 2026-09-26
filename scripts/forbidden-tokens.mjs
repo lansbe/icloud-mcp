@@ -703,8 +703,11 @@ export const FORBIDDEN = [
   // rather than terse. It carried a leading `\s*` when it was written, which is
   // outside the interpolation and therefore matches LITERAL characters of the
   // template: `` `${CONFIRM_KEY_PREFIX} ${userId}:${jti}` `` passed, and so did
-  // the same thing with a newline. Both build `confirm:v3: <id>:...` — a key
-  // with a space in it, which is not the key this rule says is required. No
+  // the same thing with a newline. Both build a key with a space or a newline
+  // between the prefix and the id — not the key this rule says is required. The
+  // concrete bytes were spelled here with the confirmation prefix's version
+  // segment in them and went stale when that prefix moved, so the shape is
+  // described rather than quoted. No
   // cross-user leak, since the id is still there, but the rule proved less than
   // its own first paragraph claimed, and that paragraph is the thing a reader
   // relies on. Dropped, so anything at all between the prefix and the id fires.

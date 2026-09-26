@@ -123,6 +123,12 @@ function payload(
     // the RESOURCE, on the ETag's own footing — not part of the change the user
     // approved, which is what `h` binds.
     s: 3,
+    // The diff the preview observed. A fact about what MOVED, which is a
+    // different question from the one `h` binds — `h` binds the change the user
+    // approved, and a scopeless update's change carries every field whether or
+    // not it moved. Two members, so a case asserting a count cannot pass against
+    // a one-element list by coincidence.
+    f: ["summary", "location"],
     h: "cGxhY2Vob2xkZXItY2hhbmdlLWhhc2g",
     x: soon(),
     // The user this confirmation was minted for. One edit here covers every
@@ -549,6 +555,121 @@ describe("a confirmation names the target it was minted for", () => {
     }
   });
 
+  it("refuses a version 3 token, and refuses the v3 FIELD SET at the current version too", async () => {
+    // Version 3 is the format this build replaced when the object arm gained
+    // `f`. Three tokens, and the reason there are three is that the two layers
+    // refusing them have to be measured SEPARATELY — a case resting on whichever
+    // check happened to run first would prove less than it looks, which is the
+    // argument the version-2 case above makes with two.
+    //
+    // The semantic difference is what makes the version bump earn its cost
+    // rather than duplicate the predicate. Under v3 a calendar update's
+    // `changedFields` meant the fields the change ASSERTED a value for; under v4
+    // it means the fields the preview OBSERVED moving. On a scopeless update
+    // those differed by seven — eight published where one moved, measured live on
+    // 2026-09-25. A v3 token redeemed by a v4 build is a confirmation whose two
+    // ends disagree about what the answer means, and only a version field can say
+    // that.
+    //
+    //   1. The literal shape a v3 build minted: no `f`, version set back. BOTH
+    //      layers refuse it, which is what a real in-flight token meets.
+    const { f: _droppedFromStale, ...v3Shape } = payload();
+    const staleWithoutField: Record<string, unknown> = { ...v3Shape, v: 3 };
+    //   2. The CURRENT field set with the version set back. The predicate passes
+    //      this one, so only the strict version comparison can refuse it — this
+    //      is the leg that fails if the bump is ever reverted as redundant.
+    const staleWithField: Record<string, unknown> = { ...payload(), v: 3 };
+    //   3. The v3 FIELD SET at the current version. The version check passes, so
+    //      only the structural predicate can refuse it — this is the leg that
+    //      fails if `f` is ever made optional or defaulted, which would let the
+    //      published array read `undefined` and the sentence count zero on a
+    //      write that changed something.
+    const currentWithoutField: Record<string, unknown> = {
+      ...v3Shape,
+      v: CONFIRM_VERSION,
+    };
+
+    for (const [name, refused] of [
+      ["a v3 token as one was actually minted", staleWithoutField],
+      ["a v3 version carrying the current field set", staleWithField],
+      ["the v3 field set at the current version", currentWithoutField],
+    ] as const) {
+      const token = await sealAs(
+        toBase64Url(TOKEN_ENCODER.encode(JSON.stringify(refused))),
+        SECRET,
+      );
+
+      await expect(
+        verifyConfirmation(token, SECRET, USER, "dav"),
+        `${name} was admitted`,
+      ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+    }
+
+    // Non-vacuity: the same field set at the current version WITH the field is
+    // accepted, so the three refusals above are about the version and the field
+    // and not about the helper having produced something unusable.
+    const current = payload();
+    expect(
+      await verifyConfirmation(
+        await mintConfirmation(current, SECRET),
+        SECRET,
+        USER,
+        "dav",
+      ),
+    ).toEqual(current);
+  });
+
+  it("round-trips the previewed diff, including the empty list", async () => {
+    // **The list is this server's own OBSERVATION and the commit publishes it
+    // verbatim**, so a value that did not survive the round trip is a value a
+    // user reads as "these are the fields that moved". See
+    // `DavObjectConfirmPayload.f`, which records what the commit published
+    // before this field existed and how far out it was.
+    const named = payload({ f: ["summary"] });
+    const read = await verifyConfirmation(
+      await mintConfirmation(named, SECRET),
+      SECRET,
+      USER,
+      "dav",
+    );
+    expect(read.f).toStrictEqual(["summary"]);
+
+    // ZERO is an answer and not an absence — the update that moves nothing. It
+    // has to survive as an empty list rather than being read as "no diff was
+    // recorded", because the first produces "changing 0 fields" and the second is
+    // refused outright.
+    const moved = payload({ f: [] });
+    expect(
+      (
+        await verifyConfirmation(
+          await mintConfirmation(moved, SECRET),
+          SECRET,
+          USER,
+          "dav",
+        )
+      ).f,
+    ).toStrictEqual([]);
+  });
+
+  it("refuses a diff that is not a list of strings", async () => {
+    // Four shapes a cast or a hand-built payload reaches, each of which would
+    // print into the published array and the sentence's count unaltered. `null`
+    // is the one worth naming: it is what a leg that "had no diff to report"
+    // would reach for, and it must be refused rather than read as an empty list,
+    // because the two are different claims about the same write.
+    for (const f of [null, "summary", 3, ["summary", 7], [null], {}]) {
+      await expect(
+        verifyConfirmation(
+          await mintConfirmation(malformed({ ...payload(), f }), SECRET),
+          SECRET,
+          USER,
+          "dav",
+        ),
+        `${JSON.stringify(f)} was admitted as a previewed diff`,
+      ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+    }
+  });
+
   it("keeps the signed-in user immediately after the versioned prefix", async () => {
     // The `store-key-without-a-user` rule's property, asserted here as well as
     // in `test/key-shapes.test.ts`, because the prefix moved this phase and a
@@ -557,7 +678,7 @@ describe("a confirmation names the target it was minted for", () => {
 
     await reserveConfirmation(kv.binding, USER, "target-arm-key", soon());
 
-    expect(kv.puts[0]!.key).toBe(`confirm:v3:${USER}:target-arm-key`);
+    expect(kv.puts[0]!.key).toBe(`confirm:v4:${USER}:target-arm-key`);
   });
 });
 
@@ -725,6 +846,56 @@ describe("a collection confirmation cannot reach an ETag at all", () => {
     await expect(
       verifyConfirmation(await mintConfirmation(both, SECRET), SECRET, USER, "col"),
     ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it("refuses a collection payload carrying a per-field diff, and a mail one too", async () => {
+    // **Asserted per-field rather than left to the quadratic arm table, because
+    // that table cannot see this line.** Its DAV-object row carries `e`, `r` and
+    // `s` alongside `f`, so the collection arm refuses it on the first of those
+    // and the `f` absence is never what decided anything — a check that can never
+    // be the deciding one looks exactly like a check that was never added.
+    //
+    // A collection has no per-field diff; `g` is the observation that arm carries
+    // instead. A payload bringing one could be read under the object arm, which
+    // is the whole thing the discriminator forbids.
+    const collectionWithDiff = malformed({
+      ...collectionPayload(),
+      f: ["summary"],
+    });
+    await expect(
+      verifyConfirmation(
+        await mintConfirmation(collectionWithDiff, SECRET),
+        SECRET,
+        USER,
+        "col",
+      ),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+
+    const mailWithDiff = malformed({ ...mailPayload(), f: ["summary"] });
+    await expect(
+      verifyConfirmation(
+        await mintConfirmation(mailWithDiff, SECRET),
+        SECRET,
+        USER,
+        "mail",
+      ),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+
+    // Non-vacuity in both directions: the same two payloads WITHOUT the field are
+    // accepted, so each refusal above is about the stray field and nothing else.
+    for (const [target, built] of [
+      ["col", collectionPayload()],
+      ["mail", mailPayload()],
+    ] as const) {
+      expect(
+        await verifyConfirmation(
+          await mintConfirmation(built, SECRET),
+          SECRET,
+          USER,
+          target,
+        ),
+      ).toEqual(built);
+    }
   });
 
   it("refuses an object payload carrying a collection binding", async () => {
@@ -1915,7 +2086,7 @@ describe("the single-use reservation", () => {
     await reserveConfirmation(kv.binding, USER, "value-shape", soon());
 
     expect(kv.puts[0].value).toBe("1");
-    expect(CONFIRM_KEY_PREFIX).toBe("confirm:v3:");
+    expect(CONFIRM_KEY_PREFIX).toBe("confirm:v4:");
   });
 
   it("refuses a spent token with the same error every other cause raises", async () => {

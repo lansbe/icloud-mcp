@@ -201,7 +201,7 @@ describe("key shapes today, one pin per store", () => {
     ).toBe(3);
   });
 
-  it("CONFIRM_KV: confirm:v3:{user id}:{jti}", async () => {
+  it("CONFIRM_KV: confirm:v4:{user id}:{jti}", async () => {
     const kv = fakeKv();
     const jti = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     const soon = Math.floor(Date.now() / 1000) + 300;
@@ -209,17 +209,23 @@ describe("key shapes today, one pin per store", () => {
     await reserveConfirmation(kv.binding, USER_A.userId, jti, soon);
 
     expect(kv.puts.length, "the reservation wrote nothing").toBe(1);
-    // The literal prefix at version 3, then the user id the caller passed in,
+    // The literal prefix at version 4, then the user id the caller passed in,
     // then the jti. The prefix is typed out rather than imported so the prefix
     // itself is pinned; the user id is the literal vectors row, which is a
     // different thing from the key it is being compared against.
+    //
+    // **Version 4 because the payload moved to 4, and this line is what makes
+    // the in-step rule a rule.** `CONFIRM_KEY_PREFIX`'s docstring says the two
+    // version segments are kept in step deliberately. A payload bump that left
+    // this alone would make that sentence false with nothing going red, so the
+    // byte-exact pin here is the thing that sends the author to read it.
     expect(kv.puts[0]!.key).toBe(
-      "confirm:v3:" + USER_A.userId + ":aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "confirm:v4:" + USER_A.userId + ":aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
     );
     // Three colon-separated parts after the scheme word, and the middle one is
     // 64 hex. A key with no user in it fails this even if the prefix moved.
     expect(kv.puts[0]!.key).toMatch(
-      /^confirm:v3:[0-9a-f]{64}:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee$/,
+      /^confirm:v4:[0-9a-f]{64}:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee$/,
     );
   });
 

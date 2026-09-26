@@ -178,8 +178,37 @@ export class ConfirmationInvalidError extends Error {
  * No compatibility arm admits a v2 token back. An arm that read the old shape
  * and filled in a discriminator would be guessing at the one field the guess
  * was added to remove.
+ *
+ * **Bumped to 4 when the object arm gained `f`, and this is the bump where the
+ * reasoning is worth reading rather than assumed from the two above it.** The
+ * structural predicate REQUIRES `f` on that arm, so a v3 token is already
+ * refused by `hasDavObjectArm` whether or not this constant moves — which makes
+ * the bump look redundant. It is not, for two reasons.
+ *
+ * The first is that the predicate answers "is this shape readable" and the
+ * version answers "is this shape MINE". A v3 token is a well-formed payload from
+ * a build with different SEMANTICS: under v3 a calendar update's
+ * `changedFields` meant the fields the change ASSERTED a value for, and under v4
+ * it means the fields the preview OBSERVED moving. Those are different answers to
+ * the question a user reads, and on a scopeless update they differed by seven —
+ * eight reported where one moved, measured live on 2026-09-25. A token minted by
+ * a build that meant the first thing, redeemed by a build that publishes the
+ * second, is a confirmation whose two ends disagree about what the response says.
+ * The version is the field that can state that; a field list cannot.
+ *
+ * The second is that the predicate's refusal is a coincidence of which fields it
+ * happens to check, and a later edit that made `f` optional or defaulted it to
+ * `[]` would admit a v3 token and publish "changing 0 fields" on a write that
+ * changed one. That is the class of failure `t`'s own docstring describes, and
+ * the version check is the layer that stays true through that edit.
+ *
+ * The cost is the same cost, named a third time rather than assumed to have been
+ * paid twice: every preview in flight at the deploy dies, its token carries
+ * `v: 3`, the check below is the same strict inequality, and it costs one
+ * re-preview per confirmation alive at the deploy. The window in which any are
+ * alive is `CONFIRM_TTL_SECONDS` wide.
  */
-export const CONFIRM_VERSION = 3;
+export const CONFIRM_VERSION = 4;
 
 /**
  * The operation a confirmation authorises.
@@ -258,8 +287,18 @@ export const CONFIRM_TTL_SECONDS = 300;
  * token of a different shape. The user id still sits immediately after this
  * prefix and that has not moved — the bump changes the namespace and nothing
  * about the key's structure.
+ *
+ * `v4` because the object arm gained `f` and the in-step rule is a rule rather
+ * than a case-by-case judgement. On this bump the rule's own reason does not
+ * bite — a v3 token is refused at the version check, which runs before any
+ * reservation, so it can never reach a slot to share one. What would bite is
+ * leaving the rule's sentence in place while the two numbers diverged: a claim
+ * that is quietly false is worse than a narrower one that is true, and this
+ * project has that failure recorded in three other docstrings. Nothing is lost
+ * by moving it. Every record under the old namespace belongs to a token that
+ * cannot be redeemed any more, so no replay window opens.
  */
-export const CONFIRM_KEY_PREFIX = "confirm:v3:";
+export const CONFIRM_KEY_PREFIX = "confirm:v4:";
 
 /**
  * The separator between the sealed payload and its seal.
@@ -446,6 +485,72 @@ export interface DavObjectConfirmPayload extends ConfirmPayloadBase {
    * reintroduced into a signature.
    */
   s: number | null;
+  /**
+   * The field names the PREVIEW observed moving, as the preview published them.
+   *
+   * **Here rather than in the change, on `s`'s footing and
+   * `DavCollectionConfirmPayload.g`'s, and the reason transfers without
+   * alteration.** `h` binds what the USER APPROVED and refuses any alteration of
+   * it. This is not that. It is this server's own OBSERVATION at read time — the
+   * diff between the change the caller asked for and the resource as it stood —
+   * and it is not something a caller could sensibly re-supply, because
+   * re-supplying it is re-supplying this server's own observation.
+   *
+   * **Why it has to travel at all, measured rather than reasoned.** On
+   * 2026-09-25 a title-only update of a real event previewed correctly —
+   * `changedFields: ["summary"]`, *"changing 1 field"* — and committed
+   * *"changing 8 fields"*, listing every field of the change. A read-back proved
+   * only the title had moved. The cause is that an update with no scope fills
+   * every unmentioned field from the stored resource, which is what lets the
+   * patch assert them, so at commit time every field of the change holds a value
+   * and "what the change carries" is the whole of it. The commit had no channel
+   * to the before-state as the preview saw it, so it published the only number it
+   * had and published it under a name that means the other thing. Over-reporting
+   * in the ALARMING direction, on the one response whose sentence also says the
+   * previous values cannot be recovered.
+   *
+   * **A COMMIT COULD RE-DERIVE THIS, and it is sealed anyway.** Since plan 17-07
+   * every update patches, and a patch re-reads the resource before it writes, so
+   * the before-state is genuinely in the commit's hands and the diff is genuinely
+   * computable there. Two things decide it the other way. The list answers *"what
+   * did the person agree to"*, and the confirmation is this project's one channel
+   * for that question — a re-derivation answers it only as long as the ETag
+   * comparison inside the writer keeps holding, which makes the honesty of a
+   * published sentence depend on a `!==` in another function. And a number this
+   * server publishes as its own observation must not come off a request, which is
+   * the rule `g` states and `ConfirmationSummary` states for every count in the
+   * composed line.
+   *
+   * **What is NOT claimed: this is not an observation of the WRITTEN bytes.** It
+   * is the diff as of the read the user was shown, which is the question
+   * `changedFields` asks on both legs. Nothing here reads the resource back
+   * afterwards, and the fields a commit reports are therefore what it set out to
+   * move rather than what a fresh look confirmed had moved.
+   *
+   * **The VOCABULARY is closed, and the closure is held at the mint site rather
+   * than here.** This module is protocol-neutral and has no business knowing
+   * what a calendar field is called, so the type is `string[]`. Every value that
+   * reaches it comes from `CHANGE_FIELDS` in `src/mcp/tools/calendar.ts` — or
+   * from that file's own `"alarms"` literal, or from `ContactChangeField` on the
+   * contacts path — and never from a string read off a resource
+   * (./.claude/CLAUDE.md § 4). A preview that put stranger-authored text here
+   * would publish it from inside the trusted half of the commit's response.
+   *
+   * REQUIRED and never optional, on `g`'s argument: an absent list does not read
+   * as "nothing moved", it reaches the published array and the sentence's count
+   * as a value nobody observed. An empty list is a real answer — the update that
+   * moves nothing — and is not a missing one.
+   *
+   * **Sealed by every kind on this arm; read by the CALENDAR arms only.** A
+   * calendar create and delete fill it and read it back, so all three kinds take
+   * their published list from one place and no future kind can reintroduce the
+   * disagreement. Both CONTACT legs fill it and neither reads it, on `s`'s
+   * precedent exactly — their list is a pure function of the hash-bound change,
+   * so preview and commit call one function over one bound value and cannot
+   * disagree. The fact is true of the preview either way and it costs a value
+   * already in hand.
+   */
+  f: string[];
 }
 
 /**
@@ -1999,6 +2104,24 @@ function hasDavObjectArm(candidate: Record<string, unknown>): boolean {
     (candidate.s === null ||
       (typeof candidate.s === "number" && Number.isInteger(candidate.s))) &&
     "s" in candidate &&
+    // The previewed diff. REQUIRED, and a payload from a build that predates the
+    // field is refused here rather than admitted with the list reading
+    // `undefined`. That is the line above it in its sharper form: an absent list
+    // does not read as "nothing moved", it reaches a published array and a
+    // sentence's count as a value nobody observed — which on a scopeless update
+    // is how "changing 8 fields" got said about one that moved.
+    //
+    // **No `"f" in candidate` companion, and the difference from `s` is the same
+    // difference `u` records in the base predicate.** `s`'s type ADMITS null, so
+    // an absent field and a present null are indistinguishable to a comparison.
+    // `f` is a plain array, and `undefined` fails `Array.isArray` on its own.
+    //
+    // Every member typed, because one non-string in the list is a value that
+    // prints into the published array unaltered. The VOCABULARY is not checked
+    // here and must not be: this module knows no protocol's field names, and the
+    // closure is held at the mint site. See `DavObjectConfirmPayload.f`.
+    Array.isArray(candidate.f) &&
+    candidate.f.every((one) => typeof one === "string") &&
     // And NOT a collection binding. Refusing a field that is PRESENT but does
     // not belong is the half a structural predicate usually skips, and it is
     // the half that matters on a union: a payload carrying both an ETag and a
@@ -2011,9 +2134,12 @@ function hasDavObjectArm(candidate: Record<string, unknown>): boolean {
 /**
  * The fields `DavCollectionConfirmPayload` adds, and the ones it must NOT carry.
  *
- * The three absences are asserted rather than assumed. A collection payload
- * that also carried an ETag would satisfy the object arm, and the whole point
- * of `b` is that a collection target cannot be committed as an object one.
+ * The absences are asserted rather than assumed, and they are enumerated by the
+ * lines below rather than counted here — a count beside a list is a second thing
+ * to go stale, which is the lesson `ConfirmationInvalidError`'s own docstring
+ * records about enumerating its causes. A collection payload that also carried an
+ * ETag would satisfy the object arm, and the whole point of `b` is that a
+ * collection target cannot be committed as an object one.
  *
  * `g` is REQUIRED, and a payload from a build that predates it is refused here
  * rather than admitted with the field reading `undefined`. That is
@@ -2038,7 +2164,11 @@ function hasDavCollectionArm(candidate: Record<string, unknown>): boolean {
     candidate.b.length > 0 &&
     !("e" in candidate) &&
     !("r" in candidate) &&
-    !("s" in candidate)
+    !("s" in candidate) &&
+    // A collection has no per-field diff — `g`, one field up, is the observation
+    // this arm carries instead — so a payload bringing one is a payload that
+    // could be read under the object arm too.
+    !("f" in candidate)
   );
 }
 
@@ -2094,6 +2224,7 @@ function hasMailArm(candidate: Record<string, unknown>): boolean {
     !("r" in candidate) &&
     !("e" in candidate) &&
     !("s" in candidate) &&
-    !("b" in candidate)
+    !("b" in candidate) &&
+    !("f" in candidate)
   );
 }

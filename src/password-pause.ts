@@ -60,10 +60,11 @@ import type { Principal } from "./principal";
  * user segment is a key any signed-in caller could name.
  *
  * The version segment is the same hedge the login counter's `authorize-failures:v3:`
- * carries, and `confirm:v3:` and the DAV discovery cache's own versioned prefix
- * before it — that last one named by role rather than spelled, because it has
- * already moved once and a spelled cross-reference goes stale in silence when it
- * moves again: a later change to the
+ * carries, and the confirmation slot's own prefix and the DAV discovery cache's
+ * before it — those two named by role rather than spelled, because both have
+ * already moved and a spelled cross-reference goes stale in silence when it moves
+ * again. This paragraph spelled the confirmation one until that prefix reached
+ * v4: a later change to the
  * shape becomes detectable rather than being silently misread as the current
  * one. No older shape is read, so a leftover key is ignored and expires on its
  * own TTL.

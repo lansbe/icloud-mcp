@@ -2037,6 +2037,12 @@ describe("the calendar_commit write", () => {
         // fixtures turns on it: each is asserting a REFUSAL, and the refusal
         // happens before any body is built.
         s: null,
+        // The diff the preview observed. Empty for the reason `s` is null: no
+        // fixture here reaches a published response, so the one thing that must
+        // be true of this field is that it is PRESENT — an absent one is refused
+        // by the structural predicate and the case would stop being about the
+        // cause its name claims.
+        f: [],
         h: await changeHashOf(good.change),
         x: now - 1,
         // The OWNER, who is the caller every commit in this file is made as.
@@ -2062,6 +2068,12 @@ describe("the calendar_commit write", () => {
         // fixtures turns on it: each is asserting a REFUSAL, and the refusal
         // happens before any body is built.
         s: null,
+        // The diff the preview observed. Empty for the reason `s` is null: no
+        // fixture here reaches a published response, so the one thing that must
+        // be true of this field is that it is PRESENT — an absent one is refused
+        // by the structural predicate and the case would stop being about the
+        // cause its name claims.
+        f: [],
         h: await changeHashOf(good.change),
         x: now + CONFIRM_TTL_SECONDS,
         // The OWNER, for the same reason as the fixture above: without it this
@@ -2976,6 +2988,9 @@ describe("the calendar_commit delete", () => {
             r: "20260210T150000Z",
             e: PREVIEW_ETAG,
             s: 0,
+            // Present, so the structural predicate admits the payload and the
+            // scope guard below is genuinely the only thing refusing it.
+            f: ["startLocal"],
             // The seal and the hash both AGREE with this change, so every check
             // ahead of the dispatch passes. This token is refused by the scope
             // guard alone, which is what makes the case a real one.
@@ -3186,6 +3201,12 @@ describe("the calendar_commit delete", () => {
         // fixtures turns on it: each is asserting a REFUSAL, and the refusal
         // happens before any body is built.
         s: null,
+        // The diff the preview observed. Empty for the reason `s` is null: no
+        // fixture here reaches a published response, so the one thing that must
+        // be true of this field is that it is PRESENT — an absent one is refused
+        // by the structural predicate and the case would stop being about the
+        // cause its name claims.
+        f: [],
         h: await changeHashOf(change),
         x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
         // The OWNER. The disagreement this case is about is between the signed
@@ -3239,6 +3260,12 @@ describe("the calendar_commit delete", () => {
         // fixtures turns on it: each is asserting a REFUSAL, and the refusal
         // happens before any body is built.
         s: null,
+        // The diff the preview observed. Empty for the reason `s` is null: no
+        // fixture here reaches a published response, so the one thing that must
+        // be true of this field is that it is PRESENT — an absent one is refused
+        // by the structural predicate and the case would stop being about the
+        // cause its name claims.
+        f: [],
         h: await changeHashOf(created),
         x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
         // The OWNER. This case is about a create that names an ETag, and the
@@ -3415,6 +3442,12 @@ describe("the calendar_commit delete", () => {
         // fixtures turns on it: each is asserting a REFUSAL, and the refusal
         // happens before any body is built.
         s: null,
+        // The diff the preview observed. Empty for the reason `s` is null: no
+        // fixture here reaches a published response, so the one thing that must
+        // be true of this field is that it is PRESENT — an absent one is refused
+        // by the structural predicate and the case would stop being about the
+        // cause its name claims.
+        f: [],
         h: await changeHashOf(fresh.change),
         x: now - 1,
         // The OWNER, so "expired" is genuinely the cause this row contributes
@@ -5181,6 +5214,12 @@ describe("an attendee list this server read cannot reach one it writes", () => {
         // fixtures turns on it: each is asserting a REFUSAL, and the refusal
         // happens before any body is built.
         s: null,
+        // The diff the preview observed. Empty for the reason `s` is null: no
+        // fixture here reaches a published response, so the one thing that must
+        // be true of this field is that it is PRESENT — an absent one is refused
+        // by the structural predicate and the case would stop being about the
+        // cause its name claims.
+        f: [],
         h: await changeHashOf(laundered),
         x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
         // The OWNER — and this is the ONE of the seven hand-built payloads in
@@ -6914,6 +6953,10 @@ describe("no update path emits an ATTENDEE, whatever the change carries", () => 
         // path any more — every writer takes it from the patched component's own
         // stored value, which is the point of the sibling case below.
         s: 2,
+        // The diff the preview observed. This case is about what the WRITER emits
+        // — no `ATTENDEE`, whatever the change carries — so the list only has to
+        // be present and plausible for the commit to be reached at all.
+        f: ["summary", "startLocal", "endLocal"],
         h: await changeHashOf(laundered),
         x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
         // The OWNER. A missing or wrong user turns the commit into a refusal, so
@@ -7052,6 +7095,9 @@ describe("a series-scoped update is refused at PREVIEW, and must stay so", () =>
         r: SERIES_MOVED_RECURRENCE_ID,
         e: PREVIEW_ETAG,
         s: 2,
+        // Present and plausible; this case turns on the revision the writer emits
+        // rather than on anything published in the response.
+        f: ["summary"],
         h: await changeHashOf(change),
         x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
         u: principal.userId,
@@ -7965,6 +8011,13 @@ describe("the composed line, built from this server's own counts", () => {
     // two sentences agreed. They do not, on a rename, and each side is right:
     // the preview quotes the title the user already knows and the commit
     // quotes the one it wrote.
+    //
+    // **The TITLE is now the only divergence, and until 2026-09-25 this case
+    // also pinned a divergent field count — one forward, seven past.** That
+    // second half was the defect rather than a design: the commit counted every
+    // field the change asserted a value for, which on a scopeless update is all
+    // of them, so a one-field rename reported seven. Both numbers read one now.
+    // The final assertion below survives on its true ground, which is the name.
     const stub = writeDavStub();
     await warmWrite(stub);
 
@@ -7991,13 +8044,20 @@ describe("the composed line, built from this server's own counts", () => {
     );
     expect(forward).not.toContain(RENAMED_TITLE);
 
-    // Direction two: the COMMIT names the title that was written, because a
-    // commit re-reads nothing and the old name is no longer a fact about the
-    // calendar. The field count differs too, and that half was already
-    // documented as deliberate at the construction site.
+    // Direction two: the COMMIT names the title that was written, because that
+    // is the name the event now answers to and the old one is no longer a fact
+    // about the calendar. The field count does NOT differ: both legs say one,
+    // because both count the list the preview sealed.
     expect(past).toBe(
-      `Overwrote event '${RENAMED_TITLE}', changing 7 fields. ` +
+      `Overwrote event '${RENAMED_TITLE}', changing 1 field. ` +
         "The values it held before cannot be recovered.",
+    );
+    // And it is the same count on both sides, asserted as an equality rather
+    // than as two literals that happen to agree — a literal pair would go green
+    // again the moment one leg started counting something else, as long as
+    // whoever changed it also changed the number here.
+    expect(past.match(/changing (\d+) field/)![1]).toBe(
+      forward.match(/changing (\d+) field/)![1],
     );
     expect(past).not.toContain(HOSTILE_TITLE);
 
@@ -8006,6 +8066,92 @@ describe("the composed line, built from this server's own counts", () => {
     // later change that made the two lines agree by the verb alone turns it
     // red and sends the author to the comment that argues why they do not.
     expect(past).not.toBe(forward.replace("Overwriting", "Overwrote"));
+  });
+
+  // -------------------------------------------------------------------------
+  // The defect found in Phase 17's live UAT, 2026-09-25
+  //
+  // A title-only update of a real event previewed `changedFields: ["summary"]`
+  // and "changing 1 field", then committed all eight field names and "changing 8
+  // fields". A read-back proved only the title had moved. The cause: a SCOPELESS
+  // update fills every unmentioned field from the stored resource — that is what
+  // lets the patch assert them — so at commit time every field of the confirmed
+  // change holds a value, and the commit was publishing "what the change
+  // carries" under the name "what changed".
+  //
+  // The case below is written so it would have FAILED against that build in four
+  // independent places, because the one thing this test must not be is a single
+  // literal somebody can update to whatever the code now says.
+  // -------------------------------------------------------------------------
+
+  it("reports ONE field on a scopeless one-field update, on both legs and in both halves", async () => {
+    const stub = writeDavStub();
+    await warmWrite(stub);
+
+    // The ONLY field mentioned, and no scope — which is the shape that produced
+    // the defect. The stored event carries a location, a start, an end and a
+    // zone, so a commit reporting "what the change asserts" has seven other
+    // names available to it and reported all of them.
+    const { trusted, untrusted } = await preview({
+      id: SIMPLE_EVENT_ID,
+      summary: RENAMED_TITLE,
+    });
+    expect(trusted.scope, "the case is only about the SCOPELESS shape").toBe(
+      null,
+    );
+
+    const result = await invokeRegistered("calendar_commit", {
+      confirmToken: String(trusted.confirmToken),
+      change: untrusted.change,
+    });
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+    const outcome = JSON.parse(blocks(result).trusted) as Record<string, unknown>;
+
+    // One: the PREVIEW's structured answer, which was always right.
+    expect(trusted.changedFields).toStrictEqual(["summary"]);
+
+    // Two: the COMMIT's structured answer. This is the assertion the old build
+    // failed, and `toStrictEqual` rather than `toContain` is the whole point —
+    // `toContain("summary")` was true of the eight-name list too.
+    expect(outcome.changedFields).toStrictEqual(["summary"]);
+
+    // Three: NAMED absences, so the failure says which fields were invented
+    // rather than only that a length was wrong. Every one of these appeared in
+    // the live response for an update that touched none of them.
+    for (const invented of [
+      "startLocal",
+      "startTzid",
+      "endLocal",
+      "endTzid",
+      "allDay",
+      "location",
+      "description",
+    ]) {
+      expect(
+        outcome.changedFields as string[],
+        `the commit claimed ${invented} moved`,
+      ).not.toContain(invented);
+    }
+
+    // Four: the two SENTENCES, compared to each other rather than to literals.
+    // The user reads these, and the one that lied is the commit's — beside a
+    // clause saying the previous values cannot be recovered.
+    const forward = String(untrusted.confirmationLine);
+    const past = String(fencedObject(blocks(result).untrusted).confirmationLine);
+    expect(forward).toContain("changing 1 field");
+    expect(past).toContain("changing 1 field");
+    expect(past.match(/changing (\d+) field/)![1]).toBe(
+      forward.match(/changing (\d+) field/)![1],
+    );
+    // And the count in each line is the length of the list published beside it,
+    // so a future leg that moved the array without moving the sentence — or the
+    // reverse — is caught here rather than by a user reading two answers.
+    expect(past).toContain(
+      `changing ${(outcome.changedFields as string[]).length} field`,
+    );
+    expect(forward).toContain(
+      `changing ${(trusted.changedFields as string[]).length} field`,
+    );
   });
 
   it("names the recipient count and the thing that cannot be undone, on a create", async () => {
@@ -10258,15 +10404,24 @@ describe("what the preview SAYS when the only thing changing is a reminder", () 
     // `affectedOccurrences` already makes one field over.
     expect(previewLine).toContain("removing its reminder");
     expect(commitLine).toContain("removing its reminder");
-    expect(outcome.changedFields).toContain("alarms");
+    expect(outcome.changedFields).toStrictEqual(["alarms"]);
 
-    // The FIELD COUNT legitimately differs, and this pins that rather than
-    // pretending the two lines match. A preview answers "how many fields move"
-    // and a commit answers "how many did I assert a value for" — a commit
-    // re-reads nothing, so it cannot report what moved. The alarm clause is
-    // present on both sides regardless, which is what the user needs.
+    // **THE FIELD COUNT AGREES, and until 2026-09-25 this assertion pinned the
+    // opposite.** It read `expect(commitLine).toContain("changing 8 fields")`
+    // beside a preview saying one, with a comment calling the gap legitimate: a
+    // commit re-reads nothing, so it could only report what it asserted a value
+    // for. Neither half held. Every update patches and therefore re-reads, and
+    // the commit was not reporting a different true thing — it was reporting
+    // every field of a change that carries the whole stored state, which is what
+    // a scopeless update's change is. The number a user saw grew from one to
+    // eight across a gate whose own sentence says the previous values cannot be
+    // recovered.
+    //
+    // The comment is recorded rather than deleted because it is the reason the
+    // defect survived review: a test that asserts a wrong number and explains
+    // why looks exactly like a test that pins a decision.
     expect(previewLine).toContain("changing 1 field");
-    expect(commitLine).toContain("changing 8 fields");
+    expect(commitLine).toContain("changing 1 field");
   });
 
   it("produces every sentence through the ONE composer", () => {

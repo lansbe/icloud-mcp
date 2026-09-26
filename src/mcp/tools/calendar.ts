@@ -1339,7 +1339,25 @@ export interface CommitOutcome {
   applied: boolean;
   /** The opaque event id, still addressable. */
   id: string;
-  /** The names of the fields this write asserted a value for, or removed. */
+  /**
+   * The names of the fields that MOVED, as the preview observed them moving.
+   *
+   * **Taken off the signed confirmation on all three kinds — never recomputed
+   * here — and the reason is a defect this field used to have.** It said "the
+   * fields this write asserted a value for", which on a scopeless update is
+   * every field of the change: an update with no scope fills every unmentioned
+   * field from the stored resource, because that is what lets the patch assert
+   * them. So a title-only update published all eight and its sentence read
+   * *"changing 8 fields"* while the preview the user actually approved read
+   * *"changing 1 field"*. Measured on 2026-09-25 against a real event; a
+   * read-back proved only the title had moved.
+   *
+   * The preview is the leg that can answer this — it diffs the request against
+   * the resource it read — so its answer rides in `DavObjectConfirmPayload.f`
+   * and this field publishes it. The sentence beside it counts the same list, so
+   * the two cannot describe different writes, and the preview and the commit
+   * cannot either.
+   */
   changedFields: string[];
   /**
    * Whether anybody was told.
@@ -1782,26 +1800,31 @@ function minutesList(alarms: readonly AlarmChange[]): string | null {
     : alarms.map((one) => String(one.minutesBefore)).join(", ");
 }
 
-/**
- * The fields a change ASSERTS a value for, which is not the same as a diff.
- *
- * Said plainly because the name invites the other reading: a commit
- * deliberately re-reads nothing, so it can report what it wrote and cannot
- * report what moved. The preview is where the diff lives, and the preview is
- * the thing the user was asked to read.
- */
-function assertedFields(change: NormalizedChange): string[] {
-  const fields: string[] = CHANGE_FIELDS.filter(
-    (field) => change[field] !== null,
-  );
-  // Alarms are NOT in `CHANGE_FIELDS` — that tuple's values are strings and
-  // booleans, and a list is neither — so the one field this plan added is
-  // appended by name. A non-null value is an ASSERTION about reminders, which
-  // is exactly what this function counts; whether it MOVED anything is the
-  // preview's question and is answered by `alarmLineSummaryOf`.
-  if (change.alarms !== null) fields.push("alarms");
-  return fields;
-}
+// **`assertedFields` was REMOVED here, and the removal is the fix rather than a
+// tidy-up, so it is recorded rather than left as an absence.**
+//
+// It returned every field of `CHANGE_FIELDS` the confirmed change held a
+// non-null value for, plus `alarms` when that was non-null, and its own
+// docstring conceded that *"whether it MOVED anything is the preview's
+// question"*. The function did what it said. What went wrong is where its answer
+// went: the update commit published it as `changedFields` and counted it into
+// *"changing N fields"*. On a scopeless update every field is non-null by
+// construction — the preview fills the unmentioned ones from the stored resource,
+// which is what lets the patch assert them — so a title-only update reported
+// eight where one moved. Measured live on 2026-09-25, in the ALARMING direction,
+// on the one response whose sentence also says the previous values cannot be
+// recovered.
+//
+// Its justifying premise had also expired. *"A commit re-reads nothing"* was true
+// until plan 17-07 made every update a patch; a patch re-reads the resource
+// before it writes. The answer the commit publishes now comes off
+// `DavObjectConfirmPayload.f` — the preview's own observation, sealed — because
+// that list answers "what did the person agree to" and the confirmation is this
+// project's channel for that question.
+//
+// Deleted rather than kept unused: a function producing a number no leg may
+// publish, under a name a later reader would reach for, is the defect one edit
+// away.
 
 /**
  * Whether this server could anchor the REQUESTED change to its zone.
@@ -2479,6 +2502,15 @@ async function buildPreview(
       // would be this leg claiming the resource had no revision, and it costs one
       // number already in hand. See `ConfirmPayload.s`, which carries the argument.
       s: read.sequence,
+      // **The diff THIS leg measured, sealed, and this is the one arm that could
+      // not survive without it.** `fields` is the same list the response
+      // publishes as `changedFields` and the same list the sentence below counts,
+      // so all three come off one measurement. The commit cannot honestly ask
+      // this question of its own re-read — see `DavObjectConfirmPayload.f`, which
+      // records what the commit published before this field existed and how far
+      // out it was. The values are `CHANGE_FIELDS` members and this file's own
+      // `"alarms"` literal, never a string read off the resource.
+      f: fields.map((one) => one.field),
       h: await changeHashOf(scoped),
       x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
       // The user this preview belongs to, sealed so the commit can refuse
@@ -2523,10 +2555,12 @@ async function buildPreview(
         name: current.summary,
         // A rewrite replaces a resource; nothing goes with it.
         alsoRemoved: null,
-        // The DIFF count, which is the question a PREVIEW answers: how many
-        // fields move. The commit's own line counts what it ASSERTED instead,
-        // for the reason `assertedFields` records — a commit re-reads nothing,
-        // so it can report what it wrote and cannot report what moved.
+        // The DIFF count: how many fields move. **The commit's line says the
+        // SAME number now**, because the list it counts is this list, sealed into
+        // the confirmation two dozen lines up. It did not until 2026-09-25: it
+        // counted what the change ASSERTED a value for, which on a scopeless
+        // update is everything, so this said one and the commit said eight about
+        // the same write. See `DavObjectConfirmPayload.f`.
         fieldCount: fields.length,
         recipientCount: desired.attendees.length,
         // WHICH way the reminders go, because "changing 1 field" is true of an
@@ -2750,6 +2784,14 @@ async function buildDeletePreview(
       // Reporting what the resource actually carried costs nothing, and a null
       // here would be this leg claiming the resource had no revision.
       s: read.sequence,
+      // What goes away, sealed. **The commit COULD re-derive this one** — a
+      // delete's list is `removedFields` over the hash-bound change, so the two
+      // legs would call one function over one bound value and could not disagree
+      // — and it is sealed and read back anyway, so that all three kinds take
+      // their published list from ONE place. A kind added later inherits the
+      // guarantee rather than having to be told about it, which is exactly what
+      // the update arm was not.
+      f: fields.map((one) => one.field),
       h: await changeHashOf(change),
       x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
       // The user this preview belongs to. Same field, same source, same reason
@@ -3032,6 +3074,13 @@ async function buildCreatePreview(
       // revision it carried. `createEvent` emits zero — a new event's first —
       // and never reads this field.
       s: null,
+      // **NOT null and not empty, unlike the two fields above it.** A create has
+      // no ETag and no stored revision because there is no resource yet, and it
+      // still has a diff: every field it brings into being moved, from nothing to
+      // something. `addedFields` produced this list and the response publishes it,
+      // so the same list a person read is the one the commit reports. Sealed and
+      // read back on the delete arm's argument — one place, all three kinds.
+      f: fields.map((one) => one.field),
       h: await changeHashOf(change),
       x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
       // NOT null, unlike the two fields above it. A create has no ETag and no
@@ -3691,9 +3740,13 @@ async function applyCommit(
     return {
       applied: written.created,
       id: written.id,
-      // What this write ASSERTED a value for, in the same vocabulary and the
-      // same order the preview showed it appearing in.
-      changedFields: addedFields(change).map((one) => one.field),
+      // What came into being, and it is the PREVIEW's list rather than a fresh
+      // `addedFields(change)` over the same hash-bound value. The two are equal
+      // here — a create's list is a pure function of the change, and the hash
+      // binds the change — so this is not a fix on this arm; it is what makes
+      // ONE field the single source for all three kinds. See
+      // `DavObjectConfirmPayload.f`.
+      changedFields: payload.f,
       // **INTENT, never outcome.** This server asked iCloud to carry the
       // invitation by naming the attendees and omitting any scheduling-agent
       // parameter. Whether iCloud then reported anything is a SEPARATE field —
@@ -3769,9 +3822,10 @@ async function applyCommit(
     return {
       applied: removed.applied,
       id: removed.id,
-      // What went away, in the same vocabulary and the same order the preview
-      // showed it disappearing in.
-      changedFields: removedFields(change).map((one) => one.field),
+      // What went away — the PREVIEW's list, not a fresh `removedFields(change)`
+      // over the same hash-bound value. Equal either way on this arm, for the
+      // create arm's stated reason; read from the one place so no kind can drift.
+      changedFields: payload.f,
       invitationsSent: change.attendees.length > 0,
       recipientCount: change.attendees.length,
       // **This is the path where the pair matters most**, because it is the one
@@ -3914,7 +3968,22 @@ async function applyCommit(
   return {
     applied: written.applied,
     id: written.id,
-    changedFields: assertedFields(change),
+    // **THE DEFECT THIS ARM CARRIED, and the fix is this one line.** It was
+    // `assertedFields(change)`: every field of the change holding a non-null
+    // value. On a scopeless update the preview fills every unmentioned field from
+    // the stored resource — that is what lets the patch assert them — so this
+    // published all eight on a title-only update and the sentence below counted
+    // eight, while the preview the user had just approved said one. Measured
+    // against a real event on 2026-09-25 and confirmed by a read-back: only the
+    // title had moved.
+    //
+    // The PREVIEW's observation, sealed. The commit re-reads the resource and
+    // could diff it — `occurrenceBody` and `scopelessBody` hold the before-state
+    // — and that was declined on purpose: this list answers "what did the person
+    // agree to", the confirmation is the channel for that question, and a
+    // re-derivation would be honest only for as long as the ETag comparison
+    // inside the writer keeps holding. See `DavObjectConfirmPayload.f`.
+    changedFields: payload.f,
     // **All four keyed on what the RESOURCE carries, never on what the
     // re-supplied change happens to hold.** Both writers patch, so what separates
     // the two cases is the STORED bytes rather than the choice of writer — and
@@ -3956,26 +4025,33 @@ async function applyCommit(
     recipients: recipientCount > 0 ? change.attendees : [],
     summary: change.summary,
     location: change.location,
-    // **The field count here answers a DIFFERENT question from the preview's,
-    // and the divergence is deliberate rather than a drift.** A commit re-reads
-    // nothing, so it can report what it ASSERTED a value for and cannot report
-    // what moved — which is the distinction `assertedFields` and
-    // `CommitOutcome.changedFields` already carry. The line counts the same
-    // list the response publishes beside it, so the sentence and the structure
-    // agree with each other; it is the preview that asks the narrower question,
-    // and it is the preview the user was asked to read.
+    // **The field count here answers the SAME question as the preview's, and the
+    // paragraph that used to sit here argued the opposite.** It said the
+    // divergence was deliberate: a commit re-reads nothing, so it could only
+    // report what it ASSERTED a value for. Both halves were wrong by
+    // 2026-09-25 — every update patches and therefore re-reads, and the
+    // divergence was not deliberate, it was eight reported where one moved. The
+    // argument is left recorded rather than quietly replaced, because a boundary
+    // whose history is rewritten cannot be audited and because this comment is
+    // the reason three review rounds walked past the defect.
+    //
+    // The line counts `payload.f` — the same list the response publishes beside
+    // it, sealed by the preview — so the sentence, the structure, and the two
+    // legs all agree. What still diverges is the SUBJECT on a rename, below, and
+    // that one is genuine.
     confirmationLine: composeConfirmationLine(
       {
         kind: "update",
         noun: "event",
-        // **The SUBJECT here answers a different question from the preview's
-        // too, on a rename, and that divergence is deliberate in the same way
-        // the field count below it is.** The preview names the title the
-        // resource carried THEN, because a user recognises the event by what
+        // **The SUBJECT here answers a different question from the preview's,
+        // on a rename, and it is now the ONLY thing that does — the field count
+        // below it stopped diverging on 2026-09-25.** The preview names the title
+        // the resource carried THEN, because a user recognises the event by what
         // it is called today and would be asked to confirm a change to
         // something they have never seen otherwise. This names the title that
-        // was WRITTEN, because a commit re-reads nothing and the old name is
-        // no longer a fact about the calendar. Each line is right at its own
+        // was WRITTEN, because that is the name the event now answers to and the
+        // old one is no longer a fact about the calendar. Each line is right at
+        // its own
         // moment; what is NOT true, and what two places used to claim, is that
         // the pair differs by the verb alone. It does on a create and on a
         // delete, which compose both sides from one hash-bound title, and it
@@ -3985,7 +4061,9 @@ async function applyCommit(
         // subject — which is the one signal a lying preview would produce.
         name: change.summary,
         alsoRemoved: null,
-        fieldCount: assertedFields(change).length,
+        // The SEALED list's length, so this number and the array published beside
+        // it come off one measurement and neither can drift from the preview's.
+        fieldCount: payload.f.length,
         // Computed over the bytes THIS leg re-read, not over the preview's
         // figure — the same discipline `affectedOccurrences` follows, and for
         // the same reason: a commit restating the preview's own answer proves

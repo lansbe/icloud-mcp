@@ -464,10 +464,12 @@ const MAX_FAILURES_PER_WINDOW = 5;
  * plain literals — and the rule's own comment names that gap as this phase's to
  * close.
  *
- * The version segment is the same hedge `confirm:v3:` and the DAV discovery
- * cache's own versioned prefix carry — named by role there rather than spelled,
- * because that one has already moved once and a spelled cross-reference goes
- * stale in silence when it moves again: a
+ * The version segment is the same hedge the confirmation slot's own prefix and
+ * the DAV discovery cache's carry — both named by role rather than spelled,
+ * because each has already moved and a spelled cross-reference goes stale in
+ * silence when it moves again. This paragraph spelled the confirmation one until
+ * that prefix reached v4, which is the staleness it was warning about happening
+ * to itself: a
  * later change to the shape becomes detectable rather than silently misread as
  * the current one. It has been needed twice. The keys before `v2` were
  * keyed by source rather than by target. `v2` keys held a plain count per
