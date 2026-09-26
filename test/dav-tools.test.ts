@@ -67,6 +67,7 @@ import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
 import {
   CALENDAR_UNTRUSTED_NOTICE,
   TELLS_BY_EVIDENCE,
+  UNNAMED_ORGANISER,
   affectedOccurrencesFor,
   calendarListToolResult,
   commitToolResult,
@@ -74,6 +75,8 @@ import {
   eventPageToolResult,
   previewToolResult,
   registerCalendarTools,
+  whoIsToldOf,
+  whoWasToldOf,
 } from "../src/mcp/tools/calendar";
 import type { CommitOutcome, EventPreview } from "../src/mcp/tools/calendar";
 import { registerContactsTools } from "../src/mcp/tools/contacts";
@@ -10534,7 +10537,10 @@ describe("calendar_respond_to_invitation, end to end", () => {
     expect(typeof trusted.confirmToken).toBe("string");
 
     expect(untrusted.confirmationLine).toBe(WOULD_LINE);
-    expect(untrusted.organizerName).toBe("Probe Organiser");
+    expect(untrusted.organizer).toStrictEqual({
+      name: "Probe Organiser",
+      address: "organiser.probe@example.invalid",
+    });
     expect(untrusted.change).toEqual({
       kind: "reply",
       scope: null,
@@ -10772,11 +10778,11 @@ describe("calendar_respond_to_invitation, boundaries", () => {
   // RSVP-05 / D-04: no key names a person
   // -------------------------------------------------------------------------
 
-  it("takes exactly an id and an answer, and no key that could name a person", () => {
+  it("takes exactly an id, an answer and a display zone, and no key that could name a person", () => {
     const keys = Object.keys(schemaFor("calendar_respond_to_invitation").shape).sort();
-    // 18-04 adds `tzid` and 18-05 adds `scope`; each updates this set. The
-    // pattern below never changes.
-    expect(keys).toStrictEqual(["answer", "id"]);
+    // 18-04 added `tzid` (display only) and 18-05 adds `scope`; each updates
+    // this set. The pattern below never changes.
+    expect(keys).toStrictEqual(["answer", "id", "tzid"]);
     for (const key of keys) {
       expect(key).not.toMatch(/address|attendee|email|mailto|partstat|organi[sz]er|recipient/i);
     }
@@ -10852,7 +10858,9 @@ describe("calendar_respond_to_invitation, boundaries", () => {
     expect(trusted.tells).toBeNull();
     expect(untrusted.change).toBeNull();
     expect(untrusted.confirmationLine).toBeNull();
-    expect(untrusted.organizerName).toBeNull();
+    expect(untrusted.organizer).toBeNull();
+    expect(untrusted.others).toBeNull();
+    expect(trusted.whoIsTold).toBeNull();
 
     // Exactly the two reads, and nothing written.
     expect(stub.observed.map((one) => one.method)).toStrictEqual(["REPORT", "PROPFIND"]);
@@ -11100,5 +11108,450 @@ describe("calendar_respond_to_invitation, boundaries", () => {
     // Non-vacuity: the block above wrote, so this is not a loop over nothing.
     expect(all.filter((one) => one.method === "PUT").length).toBeGreaterThanOrEqual(6);
     expect(all.filter((one) => one.method === "POST")).toStrictEqual([]);
+  });
+});
+
+// ===========================================================================
+// calendar_respond_to_invitation — what the preview says (phase 18, plan 18-04)
+//
+// RSVP-02 in full: the organiser (D-12's fallback), the times in the zone the
+// user asked for, the other attendees and what they said (D-10), and in plain
+// words who hears about the answer (D-09). Every case drives the registered
+// tool through its shipped schema.
+// ===========================================================================
+
+describe("calendar_respond_to_invitation, what the preview says", () => {
+  const GENUINE_PATH = `${WORK_PATH}rsvp-probe-0002.ics`;
+  const GENUINE_ID = encodeEventId({
+    calendarUrl: CALENDAR_URL,
+    objectUrl: `https://p42-caldav.icloud.com${GENUINE_PATH}`,
+    recurrenceId: null,
+  });
+  const IMPORTED_PATH = `${WORK_PATH}rsvp-probe-0001.ics`;
+  const IMPORTED_ID = encodeEventId({
+    calendarUrl: CALENDAR_URL,
+    objectUrl: `https://p42-caldav.icloud.com${IMPORTED_PATH}`,
+    recurrenceId: null,
+  });
+  const PROBE_PATH = `${WORK_PATH}reply-says.ics`;
+  const PROBE_ID = encodeEventId({
+    calendarUrl: CALENDAR_URL,
+    objectUrl: `https://p42-caldav.icloud.com${PROBE_PATH}`,
+    recurrenceId: null,
+  });
+  const SCHEDULE_TAG = "probe-schedule-tag-1";
+  const ALIAS_ADDRESS = "alias.one@example.invalid";
+
+  const ORGANISER = "ORGANIZER;CN=Probe Organiser:mailto:organiser.probe@example.invalid";
+  const MINE = `ATTENDEE;CN=${LOGIN_ADDRESS};PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:${LOGIN_ADDRESS}`;
+  const DANA = "ATTENDEE;CN=Dana;PARTSTAT=ACCEPTED:mailto:dana@example.invalid";
+  const EVE = "ATTENDEE;CN=Eve;PARTSTAT=X-PONDERING;EMAIL=eve@example.invalid:/aEve/principal/";
+  const SAM = "ATTENDEE:mailto:sam@example.invalid";
+
+  /** One non-repeating invitation: 16:00 to 17:00 UTC on 2026-10-01 unless a case says otherwise. */
+  function invitationBody(
+    organizer: string | null,
+    attendees: string[],
+    times: string[] = ["DTSTART:20261001T160000Z", "DTEND:20261001T170000Z"],
+  ): string {
+    return icsLines(
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Example Org//Reply Says//EN",
+      "BEGIN:VEVENT",
+      "UID:reply-says@example.invalid",
+      "DTSTAMP:20260901T120000Z",
+      ...times,
+      "SEQUENCE:0",
+      "SUMMARY:Second-round interview",
+      ...(organizer === null ? [] : [organizer]),
+      ...attendees,
+      "END:VEVENT",
+      "END:VCALENDAR",
+    );
+  }
+
+  /** Drive the tool through its SHIPPED schema; `null` when the schema refuses. */
+  async function viaSchema(
+    args: Record<string, unknown>,
+  ): Promise<{ isError?: boolean; content: { text: string }[] } | null> {
+    const parsed = schemaFor("calendar_respond_to_invitation").safeParse(args);
+    if (!parsed.success) return null;
+    return invokeRegistered(
+      "calendar_respond_to_invitation",
+      parsed.data as Record<string, unknown>,
+    );
+  }
+
+  /** A response's two halves, parsed. Fails loudly on an error result. */
+  function halves(result: { isError?: boolean; content: { text: string }[] } | null): {
+    trusted: Record<string, unknown>;
+    untrusted: Record<string, unknown>;
+  } {
+    expect(result, "the schema refused the call").not.toBeNull();
+    expect(result!.isError, `the call failed: ${result!.content[0]?.text}`).not.toBe(true);
+    const raw = blocks(result!);
+    return {
+      trusted: JSON.parse(raw.trusted) as Record<string, unknown>,
+      untrusted: fencedObject(raw.untrusted),
+    };
+  }
+
+  /** Everything a response said, lower-cased. */
+  function allText(result: { content: { text: string }[] } | null): string {
+    return (result?.content ?? []).map((one) => one.text).join("\n").toLowerCase();
+  }
+
+  async function probe(body: string, extra: WriteStubOptions = {}): Promise<WriteStub> {
+    const stub = writeDavStub({ objects: { [PROBE_PATH]: body }, ...extra });
+    await warmWrite(stub);
+    return stub;
+  }
+
+  // -------------------------------------------------------------------------
+  // D-12: the organiser, by whatever the invitation carries
+  // -------------------------------------------------------------------------
+
+  it.each([
+    [
+      "a CN and a mailto",
+      ORGANISER,
+      { name: "Probe Organiser", address: "organiser.probe@example.invalid" },
+      true,
+    ],
+    [
+      "a CN and a path with EMAIL=",
+      "ORGANIZER;CN=Probe Organiser;EMAIL=organiser.probe@example.invalid:/aOrg/principal/",
+      { name: "Probe Organiser", address: "organiser.probe@example.invalid" },
+      true,
+    ],
+    [
+      "a CN and no address",
+      "ORGANIZER;CN=Probe Organiser:/aOrg/principal/",
+      { name: "Probe Organiser", address: null },
+      false,
+    ],
+    [
+      "an address and no CN",
+      "ORGANIZER:mailto:organiser.probe@example.invalid",
+      { name: "organiser.probe@example.invalid", address: "organiser.probe@example.invalid" },
+      true,
+    ],
+    [
+      "neither a name nor an address",
+      "ORGANIZER:/aOrg/principal/",
+      { name: UNNAMED_ORGANISER, address: null },
+      false,
+    ],
+  ])("names an organiser carrying %s", async (_label, organizer, expected, known) => {
+    await probe(invitationBody(organizer, [MINE]));
+
+    const { trusted, untrusted } = halves(
+      await viaSchema({ id: PROBE_ID, answer: "declined" }),
+    );
+
+    // Fenced, and never null: the organiser is never dropped (D-12).
+    expect(untrusted.organizer).toStrictEqual(expected);
+    expect(trusted.organizerAddressKnown).toBe(known);
+    expect(trusted).not.toHaveProperty("organizer");
+    // No tag and no SCHEDULE-AGENT marker: the evidence decides nothing.
+    expect(trusted.tells).toBe("organizer-maybe");
+    expect((untrusted.organizer as { name: unknown }).name).not.toBeNull();
+  });
+
+  it("says in its own words when iCloud tells an organiser whose address it cannot read", async () => {
+    await probe(invitationBody("ORGANIZER;CN=Probe Organiser:/aOrg/principal/", [MINE]), {
+      scheduleTags: { [PROBE_PATH]: SCHEDULE_TAG },
+    });
+
+    const { trusted, untrusted } = halves(
+      await viaSchema({ id: PROBE_ID, answer: "accepted" }),
+    );
+
+    expect(trusted.tells).toBe("organizer");
+    expect(trusted.whoIsTold).toBe(
+      "iCloud will tell the organiser your answer. This server cannot read the " +
+        "organiser's address, so it cannot show you where the reply goes.",
+    );
+    // The composed line still names them, by the name the invitation carries.
+    expect(String(untrusted.confirmationLine)).toContain("'Probe Organiser'");
+  });
+
+  it("shows the fixed phrase, never null, when the organiser carries nothing at all", async () => {
+    await probe(invitationBody("ORGANIZER:/aOrg/principal/", [MINE]), {
+      scheduleTags: { [PROBE_PATH]: SCHEDULE_TAG },
+    });
+
+    const result = await viaSchema({ id: PROBE_ID, answer: "accepted" });
+    const { trusted, untrusted } = halves(result);
+
+    expect((untrusted.organizer as { name: unknown }).name).toBe(
+      "an organiser whose address this server cannot read",
+    );
+    expect(trusted.organizerAddressKnown).toBe(false);
+    expect(String(trusted.whoIsTold)).toContain("cannot read the organiser's address");
+  });
+
+  // -------------------------------------------------------------------------
+  // D-10: the other attendees, their answers, and never the user
+  // -------------------------------------------------------------------------
+
+  it("lists every other attendee with a matched answer, and says they are not told directly", async () => {
+    await probe(invitationBody(ORGANISER, [DANA, MINE, EVE, SAM]), {
+      scheduleTags: { [PROBE_PATH]: SCHEDULE_TAG },
+    });
+
+    const { trusted, untrusted } = halves(
+      await viaSchema({ id: PROBE_ID, answer: "tentative" }),
+    );
+
+    expect(untrusted.others).toStrictEqual([
+      { name: "Dana", email: "dana@example.invalid", answer: "accepted" },
+      // A stranger's own PARTSTAT is MATCHED, never repeated.
+      { name: "Eve", email: "eve@example.invalid", answer: "other" },
+      // No PARTSTAT is RFC 5545's default: not answered.
+      { name: null, email: "sam@example.invalid", answer: "needs-action" },
+    ]);
+    expect(trusted.othersCount).toBe(3);
+    expect(trusted).not.toHaveProperty("others");
+    expect(trusted.whoIsTold).toBe(
+      "iCloud will tell the organiser your answer. The other 3 attendees are not told directly.",
+    );
+    expect(JSON.stringify(trusted)).not.toContain("X-PONDERING");
+    expect(JSON.stringify(untrusted)).not.toContain("X-PONDERING");
+  });
+
+  it("uses the singular for one other attendee", async () => {
+    await probe(invitationBody(ORGANISER, [MINE, DANA]), {
+      scheduleTags: { [PROBE_PATH]: SCHEDULE_TAG },
+    });
+
+    const { trusted } = halves(await viaSchema({ id: PROBE_ID, answer: "declined" }));
+
+    expect(trusted.othersCount).toBe(1);
+    expect(trusted.whoIsTold).toBe(
+      "iCloud will tell the organiser your answer. The other 1 attendee is not told directly.",
+    );
+  });
+
+  it("never lists the user's own line, though it carries a CN, and names no user address anywhere", async () => {
+    await probe(
+      invitationBody(ORGANISER, [
+        // The genuine copy's shape: CN is the address, the value a path.
+        `ATTENDEE;CN=${LOGIN_ADDRESS};PARTSTAT=NEEDS-ACTION;EMAIL=${LOGIN_ADDRESS}:/aOwnerPrincipalProbe/principal/`,
+        DANA,
+      ]),
+      { scheduleTags: { [PROBE_PATH]: SCHEDULE_TAG } },
+    );
+
+    const result = await viaSchema({ id: PROBE_ID, answer: "accepted" });
+    const { untrusted } = halves(result);
+
+    expect(untrusted.others).toStrictEqual([
+      { name: "Dana", email: "dana@example.invalid", answer: "accepted" },
+    ]);
+    const text = allText(result);
+    expect(text).not.toContain(LOGIN_ADDRESS);
+    expect(text).not.toContain(ALIAS_ADDRESS);
+  });
+
+  it("names neither of the user's addresses on the genuine copy's preview or commit", async () => {
+    const stub = writeDavStub({
+      objects: { [GENUINE_PATH]: ATTENDEE_COPY_GENUINE_ICS },
+      scheduleTags: { [GENUINE_PATH]: SCHEDULE_TAG },
+    });
+    await warmWrite(stub);
+
+    const previewed = await viaSchema({ id: GENUINE_ID, answer: "declined", tzid: "America/Chicago" });
+    const { trusted, untrusted } = halves(previewed);
+    // The organiser's own attendee line is not counted among the others: the
+    // preview names them once, as the organiser, and says whether they hear.
+    expect(untrusted.others).toStrictEqual([]);
+    expect(trusted.othersCount).toBe(0);
+    expect(trusted.whoIsTold).toBe("iCloud will tell the organiser your answer.");
+
+    const committed = await invokeRegistered("calendar_commit", {
+      confirmToken: trusted.confirmToken,
+      change: untrusted.change,
+    });
+    const text = `${allText(previewed)}\n${allText(committed)}`;
+    expect(text).not.toContain(LOGIN_ADDRESS);
+    expect(text).not.toContain(ALIAS_ADDRESS);
+  });
+
+  // -------------------------------------------------------------------------
+  // OQ3: the times, in the zone the user asked for
+  // -------------------------------------------------------------------------
+
+  it("renders the times in a requested zone, as trusted fields this server computed", async () => {
+    const stub = writeDavStub({
+      objects: { [GENUINE_PATH]: ATTENDEE_COPY_GENUINE_ICS },
+      scheduleTags: { [GENUINE_PATH]: SCHEDULE_TAG },
+    });
+    await warmWrite(stub);
+
+    const { trusted, untrusted } = halves(
+      await viaSchema({ id: GENUINE_ID, answer: "accepted", tzid: "America/Chicago" }),
+    );
+
+    // 12:00 in Los Angeles on 2026-09-29 is 19:00Z, which is 14:00 in Chicago.
+    expect(trusted.start).toBe("2026-09-29T14:00:00");
+    expect(trusted.end).toBe("2026-09-29T15:00:00");
+    expect(trusted.timesZone).toBe("America/Chicago");
+    expect(trusted.timesZoneSource).toBe("requested");
+    expect(trusted.allDay).toBe(false);
+    expect(untrusted).not.toHaveProperty("start");
+    expect(untrusted).not.toHaveProperty("timesZone");
+  });
+
+  it("shows the event's own wall clock, fenced, when no zone is asked for", async () => {
+    const stub = writeDavStub({
+      objects: { [GENUINE_PATH]: ATTENDEE_COPY_GENUINE_ICS },
+      scheduleTags: { [GENUINE_PATH]: SCHEDULE_TAG },
+    });
+    await warmWrite(stub);
+
+    const { trusted, untrusted } = halves(
+      await viaSchema({ id: GENUINE_ID, answer: "accepted" }),
+    );
+
+    expect(trusted.timesZoneSource).toBe("event");
+    expect(trusted).not.toHaveProperty("start");
+    expect(trusted).not.toHaveProperty("timesZone");
+    // The preview says which zone it used: the event's own, inside the fence.
+    expect(untrusted.start).toBe("2026-09-29T12:00:00");
+    expect(untrusted.end).toBe("2026-09-29T13:00:00");
+    expect(untrusted.timesZone).toBe("America/Los_Angeles");
+  });
+
+  it("keeps an all-day event's own dates, even with a zone asked for", async () => {
+    await probe(
+      invitationBody(ORGANISER, [MINE], [
+        "DTSTART;VALUE=DATE:20261001",
+        "DTEND;VALUE=DATE:20261002",
+      ]),
+    );
+
+    for (const tzid of [undefined, "America/Chicago"]) {
+      const { trusted, untrusted } = halves(
+        await viaSchema({ id: PROBE_ID, answer: "accepted", ...(tzid ? { tzid } : {}) }),
+      );
+      expect(trusted.allDay).toBe(true);
+      expect(trusted.timesZoneSource).toBe("event");
+      expect(untrusted.start).toBe("2026-10-01");
+    }
+  });
+
+  it("refuses a zone this server holds no definition for, before any request, minting nothing", async () => {
+    const stub = await probe(invitationBody(ORGANISER, [MINE]));
+
+    const result = await viaSchema({ id: PROBE_ID, answer: "accepted", tzid: "Mars/Olympus" });
+    const { trusted, untrusted } = halves(result);
+
+    expect(trusted.refusal).toBe("unsupported-timezone");
+    expect(typeof trusted.refusalReason).toBe("string");
+    expect(trusted.confirmToken).toBeNull();
+    expect(untrusted.change).toBeNull();
+    expect(untrusted.confirmationLine).toBeNull();
+    expect(stub.observed).toStrictEqual([]);
+    // The caller's string is not echoed into this server's sentence.
+    expect(allText(result)).not.toContain("mars/olympus");
+  });
+
+  it("does not seal the display zone into the change: a zone-less commit accepts it", async () => {
+    const stub = await probe(invitationBody(ORGANISER, [MINE]), {
+      scheduleTags: { [PROBE_PATH]: SCHEDULE_TAG },
+    });
+
+    const shown = halves(await viaSchema({ id: PROBE_ID, answer: "accepted", tzid: "America/Denver" }));
+    const plain = halves(await viaSchema({ id: PROBE_ID, answer: "accepted" }));
+    expect(shown.untrusted.change).toStrictEqual(plain.untrusted.change);
+    expect(shown.untrusted.confirmationLine).toBe(plain.untrusted.confirmationLine);
+
+    stub.observed.length = 0;
+    const committed = halves(
+      await invokeRegistered("calendar_commit", {
+        confirmToken: shown.trusted.confirmToken,
+        change: shown.untrusted.change,
+      }),
+    );
+    expect(committed.trusted.applied).toBe(true);
+    expect(stub.observed.filter((one) => one.method === "PUT").length).toBe(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // D-09 / D-02: who is told, per event, in both tenses
+  // -------------------------------------------------------------------------
+
+  it.each([
+    ["a schedule tag", GENUINE_ID, GENUINE_PATH, ATTENDEE_COPY_GENUINE_ICS, SCHEDULE_TAG,
+      "iCloud will tell the organiser your answer.",
+      "iCloud was asked to tell the organiser your answer."],
+    ["no tag and no marker", GENUINE_ID, GENUINE_PATH, ATTENDEE_COPY_GENUINE_ICS, null,
+      "The organiser may be told your answer by iCloud. This invitation does not show whether iCloud will send it.",
+      "The organiser may have been told your answer by iCloud."],
+    ["the imported copy's markers", IMPORTED_ID, IMPORTED_PATH, ATTENDEE_COPY_IMPORTED_ICS, null,
+      "Only your calendar changes. Nobody is told.",
+      "Only your calendar changed. Nobody was told."],
+  ] as const)("says who is told for %s, and the commit says it in the past tense", async (
+    _label, id, path, body, tag, would, did,
+  ) => {
+    const stub = writeDavStub({
+      objects: { [path]: body },
+      ...(tag === null ? {} : { scheduleTags: { [path]: tag } }),
+    });
+    await warmWrite(stub);
+
+    const previewed = halves(await viaSchema({ id, answer: "declined" }));
+    expect(previewed.trusted.whoIsTold).toBe(would);
+
+    const committed = halves(
+      await invokeRegistered("calendar_commit", {
+        confirmToken: previewed.trusted.confirmToken,
+        change: previewed.untrusted.change,
+      }),
+    );
+    expect(committed.trusted.whoWasTold).toBe(did);
+    expect(committed.untrusted).not.toHaveProperty("whoWasTold");
+  });
+
+  it("pins every sentence of the closed table, in both tenses", () => {
+    const unobserved = { status: "unreported", confirmed: false } as const;
+    expect(whoIsToldOf("organizer", "accepted", true, 0)).toBe(
+      "iCloud will tell the organiser your answer.",
+    );
+    expect(whoIsToldOf("organizer-maybe", "accepted", true, 2)).toBe(
+      "The organiser may be told your answer by iCloud. This invitation does not " +
+        "show whether iCloud will send it. The other 2 attendees are not told directly.",
+    );
+    expect(whoIsToldOf("nobody", "tentative", false, 0)).toBe(
+      "Only your calendar changes. Nobody is told.",
+    );
+    // D-02's narrowing. Reachable from no row of TELLS_BY_EVIDENCE today, because
+    // 18-01 measured iCloud replying; kept, and pinned, for the day it is not.
+    expect(whoIsToldOf("narrowed", "declined", true, 0)).toBe(
+      "Your calendar will show declined; the organiser will not be told.",
+    );
+    expect(whoWasToldOf("narrowed", "declined", 0, unobserved)).toBe(
+      "Your calendar shows declined; the organiser has not been told.",
+    );
+    expect(whoWasToldOf("organizer", "accepted", 1, unobserved)).toBe(
+      "iCloud was asked to tell the organiser your answer. The other 1 attendee was not told directly.",
+    );
+    expect(whoWasToldOf("organizer", "accepted", 3, { status: "sent", confirmed: true })).toBe(
+      "iCloud reports the reply to the organiser as sent. The other 3 attendees were not told directly.",
+    );
+    expect(whoWasToldOf("organizer", "accepted", 0, { status: "delivered", confirmed: true })).toBe(
+      "iCloud reports the reply to the organiser as delivered.",
+    );
+    // A pending report is not a report of sending, so it says what was done.
+    expect(whoWasToldOf("organizer", "accepted", 0, { status: "pending", confirmed: false })).toBe(
+      "iCloud was asked to tell the organiser your answer.",
+    );
+    // "Nobody" is never said where the evidence could not decide.
+    for (const count of [0, 1, 4]) {
+      expect(whoIsToldOf("organizer-maybe", "declined", true, count)).not.toMatch(/nobody/i);
+      expect(whoWasToldOf("organizer-maybe", "declined", count, unobserved)).not.toMatch(/nobody/i);
+    }
   });
 });

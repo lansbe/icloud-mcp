@@ -323,11 +323,17 @@ export const TRUSTED_FIELD_ALLOWLIST: Record<string, AllowedShape> = {
   // PARTSTAT and the stored scheduling marker are read, and a literal from this
   // server's own list is published in their place — the raw values never leave.
   //
-  // **Note what is NOT here: `title`, `organizerName`, `change` and
-  // `confirmationLine`.** The title and the organiser's name are chosen by
-  // whoever sent the invitation, the change is the object a caller passes back,
-  // and the line quotes both names, so all four ride inside the fence. The
-  // user's own address is on neither side at all (RSVP-02).
+  // **Note what is NOT here: `title`, `organizer`, `others`, `change` and
+  // `confirmationLine`.** The title, the organiser and every other attendee are
+  // chosen by whoever sent the invitation, the change is the object a caller
+  // passes back, and the line quotes the names, so all five ride inside the
+  // fence. The user's own address is on neither side at all (RSVP-02).
+  //
+  // `start`, `end` and `timesZone` are OPTIONAL here (plan 18-04): they ride
+  // out only when this server rendered them itself from an instant, in a zone
+  // the caller named and it validated. On the event's own path the zone is the
+  // resource's string — a stranger's on the unresolved path — so all three ride
+  // fenced instead, on `eventUntrustedPart`'s precedent for `startTzid`.
   replyPreviewToolResult: {
     top: new Set([
       "id", // server-generated: the caller's opaque id, echoed — base64url(JSON) this server minted over discovered URLs.
@@ -335,11 +341,20 @@ export const TRUSTED_FIELD_ALLOWLIST: Record<string, AllowedShape> = {
       "currentAnswer", // server-generated: one of five literals this server MATCHED the stored PARTSTAT against, or null. The raw value is never published.
       "evidence", // server-generated: one of three literals this server computes from the stored bytes and the server's scheduling marker, never a value copied out of them.
       "tells", // server-generated: one of four literals, looked up in TELLS_BY_EVIDENCE from the evidence above.
-      "refusal", // server-generated: one of five literals from a closed union, or null.
-      "refusalReason", // server-generated: this server's own sentence from a closed table. Names no address, no title, no organiser.
+      "refusal", // server-generated: one of six literals from a closed union, or null.
+      "refusalReason", // server-generated: this server's own sentence from a closed table. Names no address, no title, no organiser, no zone.
+      "allDay", // server-generated: this server's reading of DATE vs DATE-TIME. A boolean, or null when nothing was read.
+      "timesZoneSource", // server-generated: one of two literals naming which path produced the times, or null. Never the zone itself.
+      "start", // server-generated, OPTIONAL: rendered by utcToLocalTime from a parsed instant, in a zone isSupportedTimezone validated. Present only on the requested-zone path.
+      "end", // server-generated, OPTIONAL: as start.
+      "timesZone", // caller-chosen and server-VALIDATED, OPTIONAL: present only when it is one of this server's own allow-listed zone names. The event's own zone is never published here.
+      "organizerAddressKnown", // server-generated: a boolean this server computed from whether the organiser line carried an address. Carries no address.
+      "othersCount", // server-generated: a count this server took of the list it built. Identities stay fenced.
+      "whoIsTold", // server-generated: one sentence from a closed table, keyed on tells, the boolean above and the count. Interpolates only this server's answer word and its own count; no name, no address.
       "confirmToken", // server-generated: signed here with this server's own key.
       "expiresInSeconds", // server-generated: this server's own TTL constant.
     ]),
+    optionalTop: new Set(["start", "end", "timesZone"]),
   },
 
   // -- calendar_commit, the reply arm ---------------------------------------
@@ -354,6 +369,7 @@ export const TRUSTED_FIELD_ALLOWLIST: Record<string, AllowedShape> = {
       "answer", // server-generated: one of three literals, from the signed change.
       "tells", // server-generated: one of four literals, from this commit's own re-read through TELLS_BY_EVIDENCE.
       "delivery", // server-generated: a matched status constant and a boolean this server decided. Never a status string a server wrote.
+      "whoWasTold", // server-generated: one sentence from a closed table, keyed on tells, the delivery status above and this commit's own count. No name, no address.
     ]),
   },
 
@@ -1177,7 +1193,17 @@ function replyPreview(overrides: Partial<ReplyPreview> = {}): ReplyPreview {
     refusal: null,
     refusalReason: null,
     title: HOSTILE_CALENDAR_TITLE,
-    organizerName: "Probe Organiser",
+    start: "2026-09-29T12:00:00",
+    end: "2026-09-29T13:00:00",
+    allDay: false,
+    timesZone: "America/Los_Angeles",
+    timesZoneSource: "event",
+    organizer: { name: "Probe Organiser", address: "organiser.probe@example.invalid" },
+    organizerAddressKnown: true,
+    others: [{ name: "Dana Hostile", email: "dana@example.invalid", answer: "accepted" }],
+    othersCount: 1,
+    whoIsTold:
+      "iCloud will tell the organiser your answer. The other 1 attendee is not told directly.",
     change: { kind: "reply", scope: null, answer: "accepted" },
     confirmToken: "cGF5bG9hZA.bWFj",
     expiresInSeconds: 300,
@@ -1201,6 +1227,7 @@ function replyCommitOutcome(
     answer: "accepted",
     tells: "organizer",
     delivery: { status: "unreported", confirmed: false },
+    whoWasTold: "iCloud was asked to tell the organiser your answer.",
     confirmationLine:
       "Answered the invitation as accepted, telling the organiser 'Probe Organiser'. A reply cannot be unsent.",
     ...overrides,
@@ -1359,10 +1386,20 @@ describe("the trusted block of every shipped DAV shaper", () => {
   it("replyPreviewToolResult publishes exactly the audited keys", () => {
     const shape = TRUSTED_FIELD_ALLOWLIST.replyPreviewToolResult;
 
-    // The minted path and a refusal, because the key set must be the same on
-    // both and a null-valued field is where a shaper is tempted to drop a key.
+    // The requested-zone path publishes the optional keys; the event-zone path,
+    // a refusal and the zone refusal do not. Both sides of the optional set.
+    expectExactKeys(
+      trustedBlockOf(
+        replyPreviewToolResult(
+          replyPreview({ timesZone: "America/Chicago", timesZoneSource: "requested" }),
+        ),
+      ),
+      shape.top,
+      "replyPreviewToolResult (requested zone)",
+    );
+    const reduced = without(shape.top, shape.optionalTop!);
     for (const [label, preview] of [
-      ["minted", replyPreview()],
+      ["minted, event zone", replyPreview()],
       [
         "refused",
         replyPreview({
@@ -1370,7 +1407,32 @@ describe("the trusted block of every shipped DAV shaper", () => {
           tells: null,
           refusal: "not-invited",
           refusalReason: "You are not invited to this event as a guest.",
-          organizerName: null,
+          organizer: null,
+          organizerAddressKnown: null,
+          others: null,
+          othersCount: null,
+          whoIsTold: null,
+          change: null,
+          confirmToken: null,
+          expiresInSeconds: null,
+          confirmationLine: null,
+        }),
+      ],
+      [
+        "zone refused",
+        replyPreview({
+          refusal: "unsupported-timezone",
+          title: null,
+          start: null,
+          end: null,
+          allDay: null,
+          timesZone: null,
+          timesZoneSource: null,
+          organizer: null,
+          organizerAddressKnown: null,
+          others: null,
+          othersCount: null,
+          whoIsTold: null,
           change: null,
           confirmToken: null,
           expiresInSeconds: null,
@@ -1379,18 +1441,26 @@ describe("the trusted block of every shipped DAV shaper", () => {
       ],
     ] as const) {
       const trusted = trustedBlockOf(replyPreviewToolResult(preview));
-      expectExactKeys(trusted, shape.top, `replyPreviewToolResult (${label})`);
+      expectExactKeys(trusted, reduced, `replyPreviewToolResult (${label})`);
     }
 
-    // The title and the organiser's name are FENCED, and named here rather than
-    // left to the key set: the comparison would also pass if either had been
-    // dropped from the response altogether.
+    // The title, the organiser and every other attendee are FENCED, and named
+    // here rather than left to the key set: the comparison would also pass if
+    // any had been dropped from the response altogether.
     const result = replyPreviewToolResult(replyPreview());
     const trusted = JSON.stringify(trustedBlockOf(result));
-    expect(trusted).not.toContain(HOSTILE_CALENDAR_TITLE);
-    expect(trusted).not.toContain("Probe Organiser");
-    expect(result.content[1].text).toContain(HOSTILE_CALENDAR_TITLE);
-    expect(result.content[1].text).toContain("Probe Organiser");
+    for (const stranger of [
+      HOSTILE_CALENDAR_TITLE,
+      "Probe Organiser",
+      "organiser.probe@example.invalid",
+      "Dana Hostile",
+      "dana@example.invalid",
+      // The event's own zone, on the event-zone path.
+      "America/Los_Angeles",
+    ]) {
+      expect(trusted).not.toContain(stranger);
+      expect(result.content[1].text).toContain(stranger);
+    }
     expect(result.content[1].text).toContain("confirmationLine");
   });
 

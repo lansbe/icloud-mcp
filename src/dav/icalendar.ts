@@ -2923,13 +2923,42 @@ export type SchedulingEvidence =
   | "imported-copy"
   | "undetermined";
 
+/**
+ * Who organises an invitation, as the line carries it (D-12).
+ *
+ * Two fields rather than one display string, because "the organiser's address
+ * is unknown" is a fact the preview states in its own words, and a single
+ * string that fell back from the name to the address would have erased it.
+ */
+export interface InvitationOrganizer {
+  /** The `CN`, verbatim and untrusted. Null when absent or empty. */
+  name: string | null;
+  /**
+   * The address the reply would go to: the `mailto:` value, else the `EMAIL`
+   * parameter, else null. Verbatim and untrusted. 18-01 measured a genuine
+   * iCloud invitation whose organiser value is an opaque principal path with
+   * the address only in `EMAIL=`, which is why the parameter is read too.
+   */
+  address: string | null;
+}
+
+/** One other person on an invitation, verbatim. Every field untrusted. */
+export interface InvitationAttendee {
+  /** The `CN`. Null when absent. */
+  name: string | null;
+  /** The `mailto:` address, else the `EMAIL` parameter, else null. */
+  email: string | null;
+  /** The raw `PARTSTAT`. The tool layer matches it against a closed table. */
+  partstat: string | null;
+}
+
 /** What a preview needs to know about one invitation, read in one parse. */
 export interface InvitationFacts {
   /**
-   * Who organises it, for the sentence. The `CN`, else the `mailto:` address,
-   * else the `EMAIL` parameter, else null. Untrusted and verbatim.
+   * Who organises it: the first `ORGANIZER` on the resource, or both fields
+   * null when there is none. Untrusted and verbatim.
    */
-  organizerName: string | null;
+  organizer: InvitationOrganizer;
   /**
    * The raw `PARTSTAT` on the user's own line, on the first component carrying
    * one, or null. Untrusted and verbatim: the tool layer MATCHES it against a
@@ -2938,6 +2967,23 @@ export interface InvitationFacts {
   ownAnswer: string | null;
   /** Which side of 18-01's measurement this resource sits on. */
   evidence: SchedulingEvidence;
+  /**
+   * Everybody else on the invitation, in document order (D-10).
+   *
+   * Read off ONE component — the master when there is one, else the first —
+   * because a master and its overrides each repeat the list, and reading every
+   * component would list each person once per edited date.
+   *
+   * **Two kinds of line are left out, and both on purpose.** The user's own
+   * line or lines, matched by `isOwnAddress` against the account's own address
+   * set: the user is not "another attendee", and their address must not reach
+   * a response (RSVP-02). And the organiser's own attendee line, when the
+   * organiser also sits on the list (both measured copies carry one): the
+   * preview names the organiser separately and says whether they are told, so
+   * counting them again among the people who are "not told directly" would
+   * make the preview contradict itself.
+   */
+  others: InvitationAttendee[];
 }
 
 /**
@@ -2984,14 +3030,14 @@ export function invitationFactsOf(
   scheduleTag: string | null,
 ): InvitationFacts {
   return withParsedResource(icsText, (resource) => {
-    let organizerName: string | null = null;
+    let organizerLine: IcalProperty | null = null;
     let ownAnswer: string | null = null;
     let answered = false;
     let clientScheduled = false;
 
     for (const component of resource.components) {
       for (const organizer of component.getAllProperties("organizer")) {
-        if (organizerName === null) organizerName = organizerNameOf(organizer);
+        if (organizerLine === null) organizerLine = organizer;
         if (isClientScheduled(organizer)) clientScheduled = true;
       }
       for (const attendee of component.getAllProperties("attendee")) {
@@ -3011,21 +3057,64 @@ export function invitationFactsOf(
           ? "imported-copy"
           : "undetermined";
 
-    return { organizerName, ownAnswer, evidence };
+    const organizer: InvitationOrganizer =
+      organizerLine === null
+        ? { name: null, address: null }
+        : { name: nonEmpty(firstParameter(organizerLine, "cn")), address: addressOf(organizerLine) };
+
+    // The master when there is one: it carries the list every override repeats.
+    const listed =
+      resource.components.find((one) => !one.hasProperty("recurrence-id")) ??
+      resource.components[0] ??
+      null;
+    const others: InvitationAttendee[] = [];
+    for (const attendee of listed?.getAllProperties("attendee") ?? []) {
+      if (namesUser(attendee, addresses)) continue;
+      if (organizerLine !== null && sameParty(attendee, organizerLine)) continue;
+      others.push({
+        name: firstParameter(attendee, "cn"),
+        email: addressOf(attendee),
+        partstat: firstParameter(attendee, "partstat"),
+      });
+    }
+
+    return { organizer, ownAnswer, evidence, others };
   });
 }
 
-/** An organiser's name for the sentence, from whatever the line carries. */
-function organizerNameOf(organizer: IcalProperty): string | null {
-  const name = firstParameter(organizer, "cn");
-  if (name !== null && name.length > 0) return name;
-  const value = calAddressOf(organizer);
+/** A string, or null when it is absent or empty. */
+function nonEmpty(value: string | null): string | null {
+  return value !== null && value.length > 0 ? value : null;
+}
+
+/**
+ * The address one `ORGANIZER` or `ATTENDEE` line would be reached at: the
+ * `mailto:` value, else the `EMAIL` parameter, else null. Verbatim.
+ */
+function addressOf(property: IcalProperty): string | null {
+  const value = calAddressOf(property);
   if (value !== null && value.toLowerCase().startsWith(MAILTO_PREFIX)) {
     const address = value.slice(MAILTO_PREFIX.length);
     if (address.length > 0) return address;
   }
-  const email = firstParameter(organizer, "email");
-  return email !== null && email.length > 0 ? email : null;
+  return nonEmpty(firstParameter(property, "email"));
+}
+
+/**
+ * Whether an attendee line names the same person as the organiser line.
+ *
+ * The same value exactly (an opaque principal path compares only that way, on
+ * `isOwnAddress`'s rule), or the same address once folded. Used only to keep
+ * the organiser out of the other-attendees list, never to decide who is told.
+ */
+function sameParty(attendee: IcalProperty, organizer: IcalProperty): boolean {
+  const value = calAddressOf(attendee);
+  if (value !== null && value.length > 0 && value === calAddressOf(organizer)) {
+    return true;
+  }
+  const one = addressOf(attendee);
+  const two = addressOf(organizer);
+  return one !== null && two !== null && one.toLowerCase() === two.toLowerCase();
 }
 
 /** Whether a line says the server does not schedule for this person. */

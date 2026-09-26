@@ -41,6 +41,7 @@ import type {
   AlarmReading,
   AlarmSpec,
   BuildEventInput,
+  InvitationFacts,
   OccurrenceCounts,
   OverrideRange,
   ReplyAnswer,
@@ -86,6 +87,7 @@ import {
   isWriteScope,
   localTimeToUtc,
   storedAlarmsOf,
+  utcToLocalTime,
 } from "../../dav/icalendar";
 import {
   decodeCalendarId,
@@ -4675,7 +4677,8 @@ export type ReplyRefusal =
   | "not-invited"
   | "organiser"
   | "ambiguous"
-  | "unchanged";
+  | "unchanged"
+  | "unsupported-timezone";
 
 /**
  * The sentence each refusal carries. This server's own words, and the only ones.
@@ -4702,6 +4705,11 @@ const REPLY_REFUSAL_REASONS: Readonly<Record<ReplyRefusal, string>> =
     unchanged:
       "Your answer is already this one. Nothing would change, so nothing " +
       "was prepared.",
+    // Names no zone. The zone is the caller's string, and a refusal that
+    // echoed it would put caller text into this server's own sentence.
+    "unsupported-timezone":
+      "This server holds no definition for the requested time zone, so " +
+      "nothing was prepared. Omit the zone to see the event's own.",
   });
 
 /** The user's stored answer, as one of this server's own words. */
@@ -4734,6 +4742,206 @@ function currentAnswerOf(raw: string | null): CurrentAnswer | null {
 }
 
 /**
+ * Another attendee's stored answer, matched. Never null.
+ *
+ * A line with no PARTSTAT reads as `needs-action`, because RFC 5545 § 3.2.12
+ * makes that the default: a person who has said nothing has not answered.
+ * Unlike the user's own answer, "no value" here is not a separate fact worth a
+ * separate word.
+ */
+function otherAnswerOf(raw: string | null): CurrentAnswer {
+  return currentAnswerOf(raw) ?? "needs-action";
+}
+
+/**
+ * Where the preview's times came from.
+ *
+ * `requested`: this server converted the event's instants into a zone the
+ * caller named and it validated. `event`: the event's own wall clock, in the
+ * zone the event itself names — a stranger's string on the unresolved path.
+ */
+export type TimesZoneSource = "requested" | "event";
+
+/** The organiser as the preview names them (D-12). Stranger text. */
+export interface ReplyOrganizerRow {
+  /**
+   * The CN, else the address, else this server's own fixed phrase. Never null,
+   * so the organiser is never dropped and never printed as nothing.
+   */
+  name: string;
+  /** The address the reply goes to, or null when the invitation carries none. */
+  address: string | null;
+}
+
+/** One other attendee, as the preview lists them (D-10). */
+export interface ReplyAttendeeRow {
+  /** The CN, verbatim. Stranger text. */
+  name: string | null;
+  /** The address, verbatim. Stranger text. */
+  email: string | null;
+  /** Their stored answer, MATCHED against this server's closed table. */
+  answer: CurrentAnswer;
+}
+
+/**
+ * The organiser's name when the invitation carries neither a name nor an
+ * address. This server's own words, so a preview never shows the organiser as
+ * null and never leaves them out (D-12).
+ */
+export const UNNAMED_ORGANISER = "an organiser whose address this server cannot read";
+
+/** The organiser row: the CN, else the address, else the fixed phrase. */
+function organizerRowOf(facts: InvitationFacts): ReplyOrganizerRow {
+  const { name, address } = facts.organizer;
+  return { name: name ?? address ?? UNNAMED_ORGANISER, address };
+}
+
+/** The name the composer quotes: the CN, else the address, else none. */
+function organizerNameFor(facts: InvitationFacts): string | null {
+  return facts.organizer.name ?? facts.organizer.address;
+}
+
+/** "The other N attendees are not told directly.", in either tense. */
+function othersNotToldOf(count: number, tense: "would" | "did"): string {
+  if (count === 1) {
+    return tense === "would"
+      ? "The other 1 attendee is not told directly."
+      : "The other 1 attendee was not told directly.";
+  }
+  return tense === "would"
+    ? `The other ${count} attendees are not told directly.`
+    : `The other ${count} attendees were not told directly.`;
+}
+
+/**
+ * Who hears about the answer, in plain words (RSVP-02, D-09, D-10).
+ *
+ * **One closed table, decided per event from the data, and no blanket
+ * caveat.** Which sentence is chosen is keyed on `tells` — itself looked up in
+ * `TELLS_BY_EVIDENCE` from what 18-01 measured — on whether the organiser's
+ * address is known, and on how many other people are on the invitation.
+ *
+ * **It holds no stranger text, and must not.** It is published in the TRUSTED
+ * half. The organiser's name is already in the fenced `organizer` row and in the
+ * composed line through the composer's quoting; a trusted sentence that
+ * carried the name would be a stranger's string presented as this server's.
+ * The only interpolations are this server's own answer word and its own count.
+ *
+ * `organizer-maybe` says "may" and never "will not": where the evidence cannot
+ * decide, the one claim that must not be made is that nobody hears, because a
+ * reply cannot be unsent (T-18-21).
+ */
+export function whoIsToldOf(
+  tells: ReplyTells,
+  answer: ReplyAnswerWord,
+  organizerAddressKnown: boolean,
+  othersCount: number,
+): string {
+  let lead: string;
+  switch (tells) {
+    case "organizer":
+      lead = organizerAddressKnown
+        ? "iCloud will tell the organiser your answer."
+        : "iCloud will tell the organiser your answer. This server cannot " +
+          "read the organiser's address, so it cannot show you where the " +
+          "reply goes.";
+      break;
+    case "organizer-maybe":
+      lead =
+        "The organiser may be told your answer by iCloud. This invitation " +
+        "does not show whether iCloud will send it.";
+      break;
+    case "nobody":
+      lead = "Only your calendar changes. Nobody is told.";
+      break;
+    case "narrowed":
+      lead = `Your calendar will show ${answer}; the organiser will not be told.`;
+      break;
+  }
+  return othersCount >= 1 ? `${lead} ${othersNotToldOf(othersCount, "would")}` : lead;
+}
+
+/**
+ * `whoIsToldOf`'s past-tense twin, for the commit.
+ *
+ * The organiser arm reports what this server DID — it handed the answer to
+ * iCloud — unless the delivery report carries a status the server itself
+ * recorded, in which case it says that status and nothing stronger. Today the
+ * report is always the unobserved constant (18-01 measured nothing to read
+ * back), so the first form is the one that ships.
+ */
+export function whoWasToldOf(
+  tells: ReplyTells,
+  answer: ReplyAnswerWord,
+  othersCount: number,
+  delivery: DeliveryReport,
+): string {
+  let lead: string;
+  switch (tells) {
+    case "organizer":
+      lead =
+        delivery.status === "sent" || delivery.status === "delivered"
+          ? `iCloud reports the reply to the organiser as ${delivery.status}.`
+          : "iCloud was asked to tell the organiser your answer.";
+      break;
+    case "organizer-maybe":
+      lead = "The organiser may have been told your answer by iCloud.";
+      break;
+    case "nobody":
+      lead = "Only your calendar changed. Nobody was told.";
+      break;
+    case "narrowed":
+      lead = `Your calendar shows ${answer}; the organiser has not been told.`;
+      break;
+  }
+  return othersCount >= 1 ? `${lead} ${othersNotToldOf(othersCount, "did")}` : lead;
+}
+
+/** The times a reply preview shows, and where they came from. */
+interface ReplyTimes {
+  start: string;
+  end: string;
+  allDay: boolean;
+  timesZone: string;
+  timesZoneSource: TimesZoneSource;
+}
+
+/**
+ * The event's times, in the zone the caller asked for when that is possible.
+ *
+ * `requested` only when a zone was named AND the event has an instant on both
+ * ends: this server then renders those instants itself, in a zone it
+ * validated, so the strings are its own. An all-day date and a time whose zone
+ * the resource never defined have no instant, so they keep the event's own
+ * wall clock and say so with `event` — converting a date nobody anchored would
+ * publish a time nobody chose.
+ *
+ * `tzid` is DISPLAY only. It is not hashed into the change and never reaches
+ * the commit, so the same confirmation is minted whatever zone was asked for.
+ */
+function replyTimesOf(detail: EventDetail, tzid: string | undefined): ReplyTimes {
+  if (
+    tzid !== undefined &&
+    !detail.allDay &&
+    detail.startUtc !== undefined &&
+    detail.endUtc !== undefined
+  ) {
+    const start = utcToLocalTime(detail.startUtc, tzid);
+    const end = utcToLocalTime(detail.endUtc, tzid);
+    if (start !== null && end !== null) {
+      return { start, end, allDay: false, timesZone: tzid, timesZoneSource: "requested" };
+    }
+  }
+  return {
+    start: detail.startLocal,
+    end: detail.endLocal,
+    allDay: detail.allDay,
+    timesZone: detail.startTzid,
+    timesZoneSource: "event",
+  };
+}
+
+/**
  * What answering one invitation would do, and the confirmation to do it.
  *
  * Its own shape rather than an `EventPreview`, on `CollectionDeletePreview`'s
@@ -4741,8 +4949,8 @@ function currentAnswerOf(raw: string | null): CurrentAnswer | null {
  * borrowing that shape would publish a dozen keys that mean nothing here.
  *
  * **The user's own address and the user's own line appear nowhere in it**
- * (RSVP-02). `organizerName` is the organiser's; on every refusal it is null,
- * because on the `organiser` refusal the organiser IS the user.
+ * (RSVP-02). `organizer` and `others` are other people; on every refusal both
+ * are null, because on the `organiser` refusal the organiser IS the user.
  */
 export interface ReplyPreview {
   /** The caller's opaque id, echoed. */
@@ -4765,8 +4973,30 @@ export interface ReplyPreview {
   refusalReason: string | null;
   /** The event's title. Stranger text. */
   title: string | null;
-  /** The organiser's name. Stranger text; null on every refusal. */
-  organizerName: string | null;
+  /**
+   * The start, as a wall clock in `timesZone`. Null only when nothing was read
+   * (the zone refusal). This server's own rendering on the `requested` path,
+   * the event's own on the `event` path — see `replyTimesOf`.
+   */
+  start: string | null;
+  /** The end, on the same terms as `start`. */
+  end: string | null;
+  /** True when the event is a date rather than an instant. */
+  allDay: boolean | null;
+  /** The zone `start` and `end` are in: the requested one, or the event's own. */
+  timesZone: string | null;
+  /** Which of the two `timesZone` is. Null only when nothing was read. */
+  timesZoneSource: TimesZoneSource | null;
+  /** The organiser, named by D-12's fallback. Stranger text; null on a refusal. */
+  organizer: ReplyOrganizerRow | null;
+  /** Whether the invitation carries the organiser's address. Null on a refusal. */
+  organizerAddressKnown: boolean | null;
+  /** Everybody else on it, never the user. Stranger text; null on a refusal. */
+  others: ReplyAttendeeRow[] | null;
+  /** How many `others` there are. This server's count; null on a refusal. */
+  othersCount: number | null;
+  /** This server's sentence about who hears the answer. Null on a refusal. */
+  whoIsTold: string | null;
   /** The change to pass back to `calendar_commit`, or null on a refusal. */
   change: NormalizedReplyChange | null;
   confirmToken: string | null;
@@ -4793,6 +5023,8 @@ export interface ReplyCommitOutcome {
    * iCloud, never that it was delivered.
    */
   delivery: DeliveryReport;
+  /** `whoIsTold`'s past-tense twin, from this commit's own re-read. */
+  whoWasTold: string;
   /** This server's sentence, in the past tense. */
   confirmationLine: string;
 }
@@ -4814,18 +5046,38 @@ function replyPreviewTrustedPart(preview: ReplyPreview): Record<string, unknown>
     tells: preview.tells,
     refusal: preview.refusal,
     refusalReason: preview.refusalReason,
+    allDay: preview.allDay,
+    timesZoneSource: preview.timesZoneSource,
+    // The times ride out here ONLY when this server rendered them itself, from
+    // an instant, in a zone it validated. On the event's own path the zone is
+    // whatever the resource named — a stranger's string when it is one this
+    // server cannot resolve — so the times and the zone ride fenced, on
+    // `eventUntrustedPart`'s precedent for `startTzid`.
+    ...(preview.timesZoneSource === "requested"
+      ? { start: preview.start, end: preview.end, timesZone: preview.timesZone }
+      : {}),
+    organizerAddressKnown: preview.organizerAddressKnown,
+    othersCount: preview.othersCount,
+    whoIsTold: preview.whoIsTold,
     confirmToken: preview.confirmToken,
     expiresInSeconds: preview.expiresInSeconds,
   };
 }
 
-/** The half somebody else wrote: the title, the organiser, and the sentence quoting them. */
+/**
+ * The half somebody else wrote: the title, the organiser, everybody else on
+ * it, and the sentence quoting them. Plus the times, on the event-zone path.
+ */
 function replyPreviewUntrustedPart(preview: ReplyPreview): Record<string, unknown> {
   return {
     // Repeated from the trusted half so the model joins the two BY IDENTITY.
     id: preview.id,
     title: preview.title,
-    organizerName: preview.organizerName,
+    ...(preview.timesZoneSource === "requested"
+      ? {}
+      : { start: preview.start, end: preview.end, timesZone: preview.timesZone }),
+    organizer: preview.organizer,
+    others: preview.others,
     change: preview.change,
     confirmationLine: preview.confirmationLine,
   };
@@ -4853,6 +5105,7 @@ function replyCommitTrustedPart(outcome: ReplyCommitOutcome): Record<string, unk
     answer: outcome.answer,
     tells: outcome.tells,
     delivery: outcome.delivery,
+    whoWasTold: outcome.whoWasTold,
   };
 }
 
@@ -4889,15 +5142,50 @@ export function replyCommitToolResult(outcome: ReplyCommitOutcome): ToolResult {
  * **A refusal mints nothing.** It carries this server's sentence and no
  * confirmation, so there is nothing to commit (`nothingMinted`'s precedent).
  */
+/**
+ * The refusal of a zone this server holds no definition for.
+ *
+ * Built at the tool boundary, before any request: nothing has been read, so
+ * every field about the event is null, and nothing is minted.
+ */
+function unsupportedZonePreview(id: string, answer: ReplyAnswerWord): ReplyPreview {
+  return {
+    id,
+    answer,
+    currentAnswer: null,
+    evidence: null,
+    tells: null,
+    refusal: "unsupported-timezone",
+    refusalReason: REPLY_REFUSAL_REASONS["unsupported-timezone"],
+    title: null,
+    start: null,
+    end: null,
+    allDay: null,
+    timesZone: null,
+    timesZoneSource: null,
+    organizer: null,
+    organizerAddressKnown: null,
+    others: null,
+    othersCount: null,
+    whoIsTold: null,
+    change: null,
+    confirmToken: null,
+    expiresInSeconds: null,
+    confirmationLine: null,
+  };
+}
+
 async function buildReplyPreview(
   principal: Principal,
   davFetch: DavFetch,
   ref: EventRef,
   id: string,
   answer: ReplyAnswerWord,
+  tzid: string | undefined,
 ): Promise<ReplyPreview> {
   const read = await getEventWithEtag(env, principal, davFetch, ref);
   const title = read.detail.summary;
+  const times = replyTimesOf(read.detail, tzid);
 
   const refused = (
     refusal: ReplyRefusal,
@@ -4911,9 +5199,15 @@ async function buildReplyPreview(
     refusal,
     refusalReason: REPLY_REFUSAL_REASONS[refusal],
     title,
+    ...times,
     // Null on EVERY refusal, and the organiser refusal is why: there the
     // organiser is the user, and their name or address must not come back.
-    organizerName: null,
+    // The others go with it: on that refusal they are the user's own guests.
+    organizer: null,
+    organizerAddressKnown: null,
+    others: null,
+    othersCount: null,
+    whoIsTold: null,
     change: null,
     confirmToken: null,
     expiresInSeconds: null,
@@ -4961,6 +5255,14 @@ async function buildReplyPreview(
     env.CONFIRM_SECRET,
   );
 
+  const organizer = organizerRowOf(facts);
+  const organizerAddressKnown = facts.organizer.address !== null;
+  const others: ReplyAttendeeRow[] = facts.others.map((one) => ({
+    name: one.name,
+    email: one.email,
+    answer: otherAnswerOf(one.partstat),
+  }));
+
   return {
     id,
     answer,
@@ -4970,7 +5272,12 @@ async function buildReplyPreview(
     refusal: null,
     refusalReason: null,
     title,
-    organizerName: facts.organizerName,
+    ...times,
+    organizer,
+    organizerAddressKnown,
+    others,
+    othersCount: others.length,
+    whoIsTold: whoIsToldOf(tells, answer, organizerAddressKnown, others.length),
     change,
     confirmToken,
     expiresInSeconds: CONFIRM_TTL_SECONDS,
@@ -4983,7 +5290,7 @@ async function buildReplyPreview(
         fieldCount: null,
         recipientCount: null,
         alarms: null,
-        reply: { answer, tells, organizerName: facts.organizerName },
+        reply: { answer, tells, organizerName: organizerNameFor(facts) },
       },
       "would",
     ),
@@ -5114,13 +5421,16 @@ async function applyReplyCommit(
   // 7d. The one write, conditional on the ETag the preview signed.
   await updateEvent(env, principal, davFetch, ref, built.body, payload.e);
 
+  // No read-back: 18-01 measured nothing on the organiser's line to read.
+  const delivery = UNOBSERVED_DELIVERY;
+
   return {
     id: encodeEventId(ref),
     applied: true,
     answer: change.answer,
     tells,
-    // No read-back: 18-01 measured nothing on the organiser's line to read.
-    delivery: UNOBSERVED_DELIVERY,
+    delivery,
+    whoWasTold: whoWasToldOf(tells, change.answer, facts.others.length, delivery),
     confirmationLine: composeConfirmationLine(
       {
         kind: "reply",
@@ -5133,7 +5443,7 @@ async function applyReplyCommit(
         reply: {
           answer: change.answer,
           tells,
-          organizerName: facts.organizerName,
+          organizerName: organizerNameFor(facts),
         },
       },
       "did",
@@ -6181,9 +6491,20 @@ export function registerCalendarTools(
             "The user's own answer. Only the user's own answer changes; " +
               "nobody else's can be set.",
           ),
+        // Display only, on `calendar_find_free_slots`' own wording: it changes
+        // which zone the preview's times are shown in and nothing else. It is
+        // not hashed into the change and never reaches the commit.
+        tzid: z
+          .string()
+          .optional()
+          .describe(
+            "The IANA zone to show the preview's times in, e.g. " +
+              "America/Chicago. Omit it to see the event's own zone. A zone " +
+              "this server holds no definition for is refused.",
+          ),
       }),
     },
-    async ({ id, answer }) => {
+    async ({ id, answer, tzid }) => {
       try {
         // Who this call acts for. First, so a refused principal reads
         // `auth_failed` before anything else is looked at (D-27).
@@ -6192,9 +6513,15 @@ export function registerCalendarTools(
         // outbound request. The cheapest possible refusal of a forged id.
         const ref = decodeEventId(id);
 
+        // The zone next, still before any request: a zone this server cannot
+        // render is refused with nothing read, nothing minted, nothing sent.
+        if (tzid !== undefined && !isSupportedTimezone(tzid)) {
+          return replyPreviewToolResult(unsupportedZonePreview(id, answer));
+        }
+
         return replyPreviewToolResult(
           await withConfirmationBoundary(() =>
-            buildReplyPreview(actor, davFetch, ref, id, answer),
+            buildReplyPreview(actor, davFetch, ref, id, answer, tzid),
           ),
         );
       } catch (err) {

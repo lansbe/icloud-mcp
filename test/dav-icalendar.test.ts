@@ -4279,9 +4279,14 @@ describe("invitationFactsOf", () => {
     expect(
       invitationFactsOf(ATTENDEE_COPY_GENUINE_ICS, OWN_ADDRESSES, "probe-schedule-tag-1"),
     ).toStrictEqual({
-      organizerName: "Probe Organiser",
+      // The genuine copy's organiser value is an opaque principal path, so the
+      // address comes from EMAIL=, exactly as 18-01 recorded it.
+      organizer: { name: "Probe Organiser", address: "organiser.probe@example.invalid" },
       ownAnswer: "NEEDS-ACTION",
       evidence: "scheduling-object",
+      // The only other line is the organiser's own attendee line, which is
+      // named once, as the organiser, and not again among the others.
+      others: [],
     });
   });
 
@@ -4299,9 +4304,10 @@ describe("invitationFactsOf", () => {
     expect(
       invitationFactsOf(ATTENDEE_COPY_IMPORTED_ICS, OWN_ADDRESSES, null),
     ).toStrictEqual({
-      organizerName: "Probe Organiser",
+      organizer: { name: "Probe Organiser", address: "organiser.probe@example.invalid" },
       ownAnswer: "NEEDS-ACTION",
       evidence: "imported-copy",
+      others: [],
     });
   });
 
@@ -4352,21 +4358,144 @@ describe("invitationFactsOf", () => {
       `ATTENDEE;PARTSTAT=NEEDS-ACTION;SCHEDULE-AGENT=NONE:mailto:${OWN_LOGIN}`,
     ]);
     expect(invitationFactsOf(ics, [], null)).toStrictEqual({
-      organizerName: "Probe Organiser",
+      organizer: { name: "Probe Organiser", address: "organiser.probe@example.invalid" },
       ownAnswer: null,
       evidence: "undetermined",
+      // With no address set nobody is the user, so the user's line is listed
+      // as anybody else's would be. The tool never reaches this: an empty set
+      // is refused as not-invited before a preview is built.
+      others: [
+        { name: null, email: OWN_LOGIN, partstat: "NEEDS-ACTION" },
+      ],
     });
   });
 
+  // D-12: the four shapes an ORGANIZER can take, plus its absence. The name is
+  // the CN and nothing else; the address is the mailto, else EMAIL=, else null.
+  // The tool layer composes the display name from the two, so the facts keep
+  // them apart and "the address is unknown" survives as a fact.
   it.each([
-    ["the CN", "ORGANIZER;CN=Probe Organiser:mailto:organiser.probe@example.invalid", "Probe Organiser"],
-    ["the mailto address when there is no CN", "ORGANIZER:mailto:organiser.probe@example.invalid", "organiser.probe@example.invalid"],
-    ["the EMAIL= when the value is a path", "ORGANIZER;EMAIL=organiser.probe@example.invalid:/aOrg/principal/", "organiser.probe@example.invalid"],
-    ["null when nothing names them", "ORGANIZER:/aOrg/principal/", null],
-    ["null when there is no organiser", null, null],
-  ])("names the organiser by %s", (_label, organizer, expected) => {
+    [
+      "a CN and a mailto",
+      "ORGANIZER;CN=Probe Organiser:mailto:organiser.probe@example.invalid",
+      { name: "Probe Organiser", address: "organiser.probe@example.invalid" },
+    ],
+    [
+      "a CN and a path, with the address in EMAIL=",
+      "ORGANIZER;CN=Probe Organiser;EMAIL=organiser.probe@example.invalid:/aOrg/principal/",
+      { name: "Probe Organiser", address: "organiser.probe@example.invalid" },
+    ],
+    [
+      "a CN and nothing that addresses them",
+      "ORGANIZER;CN=Probe Organiser:/aOrg/principal/",
+      { name: "Probe Organiser", address: null },
+    ],
+    [
+      "neither a name nor an address",
+      "ORGANIZER:/aOrg/principal/",
+      { name: null, address: null },
+    ],
+    [
+      "a mailto and no CN",
+      "ORGANIZER:mailto:organiser.probe@example.invalid",
+      { name: null, address: "organiser.probe@example.invalid" },
+    ],
+    [
+      "an empty CN and an empty mailto",
+      "ORGANIZER;CN=:mailto:",
+      { name: null, address: null },
+    ],
+    ["no ORGANIZER line at all", null, { name: null, address: null }],
+  ])("reads the organiser from %s", (_label, organizer, expected) => {
     const ics = invitationIcs([`ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:${OWN_LOGIN}`], organizer);
-    expect(invitationFactsOf(ics, OWN_ADDRESSES, null).organizerName).toBe(expected);
+    expect(invitationFactsOf(ics, OWN_ADDRESSES, null).organizer).toStrictEqual(expected);
+  });
+
+  // D-10: the other attendees, verbatim, and never the user.
+  it("lists every other attendee verbatim, in document order", () => {
+    const ics = invitationIcs([
+      STRANGER_LINE,
+      `ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:${OWN_LOGIN}`,
+      "ATTENDEE;CN=Eve;PARTSTAT=X-PONDERING;EMAIL=eve@example.invalid:/aEve/principal/",
+      "ATTENDEE:mailto:sam@example.invalid",
+    ]);
+    expect(invitationFactsOf(ics, OWN_ADDRESSES, null).others).toStrictEqual([
+      { name: "Dana", email: "dana@example.invalid", partstat: "ACCEPTED" },
+      // Verbatim: a stranger's own PARTSTAT is the tool layer's to match.
+      { name: "Eve", email: "eve@example.invalid", partstat: "X-PONDERING" },
+      { name: null, email: "sam@example.invalid", partstat: null },
+    ]);
+  });
+
+  it("never lists the user's own line, even when it carries a CN", () => {
+    // The genuine copy's own shape: the user's CN IS their address, and the
+    // value is a principal path. Neither the line nor the CN may come back.
+    const ics = invitationIcs([
+      `ATTENDEE;CN=${OWN_LOGIN};PARTSTAT=NEEDS-ACTION;EMAIL=${OWN_LOGIN}:${OWN_PRINCIPAL}`,
+      STRANGER_LINE,
+    ]);
+    const facts = invitationFactsOf(ics, OWN_ADDRESSES, null);
+    expect(facts.others).toStrictEqual([
+      { name: "Dana", email: "dana@example.invalid", partstat: "ACCEPTED" },
+    ]);
+    const text = JSON.stringify(facts).toLowerCase();
+    expect(text).not.toContain(OWN_LOGIN);
+    expect(text).not.toContain(OWN_ALIAS);
+    expect(text).not.toContain(OWN_PRINCIPAL.toLowerCase());
+  });
+
+  it("leaves the user's alias line out too", () => {
+    const ics = invitationIcs([
+      `ATTENDEE;CN=Me Too;PARTSTAT=ACCEPTED:MAILTO:${OWN_ALIAS.toUpperCase()}`,
+      STRANGER_LINE,
+    ]);
+    expect(invitationFactsOf(ics, OWN_ADDRESSES, null).others.map((one) => one.name))
+      .toStrictEqual(["Dana"]);
+  });
+
+  it.each([
+    ["the same mailto", "ATTENDEE;CN=Probe Organiser;PARTSTAT=ACCEPTED:mailto:organiser.probe@example.invalid"],
+    ["the same mailto in another case", "ATTENDEE;PARTSTAT=ACCEPTED:MAILTO:Organiser.Probe@example.invalid"],
+    [
+      "a path carrying the organiser's EMAIL=",
+      "ATTENDEE;PARTSTAT=ACCEPTED;EMAIL=organiser.probe@example.invalid:/aOrg/principal/",
+    ],
+  ])("leaves the organiser's own attendee line out when it matches by %s", (_label, line) => {
+    const ics = invitationIcs([line, STRANGER_LINE, `ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:${OWN_LOGIN}`]);
+    expect(invitationFactsOf(ics, OWN_ADDRESSES, null).others.map((one) => one.name))
+      .toStrictEqual(["Dana"]);
+  });
+
+  it("reads the others off the master, once, when overrides repeat the list", () => {
+    const ics = `${[
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Example Org//Reply Fixture//EN",
+      "BEGIN:VEVENT",
+      "UID:reply-series@example.invalid",
+      "DTSTAMP:20260901T120000Z",
+      "RECURRENCE-ID:20261008T160000Z",
+      "DTSTART:20261008T170000Z",
+      "DTEND:20261008T180000Z",
+      "SUMMARY:Weekly",
+      REPLY_ORGANISER_LINE,
+      "ATTENDEE;CN=Override Only;PARTSTAT=ACCEPTED:mailto:override@example.invalid",
+      "END:VEVENT",
+      "BEGIN:VEVENT",
+      "UID:reply-series@example.invalid",
+      "DTSTAMP:20260901T120000Z",
+      "DTSTART:20261001T160000Z",
+      "DTEND:20261001T170000Z",
+      "RRULE:FREQ=WEEKLY;COUNT=4",
+      "SUMMARY:Weekly",
+      REPLY_ORGANISER_LINE,
+      STRANGER_LINE,
+      `ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:${OWN_LOGIN}`,
+      "END:VEVENT",
+      "END:VCALENDAR",
+    ].join("\r\n")}\r\n`;
+    expect(invitationFactsOf(ics, OWN_ADDRESSES, null).others.map((one) => one.name))
+      .toStrictEqual(["Dana"]);
   });
 
   it("returns the user's stored answer verbatim, however strange", () => {
