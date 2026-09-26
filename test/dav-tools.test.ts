@@ -47,6 +47,7 @@ import {
 } from "../src/dav/ids";
 import {
   ATTENDEE_COPY_GENUINE_ICS,
+  ATTENDEE_COPY_IMPORTED_ICS,
   HOSTILE_TIMEZONE_ICS,
   HOSTILE_TZID,
   HOSTILE_TZID_SUMMARY,
@@ -10636,3 +10637,468 @@ describe("calendar_respond_to_invitation, end to end", () => {
   });
 });
 
+
+// ===========================================================================
+// calendar_respond_to_invitation — the boundaries (phase 18, plan 18-03)
+//
+// Every case here goes through the REGISTERED tools and through their schemas,
+// the way a real MCP server drives them: `viaSchema` parses the arguments with
+// the shipped input schema first and hands the handler only what the schema
+// kept. Calling `buildReplyPreview` or `applyReplyCommit` directly would walk
+// past the strict schema and the commit routing, which are the two things most
+// of these cases are about.
+// ===========================================================================
+
+describe("calendar_respond_to_invitation, boundaries", () => {
+  const GENUINE_PATH = `${WORK_PATH}rsvp-probe-0002.ics`;
+  const GENUINE_URL = `https://p42-caldav.icloud.com${GENUINE_PATH}`;
+  const GENUINE_ID = encodeEventId({
+    calendarUrl: CALENDAR_URL,
+    objectUrl: GENUINE_URL,
+    recurrenceId: null,
+  });
+  const IMPORTED_PATH = `${WORK_PATH}rsvp-probe-0001.ics`;
+  const IMPORTED_ID = encodeEventId({
+    calendarUrl: CALENDAR_URL,
+    objectUrl: `https://p42-caldav.icloud.com${IMPORTED_PATH}`,
+    recurrenceId: null,
+  });
+  const PROBE_PATH = `${WORK_PATH}reply-boundary.ics`;
+  const PROBE_ID = encodeEventId({
+    calendarUrl: CALENDAR_URL,
+    objectUrl: `https://p42-caldav.icloud.com${PROBE_PATH}`,
+    recurrenceId: null,
+  });
+  const SCHEDULE_TAG = "probe-schedule-tag-1";
+  const ALIAS_ADDRESS = "alias.one@example.invalid";
+
+  /**
+   * Every stub this block installed, so the last case can say that NO request
+   * across all of them was a POST. Tests in one file run in order, and the
+   * last case asserts it saw commits at all, so it cannot pass over nothing.
+   */
+  const everyStub: WriteStub[] = [];
+
+  function tracked(options: WriteStubOptions): WriteStub {
+    const stub = writeDavStub(options);
+    everyStub.push(stub);
+    return stub;
+  }
+
+  /** One non-repeating invitation carrying exactly the lines a case names. */
+  function invitationBody(organizer: string, attendees: string[]): string {
+    return icsLines(
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Example Org//Reply Boundary//EN",
+      "BEGIN:VEVENT",
+      "UID:reply-boundary@example.invalid",
+      "DTSTAMP:20260901T120000Z",
+      "DTSTART:20261001T160000Z",
+      "DTEND:20261001T170000Z",
+      "SEQUENCE:2",
+      "SUMMARY:Boundary probe",
+      organizer,
+      ...attendees,
+      "END:VEVENT",
+      "END:VCALENDAR",
+    );
+  }
+
+  const ORGANISER = "ORGANIZER;CN=Probe Organiser:mailto:organiser.probe@example.invalid";
+  const DANA = "ATTENDEE;CN=Dana;PARTSTAT=ACCEPTED:mailto:dana@example.invalid";
+  const MINE = `ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:${LOGIN_ADDRESS}`;
+
+  /**
+   * Drive one registered tool through its SHIPPED schema, then its handler.
+   *
+   * A schema refusal returns `null` and the handler never runs, which is what
+   * a real server does with arguments its schema rejects.
+   */
+  async function viaSchema(
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<{ isError?: boolean; content: { text: string }[] } | null> {
+    const parsed = schemaFor(name).safeParse(args);
+    if (!parsed.success) return null;
+    return invokeRegistered(name, parsed.data as Record<string, unknown>);
+  }
+
+  /** A response's two halves, parsed. Fails loudly on an error result. */
+  function halves(result: { isError?: boolean; content: { text: string }[] } | null): {
+    trusted: Record<string, unknown>;
+    untrusted: Record<string, unknown>;
+  } {
+    expect(result, "the schema refused the call").not.toBeNull();
+    expect(result!.isError, `the call failed: ${result!.content[0]?.text}`).not.toBe(true);
+    const raw = blocks(result!);
+    return {
+      trusted: JSON.parse(raw.trusted) as Record<string, unknown>,
+      untrusted: fencedObject(raw.untrusted),
+    };
+  }
+
+  /** The error category a refused call answered with. */
+  function categoryOf(result: { isError?: boolean; content: { text: string }[] } | null): string {
+    expect(result, "the schema refused the call").not.toBeNull();
+    expect(result!.isError).toBe(true);
+    return (JSON.parse(result!.content[0].text) as { category: string }).category;
+  }
+
+  /** Everything a response said, lower-cased, for address searches. */
+  function textOf(result: { content: { text: string }[] } | null): string {
+    return (result?.content ?? []).map((one) => one.text).join("\n").toLowerCase();
+  }
+
+  /** Unfolded ATTENDEE lines of a body. */
+  function attendeeLines(body: string): string[] {
+    return body
+      .replace(/\r\n[ \t]/g, "")
+      .split("\r\n")
+      .filter((line) => line.startsWith("ATTENDEE"));
+  }
+
+  async function genuineStub(extra: WriteStubOptions = {}): Promise<WriteStub> {
+    const stub = tracked({
+      objects: { [GENUINE_PATH]: ATTENDEE_COPY_GENUINE_ICS },
+      scheduleTags: { [GENUINE_PATH]: SCHEDULE_TAG },
+      ...extra,
+    });
+    await warmWrite(stub);
+    return stub;
+  }
+
+  // -------------------------------------------------------------------------
+  // RSVP-05 / D-04: no key names a person
+  // -------------------------------------------------------------------------
+
+  it("takes exactly an id and an answer, and no key that could name a person", () => {
+    const keys = Object.keys(schemaFor("calendar_respond_to_invitation").shape).sort();
+    // 18-04 adds `tzid` and 18-05 adds `scope`; each updates this set. The
+    // pattern below never changes.
+    expect(keys).toStrictEqual(["answer", "id"]);
+    for (const key of keys) {
+      expect(key).not.toMatch(/address|attendee|email|mailto|partstat|organi[sz]er|recipient/i);
+    }
+  });
+
+  it.each([
+    ["an attendee", { attendee: `mailto:${ALIAS_ADDRESS}` }],
+    ["an email", { email: ALIAS_ADDRESS }],
+    ["an address", { address: `mailto:${LOGIN_ADDRESS}` }],
+    ["an organiser", { organizer: `mailto:${LOGIN_ADDRESS}` }],
+    ["a partstat", { partstat: "DECLINED" }],
+    ["somebody else's answer", { as: "dana@example.invalid" }],
+  ])("refuses a call carrying %s, spending ZERO requests", async (_label, extra) => {
+    const stub = await genuineStub();
+
+    const result = await viaSchema("calendar_respond_to_invitation", {
+      id: GENUINE_ID,
+      answer: "declined",
+      ...extra,
+    });
+
+    expect(result, "the extra key was accepted").toBeNull();
+    expect(stub.observed.length).toBe(0);
+    // The same call without the extra key is accepted, so the refusal above is
+    // about the key and not about the rest of the arguments.
+    expect(
+      schemaFor("calendar_respond_to_invitation").safeParse({
+        id: GENUINE_ID,
+        answer: "declined",
+      }).success,
+    ).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // D-14, D-15, OQ4: the refusals, each with a closed reason and no write
+  // -------------------------------------------------------------------------
+
+  it.each([
+    [
+      "the user organises it",
+      "organiser",
+      invitationBody(`ORGANIZER;CN=Me:mailto:${LOGIN_ADDRESS}`, [MINE, DANA]),
+    ],
+    ["the user is not on it", "not-invited", invitationBody(ORGANISER, [DANA])],
+    [
+      "two of the user's addresses are on it",
+      "ambiguous",
+      invitationBody(ORGANISER, [
+        MINE,
+        `ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:${ALIAS_ADDRESS}`,
+      ]),
+    ],
+    [
+      "the stored answer already is the requested one",
+      "unchanged",
+      invitationBody(ORGANISER, [`ATTENDEE;PARTSTAT=DECLINED:mailto:${LOGIN_ADDRESS}`, DANA]),
+    ],
+  ])("refuses when %s: reason %s, no token, no write, two reads", async (_label, reason, body) => {
+    const stub = tracked({ objects: { [PROBE_PATH]: body } });
+    await warmWrite(stub);
+
+    const result = await viaSchema("calendar_respond_to_invitation", {
+      id: PROBE_ID,
+      answer: "declined",
+    });
+    const { trusted, untrusted } = halves(result);
+
+    expect(trusted.refusal).toBe(reason);
+    expect(typeof trusted.refusalReason).toBe("string");
+    expect(trusted.confirmToken).toBeNull();
+    expect(trusted.expiresInSeconds).toBeNull();
+    expect(trusted.evidence).toBeNull();
+    expect(trusted.tells).toBeNull();
+    expect(untrusted.change).toBeNull();
+    expect(untrusted.confirmationLine).toBeNull();
+    expect(untrusted.organizerName).toBeNull();
+
+    // Exactly the two reads, and nothing written.
+    expect(stub.observed.map((one) => one.method)).toStrictEqual(["REPORT", "PROPFIND"]);
+
+    // Neither of the user's own addresses comes back, on any refusal — the
+    // organiser refusal and the ambiguous one being the two that hold them.
+    const text = textOf(result);
+    expect(text).not.toContain(LOGIN_ADDRESS);
+    expect(text).not.toContain(ALIAS_ADDRESS);
+  });
+
+  // -------------------------------------------------------------------------
+  // D-16: the event moved between preview and commit
+  // -------------------------------------------------------------------------
+
+  it("refuses a commit when the event changed after the preview, writes nothing, and a fresh preview commits", async () => {
+    await genuineStub();
+    const first = halves(
+      await viaSchema("calendar_respond_to_invitation", { id: GENUINE_ID, answer: "accepted" }),
+    );
+
+    // The organiser edits the event: a new title under a new ETag.
+    const moved = ATTENDEE_COPY_GENUINE_ICS.replace(
+      "SUMMARY:New EventRSVP probe C - delete me",
+      "SUMMARY:RSVP probe C - moved by the organiser",
+    );
+    expect(moved).not.toBe(ATTENDEE_COPY_GENUINE_ICS);
+    const after = tracked({
+      objects: { [GENUINE_PATH]: moved },
+      etags: { [GENUINE_PATH]: '"etag-B"' },
+      scheduleTags: { [GENUINE_PATH]: SCHEDULE_TAG },
+    });
+    installStub(after);
+
+    const stale = await viaSchema("calendar_commit", {
+      confirmToken: first.trusted.confirmToken,
+      change: first.untrusted.change,
+    });
+    expect(categoryOf(stale)).toBe("stale_resource");
+    // The re-read saw the new ETag and stopped there.
+    expect(after.observed.map((one) => one.method)).toStrictEqual(["REPORT"]);
+
+    after.observed.length = 0;
+    const fresh = halves(
+      await viaSchema("calendar_respond_to_invitation", { id: GENUINE_ID, answer: "accepted" }),
+    );
+    const committed = halves(
+      await viaSchema("calendar_commit", {
+        confirmToken: fresh.trusted.confirmToken,
+        change: fresh.untrusted.change,
+      }),
+    );
+    expect(committed.trusted.applied).toBe(true);
+    const puts = after.observed.filter((one) => one.method === "PUT");
+    expect(puts.length).toBe(1);
+    expect(puts[0].headers["if-match"]).toBe('"etag-B"');
+    expect(puts[0].body).toContain("SUMMARY:RSVP probe C - moved by the organiser");
+  });
+
+  // -------------------------------------------------------------------------
+  // D-05: a reply token is not an update token, in either direction
+  // -------------------------------------------------------------------------
+
+  it("refuses a reply token handed an update change, before the slot is reserved", async () => {
+    const stub = await genuineStub();
+    const reply = halves(
+      await viaSchema("calendar_respond_to_invitation", { id: GENUINE_ID, answer: "declined" }),
+    );
+    stub.observed.length = 0;
+
+    const misused = await viaSchema("calendar_commit", {
+      confirmToken: reply.trusted.confirmToken,
+      change: { kind: "update", scope: null, summary: "Hijacked" },
+    });
+    expect(categoryOf(misused)).toBe("confirmation_invalid");
+    expect(stub.observed.length).toBe(0);
+
+    // The slot is still free: the same token, with its own change, commits.
+    const spent = halves(
+      await viaSchema("calendar_commit", {
+        confirmToken: reply.trusted.confirmToken,
+        change: reply.untrusted.change,
+      }),
+    );
+    expect(spent.trusted.applied).toBe(true);
+    expect(stub.observed.filter((one) => one.method === "PUT").length).toBe(1);
+  });
+
+  it("refuses an update token handed a reply change, before the slot is reserved", async () => {
+    const stub = tracked({});
+    await warmWrite(stub);
+    const { confirmToken, change } = await previewFor(SIMPLE_EVENT_ID, {
+      startLocal: "2026-02-10T16:00:00",
+    });
+    stub.observed.length = 0;
+
+    const misused = await viaSchema("calendar_commit", {
+      confirmToken,
+      change: { kind: "reply", answer: "declined" },
+    });
+    expect(categoryOf(misused)).toBe("confirmation_invalid");
+    expect(stub.observed.length).toBe(0);
+
+    const spent = halves(await viaSchema("calendar_commit", { confirmToken, change }));
+    expect(spent.trusted.applied).toBe(true);
+    const puts = stub.observed.filter((one) => one.method === "PUT");
+    expect(puts.length).toBe(1);
+    expect(puts[0].url).toBe(SIMPLE_OBJECT_URL);
+  });
+
+  // -------------------------------------------------------------------------
+  // D-08 / RSVP-06: the update tool cannot answer
+  // -------------------------------------------------------------------------
+
+  it("gives calendar_update_event no key that names an answer", () => {
+    for (const key of Object.keys(schemaFor("calendar_update_event").shape)) {
+      expect(key).not.toMatch(/answer|partstat|rsvp|reply/i);
+    }
+  });
+
+  it("leaves every attendee's answer as stored when an update carries answer-shaped keys", async () => {
+    const stub = await genuineStub();
+    const stored = identityRoundTrip(ATTENDEE_COPY_GENUINE_ICS);
+
+    const updated = halves(
+      await viaSchema("calendar_update_event", {
+        id: GENUINE_ID,
+        summary: "Renamed by the attendee",
+        partstat: "DECLINED",
+        answer: "declined",
+      }),
+    );
+    expect(updated.trusted.confirmToken).not.toBeNull();
+    stub.observed.length = 0;
+
+    const committed = halves(
+      await viaSchema("calendar_commit", {
+        confirmToken: updated.trusted.confirmToken,
+        change: updated.untrusted.change,
+      }),
+    );
+    expect(committed.trusted.applied).toBe(true);
+
+    const body = writtenBody(stub);
+    expect(body.replace(/\r\n[ \t]/g, "")).toContain("SUMMARY:Renamed by the attendee");
+    expect(attendeeLines(body)).toStrictEqual(attendeeLines(stored));
+  });
+
+  it("leaves every attendee's answer as stored when a hand-minted update change carries answer", async () => {
+    // The laundering shape: no preview publishes `answer` on an update, so the
+    // only way to put one there is to write the change by hand. The commit's
+    // own schema knows the key (the reply arm reads it), so it is not refused
+    // at the schema; it has to be IGNORED by the update arm.
+    const stub = await genuineStub();
+    const stored = identityRoundTrip(ATTENDEE_COPY_GENUINE_ICS);
+
+    const laundered = {
+      kind: "update",
+      scope: null,
+      summary: "Renamed by hand",
+      startLocal: "2026-09-29T12:00:00",
+      startTzid: "America/Los_Angeles",
+      endLocal: "2026-09-29T13:00:00",
+      endTzid: "America/Los_Angeles",
+      allDay: false,
+      location: null,
+      description: null,
+      attendees: [],
+      alarms: null,
+      answer: "declined",
+    };
+    const confirmToken = await mintConfirmation(
+      {
+        v: CONFIRM_VERSION,
+        t: "dav",
+        k: "update",
+        j: crypto.randomUUID(),
+        c: CALENDAR_URL,
+        o: GENUINE_URL,
+        r: null,
+        e: PREVIEW_ETAG,
+        s: 1,
+        f: ["summary"],
+        h: await changeHashOf(laundered as unknown as NormalizedChange),
+        x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+        u: principal.userId,
+      },
+      env.CONFIRM_SECRET,
+    );
+
+    const committed = halves(
+      await viaSchema("calendar_commit", { confirmToken, change: laundered }),
+    );
+    expect(committed.trusted.applied).toBe(true);
+
+    const body = writtenBody(stub);
+    expect(body.replace(/\r\n[ \t]/g, "")).toContain("SUMMARY:Renamed by hand");
+    expect(attendeeLines(body)).toStrictEqual(attendeeLines(stored));
+    expect(
+      attendeeLines(body).map((line) => /PARTSTAT=([A-Z-]+)/.exec(line)?.[1]),
+    ).toStrictEqual(["NEEDS-ACTION", "ACCEPTED"]);
+  });
+
+  // -------------------------------------------------------------------------
+  // D-09 per event: the copy the end-to-end block did not use
+  // -------------------------------------------------------------------------
+
+  it("reads the imported copy as its own row: imported, nobody told, and commits", async () => {
+    // 18-01 measured both copies. The end-to-end block drives the genuine one;
+    // this is the imported one, served with no schedule tag, exactly as iCloud
+    // answered it (the property came back 404).
+    const stub = tracked({ objects: { [IMPORTED_PATH]: ATTENDEE_COPY_IMPORTED_ICS } });
+    await warmWrite(stub);
+
+    const preview = halves(
+      await viaSchema("calendar_respond_to_invitation", { id: IMPORTED_ID, answer: "declined" }),
+    );
+    expect(preview.trusted.evidence).toBe("imported-copy");
+    expect(preview.trusted.tells).toBe(TELLS_BY_EVIDENCE["imported-copy"]);
+    expect(preview.trusted.tells).toBe("nobody");
+    expect(preview.untrusted.confirmationLine).toBe(
+      "Answering invitation 'RSVP probe A - delete me.' as declined, on your " +
+        "calendar only. The organiser is not told.",
+    );
+
+    stub.observed.length = 0;
+    const committed = halves(
+      await viaSchema("calendar_commit", {
+        confirmToken: preview.trusted.confirmToken,
+        change: preview.untrusted.change,
+      }),
+    );
+    expect(committed.trusted.tells).toBe("nobody");
+    const diff = unfoldedDiff(identityRoundTrip(ATTENDEE_COPY_IMPORTED_ICS), writtenBody(stub));
+    expect(diff).toHaveLength(1);
+    expect(diff[0].after).toContain("PARTSTAT=DECLINED");
+  });
+
+  // -------------------------------------------------------------------------
+  // No outbound POST, anywhere in this block
+  // -------------------------------------------------------------------------
+
+  it("issued no POST across every preview and commit in this block", () => {
+    const all = everyStub.flatMap((stub) => stub.observed);
+    // Non-vacuity: the block above wrote, so this is not a loop over nothing.
+    expect(all.filter((one) => one.method === "PUT").length).toBeGreaterThanOrEqual(6);
+    expect(all.filter((one) => one.method === "POST")).toStrictEqual([]);
+  });
+});
