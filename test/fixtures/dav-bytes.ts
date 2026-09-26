@@ -1858,6 +1858,25 @@ export const ATTENDEE_COPY_SERIES_ICS = seriesFromAttendeeCopy(
 );
 
 /**
+ * An invitation of two individually edited dates with NO repeating rule behind
+ * them: no master component at all (RESEARCH Pitfall 7).
+ *
+ * **DERIVED, NOT MEASURED**, from `ATTENDEE_COPY_SERIES_ICS` by one string
+ * edit: the master's `RRULE:FREQ=WEEKLY;COUNT=4` line becomes a
+ * `RECURRENCE-ID` for its own first date, 2026-09-29 at 12:00 in Los Angeles.
+ * That turns the master into a second edited date, so the resource holds two
+ * `RECURRENCE-ID` components, each carrying the user's own line, and nothing
+ * that repeats. It is the shape a user is left with when invited to single
+ * dates of somebody else's series; what iCloud does with an answer to it is
+ * unmeasured, which is why the tool refuses it.
+ */
+export const ATTENDEE_COPY_MASTERLESS_ICS = replaceExactlyOnce(
+  ATTENDEE_COPY_SERIES_ICS,
+  "RRULE:FREQ=WEEKLY;COUNT=4\r\n",
+  "RECURRENCE-ID;TZID=America/Los_Angeles:20260929T120000\r\n",
+);
+
+/**
  * What any patch writes when it changes NOTHING: the stored body parsed and
  * wrapped back up by the same writer every answer goes through.
  *

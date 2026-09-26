@@ -341,7 +341,7 @@ export const TRUSTED_FIELD_ALLOWLIST: Record<string, AllowedShape> = {
       "currentAnswer", // server-generated: one of five literals this server MATCHED the stored PARTSTAT against, or null. The raw value is never published.
       "evidence", // server-generated: one of three literals this server computes from the stored bytes and the server's scheduling marker, never a value copied out of them.
       "tells", // server-generated: one of four literals, looked up in TELLS_BY_EVIDENCE from the evidence above.
-      "refusal", // server-generated: one of six literals from a closed union, or null.
+      "refusal", // server-generated: one of nine literals from a closed union, or null.
       "refusalReason", // server-generated: this server's own sentence from a closed table. Names no address, no title, no organiser, no zone.
       "allDay", // server-generated: this server's reading of DATE vs DATE-TIME. A boolean, or null when nothing was read.
       "timesZoneSource", // server-generated: one of two literals naming which path produced the times, or null. Never the zone itself.

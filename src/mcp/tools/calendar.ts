@@ -4674,9 +4674,17 @@ export const TELLS_BY_EVIDENCE: Readonly<Record<SchedulingEvidence, ReplyTells>>
     undetermined: "organizer-maybe",
   });
 
-/** Why a reply preview declined to mint. A closed set. */
+/**
+ * Why a reply preview declined to mint. A closed set.
+ *
+ * The first four are D-13's rule for how much of an invitation is answered,
+ * and each is a fact about the REQUEST against the event: see `replyScopeRefusal`.
+ */
 export type ReplyRefusal =
-  | "repeating"
+  | "scope-on-single"
+  | "scope-required"
+  | "single-occurrence"
+  | "no-repeating-rule"
   | "not-invited"
   | "organiser"
   | "ambiguous"
@@ -4693,9 +4701,20 @@ export type ReplyRefusal =
  */
 const REPLY_REFUSAL_REASONS: Readonly<Record<ReplyRefusal, string>> =
   Object.freeze({
-    repeating:
-      "This invitation repeats. Answering a repeating invitation is not " +
-      "available yet, so nothing was prepared.",
+    "scope-on-single":
+      "This invitation does not repeat, so it takes no scope. Omit scope to " +
+      "answer it. Nothing was prepared.",
+    "scope-required":
+      "This invitation repeats. Say scope series to answer every date in it. " +
+      "Nothing was prepared.",
+    "single-occurrence":
+      "Answering one date of a repeating invitation, or one date onward, is " +
+      "not supported. Scope series, which answers every date, is. Nothing " +
+      "was prepared.",
+    "no-repeating-rule":
+      "This invitation is a set of individually edited dates with no " +
+      "repeating rule behind them. Answering it is not supported, so nothing " +
+      "was prepared.",
     "not-invited":
       "You are not invited to this event as a guest, so there is no answer " +
       "of yours to set.",
@@ -4714,6 +4733,39 @@ const REPLY_REFUSAL_REASONS: Readonly<Record<ReplyRefusal, string>> =
       "This server holds no definition for the requested time zone, so " +
       "nothing was prepared. Omit the zone to see the event's own.",
   });
+
+/**
+ * D-13's rule for how much of an invitation one answer reaches (OQ1).
+ *
+ * A repeating invitation is answered only as a whole series, and only when the
+ * caller SAYS so. Nothing is inferred: every id listed from a series carries a
+ * recurrence id, so the id cannot tell "this Tuesday" from "every Tuesday", and
+ * a guess either way sends a reply the user did not choose.
+ *
+ * - One-off, any scope: `scope-on-single`. The caller believes something false
+ *   about the event.
+ * - No master: `no-repeating-rule`, whatever the scope (Pitfall 7). What iCloud
+ *   does with an answer to a lone edited date of somebody else's series is
+ *   unmeasured.
+ * - Repeating, no scope: `scope-required`.
+ * - Repeating, `occurrence` or `this-and-future`: `single-occurrence`.
+ * - Repeating, `series`: answered.
+ *
+ * The preview runs it on its read and the commit runs it again on its re-read
+ * with the SIGNED scope, so the two legs cannot disagree about what was
+ * confirmed.
+ */
+function replyScopeRefusal(
+  isRecurring: boolean,
+  hasSeriesMaster: boolean,
+  scope: WriteScope | null,
+): ReplyRefusal | null {
+  if (!isRecurring) return scope === null ? null : "scope-on-single";
+  if (!hasSeriesMaster) return "no-repeating-rule";
+  if (scope === null) return "scope-required";
+  if (scope !== "series") return "single-occurrence";
+  return null;
+}
 
 /** The user's stored answer, as one of this server's own words. */
 export type CurrentAnswer =
@@ -5188,23 +5240,6 @@ export function replyCommitToolResult(outcome: ReplyCommitOutcome): ToolResult {
   );
 }
 
-/**
- * Preview answering ONE invitation, and mint the confirmation to do it.
- *
- * `buildDeletePreview`'s order: read, refuse, mint, compose. Three steps touch
- * the network, all serial: the multi-get that brings the body, the ETag and the
- * scheduling marker back together; then, only for a non-repeating resource,
- * the one PROPFIND that reads the account's own addresses. Everything after
- * that is pure work over bytes already in hand.
- *
- * **The user's line is found by the account's addresses and by nothing the
- * caller said.** The tool takes an id and an answer; no parameter names a
- * person, so there is no value a caller can supply that aims the answer at
- * somebody else's line (D-04, RSVP-05).
- *
- * **A refusal mints nothing.** It carries this server's sentence and no
- * confirmation, so there is nothing to commit (`nothingMinted`'s precedent).
- */
 /** One day, in seconds. The margin the conflict read is widened by. */
 const CONFLICT_READ_MARGIN_SECONDS = 24 * 60 * 60;
 
@@ -5354,6 +5389,23 @@ function unsupportedZonePreview(id: string, answer: ReplyAnswerWord): ReplyPrevi
   };
 }
 
+/**
+ * Preview answering ONE invitation, and mint the confirmation to do it.
+ *
+ * `buildDeletePreview`'s order: read, refuse, mint, compose. Three steps touch
+ * the network, all serial: the multi-get that brings the body, the ETag and the
+ * scheduling marker back together; then, only when D-13's scope rule lets the
+ * answer through, the one PROPFIND that reads the account's own addresses;
+ * then the conflict sweep. Everything else is pure work over bytes in hand.
+ *
+ * **The user's line is found by the account's addresses and by nothing the
+ * caller said.** The tool takes an id, an answer, a scope and a display zone.
+ * No parameter names a person, so there is no value a caller can supply that
+ * aims the answer at somebody else's line (D-04, RSVP-05).
+ *
+ * **A refusal mints nothing.** It carries this server's sentence and no
+ * confirmation, so there is nothing to commit (`nothingMinted`'s precedent).
+ */
 async function buildReplyPreview(
   principal: Principal,
   davFetch: DavFetch,
@@ -5361,6 +5413,7 @@ async function buildReplyPreview(
   id: string,
   answer: ReplyAnswerWord,
   tzid: string | undefined,
+  scope: WriteScope | undefined,
 ): Promise<ReplyPreview> {
   const read = await getEventWithEtag(env, principal, davFetch, ref);
   const title = read.detail.summary;
@@ -5397,10 +5450,12 @@ async function buildReplyPreview(
     confirmationLine: null,
   });
 
-  // Before the address read, because a repeating invitation is refused whatever
-  // the addresses say, and a refusal should cost no request it does not need.
-  // Plan 18-05 replaces this refusal with the whole-series rule (D-13).
-  if (read.isRecurring) return refused("repeating", null);
+  // D-13, before the address read: a scope refusal holds whatever the
+  // addresses say, so it should cost no request it does not need.
+  const signedScope = scope ?? null;
+  const scopeRefusal = replyScopeRefusal(read.isRecurring, read.hasSeriesMaster, signedScope);
+  if (scopeRefusal !== null) return refused(scopeRefusal, null);
+  const series = signedScope === "series";
 
   const addresses = await resolveCalendarUserAddresses(env, principal, davFetch);
   const facts = invitationFactsOf(read.body, addresses, read.scheduleTag);
@@ -5413,7 +5468,9 @@ async function buildReplyPreview(
   if (planned.kind !== "ok") return refused(planned.kind, currentAnswer);
 
   const tells = TELLS_BY_EVIDENCE[facts.evidence];
-  const change: NormalizedReplyChange = { kind: "reply", scope: null, answer };
+  // The scope is hashed with the answer, so the token is bound to how much of
+  // the invitation it reaches.
+  const change: NormalizedReplyChange = { kind: "reply", scope: signedScope, answer };
 
   // RSVP-03, for EVERY answer (D-11). Awaited on its own, after the two reads
   // and the pure work above, and before anything is minted — so an auth or
@@ -5482,7 +5539,7 @@ async function buildReplyPreview(
         fieldCount: null,
         recipientCount: null,
         alarms: null,
-        reply: { answer, tells, organizerName: organizerNameFor(facts) },
+        reply: { answer, tells, organizerName: organizerNameFor(facts), series },
       },
       "would",
     ),
@@ -5595,6 +5652,15 @@ async function applyReplyCommit(
     throw new DavStaleResourceError();
   }
 
+  // 7a'. D-13 again, on the re-read and with the SIGNED scope. The ETag guard
+  // cannot see a resource that lost its rule under the same tag, and a series
+  // token must never be spent on anything but a series.
+  const signedScope = isWriteScope(change.scope) ? change.scope : null;
+  if (change.scope !== null && signedScope === null) throw new DavStaleResourceError();
+  if (replyScopeRefusal(read.isRecurring, read.hasSeriesMaster, signedScope) !== null) {
+    throw new DavStaleResourceError();
+  }
+
   // 7b. The account's addresses, read again rather than carried: they are the
   // signed-in principal's own server answer, and a confirmation is no place for
   // them.
@@ -5636,6 +5702,7 @@ async function applyReplyCommit(
           answer: change.answer,
           tells,
           organizerName: organizerNameFor(facts),
+          series: signedScope === "series",
         },
       },
       "did",
@@ -6683,6 +6750,18 @@ export function registerCalendarTools(
             "The user's own answer. Only the user's own answer changes; " +
               "nobody else's can be set.",
           ),
+        // Not SCOPE_PARAMETER: there `occurrence` is a supported answer, and
+        // here it is a refused one, so the update tool's sentence would tell a
+        // caller something false about this tool (D-13).
+        scope: z
+          .enum(WRITE_SCOPES)
+          .optional()
+          .describe(
+            "Required for a repeating invitation, and only series is accepted: " +
+              "it answers every date, replacing any date you answered " +
+              "separately, which the preview names first. occurrence and " +
+              "this-and-future are refused. Omit it for a one-off invitation.",
+          ),
         // Display only, on `calendar_find_free_slots`' own wording: it changes
         // which zone the preview's times are shown in and nothing else. It is
         // not hashed into the change and never reaches the commit.
@@ -6696,7 +6775,7 @@ export function registerCalendarTools(
           ),
       }),
     },
-    async ({ id, answer, tzid }) => {
+    async ({ id, answer, scope, tzid }) => {
       try {
         // Who this call acts for. First, so a refused principal reads
         // `auth_failed` before anything else is looked at (D-27).
@@ -6713,7 +6792,7 @@ export function registerCalendarTools(
 
         return replyPreviewToolResult(
           await withConfirmationBoundary(() =>
-            buildReplyPreview(actor, davFetch, ref, id, answer, tzid),
+            buildReplyPreview(actor, davFetch, ref, id, answer, tzid, scope),
           ),
         );
       } catch (err) {

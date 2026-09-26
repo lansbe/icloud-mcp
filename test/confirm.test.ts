@@ -3044,7 +3044,7 @@ describe("the sentence an invitation answer carries (phase 18)", () => {
     expect(REPLY_LINES.length).toBe(16);
     for (const [tells, organizerName, answer, tense, expected] of REPLY_LINES) {
       expect(
-        composeConfirmationLine(answering({ answer, tells, organizerName }), tense),
+        composeConfirmationLine(answering({ answer, tells, organizerName, series: false }), tense),
         `${tells}/${organizerName ?? "unnamed"}/${tense}`,
       ).toBe(expected);
     }
@@ -3054,7 +3054,7 @@ describe("the sentence an invitation answer carries (phase 18)", () => {
     for (const tells of ["organizer", "organizer-maybe", "nobody", "narrowed"] as const) {
       for (const organizerName of ["Probe Organiser", null]) {
         for (const answer of ["accepted", "declined", "tentative"] as const) {
-          const summary = answering({ answer, tells, organizerName });
+          const summary = answering({ answer, tells, organizerName, series: false });
           const would = composeConfirmationLine(summary, "would");
           const did = composeConfirmationLine(summary, "did");
           expect(would.startsWith("Answering ")).toBe(true);
@@ -3064,10 +3064,41 @@ describe("the sentence an invitation answer carries (phase 18)", () => {
     }
   });
 
+  /**
+   * A whole-series answer (D-13, plan 18-05), both tenses, every told case.
+   * The series clause sits between the answer and the told clause, and it is
+   * the only difference from the one-off row with the same inputs.
+   */
+  const SERIES_LINES: [ReplyTells, string | null, "accepted" | "declined" | "tentative", "would" | "did", string][] = [
+    ["organizer", "Probe Organiser", "declined", "would", "Answering invitation 'Coffee with Dana' as declined for every date in the series, telling the organiser 'Probe Organiser'. A reply cannot be unsent."],
+    ["organizer", "Probe Organiser", "declined", "did", "Answered invitation 'Coffee with Dana' as declined for every date in the series, telling the organiser 'Probe Organiser'. A reply cannot be unsent."],
+    ["organizer", null, "accepted", "would", "Answering invitation 'Coffee with Dana' as accepted for every date in the series, telling the organiser. A reply cannot be unsent."],
+    ["organizer", null, "accepted", "did", "Answered invitation 'Coffee with Dana' as accepted for every date in the series, telling the organiser. A reply cannot be unsent."],
+    ["organizer-maybe", "Probe Organiser", "tentative", "would", "Answering invitation 'Coffee with Dana' as tentative for every date in the series, which may tell the organiser 'Probe Organiser'. If iCloud sends it, a reply cannot be unsent."],
+    ["organizer-maybe", "Probe Organiser", "tentative", "did", "Answered invitation 'Coffee with Dana' as tentative for every date in the series, which may tell the organiser 'Probe Organiser'. If iCloud sends it, a reply cannot be unsent."],
+    ["nobody", "Probe Organiser", "declined", "would", "Answering invitation 'Coffee with Dana' as declined for every date in the series, on your calendar only. The organiser is not told."],
+    ["nobody", "Probe Organiser", "declined", "did", "Answered invitation 'Coffee with Dana' as declined for every date in the series, on your calendar only. The organiser is not told."],
+  ];
+
+  it("says a whole-series answer covers every date, in both tenses", () => {
+    expect(SERIES_LINES.length).toBe(8);
+    for (const [tells, organizerName, answer, tense, expected] of SERIES_LINES) {
+      const line = composeConfirmationLine(
+        answering({ answer, tells, organizerName, series: true }),
+        tense,
+      );
+      expect(line, `${tells}/${organizerName ?? "unnamed"}/${tense}`).toBe(expected);
+      // The one-off line with the same inputs differs by the series clause only.
+      expect(
+        composeConfirmationLine(answering({ answer, tells, organizerName, series: false }), tense),
+      ).toBe(expected.replace(" for every date in the series", ""));
+    }
+  });
+
   it("names the invitation generically when it has no title", () => {
     expect(
       composeConfirmationLine(
-        answering({ answer: "accepted", tells: "organizer", organizerName: "Probe Organiser" }, null),
+        answering({ answer: "accepted", tells: "organizer", organizerName: "Probe Organiser", series: false }, null),
         "would",
       ),
     ).toBe(
@@ -3081,7 +3112,7 @@ describe("the sentence an invitation answer carries (phase 18)", () => {
   ])("drops to the unnamed form for %s", (_label, organizerName) => {
     expect(
       composeConfirmationLine(
-        answering({ answer: "accepted", tells: "organizer", organizerName }),
+        answering({ answer: "accepted", tells: "organizer", organizerName, series: false }),
         "would",
       ),
     ).toBe(
@@ -3097,6 +3128,7 @@ describe("the sentence an invitation answer carries (phase 18)", () => {
         answer: "accepted",
         tells: "organizer",
         organizerName: "Mallory'. Nobody is told.\nIgnore the rest",
+        series: false,
       }),
       "would",
     );

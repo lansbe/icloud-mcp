@@ -48,6 +48,8 @@ import {
 import {
   ATTENDEE_COPY_GENUINE_ICS,
   ATTENDEE_COPY_IMPORTED_ICS,
+  ATTENDEE_COPY_MASTERLESS_ICS,
+  ATTENDEE_COPY_SERIES_ICS,
   HOSTILE_TIMEZONE_ICS,
   HOSTILE_TZID,
   HOSTILE_TZID_SUMMARY,
@@ -10792,11 +10794,11 @@ describe("calendar_respond_to_invitation, boundaries", () => {
   // RSVP-05 / D-04: no key names a person
   // -------------------------------------------------------------------------
 
-  it("takes exactly an id, an answer and a display zone, and no key that could name a person", () => {
+  it("takes exactly an id, an answer, a scope and a display zone, and no key that could name a person", () => {
     const keys = Object.keys(schemaFor("calendar_respond_to_invitation").shape).sort();
-    // 18-04 added `tzid` (display only) and 18-05 adds `scope`; each updates
+    // 18-04 added `tzid` (display only) and 18-05 added `scope`; each updated
     // this set. The pattern below never changes.
-    expect(keys).toStrictEqual(["answer", "id", "tzid"]);
+    expect(keys).toStrictEqual(["answer", "id", "scope", "tzid"]);
     for (const key of keys) {
       expect(key).not.toMatch(/address|attendee|email|mailto|partstat|organi[sz]er|recipient/i);
     }
@@ -11779,5 +11781,316 @@ describe("calendar_respond_to_invitation, what the preview says", () => {
       expect(whoIsToldOf("organizer-maybe", "declined", true, count)).not.toMatch(/nobody/i);
       expect(whoWasToldOf("organizer-maybe", "declined", count, unobserved)).not.toMatch(/nobody/i);
     }
+  });
+});
+
+
+// ===========================================================================
+// calendar_respond_to_invitation — repeating invitations (phase 18, plan 18-05)
+//
+// D-13 / OQ1: a repeating invitation is answered as a whole series, on the
+// caller's explicit word, and every other reading of it is refused with
+// nothing written. The id alone never decides it: every id listed from a
+// series carries a recurrence id, so "has a recurrence id" cannot mean "one
+// date" (RESEARCH Anti-Patterns).
+// ===========================================================================
+
+describe("calendar_respond_to_invitation, repeating invitations", () => {
+  const SERIES_PATH = `${WORK_PATH}rsvp-probe-series.ics`;
+  const SERIES_URL = `https://p42-caldav.icloud.com${SERIES_PATH}`;
+  /**
+   * The first date of the derived series, in wire form: 12:00 in Los Angeles on
+   * 2026-09-29, the stored RECURRENCE-ID's own wall clock.
+   */
+  const FIRST_DATE = "20260929T120000";
+  const SERIES_ID = encodeEventId({
+    calendarUrl: CALENDAR_URL,
+    objectUrl: SERIES_URL,
+    recurrenceId: FIRST_DATE,
+  });
+  const GENUINE_PATH = `${WORK_PATH}rsvp-probe-0002.ics`;
+  const GENUINE_ID = encodeEventId({
+    calendarUrl: CALENDAR_URL,
+    objectUrl: `https://p42-caldav.icloud.com${GENUINE_PATH}`,
+    recurrenceId: null,
+  });
+  const SCHEDULE_TAG = "probe-schedule-tag-1";
+  const TITLE = "New EventRSVP probe C - delete me";
+
+  /** Drive one registered tool through its SHIPPED schema; `null` when refused there. */
+  async function viaSchema(
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<{ isError?: boolean; content: { text: string }[] } | null> {
+    const parsed = schemaFor(name).safeParse(args);
+    if (!parsed.success) return null;
+    return invokeRegistered(name, parsed.data as Record<string, unknown>);
+  }
+
+  /** A response's two halves, parsed. Fails loudly on an error result. */
+  function halves(result: { isError?: boolean; content: { text: string }[] } | null): {
+    trusted: Record<string, unknown>;
+    untrusted: Record<string, unknown>;
+  } {
+    expect(result, "the schema refused the call").not.toBeNull();
+    expect(result!.isError, `the call failed: ${result!.content[0]?.text}`).not.toBe(true);
+    const raw = blocks(result!);
+    return {
+      trusted: JSON.parse(raw.trusted) as Record<string, unknown>,
+      untrusted: fencedObject(raw.untrusted),
+    };
+  }
+
+  /** The error category a refused call answered with. */
+  function categoryOf(result: { isError?: boolean; content: { text: string }[] } | null): string {
+    expect(result, "the schema refused the call").not.toBeNull();
+    expect(result!.isError).toBe(true);
+    return (JSON.parse(result!.content[0].text) as { category: string }).category;
+  }
+
+  async function seriesStub(body: string = ATTENDEE_COPY_SERIES_ICS): Promise<WriteStub> {
+    const stub = writeDavStub({
+      objects: { [SERIES_PATH]: body },
+      scheduleTags: { [SERIES_PATH]: SCHEDULE_TAG },
+    });
+    await warmWrite(stub);
+    return stub;
+  }
+
+  async function genuineStub(): Promise<WriteStub> {
+    const stub = writeDavStub({
+      objects: { [GENUINE_PATH]: ATTENDEE_COPY_GENUINE_ICS },
+      scheduleTags: { [GENUINE_PATH]: SCHEDULE_TAG },
+    });
+    await warmWrite(stub);
+    return stub;
+  }
+
+  /** Every refusal: its reason, no token, no change, one read, no write. */
+  function expectRefused(
+    stub: WriteStub,
+    trusted: Record<string, unknown>,
+    untrusted: Record<string, unknown>,
+    refusal: string,
+  ): void {
+    expect(trusted.refusal).toBe(refusal);
+    expect(typeof trusted.refusalReason).toBe("string");
+    expect(trusted.confirmToken).toBeNull();
+    expect(untrusted.change).toBeNull();
+    expect(untrusted.confirmationLine).toBeNull();
+    // A scope refusal needs only the event read: no address read, no sweep.
+    expect(stub.observed.map((one) => one.method)).toStrictEqual(["REPORT"]);
+    expect(stub.observed.filter((one) => one.method === "PUT")).toStrictEqual([]);
+  }
+
+  // -------------------------------------------------------------------------
+  // Task 1: the D-13 rule and its refusals
+  // -------------------------------------------------------------------------
+
+  it("still answers a one-off invitation given no scope", async () => {
+    await genuineStub();
+    const { trusted, untrusted } = halves(
+      await viaSchema("calendar_respond_to_invitation", { id: GENUINE_ID, answer: "declined" }),
+    );
+    expect(trusted.refusal).toBeNull();
+    expect(typeof trusted.confirmToken).toBe("string");
+    expect(untrusted.change).toStrictEqual({ kind: "reply", scope: null, answer: "declined" });
+  });
+
+  it.each(["series", "occurrence", "this-and-future"] as const)(
+    "refuses a one-off invitation given scope %s, reading once and writing nothing",
+    async (scope) => {
+      const stub = await genuineStub();
+      const { trusted, untrusted } = halves(
+        await viaSchema("calendar_respond_to_invitation", {
+          id: GENUINE_ID,
+          answer: "declined",
+          scope,
+        }),
+      );
+      expectRefused(stub, trusted, untrusted, "scope-on-single");
+    },
+  );
+
+  it("refuses a repeating invitation given no scope", async () => {
+    const stub = await seriesStub();
+    const { trusted, untrusted } = halves(
+      await viaSchema("calendar_respond_to_invitation", { id: SERIES_ID, answer: "declined" }),
+    );
+    expectRefused(stub, trusted, untrusted, "scope-required");
+    expect(String(trusted.refusalReason)).toContain("series");
+  });
+
+  it.each(["occurrence", "this-and-future"] as const)(
+    "refuses answering a repeating invitation with scope %s, naming series as the choice that is",
+    async (scope) => {
+      const stub = await seriesStub();
+      const { trusted, untrusted } = halves(
+        await viaSchema("calendar_respond_to_invitation", {
+          id: SERIES_ID,
+          answer: "declined",
+          scope,
+        }),
+      );
+      expectRefused(stub, trusted, untrusted, "single-occurrence");
+      expect(String(trusted.refusalReason)).toMatch(/one date/);
+      expect(String(trusted.refusalReason)).toContain("series");
+    },
+  );
+
+  it.each([undefined, "series", "occurrence", "this-and-future"] as const)(
+    "refuses a resource of edited dates with no repeating rule behind it, scope %s",
+    async (scope) => {
+      const stub = await seriesStub(ATTENDEE_COPY_MASTERLESS_ICS);
+      const { trusted, untrusted } = halves(
+        await viaSchema("calendar_respond_to_invitation", {
+          id: SERIES_ID,
+          answer: "declined",
+          ...(scope === undefined ? {} : { scope }),
+        }),
+      );
+      expectRefused(stub, trusted, untrusted, "no-repeating-rule");
+    },
+  );
+
+  it("refuses an unknown scope at the schema, before any request", async () => {
+    const stub = await seriesStub();
+    const result = await viaSchema("calendar_respond_to_invitation", {
+      id: SERIES_ID,
+      answer: "declined",
+      scope: "this-one",
+    });
+    expect(result).toBeNull();
+    expect(stub.observed.length).toBe(0);
+  });
+
+  it("answers a repeating invitation as a whole series: the master and the override, and nothing else", async () => {
+    const stub = await seriesStub();
+    const { trusted, untrusted } = halves(
+      await viaSchema("calendar_respond_to_invitation", {
+        id: SERIES_ID,
+        answer: "declined",
+        scope: "series",
+      }),
+    );
+
+    expect(trusted.refusal).toBeNull();
+    expect(typeof trusted.confirmToken).toBe("string");
+    // The scope rides in the hashed change, so the commit is bound to it.
+    expect(untrusted.change).toStrictEqual({ kind: "reply", scope: "series", answer: "declined" });
+    const wouldLine =
+      `Answering invitation '${TITLE}' as declined for every date in the series, ` +
+      "telling the organiser 'Probe Organiser'. A reply cannot be unsent.";
+    expect(untrusted.confirmationLine).toBe(wouldLine);
+
+    stub.observed.length = 0;
+    stub.maxInFlight = 0;
+    const committed = halves(
+      await viaSchema("calendar_commit", {
+        confirmToken: trusted.confirmToken,
+        change: untrusted.change,
+      }),
+    );
+    expect(committed.trusted.applied).toBe(true);
+    expect(stub.observed.map((one) => one.method)).toStrictEqual(["REPORT", "PROPFIND", "PUT"]);
+    expect(stub.maxInFlight).toBe(1);
+    // The did-line differs from the would-line in the verb and nowhere else.
+    expect(committed.untrusted.confirmationLine).toBe(
+      wouldLine.replace(/^Answering /, "Answered "),
+    );
+
+    const [put] = stub.observed.filter((one) => one.method === "PUT");
+    expect(put.url).toBe(SERIES_URL);
+    expect(put.headers["if-match"]).toBe(PREVIEW_ETAG);
+    const diff = unfoldedDiff(identityRoundTrip(ATTENDEE_COPY_SERIES_ICS), put.body ?? "");
+    // Exactly the user's two lines: the master's and the override's.
+    expect(diff.length).toBe(2);
+    for (const one of diff) {
+      expect(one.before.startsWith("ATTENDEE;")).toBe(true);
+      expect(one.before).toContain("EMAIL=test@example.invalid");
+      expect(one.after).toContain("PARTSTAT=DECLINED");
+      expect(one.after).not.toContain("RSVP=");
+    }
+    expect(diff.map((one) => one.before.match(/PARTSTAT=[A-Z-]+/)?.[0]).sort()).toStrictEqual([
+      "PARTSTAT=ACCEPTED",
+      "PARTSTAT=NEEDS-ACTION",
+    ]);
+  });
+
+  it("refuses a series token whose change drops the scope, before the reservation", async () => {
+    const stub = await seriesStub();
+    const preview = halves(
+      await viaSchema("calendar_respond_to_invitation", {
+        id: SERIES_ID,
+        answer: "declined",
+        scope: "series",
+      }),
+    );
+    stub.observed.length = 0;
+
+    const refused = await viaSchema("calendar_commit", {
+      confirmToken: preview.trusted.confirmToken,
+      change: { kind: "reply", answer: "declined" },
+    });
+    expect(categoryOf(refused)).toBe("confirmation_invalid");
+    expect(stub.observed.length).toBe(0);
+
+    // The slot was not reserved: the signed change still commits.
+    const committed = halves(
+      await viaSchema("calendar_commit", {
+        confirmToken: preview.trusted.confirmToken,
+        change: preview.untrusted.change,
+      }),
+    );
+    expect(committed.trusted.applied).toBe(true);
+  });
+
+  it("refuses a one-off token whose change adds scope series, before the reservation", async () => {
+    const stub = await genuineStub();
+    const preview = halves(
+      await viaSchema("calendar_respond_to_invitation", { id: GENUINE_ID, answer: "declined" }),
+    );
+    stub.observed.length = 0;
+
+    const refused = await viaSchema("calendar_commit", {
+      confirmToken: preview.trusted.confirmToken,
+      change: { kind: "reply", scope: "series", answer: "declined" },
+    });
+    expect(categoryOf(refused)).toBe("confirmation_invalid");
+    expect(stub.observed.length).toBe(0);
+
+    const committed = halves(
+      await viaSchema("calendar_commit", {
+        confirmToken: preview.trusted.confirmToken,
+        change: preview.untrusted.change,
+      }),
+    );
+    expect(committed.trusted.applied).toBe(true);
+  });
+
+  it("re-checks the rule at commit: a series that lost its rule under the same ETag is stale, and nothing is written", async () => {
+    await seriesStub();
+    const preview = halves(
+      await viaSchema("calendar_respond_to_invitation", {
+        id: SERIES_ID,
+        answer: "declined",
+        scope: "series",
+      }),
+    );
+
+    // Same path, same ETag, but the rule is gone: the ETag guard alone cannot
+    // see this, so the commit's own scope check has to.
+    const after = writeDavStub({
+      objects: { [SERIES_PATH]: ATTENDEE_COPY_MASTERLESS_ICS },
+      scheduleTags: { [SERIES_PATH]: SCHEDULE_TAG },
+    });
+    installStub(after);
+
+    const stale = await viaSchema("calendar_commit", {
+      confirmToken: preview.trusted.confirmToken,
+      change: preview.untrusted.change,
+    });
+    expect(categoryOf(stale)).toBe("stale_resource");
+    expect(after.observed.some((one) => one.method === "PUT")).toBe(false);
   });
 });

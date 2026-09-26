@@ -1482,9 +1482,11 @@ export type ReplyAnswerWord = "accepted" | "declined" | "tentative";
  * were and gives a reply a domain no other change can land in: its tuple starts
  * with the kind `reply`, which no update or delete tuple does.
  *
- * `scope` is here and null today. It is the slot a repeating invitation will
- * need (plan 18-05), and a slot added later would move every reply hash minted
- * before it.
+ * `scope` is `"series"` for an answer to every date of a repeating invitation
+ * and null for a one-off one (D-13, plan 18-05). It is hashed, so a token
+ * minted for the whole series cannot be spent as a one-off answer, or the
+ * reverse. The slot existed from the first reply hash, so filling it moved no
+ * hash minted before it.
  */
 export interface NormalizedReplyChange {
   kind: "reply";
@@ -1658,6 +1660,13 @@ export interface ReplyLineSummary {
    * text: it reaches the sentence through `quotedName` and nowhere else.
    */
   organizerName: string | null;
+  /**
+   * True when the answer covers every date of a repeating invitation (D-13).
+   * The line then says so in this server's own words, because an answer that
+   * reaches every Tuesday is a different act from one that reaches one, and a
+   * sentence that read the same for both would hide which the user confirmed.
+   */
+  series: boolean;
 }
 
 /**
@@ -2026,7 +2035,9 @@ export function composeConfirmationLine(
         : reply.tells === "organizer-maybe"
           ? REPLY_MAYBE_CONSEQUENCE
           : REPLY_LOCAL_CONSEQUENCE;
-    const head = `${CONFIRMATION_VERBS[summary.kind][tense]} ${subject} as ${reply.answer}`;
+    const head =
+      `${CONFIRMATION_VERBS[summary.kind][tense]} ${subject} as ${reply.answer}` +
+      (reply.series ? " for every date in the series" : "");
     return `${head}, ${told}. ${consequence}`;
   }
 
