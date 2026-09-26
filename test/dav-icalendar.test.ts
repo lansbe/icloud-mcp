@@ -3937,6 +3937,29 @@ function answeredLine(before: string, answer: ReplyAnswer): string {
 }
 
 describe("applyReply", () => {
+  it("never answers on a stranger's line that carries the user's address in EMAIL= (WR-01)", () => {
+    // The user's real line is left out. Bob's line names the user in EMAIL=,
+    // and its value is Bob's own mailto. It is Bob's line, so there is no line
+    // of the user's to answer on, and nothing is written.
+    const crafted = `ATTENDEE;CN=Bob;PARTSTAT=NEEDS-ACTION;EMAIL=${OWN_LOGIN}:mailto:bob@example.invalid`;
+    expect(answered(invitationIcs([crafted, STRANGER_LINE]), OWN_ADDRESSES, "DECLINED")).toStrictEqual({
+      kind: "not-invited",
+      body: null,
+    });
+
+    // With the user's real line present as well, only that line moves.
+    const own = `ATTENDEE;CN=Me;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:${OWN_LOGIN}`;
+    const body = answeredBody(invitationIcs([crafted, own]), OWN_ADDRESSES, "DECLINED");
+    expect(unfoldedLines(body)).toContain(crafted);
+    expect(unfoldedLines(body)).toContain(`ATTENDEE;CN=Me;PARTSTAT=DECLINED:mailto:${OWN_LOGIN}`);
+  });
+
+  it("does not read an organiser line with the user's EMAIL= on a stranger's mailto as the user (WR-01)", () => {
+    const organiser = `ORGANIZER;CN=Bob;EMAIL=${OWN_LOGIN}:mailto:bob@example.invalid`;
+    const own = `ATTENDEE;CN=Me;PARTSTAT=NEEDS-ACTION:mailto:${OWN_LOGIN}`;
+    expect(answered(invitationIcs([own], organiser), OWN_ADDRESSES, "ACCEPTED").kind).toBe("ok");
+  });
+
   it("changes exactly the user's own line on the genuine copy, compared with what any patch writes", () => {
     const identity = identityRoundTrip(ATTENDEE_COPY_GENUINE_ICS);
     const body = answeredBody(ATTENDEE_COPY_GENUINE_ICS, OWN_ADDRESSES, "DECLINED");
@@ -4264,6 +4287,13 @@ describe("isOwnAddress", () => {
     ["an empty EMAIL= on a stranger", "mailto:dana@example.invalid", "", false],
     ["a null value and no EMAIL=", null, null, false],
     ["EMAIL= never compared with a non-mailto entry", "mailto:dana@example.invalid", OWN_PRINCIPAL, false],
+    // WR-01 (18-REVIEW). A line whose value is a mailto is matched on that
+    // mailto alone. An organiser could otherwise put the user's address in
+    // EMAIL= on somebody else's line and have the answer written there.
+    ["the user's EMAIL= on a stranger's mailto", "mailto:bob@example.invalid", OWN_LOGIN, false],
+    ["the user's EMAIL= on a stranger's MAILTO, upper-case", "MAILTO:bob@example.invalid", OWN_LOGIN, false],
+    ["EMAIL= still identifies the user beside a non-mailto value", "/x/principal/", OWN_LOGIN, true],
+    ["EMAIL= still identifies the user when the line has no value", null, OWN_ALIAS, true],
   ] as const)("%s", (_label, value, email, expected) => {
     expect(isOwnAddress(value, email, OWN_ADDRESSES)).toBe(expected);
   });

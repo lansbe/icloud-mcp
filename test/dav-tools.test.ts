@@ -10844,6 +10844,16 @@ describe("calendar_respond_to_invitation, boundaries", () => {
     ],
     ["the user is not on it", "not-invited", invitationBody(ORGANISER, [DANA])],
     [
+      // WR-01 (18-REVIEW). Bob's line, carrying the user's address in EMAIL=,
+      // is still Bob's: a mailto value is matched on that mailto alone.
+      "the user's address is only in EMAIL= on a stranger's mailto line",
+      "not-invited",
+      invitationBody(ORGANISER, [
+        `ATTENDEE;CN=Bob;PARTSTAT=NEEDS-ACTION;EMAIL=${LOGIN_ADDRESS}:mailto:bob@example.invalid`,
+        DANA,
+      ]),
+    ],
+    [
       "two of the user's addresses are on it",
       "ambiguous",
       invitationBody(ORGANISER, [

@@ -2813,7 +2813,13 @@ const MAILTO_PREFIX = "mailto:";
  *   invitation iCloud itself delivered, the user's line carries an opaque
  *   principal path as its value and the address ONLY in `EMAIL=`. A matcher
  *   that read the value alone would call the user a stranger on their own
- *   invitation.
+ *   invitation. **Consulted only when the value is NOT a `mailto:`**
+ *   (18-REVIEW WR-01). A line whose value is a `mailto:` already says who it
+ *   is, and that is the whole answer. Otherwise an organiser could write the
+ *   user's address in `EMAIL=` on Bob's `mailto:` line, leave the user's own
+ *   line out, and have the user's answer written onto Bob's line. 18-01 only
+ *   ever measured `EMAIL=` beside an opaque path, so this narrows nothing
+ *   that was measured.
  * - Any other value, EXACTLY. A principal path or a `urn:uuid:` form is an
  *   opaque identifier, and folding one would be this function inventing an
  *   equivalence the server never declared. The measured line was a relative
@@ -2831,8 +2837,10 @@ export function isOwnAddress(
   addresses: readonly string[],
 ): boolean {
   const foldedValue = value === null ? null : value.toLowerCase();
+  const valueIsMailto = foldedValue !== null && foldedValue.startsWith(MAILTO_PREFIX);
+  // Never read beside a mailto value: see the second arm above.
   const foldedEmail =
-    emailParameter === null || emailParameter.length === 0
+    valueIsMailto || emailParameter === null || emailParameter.length === 0
       ? null
       : emailParameter.toLowerCase();
 
