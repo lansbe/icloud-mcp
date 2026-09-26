@@ -748,25 +748,28 @@ export const HOME_EXEMPT_REQUEST_SITES: readonly ExemptSite[] = Object.freeze([
   //
   // **The reasons below used to say "a single refresh boolean", and phase 14
   // made that sentence false rather than merely dated.** `dav_diagnose` now
-  // takes three booleans. Nothing about the claim weakened — booleans still
-  // carry no URL, and the two probes' targets are still built from this
-  // principal's own resolved home set — but an exemption's reason is the thing
-  // a reviewer reads, and a reason that is wrong in a checkable detail is worse
-  // than one that is merely brief. The wording is corrected rather than left to
-  // decay, because nothing in this file fails when prose stops matching code.
+  // takes FOUR booleans — phase 17 added the property-name probe. Nothing about
+  // the claim weakened — booleans still carry no URL, and every probe's targets
+  // are still built from this principal's own resolved home set — but an
+  // exemption's reason is the thing a reviewer reads, and a reason that is wrong
+  // in a checkable detail is worse than one that is merely brief. The wording is
+  // corrected rather than left to decay, because nothing in this file fails when
+  // prose stops matching code. The COUNT is the part that keeps going stale, and
+  // it is kept because it is the checkable detail: a reviewer who reads "four"
+  // and finds five has found a boolean nobody argued for.
   {
     file: DIAGNOSE,
     fn: "probeCalendarHome",
     request: "propfind",
     reason:
-      "the target is the homeUrl parameter, and every caller passes a resolved.homeUrl: runOneService, and since phase 14 the two probes, which resolve the account themselves through resolveDavAccount. The whole dav_diagnose input is three booleans, so no caller-supplied value reaches this URL at all",
+      "the target is the homeUrl parameter, and every caller passes a resolved.homeUrl: runOneService, and since phase 14 the probes, which resolve the account themselves through resolveDavAccount. The whole dav_diagnose input is four booleans, so no caller-supplied value reaches this URL at all",
   },
   {
     file: DIAGNOSE,
     fn: "runOneService",
     request: "fetchAddressBooks",
     reason:
-      "the account is davAccountFor(service, resolved), built from the resolved home set and a service name taken from the DAV_SERVICES constant this function loops over; the whole dav_diagnose input is three booleans, so no caller-supplied value reaches this URL at all",
+      "the account is davAccountFor(service, resolved), built from the resolved home set and a service name taken from the DAV_SERVICES constant this function loops over; the whole dav_diagnose input is four booleans, so no caller-supplied value reaches this URL at all",
   },
   // Phase 14's three sites. All of them are reached only behind their own
   // named boolean, and all three targets are built from the SAME resolved home
@@ -791,6 +794,37 @@ export const HOME_EXEMPT_REQUEST_SITES: readonly ExemptSite[] = Object.freeze([
     request: "deleteObject",
     reason:
       "the delete addresses the same generated URL, from the same local const. This is the site where being aimed wrongly would cost the most — it REMOVES what it addresses — and it is also the site where the URL is furthest from any caller: nothing reaches this function but a boolean",
+  },
+  // Phase 17's property-name probe. FOUR requests share this entry because they
+  // share this key and this loop exactly: one depth-0 `DAV:propname` PROPFIND per
+  // target, issued from one `for ... of` with one `await`. They are SERIAL and the
+  // last two cannot be otherwise — their hrefs come out of a listing the first
+  // pair's own discovery produced.
+  //
+  // **It is exempt, and two of the four targets are nonetheless checked.** That
+  // is not a contradiction, and it is the same shape `resolveDefaultCalendarUrl`
+  // and `createCalendarCollection` above already carry: exempt means no CALLER can
+  // aim it, while the check on the two wire-sourced hrefs is defence against the
+  // remote ANSWER, which is a different question. `src/dav/transport.ts` attaches
+  // the Apple ID and the app-specific password to whatever URL it is handed, and
+  // the home enumeration resolves a relative href against the home but does not
+  // compare ORIGIN — so an absolute href naming another host would survive it.
+  //
+  // **The principal target is the one the check cannot cover, and that is recorded
+  // rather than papered over.** It sits on the unsharded discovery entry host
+  // while the home URL carries the account's own `pXX-` shard, so
+  // `assertUnderHome` against the home would refuse a URL this account genuinely
+  // owns, on an origin mismatch, every time. What stands in its place is where it
+  // came from: `resolveDavAccount` produced it for THIS principal, and it is the
+  // very same URL `resolveDefaultCalendarUrl`'s first request already addresses
+  // without a containment check. A check that cannot hold is worse than none,
+  // because the next reader believes it.
+  {
+    file: DIAGNOSE,
+    fn: "runPropertyNameProbe",
+    request: "davRequest",
+    reason:
+      "FOUR requests share this entry because they share this key and this loop exactly -- one depth-0 DAV:propname PROPFIND per target. Two targets ARE the discovery triple resolveDavAccount just produced for THIS principal, the account's principalUrl and its homeUrl, so there is nothing above either of them to be contained by; the other two are hrefs read off the depth-1 home listing by advertised resource type, the scheduling inbox and the first calendar collection, and both are passed through assertUnderHome against resolved.homeUrl before the request because they arrived from the SERVER rather than from a caller and transport.ts attaches the credential to whatever URL it is handed. That check is recorded here rather than claimed as the containment this gate verified, on createCalendarCollection's and resolveDefaultCalendarUrl's own precedent. NO check is asserted on the principal and that is deliberate rather than missing: the principal sits on the unsharded discovery entry host while every collection sits on the account's pXX- shard, so assertUnderHome against the home would refuse a URL the account genuinely owns on an origin mismatch every time -- it is the same URL resolveDefaultCalendarUrl's first request addresses with no check. The probe's whole input is one boolean saying whether to run: no host, no path and no identifier crosses the tool boundary, which is why this is exempt rather than checked -- there is no caller-supplied URL for assertUnderHome to be checking. The request is READ-ONLY in the strongest form here: RFC 4918 section 9.1 makes the server answer with property NAMES and no values",
   },
 ]);
 

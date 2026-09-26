@@ -10,6 +10,7 @@ import type { DavDiagnosticOutcome } from "../../dav/diagnose";
 import {
   runCollectionWriteProbe,
   runDavDiagnosticOutcome,
+  runPropertyNameProbe,
   runTaskCollectionProbe,
 } from "../../dav/diagnose";
 import { davToErrorCategory } from "../../dav/errors";
@@ -143,7 +144,26 @@ export function davDiagnosticResult(outcome: DavDiagnosticOutcome): ToolResult {
  * bite, and it takes no title, name or id to match against and returns no
  * verdict — the comparison against what the owner named happens elsewhere.
  *
- * Both default to false, so the DEFAULT response is unchanged in cost and in
+ * **Phase 17 added a third, and the D-06 argument has to be restated for it as
+ * well rather than inherited from the two above.**
+ *
+ * `probePropertyNames` asks four of this account's resources — the principal, the
+ * calendar home, the scheduling inbox and one real calendar — which property
+ * NAMES they carry, through `DAV:propname` (RFC 4918 § 9.1). It exists because
+ * CALM-07's refusal of the account's default calendar is currently inert: two
+ * probes asking for ONE NAMED property each came back null, and a requirement is
+ * about to be deleted on the inference that Apple therefore exposes nothing. This
+ * is the exhaustive form of the question. Four things bound it. It is OFF unless
+ * asked for by name. It is READ-ONLY in the strongest form available, because the
+ * server answers a `propname` request with names and NO VALUES — so no calendar
+ * title, colour, URL or other property content can ride out through it, and the
+ * probe reads only `Object.keys` in any case. Every target is derived from THIS
+ * principal's own resolved discovery, and the two derived from the home listing
+ * are checked under the resolved home before they are requested. And the boolean
+ * reaches no host, no port, no transport mode and no URL, exactly as `refresh`
+ * does not.
+ *
+ * All three default to false, so the DEFAULT response is unchanged in cost and in
  * shape: a reader of an ordinary run sees exactly what they saw before.
  *
  * `davFetch` is passed in rather than built here, for the reason the comment on
@@ -181,9 +201,20 @@ export function registerDavDiagnoseTool(
           .describe(
             "List the to-do items in this account's task collections, with their titles.",
           ),
+        probePropertyNames: z
+          .boolean()
+          .optional()
+          .describe(
+            "Report which property names iCloud carries on the principal, the calendar home, the scheduling inbox and one calendar. Names only, no values.",
+          ),
       }),
     },
-    async ({ refresh, probeCollectionWrite, probeTaskObjects }) => {
+    async ({
+      refresh,
+      probeCollectionWrite,
+      probeTaskObjects,
+      probePropertyNames,
+    }) => {
       try {
         // Who this call acts for. First, so a refused principal reads
         // `auth_failed` before anything else is looked at (D-27).
@@ -192,15 +223,16 @@ export function registerDavDiagnoseTool(
           refresh: refresh ?? false,
         });
 
-        // Both probes run only after the two services have, and only when asked
+        // Every probe runs only after the two services have, and only when asked
         // for by name. `=== true` rather than a truthy test, so nothing but the
-        // boolean itself can turn either of them on.
+        // boolean itself can turn any of them on.
         //
-        // **NEITHER PROBE MAY DISCARD THE REPORT, and that is why each is
-        // total rather than throwing.** Both now fold every refusal into their
-        // own returned value — per collection for the to-do listing, per step
-        // for the write — so neither can reach the catch below and replace a
-        // whole diagnostic with a bare category. That is not a convenience: the
+        // **NO PROBE MAY DISCARD THE REPORT, and that is why each is
+        // total rather than throwing.** Each folds every refusal into its own
+        // returned value — per collection for the to-do listing, per step for
+        // the write, per target for the property-name reading — so none can
+        // reach the catch below and replace a whole diagnostic with a bare
+        // category. That is not a convenience: the
         // live account answers 404 on two abandoned to-do lists, and while the
         // listing threw, asking for it discarded both services' discovery, the
         // collection enumeration, the timings, and the write report beside it.
@@ -211,6 +243,16 @@ export function registerDavDiagnoseTool(
         // fail costs nothing on the account.
         if (!outcome.failed && probeTaskObjects === true) {
           outcome.report.caldav.taskObjects = await runTaskCollectionProbe(
+            env,
+            actor,
+            davFetch,
+          );
+        }
+        // Also a READ, so it goes ahead of the write for the same reason the
+        // to-do listing does: a run that is going to fail costs nothing on the
+        // account. Total rather than throwing, like both of its neighbours.
+        if (!outcome.failed && probePropertyNames === true) {
+          outcome.report.caldav.propertyNames = await runPropertyNameProbe(
             env,
             actor,
             davFetch,

@@ -37,6 +37,7 @@ import { davToErrorCategory } from "./errors";
 import type { DavService, ResolvedDavAccount } from "./discovery";
 import {
   DAV_SERVICES,
+  assertUnderHome,
   clearDavCache,
   davAccountFor,
   resolveDavAccount,
@@ -186,6 +187,14 @@ export interface DavServiceReport {
    * and in shape.
    */
   taskObjects: TaskCollectionProbe | null;
+  /**
+   * CalDAV only: which property NAMES this account's resources carry.
+   *
+   * `null` when `probePropertyNames` was absent or false. Same convention, same
+   * reason, and the same default as the two probes above: the ordinary response
+   * is unchanged in cost and in shape, and the run issues no extra request.
+   */
+  propertyNames: PropertyNameProbe | null;
   timings: DavServiceTimings;
 }
 
@@ -378,6 +387,77 @@ export interface TaskCollectionProbe {
 }
 
 /**
+ * One resource, and every property NAME it carries — never a value.
+ *
+ * **The names are the ones the DAV library hands back, which are the namespace
+ * prefix stripped and the remainder camel-cased.** So `CALDAV:schedule-default-
+ * calendar-URL` arrives as `scheduleDefaultCalendarURL`, and that is the useful
+ * spelling rather than a lossy one: it is exactly the key a reader of this report
+ * would then look up in `DAVResponse.props`, which is how every property in this
+ * module is already read. Two consequences are worth writing down rather than
+ * discovering. Two properties from DIFFERENT namespaces sharing a local name
+ * collapse to one key, so a name appearing once here does not prove one property.
+ * And a property the server named only inside a non-2xx propstat is not here at
+ * all, because the library keeps only the 2xx ones — a `propname` answer is
+ * normally all-200, so this is a caveat rather than a gap.
+ *
+ * `names` is `null` in two distinguishable cases, and `category` is what
+ * separates them: a category means this target was ASKED and refused, while a
+ * null category with an empty `href` means the target could not be found in the
+ * account's own home listing, so nothing was asked. An EMPTY array is a third,
+ * different answer — the resource was asked and named no properties at all.
+ */
+export interface PropertyNameTarget {
+  /** Which resource: `principal`, `home`, `schedule-inbox`, `calendar`. */
+  target: string;
+  /** The href actually asked, or `""` when none could be derived. */
+  href: string;
+  /** Every property name carried, sorted. `null` when nothing was asked. */
+  names: string[] | null;
+  /** The refusal's category, from the fixed vocabulary. `null` when none. */
+  category: string | null;
+}
+
+/**
+ * What property NAMES iCloud carries on four resources of this account.
+ *
+ * **It exists because two targeted probes came back null and a requirement is
+ * about to be deleted on the strength of that.** CALM-07 refuses the account's
+ * default calendar as a delete target, and the refusal is inert: measured live on
+ * 2026-09-25, `CALDAV:schedule-default-calendar-URL` is absent from all thirteen
+ * home rows AND from the scheduling inbox, which is where RFC 6638 § 9.2 defines
+ * it. The likely explanation is that Apple's "Default Calendar" is a per-DEVICE
+ * setting rather than account state, in which case no server property exists to
+ * find. That explanation may well be right, and it is still an INFERENCE: both
+ * probes so far asked for ONE NAMED property, which is a different question from
+ * asking what properties exist.
+ *
+ * `DAV:propname` is that second question. RFC 4918 § 9.1 defines a PROPFIND whose
+ * body is `<D:propfind><D:propname/></D:propfind>` as returning the name of every
+ * property the resource carries, WITH NO VALUES. So this is the exhaustive ask,
+ * and it cannot leak a value because the server sends none — which is what makes
+ * it safe to point at a real account.
+ *
+ * **Nothing here decides anything.** The probe reports names; whether Apple
+ * exposes a default-calendar property, and what CALM-07 should therefore say, is
+ * the owner's call on this reading. A verdict computed in this file would be this
+ * file deciding CALM-07.
+ */
+export interface PropertyNameProbe {
+  /** One entry per target, in the fixed order the probe asks them. */
+  targets: PropertyNameTarget[];
+  /**
+   * The category of a refusal that stopped the probe BEFORE any target could be
+   * derived, or `null` when it got as far as the targets.
+   *
+   * Distinct from the per-target field for the reason `TaskCollectionProbe`'s
+   * own pair is: that one says "this resource was asked and refused", this one
+   * says "no resource was ever asked".
+   */
+  category: string | null;
+}
+
+/**
  * The whole `dav_diagnose` contract.
  *
  * **The two services are reported separately and unconditionally, including
@@ -416,6 +496,7 @@ function emptyServiceReport(): DavServiceReport {
     collections: null,
     collectionWrite: null,
     taskObjects: null,
+    propertyNames: null,
     timings: { discoveryMs: null, collectionsMs: null },
   };
 }
@@ -753,15 +834,22 @@ async function runOneService(
 }
 
 // ---------------------------------------------------------------------------
-// The two opt-in probes (Phase 14: SPIKE-04 and SPIKE-02's object-level half).
+// The opt-in probes (Phase 14: SPIKE-04 and SPIKE-02's object-level half;
+// phase 17: the property-name reading CALM-07's verdict is waiting on).
 //
-// Both are OFF by default, both are reached only through their own named
-// boolean on `dav_diagnose`, and neither takes a URL, an identifier or a name
-// from any caller. Both are strictly SERIAL — a `for ... of` with its own
-// `await`, never a concurrent combinator. `dav-concurrent-request` names both
-// of them and all four library primitives they call, and those names went onto
-// that alternation before either function was written, because a name omitted
-// from it is invisible to every assertion in the suite.
+// Every one of them is OFF by default, every one is reached only through its own
+// named boolean on `dav_diagnose`, and none takes a URL, an identifier or a name
+// from any caller. Every one is strictly SERIAL — a `for ... of` with its own
+// `await`, never a concurrent combinator. `dav-concurrent-request` names each of
+// them and every library primitive they call, and those names went onto that
+// alternation before the functions were written, because a name omitted from it
+// is invisible to every assertion in the suite.
+//
+// The COUNT is deliberately not stated in the paragraph above. It said "the two"
+// and "both" throughout while there were two, and the third probe made every one
+// of those words false rather than merely dated — which is the same silent
+// staleness this tree has recorded elsewhere: nothing fails when prose stops
+// matching code. How many there are is a question for the file.
 //
 // **Every tsdav helper below passes `fetch: davFetch` EXPLICITLY.** That
 // parameter is declared `fetch?: typeof fetch` and resolved as
@@ -1341,4 +1429,220 @@ export async function runTaskCollectionProbe(
     collections,
     category: null,
   };
+}
+
+/**
+ * Every property NAME one multistatus carried, sorted and de-duplicated.
+ *
+ * **NAMES ONLY, and that is the safety property rather than a convenience.** It
+ * reads `Object.keys` off the parsed property object and never indexes into it,
+ * so no value can ride out through this function no matter what the server put
+ * in the response body. A conformant `DAV:propname` answer carries empty
+ * elements and there is nothing to read; a server that answered with values
+ * anyway would still be reported as names, because a key is all this function
+ * can see.
+ *
+ * Hand-narrowed for the reason everything else in this module is: the library
+ * types this whole region `any`, so the compiler is not watching, and a response
+ * carrying no property region at all must contribute nothing rather than throw.
+ * Sorted, so two runs against the same account produce the same reading and a
+ * diff between two accounts is a diff rather than a reordering.
+ */
+function propertyNamesIn(responses: DAVResponse[]): string[] {
+  const names = new Set<string>();
+  for (const response of responses) {
+    const props: unknown = response.props;
+    if (props === null || typeof props !== "object") continue;
+    for (const key of Object.keys(props as Record<string, unknown>)) {
+      names.add(key);
+    }
+  }
+  return [...names].sort();
+}
+
+/**
+ * One target of the property-name probe, before it is asked.
+ *
+ * `contained` says whether the href arrived from the WIRE, which is what decides
+ * whether `assertUnderHome` can be run against it at all — see the probe's own
+ * docstring for why that is not the same question as "is it caller-supplied".
+ */
+interface PropertyNameAsk {
+  target: string;
+  href: string;
+  contained: boolean;
+}
+
+/**
+ * Ask four of this account's resources what property NAMES they carry.
+ *
+ * READ-ONLY, and read-only in the strongest form this project has: `DAV:propname`
+ * (RFC 4918 § 9.1) asks for names and the server answers with names, so there is
+ * no value in the response for this code to mishandle. It writes nothing, it goes
+ * nowhere near `src/mail/`, and `PropertyNameProbe`'s own docstring records why it
+ * exists — a requirement is about to be deleted on an inference, and this is the
+ * measurement that either confirms the inference or refutes it.
+ *
+ * **Four targets, depth 0 each, and every one derived from the account's own
+ * resolved discovery.** The principal, the calendar home, the scheduling inbox,
+ * and one real calendar. The last two are READ OFF the home listing by their
+ * advertised resource type rather than constructed from a string, because a URL
+ * this server assembled from a pattern would agree with reality right up until
+ * the moment the answer mattered — the argument this module's header already
+ * makes about the shard host. The calendar is reported BY HREF, so the reading is
+ * reproducible against the same collection later.
+ *
+ * **TOTAL, never throwing.** Every refusal folds into the returned value: per
+ * target when a target was asked and refused, on the probe itself when nothing
+ * could be derived at all. That is the contract the two probes above already
+ * obey and it is not a convenience — this module's header says a diagnostic that
+ * discards its measurements at the first problem is useless for the one job it
+ * has, and the live account has already proved it, answering 404 on two abandoned
+ * collections and costing an entire report.
+ *
+ * **Strictly serial**: one `for ... of`, one `await` per target, no combinator
+ * and nothing resembling one. Four round trips plus discovery and the listing is
+ * already most of a per-invocation connection budget, and iCloud's own per-account
+ * ceiling is lower, undocumented and deliberately unmeasured.
+ *
+ * ## Containment, and the one target it cannot cover
+ *
+ * The two hrefs that came off the WIRE — the scheduling inbox and the calendar —
+ * are passed through `assertUnderHome` against this account's own resolved home
+ * before anything is requested, because `./transport.ts` attaches the Apple ID
+ * and the app-specific password to whatever URL it is handed and "the server said
+ * so" is not an authorisation. The enumeration resolves a relative href against
+ * the home and drops one that will not resolve, but it does not check ORIGIN, so
+ * an absolute href naming another host would otherwise survive it. A refusal
+ * arrives as the same typed class every other not-found does and becomes that
+ * target's category, which is why it is inside the per-target `try`.
+ *
+ * **The home URL is the base, so there is nothing above it to be contained by** —
+ * the claim `fetchCollections`' own exemption makes one module over.
+ *
+ * **The principal is NOT under the home set and cannot be made to be, so no
+ * containment claim is asserted on it and this is what stands in its place.** It
+ * sits on the unsharded DISCOVERY ENTRY host while every collection on the account
+ * sits on the account's own `pXX-` shard, which is the host the home URL carries —
+ * the trap `resolveDefaultCalendarUrl` records at length, and the reason it
+ * resolves a relative inbox href against the home rather than the principal.
+ * Running `assertUnderHome(principalUrl, homeUrl)` would therefore refuse a URL
+ * this account genuinely owns, on an origin mismatch, every single time. What
+ * protects it instead is where it came from: `resolveDavAccount` produced it for
+ * THIS principal, and it is the very same URL `resolveDefaultCalendarUrl` already
+ * requests without a containment check. Writing a check that cannot hold would be
+ * worse than writing none, because the next reader would believe it.
+ *
+ * ## What the caller cannot aim
+ *
+ * Nothing. The whole input is one boolean saying whether to run. No host, no
+ * path, no identifier and no name crosses the tool boundary, which is why the
+ * containment gate carries this site as exempt-with-a-reason rather than checked.
+ *
+ * Nothing here is logged. This module contains no logging calls of any kind, and
+ * no server's status line, response body or URL reaches any error report — only a
+ * category, dispatched on the error's TYPE.
+ */
+export async function runPropertyNameProbe(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+): Promise<PropertyNameProbe> {
+  // Discovery and the home listing, recorded rather than thrown, exactly as the
+  // to-do probe records them. A refusal here means no resource was ever asked.
+  let resolved: ResolvedDavAccount;
+  let home: Awaited<ReturnType<typeof probeCalendarHome>>;
+  try {
+    resolved = await resolveDavAccount(env, principal, davFetch, "caldav");
+    home = await probeCalendarHome(davFetch, resolved.homeUrl);
+  } catch (err) {
+    // The TYPE is read; the value never is — ./.claude/CLAUDE.md §4.
+    return { targets: [], category: davToErrorCategory(err).category };
+  }
+
+  // Both read OFF the listing by advertised resource type, never constructed.
+  // `scheduleInbox` is how the library spells RFC 6638's inbox resource type
+  // once it has stripped the namespace prefix — measured live on 2026-09-25,
+  // and recorded on `DavCollectionProbe.scheduleDefaultCalendarUrl`.
+  const inbox = home.collections.find((one) =>
+    one.resourceTypes.includes("scheduleInbox"),
+  );
+  // The FIRST calendar collection, whichever the listing put first. Which one it
+  // is does not matter to the question and the href says which it was.
+  const calendar = home.collections.find((one) =>
+    one.resourceTypes.includes("calendar"),
+  );
+
+  const asks: PropertyNameAsk[] = [
+    // Not contained, and the docstring above says at length why a check here
+    // cannot hold rather than merely why one is absent.
+    { target: "principal", href: resolved.principalUrl, contained: false },
+    // The base itself. Nothing above it to be contained by.
+    { target: "home", href: resolved.homeUrl, contained: false },
+    { target: "schedule-inbox", href: inbox?.href ?? "", contained: true },
+    { target: "calendar", href: calendar?.href ?? "", contained: true },
+  ];
+
+  const targets: PropertyNameTarget[] = [];
+  // One target at a time, one await each. No combinator, and nothing that
+  // resembles one.
+  for (const ask of asks) {
+    if (ask.href === "") {
+      // The listing held no such row, so nothing was asked. A null `names` with
+      // a null `category` is that state, and it is a different fact from a
+      // refusal and a different fact again from an empty list of names.
+      targets.push({
+        target: ask.target,
+        href: "",
+        names: null,
+        category: null,
+      });
+      continue;
+    }
+
+    try {
+      if (ask.contained) assertUnderHome(ask.href, resolved.homeUrl);
+      const responses = await davRequest({
+        url: ask.href,
+        init: {
+          method: "PROPFIND",
+          // The WebDAV depth header, and nothing else. Never a credential from
+          // here: `./transport.ts` attaches it per call and is the only place
+          // that may.
+          headers: { depth: "0" },
+          namespace: "d",
+          // RFC 4918 § 9.1: `propname` is a CHILD of `propfind` rather than a
+          // property inside `prop`, which is why the library's own `propfind`
+          // helper cannot express it — that helper always wraps what it is
+          // given in a `prop` element.
+          body: {
+            "d:propfind": {
+              _attributes: { "xmlns:d": "DAV:" },
+              "d:propname": {},
+            },
+          },
+        },
+        fetch: davFetch,
+      });
+      targets.push({
+        target: ask.target,
+        href: ask.href,
+        names: propertyNamesIn(responses),
+        category: null,
+      });
+    } catch (err) {
+      // This resource was asked and refused, or its href was refused by the
+      // containment check before it could be asked. Either way the run goes on
+      // to the next target: one dead resource must not cost the whole reading.
+      // The TYPE is read; the value never is.
+      targets.push({
+        target: ask.target,
+        href: ask.href,
+        names: null,
+        category: davToErrorCategory(err).category,
+      });
+    }
+  }
+
+  return { targets, category: null };
 }

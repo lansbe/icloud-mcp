@@ -232,6 +232,114 @@ function supportedReportSetBody(href: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// The property-name probe's fixture (phase 17)
+//
+// `DAV:propname` (RFC 4918 § 9.1) returns the NAME of every property a resource
+// carries and no values at all, which is what makes it safe to aim at a real
+// account — and what these fixtures have to express faithfully, including the
+// hostile shape where a server sends values anyway.
+// ---------------------------------------------------------------------------
+
+/** The CalDAV principal, as discovery resolves it off the root's own answer. */
+const CALDAV_PRINCIPAL = `https://caldav.icloud.com${PRINCIPAL_PATH}`;
+/** The scheduling inbox, which the probe must READ off the listing, not build. */
+const SCHEDULE_INBOX = `${CALDAV_HOME}inbox/`;
+/** The first calendar collection `calendarListBody` puts in the home set. */
+const FIRST_CALENDAR = `${CALDAV_HOME}home/`;
+
+/**
+ * A `DAV:propname` answer: one `response`, every property NAMED and EMPTY.
+ *
+ * Empty elements, because that is what the RFC says a server sends — the whole
+ * safety argument for pointing this probe at a real account is that there is no
+ * value in the response to mishandle. `valuedPropNameBody` below is the
+ * non-conformant twin that carries values anyway, and the two together are what
+ * pin the names-only guarantee rather than assume it.
+ */
+function propNameBody(href: string, ...names: string[]): string {
+  const props = names.map((name) => `<${name}/>`).join("");
+  return `<response><href>${href}</href><propstat><status>HTTP/1.1 200 OK</status><prop>${props}</prop></propstat></response>`;
+}
+
+/**
+ * The four answers this account gives, one per target.
+ *
+ * **The four name sets are deliberately DIFFERENT from one another**, and one of
+ * them — the inbox — is the only one carrying the default-calendar property. A
+ * fixture where the four agreed could not tell a probe that asks each target from
+ * one that asks one target four times, and a fixture where every target carried
+ * the interesting property could not show which resource carries it, which is the
+ * entire question this probe exists to answer.
+ *
+ * Spelled the way iCloud spells them, on the wire: the DAV library strips the
+ * namespace prefix and camel-cases the remainder, so `C:schedule-default-
+ * calendar-URL` arrives as `scheduleDefaultCalendarURL`. Asserting the CAMELCASED
+ * form against a fixture written in the WIRE form is what makes these cases read
+ * the real transformation rather than a restatement of it.
+ */
+function defaultPropNames(url: string): Response {
+  if (url === CALDAV_PRINCIPAL) {
+    return multistatus(
+      propNameBody(
+        PRINCIPAL_PATH,
+        "current-user-principal",
+        "principal-URL",
+        "C:calendar-home-set",
+        "C:schedule-inbox-URL",
+        "C:schedule-outbox-URL",
+      ),
+    );
+  }
+  if (url === CALDAV_HOME) {
+    return multistatus(
+      propNameBody(
+        CALDAV_HOME,
+        "resourcetype",
+        "displayname",
+        "owner",
+        "current-user-privilege-set",
+      ),
+    );
+  }
+  if (url === SCHEDULE_INBOX) {
+    return multistatus(
+      propNameBody(
+        SCHEDULE_INBOX,
+        "resourcetype",
+        "getctag",
+        "C:schedule-default-calendar-URL",
+      ),
+    );
+  }
+  return multistatus(
+    propNameBody(
+      url,
+      "resourcetype",
+      "displayname",
+      "C:supported-calendar-component-set",
+    ),
+  );
+}
+
+/** One `response` for the scheduling inbox, as the home listing carries it. */
+function schedulingInboxResponse(href: string): string {
+  return `<response><href>${href}</href><propstat><status>HTTP/1.1 200 OK</status><prop><resourcetype><collection/><C:schedule-inbox/></resourcetype><displayname>Inbox</displayname></prop></propstat></response>`;
+}
+
+/**
+ * The home listing WITH the scheduling inbox in it.
+ *
+ * Measured live on 2026-09-25: the inbox is a child of the calendar home,
+ * carrying `resourceTypes: ["collection", "scheduleInbox"]`. The probe finds it
+ * by that resource type rather than by a constructed URL, so a fixture without
+ * this row is what proves the "not found" branch and one with it is what proves
+ * the probe reads the listing instead of guessing a path.
+ */
+function calendarListWithInboxBody(): string {
+  return calendarListBody() + schedulingInboxResponse(SCHEDULE_INBOX);
+}
+
+// ---------------------------------------------------------------------------
 // The stub, and what it records
 // ---------------------------------------------------------------------------
 
@@ -288,6 +396,14 @@ function davStub(
     scheduleInboxUrl?: string | null;
     /** The default calendar that inbox names, or `null` for none. */
     defaultCalendarUrl?: string | null;
+    /**
+     * The answer to a `DAV:propname` PROPFIND, per URL.
+     *
+     * Absent keeps this conversation exactly as it was: no request in it carries
+     * a `propname` body, so the branch is unreachable and every case that
+     * predates the property-name probe is untouched.
+     */
+    propNames?: (url: string) => Response;
   } = {},
 ): Stub {
   const caldavHome = options.caldavHome ?? CALDAV_HOME;
@@ -333,6 +449,14 @@ function davStub(
     const override = options.onRequest?.(url, method, (seq += 1));
     if (override) {
       response = override;
+    } else if (String(init?.body ?? "").includes("propname")) {
+      // RFC 4918 § 9.1's exhaustive ask, and it has to be discriminated on the
+      // BODY rather than the URL: a `propname` PROPFIND goes to the SAME
+      // principal and the SAME home URL the two discovery questions do, so the
+      // URL alone cannot tell them apart — exactly as it cannot for CALM-07's
+      // two legs further down. FIRST among the branches for the same reason:
+      // every one below it would otherwise claim these requests as its own.
+      response = (options.propNames ?? defaultPropNames)(url);
     } else if (url.includes("/.well-known/")) {
       // iCloud does not serve a useful redirect here for this account shape.
       response = new Response(null, { status: 404 });
@@ -397,14 +521,21 @@ function davStub(
 /**
  * What the registered `dav_diagnose` callback accepts.
  *
- * Three booleans and nothing else. Named once so the two probes phase 14 added
- * are visible in one place beside `refresh`, and so a fourth input added later
- * has to be written down here before any case can reach it.
+ * Booleans and nothing else. Named once so every probe is visible in one place
+ * beside `refresh`, and so an input added later has to be written down here
+ * before any case can reach it.
+ *
+ * The COUNT is deliberately not in this sentence any more. It said "three
+ * booleans" and phase 17's property-name probe made that false — the same silent
+ * staleness a number written into prose always acquires, because nothing fails
+ * when it stops matching. How many there are is a question for the interface, and
+ * the schema case below is what pins the answer mechanically.
  */
 interface DiagnoseArgs {
   refresh?: boolean;
   probeCollectionWrite?: boolean;
   probeTaskObjects?: boolean;
+  probePropertyNames?: boolean;
 }
 
 /** Pull the one registered `dav_diagnose` callback out, without a real server. */
@@ -1668,6 +1799,7 @@ describe("dav_diagnose, the bounded to-do listing (SPIKE-02, object level)", () 
     const shape = registered[0].inputSchema as { shape: Record<string, unknown> };
     expect(Object.keys(shape.shape).sort()).toEqual([
       "probeCollectionWrite",
+      "probePropertyNames",
       "probeTaskObjects",
       "refresh",
     ]);
@@ -2048,5 +2180,465 @@ describe("the to-do probe when one collection is refused", () => {
     expect(probe.category).toBe("not_found");
     expect(probe.collections).toEqual([]);
     expect(probe.collectionsFound).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The property-name probe (phase 17)
+//
+// WHY IT EXISTS, stated here because a reader arriving at a failing case needs
+// it. CALM-07 refuses the account's own default calendar as a delete target,
+// "locally, before any request is sent". Measured live on 2026-09-25 the guard is
+// INERT: `CALDAV:schedule-default-calendar-URL` is absent from all thirteen home
+// rows AND from the scheduling inbox, which is where RFC 6638 § 9.2 defines it.
+// The likely explanation is that Apple's "Default Calendar" is a per-DEVICE
+// setting rather than account state — in which case no server property exists to
+// find, and the requirement should be withdrawn.
+//
+// That explanation may well be right, and it is still an INFERENCE. Both probes
+// so far asked for ONE NAMED property, which is a different question from asking
+// what properties exist. `DAV:propname` (RFC 4918 § 9.1) is the second question,
+// and these cases are what make it safe to ask a real account: the guarantee that
+// no VALUE can come back through it is pinned against a fixture that sends values
+// anyway, rather than assumed from the RFC.
+// ---------------------------------------------------------------------------
+
+/** One property-name target, as the report carries it. */
+interface NameTarget {
+  target: string;
+  href: string;
+  names: string[] | null;
+  category: string | null;
+}
+
+interface NameProbe {
+  targets: NameTarget[];
+  category: string | null;
+}
+
+function nameProbeOf(result: {
+  content: { type: "text"; text: string }[];
+}): NameProbe | null {
+  return serviceOf(result, "caldav").propertyNames as NameProbe | null;
+}
+
+/** Every request whose body carried the exhaustive ask. */
+function propNameRequests(stub: Stub): ObservedRequest[] {
+  return stub.requests.filter((request) =>
+    String(request.init.body ?? "").includes("propname"),
+  );
+}
+
+function targetNamed(probe: NameProbe, target: string): NameTarget | undefined {
+  return probe.targets.find((one) => one.target === target);
+}
+
+/**
+ * A NON-CONFORMANT `propname` answer: every property named AND valued.
+ *
+ * RFC 4918 § 9.1 says a server answers `propname` with names alone, so this is a
+ * shape no conformant server sends — which is exactly why it is the fixture the
+ * names-only guarantee is pinned against. A guarantee that holds only while the
+ * server behaves is not a guarantee; this one has to hold because the probe reads
+ * KEYS and never indexes into the property object, and the only way to prove that
+ * is to put values in front of it and watch none come out.
+ *
+ * The three values are chosen to be unmistakable in a serialised report: a
+ * calendar title a real account might carry, a colour, and an href. None of them
+ * is a URL this report legitimately contains, so a case can assert their absence
+ * from the WHOLE response rather than only from the field they would land in.
+ */
+function valuedPropNameBody(href: string): string {
+  return (
+    `<response><href>${href}</href><propstat><status>HTTP/1.1 200 OK</status><prop>` +
+    `<displayname>Job search interviews</displayname>` +
+    `<ca:calendar-color xmlns:ca="http://apple.com/ns/ical/">#FF2D55FF</ca:calendar-color>` +
+    `<C:schedule-default-calendar-URL><href>/1234567890/calendars/secret-default/</href></C:schedule-default-calendar-URL>` +
+    `</prop></propstat></response>`
+  );
+}
+
+describe("what property NAMES iCloud carries, asked exhaustively", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("is OFF unless asked for by name, and an ordinary run asks nothing", async () => {
+    // The default, and the property that makes this probe free to ship: a reader
+    // of an ordinary `dav_diagnose` response sees exactly what they saw before it
+    // existed, and the run issues not one extra request.
+    const stub = davStub({ caldavHomeBody: calendarListWithInboxBody });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({});
+
+    expect(nameProbeOf(result)).toBeNull();
+    expect(propNameRequests(stub)).toEqual([]);
+  });
+
+  it("refuses to run on anything but the boolean itself", async () => {
+    // `=== true` rather than a truthy test, asserted rather than read off the
+    // source. A truthy test would let a string, a number or an object turn a
+    // probe on, and the four booleans are the whole reason D-06's argument
+    // survives on this tool.
+    const stub = davStub({ caldavHomeBody: calendarListWithInboxBody });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const handler = diagnoseHandler(createDavFetch(owner));
+    for (const truthy of ["yes", 1, {}, []] as unknown[]) {
+      const result = await handler({
+        probePropertyNames: truthy,
+      } as unknown as DiagnoseArgs);
+      expect(nameProbeOf(result)).toBeNull();
+    }
+    expect(propNameRequests(stub)).toEqual([]);
+  });
+
+  it("asks four resources derived from discovery and reports what each NAMES", async () => {
+    // The whole instrument, in one call. The four targets are the principal, the
+    // calendar home, the scheduling inbox and one real calendar — and the last
+    // two are READ OFF the home listing by advertised resource type rather than
+    // built from a string, which is why the fixture has to carry an inbox row for
+    // this case to reach it at all.
+    //
+    // The four name sets differ from one another ON PURPOSE, and only the inbox
+    // carries the default-calendar property. A fixture where they agreed could not
+    // tell a probe that asks each target from one that asks one target four times.
+    const stub = davStub({ caldavHomeBody: calendarListWithInboxBody });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probePropertyNames: true,
+    });
+
+    expect(result.isError).toBeUndefined();
+    const probe = nameProbeOf(result)!;
+    expect(probe.category).toBeNull();
+
+    // The fixed order, and the href each target resolved to. The calendar is
+    // reported BY HREF so the reading is reproducible against the same collection.
+    expect(probe.targets.map((one) => one.target)).toEqual([
+      "principal",
+      "home",
+      "schedule-inbox",
+      "calendar",
+    ]);
+    expect(probe.targets.map((one) => one.href)).toEqual([
+      CALDAV_PRINCIPAL,
+      CALDAV_HOME,
+      SCHEDULE_INBOX,
+      FIRST_CALENDAR,
+    ]);
+
+    // Sorted, de-duplicated, and spelled as the DAV library hands them back: the
+    // namespace prefix stripped and the remainder camel-cased. The fixture is
+    // written in the WIRE form, so these lists read the real transformation.
+    expect(targetNamed(probe, "principal")!.names).toEqual([
+      "calendarHomeSet",
+      "currentUserPrincipal",
+      "principalURL",
+      "scheduleInboxURL",
+      "scheduleOutboxURL",
+    ]);
+    expect(targetNamed(probe, "home")!.names).toEqual([
+      "currentUserPrivilegeSet",
+      "displayname",
+      "owner",
+      "resourcetype",
+    ]);
+    // THE ROW THE WHOLE PROBE IS FOR. RFC 6638 § 9.2 puts the default-calendar
+    // property on the scheduling inbox, and this is the reading that would show
+    // it there if iCloud carried it.
+    expect(targetNamed(probe, "schedule-inbox")!.names).toEqual([
+      "getctag",
+      "resourcetype",
+      "scheduleDefaultCalendarURL",
+    ]);
+    expect(targetNamed(probe, "calendar")!.names).toEqual([
+      "displayname",
+      "resourcetype",
+      "supportedCalendarComponentSet",
+    ]);
+    for (const one of probe.targets) expect(one.category).toBeNull();
+
+    // FOUR requests, one per target, each a depth-0 PROPFIND.
+    const asked = propNameRequests(stub);
+    expect(asked.length).toBe(4);
+    expect(asked.map((request) => request.url)).toEqual([
+      CALDAV_PRINCIPAL,
+      CALDAV_HOME,
+      SCHEDULE_INBOX,
+      FIRST_CALENDAR,
+    ]);
+    for (const request of asked) {
+      expect(request.method).toBe("PROPFIND");
+      expect(new Headers(request.init.headers).get("depth")).toBe("0");
+    }
+
+    // READ-ONLY, and asserted over the whole run rather than over this probe's
+    // own requests: a mutating method anywhere here would mean the probe reached
+    // something it has no business reaching.
+    expect(methodsOf(stub, "MKCOL", "PROPPATCH", "DELETE", "PUT")).toEqual([]);
+    expect(stub.overlapped).toBe(false);
+  });
+
+  it("reports only NAMES even when the server answers with values", async () => {
+    // THE SAFETY CASE, and the one that makes this probe safe to point at a real
+    // account. A conformant server sends empty elements, so a probe that read
+    // values would look correct against every honest fixture. This one is
+    // deliberately non-conformant — every property is named AND valued, on all
+    // four targets — and the report still has to carry names alone.
+    //
+    // Asserted against the WHOLE serialised response rather than against the
+    // `names` field, because a value that leaked into any other field would pass
+    // a field-scoped check while still reaching a model's context.
+    const stub = davStub({
+      caldavHomeBody: calendarListWithInboxBody,
+      propNames: (url) => multistatus(valuedPropNameBody(url)),
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probePropertyNames: true,
+    });
+
+    const probe = nameProbeOf(result)!;
+    expect(probe.targets.length).toBe(4);
+    for (const one of probe.targets) {
+      expect(one.names).toEqual([
+        "calendarColor",
+        "displayname",
+        "scheduleDefaultCalendarURL",
+      ]);
+    }
+
+    // Non-vacuity first: the values really were sent, so a probe that carried
+    // them through would have had something to carry.
+    const sent = propNameRequests(stub);
+    expect(sent.length).toBe(4);
+
+    const whole = result.content[0].text;
+    for (const value of [
+      "Job search interviews",
+      "#FF2D55FF",
+      "secret-default",
+    ]) {
+      expect(
+        whole.includes(value),
+        `a property VALUE reached the response: ${value}`,
+      ).toBe(false);
+    }
+  });
+
+  it("folds a refused target into its category and KEEPS GOING", async () => {
+    // TOTAL rather than throwing. A refusal on one target must not cost the other
+    // three, and must not cost the surrounding report either — this module's own
+    // header says a diagnostic that discards its measurements at the first problem
+    // is useless for the one job it has, and the live account has already proved
+    // it by answering 404 on two abandoned collections.
+    const stub = davStub({
+      caldavHomeBody: calendarListWithInboxBody,
+      propNames: (url) =>
+        url === SCHEDULE_INBOX
+          ? new Response(null, { status: 404 })
+          : defaultPropNames(url),
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probePropertyNames: true,
+    });
+
+    // Not an error payload. The report came back.
+    expect(result.isError).toBeUndefined();
+    const probe = nameProbeOf(result)!;
+    expect(probe.category).toBeNull();
+
+    const refused = targetNamed(probe, "schedule-inbox")!;
+    expect(refused.category).toBe("not_found");
+    expect(refused.names).toBeNull();
+    // Named anyway, so a reader can see that this resource WAS asked — a
+    // different fact from one that was never derived.
+    expect(refused.href).toBe(SCHEDULE_INBOX);
+
+    // And the target after it was still asked, which is the "keeps going" half.
+    expect(targetNamed(probe, "calendar")!.names).toEqual([
+      "displayname",
+      "resourcetype",
+      "supportedCalendarComponentSet",
+    ]);
+    expect(propNameRequests(stub).length).toBe(4);
+
+    // The services' own measurements survived too.
+    expect(serviceOf(result, "caldav").homeUrl).toBe(CALDAV_HOME);
+    expect(serviceOf(result, "carddav").addressBookCount).toBe(2);
+  });
+
+  it("refuses a wire-sourced href outside the account's own home, at ZERO cost", async () => {
+    // The containment half. The home enumeration resolves a relative href
+    // against the home and drops one that will not resolve, but it does not
+    // compare ORIGIN — so an ABSOLUTE href naming another host survives it, and
+    // `src/dav/transport.ts` attaches the Apple ID and the app-specific password
+    // to whatever URL it is handed. "The server said so" is not an authorisation.
+    //
+    // The falsifiable half is the request COUNT: the refusal is synchronous and
+    // reaches no network, so nothing is ever sent to the foreign host.
+    const foreign = "https://attacker.example/1234567890/calendars/inbox/";
+    const stub = davStub({
+      caldavHomeBody: () =>
+        calendarListBody() + schedulingInboxResponse(foreign),
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probePropertyNames: true,
+    });
+
+    const probe = nameProbeOf(result)!;
+    const refused = targetNamed(probe, "schedule-inbox")!;
+    // Byte-identical at this layer to a genuine not-found, which is deliberate:
+    // a distinguishable refusal is an existence oracle.
+    expect(refused.category).toBe("not_found");
+    expect(refused.names).toBeNull();
+
+    expect(
+      stub.requests.filter((request) => request.url.includes("attacker.example")),
+      "the credential was sent to a host outside the account's own home set",
+    ).toEqual([]);
+    // Three asked, not four — and the three that were asked still answered.
+    expect(propNameRequests(stub).length).toBe(3);
+    expect(targetNamed(probe, "calendar")!.names).not.toBeNull();
+  });
+
+  it("says a target was never asked when the listing holds no such row", async () => {
+    // The third state, and it is a different fact from both of the others. A null
+    // `names` with a NULL category and an empty href means the home set carried no
+    // scheduling inbox at all, so nothing was asked — as distinct from a refusal,
+    // and as distinct again from a resource that answered with no names.
+    //
+    // `calendarListBody` is the shape that produces it: four calendars, a reminder
+    // list, and no inbox row.
+    const stub = davStub();
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probePropertyNames: true,
+    });
+
+    const probe = nameProbeOf(result)!;
+    const missing = targetNamed(probe, "schedule-inbox")!;
+    expect(missing.href).toBe("");
+    expect(missing.names).toBeNull();
+    expect(missing.category).toBeNull();
+
+    // Still four entries: the target is reported as unasked rather than dropped,
+    // because a target silently missing from this list would read as a resource
+    // that carries no properties.
+    expect(probe.targets.length).toBe(4);
+    expect(propNameRequests(stub).length).toBe(3);
+  });
+
+  it("tells a refused target apart from one that NAMES NOTHING", async () => {
+    // Without the category both read as "no names", and "this server could not
+    // look" would be indistinguishable from "this resource carries nothing".
+    const stub = davStub({
+      caldavHomeBody: calendarListWithInboxBody,
+      propNames: (url) =>
+        url === SCHEDULE_INBOX
+          ? new Response(null, { status: 404 })
+          : multistatus(propNameBody(url)),
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probePropertyNames: true,
+    });
+
+    const probe = nameProbeOf(result)!;
+    expect(targetNamed(probe, "schedule-inbox")!.names).toBeNull();
+    expect(targetNamed(probe, "schedule-inbox")!.category).toBe("not_found");
+    // Asked, answered, and named nothing. An EMPTY ARRAY, not a null.
+    expect(targetNamed(probe, "calendar")!.names).toEqual([]);
+    expect(targetNamed(probe, "calendar")!.category).toBeNull();
+  });
+
+  it("keeps the report when NOTHING could be derived at all", async () => {
+    // A refusal before any target exists — discovery, or the home listing — is
+    // carried on the probe rather than on an entry, because "no resource was ever
+    // asked" is a different statement from "this resource was asked and refused".
+    // Either way the surrounding report survives.
+    let seenHome = 0;
+    const stub = davStub({
+      onRequest: (url) => {
+        if (url !== CALDAV_HOME) return null;
+        // The first listing belongs to the two services and must succeed, so
+        // there is a real report for the probe's failure to survive inside.
+        seenHome += 1;
+        return seenHome === 1 ? null : new Response(null, { status: 404 });
+      },
+    });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probePropertyNames: true,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(serviceOf(result, "caldav").homeUrl).toBe(CALDAV_HOME);
+
+    const probe = nameProbeOf(result)!;
+    expect(probe.category).toBe("not_found");
+    expect(probe.targets).toEqual([]);
+    expect(propNameRequests(stub)).toEqual([]);
+  });
+
+  it("sends EVERY request through this project's own transport, serially", async () => {
+    // The credential case, for the probe this plan adds. Every tsdav helper
+    // declares `fetch?: typeof fetch` as OPTIONAL and resolves it as
+    // `fetchOverride ?? fetch`, so omitting the option at the new call site would
+    // silently use the bare global: no `authorization` header, no
+    // `redirect: "manual"`, no per-request serialisation gate, no
+    // status-to-error mapping. Against iCloud that is a 401 on every target, and
+    // at the report level a 401 on every target is indistinguishable from iCloud
+    // carrying no properties — a measured-looking WRONG verdict on the very
+    // question this probe exists to settle, produced by a bug in this repository.
+    //
+    // The source scan cannot see the omission: the fetch happens inside
+    // `node_modules`, which it does not walk. This reads what was actually SENT.
+    const stub = davStub({ caldavHomeBody: calendarListWithInboxBody });
+    vi.stubGlobal("fetch", stub.fetch);
+
+    const result = await diagnoseHandler(createDavFetch(owner))({
+      probePropertyNames: true,
+    });
+
+    // Non-vacuity first: a walk over a list that never grew the probe's own
+    // requests would pass while proving nothing about them.
+    expect(propNameRequests(stub).length).toBe(4);
+    expect(nameProbeOf(result)).not.toBeNull();
+
+    for (const request of stub.requests) {
+      const authorization = new Headers(request.init.headers).get(
+        "authorization",
+      );
+      expect(
+        authorization,
+        `${request.method} ${request.url} carried no credential — a tsdav helper was called without fetch: davFetch`,
+      ).toBeTruthy();
+      expect(authorization!.startsWith("Basic ")).toBe(true);
+      expect(
+        request.init.redirect,
+        `${request.method} ${request.url} did not carry redirect: manual`,
+      ).toBe("manual");
+    }
+
+    // Serial, and asserted off the recorded ticks rather than off the absence of
+    // a combinator in the source: every request ended before the next began.
+    expect(stub.overlapped).toBe(false);
+    for (let index = 1; index < stub.requests.length; index += 1) {
+      expect(stub.requests[index - 1].end).toBeLessThan(
+        stub.requests[index].start,
+      );
+    }
   });
 });
