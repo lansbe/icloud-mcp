@@ -111,6 +111,7 @@ import {
   CONFIRM_TTL_SECONDS,
   CONFIRM_VERSION,
   ConfirmationInvalidError,
+  REPLY_TELLS,
   changeHashMatches,
   changeHashOf,
   composeConfirmationLine,
@@ -3193,6 +3194,14 @@ interface SuppliedChange {
    * an update's hash would be a way to answer through the update tool (RSVP-06).
    */
   answer?: ReplyAnswerWord;
+  /**
+   * Who the reply preview said would be told, carried back with the answer.
+   *
+   * Read by `normalizeSuppliedReply` and by nothing else, on `answer`'s terms.
+   * It is hashed into the reply change (18-REVIEW WR-02), so the commit is
+   * bound to the sentence the user was shown.
+   */
+  tells?: ReplyTells;
 }
 
 /**
@@ -5644,8 +5653,10 @@ async function buildReplyPreview(
 
   const tells = TELLS_BY_EVIDENCE[facts.evidence];
   // The scope is hashed with the answer, so the token is bound to how much of
-  // the invitation it reaches.
-  const change: NormalizedReplyChange = { kind: "reply", scope: signedScope, answer };
+  // the invitation it reaches. So is who is told (18-REVIEW WR-02): the user
+  // agrees to a sentence naming who hears, and the commit must not tell anyone
+  // that sentence did not name.
+  const change: NormalizedReplyChange = { kind: "reply", scope: signedScope, answer, tells };
 
   // RSVP-03, for EVERY answer (D-11). Awaited on its own, after the two reads
   // and the pure work above, and before anything is minted — so an auth or
@@ -5755,6 +5766,13 @@ function normalizeSuppliedReply(supplied: SuppliedChange): NormalizedReplyChange
   if (answer !== "accepted" && answer !== "declined" && answer !== "tentative") {
     throw new ConfirmationInvalidError();
   }
+  // Absent or outside the closed four is refused on the same terms as a bad
+  // answer. The hash would refuse it anyway; refusing here keeps an unknown
+  // string out of the canonical tuple altogether.
+  const tells = supplied.tells;
+  if (tells === undefined || !(REPLY_TELLS as readonly string[]).includes(tells)) {
+    throw new ConfirmationInvalidError();
+  }
   const foreign = [
     supplied.summary,
     supplied.startLocal,
@@ -5768,7 +5786,7 @@ function normalizeSuppliedReply(supplied: SuppliedChange): NormalizedReplyChange
     supplied.alarms,
   ].some((value) => value !== undefined && value !== null);
   if (foreign) throw new ConfirmationInvalidError();
-  return { kind: "reply", scope: supplied.scope ?? null, answer };
+  return { kind: "reply", scope: supplied.scope ?? null, answer, tells };
 }
 
 /**
@@ -5868,6 +5886,13 @@ async function applyReplyCommit(
   // Read off THIS leg's bytes, so the did-line reports what the commit saw.
   const facts = invitationFactsOf(read.body, addresses, read.scheduleTag);
   const tells = TELLS_BY_EVIDENCE[facts.evidence];
+
+  // 7c'. Who is told, against what the preview signed (18-REVIEW WR-02). The
+  // ETag pins the body, but not the scheduling marker or the address set, and
+  // either can move the answer between the two legs. The user agreed to the
+  // preview's sentence about who hears, so a commit that would tell somebody
+  // else is refused as stale, with nothing written.
+  if (tells !== change.tells) throw new DavStaleResourceError();
 
   // 7d. The one write, conditional on the ETag the preview signed.
   await updateEvent(env, principal, davFetch, ref, built.body, payload.e);
@@ -7197,6 +7222,9 @@ export function registerCalendarTools(
             // An invitation answer's one value. Read only by the reply arm; the
             // update arm ignores it, so it cannot move an update (RSVP-06).
             answer: z.enum(REPLY_ANSWER_WORDS).optional(),
+            // Who the reply preview said would be told. Hashed with the answer
+            // and checked again after the commit's re-read (WR-02).
+            tells: z.enum(REPLY_TELLS).optional(),
           })
           .describe(
             "The change object calendar_update_event returned, passed back " +

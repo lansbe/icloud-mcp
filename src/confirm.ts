@@ -1487,11 +1487,20 @@ export type ReplyAnswerWord = "accepted" | "declined" | "tentative";
  * minted for the whole series cannot be spent as a one-off answer, or the
  * reverse. The slot existed from the first reply hash, so filling it moved no
  * hash minted before it.
+ *
+ * `tells` is who the preview said would be told (18-REVIEW WR-02). It is
+ * hashed, so the confirmation is bound to the sentence the user agreed to,
+ * and the commit refuses as stale when its own re-read decides differently —
+ * a user shown "nobody is told" must never send a reply to the organiser.
+ * Adding it moved every reply hash, so a reply token minted before it is
+ * refused rather than spent. That is the safe direction, and reply tokens
+ * live for minutes.
  */
 export interface NormalizedReplyChange {
   kind: "reply";
   scope: string | null;
   answer: ReplyAnswerWord;
+  tells: ReplyTells;
 }
 
 /**
@@ -1501,7 +1510,7 @@ export interface NormalizedReplyChange {
  * caller passed back cannot reach the output.
  */
 export function canonicalReplyChange(change: NormalizedReplyChange): string {
-  return JSON.stringify([change.kind, change.scope ?? null, change.answer]);
+  return JSON.stringify([change.kind, change.scope ?? null, change.answer, change.tells]);
 }
 
 /** The canonical reply change, digested and carried as base64url. */
@@ -1647,7 +1656,10 @@ export interface ConfirmationSummary {
  *   18-01 measured the opposite, so nothing produces this today; it is kept so
  *   the sentence for that case is written and pinned before anything needs it.
  */
-export type ReplyTells = "organizer" | "organizer-maybe" | "nobody" | "narrowed";
+export const REPLY_TELLS = ["organizer", "organizer-maybe", "nobody", "narrowed"] as const;
+
+/** One of `REPLY_TELLS`. The list is the runtime form a schema can enumerate. */
+export type ReplyTells = (typeof REPLY_TELLS)[number];
 
 /** What the line says about an invitation answer. */
 export interface ReplyLineSummary {

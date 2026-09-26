@@ -10561,6 +10561,7 @@ describe("calendar_respond_to_invitation, end to end", () => {
       kind: "reply",
       scope: null,
       answer: "tentative",
+      tells: "organizer",
     });
   });
 
@@ -10944,6 +10945,97 @@ describe("calendar_respond_to_invitation, boundaries", () => {
     expect(puts.length).toBe(1);
     expect(puts[0].headers["if-match"]).toBe('"etag-B"');
     expect(puts[0].body).toContain("SUMMARY:RSVP probe C - moved by the organiser");
+  });
+
+  // -------------------------------------------------------------------------
+  // WR-02 (18-REVIEW): who is told is bound to the confirmation
+  //
+  // The ETag pins the body and nothing else. The scheduling marker arrives in
+  // a separate response header, so it can move between the two legs under the
+  // SAME ETag — and it alone decides whether iCloud tells the organiser.
+  // -------------------------------------------------------------------------
+
+  it.each([
+    ["nobody", "organizer", false, true],
+    ["organizer", "nobody", true, false],
+  ] as const)(
+    "refuses a commit when the preview said %s is told and the re-read says %s, writing nothing",
+    async (shown, now, tagAtPreview, tagAtCommit) => {
+      const etag = '"etag-same"';
+      const options = (tagged: boolean): WriteStubOptions => ({
+        objects: { [IMPORTED_PATH]: ATTENDEE_COPY_IMPORTED_ICS },
+        etags: { [IMPORTED_PATH]: etag },
+        ...(tagged ? { scheduleTags: { [IMPORTED_PATH]: SCHEDULE_TAG } } : {}),
+      });
+      await warmWrite(tracked(options(tagAtPreview)));
+      const preview = halves(
+        await viaSchema("calendar_respond_to_invitation", { id: IMPORTED_ID, answer: "declined" }),
+      );
+      expect(preview.trusted.tells).toBe(shown);
+      expect((preview.untrusted.change as { tells: string }).tells).toBe(shown);
+
+      const after = tracked(options(tagAtCommit));
+      installStub(after);
+      const stale = await viaSchema("calendar_commit", {
+        confirmToken: preview.trusted.confirmToken,
+        change: preview.untrusted.change,
+      });
+
+      expect(categoryOf(stale)).toBe("stale_resource");
+      // The two reads, and no write.
+      expect(after.observed.map((one) => one.method)).toStrictEqual(["REPORT", "PROPFIND"]);
+
+      // A fresh preview names the new answer, and that one commits.
+      after.observed.length = 0;
+      const fresh = halves(
+        await viaSchema("calendar_respond_to_invitation", { id: IMPORTED_ID, answer: "declined" }),
+      );
+      expect(fresh.trusted.tells).toBe(now);
+      const committed = halves(
+        await viaSchema("calendar_commit", {
+          confirmToken: fresh.trusted.confirmToken,
+          change: fresh.untrusted.change,
+        }),
+      );
+      expect(committed.trusted.applied).toBe(true);
+      expect(committed.trusted.tells).toBe(now);
+      expect(after.observed.filter((one) => one.method === "PUT").length).toBe(1);
+    },
+  );
+
+  it("refuses a change whose 'tells' was edited, before any request", async () => {
+    const stub = await genuineStub();
+    const preview = halves(
+      await viaSchema("calendar_respond_to_invitation", { id: GENUINE_ID, answer: "declined" }),
+    );
+    const signed = preview.untrusted.change as Record<string, unknown>;
+    expect(signed.tells).toBe("organizer");
+    stub.observed.length = 0;
+
+    for (const tells of ["nobody", undefined]) {
+      const refused = await viaSchema("calendar_commit", {
+        confirmToken: preview.trusted.confirmToken,
+        change: { ...signed, tells },
+      });
+      expect(categoryOf(refused), String(tells)).toBe("confirmation_invalid");
+    }
+    // A value outside the four never reaches the handler.
+    expect(
+      await viaSchema("calendar_commit", {
+        confirmToken: preview.trusted.confirmToken,
+        change: { ...signed, tells: "everyone" },
+      }),
+    ).toBeNull();
+    expect(stub.observed.length).toBe(0);
+
+    // The slot was not reserved: the signed change still commits.
+    const committed = halves(
+      await viaSchema("calendar_commit", {
+        confirmToken: preview.trusted.confirmToken,
+        change: signed,
+      }),
+    );
+    expect(committed.trusted.applied).toBe(true);
   });
 
   // -------------------------------------------------------------------------
@@ -11943,7 +12035,12 @@ describe("calendar_respond_to_invitation, repeating invitations", () => {
     );
     expect(trusted.refusal).toBeNull();
     expect(typeof trusted.confirmToken).toBe("string");
-    expect(untrusted.change).toStrictEqual({ kind: "reply", scope: null, answer: "declined" });
+    expect(untrusted.change).toStrictEqual({
+      kind: "reply",
+      scope: null,
+      answer: "declined",
+      tells: "organizer",
+    });
   });
 
   it.each(["series", "occurrence", "this-and-future"] as const)(
@@ -12026,7 +12123,12 @@ describe("calendar_respond_to_invitation, repeating invitations", () => {
     expect(trusted.refusal).toBeNull();
     expect(typeof trusted.confirmToken).toBe("string");
     // The scope rides in the hashed change, so the commit is bound to it.
-    expect(untrusted.change).toStrictEqual({ kind: "reply", scope: "series", answer: "declined" });
+    expect(untrusted.change).toStrictEqual({
+      kind: "reply",
+      scope: "series",
+      answer: "declined",
+      tells: "organizer",
+    });
     const wouldLine =
       `Answering invitation '${TITLE}' as declined for every date in the series, ` +
       "telling the organiser 'Probe Organiser'. A reply cannot be unsent.";

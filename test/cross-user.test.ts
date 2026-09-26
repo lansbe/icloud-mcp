@@ -1545,6 +1545,8 @@ describe("an invitation answer belongs to the person who gave it", () => {
       kind: "reply",
       scope: null,
       answer: "declined",
+      // This fixture carries no scheduling marker, so the bytes cannot decide.
+      tells: "organizer-maybe",
     });
     // A preview writes nothing, anywhere.
     expect(stub.writesUnder.A).toEqual([]);

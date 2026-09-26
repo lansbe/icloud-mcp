@@ -22,6 +22,7 @@ import {
   ConfirmationInvalidError,
   canonicalChange,
   canonicalContactChange,
+  REPLY_TELLS,
   changeHashMatches,
   canonicalReplyChange,
   changeHashOf,
@@ -1706,25 +1707,32 @@ describe("comparing two canonical change hashes", () => {
 
 describe("the reply change hashes in its own domain (phase 18)", () => {
   function reply(overrides: Partial<NormalizedReplyChange> = {}): NormalizedReplyChange {
-    return { kind: "reply", scope: null, answer: "declined", ...overrides };
+    return { kind: "reply", scope: null, answer: "declined", tells: "organizer", ...overrides };
   }
 
   it("is a fixed-order tuple that starts with the kind", () => {
-    expect(canonicalReplyChange(reply())).toBe('["reply",null,"declined"]');
+    // `tells` joined the tuple with 18-REVIEW WR-02, which moved every reply
+    // hash. No update or delete hash moved: see the last case in this block.
+    expect(canonicalReplyChange(reply())).toBe('["reply",null,"declined","organizer"]');
     // No update or delete tuple starts with `reply`, so no reply hash can be
     // spent as one and no update hash can be spent as a reply (D-05).
     expect((JSON.parse(canonicalChange(change())) as unknown[])[0]).toBe("update");
   });
 
   it("hashes equal changes equally, across calls and across key order", async () => {
-    const shuffled = { answer: "declined", scope: null, kind: "reply" } as NormalizedReplyChange;
+    const shuffled = {
+      tells: "organizer",
+      answer: "declined",
+      scope: null,
+      kind: "reply",
+    } as NormalizedReplyChange;
 
     expect(await replyChangeHashOf(reply())).toBe(await replyChangeHashOf(reply()));
     expect(await replyChangeHashOf(shuffled)).toBe(await replyChangeHashOf(reply()));
   });
 
   it("reads an absent scope as null", async () => {
-    const absent = { kind: "reply", answer: "declined" } as NormalizedReplyChange;
+    const absent = { kind: "reply", answer: "declined", tells: "organizer" } as NormalizedReplyChange;
     expect(await replyChangeHashOf(absent)).toBe(await replyChangeHashOf(reply()));
   });
 
@@ -1742,6 +1750,14 @@ describe("the reply change hashes in its own domain (phase 18)", () => {
       [null, "series", "occurrence"].map((scope) => replyChangeHashOf(reply({ scope }))),
     );
     expect(new Set(hashes).size).toBe(3);
+  });
+
+  it("differs when who is told differs, for every pair of the four (WR-02)", async () => {
+    const hashes = await Promise.all(
+      REPLY_TELLS.map((tells) => replyChangeHashOf(reply({ tells }))),
+    );
+    expect(REPLY_TELLS).toStrictEqual(["organizer", "organizer-maybe", "nobody", "narrowed"]);
+    expect(new Set(hashes).size).toBe(4);
   });
 
   it("left every existing change hash where it was", async () => {

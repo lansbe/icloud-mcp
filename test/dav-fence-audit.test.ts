@@ -1228,7 +1228,7 @@ function replyPreview(overrides: Partial<ReplyPreview> = {}): ReplyPreview {
       { date: "2026-10-06T12:00:00", timesZone: "America/Los_Angeles", answer: "accepted" },
     ],
     separateAnswerNotice: "You answered 1 date of this series separately. This answer replaces it.",
-    change: { kind: "reply", scope: null, answer: "accepted" },
+    change: { kind: "reply", scope: null, answer: "accepted", tells: "organizer" },
     confirmToken: "cGF5bG9hZA.bWFj",
     expiresInSeconds: 300,
     confirmationLine:
