@@ -70,6 +70,13 @@ export interface ObservedDavRequest {
 export interface TwoUserDavStub {
   fetch: typeof globalThis.fetch;
   observed: ObservedDavRequest[];
+  /**
+   * Every PUT and DELETE, filed under the home its URL falls in, WHOEVER sent
+   * it. Filed before the stub decides whether to refuse it, so a write that
+   * reached B's home with A's header is on `writesUnder.B` even though the stub
+   * answered it 403. "B's copy was never written" is `writesUnder.B` empty.
+   */
+  writesUnder: Record<"A" | "B", ObservedDavRequest[]>;
 }
 
 /**
@@ -121,6 +128,103 @@ export function eventIcsForA(): string {
   return `${lines.join("\r\n")}\r\n`;
 }
 
+// ---------------------------------------------------------------------------
+// One invitation, with a copy in each home (RSVP-04, plan 18-06)
+//
+// Somebody who is neither A nor B invites them both to the same meeting. iCloud
+// then holds TWO resources: A's copy in A's home and B's copy in B's home, with
+// one UID and the same attendee lines. Answering is a write to one copy, and the
+// question these fixtures exist to ask is whether A's answer can ever move B's
+// line, or reach B's copy at all.
+//
+// Opt-in, through `twoUserDavStub({ invitationListing })`. Without that option
+// the stub is byte-for-byte what it was, so no earlier test sees a second
+// object in A's calendar.
+// ---------------------------------------------------------------------------
+
+/** The meeting's UID, the same in both copies. */
+export const INVITATION_UID = "shared-invitation-0001@example.invalid";
+
+/** The meeting's title. */
+export const INVITATION_SUMMARY = "Panel interview for A and B";
+
+/** The organiser: neither test user, so neither can be refused as the organiser. */
+export const INVITATION_ORGANIZER = "organiser.shared@example.invalid";
+
+/** A's copy, in A's home. */
+export const INVITATION_A_URL = `${CALENDAR_A}shared-invitation-0001.ics`;
+
+/** B's copy, in B's home. */
+export const INVITATION_B_URL = `${CALENDAR_B}shared-invitation-0001.ics`;
+
+/** The id A would be given for A's copy. */
+export const INVITATION_A_ID = encodeEventId({
+  calendarUrl: CALENDAR_A,
+  objectUrl: INVITATION_A_URL,
+  recurrenceId: null,
+});
+
+/** The etag each copy carries until something writes to it. */
+const INVITATION_ETAGS: Record<"A" | "B", string> = {
+  A: '"etag-invitation-a-0001"',
+  B: '"etag-invitation-b-0001"',
+};
+
+/**
+ * One user's attendee line: that user's login as a `mailto:` value, waiting
+ * for an answer. The stub's address-set answer for that user carries exactly
+ * this `mailto:`, and the other user's answer does not.
+ */
+function attendeeLineFor(user: "A" | "B"): string {
+  const appleId = user === "A" ? USER_A.appleId : USER_B.appleId;
+  return (
+    `ATTENDEE;CN=User ${user};CUTYPE=INDIVIDUAL;PARTSTAT=NEEDS-ACTION;` +
+    `ROLE=REQ-PARTICIPANT;RSVP=TRUE:mailto:${appleId}`
+  );
+}
+
+/**
+ * The invitation as raw iCalendar, listing the named users as attendees.
+ *
+ * A one-off meeting in UTC, so no zone definition rides along. It overlaps
+ * A's plain event by half an hour on purpose: A's conflict sweep then has
+ * something in A's own home to find, which shows the sweep ran against that
+ * home rather than degrading to "failed".
+ *
+ * The lines are short enough that none folds, so an unfolded comparison and a
+ * plain one read the same.
+ */
+export function invitationIcs(listing: readonly ("A" | "B")[]): string {
+  const lines = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Example Org//Synthesised Fixture//EN",
+    "CALSCALE:GREGORIAN",
+    "BEGIN:VEVENT",
+    `UID:${INVITATION_UID}`,
+    "DTSTAMP:20260101T120000Z",
+    "SEQUENCE:0",
+    `SUMMARY:${INVITATION_SUMMARY}`,
+    "DTSTART:20260210T153000Z",
+    "DTEND:20260210T163000Z",
+    `ORGANIZER;CN=Shared Organiser:mailto:${INVITATION_ORGANIZER}`,
+    `ATTENDEE;CN=Shared Organiser;CUTYPE=INDIVIDUAL;PARTSTAT=ACCEPTED;ROLE=CHAIR:mailto:${INVITATION_ORGANIZER}`,
+    ...listing.map(attendeeLineFor),
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ];
+  return `${lines.join("\r\n")}\r\n`;
+}
+
+/** Options for `twoUserDavStub`. */
+export interface TwoUserDavOptions {
+  /**
+   * Put the invitation into BOTH homes, listing these users as attendees.
+   * Absent: no invitation anywhere, which is the stub every earlier test uses.
+   */
+  readonly invitationListing?: readonly ("A" | "B")[];
+}
+
 function multistatus(body: string): Response {
   return new Response(
     `<?xml version="1.0" encoding="UTF-8"?>\n<multistatus xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:CS="http://calendarserver.org/ns/" xmlns:CA="http://apple.com/ns/ical/">${body}</multistatus>`,
@@ -135,7 +239,7 @@ interface Account {
   readonly principalPath: string;
   readonly home: string;
   readonly calendar: string;
-  /** `{ [objectPath]: icsBody }`. B's calendar is empty. */
+  /** `{ [objectPath]: icsBody }`. B's calendar is empty unless the invitation option is set. */
   readonly objects: Record<string, string>;
 }
 
@@ -155,7 +259,29 @@ interface Account {
  * 4. A URL under one user's home carrying the OTHER user's header gets 403.
  * 5. Anything else gets 404. The stub answers nothing it does not know.
  */
-export function twoUserDavStub(): TwoUserDavStub {
+export function twoUserDavStub(options: TwoUserDavOptions = {}): TwoUserDavStub {
+  const objectsA: Record<string, string> = {
+    [new URL(EVENT_A_URL).pathname]: eventIcsForA(),
+  };
+  const objectsB: Record<string, string> = {};
+  const etags: Record<string, string> = {
+    [new URL(EVENT_A_URL).pathname]: ETAG_A,
+  };
+
+  // The same invitation in both homes, each copy under its own etag. Symmetric
+  // on purpose: B's home answers every read A's home does, so a request of A's
+  // that strayed into B's home would be answered by the rule below (a 403 on a
+  // foreign header) and not by a 404 that looked like an empty calendar.
+  if (options.invitationListing !== undefined) {
+    const ics = invitationIcs(options.invitationListing);
+    const pathA = new URL(INVITATION_A_URL).pathname;
+    const pathB = new URL(INVITATION_B_URL).pathname;
+    objectsA[pathA] = ics;
+    objectsB[pathB] = ics;
+    etags[pathA] = INVITATION_ETAGS.A;
+    etags[pathB] = INVITATION_ETAGS.B;
+  }
+
   const accounts: Record<"A" | "B", Account> = {
     A: {
       label: "A",
@@ -163,7 +289,7 @@ export function twoUserDavStub(): TwoUserDavStub {
       principalPath: PRINCIPAL_PATH_A,
       home: HOME_A,
       calendar: CALENDAR_A,
-      objects: { [new URL(EVENT_A_URL).pathname]: eventIcsForA() },
+      objects: objectsA,
     },
     B: {
       label: "B",
@@ -171,17 +297,15 @@ export function twoUserDavStub(): TwoUserDavStub {
       principalPath: PRINCIPAL_PATH_B,
       home: HOME_B,
       calendar: CALENDAR_B,
-      objects: {},
+      objects: objectsB,
     },
   };
 
-  const etags: Record<string, string> = {
-    [new URL(EVENT_A_URL).pathname]: ETAG_A,
-  };
   let writes = 0;
 
   const state: TwoUserDavStub = {
     observed: [],
+    writesUnder: { A: [], B: [] },
     fetch: async () => new Response(null, { status: 500 }),
   };
 
@@ -237,6 +361,12 @@ export function twoUserDavStub(): TwoUserDavStub {
         : null;
 
     if (owner === null) return new Response(null, { status: 404 });
+
+    // Filed by the home it aimed at, before the refusal below, so a write that
+    // is about to be turned away is still counted against the home it tried.
+    if (method === "PUT" || method === "DELETE") {
+      state.writesUnder[owner.label].push({ url, method, user, body });
+    }
 
     // Somebody else's home. The real server would refuse this too. It is
     // already on `observed` with the asker's label, so a leak is visible.
