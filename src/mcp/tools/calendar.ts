@@ -293,21 +293,33 @@ export function calendarCreatedToolResult(result: CreatedCalendar): ToolResult {
 /**
  * An updated calendar's trusted fields — the id and the per-property verdict.
  *
- * **`changed` and `unchanged` are THIS SERVER's own reading and belong outside
- * the fence for the reason `subscribed` and `timezoneUnresolved` do.** Nobody
- * chose their contents: each is drawn from a closed two-value vocabulary
- * declared in `src/dav/calendar.ts`, and which list a property lands in is this
- * server's answer about a multi-status it parsed. No byte of the server's
- * answer reaches either array — not a status line, not a body, not a URL.
+ * **All three lists are THIS SERVER's own reading and belong outside the fence
+ * for the reason `subscribed` and `timezoneUnresolved` do.** Nobody chose their
+ * contents: each is drawn from a closed two-value vocabulary declared in
+ * `src/dav/calendar.ts`, and which list a property lands in is this server's
+ * answer about a collection it READ BACK. No byte of the server's answer reaches
+ * any of them — not a status line, not a body, not a URL.
  *
  * That closed vocabulary is the whole mechanism behind § 4 here. "Which
  * property failed" is exactly the field somebody would otherwise answer by
  * quoting the server's own propstat back, and once the names are this server's
  * there is nothing to quote.
  *
- * `unchanged` is ALWAYS present, including when it is empty. A field that
- * disappears on the happy path is a field a reader has to know the absence
- * rule for, and "no property failed" is an answer worth stating.
+ * **THE THREE LISTS ARE A VERDICT ON WHAT THE CALENDAR NOW HOLDS, not on what
+ * iCloud said about the request.** Plan 17-10 changed what they mean, and the
+ * change is worth stating here because the field names did not move:
+ * `updateCalendarCollection` re-reads the collection and compares, so `changed`
+ * means a fresh look found the value in place and `unchanged` means it found
+ * something else. Before that they meant "the update's answer mentioned this
+ * property" and "it did not", which against iCloud was always the second one.
+ *
+ * `unchanged` and `unverified` are ALWAYS present, including when empty. A field
+ * that disappears on the happy path is a field a reader has to know the absence
+ * rule for, and "no property was refused" is an answer worth stating.
+ *
+ * `unverified` is the one a caller must not read as a failure. It means the write
+ * went out and the look that would have confirmed it did not answer — see
+ * `CalendarPropertyOutcomes.unverified`, which owns that argument.
  */
 function calendarUpdatedTrustedPart(
   result: UpdatedCalendar,
@@ -316,6 +328,7 @@ function calendarUpdatedTrustedPart(
     id: result.id,
     changed: result.changed,
     unchanged: result.unchanged,
+    unverified: result.unverified,
   };
 }
 
@@ -4863,7 +4876,11 @@ export function registerCalendarTools(
       // equivalent hazard in renaming a calendar the caller already named.
       description:
         "Rename a calendar, recolour it, or both. Writes immediately — no " +
-        "preview, no confirmation. Reports which of the two changed. " +
+        // Terse on purpose: `dav-tools.test.ts` caps every DAV description,
+        // because it is a tax paid on every call. What the three lists mean is
+        // argued at `calendarUpdatedTrustedPart` rather than spent here.
+        "preview, no confirmation. Reads it back and reports what did and " +
+        "did not change. " +
         CALENDAR_UNTRUSTED_NOTICE,
       inputSchema: z
         .object({
@@ -4910,9 +4927,15 @@ export function registerCalendarTools(
           displayName,
           color,
         });
-        // A TOTAL refusal never arrives here: `updateCalendarCollection` throws
-        // when nothing changed, so there is no path to "a partial success with
-        // zero parts" for this shaper to print.
+        // **A TOTAL refusal DOES arrive here, and that is plan 17-10's
+        // correction rather than a regression.** The entry point used to throw
+        // when it read no change out of the update's answer, and against iCloud
+        // that arm fired on every successful write — the calendar was renamed
+        // and the tool reported a connection fault. It now re-reads the
+        // collection and reports the comparison, so a refusal arrives as both
+        // properties in `unchanged` and is a fact about the calendar rather than
+        // "the answer mentioned nothing". `changed: []` is therefore printable
+        // here, and it is printable alongside the two lists that say why.
         return calendarUpdatedToolResult(updated, { displayName, color });
       } catch (err) {
         return davErrorResult(err);

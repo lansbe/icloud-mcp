@@ -431,6 +431,30 @@ function narrowDisplayName(value: unknown): string {
 }
 
 /**
+ * Read a colour the library will not promise is a string, or even present.
+ *
+ * `narrowDisplayName`'s argument, with one addition that is the reason this is a
+ * named function rather than two inline conditions: the EMPTY STRING becomes
+ * `null` as well. A colour is compared against a colour a caller asked for, and
+ * the empty string cannot be one — so folding it into the absent case is what
+ * stops `"" === ""` reading as agreement between two colours nobody chose.
+ *
+ * It is the one narrowing both collection readers in this module share. The
+ * listing reads it off the home set's rows and the single-collection read reads
+ * it off the collection's own row, and the two must agree byte for byte about
+ * what counts as no colour at all — the second is what a rename-and-recolour is
+ * verified against, and the first is what the user sees in a listing afterwards.
+ * Two inline copies of that rule is one edit away from disagreeing.
+ *
+ * Nothing is re-cased here. `calendarColorForWire` records why the six digits go
+ * back out in whatever case the caller chose; folding case for a COMPARISON is
+ * `observedOutcomes`' business and it is argued there.
+ */
+function narrowColor(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
  * Read a `CS:source` href the library will not promise is a string, or even
  * present.
  *
@@ -520,11 +544,10 @@ function collectionsFrom(
       continue;
     }
 
-    const color = props.calendarColor;
     collections.push({
       url,
       displayName: narrowDisplayName(props.displayname),
-      color: typeof color === "string" && color.length > 0 ? color : null,
+      color: narrowColor(props.calendarColor),
       // `isSubscribed` alone, NOT `isSubscribed && !isCalendar` — a
       // collection declaring both markers is one this server cannot read
       // events from either way, so it is marked a subscription regardless.
@@ -917,25 +940,55 @@ export async function createCalendarCollection(
 export type CalendarProperty = "displayName" | "color";
 
 /**
- * Each property's key in the parsed property region the DAV library returns.
+ * What one call asks to become — the two property VALUES and nothing else.
  *
- * The library camel-cases every element name and strips the namespace prefix,
- * so `D:displayname` arrives as `displayname` and `ca:calendar-color` arrives
- * as `calendarColor`. `collectionsFrom` above already reads the same two keys
- * off a listing, which is why these spellings are not a guess.
+ * Split out from `UpdateCalendarInput` below so `observedOutcomes` can be handed
+ * the change without the URL. That is not tidiness: the comparison is a pure
+ * question about two values and a collection's current reading, and a signature
+ * carrying a request target would invite a later edit to fetch that target from
+ * inside a function whose whole claim is that it reaches no network.
  */
-const CALENDAR_PROPERTY_KEYS: Readonly<Record<CalendarProperty, string>> =
-  Object.freeze({
-    displayName: "displayname",
-    color: "calendarColor",
-  });
+export interface CalendarPropertyChange {
+  /** The new name, when a rename was asked for. ABSENT means leave it alone. */
+  displayName?: string;
+  /** `#RRGGBB`, already matched at the tool (D-08). ABSENT means leave it alone. */
+  color?: string;
+}
 
 /** How a property update went, property by property. */
 export interface CalendarPropertyOutcomes {
-  /** Properties this server asked to set and the server reported set. */
+  /**
+   * Properties this server asked to set and a FRESH READ found in place.
+   *
+   * Observed, not inferred. See `observedOutcomes`, which owns the argument: a
+   * status line is a statement by a server about a request, and the only
+   * evidence a property changed is reading the collection back and finding the
+   * value there.
+   */
   changed: CalendarProperty[];
-  /** Properties this server asked to set and the server did NOT report set. */
+  /**
+   * Properties this server asked to set and a fresh read found UNCHANGED.
+   *
+   * The collection still holds something other than what was asked for. This is
+   * a genuine refusal reported as one, which is what the previous reading of
+   * this shape claimed to catch and never could.
+   */
   unchanged: CalendarProperty[];
+  /**
+   * Properties whose outcome this server could not establish.
+   *
+   * All of them or none of them, because the verification is one read: either
+   * the fresh look answered and every asked property is judged against it, or it
+   * did not and none of them can be. It is an ARRAY rather than a boolean so
+   * that the three lists partition what was asked — every asked property sits in
+   * exactly one — which is a property a test can assert and a reader can check.
+   *
+   * It exists because the write has already happened by the time the look fails.
+   * Reporting a failure there would tell the user their calendar was untouched
+   * by a request that may well have renamed it, which is `applyCollectionCommit`'s
+   * `unverified` reasoning applied to a change rather than a removal.
+   */
+  unverified: CalendarProperty[];
 }
 
 /** A calendar that has been asked to change, and what actually changed. */
@@ -945,98 +998,142 @@ export interface UpdatedCalendar extends CalendarPropertyOutcomes {
 }
 
 /** What one `calendar_update_calendar` call supplies. */
-export interface UpdateCalendarInput {
+export interface UpdateCalendarInput extends CalendarPropertyChange {
   /** The collection URL, decoded from an opaque id this server minted. */
   collectionUrl: string;
-  /** The new name, when a rename was asked for. ABSENT means leave it alone. */
-  displayName?: string;
-  /** `#RRGGBB`, already matched at the tool (D-08). ABSENT means leave it alone. */
-  color?: string;
 }
 
-/**
- * Read the per-property outcome out of a property update's answer (CALM-05).
- *
- * ## The `207` here means the OPPOSITE of the `207` one function up
- *
- * `collectionCreatedBy` treats a `207` on the create as a REFUSAL, because RFC
- * 5689 § 3 makes an extended `MKCOL` all-or-nothing and gives its failure a
- * `DAV:mkcol-response` body. A property update is the other shape entirely: RFC
- * 4918 § 9.2 makes it a PER-PROPERTY operation whose only defined successful
- * answer is a `207` carrying one `propstat` per property. **Do not "make these
- * two consistent."** They are different methods with different specifications,
- * and the agreement would have to be a lie about one of them.
- *
- * ## What the library actually hands over, MEASURED
- *
- * Research left this open as assumption A7 and it was verified against
- * `node_modules/tsdav/dist/tsdav.js` before this reader was written, because
- * the obvious implementation depends entirely on the answer. What the library
- * does with a multistatus is REDUCE every `propstat` into ONE flat property
- * region — and it DROPS, silently and entirely, any `propstat` whose status
- * line parses outside the 2xx range. No per-property status survives the parse.
- *
- * That measurement turns the plan's first rule from a defensive precaution into
- * the only mechanism available: **ABSENCE IS THE SIGNAL.** A property this
- * server asked to set and the answer does not carry was either refused with its
- * own status or never mentioned at all, and from here those two are the same
- * observation. So the reader asks one question per property — is it present —
- * and a property that is missing is reported UNCHANGED.
- *
- * Three ways the obvious reader gets this wrong, all closed above:
- *
- * 1. **A property the request set and the answer omits is a FAILURE.** A reader
- *    that only inspects what is present reports success for a property the
- *    server silently dropped, which is why `asked` is a parameter.
- * 2. **Only a 2xx propstat is a success.** A `424 Failed Dependency` is not a
- *    success, and neither is the `403` RFC 5689 § 3.5 itself uses for a refused
- *    property set. The library's own filter already removes both, and this
- *    reader inherits that rather than restating it — see the limit below.
- * 3. **It does not throw.** The collection still exists and half the change may
- *    have landed; throwing would hand the caller a category and no way to learn
- *    WHICH half. The outcome is returned and the tool composes the sentence.
- *
- * ## What it cannot see, written down rather than left to be discovered
- *
- * The 2xx filter is the LIBRARY's, and the library applies it only when the
- * status line parses. A `propstat` carrying no status element, or one this
- * parser cannot read, is KEPT — so its properties would arrive in the region
- * below and be reported changed. RFC 4918 § 14.22 requires the status element,
- * so that shape is malformed rather than merely unusual, and it is unmeasured
- * against iCloud. Restating the range check here would not close it either:
- * the status is gone by the time this function is handed the value. The limit
- * is recorded; it is not closed.
- *
- * A non-multistatus answer — a bare `200` with no body — arrives with no
- * property region at all, and every asked property is then reported unchanged.
- * That is conservative in the direction this module has already chosen once:
- * under-reporting a change the user can verify beats telling them a calendar
- * was renamed when it was not.
- *
- * Narrowed BY HAND throughout. The property region is typed `any` by the
- * library, and `any` on one field widens what inference can promise about
- * everything reached through the value.
- */
-export function propstatOutcomes(
-  responses: DAVResponse[],
-  asked: readonly CalendarProperty[],
-): CalendarPropertyOutcomes {
-  const reported = new Set<string>();
-  for (const response of responses) {
-    const props: unknown = response.props;
-    if (props === null || typeof props !== "object") continue;
-    for (const key of Object.keys(props as Record<string, unknown>)) {
-      reported.add(key);
-    }
-  }
+// A NOTE ON `propstatOutcomes`, WHICH NO LONGER EXISTS.
+//
+// Plan 17-04 shipped a reader of that name here. It decided which of the two
+// properties a rename-and-recolour had landed by looking for their keys in the
+// property region the DAV library parses out of the `207` — `displayname` and
+// `calendarColor` — on the rule that ABSENCE IS THE SIGNAL. Plan 17-10 retired
+// it, because a live measurement showed the model underneath it describes a
+// protocol that does not exist and an answer iCloud does not send.
+//
+// TWO FINDINGS, both measured on 2026-09-25 against the owner's real account.
+//
+// 1. **iCloud's property-update answer carries NO parsed property keys at all.**
+//    `Object.keys` over the library's property region for the update step is the
+//    EMPTY ARRAY — not differently-spelled keys, none. So `changed` was always
+//    empty, and the entry point's "nothing landed, therefore throw" arm fired on
+//    every successful write. The tool reported a connection fault three times in
+//    a row while the calendar was renamed and recoloured each time. The probe now
+//    reports those keys rather than leaving them to be inferred; see
+//    `CollectionWriteStep.propKeys` in `./diagnose.ts`, which carries the
+//    measurement and the reason it is reported.
+//
+// 2. **A FAILED property update answers the same way.** A refusal is also a `207`
+//    with no parsed keys. Through this library's parse, success and refusal are
+//    indistinguishable — so no amount of looking harder at that region can tell
+//    them apart, and a spelling fix would have been a second wrong answer rather
+//    than a fix.
+//
+// AND A PROTOCOL ERROR UNDERNEATH BOTH. RFC 4918 § 9.2 makes a property update
+// ATOMIC: "Either all of the modifications succeed or none of them succeed." The
+// per-property outcome that reader was built to extract therefore describes a
+// state that CANNOT OCCUR — the name applied while the colour was refused is not
+// a thing iCloud can answer, and 17-04's own summary already recorded that no
+// test behind it had ever seen a real propstat.
+//
+// `CALENDAR_PROPERTY_KEYS` went with it, and for the sharper reason: it was a
+// table of key spellings whose only purpose was being looked up in an answer that
+// carries no keys. A frozen constant nobody reads is indistinguishable from one
+// that is load-bearing, and the next reader would have spent the afternoon
+// checking the spellings were right. They were right. The answer was empty.
+//
+// `observedOutcomes` below replaces it, and the replacement is not a better
+// reader of the same answer — it stops reading that answer entirely.
 
+/**
+ * Judge a change by what a FRESH READ of the collection now holds (CALM-05).
+ *
+ * ## Nothing here reads the server's answer to the write
+ *
+ * This is the whole correction. The previous reader was handed the property
+ * update's own multi-status and asked which properties it mentioned; this one is
+ * handed the collection's CURRENT state and asked whether it matches what was
+ * requested. A status line is a statement by a server about a request, and the
+ * only evidence a property changed is looking again and finding the value there.
+ *
+ * That is this project's settled habit rather than an invention for this defect.
+ * `applyCollectionCommit` words it as "removal verified by looking again, never
+ * by the 204", and `deleteCalendarCollection` returns a status precisely so no
+ * caller can mistake one for a verdict. The same reasoning transfers without
+ * alteration, and it had to: through this DAV library's parse, a successful
+ * property update and a refused one are the same bytes.
+ *
+ * ## `null` is a real answer, and it is the reason there are three lists
+ *
+ * A `null` state means the fresh look did not answer — it threw, and by then the
+ * write had already gone out. Every asked property is then reported UNVERIFIED
+ * rather than unchanged, because "the calendar still holds the old name" and "I
+ * could not find out" are different sentences and only one of them is true.
+ * Reporting the second as the first is the same class of lie this function exists
+ * to remove, pointed the other way.
+ *
+ * ## The colour comparison folds case, and the name comparison does not
+ *
+ * The stored form is the EIGHT-digit one `calendarColorForWire` builds, so the
+ * comparison is against that rather than against the six digits the caller
+ * typed — measured: a `#E8734A` request read back as `#E8734AFF`.
+ *
+ * Case is folded on that comparison, and ONLY on it. Two hex strings differing
+ * only in case denote the same colour — there is no colour for which folding
+ * changes which colour it is — so the fold cannot invent agreement, while a raw
+ * comparison would report a successful recolour as refused the first time iCloud
+ * normalises case. That case is unmeasured, which is exactly why it is closed
+ * rather than assumed away. A NAME is not folded: `work` and `Work` are two
+ * different names a person might have chosen, and folding there would report a
+ * rename that did not happen.
+ *
+ * **What it cannot see, written down rather than left to be discovered.** A
+ * server that stored the colour as SIX digits, or re-spelled it in any other
+ * way, reads as unchanged here. That under-reports a change the user can verify
+ * on their own devices, which is the direction this module has already chosen
+ * twice — on the create's `207`, and on the answer with no property region. The
+ * measured shape is eight digits; the limit is recorded, not closed.
+ *
+ * ## It reaches no network, and that is the requirement
+ *
+ * A comparison over two values the caller already holds. It takes no transport
+ * and no URL, so there is nothing here that could fetch the state it is supposed
+ * to be handed — which is why `CalendarPropertyChange` exists as a type separate
+ * from `UpdateCalendarInput`.
+ *
+ * Nothing about the server's answer reaches either array. The property names are
+ * this server's own closed two-value vocabulary, which is the mechanism behind
+ * `./../../.claude/CLAUDE.md` § 4 here: there is no status line, body or URL to
+ * quote, because nothing was read off one.
+ */
+export function observedOutcomes(
+  asked: CalendarPropertyChange,
+  state: CollectionState | null,
+): CalendarPropertyOutcomes {
   const changed: CalendarProperty[] = [];
   const unchanged: CalendarProperty[] = [];
-  for (const property of asked) {
-    if (reported.has(CALENDAR_PROPERTY_KEYS[property])) changed.push(property);
+  const unverified: CalendarProperty[] = [];
+
+  /** One property's landing place. `null` state sends it to `unverified`. */
+  const record = (property: CalendarProperty, matched: boolean): void => {
+    if (state === null) unverified.push(property);
+    else if (matched) changed.push(property);
     else unchanged.push(property);
+  };
+
+  if (asked.displayName !== undefined) {
+    record("displayName", state?.displayName === asked.displayName);
   }
-  return { changed, unchanged };
+  if (asked.color !== undefined) {
+    // The eight-digit wire form, through the one helper that builds it, folded
+    // for case on both sides. See the docstring for why the fold is here and
+    // nowhere near the name.
+    const wanted = calendarColorForWire(asked.color).toUpperCase();
+    record("color", state?.color?.toUpperCase() === wanted);
+  }
+
+  return { changed, unchanged, unverified };
 }
 
 /**
@@ -1067,14 +1164,48 @@ export function propstatOutcomes(
  * declines to resolve. Sending an empty `d:prop` would spend a round trip
  * asking iCloud to do nothing.
  *
- * ## A total refusal THROWS; a partial one does not
+ * ## TWO requests, and the second one is the answer
  *
- * If the answer reports nothing changed, this throws rather than returning an
- * outcome with an empty `changed` list. "A partial success with zero parts" is
- * not a sentence the tool layer should have to compose, and the alternative is
- * a response saying a change succeeded partially while naming no part of it
- * that did. A PARTIAL outcome comes back as a value, because the caller needs
- * to learn which half landed and a thrown category cannot carry that.
+ * The property update is sent, and then the collection is READ BACK. What this
+ * function reports comes from the comparison, never from the update's own status
+ * line — `observedOutcomes` above owns that argument and the measurement behind
+ * it. The second request is the honest price: one extra round trip per update,
+ * and it buys the difference between "iCloud answered 207" and "your calendar is
+ * now called that".
+ *
+ * The read is `readCollectionState` and deliberately not a second reader written
+ * here. One function reads a collection in this module; a private copy that
+ * happened to ask for the two properties this comparison wants is how the two
+ * readings of one collection start disagreeing about what no colour at all means.
+ *
+ * **The order is load-bearing and the pair cannot be raced.** The read has to see
+ * the state the write produced, so starting them together would be asking about a
+ * calendar nobody has changed yet — and `dav-concurrent-request` names both this
+ * function and the read it ends in, so a combinator around either is a
+ * commit-time rejection.
+ *
+ * ## NOTHING throws on a refusal any more, and that is the fix
+ *
+ * This function used to throw `DavConnectError` when it read no change out of the
+ * update's answer. Measured live on 2026-09-25, that arm fired on every single
+ * successful write, because iCloud's answer carries no parsed property keys at
+ * all — the calendar was renamed and recoloured and the tool said the connection
+ * had failed. See the retirement note above for the measurement.
+ *
+ * A total refusal now comes back as a VALUE, with both properties in `unchanged`.
+ * Two reasons, and the first one alone settles it:
+ *
+ * 1. **There is no honest error for it.** The vocabulary is closed at four values
+ *    and none of them means "iCloud kept the old name". `DavConnectError` says a
+ *    connection failed when one did not, and `DavNotFoundError` says the
+ *    collection was not found when it was read back successfully. Either is a
+ *    lie, and the shipped one was the exact lie this plan exists to remove.
+ * 2. **The answer is now specific enough to be worth returning.** The old empty
+ *    `changed` list meant "the answer mentioned nothing", which is not a fact
+ *    about the calendar. This one means "the calendar was read and still holds
+ *    its old values", which is a fact about the calendar and the one the user
+ *    needs. A "partial success with zero parts" was the right thing to refuse to
+ *    compose; a verified refusal is not that sentence.
  *
  * ## No retry, and the reason differs from the create's
  *
@@ -1115,22 +1246,23 @@ export async function updateCalendarCollection(
       // came out of a caller-supplied token.
       assertUnderHome(collectionUrl, resolved.homeUrl);
 
-      const asked: CalendarProperty[] = [];
+      // See the docstring: a change naming no property is refused rather than
+      // sent. `DavNotFoundError(false)` keeps the four-value error vocabulary
+      // closed and cannot be re-tried into existence. FIRST, so the body below
+      // is built only for a call that has something to say.
+      if (input.displayName === undefined && input.color === undefined) {
+        throw new DavNotFoundError(false);
+      }
+
       const prop: Record<string, string> = {};
       if (input.displayName !== undefined) {
-        asked.push("displayName");
         prop["d:displayname"] = input.displayName;
       }
       if (input.color !== undefined) {
-        asked.push("color");
         prop["ca:calendar-color"] = calendarColorForWire(input.color);
       }
-      // See the docstring: a change naming no property is refused rather than
-      // sent. `DavNotFoundError(false)` keeps the four-value error vocabulary
-      // closed and cannot be re-tried into existence.
-      if (asked.length === 0) throw new DavNotFoundError(false);
 
-      const responses = await davRequest({
+      await davRequest({
         url: collectionUrl,
         init: {
           method: UPDATE_COLLECTION_METHOD,
@@ -1154,13 +1286,21 @@ export async function updateCalendarCollection(
         fetch: davFetch,
       });
 
-      const outcomes = propstatOutcomes(responses, asked);
-      if (outcomes.changed.length === 0) {
-        // Nothing landed. `DavConnectError` is the same honest floor the create
-        // uses for "the server answered something this layer cannot act on",
-        // and nothing about the answer is read or carried — not its status, not
-        // its body, not the URL.
-        throw new DavConnectError();
+      // **The verification, and the only thing this function reports from.** The
+      // update's answer is neither read nor carried — not its status, not its
+      // body, not the URL. SERIAL, and after the write, because the read has to
+      // see what the write produced.
+      let state: CollectionState | null = null;
+      try {
+        state = await readCollectionState(env, principal, davFetch, collectionUrl);
+      } catch {
+        // Nothing is read from the caught value — ./../../.claude/CLAUDE.md § 4.
+        // **The write is NOT rethrown as a failure**, on `applyCollectionCommit`'s
+        // precedent and for its reason: the update has already gone, so reporting
+        // a fault here would tell the user their calendar was untouched by a
+        // request that may well have renamed it. `null` sends every asked
+        // property to `unverified`, which says exactly that much and no more.
+        state = null;
       }
 
       return {
@@ -1168,7 +1308,7 @@ export async function updateCalendarCollection(
         // from the caller's token, so an id that named something else would be
         // visible instead of agreeing with itself.
         id: encodeCalendarId({ collectionUrl }),
-        ...outcomes,
+        ...observedOutcomes(input, state),
       };
     },
     // See the docstring. A retry could only ever reach the containment refusal.
@@ -1179,17 +1319,47 @@ export async function updateCalendarCollection(
 /**
  * What a collection is bound to, and how much goes with it (CALM-06, D-09, D-10).
  *
- * Three answers from ONE request, and they are together rather than apart
- * because the row that must be EXCLUDED from the count is the row that carries
- * the binding. Splitting them would be two requests to read one multi-status.
+ * FOUR answers from ONE request, and they are together rather than apart because
+ * the row that must be EXCLUDED from the count is the row that carries the
+ * binding. Splitting them would be two requests to read one multi-status.
  */
 export interface CollectionState {
   /**
    * The collection's display name, or `""` when the server sent none this run
    * can read. **Stranger-authored**, on `CalendarSummary.displayName`'s footing:
    * a shared calendar's name is chosen by whoever shared it.
+   *
+   * It is also what a rename is VERIFIED against — `observedOutcomes` compares
+   * this against the name the caller asked for — so the empty-element narrowing
+   * is load-bearing on the write path as well as the read one: a `""` standing in
+   * for a name the server did not send must not compare equal to a name somebody
+   * chose, and it cannot, because the tool refuses an empty name at the schema.
    */
   displayName: string;
+  /**
+   * The colour the collection answered, or `null` when it answered none.
+   *
+   * **Added by plan 17-10, and the reason is the rename-and-recolour rather than
+   * the delete this shape was built for.** A property update is verified by
+   * reading the collection back and comparing, so the colour has to be on this
+   * shape or the comparison would need a second reader — see
+   * `updateCalendarCollection`, which declines to write one.
+   *
+   * VERBATIM, in whatever form the server stored. Apple answers the EIGHT-digit
+   * form for a calendar this server coloured and the six-digit form for one Apple
+   * coloured, and neither is normalised here: `calendarColorForWire` records why
+   * nothing re-cases a colour, and `observedOutcomes` folds case for its own
+   * COMPARISON without changing what this field holds.
+   *
+   * Null is a real answer — the collection carries no colour — on `ctag`'s
+   * footing. Nothing in this project refuses a collection for it; a calendar with
+   * no colour is an ordinary calendar.
+   *
+   * Nothing publishes it. `CollectionDeletePreview` does not grow a colour, for
+   * the reason `Collection` declines to carry a binding onward: a field a
+   * response does not need is a field somebody has to justify keeping out.
+   */
+  color: string | null;
   /**
    * The `CS:getctag` the collection answered, or `null` when it answered none.
    *
@@ -1238,16 +1408,27 @@ function ctagOf(value: unknown): string | null {
 }
 
 /**
- * Read one collection's binding, its name and its exact member count (CALM-06).
+ * Read one collection's binding, its name, its colour and its member count.
  *
- * ## One request, and both answers come out of it
+ * CALM-06 built it for the delete preview's count. Plan 17-10 gave it a second
+ * caller and a second job: it is now also the LOOK AGAIN that verifies a
+ * rename-and-recolour, because a property update's own answer cannot be told
+ * apart from a refusal — `observedOutcomes` carries that measurement.
+ *
+ * ## One request, and every answer comes out of it
  *
  * A depth-1 PROPFIND against the collection returns the collection's own row
- * alongside one row per member. The self row carries `d:displayname` and
- * `CS:getctag`; every other row is one member. That is the design rather than a
- * nuisance — D-09's binding and D-10's count are read from the same
- * multi-status, so the two numbers a delete preview shows can never describe
- * different moments.
+ * alongside one row per member. The self row carries `d:displayname`,
+ * `ca:calendar-color` and `CS:getctag`; every other row is one member. That is
+ * the design rather than a nuisance — D-09's binding and D-10's count are read
+ * from the same multi-status, so the two numbers a delete preview shows can never
+ * describe different moments.
+ *
+ * The colour rides along for ZERO extra requests, which is why the verification
+ * added a caller rather than a request shape. A server that does not know the
+ * property simply omits it from the response rather than refusing the whole
+ * PROPFIND, which is the same argument `fetchCollections` makes for asking the
+ * home set for `CS:source` it may not have.
  *
  * No bodies are requested, so the request is cheap; `d:getetag` is asked for
  * only so a member row has a property to carry and the server has a reason to
@@ -1307,6 +1488,9 @@ export async function readCollectionState(
         props: {
           "d:displayname": {},
           "d:resourcetype": {},
+          // Free: this is one request either way, and it is what a
+          // rename-and-recolour is verified against. See the docstring.
+          "ca:calendar-color": {},
           "cs:getctag": {},
           // Asked for so a member row carries something. Never read.
           "d:getetag": {},
@@ -1322,6 +1506,7 @@ export async function readCollectionState(
       const selfUrl = new URL(collectionUrl).href;
 
       let displayName = "";
+      let color: string | null = null;
       let ctag: string | null = null;
       let memberCount = 0;
 
@@ -1342,6 +1527,10 @@ export async function readCollectionState(
         if (href === selfUrl) {
           const props = response.props ?? {};
           displayName = narrowDisplayName(props.displayname);
+          // The SAME narrowing the listing uses. See `narrowColor`: two inline
+          // copies of the rule is one edit away from the two readings of one
+          // collection disagreeing about what no colour at all means.
+          color = narrowColor(props.calendarColor);
           ctag = ctagOf(props.getctag);
           continue;
         }
@@ -1349,7 +1538,7 @@ export async function readCollectionState(
         memberCount += 1;
       }
 
-      return { displayName, ctag, memberCount };
+      return { displayName, color, ctag, memberCount };
     },
     // See the docstring. A retry could only ever reach the containment refusal.
     false,

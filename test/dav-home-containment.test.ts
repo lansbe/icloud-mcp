@@ -1655,22 +1655,32 @@ describe("a forged reference is refused before the credential leaves", () => {
     // this whole file is written against.
     //
     // It asserts the REQUEST and not the answer, and that is deliberate rather
-    // than a shortcut. This stub answers every write a bare `204` with no
-    // multistatus body, which `updateCalendarCollection` correctly reads as
-    // "the server reported no property set" and refuses. Teaching the stub to
-    // answer a real multistatus would make this file own a second copy of a
-    // fixture `test/dav-calendar.test.ts` already owns, and the property THIS
-    // gate holds is where the credential went, not what came back.
+    // than a shortcut. This stub answers everything a bare `204` with no
+    // multistatus body, so the rename's verifying re-read finds no name at all
+    // and the outcome is a refusal — which is a perfectly good answer for this
+    // file, because the property THIS gate holds is where the credential went,
+    // not what came back. Teaching the stub to answer a real multistatus would
+    // make this file own a second copy of a fixture
+    // `test/dav-calendar.test.ts` already owns.
+    //
+    // **TWO requests since plan 17-10, and both are asserted.** The rename is
+    // verified by reading the collection back rather than by the update's status
+    // line, so the write AND the look again must both land on the legitimate
+    // target — a verification aimed anywhere else would be a second place the
+    // credential could travel to, and this file exists to see exactly that.
     live.observed.length = 0;
-    await refusal(() =>
-      updateCalendarCollection(env, principal, createDavFetch(owner), {
-        collectionUrl: WORK_URL,
-        displayName: "Job search 2026",
-      }),
+    const updated = await updateCalendarCollection(
+      env,
+      principal,
+      createDavFetch(owner),
+      { collectionUrl: WORK_URL, displayName: "Job search 2026" },
     );
 
-    expect(live.observed.length, "the rename issued nothing at all").toBe(1);
-    expect(live.observed[0]).toBe(WORK_URL);
+    expect(live.observed.length, "the rename issued nothing at all").toBe(2);
+    expect(live.observed).toEqual([WORK_URL, WORK_URL]);
+    // The refusal came back as a VALUE rather than a throw. There is no member of
+    // the four-value error vocabulary that means "iCloud kept the old name".
+    expect(updated.unchanged).toEqual(["displayName"]);
   });
 
   it("refuses the sibling path when the home set has NO trailing slash", async () => {

@@ -1519,8 +1519,19 @@ interface WriteStubOptions {
  *
  * A `ctag` of `null` emits NO binding element at all, which is what a server
  * answering no `CS:getctag` produces and the shape a delete must refuse on.
+ *
+ * `reading` is what the container's row says about ITSELF, and it carries the
+ * colour as well as the name since plan 17-10: this answer is what a
+ * rename-and-recolour is now verified against, so the update cases have to be
+ * able to make the collection read back as the new values or the old ones. Both
+ * default to what this fixture answered before the parameter existed — the name
+ * `Work` and no colour element — so every delete case is untouched.
  */
-function collectionRows(ctag: string | null, members: string[]): string {
+function collectionRows(
+  ctag: string | null,
+  members: string[],
+  reading: { displayName?: string; color?: string } = {},
+): string {
   const rows = members
     .map(
       (href) =>
@@ -1534,8 +1545,11 @@ function collectionRows(ctag: string | null, members: string[]): string {
   return (
     `<response><href>${WORK_PATH}</href><propstat>` +
     `<status>HTTP/1.1 200 OK</status><prop>` +
-    `<displayname>Work</displayname>` +
+    `<displayname>${reading.displayName ?? "Work"}</displayname>` +
     `<resourcetype><collection/><C:calendar/></resourcetype>` +
+    (reading.color === undefined
+      ? ""
+      : `<CA:calendar-color>${reading.color}</CA:calendar-color>`) +
     (ctag === null ? "" : `<CS:getctag>${ctag}</CS:getctag>`) +
     `</prop></propstat></response>` +
     rows
@@ -8330,10 +8344,17 @@ describe("the calendar_create_calendar call", () => {
 // ---------------------------------------------------------------------------
 // CALM-05 — the rename and recolour, at the tool boundary
 //
-// The service-layer cases in `test/dav-calendar.test.ts` prove what is read out
-// of a `207`; these prove what the user is TOLD about it. The sharpest one is
-// the half-success: the name changed, the colour did not, and the answer has to
-// say so in this server's own words — no status line, no URL, no server body.
+// The service-layer cases in `test/dav-calendar.test.ts` prove what the entry
+// point READS; these prove what the user is TOLD about it.
+//
+// **Rewritten by plan 17-10.** These cases used to drive propstat statuses — the
+// colour refused with a `403`, the name accepted with a `200` — and assert which
+// half the answer named. Measured live on 2026-09-25, iCloud's answer to a
+// property update carries no parsed property keys at all, so none of those
+// fixtures described a server that exists, and the entry point behind them threw
+// `connection_failed` on every successful write. The verdict now comes from
+// reading the collection BACK, so what a case controls is what the collection
+// says about itself afterwards.
 // ---------------------------------------------------------------------------
 
 /** One `d:response` wrapper for a property update's answer. */
@@ -8346,27 +8367,49 @@ function propertyUpdateAnswer(propstats: string): string {
   );
 }
 
-/** Both properties accepted. */
-const UPDATE_BOTH_SET = propertyUpdateAnswer(
-  "<d:propstat><d:prop><d:displayname/><ca:calendar-color/></d:prop>" +
-    "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>",
+/**
+ * iCloud's own answer: a `207` whose property region is EMPTY.
+ *
+ * The propstat is present, its status is `200`, and it names no property — which
+ * is what makes the library's parsed region carry no keys. A REFUSED update
+ * answers the same way, which is why nothing here reads it.
+ */
+const UPDATE_ANSWER = propertyUpdateAnswer(
+  "<d:propstat><d:prop/><d:status>HTTP/1.1 200 OK</d:status></d:propstat>",
 );
 
-/** The name accepted, the colour refused — the half the probe could not see. */
-const UPDATE_COLOUR_REFUSED = propertyUpdateAnswer(
-  "<d:propstat><d:prop><d:displayname/></d:prop>" +
-    "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>" +
-    "<d:propstat><d:prop><ca:calendar-color/></d:prop>" +
-    "<d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>",
-);
+/** The name the update cases rename to, and the colour they recolour to. */
+const UPDATE_NAME = "Job search 2026";
+const UPDATE_COLOR = "#1f77b4";
+/** What iCloud stores for that colour — the eight-digit form, measured. */
+const UPDATE_COLOR_STORED = "#1f77b4FF";
 
-/** A stub that answers a property update, and everything else as usual. */
-function updatingWriteStub(body = UPDATE_BOTH_SET, status = 207): WriteStub {
+/**
+ * A stub that answers a property update AND the read that verifies it.
+ *
+ * `after` is what the collection says about itself when it is read back, which is
+ * the only thing the reported verdict comes from. `body` is what the update
+ * itself answers, and it is a parameter only so a case can prove that changing it
+ * changes nothing.
+ */
+function updatingWriteStub(
+  after: { displayName?: string; color?: string } = {},
+  body = UPDATE_ANSWER,
+  status = 207,
+): WriteStub {
   return writeDavStub({
-    onRequest: (_url, method) =>
-      method === "PROPPATCH"
-        ? new Response(body, { status, headers: XML_HEADERS })
-        : null,
+    onRequest: (url, method) => {
+      if (method === "PROPPATCH") {
+        return new Response(body, { status, headers: XML_HEADERS });
+      }
+      // The look again. Answered here so a case can say what the collection now
+      // holds; the canned branch answers a fixed name and no colour, which would
+      // make every verification a refusal.
+      if (method === "PROPFIND" && new URL(url).pathname === WORK_PATH) {
+        return multistatus(collectionRows(WORK_CTAG, WORK_MEMBERS, after));
+      }
+      return null;
+    },
   });
 }
 
@@ -8503,14 +8546,21 @@ describe("the calendar_update_calendar registration", () => {
 });
 
 describe("the calendar_update_calendar call", () => {
-  it("names BOTH properties as changed when both propstats are 2xx", async () => {
-    const stub = updatingWriteStub();
+  it("names BOTH properties as changed when the fresh read finds both", async () => {
+    // **The regression case at the tool boundary.** The update answers iCloud's
+    // own shape — a `207` with an empty property region — and the collection reads
+    // back holding the new name and the new colour. The shipped tool returned
+    // `connection_failed` here, on every single successful write.
+    const stub = updatingWriteStub({
+      displayName: UPDATE_NAME,
+      color: UPDATE_COLOR_STORED,
+    });
     await warmWrite(stub);
 
     const outcome = await updateCalendarCall({
       calendarId: CALENDAR_ID,
-      displayName: "Job search 2026",
-      color: "#1f77b4",
+      displayName: UPDATE_NAME,
+      color: UPDATE_COLOR,
     });
     if (outcome.refused) throw new Error("the update was refused");
 
@@ -8519,34 +8569,46 @@ describe("the calendar_update_calendar call", () => {
       "displayName",
     ]);
     expect(outcome.trusted.unchanged).toEqual([]);
-    // ONE request, and it did not fan out with anything.
-    expect(stub.observed.length).toBe(1);
-    expect(stub.observed[0].method).toBe("PROPPATCH");
+    expect(outcome.trusted.unverified).toEqual([]);
+    // TWO requests — the write, then the look again — and they did not fan out
+    // with each other. `maxInFlight` is the only thing that can tell a serial
+    // pair from a concurrent one that resolved in order.
+    expect(stub.observed.map((one) => one.method)).toEqual([
+      "PROPPATCH",
+      "PROPFIND",
+    ]);
     expect(stub.maxInFlight).toBe(1);
   });
 
-  it("names WHICH half landed when the colour is refused, echoing no server text", async () => {
-    // **The case this whole plan exists for.** The envelope is a `207`, which
-    // is the only successful answer RFC 4918 § 9.2 defines for a property
-    // update — and the colour's own propstat inside it says `403`. Reading the
-    // envelope alone tells the user their calendar was recoloured when it was
-    // not.
-    const stub = updatingWriteStub(UPDATE_COLOUR_REFUSED);
+  it("names WHICH property the fresh read found, echoing no server text", async () => {
+    // The name is the new one and the colour is not what was asked for, so the
+    // answer has to say which — in this server's own words, with no status line,
+    // no URL and no server body anywhere in it.
+    const stub = updatingWriteStub({ displayName: UPDATE_NAME });
     await warmWrite(stub);
 
     const outcome = await updateCalendarCall({
       calendarId: CALENDAR_ID,
-      displayName: "Job search 2026",
-      color: "#1f77b4",
+      displayName: UPDATE_NAME,
+      color: UPDATE_COLOR,
     });
     if (outcome.refused) throw new Error("the update was refused");
 
     expect(outcome.trusted.changed).toEqual(["displayName"]);
     expect(outcome.trusted.unchanged).toEqual(["color"]);
 
-    // NOT an error. The collection exists and half the change landed; a thrown
-    // category would carry no way to learn which half.
-    const whole = outcome.raw.trusted + outcome.raw.untrusted;
+    // NOT an error. The collection exists and half of what was asked is in place;
+    // a thrown category would carry no way to learn which half.
+    //
+    // **Searched over the two JSON PAYLOADS rather than over the raw fenced
+    // text, and that is a fix rather than a weakening.** The fence carries a
+    // random UUID nonce on every response — twice — and a UUID is thirty-two hex
+    // characters, so `403` turns up inside one often enough to have made this
+    // case flake roughly one full-suite run in six. It was filed in
+    // `deferred-items.md` as a flaky test; it was a wrong test. The nonce is not
+    // a response FIELD and § 4 says nothing about it, so the assertion now reads
+    // the fields.
+    const whole = outcome.raw.trusted + JSON.stringify(outcome.untrusted);
     // ./.claude/CLAUDE.md § 4: no response field may echo a server status line,
     // a body or a URL. The property names come from this server's own closed
     // two-value vocabulary, which is what leaves nothing to quote.
@@ -8558,37 +8620,78 @@ describe("the calendar_update_calendar call", () => {
     expect(whole).not.toContain("1234567890");
   });
 
-  it("reports the change REFUSED when every property was refused", async () => {
-    // Not "a partial success with zero parts". A response saying a change
-    // succeeded partially while naming no part of it that did is worse than no
-    // answer at all.
-    const stub = updatingWriteStub(
-      propertyUpdateAnswer(
-        "<d:propstat><d:prop><d:displayname/><ca:calendar-color/></d:prop>" +
-          "<d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>",
-      ),
-    );
+  it("reports a TOTAL refusal as an ordinary answer, never as an error", async () => {
+    // **This case is inverted from the one plan 17-04 shipped, and the inversion
+    // is the fix.** It used to assert `isError: true` with a `connection_failed`
+    // category, on the reasoning that "a partial success with zero parts" is not
+    // a sentence worth composing. That reasoning was sound about the OLD answer,
+    // which meant "the update's reply mentioned no property" — a fact about a
+    // reply rather than about the calendar.
+    //
+    // It is not sound about this one. The collection was read back and still
+    // holds its old name and its old colour, which is a fact about the calendar
+    // and the one the user needs. And there is no honest error for it: the
+    // vocabulary is closed at four values, none of them means "iCloud kept the
+    // old name", and `connection_failed` said a connection had failed when none
+    // had — the exact lie that made this tool report a fault on three successful
+    // renames in a row against the real account.
+    const stub = updatingWriteStub({ displayName: "Work", color: "#3f3f3fFF" });
     await warmWrite(stub);
 
-    const parsed = schemaFor("calendar_update_calendar").safeParse({
+    const outcome = await updateCalendarCall({
       calendarId: CALENDAR_ID,
-      displayName: "Job search 2026",
-      color: "#1f77b4",
+      displayName: UPDATE_NAME,
+      color: UPDATE_COLOR,
     });
-    expect(parsed.success).toBe(true);
-    const result = await invokeRegistered(
-      "calendar_update_calendar",
-      parsed.data as Record<string, unknown>,
-    );
+    if (outcome.refused) throw new Error("the update was refused");
 
-    expect(result.isError).toBe(true);
-    // ONE block, the error shape — so there is no `changed: []` anywhere in the
-    // answer for a model to report as a partial success.
-    expect(result.content.length).toBe(1);
-    const whole = result.content[0].text;
-    expect(JSON.parse(whole).category).toBe("connection_failed");
+    // `changed: []` IS printable now, because the two lists beside it say why.
+    expect(outcome.trusted.changed).toEqual([]);
+    expect((outcome.trusted.unchanged as string[]).sort()).toEqual([
+      "color",
+      "displayName",
+    ]);
+    expect(outcome.trusted.unverified).toEqual([]);
+    // Still nothing of the server's answer in either half.
+    const whole = outcome.raw.trusted + JSON.stringify(outcome.untrusted);
     expect(whole).not.toContain("403");
     expect(whole).not.toContain("p42");
+    expect(whole).not.toContain("1234567890");
+  });
+
+  it("reports UNVERIFIED when the look again fails, and still not an error", async () => {
+    // The write has already gone. Reporting a fault here would tell the user
+    // their calendar was untouched by a request that may well have renamed it,
+    // which is `applyCollectionCommit`'s own reasoning about a removal it could
+    // not confirm.
+    const stub = writeDavStub({
+      onRequest: (url, method) => {
+        if (method === "PROPPATCH") {
+          return new Response(UPDATE_ANSWER, { status: 207, headers: XML_HEADERS });
+        }
+        if (method === "PROPFIND" && new URL(url).pathname === WORK_PATH) {
+          return new Response(null, { status: 503 });
+        }
+        return null;
+      },
+    });
+    await warmWrite(stub);
+
+    const outcome = await updateCalendarCall({
+      calendarId: CALENDAR_ID,
+      displayName: UPDATE_NAME,
+    });
+    if (outcome.refused) throw new Error("the update was refused");
+
+    expect(outcome.trusted.unverified).toEqual(["displayName"]);
+    expect(outcome.trusted.changed).toEqual([]);
+    expect(outcome.trusted.unchanged).toEqual([]);
+    // Nothing about the failed read reaches the answer — not its status, not its
+    // body, not the URL it was aimed at.
+    const whole = outcome.raw.trusted + JSON.stringify(outcome.untrusted);
+    expect(whole).not.toContain("503");
+    expect(whole).not.toContain("p42");
+    expect(whole).not.toContain("1234567890");
   });
 
   it("refuses a call changing nothing with ZERO requests issued", async () => {
@@ -8639,17 +8742,12 @@ describe("the calendar_update_calendar call", () => {
   });
 
   it("sends the colour to the wire as eight hex digits, the create's own pairing", async () => {
-    const stub = updatingWriteStub(
-      propertyUpdateAnswer(
-        "<d:propstat><d:prop><ca:calendar-color/></d:prop>" +
-          "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>",
-      ),
-    );
+    const stub = updatingWriteStub({ color: UPDATE_COLOR_STORED });
     await warmWrite(stub);
 
     const outcome = await updateCalendarCall({
       calendarId: CALENDAR_ID,
-      color: "#1f77b4",
+      color: UPDATE_COLOR,
     });
     if (outcome.refused) throw new Error("the update was refused");
 
@@ -8663,13 +8761,16 @@ describe("the calendar_update_calendar call", () => {
   });
 
   it("keeps the caller's own name and colour INSIDE the fence", async () => {
-    const stub = updatingWriteStub();
+    const stub = updatingWriteStub({
+      displayName: HOSTILE_CALENDAR_NAME,
+      color: UPDATE_COLOR_STORED,
+    });
     await warmWrite(stub);
 
     const parsed = schemaFor("calendar_update_calendar").safeParse({
       calendarId: CALENDAR_ID,
       displayName: HOSTILE_CALENDAR_NAME,
-      color: "#1f77b4",
+      color: UPDATE_COLOR,
     });
     expect(parsed.success).toBe(true);
     const result = await invokeRegistered(
@@ -8682,11 +8783,15 @@ describe("the calendar_update_calendar call", () => {
     expect(raw.untrusted).toContain(HOSTILE_CALENDAR_NAME);
     expect(raw.trusted).not.toContain("#1f77b4");
     // The verdict is this server's own reading and rides OUTSIDE the fence, on
-    // the same footing as `subscribed` and `timezoneUnresolved`.
+    // the same footing as `subscribed` and `timezoneUnresolved`. **The name the
+    // fresh read answered is NOT out here either** — the collection reads back
+    // holding the hostile name, and the only place that name appears in the
+    // response is the fenced half, because it is still a string somebody chose.
     expect(Object.keys(JSON.parse(raw.trusted)).sort()).toEqual([
       "changed",
       "id",
       "unchanged",
+      "unverified",
     ]);
   });
 });

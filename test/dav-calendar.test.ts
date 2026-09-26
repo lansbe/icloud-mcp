@@ -65,10 +65,10 @@ import {
   matchesAttendee,
   matchesKeyword,
   nextCivilDate,
+  observedOutcomes,
   patchEventBody,
   pinnedOccurrencesFor,
   planCreateTarget,
-  propstatOutcomes,
   readCollectionState,
   resolveOrganizerAddress,
   searchEvents,
@@ -579,19 +579,31 @@ const DEFAULT_ETAG = '"etag-1"';
  *
  * `ctag` rides on the container's row when supplied, because that is where a
  * real server puts it and where the binding is read from.
+ *
+ * `reading` is what the container's row SAYS about itself, and it carries the
+ * colour as well as the name since plan 17-10: this answer is what a
+ * rename-and-recolour is verified against, so a case has to be able to make the
+ * collection read back as the new values, the old ones, or one of each. Both
+ * default to what this fixture answered before the parameter existed — the name
+ * `Work` and no colour element at all — so every earlier case is untouched.
  */
 function memberListingBody(
   collectionHref: string,
   memberHrefs: string[],
   ctag?: string,
+  reading: { displayName?: string; color?: string } = {},
 ): string {
   const binding = ctag === undefined ? "" : `<CS:getctag>${ctag}</CS:getctag>`;
+  const colour =
+    reading.color === undefined
+      ? ""
+      : `<CA:calendar-color>${reading.color}</CA:calendar-color>`;
   const container =
     `<response><href>${collectionHref}</href><propstat>` +
     `<status>HTTP/1.1 200 OK</status><prop>` +
-    `<displayname>Work</displayname>` +
+    `<displayname>${reading.displayName ?? "Work"}</displayname>` +
     `<resourcetype><collection/><C:calendar/></resourcetype>` +
-    `${binding}</prop></propstat></response>`;
+    `${colour}${binding}</prop></propstat></response>`;
   return (
     container + memberHrefs.map((href) => objectHrefBody(href)).join("")
   );
@@ -6236,13 +6248,31 @@ describe("creating a calendar collection (CALM-04)", () => {
 // ---------------------------------------------------------------------------
 // CALM-05 — renaming and recolouring a calendar collection
 //
-// **The `207` here means the OPPOSITE of the `207` in the block above, and
-// that is the whole point of these cases.** A `207` on the create is a refusal
-// (RFC 5689 § 3, all-or-nothing). A `207` on a property update is the ONLY
-// successful answer RFC 4918 § 9.2 defines — and it is a success only if every
-// `propstat` inside it carries a 2xx status. SPIKE-04's probe read the outer
-// `207` and nothing else, which was enough to answer "does iCloud allow this at
-// all" and is not enough to tell a user their calendar was renamed.
+// **REWRITTEN BY PLAN 17-10, AND THE REWRITE IS THE POINT RATHER THAN A TIDY-UP.**
+// This block used to drive four fixtures that differed only in their `propstat`
+// statuses — both properties accepted, the colour refused with a `403`, the
+// colour silently omitted, everything refused — and asserted which half landed
+// from each. Every one of them passed. All four described a server iCloud is not.
+//
+// Two facts retired them, both measured live on 2026-09-25 against the owner's
+// own account:
+//
+//   1. iCloud's answer to a property update carries NO parsed property keys at
+//      all. The probe reports `propKeys: []` — see `test/dav-diagnose.test.ts`,
+//      which pins that shape directly. So the reader those fixtures exercised
+//      always found nothing, always reported nothing changed, and the entry
+//      point's "nothing landed" arm threw on every SUCCESSFUL write. The
+//      calendar was renamed and recoloured three times while the tool reported
+//      `connection_failed` three times.
+//   2. RFC 4918 § 9.2 makes a property update ATOMIC — "either all of the
+//      modifications succeed or none of them succeed" — so the half-success
+//      those fixtures were built around is a state that cannot occur.
+//
+// What replaces them is the shape this project already uses for its delete:
+// LOOK AGAIN. The cases below assert against what a fresh read of the collection
+// says, and the pair at the top of the block is the load-bearing one — two
+// answers that differ only in their propstats must produce the SAME verdict,
+// because the verdict does not come from the answer at all.
 // ---------------------------------------------------------------------------
 
 /** One `d:response` wrapper, so each fixture below is only its own propstats. */
@@ -6255,56 +6285,78 @@ function propertyUpdateAnswer(propstats: string): string {
   );
 }
 
-/** Both properties accepted, in ONE propstat — the ordinary success. */
-const BOTH_SET_BODY = propertyUpdateAnswer(
+/**
+ * **iCloud's own answer shape: a `207` whose property region is EMPTY.**
+ *
+ * The propstat is present and its status is `200`, and it names no property at
+ * all — which is what makes `Object.keys` over the library's parsed region come
+ * back empty. This is the fixture whose absence shipped the defect: every
+ * earlier fixture here named the two properties as empty elements, which parses
+ * to two KEYS, so the retired reader found them and the suite was green against
+ * a server nobody had asked.
+ *
+ * A REFUSED update answers this way too. That is the second measured fact and
+ * the reason no reader of this body can be written: through the library's parse,
+ * a success and a refusal are the same bytes.
+ */
+const ICLOUD_ANSWER = propertyUpdateAnswer(
+  "<d:propstat><d:prop/><d:status>HTTP/1.1 200 OK</d:status></d:propstat>",
+);
+
+/**
+ * The same answer with both properties NAMED — the shape the retired reader was
+ * built for.
+ *
+ * Kept deliberately, and not as a historical curiosity: it is half of the
+ * strongest assertion in this block. Driven against a re-read that shows the OLD
+ * values it must report a refusal, exactly as `ICLOUD_ANSWER` does — which is
+ * only true of an implementation that does not read the answer. A version that
+ * went back to reading propstats would report success here and fail there, and
+ * the pair is what catches it.
+ */
+const KEYED_ANSWER = propertyUpdateAnswer(
   "<d:propstat><d:prop><d:displayname/><ca:calendar-color/></d:prop>" +
     "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>",
 );
 
-/**
- * The name accepted and the colour REFUSED — the case the probe could not see.
- *
- * Two propstats, which is the shape RFC 4918 § 9.2 defines for exactly this:
- * one status line per group of properties that shared an outcome. The outer
- * envelope is still `207`, and a reader that stops there reports this as a
- * complete success.
- */
-const COLOUR_REFUSED_BODY = propertyUpdateAnswer(
-  "<d:propstat><d:prop><d:displayname/></d:prop>" +
-    "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>" +
-    "<d:propstat><d:prop><ca:calendar-color/></d:prop>" +
-    "<d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>",
-);
+/** The name this block renames the work calendar to. */
+const NEW_NAME = "Job search 2026";
+/** The colour it recolours it to, as a caller types it. */
+const NEW_COLOR = "#1f77b4";
+/** What iCloud stores for that colour — the eight-digit form, measured. */
+const NEW_COLOR_STORED = "#1f77b4FF";
+/** What the collection held before, so an unchanged reading has a value. */
+const OLD_READING = { displayName: "Work", color: "#3f3f3fFF" };
 
 /**
- * The colour SILENTLY DROPPED — mentioned nowhere in the answer.
+ * Answer a property update, and answer the collection read that VERIFIES it.
  *
- * Not refused with a status, not acknowledged: absent. A reader that inspects
- * only the propstats present has nothing to report about it and reports success
- * by omission, which is the second of the three ways the obvious implementation
- * is wrong.
+ * `after` is what the collection says about itself when it is read back, which
+ * is the only thing the outcome is computed from. `body` is what the update
+ * itself answers, and the cases that vary it are asserting that varying it
+ * changes nothing.
  */
-const COLOUR_OMITTED_BODY = propertyUpdateAnswer(
-  "<d:propstat><d:prop><d:displayname/></d:prop>" +
-    "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>",
-);
-
-/** Both properties refused — nothing landed at all. */
-const NOTHING_SET_BODY = propertyUpdateAnswer(
-  "<d:propstat><d:prop><d:displayname/><ca:calendar-color/></d:prop>" +
-    "<d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>",
-);
-
-/** Answer every property update with one body, and everything else normally. */
-function updatingStub(body: string, status = 207): Stub {
+function updatingStub(
+  after: { displayName?: string; color?: string } = {},
+  body: string = ICLOUD_ANSWER,
+  status = 207,
+): Stub {
   return davStub({
-    onRequest: (_url, method) =>
-      method === "PROPPATCH"
-        ? new Response(body, {
-            status,
-            headers: { "content-type": "text/xml; charset=utf-8" },
-          })
-        : null,
+    onRequest: (url, method) => {
+      if (method === "PROPPATCH") {
+        return new Response(body, {
+          status,
+          headers: { "content-type": "text/xml; charset=utf-8" },
+        });
+      }
+      // The look again. Answered HERE rather than through the canned branch so a
+      // case can say what the collection now holds; the canned branch answers a
+      // fixed name and no colour, which would make every verification a refusal.
+      if (method === "PROPFIND" && new URL(url).pathname === WORK_PATH) {
+        return multistatus(memberListingBody(WORK_PATH, [], WORK_CTAG, after));
+      }
+      return null;
+    },
   });
 }
 
@@ -6320,114 +6372,226 @@ function updateOne(
 }
 
 describe("renaming and recolouring a calendar collection (CALM-05)", () => {
-  it("issues ONE property update at the collection the id named", async () => {
-    const stub = updatingStub(BOTH_SET_BODY);
+  it("issues the update at the collection the id named, then READS IT BACK", async () => {
+    const stub = updatingStub({
+      displayName: NEW_NAME,
+      color: NEW_COLOR_STORED,
+    });
     await warm(stub);
 
     const updated = await updateOne({
-      displayName: "Job search 2026",
-      color: "#1f77b4",
+      displayName: NEW_NAME,
+      color: NEW_COLOR,
     });
 
-    // ONE. A rename and a recolour are one request, not two.
-    expect(stub.observed.length).toBe(1);
-    expect(stub.observed[0].method).toBe("PROPPATCH");
-    expect(stub.observed[0].url).toBe(WORK_URL);
+    // TWO requests, and the second one is the answer. One property update — a
+    // rename and a recolour are still one write, not two — and one read to see
+    // what it did.
+    expect(stub.observed.map((one) => one.method)).toEqual([
+      "PROPPATCH",
+      "PROPFIND",
+    ]);
+    expect(stub.observed.map((one) => one.url)).toEqual([WORK_URL, WORK_URL]);
+    // SERIAL, and it could not be otherwise: the read has to see what the write
+    // produced. `overlapped` is what says so from outside — a recorded order
+    // cannot tell a serial pair from a concurrent one that resolved in order.
+    expect(stub.overlapped).toBe(false);
     // The id names what was actually addressed rather than echoing the caller's
     // token, so an id naming something else would be visible here.
     expect(decodeCalendarId(updated.id).collectionUrl).toBe(WORK_URL);
   });
 
-  it("reports BOTH properties changed when both propstats are 2xx", async () => {
-    const stub = updatingStub(BOTH_SET_BODY);
+  it("reports BOTH properties changed when the fresh read finds both in place", async () => {
+    // **The regression case, and the one that would have caught this defect.**
+    // The update answers iCloud's own shape — a `207` with an EMPTY property
+    // region — and the collection reads back holding the new name and the new
+    // colour. That has to be a success. The shipped code threw
+    // `DavConnectError` here, on every single successful write.
+    const stub = updatingStub({
+      displayName: NEW_NAME,
+      color: NEW_COLOR_STORED,
+    });
     await warm(stub);
 
     const updated = await updateOne({
-      displayName: "Job search 2026",
-      color: "#1f77b4",
+      displayName: NEW_NAME,
+      color: NEW_COLOR,
     });
 
     expect(updated.changed.sort()).toEqual(["color", "displayName"]);
     expect(updated.unchanged).toEqual([]);
+    expect(updated.unverified).toEqual([]);
   });
 
-  it("reports the colour NOT changed when its propstat is 403, and does not throw", async () => {
-    // **This is the case SPIKE-04's probe could not see, and the point of the
-    // whole plan.** The envelope is `207`, which the create one block up treats
-    // as a refusal and which RFC 4918 § 9.2 makes the ONLY successful answer
-    // here. Reading it alone reports "renamed and recoloured" to a user whose
-    // calendar is still the old colour.
-    const stub = updatingStub(COLOUR_REFUSED_BODY);
+  it("reports the SAME verdict whether or not the answer names the properties", async () => {
+    // **The strongest assertion in this block: the update's answer is not read.**
+    // Two bodies that differ only in their propstat — iCloud's empty region, and
+    // the keyed region the retired reader was built for — driven against one
+    // re-read that shows the OLD values. Both must report a refusal.
+    //
+    // Mutation-checked: restoring a reader over the property region turns the
+    // KEYED leg red — it would report both properties changed — while the empty
+    // leg stays green. That asymmetry is the whole reason both legs are here.
+    for (const [label, body] of [
+      ["iCloud's empty property region", ICLOUD_ANSWER],
+      ["a region naming both properties", KEYED_ANSWER],
+    ] as const) {
+      const stub = updatingStub(OLD_READING, body);
+      await warm(stub);
+
+      const updated = await updateOne({
+        displayName: NEW_NAME,
+        color: NEW_COLOR,
+      });
+
+      expect(updated.changed, `${label}: reported a change`).toEqual([]);
+      expect(updated.unchanged.sort(), `${label}: did not report the refusal`)
+        .toEqual(["color", "displayName"]);
+      expect(updated.unverified, `${label}: reported it unverifiable`).toEqual(
+        [],
+      );
+    }
+  });
+
+  it("reports a GENUINE refusal as a refusal, and does not throw", async () => {
+    // The case the shipped code thought it was catching and never was. Nothing
+    // landed: the collection still holds the old name and the old colour, and
+    // the answer says exactly that rather than a connection fault.
+    //
+    // It comes back as a VALUE. There is no member of the four-value error
+    // vocabulary that means "iCloud kept the old name" — `connection_failed`
+    // says a connection failed when one did not, which is the lie 17-10 removed.
+    const stub = updatingStub(OLD_READING);
     await warm(stub);
 
     const updated = await updateOne({
-      displayName: "Job search 2026",
-      color: "#1f77b4",
+      displayName: NEW_NAME,
+      color: NEW_COLOR,
+    });
+
+    expect(updated.changed).toEqual([]);
+    expect(updated.unchanged.sort()).toEqual(["color", "displayName"]);
+    // The write WAS issued, and the read that refused it was issued too.
+    expect(stub.observed.length).toBe(2);
+  });
+
+  it("names WHICH property the fresh read found, when it finds only one", async () => {
+    // Atomicity means iCloud will not answer this, and the read can still see
+    // it: the name is the new one and the colour is not what was asked for. What
+    // is reported is what the collection HOLDS, and the shape says so per
+    // property because the read genuinely answers per property.
+    const stub = updatingStub({
+      displayName: NEW_NAME,
+      color: OLD_READING.color,
+    });
+    await warm(stub);
+
+    const updated = await updateOne({
+      displayName: NEW_NAME,
+      color: NEW_COLOR,
     });
 
     expect(updated.changed).toEqual(["displayName"]);
     expect(updated.unchanged).toEqual(["color"]);
-    // It came back as a VALUE. Throwing would hand the caller a category and no
-    // way to learn which half landed.
-    expect(stub.observed.length).toBe(1);
+    expect(updated.unverified).toEqual([]);
   });
 
-  it("treats a property the answer OMITS as not changed", async () => {
-    // Omission is not an implicit success. A reader that inspects only what is
-    // present has nothing to say about a property the server silently dropped,
-    // and saying nothing reads as "it worked" at every layer above.
-    const stub = updatingStub(COLOUR_OMITTED_BODY);
+  it("reports on ONLY the property that was asked for", async () => {
+    // A rename against a collection whose colour is nothing like the one another
+    // case asks for. The colour is not mentioned in the verdict at all, because
+    // nothing asked about it — an outcome naming a property the caller left
+    // alone would be this server inventing a claim about the resource.
+    const stub = updatingStub({ displayName: NEW_NAME, color: "#000000FF" });
     await warm(stub);
 
-    const updated = await updateOne({
-      displayName: "Job search 2026",
-      color: "#1f77b4",
-    });
+    const updated = await updateOne({ displayName: NEW_NAME });
 
     expect(updated.changed).toEqual(["displayName"]);
-    expect(updated.unchanged).toEqual(["color"]);
+    expect(updated.unchanged).toEqual([]);
+    expect(updated.unverified).toEqual([]);
   });
 
-  it("refuses outright when NOTHING changed, rather than reporting an empty partial", async () => {
-    const stub = updatingStub(NOTHING_SET_BODY);
+  it("matches the colour on the EIGHT-digit stored form, folding case only there", async () => {
+    // iCloud stores `#RRGGBBFF` for a colour a caller typed as `#RRGGBB`, so the
+    // comparison is against the wire form rather than the six digits. Case is
+    // folded on it — two hex strings differing only in case are the same colour,
+    // and a raw comparison would report a successful recolour as refused the
+    // first time a server normalised case.
+    const stub = updatingStub({ color: "#1F77B4ff" });
     await warm(stub);
 
-    await expect(
-      updateOne({ displayName: "Job search 2026", color: "#1f77b4" }),
-    ).rejects.toBeInstanceOf(DavConnectError);
-    // The request WAS issued; it is the ANSWER that is refused.
-    expect(stub.observed.length).toBe(1);
-    expect(stub.observed[0].method).toBe("PROPPATCH");
-  });
+    const updated = await updateOne({ color: NEW_COLOR });
 
-  it("sends no colour element at all on a rename with no colour", async () => {
-    const stub = updatingStub(
-      propertyUpdateAnswer(
-        "<d:propstat><d:prop><d:displayname/></d:prop>" +
-          "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>",
-      ),
-    );
-    await warm(stub);
-
-    const updated = await updateOne({ displayName: "Job search 2026" });
-    const body = String(stub.observed[0].body);
-
-    expect(body).toContain("<d:displayname>Job search 2026</d:displayname>");
-    // ABSENT, not empty. An element present with no value is a request to BLANK
-    // the property, which is not what "leave the colour alone" means.
-    expect(body).not.toContain("calendar-color");
-    // Only the property that was asked for is reported on.
-    expect(updated.changed).toEqual(["displayName"]);
+    expect(updated.changed).toEqual(["color"]);
     expect(updated.unchanged).toEqual([]);
   });
 
+  it("does NOT fold case on the name, because two cases are two names", async () => {
+    // The other half of the fold, and the reason it is written down: `work` and
+    // `Work` are two names a person might have chosen, so a rename to one of
+    // them is not satisfied by the other. Mutation-checked against the colour
+    // case above — folding the name as well turns this red and leaves that green.
+    const stub = updatingStub({ displayName: "job search 2026" });
+    await warm(stub);
+
+    const updated = await updateOne({ displayName: NEW_NAME });
+
+    expect(updated.changed).toEqual([]);
+    expect(updated.unchanged).toEqual(["displayName"]);
+  });
+
+  it("reports UNVERIFIED, not refused, when the look again fails", async () => {
+    // The write has already gone by the time the read fails. Reporting a refusal
+    // here would tell the user their calendar was untouched by a request that may
+    // well have renamed it — `applyCollectionCommit`'s `unverified` reasoning,
+    // applied to a change rather than a removal.
+    //
+    // Neither `changed` nor `unchanged` carries the property. "The calendar still
+    // holds the old name" and "I could not find out" are different sentences and
+    // only one of them is true.
+    const stub = davStub({
+      onRequest: (url, method) => {
+        if (method === "PROPPATCH") {
+          return new Response(ICLOUD_ANSWER, {
+            status: 207,
+            headers: { "content-type": "text/xml; charset=utf-8" },
+          });
+        }
+        if (method === "PROPFIND" && new URL(url).pathname === WORK_PATH) {
+          return new Response(null, { status: 503 });
+        }
+        return null;
+      },
+    });
+    await warm(stub);
+
+    const updated = await updateOne({
+      displayName: NEW_NAME,
+      color: NEW_COLOR,
+    });
+
+    expect(updated.unverified.sort()).toEqual(["color", "displayName"]);
+    expect(updated.changed).toEqual([]);
+    expect(updated.unchanged).toEqual([]);
+    // Both requests went out. The failure is the READ's, and it is not rethrown.
+    expect(stub.observed.length).toBe(2);
+  });
+
+  it("sends no colour element at all on a rename with no colour", async () => {
+    const stub = updatingStub({ displayName: NEW_NAME });
+    await warm(stub);
+
+    await updateOne({ displayName: NEW_NAME });
+    const body = String(stub.observed[0].body);
+
+    expect(body).toContain(`<d:displayname>${NEW_NAME}</d:displayname>`);
+    // ABSENT, not empty. An element present with no value is a request to BLANK
+    // the property, which is not what "leave the colour alone" means.
+    expect(body).not.toContain("calendar-color");
+  });
+
   it("sends no displayname element at all on a recolour with no rename", async () => {
-    const stub = updatingStub(
-      propertyUpdateAnswer(
-        "<d:propstat><d:prop><ca:calendar-color/></d:prop>" +
-          "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>",
-      ),
-    );
+    const stub = updatingStub({ color: "#1F77B4FF" });
     await warm(stub);
 
     const updated = await updateOne({ color: "#1F77B4" });
@@ -6441,10 +6605,10 @@ describe("renaming and recolouring a calendar collection (CALM-05)", () => {
   });
 
   it("declares two namespaces and carries the transport's credential only", async () => {
-    const stub = updatingStub(BOTH_SET_BODY);
+    const stub = updatingStub({ displayName: NEW_NAME });
     await warm(stub);
 
-    await updateOne({ displayName: "Job search 2026", color: "#1f77b4" });
+    await updateOne({ displayName: NEW_NAME, color: NEW_COLOR });
     const body = String(stub.observed[0].body);
 
     expect(body).toContain('xmlns:d="DAV:"');
@@ -6461,12 +6625,13 @@ describe("renaming and recolouring a calendar collection (CALM-05)", () => {
   });
 
   it("refuses a change naming NEITHER property, with nothing sent", async () => {
-    const stub = updatingStub(BOTH_SET_BODY);
+    const stub = updatingStub();
     await warm(stub);
 
     await expect(updateOne({})).rejects.toBeInstanceOf(DavNotFoundError);
     // ZERO. Sending an empty `d:prop` would spend a round trip asking iCloud to
-    // do nothing, against a connection budget this project counts.
+    // do nothing, against a connection budget this project counts — and it would
+    // spend a second one reading the collection back afterwards.
     expect(stub.observed.length).toBe(0);
   });
 
@@ -6474,75 +6639,135 @@ describe("renaming and recolouring a calendar collection (CALM-05)", () => {
     // The first collection write whose target is genuinely caller-supplied. The
     // URL arrives inside an opaque id, and `src/dav/transport.ts` attaches the
     // Apple ID and the app-specific password to whatever URL it is handed.
-    const stub = updatingStub(BOTH_SET_BODY);
+    const stub = updatingStub();
     await warm(stub);
 
     await expect(
       updateOne(
-        { displayName: "Job search 2026" },
+        { displayName: NEW_NAME },
         "https://evil.example/1234567890/calendars/work/",
       ),
     ).rejects.toBeInstanceOf(DavNotFoundError);
     expect(stub.observed.length).toBe(0);
   });
 
-  it("reports nothing changed when the answer carries no multistatus at all", async () => {
-    // A bare `200` with no body. The library hands back a response with no
-    // property region, so every asked property is absent and the change is
-    // refused — conservative in the direction this module already chose once on
-    // the create: under-reporting a change the user can verify beats telling
-    // them a calendar was renamed when it was not.
-    const stub = updatingStub("", 200);
+  it("reports a refusal when the update answers no multistatus at all", async () => {
+    // A bare `200` with no body. It changes nothing about the verdict, because
+    // the verdict never came from the update's answer — the collection reads
+    // back holding its old values, and that is the refusal. Before 17-10 this
+    // threw, and the throw was indistinguishable from the one every SUCCESSFUL
+    // write produced.
+    const stub = updatingStub(OLD_READING, "", 200);
     await warm(stub);
 
-    await expect(
-      updateOne({ displayName: "Job search 2026" }),
-    ).rejects.toBeInstanceOf(DavConnectError);
-    expect(stub.observed.length).toBe(1);
+    const updated = await updateOne({ displayName: NEW_NAME });
+
+    expect(updated.changed).toEqual([]);
+    expect(updated.unchanged).toEqual(["displayName"]);
+    expect(stub.observed.length).toBe(2);
   });
 });
 
-describe("propstatOutcomes, read directly", () => {
-  it("splits what was asked into what the answer mentions and what it does not", () => {
-    // The reader in isolation, over the shape the library actually produces:
-    // ONE flat property region per response, because the library reduces every
-    // propstat into it and DROPS any whose status parses outside 2xx. Absence
-    // is therefore the only signal available, which is why `asked` is a
-    // parameter rather than something inferred from the answer.
-    const responses = [
-      {
-        status: 207,
-        statusText: "Multi-Status",
-        ok: true,
-        props: { displayname: {} },
-      },
-    ];
+describe("observedOutcomes, read directly", () => {
+  /** A collection reading, with the two fields this comparison looks at. */
+  function reading(
+    displayName: string,
+    color: string | null,
+  ): CollectionState {
+    return { displayName, color, ctag: WORK_CTAG, memberCount: 0 };
+  }
 
-    expect(propstatOutcomes(responses, ["displayName", "color"])).toEqual({
+  it("splits what was asked by what the fresh read actually holds", () => {
+    expect(
+      observedOutcomes(
+        { displayName: "Job search 2026", color: "#1f77b4" },
+        reading("Job search 2026", "#aaaaaaFF"),
+      ),
+    ).toEqual({
       changed: ["displayName"],
       unchanged: ["color"],
+      unverified: [],
     });
   });
 
-  it("reports everything unchanged when there is no property region", () => {
-    const responses = [
-      { status: 200, statusText: "OK", ok: true },
-    ];
-
-    expect(propstatOutcomes(responses, ["displayName", "color"])).toEqual({
+  it("sends EVERY asked property to unverified when there is no reading", () => {
+    // `null` is the fresh look that did not answer. Nothing is reported changed
+    // and nothing is reported unchanged, because neither would be true.
+    expect(
+      observedOutcomes({ displayName: "Job search 2026", color: "#1f77b4" }, null),
+    ).toEqual({
       changed: [],
-      unchanged: ["displayName", "color"],
+      unchanged: [],
+      unverified: ["displayName", "color"],
     });
+  });
+
+  it("reads a colour the collection does not carry as unchanged, never as changed", () => {
+    // A collection answering no colour cannot be a collection that just took
+    // one. The absent case is folded into the refusal rather than into the
+    // agreement, which is the direction this module chooses everywhere.
+    expect(
+      observedOutcomes({ color: "#1f77b4" }, reading("Work", null)),
+    ).toEqual({ changed: [], unchanged: ["color"], unverified: [] });
+  });
+
+  it("refuses to match the SIX-digit form, and the limit is recorded", () => {
+    // Measured: iCloud stores eight digits for a colour this server set. A server
+    // that stored six would read as unchanged here — which under-reports a change
+    // the user can verify on their own devices, the direction this module has
+    // already chosen twice. The limit is pinned rather than left to be discovered.
+    expect(
+      observedOutcomes({ color: "#1f77b4" }, reading("Work", "#1f77b4")),
+    ).toEqual({ changed: [], unchanged: ["color"], unverified: [] });
   });
 
   it("asks about nothing when nothing was asked", () => {
-    // Non-vacuity in the other direction: an empty `asked` must not invent a
+    // Non-vacuity in the other direction: an empty change must not invent a
     // property to report on. The entry point refuses this call before the
-    // request, so this pins the reader's own behaviour rather than a reachable
-    // path.
-    expect(
-      propstatOutcomes([{ status: 207, statusText: "", ok: true, props: {} }], []),
-    ).toEqual({ changed: [], unchanged: [] });
+    // request, so this pins the comparison's own behaviour rather than a
+    // reachable path.
+    expect(observedOutcomes({}, reading("Work", "#1f77b4FF"))).toEqual({
+      changed: [],
+      unchanged: [],
+      unverified: [],
+    });
+    // And with no reading either, which is the shape that would otherwise be
+    // tempted to report a property nobody named as unverifiable.
+    expect(observedOutcomes({}, null)).toEqual({
+      changed: [],
+      unchanged: [],
+      unverified: [],
+    });
+  });
+
+  it("partitions what was asked: every property lands in exactly one list", () => {
+    // The invariant the three-list shape exists to make checkable. Asserted over
+    // every combination of what can be asked and both states of the reading,
+    // because a comparison that double-counted would otherwise be visible only
+    // in whichever single case a reader happened to look at.
+    const changes = [
+      { displayName: "Job search 2026" },
+      { color: "#1f77b4" },
+      { displayName: "Job search 2026", color: "#1f77b4" },
+    ];
+    const states = [
+      reading("Job search 2026", "#1f77b4FF"),
+      reading("Work", "#aaaaaaFF"),
+      null,
+    ];
+
+    for (const change of changes) {
+      for (const state of states) {
+        const outcome = observedOutcomes(change, state);
+        const all = [
+          ...outcome.changed,
+          ...outcome.unchanged,
+          ...outcome.unverified,
+        ];
+        expect(all.sort()).toEqual(Object.keys(change).sort());
+        expect(new Set(all).size).toBe(all.length);
+      }
+    }
   });
 });
 

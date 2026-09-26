@@ -224,31 +224,38 @@ export const TRUSTED_FIELD_ALLOWLIST: Record<string, AllowedShape> = {
 
   // -- calendar_update_calendar (CALM-05) -----------------------------------
   //
-  // THREE keys, and the two new ones are the interesting entry on this whole
-  // list — the first fields published outside the fence that answer a question
-  // about what a SERVER did, rather than reporting a value this server computed
-  // from its own inputs.
+  // FOUR keys, and the three lists are the interesting entry on this whole list
+  // — the first fields published outside the fence that answer a question about
+  // what happened on the ACCOUNT, rather than reporting a value this server
+  // computed from its own inputs.
   //
   // They pass the fence's stated test anyway, and the mechanism is the reason.
   // Each array's contents are drawn from a CLOSED two-value vocabulary declared
-  // in `src/dav/calendar.ts` (`CalendarProperty`), and which of the two lists a
-  // property lands in is this server's own reading of a multi-status it parsed.
-  // No byte of the server's answer reaches either array: not a status line, not
-  // a propstat, not a body, not a URL. The closed vocabulary IS the mitigation
-  // `.claude/CLAUDE.md` § 4 asks for — "which property failed" is precisely the
-  // field somebody would otherwise answer by quoting the server's own propstat
-  // back, and once the names are this server's there is nothing left to quote.
+  // in `src/dav/calendar.ts` (`CalendarProperty`), and which of the three lists a
+  // property lands in is this server's own comparison between what was asked for
+  // and what a FRESH READ of the collection holds. No byte of the server's answer
+  // reaches any of them: not a status line, not a propstat, not a body, not a
+  // URL. The closed vocabulary IS the mitigation `.claude/CLAUDE.md` § 4 asks for
+  // — "which property failed" is precisely the field somebody would otherwise
+  // answer by quoting the server's own propstat back, and once the names are this
+  // server's there is nothing left to quote.
   //
-  // **`unchanged` is not optional and must not become optional.** A field that
-  // disappears on the happy path is a field a reader has to know an absence
-  // rule for, and "no property failed" is an answer worth stating out loud.
+  // **`unverified` is plan 17-10's third list, and it is not a status echo.** It
+  // names the properties whose outcome could not be established because the look
+  // again did not answer — a fact about what THIS SERVER managed to do, from the
+  // same closed vocabulary, carrying nothing about why the read failed.
+  //
+  // **None of the three is optional and none must become optional.** A field that
+  // disappears on the happy path is a field a reader has to know an absence rule
+  // for, and "no property was refused" is an answer worth stating out loud.
   calendarUpdatedToolResult: {
     top: new Set([
       "id", // server-generated: base64url(JSON) minted here over the collection URL the request ACTUALLY addressed.
-      "changed", // server-generated: this server's own reading, from a closed two-value vocabulary it declares. No server text reaches it.
-      "unchanged", // server-generated: the same reading, same closed vocabulary. Always present, including when empty.
+      "changed", // server-generated: this server's own comparison against a fresh read, from a closed two-value vocabulary it declares. No server text reaches it.
+      "unchanged", // server-generated: the same comparison, same closed vocabulary. Always present, including when empty.
+      "unverified", // server-generated: the same closed vocabulary again, naming what the fresh read could not establish. Carries nothing about the failure.
     ]),
-    // No `optionalTop`: both arrays are spread unconditionally, and an empty
+    // No `optionalTop`: all three arrays are spread unconditionally, and an empty
     // array is a real answer rather than an absent one.
   },
 
@@ -1274,15 +1281,17 @@ describe("the trusted block of every shipped DAV shaper", () => {
   it("calendarUpdatedToolResult publishes exactly the audited keys", () => {
     const shape = TRUSTED_FIELD_ALLOWLIST.calendarUpdatedToolResult;
 
-    // Driven on the HALF-SUCCESS, deliberately. A full success leaves
-    // `unchanged` empty, and an empty array is the one value that would let a
-    // shaper drop the key entirely while this case stayed green.
+    // Driven on the SPLIT reading, deliberately: one property found in place and
+    // one found unchanged. A full success leaves two of the three lists empty,
+    // and an empty array is the one value that would let a shaper drop the key
+    // entirely while this case stayed green.
     const trusted = trustedBlockOf(
       calendarUpdatedToolResult(
         {
           id: encodeCalendarId({ collectionUrl: CALENDAR_URL }),
           changed: ["displayName"],
           unchanged: ["color"],
+          unverified: [],
         },
         { displayName: "Job search 2026", color: "#1f77b4" },
       ),
@@ -1291,11 +1300,33 @@ describe("the trusted block of every shipped DAV shaper", () => {
     expectExactKeys(trusted, shape.top, "calendarUpdatedToolResult top level");
 
     // The VALUES, not only the keys. This gate is otherwise blind to what sits
-    // at a permitted key, and the whole reason these two arrays are allowed
+    // at a permitted key, and the whole reason these three arrays are allowed
     // outside the fence is that their contents come from a closed vocabulary
     // this server declares rather than from anything the server sent back.
     expect(trusted.changed).toEqual(["displayName"]);
     expect(trusted.unchanged).toEqual(["color"]);
+    expect(trusted.unverified).toEqual([]);
+
+    // The EMPTY-ARRAY key set, asserted separately. `unverified` is the list a
+    // shaper is most tempted to drop, because it is empty on every path but one
+    // — so the case that would go green on a dropped key is driven too.
+    const unverified = trustedBlockOf(
+      calendarUpdatedToolResult(
+        {
+          id: encodeCalendarId({ collectionUrl: CALENDAR_URL }),
+          changed: [],
+          unchanged: [],
+          unverified: ["displayName", "color"],
+        },
+        { displayName: "Job search 2026", color: "#1f77b4" },
+      ),
+    );
+    expectExactKeys(
+      unverified,
+      shape.top,
+      "calendarUpdatedToolResult top level, unverified",
+    );
+    expect(unverified.unverified).toEqual(["displayName", "color"]);
   });
 
   it("collectionPreviewToolResult publishes exactly the audited keys", () => {
