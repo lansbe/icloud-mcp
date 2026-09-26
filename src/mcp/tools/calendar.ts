@@ -1833,11 +1833,12 @@ export function affectedOccurrencesFor(
  * What a write against this target must settle before anything is minted.
  *
  * **The scope question is asked BEFORE the resource's own blockers**, and the
- * order is deliberate. A recurring resource has a blocker for the rebuild path
- * — it always has, since 05-06 — so consulting that first would answer "this
- * server cannot rewrite a series" to a caller who never said which occurrences
- * they meant, and the caller would reasonably conclude that saying so would not
- * have helped. Asking the scope question first makes the answer actionable.
+ * order is deliberate. A recurring resource has a blocker for the whole-resource
+ * write — it always has, since 05-06 — so consulting that first would answer
+ * "this server cannot rewrite a series" to a caller who never said which
+ * occurrences they meant, and the caller would reasonably conclude that saying so
+ * would not have helped. Asking the scope question first makes the answer
+ * actionable.
  *
  * Returns the refusal to publish, or null to proceed. Every refusal is a FIELD
  * on a successful result and mints nothing — see `EventPreview.scopeRequired`.
@@ -2113,9 +2114,9 @@ async function buildPreview(
     // it costs no request because the body is already in hand.
     //
     // **It is disclosure and never input, which is the distinction PITFALLS #12
-    // turns on.** No writer on this path reads it. The rebuild forces
-    // `participants: null` and the patch takes only the seven value fields, so
-    // there is no value in this array that can reach the bytes — what the array
+    // turns on.** No writer on this path reads it. Every writer is a patch and a
+    // patch takes only the seven value fields, so there is no value in this array
+    // that can reach the bytes — what the array
     // does is let the preview NAME the people before the user agrees, and let
     // the outcome name them afterwards, which is the whole of CALW-08. An
     // attendee list this server READ still cannot become one it WROTE.
@@ -2124,24 +2125,35 @@ async function buildPreview(
   const fields = diffOf(current, desired);
 
   const isRecurring = read.isRecurring;
-  // Which blocker applies is a function of the SCOPE, because the write shapes
-  // ask different questions of the same bytes. A patch has no bytes-level
-  // blocker left at all — see the note above `deleteBlockerOf`, which records
-  // why the last one was retired rather than kept saying something no longer
-  // true — while a scopeless write against a SERIES is still refused, because a
-  // series-scoped rewrite moves the master's `DTSTART` and orphans every
-  // existing override.
+  // **ONE arm survived D-02's collapse, and this comment exists because "why
+  // does one arm survive" is the exact question a later reader asks.**
   //
-  // **`this-and-future` is on the PATCH side, and that is a claim about the
-  // operation rather than a convenience.** It writes exactly what an
-  // occurrence-scoped change writes — one resource, master untouched, one
-  // override component — with one parameter added to the identifier.
-  const patches = scope === "occurrence" || scope === "this-and-future";
-  const structural = patches
-    ? null
-    : isRecurring
-      ? "recurring"
-      : read.unsupportedTarget;
+  // Every update patches now, so no bytes-level verdict about a REBUILD reaches
+  // this expression any more. All of them described something a rebuild could not
+  // reproduce — a reminder, an `X-` property, a UID the builder had to derive
+  // from the object URL — and a patch reproduces nothing, it keeps the bytes. The
+  // whole family retired with the rebuild; see the retirement note above
+  // `deleteBlockerOf` in `../../dav/calendar.ts`, which records them by name.
+  //
+  // `recurring` is NOT one of those verdicts and must not be collapsed with them.
+  // It says this server has no writer for the operation AT ALL: a series-scoped
+  // rewrite moves the master's `DTSTART` and orphans every override stored
+  // against the old slots. Drop it and the preview MINTS a confirmation the
+  // commit's own dispatch has no branch for, so the refusal arrives one tool call
+  // later out of `isDispatchableScope` saying `confirmation_invalid` — later, and
+  // about the wrong thing: it implicates the confirmation, which the model is told
+  // to trust, when the truth is that a whole series cannot be rewritten. Pinned
+  // by "a series-scoped update is refused at PREVIEW, and must stay so" in
+  // `test/dav-tools.test.ts`.
+  //
+  // **The scope test stays, and it is no longer a claim about the writer.** Both
+  // SCOPED shapes reach one override component of a series, which is a thing this
+  // server can write; the scopeless shape reaches the whole resource, which for a
+  // series it cannot. So the question the test asks is which of those two a
+  // recurring resource is being asked for.
+  const reachesOneOccurrence =
+    scope === "occurrence" || scope === "this-and-future";
+  const structural = !reachesOneOccurrence && isRecurring ? "recurring" : null;
   const blocker = structural ?? requestedZoneBlocker(desired);
 
   // The later dates this change will NOT move, because somebody edited them by
@@ -2990,60 +3002,75 @@ async function occurrenceBody(
 }
 
 /**
- * Read the resource back and produce the SCOPELESS rewrite's bytes.
+ * Read the resource back and produce the SCOPELESS update's bytes.
  *
- * ## Two writers behind one door, chosen by the bytes rather than by the request
+ * ## ONE writer, and the single arm is the guarantee (D-02)
  *
- * A one-off event that carries nobody is REBUILT, exactly as it has been since
- * 05-06: `updateEventBody` assembles it from the confirmed change, at the
- * revision the preview sealed.
+ * Every scopeless update PATCHES: the stored bytes with the confirmed fields
+ * asserted over them, and nothing else touched. There were two writers here
+ * from 05-06 until plan 17-07 — a resource carrying `ATTENDEE` or `ORGANIZER`
+ * was patched and every other one was REBUILT from the confirmed change — and
+ * the second arm is gone rather than narrowed.
  *
- * A one-off event that carries `ATTENDEE` or `ORGANIZER` is PATCHED. iCloud
- * rewrites such a resource on the way in — probe P-1 (d) measured the organiser's
- * `mailto:` replaced by an opaque per-account principal href and
- * `SCHEDULE-STATUS` stamped onto every attendee — so a rebuild would re-emit a
- * plain `mailto:`, drop the only evidence anything was sent, and reset every
- * `PARTSTAT`, ERASING an attendee's `ACCEPTED` reply. That is why the update was
- * REFUSED outright until plan 05-14 (`.planning/WINDOWS.md` entry 61), and
- * `patchEventBody` is the alternative that made narrowing the refusal safe.
+ * **Why the rebuild went, and it is not tidiness.** A rebuild assembles the
+ * resource from the fields this server models and therefore drops, by omission,
+ * everything it does not: a `VALARM`, an `X-` property, a non-standard parameter
+ * on a property it does copy. It could only ever be made safe by an ALLOW-LIST
+ * of things somebody remembered to list — and CALM-03 asks for the opposite
+ * promise, that an update preserve every property the tool does not model. The
+ * patch makes that promise structurally: there is nothing for it to drop,
+ * because it never rebuilds anything. Widening the allow-list to cover alarms
+ * would have fixed alarms and nothing else.
  *
- * **The choice is made from the RE-READ's own bytes and from nothing else.** A
- * flag in the confirmation could be substituted only by re-signing it, but it
- * could still go stale — and the failure mode of getting this wrong is silent
- * and permanent: a resource patched when it should have been rebuilt is merely
- * conservative, while a resource rebuilt when it should have been patched has
- * lost the organiser and everybody's reply with a 2xx to show for it. The ETag
- * comparison below is what makes reading the fresh bytes safe: they are the
- * PREVIEW's bytes or there is no write.
+ * What that additionally retires is the refusal the rebuild needed. A resource
+ * holding a reminder answered `unsupported-properties` and could not be updated
+ * at all, which is the ORDINARY shape on a real calendar rather than an exotic
+ * one. See the retirement note above `deleteBlockerOf` in `../../dav/calendar.ts`.
  *
- * ## Why the read is unconditional, including for the rebuild
+ * The hazards on a SCHEDULING resource are the sharper half of the same
+ * argument and they have not changed: iCloud rewrites such a resource on the way
+ * in — probe P-1 (d) measured the organiser's `mailto:` replaced by an opaque
+ * per-account principal href and `SCHEDULE-STATUS` stamped onto every attendee —
+ * so a rebuild re-emits a plain `mailto:`, drops the only evidence anything was
+ * sent, and resets every `PARTSTAT`, ERASING an attendee's `ACCEPTED` reply.
  *
- * Because "does this resource carry people" cannot be answered without it. The
- * cost is one serial, awaited multi-get before one conditional write, on a path
- * already gated behind a human confirmation — `observeDelivery`'s precedent and
- * `occurrenceBody`'s, which is the same shape reached from the other direction.
- * It is `getEventWithEtag`, so it adds no name to the fan-out surface and
- * inherits the containment assertions on both URLs unchanged. It is never a
- * fan-out: `EventPreview.writeCount` is what a person is asked to agree to, and
- * it counts WRITES, of which there is still exactly one.
+ * ## The read stays, and it is still unconditional
  *
- * A side effect worth naming: the staleness refusal now costs ZERO writes on
- * this path too, rather than one `PUT` the server answers 412 to.
+ * A patch needs the whole resource, so the re-read is what the write is built
+ * from rather than what chooses between two writers. The cost is one serial,
+ * awaited multi-get before one conditional write, on a path already gated behind
+ * a human confirmation — `observeDelivery`'s precedent and `occurrenceBody`'s,
+ * which is the same shape reached from the other direction. It is
+ * `getEventWithEtag`, so it adds no name to the fan-out surface and inherits the
+ * containment assertions on both URLs unchanged. It is never a fan-out:
+ * `EventPreview.writeCount` is what a person is asked to agree to, and it counts
+ * WRITES, of which there is exactly one.
  *
- * ## The revision
+ * The ETag comparison is untouched and the staleness guarantee with it: the
+ * bytes this builds from are the PREVIEW's bytes or there is no write, and the
+ * refusal costs ZERO writes rather than one `PUT` the server answers 412 to.
  *
- * The rebuild takes it from the SIGNED payload, unchanged — a fact about the
- * resource at preview time, sealed so a caller cannot move it. The patch takes
- * it from the patched component's own stored value, which is
- * `applyOccurrenceOverride`'s rule. The ETag agreement above means the two are
- * the same number, and each writer reads it from the place that is right for it.
+ * ## The revision, and what stopped being read
+ *
+ * `nextSequence` of the patched component's OWN stored value, which is
+ * `applyOccurrenceOverride`'s rule. The rebuild took it from the SIGNED payload
+ * instead, and `ConfirmPayload.s` is still sealed for the reason its own
+ * docstring now gives — nothing here reads it, so this function no longer takes
+ * it as a parameter at all.
+ *
+ * ## The boolean it returns is a FACT, not a route
+ *
+ * `read.isScheduling` decided which writer ran until this plan. It now decides
+ * nothing here, and it is still returned, because the OUTCOME reports whether
+ * anybody was told — and that question is about what the resource carries, which
+ * has not changed. Hard-coding `true` would claim an invitation went out for a
+ * resource iCloud does not schedule.
  */
 async function scopelessBody(
   principal: Principal,
   davFetch: DavFetch,
   ref: EventRef,
   signedEtag: string | null,
-  carriedSequence: number | null,
   input: BuildEventInput,
 ): Promise<{ body: string; scheduling: boolean }> {
   const read = await getEventWithEtag(env, principal, davFetch, ref);
@@ -3051,20 +3078,14 @@ async function scopelessBody(
     throw new DavStaleResourceError();
   }
 
-  if (!read.isScheduling) {
-    return {
-      body: updateEventBody(ref, input, carriedSequence),
-      scheduling: false,
-    };
-  }
-
   const body = patchEventBody(read.body, input);
   // Not a single non-repeating event after all. Reported as not-found, which is
   // the answer the read leg gives for the same condition. Unreachable through a
-  // confirmation this server minted — a series is refused before minting — but
-  // the alternative is a non-null assertion about a caller this cannot see.
+  // confirmation this server minted — a series is refused before minting, by the
+  // one arm of `buildPreview`'s blocker that survived D-02's collapse — but the
+  // alternative is a non-null assertion about a caller this cannot see.
   if (body === null) throw new DavNotFoundError(false);
-  return { body, scheduling: true };
+  return { body, scheduling: read.isScheduling };
 }
 
 /**
@@ -3162,18 +3183,25 @@ const DISPATCHED_SCOPES: ReadonlySet<WriteScope> = new Set([
  * which of those scopes has code written for it.
  *
  * Null is a real arm rather than an absence: it is the whole-resource shape —
- * remove the resource on a delete, rebuild it on an update.
+ * remove the resource on a delete, assert the change over its one component on
+ * an update.
  *
  * **Everything else must REFUSE, and the reason is the shape of what happens if
  * it does not.** Both dispatches were written as a positive match on the two
- * patch scopes with an implicit `else`, and both `else` arms are the most
+ * scoped shapes with an implicit `else`, and both `else` arms are the most
  * destructive branch available: a whole-resource `DELETE` that also hardcodes
- * `affectedOccurrences: 1`, and a full `updateEventBody` rebuild that by its own
- * docstring drops everything the change does not mention. So a scope published
- * later and given no arm would not fail — it would delete the resource entire
- * and report that it had changed one occurrence. That is precisely the "preview
- * said one thing, the write did another" failure this phase exists to make
- * unreachable, arrived at by an omitted `else`.
+ * `affectedOccurrences: 1`, and a whole-resource update that hardcodes the same
+ * count. So a scope published later and given no arm would not fail — it would
+ * delete the resource entire and report that it had changed one occurrence. That
+ * is precisely the "preview said one thing, the write did another" failure this
+ * phase exists to make unreachable, arrived at by an omitted `else`.
+ *
+ * The update arm's own consequence narrowed with D-02 and did not disappear.
+ * Until then the `else` was a REBUILD that dropped every property the change did
+ * not mention; now it patches, so a series falling into it is answered not-found
+ * instead. A refusal here is still the right answer, because a caller told their
+ * confirmation is invalid retries and a caller told the event does not exist is
+ * being told something false about their own calendar.
  *
  * It is LATENT rather than live today: `series` is refused before minting on
  * both paths, so no confirmation carrying it exists, and the change hash binds
@@ -3506,36 +3534,48 @@ async function applyCommit(
     // person**: an attendee list this server READ must not survive into a
     // resource it WROTE (PITFALLS #12), and a rebuild that emitted a plain
     // `mailto:` organiser would destroy the opaque principal href iCloud assigns
-    // to a scheduling resource (probe P-1 (d)). `updateEventBody` overrides this
-    // field anyway, so the two layers agree; writing it here is what stops a
-    // reader concluding that the omission was an oversight.
+    // to a scheduling resource (probe P-1 (d)).
     //
-    // Neither patch reads it either — `updateOccurrenceBody` and
-    // `patchEventBody` take only the seven value fields — so all three write
-    // shapes agree. **That is what makes plan 05-14's disclosure safe rather
-    // than a hole in the laundering boundary**: `change.attendees` now names the
-    // people an invited update will reach, but it names them to the RESPONSE.
-    // The `ATTENDEE` lines that go on the wire are the STORED resource's own,
-    // cloned byte for byte by the patch and never emitted from this array.
+    // **Since D-02 that is STRUCTURAL rather than enforced by an override.** The
+    // rebuild forced this field to null on its way to the builder, and the
+    // rebuild is gone — so there is no builder to override. All three writers
+    // patch, and a patch never constructs a participant at all:
+    // `applyOverrideChange` asserts seven named properties over the component
+    // the resource already had, and neither `ORGANIZER` nor `ATTENDEE` is among
+    // them. Writing the null here is what stops a reader concluding the omission
+    // was an oversight; the guarantee itself is pinned by "no update path emits
+    // an ATTENDEE, whatever the change carries" in `test/dav-tools.test.ts`,
+    // driven through every scope with three people in the confirmed change.
+    //
+    // **That is what makes plan 05-14's disclosure safe rather than a hole in the
+    // laundering boundary**: `change.attendees` names the people an invited
+    // update will reach, but it names them to the RESPONSE. The `ATTENDEE` lines
+    // that go on the wire are the STORED resource's own, cloned byte for byte by
+    // the patch and never emitted from this array.
     participants: null,
-    // Likewise overridden one layer down, and likewise written here so the
-    // pair reads as deliberate. The revision that actually reaches the wire
-    // comes from the SIGNED payload's `s` on the rebuild path, and from the
-    // patched component's own stored revision on the occurrence path.
+    // Likewise not read by any writer, and likewise written here so the pair
+    // reads as deliberate. The revision that reaches the wire is `nextSequence`
+    // of the patched component's OWN stored value, on every scope — so a caller
+    // cannot choose one, and neither can this field.
     sequence: 0,
   };
 
-  // The PATCH shapes, both of them, dispatched on the hash-bound scope. They
-  // are one operation with one parameter between them: a change from a date
-  // onward writes the same resource an occurrence-scoped change writes, with
-  // the reach marked on the identifier. So there is one arm rather than two,
-  // and in particular no second write — see `EventPreview.writeCount`.
+  // The dispatch, on the hash-bound scope. **All three arms PATCH now** (D-02),
+  // so what this chooses between is the REACH of the patch rather than the kind
+  // of writer: a scoped change writes one override component of a series, and a
+  // scopeless one writes the whole resource. The two scoped shapes are one
+  // operation with one parameter between them — a change from a date onward
+  // writes the same resource an occurrence-scoped change writes, with the reach
+  // marked on the identifier — so there is one arm for them rather than two, and
+  // in particular no second write; see `EventPreview.writeCount`.
   //
   // **The `null` here is the scopeless arm and NOTHING else**, on the same
   // guarantee step 5b gives the delete dispatch: an unrecognised scope was
-  // refused above, so it cannot reach `updateEventBody` — which by its own
-  // docstring drops everything the change does not mention — by falling past
-  // two positive matches.
+  // refused above, so it cannot reach the scopeless writer by falling past two
+  // positive matches. That mattered more when the arm it fell into rebuilt the
+  // resource; it still matters, because the scopeless writer asserts the change
+  // over the ONE component a resource that does not repeat has, and a series
+  // reaching it is answered not-found rather than written to.
   const rewrite =
     change.scope === "occurrence" || change.scope === "this-and-future"
       ? await occurrenceBody(principal, davFetch, ref, payload.e, buildInput, change.scope)
@@ -3545,25 +3585,20 @@ async function applyCommit(
             davFetch,
             ref,
             payload.e,
-            // The revision the PREVIEW observed on the stored resource, read
-            // back out of the sealed payload, and used only by the REBUILD arm.
-            // `nextSequence` advances it; a caller cannot move it, because it
-            // never left this server unsealed.
-            payload.s,
             buildInput,
           )),
-          // A scopeless rewrite replaces a resource that does not repeat — one
+          // A scopeless update rewrites a resource that does not repeat — one
           // occurrence, by the same blocker that keeps a series off this path.
           affected: 1 as number | string,
         };
 
   const written = await updateEvent(env, principal, davFetch, ref, rewrite.body, payload.e);
 
-  // **Only for a resource that actually carries people.** A rebuild wrote no
-  // `ATTENDEE` at all, so there is nothing for iCloud to have reported and the
-  // request is not spent — `observeDelivery` skips on a zero count, and this
-  // makes the count zero for the arm where the change's array is a description
-  // of a resource that no longer describes it.
+  // **Only for a resource that actually carries people.** A resource carrying
+  // nobody has no `ATTENDEE` for the patch to have cloned, so there is nothing
+  // for iCloud to have reported and the request is not spent — `observeDelivery`
+  // skips on a zero count, and this makes the count zero for the case where the
+  // change's array describes a resource it does not describe.
   const recipientCount = rewrite.scheduling ? change.attendees.length : 0;
   const delivery = await observeDelivery(principal, davFetch, ref, recipientCount);
 
@@ -3572,17 +3607,20 @@ async function applyCommit(
     id: written.id,
     changedFields: assertedFields(change),
     // **All four keyed on what the RESOURCE carries, never on what the
-    // re-supplied change happens to hold.** The two arms are genuinely
-    // different statements about the bytes that just went out:
+    // re-supplied change happens to hold.** Both writers patch, so what separates
+    // the two cases is the STORED bytes rather than the choice of writer — and
+    // they are genuinely different statements about what just went out:
     //
-    //   - A REBUILD is built with `participants: null`, so the resource it wrote
-    //     carries no `ATTENDEE` at all and therefore told nobody. Reporting a
-    //     count of people beside an `invitationsSent: false` would be a response
-    //     contradicting itself about the one fact CALW-08 exists to report — so
-    //     `rewrite.scheduling` is false, the count is zero, and the list empty.
-    //   - A PATCH cloned every `ATTENDEE` line the resource already had, at a
-    //     revision one past the stored one, which is what an invitation update
-    //     IS. Those people were told, so the response names them.
+    //   - A resource carrying NOBODY had no `ATTENDEE` for the patch to clone, so
+    //     the resource that went out names nobody and therefore told nobody.
+    //     Reporting a count of people beside an `invitationsSent: false` would be
+    //     a response contradicting itself about the one fact CALW-08 exists to
+    //     report — so `rewrite.scheduling` is false, the count is zero, and the
+    //     list empty.
+    //   - A resource carrying people had every `ATTENDEE` line cloned byte for
+    //     byte, at a revision one past the stored one, which is what an
+    //     invitation update IS. Those people were told, so the response names
+    //     them.
     //
     // **Present values rather than omitted keys.** A send must never be
     // inferred from silence, and the case where nothing was sent is where that

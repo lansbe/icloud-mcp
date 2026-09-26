@@ -5468,6 +5468,225 @@ describe("an invited event is PATCHED rather than rebuilt", () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// D-02 — a PLAIN event is patched too, and the refusal it used to get is gone
+//
+// Until plan 17-07 a one-off event carrying NOBODY was REBUILT: the commit
+// assembled the whole resource from the confirmed change, and therefore had to
+// REFUSE any resource holding something its builder could not re-emit — a
+// reminder, an `X-` property, a non-standard parameter on a property it does
+// model. Every event somebody set a reminder on is that shape, so the refusal
+// was the ordinary answer rather than an exotic one.
+//
+// CALM-03 asks for preservation instead of refusal, and the patch is what
+// already makes that promise: it keeps the stored bytes and asserts only the
+// confirmed fields over them. So the routing change is what this block is
+// about, and the fixture below is the resource that measures it — a plain
+// event, nobody invited, carrying exactly the three things the rebuild could
+// not reproduce.
+//
+// Asserted against the bytes that went on the WIRE rather than against this
+// server's own parse of them, on the neighbouring block's argument: the values
+// being protected are ones another client produced, and a test reading them
+// back through the parser that would drop them would agree with itself.
+// ---------------------------------------------------------------------------
+
+const PLAIN_HAZARDS_UID = "plain-hazards-0077";
+const PLAIN_HAZARDS_PATH = `${WORK_PATH}${PLAIN_HAZARDS_UID}.ics`;
+const PLAIN_HAZARDS_EVENT_ID = encodeEventId({
+  calendarUrl: CALENDAR_URL,
+  objectUrl: `https://p42-caldav.icloud.com${PLAIN_HAZARDS_PATH}`,
+  recurrenceId: null,
+});
+
+/**
+ * One plain event carrying every hazard the rebuild refused, and no people.
+ *
+ * Three hazards, one line each so a later executor deleting a "redundant" one
+ * knows what leaves with it:
+ *
+ *   - **The `VALARM`.** The ordinary case. `REWRITABLE_EVENT_PROPERTIES` never
+ *     held a subcomponent, so any resource with a reminder on it answered
+ *     `unsupported-properties` and the update was refused.
+ *   - **`X-APPLE-TRAVEL-ADVISORY-BEHAVIOR`.** An unmodelled PROPERTY. Nothing
+ *     in this project reads it; its whole job is to survive a write anyway.
+ *   - **`X-APPLE-STRUCTURED-TITLE` on `SUMMARY`.** The harder one, and the
+ *     reason both are here: a property-level allow-list drops the unmodelled
+ *     property and copies the modelled one's VALUE, losing a non-standard
+ *     PARAMETER on a property it believed it had carried.
+ *
+ * `SEQUENCE:3` rather than zero, so a writer that RESET the revision instead of
+ * advancing it is visible — a stalled revision fails silently at every layer.
+ *
+ * Anchored in plain UTC with no `VTIMEZONE` of its own, which is `simpleIcs`'s
+ * own shape: what a defined zone survives is asserted byte-for-byte at the
+ * writer in `test/dav-calendar.test.ts`, against a fixture that defines one.
+ */
+function plainHazardsIcs(): string {
+  return icsLines(
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Apple Inc.//iOS 26.0//EN",
+    "CALSCALE:GREGORIAN",
+    "BEGIN:VEVENT",
+    `UID:${PLAIN_HAZARDS_UID}`,
+    "DTSTAMP:20260101T120000Z",
+    "SUMMARY;X-APPLE-STRUCTURED-TITLE=planning-block:Quarterly planning",
+    "LOCATION:Meeting room two",
+    "DTSTART:20260210T150000Z",
+    "DTEND:20260210T160000Z",
+    "SEQUENCE:3",
+    "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+    "BEGIN:VALARM",
+    "ACTION:DISPLAY",
+    "DESCRIPTION:Quarterly planning",
+    "TRIGGER:-PT15M",
+    "END:VALARM",
+    "END:VEVENT",
+    "END:VCALENDAR",
+  );
+}
+
+describe("a plain event carrying a reminder is PATCHED, not refused (D-02)", () => {
+  /** Preview a move of the stored resource, commit it, return the raw write. */
+  async function moveIt(): Promise<{
+    body: string;
+    previewed: Record<string, unknown>;
+    outcome: Record<string, unknown>;
+    stub: WriteStub;
+  }> {
+    const stub = writeDavStub({
+      objects: { [PLAIN_HAZARDS_PATH]: plainHazardsIcs() },
+    });
+    await warmWrite(stub);
+
+    const previewed = await preview({
+      id: PLAIN_HAZARDS_EVENT_ID,
+      startLocal: "2026-02-10T16:00:00",
+      endLocal: "2026-02-10T17:00:00",
+    });
+    expect(
+      previewed.trusted.confirmToken,
+      "the preview refused a resource this server can now patch",
+    ).not.toBeNull();
+
+    stub.observed.length = 0;
+    stub.maxInFlight = 0;
+    const result = await invokeRegistered("calendar_commit", {
+      confirmToken: String(previewed.trusted.confirmToken),
+      change: previewed.untrusted.change,
+    });
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+
+    return {
+      // Unfolded, so a value broken across a continuation line is still one
+      // string. A `not.toContain` against folded bytes passes on a value that
+      // is present, which is the worse of the two failure directions.
+      body: String(
+        stub.observed.filter((one) => one.method === "PUT")[0].body,
+      ).replace(/\r\n[ \t]/g, ""),
+      previewed: previewed.trusted,
+      outcome: JSON.parse(blocks(result).trusted) as Record<string, unknown>,
+      stub,
+    };
+  }
+
+  it("MINTS a confirmation where the rebuild refused the resource outright", async () => {
+    const { previewed } = await moveIt();
+
+    // `unsupported-properties` until this plan, and it was the honest answer
+    // while a rebuild was the only writer: the reminder below would have
+    // disappeared with a 2xx to show for it. There is no rebuild now, so there
+    // is nothing for the verdict to protect and nothing to refuse.
+    expect(previewed.unsupportedTarget).toBeNull();
+    expect(typeof previewed.confirmToken).toBe("string");
+    // ONE write, as every other update on this path: the patch is a conditional
+    // PUT of the stored bytes with the confirmed fields over them.
+    expect(previewed.writeCount).toBe(1);
+  });
+
+  it("keeps the reminder the rebuild would have taken away", async () => {
+    const { body } = await moveIt();
+
+    expect(body).toContain("BEGIN:VALARM");
+    expect(body).toContain("TRIGGER:-PT15M");
+    expect(body).toContain("ACTION:DISPLAY");
+    // The alarm's OWN description, which is a `DESCRIPTION` property inside a
+    // subcomponent. The patch removes a null description from the VEVENT, and
+    // a removal that reached into the alarm would take this with it — leaving
+    // a reminder that fires with no text.
+    expect(body).toContain("DESCRIPTION:Quarterly planning");
+    expect(body.match(/^BEGIN:VALARM/gm)?.length).toBe(1);
+  });
+
+  it("keeps an unmodelled property, and a non-standard parameter on a modelled one", async () => {
+    const { body } = await moveIt();
+
+    // The property nothing in this project reads.
+    expect(body).toContain("X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC");
+    // And the parameter on `SUMMARY` — a property the change DOES assert a new
+    // value for. This is the case a property-level allow-list passes while
+    // losing the parameter, because it copied the value it recognised and
+    // rebuilt the line around it.
+    expect(body).toContain("SUMMARY;X-APPLE-STRUCTURED-TITLE=planning-block:");
+    // The resource's own wrapper too: `serializeOccurrenceResource` clones the
+    // stored VCALENDAR rather than building a fresh one, so the client that
+    // created the event is still named as its producer.
+    expect(body).toContain("PRODID:-//Apple Inc.//iOS 26.0//EN");
+    expect(body).toContain(`UID:${PLAIN_HAZARDS_UID}`);
+  });
+
+  it("advances SEQUENCE from the value the resource carried, never from zero", async () => {
+    const { body } = await moveIt();
+
+    // Three to four. Not to zero, which is what the builder mints for a NEW
+    // event and what the rebuild reset this to until 05-09 — and not to three,
+    // which every other client on the account would treat as a repeat of what
+    // it already has and ignore, silently, at every layer.
+    expect(body).toContain("SEQUENCE:4");
+    expect(body).not.toContain("SEQUENCE:0");
+    expect(body).not.toContain("SEQUENCE:3");
+  });
+
+  it("actually applies the change, so none of the above is preservation by inaction", async () => {
+    // The control. Every assertion in this block is that something SURVIVED,
+    // and a writer that sent the stored bytes straight back would satisfy all
+    // of them while doing nothing at all.
+    const { body, outcome } = await moveIt();
+
+    expect(body).toContain("DTSTART;TZID=UTC:20260210T160000");
+    expect(body).toContain("DTEND;TZID=UTC:20260210T170000");
+    expect(body).not.toContain("DTSTART:20260210T150000Z");
+    expect(outcome.applied).toBe(true);
+  });
+
+  it("reports NO invitation, because the boolean is the resource's own fact", async () => {
+    const { outcome } = await moveIt();
+
+    // **The value `scopelessBody` returns is `read.isScheduling` and not a
+    // hard-coded `true`.** The routing stopped depending on that fact; the
+    // REPORTING did not. This resource carries nobody, so nobody was told, and
+    // a response claiming otherwise would be wrong about the one fact CALW-08
+    // exists to report.
+    expect(outcome.invitationsSent).toBe(false);
+    expect(outcome.recipientCount).toBe(0);
+    expect(outcome.recipients).toBeUndefined();
+  });
+
+  it("costs one read and one write, serial, and no delivery re-read", async () => {
+    const { stub } = await moveIt();
+
+    // TWO requests: the re-read the patch is built from, then the conditional
+    // write. No third one — `observeDelivery` skips on a zero recipient count,
+    // and there is nobody here for iCloud to have told anything.
+    expect(stub.observed.map((one) => one.method)).toEqual(["REPORT", "PUT"]);
+    expect(stub.observed[1].headers["if-match"]).toBe(PREVIEW_ETAG);
+    // Never a fan-out. Conventions §3: a concurrent burst against one account
+    // can lock the user out of their own mail on their own devices.
+    expect(stub.maxInFlight).toBe(1);
+  });
+});
 // ---------------------------------------------------------------------------
 // CALW-02 — a write against a series must say which occurrences it means
 //
@@ -6584,6 +6803,245 @@ describe("changing a series from one date onward (this-and-future), through the 
     expect(occurrenceLines(writtenBody(stub))[3]).toContain(
       "2026-04-27T17:00:00",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CALM-03's laundering half — NO update path can emit an ATTENDEE
+//
+// **This is the replacement pin for a guarantee that used to ride on an
+// override.** The rebuild forced `participants: null` on its way to the
+// builder, and that override was what made it structurally impossible for an
+// attendee list this server READ to survive into a resource it WROTE. Plan
+// 17-07 deletes the rebuild, so the override goes with it and the guarantee has
+// to be re-stated under a new owner — before the old owner leaves, because a
+// guarantee that leaves quietly takes its tests with it.
+//
+// What replaces it is STRONGER than it was. A patch never constructs a
+// participant at all: `applyOverrideChange` asserts seven named properties over
+// the component the resource already had, and neither `ORGANIZER` nor
+// `ATTENDEE` is among them. There is no field to override because there is no
+// builder to override it on.
+//
+// Driven through EVERY scope with a confirmed change carrying three people,
+// because the override sat on ONE writer and the property now has to hold for
+// all three. `.claude/CLAUDE.md`'s calendar-invitation section is what this
+// enforces: an attendee list is something the USER supplies, and no write tool
+// in this project may take an event id — or any other identifier — as the
+// SOURCE of one.
+// ---------------------------------------------------------------------------
+
+describe("no update path emits an ATTENDEE, whatever the change carries", () => {
+  /**
+   * Commit a hand-minted update carrying three people, and return the write.
+   *
+   * Hand-minted because there is no other way in: the preview reads its
+   * `attendees` off the STORED resource and no caller can supply them, which is
+   * the first layer. This is what the boundary looks like with that layer
+   * removed.
+   */
+  async function commitWithPeople(
+    scope: "occurrence" | "this-and-future" | null,
+  ): Promise<{ body: string; outcome: Record<string, unknown> }> {
+    const series = scope !== null;
+    const stub = series
+      ? bodyStub(seriesIcs())
+      : writeDavStub({ objects: { [SIMPLE_OBJECT_PATH]: simpleIcs() } });
+    await warmWrite(stub);
+
+    const laundered: NormalizedChange = {
+      kind: "update",
+      scope,
+      summary: "Moved",
+      startLocal: series ? "2026-04-20T16:00:00" : "2026-02-10T16:00:00",
+      startTzid: "UTC",
+      endLocal: series ? "2026-04-20T16:30:00" : "2026-02-10T17:00:00",
+      endTzid: "UTC",
+      allDay: false,
+      location: null,
+      description: null,
+      // Three, and the third is an address this account could plausibly
+      // resolve as its own organiser — so a writer that "helpfully" promoted
+      // one of them to `ORGANIZER` rather than emitting `ATTENDEE` lines is
+      // caught by the same assertions.
+      attendees: [
+        { email: GUEST_ONE, name: ATTENDEE_NAME },
+        { email: GUEST_TWO, name: null },
+        { email: ORGANISER_ADDRESS, name: ORGANISER_NAME },
+      ],
+    };
+
+    const confirmToken = await mintConfirmation(
+      {
+        v: CONFIRM_VERSION,
+        t: "dav",
+        k: "update",
+        j: crypto.randomUUID(),
+        c: CALENDAR_URL,
+        o: series ? SERIES_OBJECT_URL : SIMPLE_OBJECT_URL,
+        r: series ? SERIES_MOVED_RECURRENCE_ID : null,
+        e: PREVIEW_ETAG,
+        // The revision the preview observed. Sealed and NOT READ on any update
+        // path any more — every writer takes it from the patched component's own
+        // stored value, which is the point of the sibling case below.
+        s: 2,
+        h: await changeHashOf(laundered),
+        x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+        // The OWNER. A missing or wrong user turns the commit into a refusal, so
+        // getting it wrong here would make every assertion below pass over a
+        // write that never happened — which is why the success is asserted first.
+        u: principal.userId,
+      },
+      env.CONFIRM_SECRET,
+    );
+
+    stub.observed.length = 0;
+    const result = await invokeRegistered("calendar_commit", {
+      confirmToken,
+      change: laundered,
+    });
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+
+    return {
+      body: writtenBody(stub).replace(/\r\n[ \t]/g, ""),
+      outcome: JSON.parse(blocks(result).trusted) as Record<string, unknown>,
+    };
+  }
+
+  for (const scope of [null, "occurrence", "this-and-future"] as const) {
+    const label = scope ?? "scopeless";
+
+    it(`writes ZERO people on the ${label} path`, async () => {
+      const { body, outcome } = await commitWithPeople(scope);
+
+      // Not one line, under either name, and not one of the three addresses
+      // anywhere in the bytes — including inside a parameter, which is where a
+      // display name would land.
+      expect(body).not.toContain("ATTENDEE");
+      expect(body).not.toContain("ORGANIZER");
+      expect(body).not.toContain(GUEST_ONE);
+      expect(body).not.toContain(GUEST_TWO);
+      expect(body).not.toContain(ORGANISER_ADDRESS);
+      expect(body).not.toContain(ATTENDEE_NAME);
+
+      // And the write happened, so none of the above is a property of a body
+      // that was never sent.
+      expect(body).toContain("SUMMARY:Moved");
+      expect(outcome.applied).toBe(true);
+
+      // The response agrees. Reporting three recipients beside "nobody was
+      // told" would be a response contradicting itself about the one fact
+      // CALW-08 exists to report.
+      expect(outcome.invitationsSent).toBe(false);
+      expect(outcome.recipientCount).toBe(0);
+    });
+  }
+
+  it("takes the revision off the stored component, so a caller cannot choose one", async () => {
+    // **The second guarantee the deleted override carried**, and it moved the
+    // same way: the rebuild forced `sequence` on the builder, and the patch
+    // reads `nextSequence` of the component's OWN stored value. The payload
+    // above seals `2`; the series fixture stores `2`; and what goes out is `3`
+    // either way, so this case alone cannot tell them apart — which is why the
+    // scopeless leg below uses a resource storing something ELSE.
+    const { body } = await commitWithPeople(null);
+
+    // `simpleIcs` stores zero, so one is the answer. A writer reading the
+    // payload's `2` would emit `3`, and a writer resetting would emit `0`.
+    expect(body).toContain("SEQUENCE:1");
+    expect(body).not.toContain("SEQUENCE:3");
+    expect(body).not.toContain("SEQUENCE:0");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A SERIES is refused at the preview, and the refusal is load-bearing
+// ---------------------------------------------------------------------------
+
+describe("a series-scoped update is refused at PREVIEW, and must stay so", () => {
+  it("answers `recurring` for a lone master carrying a rule, and mints nothing", async () => {
+    // **The one arm of `buildPreview`'s blocker expression that survived plan
+    // 17-07's collapse, asserted on its own.** Every other arm went: under
+    // D-02 an update PATCHES, so none of the rebuild's verdicts describes it.
+    // This one does not describe a rebuild — it describes an operation this
+    // server has no writer for at all, and the sibling case below is what it
+    // costs to lose it.
+    const stub = bodyStub(seriesIcs());
+    await warmWrite(stub);
+
+    const { trusted } = await preview({
+      id: SERIES_EVENT_ID,
+      startLocal: "2026-04-20T16:00:00",
+      scope: "series",
+    });
+
+    expect(trusted.unsupportedTarget).toBe("recurring");
+    expect(trusted.confirmToken).toBeNull();
+    expect(trusted.writeCount).toBe(0);
+    // And the preview wrote nothing, which is what a preview is for.
+    expect(stub.observed.filter((one) => one.method === "PUT").length).toBe(0);
+  });
+
+  it("is the only thing standing between the caller and a WORSE error later", async () => {
+    // **What a collapsed blocker would cost, measured rather than asserted in
+    // prose.** Drop the arm above and the preview mints a confirmation for an
+    // operation the commit's own dispatch has no branch for — so the refusal
+    // arrives one tool call later, from `isDispatchableScope`, and it says
+    // `confirmation_invalid`.
+    //
+    // That is worse in two ways rather than one. It is LATER, after the user has
+    // agreed to something; and it implicates the CONFIRMATION — the one block a
+    // model is told to trust and pass back unaltered — when the truth is that
+    // this server cannot rewrite a whole series. A caller told their
+    // confirmation is invalid retries; a caller told the operation is not
+    // supported for a series stops.
+    const stub = bodyStub(seriesIcs());
+    await warmWrite(stub);
+
+    const change: NormalizedChange = {
+      kind: "update",
+      scope: "series",
+      summary: "Moved",
+      startLocal: "2026-04-20T16:00:00",
+      startTzid: "UTC",
+      endLocal: "2026-04-20T16:30:00",
+      endTzid: "UTC",
+      allDay: false,
+      location: null,
+      description: null,
+      attendees: [],
+    };
+    const confirmToken = await mintConfirmation(
+      {
+        v: CONFIRM_VERSION,
+        t: "dav",
+        k: "update",
+        j: crypto.randomUUID(),
+        c: CALENDAR_URL,
+        o: SERIES_OBJECT_URL,
+        r: SERIES_MOVED_RECURRENCE_ID,
+        e: PREVIEW_ETAG,
+        s: 2,
+        h: await changeHashOf(change),
+        x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+        u: principal.userId,
+      },
+      env.CONFIRM_SECRET,
+    );
+
+    stub.observed.length = 0;
+    const result = await invokeRegistered("calendar_commit", {
+      confirmToken,
+      change,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).category).toBe(
+      "confirmation_invalid",
+    );
+    // ZERO requests. The user's calendar is untouched — but they were told the
+    // wrong thing about why.
+    expect(stub.observed.length).toBe(0);
   });
 });
 

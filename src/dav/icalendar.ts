@@ -355,8 +355,9 @@ export interface ParsedCalendarResource {
    * `CALSCALE`, every `VTIMEZONE` definition, any `X-` property somebody's
    * client wrote — lives here and nowhere else. A writer that rebuilt the
    * wrapper from a template would drop all of it silently, which is exactly the
-   * loss `structuralBlockerOf` refuses a REBUILD over; a writer that clones this
-   * has nothing to drop.
+   * loss this project refused an update over until D-02 made every update a
+   * patch; a writer that clones this has nothing to drop, so there is nothing
+   * left to refuse.
    *
    * Never mutated by anything in this module. `serializeOccurrenceResource`
    * clones it before touching it, so a parsed resource can be serialised twice
@@ -1636,14 +1637,25 @@ export interface BuildEventInput extends TimeAnchor {
    * Who is inviting and who is invited, or null for an event that reaches
    * nobody.
    *
-   * **Null is the only way to get a resource with no scheduling properties, and
-   * every rewrite path passes it.** A resource carrying `ORGANIZER` or
-   * `ATTENDEE` is a scheduling object resource that iCloud sends invitations
-   * for; a resource that acquired one by accident would invite somebody nobody
-   * asked to invite. `updateEventBody` in `./calendar.ts` passes null
-   * unconditionally, which is what makes it structurally impossible for an
-   * attendee list this server READ to survive into a resource it WROTE — see
-   * the participation-boundary note on `ATTENDEE_PARTSTAT` above.
+   * **Null is the only way to get a resource with no scheduling properties.** A
+   * resource carrying `ORGANIZER` or `ATTENDEE` is a scheduling object resource
+   * that iCloud sends invitations for; a resource that acquired one by accident
+   * would invite somebody nobody asked to invite. See the participation-boundary
+   * note on `ATTENDEE_PARTSTAT` above.
+   *
+   * **A CREATE is the only path that reaches this field at all, and that is what
+   * makes the boundary structural rather than enforced (D-02).** An UPDATE used
+   * to reach it through a rewrite that passed null unconditionally — an override
+   * on one writer, which is a guarantee somebody has to keep remembering. Every
+   * update patches now, and a patch never CONSTRUCTS a participant: it asserts
+   * seven named properties over the component the resource already had, and
+   * neither `ORGANIZER` nor `ATTENDEE` is among them. So an attendee list this
+   * server READ cannot survive into a resource it WROTE because there is no
+   * writer on that path that emits one, not because a writer was told not to.
+   *
+   * Pinned by "no update path emits an ATTENDEE, whatever the change carries" in
+   * `test/dav-tools.test.ts`, which drives every scope with a confirmed change
+   * carrying three people and asserts none of them reaches the bytes.
    *
    * An empty `attendees` array is treated as null: nobody is nobody, and an
    * `ORGANIZER` with no recipients is a claim the request never made.
@@ -1654,14 +1666,17 @@ export interface BuildEventInput extends TimeAnchor {
    *
    * **The builder is told rather than deciding, and that split is the whole
    * defence.** A create passes zero, which RFC 5545 §3.8.7.4 defines as a new
-   * event's first revision. A rewrite passes `nextSequence` of what the FETCHED
-   * resource carried. Deciding here would mean one function holding both
-   * answers, and the create's answer is the wrong one on the rewrite path.
+   * event's first revision. Deciding here would mean one function holding both
+   * a create's answer and an update's, and the create's is the wrong one
+   * whenever a resource already exists.
    *
-   * `updateEventBody` in `./calendar.ts` OVERRIDES whatever arrives in this
-   * field, exactly as it overrides `participants`, so a caller cannot reach the
-   * wire with a revision it chose. That is the second layer; this docstring is
-   * the first.
+   * **Like `participants` above, only a CREATE reaches this field now (D-02).**
+   * An update patches, and `applyOverrideChange` writes `nextSequence` of the
+   * patched component's OWN stored revision — read off the bytes rather than
+   * supplied, so a caller cannot reach the wire with a revision it chose. That
+   * used to be an override on a rewrite; it is now a property of the only writer
+   * there is. Pinned by "takes the revision off the stored component, so a caller
+   * cannot choose one" in `test/dav-tools.test.ts`.
    */
   sequence: number;
 }
@@ -2323,11 +2338,12 @@ export function applyOccurrenceOverride(
  *     somewhere else.
  *
  * Refusing rather than guessing is the whole of the difference. Unreachable
- * through the shipped tools — `structuralBlockerOf` answers `recurring` for all
- * three before a scopeless confirmation is minted — and asserted directly for
- * that reason, because a guard nothing can reach is invisible to every
- * assertion around it and the day something CAN reach it is the day it has to
- * already work.
+ * through the shipped tools — the tool boundary reads `EventWithEtag.isRecurring`
+ * and refuses all three before a scopeless confirmation is minted, either by
+ * requiring a scope or, for `series`, by the one arm of `buildPreview`'s blocker
+ * that D-02's collapse deliberately kept — and asserted directly for that reason,
+ * because a guard nothing can reach is invisible to every assertion around it and
+ * the day something CAN reach it is the day it has to already work.
  *
  * ## The revision, and where it comes from
  *
@@ -2363,12 +2379,13 @@ export function applyEventChange(
  * Wrap a patched component list back up as the resource to write.
  *
  * **The wrapper is CLONED from the resource's own rather than built from a
- * template**, which is the whole difference between a patch and the rebuild
- * `updateEventBody` performs. Every `VTIMEZONE` the resource defined survives
+ * template**, which is the whole difference between a patch and the rebuild this
+ * project retired in D-02. Every `VTIMEZONE` the resource defined survives
  * byte-for-byte, as does its own `PRODID`, its `CALSCALE`, and anything else a
- * client put at the calendar level. A rebuild would drop all of it, which is
- * why a rebuild refuses a resource carrying anything it cannot reproduce and
- * this does not have to.
+ * client put at the calendar level. A rebuild dropped all of it, which is why it
+ * had to REFUSE a resource carrying anything it could not reproduce — and why a
+ * patch needs no refusal at all. That is the whole of CALM-03: the guarantee is a
+ * property of the writer rather than an allow-list somebody maintains.
  *
  * The zone definition is added only when the resource does not ALREADY define
  * that identifier. Adding a second `VTIMEZONE` for a zone the resource already
@@ -2452,8 +2469,10 @@ const NOT_A_SERIES: SeriesNarrowing = Object.freeze({
  *
  * **A narrowing is a CHANGE to the event, so it earns a new revision like every
  * other change this server writes (05-REVIEW.md WR-03).** Neither narrowing did,
- * while `applyOccurrenceOverride` and `updateEventBody` both do — three writers
- * advancing it and two not, with the asymmetry recorded nowhere.
+ * while `applyOccurrenceOverride` and `applyEventChange` both do — three writers
+ * advancing it and two not, with the asymmetry recorded nowhere. (It was
+ * `updateEventBody` beside the first of those until D-02 replaced the rewrite with
+ * a patch; the count and the argument are unchanged, only the name.)
  *
  * `nextSequence`'s own docstring is why that is not cosmetic: a revision that
  * does not advance raises nothing anywhere — not here, not at iCloud, not in the
