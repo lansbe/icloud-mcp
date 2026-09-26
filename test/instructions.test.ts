@@ -413,8 +413,8 @@ const CAPABILITY_CLAIMS = [
     tools: ["calendar_delete_calendar"],
   },
   {
-    claim: "the account's default calendar is refused",
-    clause: "The account's default calendar is refused outright",
+    claim: "the user's default calendar is not exempt from deletion",
+    clause: "The user's default calendar is not exempt",
     tools: ["calendar_delete_calendar"],
   },
 ] as const;
