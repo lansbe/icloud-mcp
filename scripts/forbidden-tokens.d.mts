@@ -107,6 +107,12 @@ export declare const PRINCIPAL_CONSTRUCTOR_SCOPE: string;
 export declare const CONFIRM_LINE_COMPOSER: RegExp;
 export declare const CONFIRM_LINE_OWNER: string;
 export declare const CONFIRM_LINE_SCOPE: string;
+export declare const MUTATING_OPEN_COMMAND: RegExp;
+export declare const MUTATING_OPEN_OWNER: string;
+export declare const MUTATING_OPEN_SCOPE: string;
+export declare const MUTATING_SESSION_IMPORT: RegExp;
+export declare const MUTATING_SESSION_OWNER: string;
+export declare const MUTATING_SESSION_SCOPE: string;
 export declare const OWNERSHIP_VIOLATION_IDS: readonly string[];
 
 /** One declared DAV write module: why it is declared, and a disposition for
@@ -149,6 +155,12 @@ export declare function checkPrincipalConstructorOwnership(
 ): Violation[];
 export declare function checkConfirmLineOwnership(
   composers: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function checkMutatingOpenOwnership(
+  sites: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function checkMutatingSessionImportOwnership(
+  importers: ReadonlyArray<OwnershipMatch>,
 ): Violation[];
 
 /** Every name `contents` exports as a `function` declaration, in source order. */

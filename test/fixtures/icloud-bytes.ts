@@ -259,6 +259,54 @@ export function examineResponse(
   );
 }
 
+/**
+ * A mailbox opened for changing, with the access code as a parameter.
+ *
+ * `"[READ-WRITE]"` is what RFC 3501 §6.3.1 says a writable mailbox answers.
+ * `"[READ-ONLY]"` and `""` (no code at all) are the two refusal shapes the
+ * mutating orchestrator must turn away. `uidValidity` may be `null`, which
+ * leaves the validity line out entirely: the absent case, which fails closed.
+ *
+ * Test fixtures may spell the command; the scan count on it covers `src/` only.
+ */
+export function selectResponse(
+  tag: string,
+  accessCode: "[READ-WRITE]" | "[READ-ONLY]" | "",
+  exists = INBOX_EXISTS,
+  uidValidity: number | null = INBOX_UIDVALIDITY,
+): Uint8Array {
+  const completion =
+    accessCode === ""
+      ? `${tag} OK SELECT completed`
+      : `${tag} OK ${accessCode} SELECT completed`;
+  return wire(
+    `* ${exists} EXISTS`,
+    "* 0 RECENT",
+    "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)",
+    "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)] Flags permitted",
+    ...(uidValidity === null ? [] : [`* OK [UIDVALIDITY ${uidValidity}] UIDs valid`]),
+    completion,
+  );
+}
+
+/**
+ * The untagged reply a flag change carries back, then its tagged completion.
+ *
+ * `* n FETCH (UID u FLAGS (...))`. `flags` is the list's inside, verbatim, so
+ * a case can script `\\Seen`, an empty list, or another case of the flag.
+ */
+export function flagEcho(
+  tag: string,
+  sequence: number,
+  uid: number,
+  flags: string,
+): Uint8Array {
+  return wire(
+    `* ${sequence} FETCH (UID ${uid} FLAGS (${flags}))`,
+    `${tag} OK STORE completed`,
+  );
+}
+
 /** A greeting that itself refuses on connection count. */
 export const GREETING_AT_CONNECTION_LIMIT = wire(
   "* BYE Too many simultaneous connections from this IP; try again later",

@@ -266,6 +266,79 @@ export function parseExists(line: string): number | null {
 }
 
 /**
+ * The access code on a mailbox open's tagged completion, or `null`.
+ *
+ * RFC 3501 §6.3.1 puts it there: `a4 OK [READ-WRITE] ... completed`. Only a
+ * bracketed code IMMEDIATELY after an OK counts. A NO, a code further along in
+ * the human text, and an untagged line are all `null`. Response codes are
+ * case-insensitive atoms, so the match is too.
+ *
+ * Three answers, not two, and that is the point (PITFALLS #33). `null` means the
+ * server did not say. A caller that read `null` as "writable" would go on to
+ * change a mailbox the server never agreed to open for changing, so every
+ * caller must treat `null` exactly as it treats `"read-only"`.
+ */
+export function parseAccessCode(
+  taggedLine: string,
+): "read-write" | "read-only" | null {
+  const parsed = parseTaggedResponse(taggedLine);
+  if (parsed === null || parsed.status !== "OK") return null;
+  const match = /^\[(READ-WRITE|READ-ONLY)\]/i.exec(parsed.text);
+  if (match === null) return null;
+  return match[1].toUpperCase() === "READ-WRITE" ? "read-write" : "read-only";
+}
+
+/**
+ * Whether the FETCH reply for one UID says the message is seen, or `null`.
+ *
+ * Reads the untagged FETCH replies a command produced. It finds the reply whose
+ * OWN UID item equals `uid`, and never goes by position or by the
+ * sequence-number prefix. Those can name another message, and the answer would
+ * then be about the wrong one while looking right. `fetchReplies` in
+ * `./service.ts` records the same rule for the read path.
+ *
+ * The seen flag is compared without regard to case. `null` means no reply for
+ * this UID carried a flag list, which is how a message that no longer exists
+ * shows up: the server answers OK and sends nothing about it.
+ *
+ * Pure: it reads the lines it is handed and touches nothing else.
+ */
+export function seenStateOf(
+  untagged: readonly ResponseLine[],
+  uid: number,
+): boolean | null {
+  for (const line of untagged) {
+    const parsed = parseSExpr(line);
+    if (parsed[0] !== "*") continue;
+    if (typeof parsed[2] !== "string" || parsed[2].toUpperCase() !== "FETCH") {
+      continue;
+    }
+    const list = parsed[3];
+    if (!Array.isArray(list)) continue;
+
+    let replyUid: string | null = null;
+    let flags: SExpr | undefined;
+    for (let index = 0; index + 1 < list.length; index += 2) {
+      const key = list[index];
+      if (typeof key !== "string") continue;
+      const upper = key.toUpperCase();
+      const value = list[index + 1];
+      if (upper === "UID" && typeof value === "string") replyUid = value;
+      if (upper === "FLAGS") flags = value;
+    }
+
+    if (replyUid === null || !/^[1-9]\d*$/.test(replyUid)) continue;
+    if (Number(replyUid) !== uid) continue;
+    if (!Array.isArray(flags)) continue;
+
+    return flags.some(
+      (flag) => typeof flag === "string" && flag.toLowerCase() === "\\seen",
+    );
+  }
+  return null;
+}
+
+/**
  * Decoder for mailbox names that arrived as literals.
  *
  * Only ever applied to a mailbox NAME, never to a message payload. A mailbox

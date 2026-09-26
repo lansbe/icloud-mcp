@@ -6,7 +6,7 @@
 // exactly that text. What this module re-exports below is a compatibility
 // surface, not a second copy.
 //
-// ONE module, six registrations. D-17 constrains the MCP tool *surface* —
+// ONE module, every mail registration. D-17 constrains the MCP tool *surface* —
 // registered tools with distinct names — not the file count, and D-17 itself
 // says the unread tool shares the listing implementation internally rather than
 // duplicating it. That sharing is cheapest and least drift-prone inside one
@@ -73,6 +73,8 @@ import {
   listUnread,
   searchMessages,
 } from "../../mail/service";
+import type { ReadStateOutcome } from "../../mail/triage";
+import { markRead, markUnread } from "../../mail/triage";
 import type { Principal } from "../../principal";
 import type { ConfirmRefusal } from "../../staging/presign";
 import {
@@ -1526,6 +1528,54 @@ function resolveMailbox(folderId: string | undefined): string {
 }
 
 /**
+ * The fixed sentence a read-only refusal carries. Plain ASCII.
+ *
+ * It says what happened, that nothing changed, and that trying again will not
+ * help. The last part matters most: without it a model reads a refusal as a
+ * passing fault and retries.
+ */
+const READ_ONLY_REASON =
+  "iCloud opened this folder read-only, so nothing was changed. " +
+  "Retrying will not help.";
+
+/**
+ * The answer to marking one message read or unread.
+ *
+ * Plain JSON, not the untrusted fence. Every field is this server's own: the id
+ * the caller passed, which decoded as a token this server minted (base64url,
+ * so it cannot carry a sentence); the boolean the caller chose; and what iCloud
+ * reported. No stranger-authored text reaches this answer.
+ *
+ * `state` is what iCloud said after the change, and it can differ from
+ * `requested`. When it does, the answer shows both, so nobody reads the request
+ * as the result (PITFALLS #33). `stateSource` says which reply that came from.
+ *
+ * Neither arm is `isError`, following the `AppendOutcome` precedent: a
+ * read-only folder is a successful call that reports a stated reason.
+ */
+export function readStateToolResult(
+  id: string,
+  requestedRead: boolean,
+  outcome: ReadStateOutcome,
+): ToolResult {
+  const requested = requestedRead ? "read" : "unread";
+  const body = outcome.applied
+    ? {
+        id,
+        requested,
+        state: outcome.seen ? "read" : "unread",
+        stateSource: outcome.source,
+      }
+    : {
+        id,
+        requested,
+        refusal: outcome.refusal,
+        reason: READ_ONLY_REASON,
+      };
+  return { content: [{ type: "text", text: JSON.stringify(body) }] };
+}
+
+/**
  * Register the mail tools on a per-request server instance.
  *
  * `gate` is built per request in `createServerFactory` and threaded in, rather
@@ -2613,6 +2663,58 @@ export function registerMailTools(
         // result, not errors — D-35's vocabulary stays closed at four. Only a
         // malformed or expired ticket, and a genuine transport failure, reach
         // here.
+        return mailErrorResult(err);
+      }
+    },
+  );
+
+  /**
+   * Mark one message read or unread (MUTA-07).
+   *
+   * The first tool in this project that changes a mailbox. It lives in this
+   * module rather than a sibling so there is still one error shaper for mail.
+   *
+   * **No preview and no confirmation, and that is a decision (D-09).** Every
+   * other write in this milestone is previewed first. This one is not, because
+   * it changes one flag on one message, it harms nothing, and the same tool
+   * puts it back. A reply cannot be unsent and a delete cannot be undone, so
+   * those are previewed. This can be undone in one call.
+   *
+   * The input is exactly an id and a boolean. No folder, no search term, no
+   * list and no address: one message per call, named by an id this server
+   * minted. The verbs come from `../../mail/triage`. This module never imports
+   * the mutating orchestrator, and the scan would refuse it if it did.
+   */
+  server.registerTool(
+    "mail_mark_read",
+    {
+      // The standing untrusted-content line too, although this answer carries
+      // no stranger-authored text: it is stated over the whole mail surface,
+      // so no tool is the one place a model arrives unwarned. That leaves under
+      // a hundred characters for the rest, so the answer's own fields say that
+      // the state is iCloud's, and the server instructions say that reading
+      // never marks mail read.
+      description:
+        "Mark one email read or unread by its id. Writes at once, no " +
+        `preview; call again to undo. ${UNTRUSTED_NOTICE}`,
+      inputSchema: z.object({
+        id: z.string().describe("The opaque message id from a listing."),
+        read: z
+          .boolean()
+          .describe("true marks the message read; false marks it unread."),
+      }),
+    },
+    async ({ id, read }) => {
+      try {
+        const actor = await principal;
+        // Decoded before any socket, as every other tool here does it: a bad
+        // token is refused without spending a connection.
+        const ref = decodeMessageId(id);
+        const outcome = read
+          ? await markRead(actor, gate, ref)
+          : await markUnread(actor, gate, ref);
+        return readStateToolResult(id, read, outcome);
+      } catch (err) {
         return mailErrorResult(err);
       }
     },

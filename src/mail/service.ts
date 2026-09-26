@@ -14,6 +14,13 @@
 // mailbox opened for changing (PITFALLS #32). A second orchestrator, if one
 // exists, is a separate named function with its own open step.
 //
+// One does exist. `withMutatingMailbox` and `withMutatingMailboxOver` sit beside
+// the read pair, over the same private core and the same request-scoped gate,
+// and open their mailbox in the mutating form. Only `./triage.ts` may import
+// them, and a scan count holds that in both directions. They take no mode, and
+// neither does the read pair: which kind of session a caller gets is decided by
+// which function it names, never by an argument it passes.
+//
 // Concurrency: exactly one socket is opened per invocation, and the connect
 // call is never wrapped in any concurrent combinator. See
 // MAX_CONCURRENT_CONNECTIONS in ./socket.ts for why.
@@ -51,6 +58,7 @@ import type {
 import {
   correlateStatus,
   decodeModifiedUtf7,
+  parseAccessCode,
   parseCapabilityLine,
   parseExists,
   parseListLine,
@@ -197,8 +205,15 @@ export interface MailSessionOptions
  * optional mailbox. `null` there is a fact rather than a missing value: no
  * mailbox was opened, so the server never reported a validity or a count for
  * one, and a zero would be a claim this server cannot make.
+ *
+ * `access` is the discriminant that keeps this type apart from
+ * `MutatingMailSession`. TypeScript compares shapes, not names, so without two
+ * different literal values here a mutating session would be accepted wherever a
+ * read session is asked for, and the other way round.
  */
 export interface MailSession {
+  /** Always `"read-only"`. Never widened: see `MutatingMailSession`. */
+  readonly access: "read-only";
   channel: ImapChannel;
   /** The raw wire mailbox name that was opened, or `null` if none was. */
   mailbox: string | null;
@@ -565,6 +580,7 @@ export async function withMailSessionOver<T>(
       }
 
       const session: MailSession = {
+        access: "read-only",
         channel,
         mailbox,
         uidValidity,
@@ -624,6 +640,164 @@ export async function withMailSession<T>(
   }
 
   return withMailSessionOver(
+    sock,
+    principal,
+    gate,
+    mailbox,
+    expectedUidValidity,
+    fn,
+    options,
+  );
+}
+
+/**
+ * An authenticated session with one mailbox opened in the mutating form.
+ *
+ * Built only by `withMutatingMailboxOver`, and only after the server said the
+ * mailbox is writable. A mutating session always has a mailbox open, so none of
+ * the three mailbox fields can be `null` here, unlike on `MailSession`.
+ *
+ * `access` is `"read-write"` and `MailSession`'s is `"read-only"`. Those two
+ * different literal values are what make the types unassignable to each other.
+ * Without them TypeScript would compare the shapes, find them compatible, and
+ * let a read helper take a mutating session or a verb take a read-only one.
+ */
+export interface MutatingMailSession {
+  /** Always `"read-write"`. The discriminant that keeps the two kinds apart. */
+  readonly access: "read-write";
+  channel: ImapChannel;
+  /** The raw wire mailbox name that was opened. */
+  mailbox: string;
+  /** The UIDVALIDITY the server reported, already checked against the id's. */
+  uidValidity: number;
+  /** How many messages the mailbox holds. */
+  exists: number;
+  /** The post-authentication capability list, verbatim, or `null`. */
+  capability: string | null;
+}
+
+/**
+ * What the mutating orchestrator resolves to when the mailbox did not open for
+ * writing.
+ *
+ * The server answered the open with OK but said the mailbox is read-only, or
+ * gave no access code at all. Both are the same refusal (PITFALLS #33): absent
+ * is not read-write.
+ *
+ * A value and not an exception, on purpose. The return type carries it, so
+ * TypeScript makes every caller handle it. An exception could fall through to
+ * `toErrorCategory`'s floor and come out as `connection_failed`, which tells the
+ * model to retry something that will fail the same way every time.
+ */
+export const MAILBOX_NOT_WRITABLE: unique symbol = Symbol("mailbox-not-writable");
+
+/**
+ * Hold a session over an already-open stream pair, with one mailbox opened in
+ * the mutating form.
+ *
+ * The lifecycle is the private core's, exactly as for the read orchestrator:
+ * the same gate, the same sign-in, the same deadline, the same teardown. The
+ * call into the core is the only statement, so nothing awaits ahead of the
+ * gate. One session per request holds whichever kind of session it is.
+ *
+ * The mailbox and its validity are required, not nullable. A change is always
+ * to a message the caller already holds an id for, and that id carries the
+ * validity it was minted under.
+ *
+ * The open step, in order:
+ *
+ * 1. Quote the mailbox, refusing a name with CR, LF or NUL.
+ * 2. Open it in the mutating form. This is the one place in the source tree
+ *    that builds that command, and a scan count holds it there. Anything other
+ *    than OK is `ImapNotFoundError`.
+ * 3. Check the validity against the id's, before anything can change. Absent
+ *    or different is `ImapNotFoundError`.
+ * 4. Read the access code off the tagged completion. Only read-write goes on.
+ *    Read-only and absent both resolve to `MAILBOX_NOT_WRITABLE`, and no
+ *    command is sent after the open.
+ * 5. Build the `MutatingMailSession` and hand it to `fn`.
+ *
+ * No mode argument, and none may be added. The read orchestrator takes none
+ * either. Only `./triage.ts` imports this, and it exports verbs, never a session.
+ */
+export async function withMutatingMailboxOver<T>(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string,
+  expectedUidValidity: number,
+  fn: (session: MutatingMailSession) => Promise<T>,
+  options: MailSessionOptions = {},
+): Promise<T | typeof MAILBOX_NOT_WRITABLE> {
+  return withMailSessionCore<T | typeof MAILBOX_NOT_WRITABLE>(
+    duplex,
+    principal,
+    gate,
+    options,
+    async (channel, capability) => {
+      // Refuse rather than repair, as the read open does: a CR or LF in the
+      // name would end the command line early and inject a second command.
+      const quoted = quoteMailbox(mailbox);
+      if (quoted === null) throw new ImapNotFoundError();
+
+      const opened = await sendCommand(
+        channel,
+        channel.nextTag(),
+        `SELECT ${quoted}`,
+      );
+      if (opened.status !== "OK") throw new ImapNotFoundError();
+
+      // Before the access check, so a changed folder is not_found whether or
+      // not it is writable. Nothing has been changed at this point either way.
+      const { uidValidity, exists } = checkedMailboxFacts(
+        opened.untagged,
+        expectedUidValidity,
+      );
+
+      // OK alone does not mean writable. Only an explicit read-write code does.
+      if (parseAccessCode(opened.tagged.text) !== "read-write") {
+        return async () => MAILBOX_NOT_WRITABLE;
+      }
+
+      const session: MutatingMailSession = {
+        access: "read-write",
+        channel,
+        mailbox,
+        uidValidity,
+        exists,
+        capability,
+      };
+
+      return () => fn(session);
+    },
+  );
+}
+
+/**
+ * Open one socket and hold a mutating session over it.
+ *
+ * The same shape as `withMailSession`, for the same reasons: the gate is
+ * checked before the socket opens, nothing awaits between that check and the
+ * core's acquire, and a connect failure is a context-free `ImapConnectError`.
+ */
+export async function withMutatingMailbox<T>(
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string,
+  expectedUidValidity: number,
+  fn: (session: MutatingMailSession) => Promise<T>,
+  options: MailSessionOptions = {},
+): Promise<T | typeof MAILBOX_NOT_WRITABLE> {
+  if (gate.held) throw new ImapThrottleError();
+
+  let sock: DuplexLike;
+  try {
+    sock = connectImap();
+  } catch {
+    throw new ImapConnectError();
+  }
+
+  return withMutatingMailboxOver(
     sock,
     principal,
     gate,

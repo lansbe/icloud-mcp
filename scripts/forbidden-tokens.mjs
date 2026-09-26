@@ -1093,6 +1093,131 @@ export const APPEND_OWNER = "src/mail/service.ts";
 export const APPEND_SCOPE = "src/";
 
 /**
+ * The construction site of the mutating mailbox open, permitted exactly once in
+ * the source tree.
+ *
+ * THE RULE. Exactly one place under `src/` builds the command that opens a
+ * mailbox for changing, and it is inside `withMutatingMailboxOver` in
+ * `src/mail/service.ts` (phase 20, D-03). Every read opens its mailbox
+ * read-only. This one open is the only way any code path gets a mailbox the
+ * server will let it change, and it sits behind its own orchestrator, its own
+ * session type and its own access check.
+ *
+ * WHY A COUNT. Zero is a violation as two is. A second site is a second way to
+ * reach a mailbox opened for changing, arriving without a decision; that is
+ * the PITFALLS #32 failure, where every read call site ends up one argument
+ * away from changing mail. Zero means the mutating path was deleted, renamed
+ * or emptied. That direction is the quieter one: nothing fails on the way out,
+ * because the tests that covered the deleted code leave with it.
+ *
+ * WHY THE OWNER FILE MAY HOLD ONLY ONE. The collector takes EVERY match with a
+ * fresh global copy per file, as the confirm-line count's does, and the
+ * checker allows the owner one entry. With `search()` a file contributes at
+ * most one entry, so a second open inside `src/mail/service.ts` itself would
+ * pass. It must not: "one site" is about sites, not files.
+ *
+ * WHAT IT DOES NOT SEE. Three shapes are outside this pattern's reach:
+ *
+ *   1. a command line carrying a literal tag rather than an interpolated one;
+ *   2. the command word held in a variable and handed to the generic sender in
+ *      `src/mail/imap-session.ts`;
+ *   3. a lowercase command word. The wire is case-insensitive, so a lowercase
+ *      open works on the server. The pattern stays case-sensitive anyway,
+ *      because a case-insensitive one would fire on ordinary strings that begin
+ *      with the English word "Select" followed by a space.
+ *
+ * The one legitimate site is held one layer up instead, by the byte-exact
+ * assertion on the recorded open line in `test/triage.test.ts`, which reads
+ * what was actually sent rather than the shape of the source that sent it. A
+ * count believed to prove more than it does is worse than one whose limits are
+ * written down.
+ *
+ * PROSE DISCIPLINE. The scope is the whole source tree and the walk runs on
+ * every commit, so describe this command BY ROLE in `src/` -- "opened in the
+ * mutating form", "the mutating open" -- and never by name followed by an
+ * argument. A source comment spelling it out would fail the very check it was
+ * trying to explain, in the middle of an unrelated plan.
+ *
+ * THE SHAPE. The same anchoring as `APPEND_COMMAND`: after an interpolated tag,
+ * or at the head of a quoted string, case-sensitive, with a trailing space.
+ * Those are the only two ways a command line is built in this codebase.
+ * Measured before arming: this pattern matched nothing under `src/`, `test/`
+ * or `scripts/`, so its missing arm would have fired the moment it existed
+ * without a site. It was armed in the same commit as the site.
+ *
+ * Collected from `src/` only. Tests and fixtures spell the command on purpose,
+ * to script the server's side and to assert the recorded line byte for byte,
+ * and a fixture is not a code path.
+ *
+ * No `g` flag. The collector builds its own global copy per file, because a
+ * shared global regex carries `lastIndex` from one file into the next.
+ */
+export const MUTATING_OPEN_COMMAND = /(?:\$\{[^}\n]*\}|["'`])\s*SELECT /;
+
+/** The one file under `MUTATING_OPEN_SCOPE` permitted to match
+ *  `MUTATING_OPEN_COMMAND`, and only once. */
+export const MUTATING_OPEN_OWNER = "src/mail/service.ts";
+
+/** The tree `MUTATING_OPEN_COMMAND` is collected from. Tests and fixtures spell
+ *  the command on purpose. */
+export const MUTATING_OPEN_SCOPE = "src/";
+
+/**
+ * An import of the mutating orchestrator, permitted in exactly one file of the
+ * source tree.
+ *
+ * THE RULE. Exactly one file under `src/` imports `withMutatingMailbox` or
+ * `withMutatingMailboxOver` from the service module: `src/mail/triage.ts`
+ * (phase 20, D-05). That module exports narrow verbs and never a session.
+ * Everything else that needs a message changed calls one of those verbs. The
+ * service module defines the orchestrator and imports nothing from itself, so
+ * it is not an importer and is not counted.
+ *
+ * WHY A COUNT. A second importer is a second place that can hold a mailbox
+ * opened for changing and do whatever it likes in it, arriving without a
+ * decision. A tool that imported the orchestrator directly would skip the
+ * verbs, and the verbs are where "one message, one flag, no body fetch" lives.
+ * Zero importers means the verbs module was deleted, renamed or rewired, and
+ * nothing fails on the way out: the tests that covered it leave with it.
+ *
+ * WHAT IT DOES NOT SEE. Each of these reaches the orchestrator and fires
+ * nothing:
+ *
+ *   1. a namespace import of the service module (`import * as s from ...`),
+ *      followed by a call through it;
+ *   2. a re-export of the orchestrator through another module, imported from
+ *      there;
+ *   3. a dynamic import of the service module (`await import(...)`);
+ *   4. an alias: a module path alias that does not end in `/service`, or the
+ *      orchestrator re-bound to another name inside the owner and handed on.
+ *
+ * A renamed binding in the braces (`withMutatingMailbox as open`) IS seen,
+ * because the orchestrator's own name is still spelled inside them.
+ *
+ * THE SHAPE. An import statement that names either orchestrator inside its
+ * braces, from a module path ending in `/service` with an optional TypeScript
+ * or JavaScript extension. A type-only import matches too, and so does an
+ * import spread over several lines. It matched nothing under `src/`, `test/` or
+ * `scripts/` before the owner existed, and it was armed in the same commit.
+ *
+ * Collected from `src/` only. Tests import the stream-pair form to drive it
+ * through the in-memory duplex, and a test is not a code path.
+ *
+ * No `g` flag: `scan()` uses `String.prototype.search`, which takes the first
+ * match only, so a file that imports it twice is one entry.
+ */
+export const MUTATING_SESSION_IMPORT =
+  /import\s*(?:type\s*)?\{[^}]*\bwithMutatingMailbox(?:Over)?\b[^}]*\}\s*from\s*["'][^"'\n]*\/service(?:\.[cm]?[jt]s)?["']/;
+
+/** The one file under `MUTATING_SESSION_SCOPE` permitted to match
+ *  `MUTATING_SESSION_IMPORT`. */
+export const MUTATING_SESSION_OWNER = "src/mail/triage.ts";
+
+/** The tree `MUTATING_SESSION_IMPORT` is collected from. Tests drive the
+ *  orchestrator directly, and a test is not a code path. */
+export const MUTATING_SESSION_SCOPE = "src/";
+
+/**
  * A bare network call, permitted in exactly one module of the subscription-feed
  * tree.
  *
@@ -1820,6 +1945,10 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "dav-write-entry-point-unguarded",
   "confirm-line-composer-duplicated",
   "confirm-line-composer-missing",
+  "mutating-open-duplicated",
+  "mutating-open-missing",
+  "mutating-session-importer-outside-triage",
+  "mutating-session-importer-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -2015,6 +2144,8 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const addressHashers = [];
   const principalConstructors = [];
   const confirmLineComposers = [];
+  const mutatingOpens = [];
+  const mutatingSessionImporters = [];
   const davWriteExports = {};
 
   for (const absolute of files) {
@@ -2124,6 +2255,32 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
         });
       }
     }
+    // The service module is not skipped: it holds the one mutating open, so it
+    // is expected to be the one entry. EVERY match, for the reason the
+    // confirm-line collector gives: `search()` cannot tell one site in the
+    // owner file from two. A fresh global copy per file, so no `lastIndex`
+    // travels between files.
+    if (relativePath.startsWith(MUTATING_OPEN_SCOPE)) {
+      for (const match of contents.matchAll(
+        new RegExp(MUTATING_OPEN_COMMAND, "g"),
+      )) {
+        mutatingOpens.push({
+          file: relativePath,
+          ...positionOf(contents, match.index),
+        });
+      }
+    }
+    // The service module defines the orchestrator and imports nothing from
+    // itself, so the pattern cannot match there.
+    if (relativePath.startsWith(MUTATING_SESSION_SCOPE)) {
+      const mutatingImportIndex = contents.search(MUTATING_SESSION_IMPORT);
+      if (mutatingImportIndex !== -1) {
+        mutatingSessionImporters.push({
+          file: relativePath,
+          ...positionOf(contents, mutatingImportIndex),
+        });
+      }
+    }
     // The write-module manifest collects NAMES rather than a match position, so
     // it is the one collector that keys by module instead of appending to a list.
     // A declared module that is never walked therefore has no key at all, which
@@ -2145,6 +2302,10 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   violations.push(...checkAddressHashOwnership(addressHashers));
   violations.push(...checkPrincipalConstructorOwnership(principalConstructors));
   violations.push(...checkConfirmLineOwnership(confirmLineComposers));
+  violations.push(...checkMutatingOpenOwnership(mutatingOpens));
+  violations.push(
+    ...checkMutatingSessionImportOwnership(mutatingSessionImporters),
+  );
   violations.push(...checkDavWriteCoverage(davWriteExports));
 
   return violations.sort(
@@ -2532,6 +2693,82 @@ export function checkConfirmLineOwnership(composers) {
       pattern: "confirm-line-composer-missing",
       patternIndex: FORBIDDEN.length + 22,
       why: `No file under ${CONFIRM_LINE_SCOPE} defines a composer for the human-facing confirmation line, which means ${CONFIRM_LINE_OWNER}'s was deleted, renamed, or inlined back into its call sites. Zero composers is as much a violation as two, and it is the quieter of the pair: nothing goes red on the way out, because the tests that covered the deleted code leave with it. What that loses is the whole of CONF-04 -- the sentence a person reads before agreeing to a destructive change goes back to being written by a model that is reading stranger-authored content in the same context window, which is the residual attack PITFALLS #40 describes: preview a real delete, describe it inaccurately, get a yes, commit honestly, and every mechanical check passes. Restore the definition in ${CONFIRM_LINE_OWNER}. If the composer really moved, that is a change to the safety boundary: get a decision, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The one mutating open, as a pure function over a list of construction sites.
+ *
+ * The confirm-line checker's body, because the owner is permitted ONE site and
+ * not "any number of them": a second open inside the owner file is a second
+ * site and gets the same id as a second file. See the `MUTATING_OPEN_COMMAND`
+ * docstring for why this is a count and for the three shapes it cannot see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} sites
+ */
+export function checkMutatingOpenOwnership(sites) {
+  const violations = [];
+  let ownerSites = 0;
+  for (const site of sites) {
+    if (site.file === MUTATING_OPEN_OWNER) {
+      ownerSites += 1;
+      if (ownerSites === 1) continue;
+    }
+    violations.push({
+      file: site.file,
+      line: site.line,
+      column: site.column,
+      pattern: "mutating-open-duplicated",
+      patternIndex: FORBIDDEN.length + 23,
+      why: `A second construction site of the mutating mailbox open -- either in another module under ${MUTATING_OPEN_SCOPE}, or a second one inside ${MUTATING_OPEN_OWNER} itself, which counts the same. Every read opens its mailbox read-only, and exactly one place builds the open that lets the server change a mailbox: inside withMutatingMailboxOver, behind its own session type and its own access check. A second site is a second way to reach a mailbox opened for changing, arriving without a decision, which is the PITFALLS #32 failure. Call a verb in src/mail/triage.ts instead. If a second site genuinely belongs, that is a decision on the safety boundary, not a refactor: get the decision, then change the owner, never the pattern.`,
+    });
+  }
+  if (sites.length === 0) {
+    violations.push({
+      file: MUTATING_OPEN_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "mutating-open-missing",
+      patternIndex: FORBIDDEN.length + 24,
+      why: `No file under ${MUTATING_OPEN_SCOPE} builds the mutating mailbox open, which means the site in ${MUTATING_OPEN_OWNER} was deleted, renamed, or emptied. Zero is as much a violation as two, and it is the quieter of the pair: nothing goes red on the way out, because the tests that covered the deleted code leave with it. Restore the open inside withMutatingMailboxOver. If it really moved, that is a change to the safety boundary: get a decision, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The one importer of the mutating orchestrator, as a pure function over a list
+ * of importers.
+ *
+ * The write choke point's body: one owner, a non-owner is reported, and an
+ * empty list is the missing arm. See the `MUTATING_SESSION_IMPORT` docstring for
+ * why this is a count and for the four shapes it cannot see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} importers
+ */
+export function checkMutatingSessionImportOwnership(importers) {
+  const violations = [];
+  for (const importer of importers) {
+    if (importer.file === MUTATING_SESSION_OWNER) continue;
+    violations.push({
+      file: importer.file,
+      line: importer.line,
+      column: importer.column,
+      pattern: "mutating-session-importer-outside-triage",
+      patternIndex: FORBIDDEN.length + 25,
+      why: `An import of the mutating orchestrator under ${MUTATING_SESSION_SCOPE} outside ${MUTATING_SESSION_OWNER}. That module is the only place allowed to hold a mailbox opened for changing, and it exports narrow verbs -- one message, one flag, no body fetch -- never a session. A second importer skips those verbs and can do anything to the mailbox it holds. Call a verb from ${MUTATING_SESSION_OWNER} instead, or add one there. Do not reach the orchestrator another way (a namespace import, a re-export, a dynamic import, an alias). A second importer is a decision on the safety boundary, not a refactor: get the decision, then change the owner, never the pattern.`,
+    });
+  }
+  if (importers.length === 0) {
+    violations.push({
+      file: MUTATING_SESSION_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "mutating-session-importer-missing",
+      patternIndex: FORBIDDEN.length + 26,
+      why: `No file under ${MUTATING_SESSION_SCOPE} imports the mutating orchestrator, which means ${MUTATING_SESSION_OWNER} was deleted, renamed, emptied, or rewired to reach it some other way. Zero is as much a violation as two: "no second importer" is trivially true of a tree where the verbs are gone, and nothing reports their absence. Restore the import in ${MUTATING_SESSION_OWNER}. If the verbs really moved, that is a change to the safety boundary: get a decision, then change the owner, never the pattern.`,
     });
   }
   return violations;

@@ -90,6 +90,7 @@ const EXPECTED_TOOLS: readonly string[] = [
   "mail_list_folders",
   "mail_list_messages",
   "mail_list_unread",
+  "mail_mark_read",
   "mail_search",
   "mail_stage_attachment",
 ];

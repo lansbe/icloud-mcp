@@ -1404,7 +1404,12 @@ describe("the read orchestrators keep their shape (MUTA-01)", () => {
     const orchestrators = Object.keys(service)
       .filter((name) => name.startsWith("with"))
       .sort();
-    expect(orchestrators).toEqual(["withMailSession", "withMailSessionOver"]);
+    expect(orchestrators).toEqual([
+      "withMailSession",
+      "withMailSessionOver",
+      "withMutatingMailbox",
+      "withMutatingMailboxOver",
+    ]);
     expect(source).toContain("async function withMailSessionCore<");
   });
 
@@ -1431,7 +1436,7 @@ describe("the read orchestrators keep their shape (MUTA-01)", () => {
     // The full source, NOT the comment-stripped one: CLAUDE.md §2 and §5 ask
     // that this command be described by role. Plan 20-03 changes the expected
     // count to one, at the mutating orchestrator's own open.
-    expect(source.match(/\bSELECT\b/g) ?? []).toHaveLength(0);
+    expect(source.match(/\bSELECT\b/g) ?? []).toHaveLength(1);
   });
 
   it("pins both read orchestrators' signatures", () => {

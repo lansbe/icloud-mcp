@@ -30,6 +30,8 @@ import {
   DAV_WRITE_MODULES,
   EXCLUDED,
   FORBIDDEN,
+  MUTATING_OPEN_OWNER,
+  MUTATING_SESSION_OWNER,
   OWNERSHIP_VIOLATION_IDS,
   PASSWORD_READER_IMPORT,
   PASSWORD_READER_OWNERS,
@@ -51,6 +53,8 @@ import {
   checkDavFetchOwnership,
   checkDavHostOwnership,
   checkDavWriteCoverage,
+  checkMutatingOpenOwnership,
+  checkMutatingSessionImportOwnership,
   checkPasswordReaderOwnership,
   checkPrincipalConstructorOwnership,
   checkPropsReaderOwnership,
@@ -4181,6 +4185,11 @@ describe("the count constraints as a set", () => {
       // One owner, so the same two lists once more.
       ...checkConfirmLineOwnership([nonOwner]).map((v) => v.pattern),
       ...checkConfirmLineOwnership([]).map((v) => v.pattern),
+      // The two phase 20 counts, one owner each, so the same pair of lists.
+      ...checkMutatingOpenOwnership([nonOwner]).map((v) => v.pattern),
+      ...checkMutatingOpenOwnership([]).map((v) => v.pattern),
+      ...checkMutatingSessionImportOwnership([nonOwner]).map((v) => v.pattern),
+      ...checkMutatingSessionImportOwnership([]).map((v) => v.pattern),
       // The second two-owner count, fed the same pair of lists the password
       // count is fed and for the same reason.
       ...checkPrincipalConstructorOwnership([
@@ -4238,6 +4247,12 @@ describe("the count constraints as a set", () => {
       // One owner again, so a lone non-owner and an empty list give one of each.
       ...checkConfirmLineOwnership([nonOwner]),
       ...checkConfirmLineOwnership([]),
+      // One owner each again: a lone non-owner and an empty list give one of
+      // each id.
+      ...checkMutatingOpenOwnership([nonOwner]),
+      ...checkMutatingOpenOwnership([]),
+      ...checkMutatingSessionImportOwnership([nonOwner]),
+      ...checkMutatingSessionImportOwnership([]),
       // TWO owners again, so the same asymmetric pair the password count needs:
       // both owners plus a non-owner is exactly one outside, and one owner
       // alone is exactly one missing.
@@ -4276,6 +4291,12 @@ describe("the count constraints as a set", () => {
     // And for the door: it is the one module that holds the grant's props, so
     // it is the one that most needs the props-in-log rule applying to it.
     expect(EXCLUDED.has(PROPS_READER_OWNER)).toBe(false);
+    // And for the verbs that change a mailbox. The module that holds a mailbox
+    // opened for changing is the one that most needs the logging ban and the
+    // peeking-fetch ban applying to it in full. The mutating open's owner is
+    // the service module, already covered above as the write's owner.
+    expect(EXCLUDED.has(MUTATING_SESSION_OWNER)).toBe(false);
+    expect(MUTATING_OPEN_OWNER).toBe(APPEND_OWNER);
     // And for both minting sites. These two are the files that hold a live
     // credential longest — the door holds a decrypted grant, the login page
     // holds a value somebody just typed — so they are the two that most need
