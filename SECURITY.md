@@ -209,6 +209,10 @@ good or empties Trash, and a message in Trash can be moved back. The list of
 messages is always the one you picked, never one built from a search or from
 what a message says.
 
+Deleting a draft is the same move, for one draft, to Trash. It acts only on a
+draft in the drafts folder, exactly as the preview showed it. It does not check
+who wrote the draft.
+
 ### Destructive calendar actions are gated
 
 Creating an event with attendees, updating an event, and deleting an event all
