@@ -225,6 +225,50 @@ export function logoutExchange(tag: string): Uint8Array {
   return wire("* BYE Logging out", `${tag} OK LOGOUT completed`);
 }
 
+// ---------------------------------------------------------------------------
+// How iCloud answers a UID search. Measured, not synthesised.
+//
+// The owner ran these from his own terminal on 2026-09-27, over raw IMAP with
+// the inbox opened read-only, and recorded the replies in 21-UAT.md under
+// "Probe, 2026-09-27". No Worker was in the path.
+//
+// The finding: when a plain UID search matches nothing, iCloud sends the tagged
+// completion and NO untagged search line at all. RFC 3501 asks for the line with
+// no numbers. So "no search line" is iCloud's way of saying "none", and it looks
+// exactly like a server that never answered. The count form (RFC 4731) always
+// answers, with a number, so that is the form a move's re-read uses.
+// ---------------------------------------------------------------------------
+
+/** iCloud's count reply for a UID that is gone. Measured verbatim, tag `a6`. */
+export const MEASURED_ESEARCH_GONE_LINE = '* ESEARCH (TAG "a6") UID COUNT 0';
+
+/** iCloud's count reply for a UID that is there. Measured verbatim, tag `a7`. */
+export const MEASURED_ESEARCH_PRESENT_LINE = '* ESEARCH (TAG "a7") UID COUNT 1';
+
+/**
+ * iCloud's whole answer to a plain UID search that matched nothing. Measured
+ * verbatim, tag `a3`. It is the completion alone: no untagged line before it.
+ */
+export const MEASURED_EMPTY_SEARCH_COMPLETION = "a3 OK SEARCH completed";
+
+/**
+ * A count reply in iCloud's measured shape, retagged, then its completion.
+ *
+ * The probe recorded the count replies' completions only as OK. The completion
+ * text here is the one the probe recorded word for word for the plain search.
+ */
+export function esearchCountReply(tag: string, count: number): Uint8Array {
+  return wire(`* ESEARCH (TAG "${tag}") UID COUNT ${count}`, `${tag} OK SEARCH completed`);
+}
+
+/**
+ * iCloud's answer to a UID search that matched nothing, retagged: the
+ * completion alone, with no untagged search line. Measured; see above.
+ */
+export function emptySearchReply(tag: string): Uint8Array {
+  return wire(`${tag} OK SEARCH completed`);
+}
+
 /**
  * The UIDVALIDITY the scripted inbox reports.
  *

@@ -47,9 +47,15 @@ import { registerMailTools } from "../src/mcp/tools/mail";
 import {
   GREETING,
   INBOX_UIDVALIDITY,
+  MEASURED_EMPTY_SEARCH_COMPLETION,
+  MEASURED_ESEARCH_GONE_LINE,
+  MEASURED_ESEARCH_PRESENT_LINE,
+  MEASURED_POST_AUTH_CAPABILITY,
   POST_AUTH_CAPABILITY,
   PRE_AUTH_CAPABILITY,
   capabilityResponse,
+  emptySearchReply,
+  esearchCountReply,
   examineResponse,
   logoutExchange,
   selectResponse,
@@ -95,13 +101,20 @@ function wireOf(duplex: FakeDuplex): string[] {
   });
 }
 
+/**
+ * The post-login capability line these moves run under: the one iCloud really
+ * sent. It advertises UIDPLUS and CONDSTORE, which a move needs, and ESEARCH,
+ * which the re-read's count form needs (21-08).
+ */
+const MOVE_CAPABILITY = MEASURED_POST_AUTH_CAPABILITY;
+
 /** The four turns every conversation opens with. The next tag is `a4`. */
-function authPrefix(): Uint8Array[] {
+function authPrefix(capability = MOVE_CAPABILITY): Uint8Array[] {
   return [
     GREETING,
     capabilityResponse("a1", PRE_AUTH_CAPABILITY),
     taggedOk("a2", "LOGIN completed"),
-    capabilityResponse("a3", POST_AUTH_CAPABILITY),
+    capabilityResponse("a3", capability),
   ];
 }
 
@@ -199,13 +212,6 @@ function markEcho(tag: string, uid: number, modSeq: string): Uint8Array {
   );
 }
 
-/** A search reply listing `uids`, then its completion. */
-function searchReply(tag: string, uids: number[]): Uint8Array {
-  return wire(
-    uids.length === 0 ? "* SEARCH" : `* SEARCH ${uids.join(" ")}`,
-    `${tag} OK SEARCH completed`,
-  );
-}
 
 function concat(parts: Uint8Array[]): Uint8Array {
   const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
@@ -274,7 +280,7 @@ describe("move one message to a named folder, previewed and committed", () => {
       copyReply("a6", MESSAGE.uid, 88),
       markEcho("a7", MESSAGE.uid, "743"),
       wire("* 1 EXPUNGE", "a8 OK EXPUNGE completed"),
-      searchReply("a9", []),
+      esearchCountReply("a9", 0),
       logoutExchange("a10"),
     ]);
     vi.mocked(connectImap)
@@ -311,7 +317,7 @@ describe("move one message to a named folder, previewed and committed", () => {
       'a6 UID COPY 4242 "Receipts"',
       "a7 UID STORE 4242 (UNCHANGEDSINCE 742) +FLAGS (\\Deleted)",
       "a8 UID EXPUNGE 4242",
-      "a9 UID SEARCH UID 4242",
+      "a9 UID SEARCH RETURN (COUNT) UID 4242",
       "a10 LOGOUT",
     ]);
 
@@ -351,7 +357,7 @@ describe("move one message to a named folder, previewed and committed", () => {
           copyReply("a6", MESSAGE.uid, 88),
           markEcho("a7", MESSAGE.uid, "743"),
           wire("a8 OK EXPUNGE completed"),
-          searchReply("a9", []),
+          esearchCountReply("a9", 0),
           logoutExchange("a10"),
         ]) as never,
       );
@@ -381,11 +387,11 @@ describe("move two messages in one session", () => {
       copyReply("a6", FIRST.uid, 88),
       markEcho("a7", FIRST.uid, "761"),
       wire("a8 OK EXPUNGE completed"),
-      searchReply("a9", []),
+      esearchCountReply("a9", 0),
       copyReply("a10", SECOND.uid, 89),
       markEcho("a11", SECOND.uid, "762"),
       wire("a12 OK EXPUNGE completed"),
-      searchReply("a13", []),
+      esearchCountReply("a13", 0),
       logoutExchange("a14"),
     ]);
     vi.mocked(connectImap)
@@ -411,11 +417,11 @@ describe("move two messages in one session", () => {
       'a6 UID COPY 4242 "Receipts"',
       "a7 UID STORE 4242 (UNCHANGEDSINCE 742) +FLAGS (\\Deleted)",
       "a8 UID EXPUNGE 4242",
-      "a9 UID SEARCH UID 4242",
+      "a9 UID SEARCH RETURN (COUNT) UID 4242",
       'a10 UID COPY 4250 "Receipts"',
       "a11 UID STORE 4250 (UNCHANGEDSINCE 760) +FLAGS (\\Deleted)",
       "a12 UID EXPUNGE 4250",
-      "a13 UID SEARCH UID 4250",
+      "a13 UID SEARCH RETURN (COUNT) UID 4250",
       "a14 LOGOUT",
     ]);
     expect(answer.confirmationLine).toBe(
@@ -444,7 +450,7 @@ describe("a MODSEQ past 2^53", () => {
       copyReply("a6", MESSAGE.uid, 88),
       markEcho("a7", MESSAGE.uid, "4611686018427387906"),
       wire("a8 OK EXPUNGE completed"),
-      searchReply("a9", []),
+      esearchCountReply("a9", 0),
       logoutExchange("a10"),
     ]);
     vi.mocked(connectImap)
@@ -476,7 +482,7 @@ describe("the verdict comes from the re-read, not from an OK (TRIA-06)", () => {
           copyReply("a6", MESSAGE.uid, 88),
           markEcho("a7", MESSAGE.uid, "743"),
           wire("a8 OK EXPUNGE completed"),
-          searchReply("a9", [MESSAGE.uid]),
+          esearchCountReply("a9", 1),
           logoutExchange("a10"),
         ]) as never,
       );
@@ -563,7 +569,7 @@ function fullMoveLines(n: number, message: Fixture): string[] {
     `a${n} UID COPY ${message.uid} "${RECEIPTS}"`,
     `a${n + 1} UID STORE ${message.uid} (UNCHANGEDSINCE ${message.modSeq}) +FLAGS (\\Deleted)`,
     `a${n + 2} UID EXPUNGE ${message.uid}`,
-    `a${n + 3} UID SEARCH UID ${message.uid}`,
+    `a${n + 3} UID SEARCH RETURN (COUNT) UID ${message.uid}`,
   ];
 }
 
@@ -573,7 +579,7 @@ function fullMoveReplies(n: number, message: Fixture, newUid: number): Uint8Arra
     copyReply(`a${n}`, message.uid, newUid),
     markEcho(`a${n + 1}`, message.uid, "9001"),
     wire(`a${n + 2} OK EXPUNGE completed`),
-    searchReply(`a${n + 3}`, []),
+    esearchCountReply(`a${n + 3}`, 0),
   ];
 }
 
@@ -595,8 +601,8 @@ function commandOf(line: string): { word: string; uid: string } {
   const tokens = line.split(" ");
   const rest = (tokens[1] ?? "").toUpperCase() === "UID" ? tokens.slice(2) : tokens.slice(1);
   const word = (rest[0] ?? "").toUpperCase();
-  // SEARCH names its UID after the `UID` search key.
-  const uid = word === "SEARCH" ? (rest[2] ?? "") : (rest[1] ?? "");
+  // SEARCH names its UID last, after the `UID` search key.
+  const uid = word === "SEARCH" ? (rest[rest.length - 1] ?? "") : (rest[1] ?? "");
   return { word, uid };
 }
 
@@ -709,7 +715,7 @@ describe("every way a move can end", () => {
       fingerprintReply("a5", [ONE]),
       copyReply("a6", ONE.uid, 88),
       wire(reply),
-      searchReply("a8", [ONE.uid]),
+      esearchCountReply("a8", 1),
       logoutExchange("a9"),
     ]);
 
@@ -720,7 +726,7 @@ describe("every way a move can end", () => {
       ...openAndCheckLines([ONE]),
       `a6 UID COPY 4242 "${RECEIPTS}"`,
       "a7 UID STORE 4242 (UNCHANGEDSINCE 742) +FLAGS (\\Deleted)",
-      "a8 UID SEARCH UID 4242",
+      "a8 UID SEARCH RETURN (COUNT) UID 4242",
       "a9 LOGOUT",
     ]);
     expectNoLine(lines, "EXPUNGE");
@@ -739,7 +745,7 @@ describe("every way a move can end", () => {
       fingerprintReply("a5", [ONE]),
       copyReply("a6", ONE.uid, 88),
       wire("a7 NO STORE failed"),
-      searchReply("a8", [ONE.uid]),
+      esearchCountReply("a8", 1),
       logoutExchange("a9"),
     ]);
 
@@ -750,7 +756,7 @@ describe("every way a move can end", () => {
       ...openAndCheckLines([ONE]),
       `a6 UID COPY 4242 "${RECEIPTS}"`,
       "a7 UID STORE 4242 (UNCHANGEDSINCE 742) +FLAGS (\\Deleted)",
-      "a8 UID SEARCH UID 4242",
+      "a8 UID SEARCH RETURN (COUNT) UID 4242",
       "a9 LOGOUT",
     ]);
     expectNoLine(lines, "EXPUNGE");
@@ -770,7 +776,7 @@ describe("every way a move can end", () => {
       copyReply("a6", ONE.uid, 88),
       markEcho("a7", ONE.uid, "743"),
       wire("a8 NO EXPUNGE failed"),
-      searchReply("a9", [ONE.uid]),
+      esearchCountReply("a9", 1),
       logoutExchange("a10"),
     ]);
 
@@ -798,7 +804,7 @@ describe("every way a move can end", () => {
       fingerprintReply("a5", [ONE]),
       copyReply("a6", ONE.uid, 88),
       wire("a7 NO STORE failed"),
-      searchReply("a8", []),
+      esearchCountReply("a8", 0),
       logoutExchange("a9"),
     ]);
 
@@ -809,7 +815,7 @@ describe("every way a move can end", () => {
       ...openAndCheckLines([ONE]),
       `a6 UID COPY 4242 "${RECEIPTS}"`,
       "a7 UID STORE 4242 (UNCHANGEDSINCE 742) +FLAGS (\\Deleted)",
-      "a8 UID SEARCH UID 4242",
+      "a8 UID SEARCH RETURN (COUNT) UID 4242",
       "a9 LOGOUT",
     ]);
     expectNoLine(lines, "EXPUNGE");
@@ -821,7 +827,10 @@ describe("every way a move can end", () => {
     });
   });
 
-  it("search answered NO: unknown, verify-refused, with the proven copy", async () => {
+  it.each([
+    ["NO", "a9 NO SEARCH failed"],
+    ["BAD", "a9 BAD Invalid search"],
+  ])("search answered %s: unknown, verify-refused, with the proven copy", async (_label, reply) => {
     const duplex = createFakeDuplex([
       ...authPrefix(),
       writableOpen(),
@@ -829,7 +838,7 @@ describe("every way a move can end", () => {
       copyReply("a6", ONE.uid, 88),
       markEcho("a7", ONE.uid, "743"),
       wire("a8 OK EXPUNGE completed"),
-      wire("a9 NO SEARCH failed"),
+      wire(reply),
       logoutExchange("a10"),
     ]);
 
@@ -933,8 +942,8 @@ describe("every way a move can end", () => {
   });
 
   it.each([
-    ["UIDPLUS", POST_AUTH_CAPABILITY.replace(" UIDPLUS", "")],
-    ["CONDSTORE", POST_AUTH_CAPABILITY.replace(" CONDSTORE", "")],
+    ["UIDPLUS", MOVE_CAPABILITY.replace(" UIDPLUS", "")],
+    ["CONDSTORE", MOVE_CAPABILITY.replace(" CONDSTORE", "")],
   ])("a post-login capability without %s: commands-unavailable, nothing after the open", async (missing, capability) => {
     expect(capability.split(" ")).not.toContain(missing);
     const duplex = createFakeDuplex([
@@ -1077,6 +1086,135 @@ describe("every way a move can end", () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// The re-read on iCloud's real replies (21-08)
+//
+// Live on 2026-09-27, every move that worked reported unknown. iCloud sends no
+// untagged search line when a plain search matches nothing, so the old re-read
+// never saw an answer (21-UAT.md, "Probe, 2026-09-27"). The re-read now asks
+// for a count, which iCloud always answers. Every reply below is iCloud's
+// measured shape, retagged to this conversation.
+// ---------------------------------------------------------------------------
+
+describe("the re-read asks for a count, and only a count for this command is an answer", () => {
+  /** Script one clean copy, mark and removal of ONE, then `reread` as the re-read's reply. */
+  function oneMoveWith(reread: Uint8Array, capability = MOVE_CAPABILITY): FakeDuplex {
+    return createFakeDuplex([
+      ...authPrefix(capability),
+      writableOpen(),
+      fingerprintReply("a5", [ONE]),
+      copyReply("a6", ONE.uid, 88),
+      markEcho("a7", ONE.uid, "743"),
+      wire("a8 OK EXPUNGE completed"),
+      reread,
+      logoutExchange("a10"),
+    ]);
+  }
+
+  const SENT = [
+    `a6 UID COPY 4242 "${RECEIPTS}"`,
+    "a7 UID STORE 4242 (UNCHANGEDSINCE 742) +FLAGS (\\Deleted)",
+    "a8 UID EXPUNGE 4242",
+    "a9 UID SEARCH RETURN (COUNT) UID 4242",
+    "a10 LOGOUT",
+  ];
+
+  it("the measured lines are the ones the probe recorded", () => {
+    expect(MEASURED_ESEARCH_GONE_LINE).toBe('* ESEARCH (TAG "a6") UID COUNT 0');
+    expect(MEASURED_ESEARCH_PRESENT_LINE).toBe('* ESEARCH (TAG "a7") UID COUNT 1');
+    expect(MEASURED_EMPTY_SEARCH_COMPLETION).toBe("a3 OK SEARCH completed");
+  });
+
+  it("COUNT 0: moved, verified-gone", async () => {
+    const duplex = oneMoveWith(
+      wire(MEASURED_ESEARCH_GONE_LINE.replace('"a6"', '"a9"'), "a9 OK SEARCH completed"),
+    );
+
+    const outcome = await runMove(duplex, [ONE]);
+
+    expect(wireOf(duplex)).toEqual([...openAndCheckLines([ONE]), ...SENT]);
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "moved", reason: "verified-gone", newUid: 88, destinationUidValidity: RECEIPTS_UIDVALIDITY },
+      ],
+    });
+  });
+
+  it("COUNT 1: copied_not_removed, still-in-source", async () => {
+    const duplex = oneMoveWith(
+      wire(MEASURED_ESEARCH_PRESENT_LINE.replace('"a7"', '"a9"'), "a9 OK SEARCH completed"),
+    );
+
+    const outcome = await runMove(duplex, [ONE]);
+
+    expect(wireOf(duplex)).toEqual([...openAndCheckLines([ONE]), ...SENT]);
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "copied_not_removed", reason: "still-in-source", newUid: 88, destinationUidValidity: RECEIPTS_UIDVALIDITY },
+      ],
+    });
+  });
+
+  it.each<[string, Uint8Array]>([
+    // iCloud's real answer to a plain search that matched nothing. It must not
+    // read as "gone": it is also exactly what a server that never looked sends.
+    ["iCloud's empty plain-search shape: OK and no untagged line", emptySearchReply("a9")],
+    ["a count line for another command's tag", wire(MEASURED_ESEARCH_GONE_LINE, "a9 OK SEARCH completed")],
+    ["an empty plain search line instead of a count", wire("* SEARCH", "a9 OK SEARCH completed")],
+    ["a count line with no number", wire('* ESEARCH (TAG "a9") UID COUNT', "a9 OK SEARCH completed")],
+  ])("%s: unknown, verify-unanswered, never moved", async (_label, reread) => {
+    const duplex = oneMoveWith(reread);
+
+    const outcome = await runMove(duplex, [ONE]);
+
+    expect(wireOf(duplex)).toEqual([...openAndCheckLines([ONE]), ...SENT]);
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "unknown", reason: "verify-unanswered", newUid: 88, destinationUidValidity: RECEIPTS_UIDVALIDITY },
+      ],
+    });
+  });
+
+  it("a server that does not advertise ESEARCH: the move still runs, no re-read is sent, and the answer is unknown, verify-unanswered", async () => {
+    // The count form is needed only for the verdict. The copy, the mark and the
+    // removal need UIDPLUS and CONDSTORE and nothing else, so they still run.
+    const withoutEsearch = MOVE_CAPABILITY.split(" ")
+      .filter((atom) => atom !== "ESEARCH")
+      .join(" ");
+    expect(withoutEsearch.split(" ")).not.toContain("ESEARCH");
+    const duplex = createFakeDuplex([
+      ...authPrefix(withoutEsearch),
+      writableOpen(),
+      fingerprintReply("a5", [ONE]),
+      copyReply("a6", ONE.uid, 88),
+      markEcho("a7", ONE.uid, "743"),
+      wire("a8 OK EXPUNGE completed"),
+      logoutExchange("a9"),
+    ]);
+
+    const outcome = await runMove(duplex, [ONE]);
+
+    const lines = wireOf(duplex);
+    expect(lines).toEqual([
+      ...openAndCheckLines([ONE]),
+      `a6 UID COPY 4242 "${RECEIPTS}"`,
+      "a7 UID STORE 4242 (UNCHANGEDSINCE 742) +FLAGS (\\Deleted)",
+      "a8 UID EXPUNGE 4242",
+      "a9 LOGOUT",
+    ]);
+    expectNoLine(lines, "SEARCH");
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "unknown", reason: "verify-unanswered", newUid: 88, destinationUidValidity: RECEIPTS_UIDVALIDITY },
+      ],
+    });
+  });
+});
 
 // ---------------------------------------------------------------------------
 // The move tools refuse by name (21-02 Task 2)
@@ -1451,7 +1589,7 @@ function oneMoveServer(message: Fixture): FakeDuplex {
     copyReply("a6", message.uid, 88),
     markEcho("a7", message.uid, "743"),
     wire("* 1 EXPUNGE", "a8 OK EXPUNGE completed"),
-    searchReply("a9", []),
+    esearchCountReply("a9", 0),
     logoutExchange("a10"),
   ]);
 }
@@ -1465,7 +1603,7 @@ function oneMoveLines(mailbox: string): string[] {
     `a6 UID COPY 4242 "${mailbox}"`,
     "a7 UID STORE 4242 (UNCHANGEDSINCE 742) +FLAGS (\\Deleted)",
     "a8 UID EXPUNGE 4242",
-    "a9 UID SEARCH UID 4242",
+    "a9 UID SEARCH RETURN (COUNT) UID 4242",
     "a10 LOGOUT",
   ];
 }

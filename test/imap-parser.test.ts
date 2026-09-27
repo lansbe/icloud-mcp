@@ -31,6 +31,7 @@ import {
   parseCopyUid,
   parseFingerprint,
   parseListLine,
+  parseEsearchCount,
   parseModifiedUids,
   parsePermanentFlags,
   parseSearchLine,
@@ -52,6 +53,8 @@ import {
   AUTH_UNCLASSIFIED_TEXT,
   CONNECTION_LIMIT_TEXT,
   GREETING_LINE,
+  MEASURED_ESEARCH_GONE_LINE,
+  MEASURED_ESEARCH_PRESENT_LINE,
   POST_AUTH_CAPABILITY,
   PRE_AUTH_CAPABILITY,
   UNTIDY_CAPABILITY_LINE,
@@ -989,6 +992,44 @@ describe("parseSearchLine", () => {
       const [first] = await untaggedFrom(line);
       expect(parseSearchLine(first!)).toBeNull();
     }
+  });
+});
+
+describe("parseEsearchCount", () => {
+  // iCloud sends no untagged search line when a plain search matches nothing
+  // (21-UAT.md, "Probe, 2026-09-27"), so a move's re-read asks for a count
+  // instead. These are the two lines the probe recorded, then every way a line
+  // can fail to be the answer to THIS command.
+  async function countOf(line: string, tag: string): Promise<number | null> {
+    const [first] = await untaggedFrom(line);
+    return parseEsearchCount(first!, tag);
+  }
+
+  it.each<[string, string, string, number | null]>([
+    ["iCloud's measured reply for a UID that is gone", MEASURED_ESEARCH_GONE_LINE, "a6", 0],
+    ["iCloud's measured reply for a UID that is there", MEASURED_ESEARCH_PRESENT_LINE, "a7", 1],
+    ["the gone reply read for another command's tag", MEASURED_ESEARCH_GONE_LINE, "a7", null],
+    ["a tag that only starts the same", '* ESEARCH (TAG "a60") UID COUNT 0', "a6", null],
+    ["no correlator at all", "* ESEARCH UID COUNT 0", "a6", null],
+    ["a correlator with no tag value", "* ESEARCH (TAG) UID COUNT 0", "a6", null],
+    ["no COUNT item", '* ESEARCH (TAG "a6") UID MIN 3', "a6", null],
+    ["no return data at all", '* ESEARCH (TAG "a6") UID', "a6", null],
+    ["COUNT with no number", '* ESEARCH (TAG "a6") UID COUNT', "a6", null],
+    ["COUNT with a word for a number", '* ESEARCH (TAG "a6") UID COUNT none', "a6", null],
+    ["COUNT with a negative number", '* ESEARCH (TAG "a6") UID COUNT -1', "a6", null],
+    ["COUNT with a leading zero", '* ESEARCH (TAG "a6") UID COUNT 01', "a6", null],
+    ["COUNT past the 32-bit range", '* ESEARCH (TAG "a6") UID COUNT 4294967296', "a6", null],
+    ["COUNT twice", '* ESEARCH (TAG "a6") UID COUNT 0 COUNT 1', "a6", null],
+    ["other items before COUNT", '* ESEARCH (TAG "a6") UID MIN 3 COUNT 1', "a6", 1],
+    ["other items after COUNT", '* ESEARCH (TAG "a6") UID COUNT 2 MIN 3 MAX 9', "a6", 2],
+    ["a set-valued item before COUNT", '* ESEARCH (TAG "a6") UID ALL 3:5,9 COUNT 4', "a6", 4],
+    ["no UID marker", '* ESEARCH (TAG "a6") COUNT 0', "a6", 0],
+    ["lowercase throughout", '* esearch (tag "a6") uid count 0', "a6", 0],
+    ["a plain search line", "* SEARCH 4242", "a6", null],
+    ["iCloud's empty plain search, were it ever sent", "* SEARCH", "a6", null],
+    ["another untagged line", "* 3 EXISTS", "a6", null],
+  ])("%s", async (_label, line, tag, expected) => {
+    expect(await countOf(line, tag)).toBe(expected);
   });
 });
 

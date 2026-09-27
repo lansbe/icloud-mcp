@@ -1563,3 +1563,14 @@ export function parseModifiedUids(taggedText: string): number[] | null {
   if (match === null) return null;
   return expandUidSet(match[1].trim()) ?? [];
 }
+
+/**
+ * The COUNT of one count-form search reply, or `null` when the line is not
+ * that reply for THIS command.
+ *
+ * RFC 4731: `* ESEARCH (TAG "<tag>") UID COUNT <n>`. A stub until 21-08's
+ * implementation lands.
+ */
+export function parseEsearchCount(_line: ResponseLine, _tag: string): number | null {
+  return null;
+}
