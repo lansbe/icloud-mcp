@@ -260,6 +260,30 @@ export function examineResponse(
 }
 
 /**
+ * One folder's answer to the status command, then its completion.
+ *
+ * The change check's first read. The mailbox is quoted as iCloud quotes it.
+ * `highestModseq` is digits, as the wire carries them; `null` leaves the item
+ * out, which is the "not tracked" arm. The items come back in a different order
+ * from the one asked for, because a server is free to reorder them.
+ */
+export function statusResponse(
+  tag: string,
+  mailbox: string,
+  uidValidity: number,
+  uidNext: number,
+  messages: number,
+  highestModseq: string | null = null,
+): Uint8Array {
+  const modseq = highestModseq === null ? "" : ` HIGHESTMODSEQ ${highestModseq}`;
+  return wire(
+    `* STATUS "${mailbox}" (MESSAGES ${messages} UIDNEXT ${uidNext} ` +
+      `UIDVALIDITY ${uidValidity}${modseq})`,
+    `${tag} OK STATUS completed`,
+  );
+}
+
+/**
  * A mailbox opened for changing, with the access code as a parameter.
  *
  * `"[READ-WRITE]"` is what RFC 3501 §6.3.1 says a writable mailbox answers.

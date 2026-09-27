@@ -838,11 +838,14 @@ function isUsableSigningKey(secret: string | undefined): secret is string {
  * produce that state is the check that cannot be forgotten by a future third
  * caller.
  *
- * **Exported for one purpose only.** Nothing outside this module calls it in
- * the running server; the export exists so `test/confirm.test.ts` can assert
- * the non-extractability against the real `CryptoKey` rather than against a
- * comment claiming it, on `DAV_KIND_LETTERS`'s export-for-one-purpose
- * precedent.
+ * **Exported for two callers.** The first is `test/confirm.test.ts`, which
+ * asserts the non-extractability against the real `CryptoKey` rather than
+ * against a comment claiming it, on `DAV_KIND_LETTERS`'s export-for-one-purpose
+ * precedent. The second is the change marker in `./change-marker.ts`, which
+ * seals with this same key under its own domain label. The label holds a
+ * character outside the base64url alphabet, so a marker's signed bytes can
+ * never equal a confirmation's, and the empty-key refusal above covers both
+ * without a copy.
  */
 export async function importConfirmationKey(
   secret: string | undefined,

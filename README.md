@@ -87,7 +87,7 @@ enforcement, and the module map — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ## Tools
 
-32 tools in four groups. Every tool description carries an untrusted-content
+33 tools in five groups. Every tool description carries an untrusted-content
 notice; event titles, message bodies, and contact fields are treated as data,
 never as instructions.
 
@@ -139,6 +139,12 @@ never as instructions.
 |------|--------------|
 | `contacts_search` | Find contacts by name or email (rows carry addresses). |
 | `contacts_get` | Read one contact in full by opaque id. |
+
+### Changes
+
+| Tool | What it does |
+|------|--------------|
+| `changes_since` | Say what changed since a marker from an earlier call: counts first, then new mail by sender and subject only. Returns a fresh marker every time. Never marks mail read. |
 
 Full input parameters for each tool are in the tool descriptions themselves and
 in [ARCHITECTURE.md](ARCHITECTURE.md).

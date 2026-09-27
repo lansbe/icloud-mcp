@@ -13,6 +13,7 @@ import type { Principal } from "../principal";
 import { SERVER_INSTRUCTIONS } from "./instructions";
 import { registerAccountTool } from "./tools/account";
 import { registerCalendarTools } from "./tools/calendar";
+import { registerChangesTool } from "./tools/changes";
 import { registerContactsTools } from "./tools/contacts";
 import { registerDavDiagnoseTool } from "./tools/dav-diagnose";
 import { registerDiagnoseTool } from "./tools/diagnose";
@@ -117,6 +118,9 @@ export function createServerFactory(
     // it needs neither.
     registerAccountTool(server, principal);
     registerMailTools(server, gate, principal);
+    // The change check (CHNG-01). The same gate as the mail tools, so its
+    // sessions queue behind theirs rather than opening a second socket.
+    registerChangesTool(server, gate, principal);
     registerDavDiagnoseTool(server, davFetch, unpaused);
     // The same `davFetch` the diagnostic takes, deliberately: one queue per
     // request means a calendar call and a diagnosis issued in the same request
