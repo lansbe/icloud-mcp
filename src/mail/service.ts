@@ -2535,10 +2535,16 @@ async function readDraftIn(
   const drafts = resolveAppendTarget(listing, null);
   if (ref.mailbox !== drafts.mailbox) return { refusal: "not-in-drafts" };
 
+  // A tie is `ambiguous-role-folder` only when it is a tie between folders the
+  // server itself marks as Trash. Two folders that merely share a Trash-like
+  // name mean no folder carries the attribute, and that is `no-trash-folder`.
   const trash = resolveRoleFolder(listing, "trash");
   if ("refusal" in trash) {
+    const marked = listing.folders.some(
+      (folder) => folder.role === "trash" && folder.roleSource === "special-use",
+    );
     return {
-      refusal: trash.refusal === "ambiguous" ? "ambiguous-role-folder" : "no-trash-folder",
+      refusal: trash.refusal === "ambiguous" && marked ? "ambiguous-role-folder" : "no-trash-folder",
     };
   }
   if (trash.folder.roleSource !== "special-use") return { refusal: "no-trash-folder" };
