@@ -295,3 +295,31 @@ export function forgetVectors(sql: SqlStorage, ids: readonly string[]): number {
   }
   return removed;
 }
+
+/** Up to `limit` ids whose expiry is at or before `now`, oldest expiry first. */
+export function expiredIds(sql: SqlStorage, now: number, limit: number): string[] {
+  return sql
+    .exec<{ vector_id: string }>(
+      `select vector_id from recall_vectors where expires_at <= ? order by expires_at limit ?`,
+      now,
+      limit,
+    )
+    .toArray()
+    .map((row) => row.vector_id);
+}
+
+/** Up to `limit` ids of any kind. */
+export function anyIds(sql: SqlStorage, limit: number): string[] {
+  return sql
+    .exec<{ vector_id: string }>(`select vector_id from recall_vectors limit ?`, limit)
+    .toArray()
+    .map((row) => row.vector_id);
+}
+
+/** The earliest expiry in the ledger, or null when it is empty. */
+export function earliestExpiry(sql: SqlStorage): number | null {
+  const row = sql
+    .exec<{ m: number | null }>(`select min(expires_at) as m from recall_vectors`)
+    .one();
+  return typeof row.m === "number" ? row.m : null;
+}

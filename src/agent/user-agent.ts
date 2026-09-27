@@ -35,15 +35,21 @@
 // that turns recall on or off, and no enabled flag. The first record for a
 // person needs no earlier call.
 //
-// ONE ALARM SLOT, SHARED. An object has one alarm. Recall will be its first
-// user (plan 25-03). Any later user folds its schedule into the same `alarm()`
-// and the same scheduling helper, rather than setting the alarm itself, or one
-// job silently drops the other's.
+// ONE ALARM SLOT, SHARED. An object has one alarm, and recall is its first
+// user. Its jobs today, in the order `alarm()` runs them: a pending destroy,
+// then revocation, then expiry. Every set and every removal goes through one
+// helper, `scheduleAlarm`, which removes the alarm only when `anyJobPending()`
+// says no job is left and otherwise never moves a set alarm later. Phases 27
+// and 28 fold their jobs into the same handler, the same helper and the same
+// predicate. A second call that sets the alarm, or a second condition for
+// removing it, would silently drop another job's schedule.
 //
 // This module logs nothing (./.claude/CLAUDE.md §4).
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
+import { type RecallStore, recallStore } from "../recall/index";
+import { type LedgerHandle, sweepExpired } from "../recall/lifecycle";
 import {
   RECALL_MAX_PAGES_PER_DAY,
   RECALL_MAX_VECTORS,
@@ -56,7 +62,10 @@ import {
   countNewIds,
   countPageOn,
   countVectors,
+  earliestExpiry,
   ensureRecallSchema,
+  expiredIds,
+  anyIds,
   forgetVectors,
   idsForMailbox,
   type LedgerRowInput,
@@ -127,6 +136,26 @@ export const RECALL_PAGE_PAUSE_MS = 60000;
  * after this, with no clean-up needed.
  */
 export const RECALL_PAGE_TTL_MS = 120000;
+
+/**
+ * The latest the alarm is ever set, from now: one day (Phase 25, D-13, D-23).
+ *
+ * The alarm is also when revocation is noticed, so this is how late a person's
+ * lost access can be noticed at most.
+ */
+export const RECALL_SWEEP_MAX_INTERVAL_MS = 86400000;
+
+/**
+ * When the alarm tries again after a failure: one hour.
+ *
+ * A thrown alarm handler is retried by the platform six times with backoff.
+ * This project catches instead, never reads what it caught, and reschedules
+ * through the one helper, so an earlier alarm is kept.
+ */
+export const RECALL_ALARM_RETRY_MS = 3600000;
+
+/** When the alarm comes back while expired rows remain after a full sweep. */
+const RECALL_SWEEP_AGAIN_MS = 60000;
 
 /** The most characters of a stored build cursor. The object never decodes it. */
 const MAX_CURSOR_CHARS = 2048;
@@ -234,6 +263,68 @@ function isLive(record: unknown, now: number): boolean {
  * `private` says, and never an instance property.
  */
 export class UserAgent extends DurableObject<Env> {
+  // Every member below that is not an RPC method is an arrow-function instance
+  // property. Workers RPC exposes every prototype method, whatever TypeScript's
+  // `private` says, and never an instance property. So the store seam, the
+  // scheduling helper, the predicate and the ledger handle cannot be called by
+  // any Worker holding a stub.
+
+  /**
+   * The recall store this object deletes through. It exists so the object's
+   * tests can substitute a fake store; production never overrides it.
+   */
+  vectorStore = (): RecallStore => recallStore();
+
+  /**
+   * Whether the object has any job for its one alarm.
+   *
+   * THIS IS THE ONE CONDITION FOR KEEPING THE ALARM. Today the job is recall's:
+   * a ledger row exists. A later phase with a job on this alarm adds its job
+   * here, in this function, and nowhere else (Phases 27 and 28 will). A second
+   * condition written beside this one would let one job remove the alarm
+   * another job still needs.
+   */
+  anyJobPending = (): boolean => {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    return countVectors(sql) > 0;
+  };
+
+  /**
+   * The one scheduling helper, and the only code in this module that sets or
+   * removes the alarm (D-23).
+   *
+   * With no job pending it removes the alarm, if one is set, and stops.
+   * Otherwise the target is `wantedAt`, raised to now if it is in the past and
+   * lowered to one day from now. The target is set only when no alarm is set,
+   * the set one is stale (at or before now), or the set one is later. So
+   * nothing here ever moves a set alarm later.
+   */
+  scheduleAlarm = async (wantedAt: number): Promise<void> => {
+    const storage = this.ctx.storage;
+    if (!this.anyJobPending()) {
+      if ((await storage.getAlarm()) !== null) await storage.deleteAlarm();
+      return;
+    }
+    const now = Date.now();
+    const target = Math.min(Math.max(wantedAt, now), now + RECALL_SWEEP_MAX_INTERVAL_MS);
+    const current = await storage.getAlarm();
+    if (current === null || current <= now || current > target) await storage.setAlarm(target);
+  };
+
+  /** Reads and removals over this object's own ledger, for the sweep and the destroy. */
+  ledgerHandle = (): LedgerHandle => {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    return {
+      expiredIds: (now, limit) => expiredIds(sql, now, limit),
+      anyIds: (limit) => anyIds(sql, limit),
+      forget: (ids) => {
+        forgetVectors(sql, ids);
+      },
+    };
+  };
+
   /**
    * The object's own name: stored once, then read back (D-22).
    *
@@ -273,7 +364,7 @@ export class UserAgent extends DurableObject<Env> {
    * The object sets each expiry itself, from the message date clamped to now.
    * No `await` anywhere, so the checks and the write are one atomic step.
    */
-  recallRecord(rows: unknown): RecordAnswer {
+  async recallRecord(rows: unknown): Promise<RecordAnswer> {
     const sql = this.ctx.storage.sql;
     ensureRecallSchema(sql);
     if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
@@ -285,7 +376,36 @@ export class UserAgent extends DurableObject<Env> {
     );
     if (countVectors(sql) + fresh > RECALL_MAX_VECTORS) return { ok: false, reason: "full" };
     recordVectors(sql, valid, Date.now(), RECALL_TTL_MS);
+    // The rows are written above with no await before them. Only now does the
+    // method wait, to make sure the alarm will expire them.
+    await this.scheduleAlarm(earliestExpiry(sql) ?? Date.now() + RECALL_SWEEP_MAX_INTERVAL_MS);
     return { ok: true };
+  }
+
+  /**
+   * The object's one alarm (Phase 25, D-13).
+   *
+   * Sweeps expired vectors, store first, then sets the alarm again through the
+   * helper: one minute out when expired rows remain, else at the next expiry
+   * (the helper lowers that to one day). It never throws: on any failure it
+   * reschedules one hour out through the same helper, which keeps an earlier
+   * alarm and removes the alarm when no job is left. The caught value is never
+   * read.
+   */
+  async alarm(): Promise<void> {
+    try {
+      const more = await sweepExpired(this.ledgerHandle(), this.vectorStore(), Date.now());
+      const next = more
+        ? Date.now() + RECALL_SWEEP_AGAIN_MS
+        : (earliestExpiry(this.ctx.storage.sql) ?? Date.now() + RECALL_SWEEP_MAX_INTERVAL_MS);
+      await this.scheduleAlarm(next);
+    } catch {
+      try {
+        await this.scheduleAlarm(Date.now() + RECALL_ALARM_RETRY_MS);
+      } catch {
+        // Nothing left to try; the platform does not retry a handler that returned.
+      }
+    }
   }
 
   /**
