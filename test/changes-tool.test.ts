@@ -59,6 +59,7 @@ import {
   POST_AUTH_CAPABILITY,
   PRE_AUTH_CAPABILITY,
   capabilityResponse,
+  emptySearchReply,
   examineResponse,
   logoutExchange,
   statusResponse,
@@ -363,6 +364,65 @@ describe("changes_since for the inbox (CHNG-01, CHNG-03, CHNG-07)", () => {
     if (reading.kind !== "current") return;
     expect(reading.content.folders[0]!.uidNext).toBe(4395);
     expect(reading.content.folders[0]!.highestModseq).toBe("124");
+  });
+
+  it("with a marker behind and iCloud's empty range: no_changes, other activity, no fetch, and the marker moves on", async () => {
+    // iCloud answers a UID search that matches nothing with the completion and
+    // no untagged search line (21-UAT.md, "Probe, 2026-09-27"). Mail arrived
+    // and was removed before this check, so the next UID moved and the range is
+    // empty. That is "none new", not a failure.
+    const marker = await markerFor({
+      folders: [
+        {
+          mailbox: "INBOX",
+          uidValidity: INBOX_UIDVALIDITY,
+          uidNext: 4392,
+          highestModseq: "118",
+        },
+      ],
+      calendar: null,
+      mintedAt: 1790000000,
+    });
+    const first = statusSession(4395, "124");
+    const second = createFakeDuplex([
+      ...authPrefix(),
+      examineResponse("a4"),
+      emptySearchReply("a5"),
+      logoutExchange("a6"),
+    ]);
+    vi.mocked(connectImap)
+      .mockReturnValueOnce(first as never)
+      .mockReturnValueOnce(second as never);
+
+    const answer = await changesCallback()({ marker });
+
+    expect(connectImap).toHaveBeenCalledTimes(2);
+    expect(wireOf(second)).toEqual([
+      "a1 CAPABILITY",
+      "a2 LOGIN [redacted]",
+      "a3 CAPABILITY",
+      'a4 EXAMINE "INBOX"',
+      "a5 UID SEARCH UID 4392:4394",
+      "a6 LOGOUT",
+    ]);
+
+    const trusted = trustedOf(answer);
+    expect(trusted.counts).toEqual([
+      {
+        source: "mail",
+        folder: "INBOX",
+        state: "no_changes",
+        newMessages: 0,
+        otherActivity: true,
+        mechanism: "status-modseq",
+      },
+    ]);
+
+    const { userId } = await ownerPrincipal();
+    const reading = await readMarker(trusted.marker, userId, env.CONFIRM_SECRET);
+    expect(reading.kind).toBe("current");
+    if (reading.kind !== "current") return;
+    expect(reading.content.folders[0]!.uidNext).toBe(4395);
   });
 });
 

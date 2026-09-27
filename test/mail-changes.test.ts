@@ -36,6 +36,7 @@ import {
   POST_AUTH_CAPABILITY,
   PRE_AUTH_CAPABILITY,
   capabilityResponse,
+  emptySearchReply,
   logoutExchange,
   statusResponse,
   taggedNo,
@@ -231,6 +232,39 @@ describe("newMailOver records exactly the header-only reads (CHNG-09)", () => {
       `a6 UID FETCH ${newest.join(",")} ${ROW_FETCH_ITEMS}`,
       "a7 LOGOUT",
     ]);
+  });
+
+  it("iCloud's empty range, OK with no search line: none new, and no fetch", async () => {
+    // Measured on 2026-09-27 (21-UAT.md, "Probe, 2026-09-27"): when a UID search
+    // matches nothing, iCloud sends the completion and no untagged search line.
+    // For a range, that is iCloud's "none": the next UID moved because mail
+    // arrived and left again before this check.
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      examineReply("a4"),
+      emptySearchReply("a5"),
+      logoutExchange("a6"),
+    ]);
+
+    const found = await newMailOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      MAILBOX,
+      UIDVALIDITY,
+      4392,
+      4395,
+    );
+
+    expect(wireOf(duplex)).toEqual([
+      "a1 CAPABILITY",
+      "a2 LOGIN [redacted]",
+      "a3 CAPABILITY",
+      'a4 EXAMINE "INBOX"',
+      "a5 UID SEARCH UID 4392:4394",
+      "a6 LOGOUT",
+    ]);
+    expect(found).toEqual({ count: 0, rows: [] });
   });
 
   it("a UID the search named and the fetch did not answer: the row is absent, no error", async () => {

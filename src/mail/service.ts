@@ -2627,6 +2627,13 @@ export interface NewMail {
  * two next UIDs: that difference counts mail that arrived and was then deleted.
  * Only UIDs inside the range are kept, because a server may answer a range with
  * a UID outside it.
+ *
+ * An OK with no untagged search line counts as none, and that is measured, not
+ * assumed. iCloud sends no search line at all when a UID search matches nothing
+ * (21-UAT.md, "Probe, 2026-09-27"), and for a range that is the ordinary answer
+ * when mail arrived and left again before this check. A move's re-read cannot
+ * read it that way, because there "none" is the claim being proven; this range
+ * only reports a count, so it can.
  */
 async function newMailIn(
   session: MailSession,
