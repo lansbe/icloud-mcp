@@ -424,6 +424,18 @@ Two layers, on purpose. The structural one is a request-scoped gate that refuses
 a second acquisition at runtime. The detective one is the scan, which refuses it
 at commit time and is the cheaper of the two, because nothing has to run.
 
+**A third layer works across requests.** The gate above only sees one request, so it cannot stop
+two Claude apps signed in to the same Apple ID from each opening a connection. Each signed-in
+person now has one Durable Object. A mail tool call must hold that object's lease before it opens
+a connection. A second call that finds the lease held is refused at once with a plain reason. It
+is not queued. The lease expires on its own after 30 seconds, so a request that dies part-way
+cannot hold it forever.
+
+The lease is added to the gate. It does not replace it. Do not remove the per-request gate because
+the object serializes too: a bug in the object would then remove the only runtime check, and
+nothing would fail. The object holds a lease and nothing else. It never opens a socket and never
+imports mail code. Changing either of those is a decision, not a refactor.
+
 ### 4. Credentials never reach a log or an error
 
 There are no logging calls anywhere under `src/`. Not "no logging of

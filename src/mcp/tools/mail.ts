@@ -23,6 +23,7 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
 import { z } from "zod";
+import type { LeasedMail } from "../../agent/lease";
 import {
   CONFIRM_TTL_SECONDS,
   CONFIRM_VERSION,
@@ -80,7 +81,6 @@ import type {
   MessageDetail,
   MessagePage,
   SearchPage,
-  SessionGate,
 } from "../../mail/service";
 import {
   DEFAULT_MAILBOX,
@@ -1899,21 +1899,26 @@ function isUnselectable(attributes: readonly string[]): boolean {
  * plain-JSON answer. Otherwise the confirmation seals the source folder, its
  * validity, the destination and each message's size, internal date and MODSEQ,
  * in the caller's order.
+ *
+ * The lease is taken around the one read session and nothing else (Phase 24):
+ * it is given back before the confirmation is minted.
  */
 export async function buildMovePreview(
   actor: Principal,
-  gate: SessionGate,
+  mail: LeasedMail,
   request: MoveRequest,
   destination: MoveDestination,
   op: "move",
 ): Promise<ToolResult> {
   const first = request.refs[0]!;
   const source = { mailbox: first.mailbox, uidValidity: first.uidValidity };
-  const facts = await readMoveSet(
-    actor,
-    gate,
-    source,
-    request.refs.map((ref) => ref.uid),
+  const facts = await mail.withConnectionLease(actor, (leased) =>
+    readMoveSet(
+      actor,
+      leased,
+      source,
+      request.refs.map((ref) => ref.uid),
+    ),
   );
 
   const idOf = new Map(request.refs.map((ref, index) => [ref.uid, request.ids[index]!]));
@@ -2069,10 +2074,17 @@ export interface MailCommitApplied {
  * reservation; then one call. Every refusal before the reservation is the one
  * `ConfirmationInvalidError`, so none of them spends the slot and none of them
  * says which check failed.
+ *
+ * The lease (Phase 24) is taken AFTER every check and BEFORE the reservation,
+ * and held across the reservation and the one move session. That order is the
+ * point. A busy refusal must not spend the confirmation: its sentence says
+ * nothing was started or changed, and a spent slot would be a change the user
+ * then has to repair with a fresh preview. The reservation is one small
+ * storage write, not a session and not staged-file work.
  */
 export async function applyMailCommit(
   actor: Principal,
-  gate: SessionGate,
+  mail: LeasedMail,
   confirmToken: string,
   change: MailCommitChange,
 ): Promise<MailCommitApplied> {
@@ -2122,20 +2134,22 @@ export async function applyMailCommit(
     }
   }
 
-  await reserveConfirmation(env.CONFIRM_KV, actor.userId, payload.j, payload.x);
+  const outcome = await mail.withConnectionLease(actor, async (leased) => {
+    await reserveConfirmation(env.CONFIRM_KV, actor.userId, payload.j, payload.x);
 
-  const outcome = await moveMessages(
-    actor,
-    gate,
-    { mailbox: sourceMailbox, uidValidity: payload.uv },
-    payload.l.map((entry) => ({
-      uid: entry.i,
-      size: entry.z,
-      internalDate: entry.d,
-      modSeq: entry.n,
-    })),
-    destinationMailbox,
-  );
+    return moveMessages(
+      actor,
+      leased,
+      { mailbox: sourceMailbox, uidValidity: payload.uv },
+      payload.l.map((entry) => ({
+        uid: entry.i,
+        size: entry.z,
+        internalDate: entry.d,
+        modSeq: entry.n,
+      })),
+      destinationMailbox,
+    );
+  });
   return {
     outcome,
     destinationId: payload.q,
@@ -2217,24 +2231,47 @@ function mailCommitResult(ids: readonly string[], applied: MailCommitApplied): T
 /**
  * Register the mail tools on a per-request server instance.
  *
- * `gate` is built per request in `createServerFactory` and threaded in, rather
- * than reached for from module scope. See `createSessionGate` for why an
- * isolate-wide counter would refuse legitimate concurrent requests.
+ * **No tool here is handed a session gate.** `mail` is the per-person
+ * connection lease (Phase 24), built in `createServerFactory` over that
+ * request's gate. A tool reaches the gate only through
+ * `mail.withConnectionLease`, which takes the person's lease first and hands
+ * the gate to the one service call inside. So a tool cannot open an iCloud
+ * mail connection without the lease: there is no gate in scope to open one
+ * with. That is structural on purpose. PITFALLS #52 names the failure the
+ * gate alone could not see, two overlapping REQUESTS from one Apple ID, and
+ * ./.claude/CLAUDE.md §3 says why a second connection is costly: iCloud's
+ * per-account ceiling is low, undocumented, and locks the user out of Mail.app
+ * when it is exhausted.
+ *
+ * The rules each call site keeps:
+ * - The lease is taken after `await principal` and after every id is decoded,
+ *   so the cheap refusals still run first and spend nothing, and a refused
+ *   principal never reaches the object.
+ * - One lease per service call, around that call and nothing else. A tool that
+ *   runs two sessions takes it twice, because the lease's expiry is sized to
+ *   one session. Staged-file work in R2 is never done under the lease.
+ * - The lease is taken outside the orchestrator, never inside
+ *   `withMailSession`'s check-and-acquire span.
+ *
+ * The gate itself is unchanged and still built per request; see
+ * `createSessionGate` for why an isolate-wide counter would refuse legitimate
+ * concurrent requests. The lease is added beside it, never in its place.
  *
  * `principal` is a promise of who the request acts for, made once per request
  * at the door. Every callback awaits it as the first line of its `try`, and
  * hands the resolved object to each mail function it calls. A refusal is
  * already the auth error, and each `catch` already maps that to
- * `auth_failed`, so an unset secret answers before the gate is touched and
- * before a socket opens. The await lives HERE and nowhere below: the session
- * orchestrator must not await ahead of its gate (see `withMailSession`).
+ * `auth_failed`, so an unset secret answers before the lease or the gate is
+ * touched and before a socket opens. The await lives HERE and nowhere below:
+ * the session orchestrator must not await ahead of its gate (see
+ * `withMailSession`).
  *
  * The staging helpers still take the ambient `env`. They reach R2, not mail,
  * and hold no credential.
  */
 export function registerMailTools(
   server: McpServer,
-  gate: SessionGate,
+  mail: LeasedMail,
   principal: Promise<Principal>,
 ): void {
   server.registerTool(
@@ -2259,7 +2296,9 @@ export function registerMailTools(
         // socket is opened, which is the cheapest possible refusal and the one
         // that spends none of the connection budget.
         const ref = decodeMessageId(id);
-        const detail = await getMessage(actor, gate, ref, { includeHtml });
+        const detail = await mail.withConnectionLease(actor, (leased) =>
+          getMessage(actor, leased, ref, { includeHtml }),
+        );
         return messageToolResult(detail);
       } catch (err) {
         // The same backstop shape `registerDiagnoseTool` uses: one boundary,
@@ -2282,7 +2321,11 @@ export function registerMailTools(
     async () => {
       try {
         const actor = await principal;
-        return folderToolResult(await listFolders(actor, gate));
+        return folderToolResult(
+          await mail.withConnectionLease(actor, (leased) =>
+            listFolders(actor, leased),
+          ),
+        );
       } catch (err) {
         return mailErrorResult(err);
       }
@@ -2317,7 +2360,9 @@ export function registerMailTools(
         // refused without spending any of the connection budget.
         const folder = decodeFolderId(folderId);
         return messagePageToolResult(
-          await listMessages(actor, gate, folder.mailbox, { pageSize, cursor }),
+          await mail.withConnectionLease(actor, (leased) =>
+            listMessages(actor, leased, folder.mailbox, { pageSize, cursor }),
+          ),
         );
       } catch (err) {
         return mailErrorResult(err);
@@ -2378,13 +2423,18 @@ export function registerMailTools(
     async ({ folderId, keyword, sender, startDate, endDate, pageSize, cursor }) => {
       try {
         const actor = await principal;
+        // Decoded before the lease is taken, so a bad folder id is refused at
+        // no cost to the object or the connection budget.
+        const mailbox = resolveMailbox(folderId);
         return searchPageToolResult(
-          await searchMessages(
-            actor,
-            gate,
-            resolveMailbox(folderId),
-            { keyword, sender, startDate, endDate },
-            { pageSize, cursor },
+          await mail.withConnectionLease(actor, (leased) =>
+            searchMessages(
+              actor,
+              leased,
+              mailbox,
+              { keyword, sender, startDate, endDate },
+              { pageSize, cursor },
+            ),
           ),
         );
       } catch (err) {
@@ -2420,11 +2470,12 @@ export function registerMailTools(
     async ({ folderId, pageSize, cursor }) => {
       try {
         const actor = await principal;
+        // Decoded before the lease is taken, as mail_search does it.
+        const mailbox = resolveMailbox(folderId);
         return messagePageToolResult(
-          await listUnread(actor, gate, resolveMailbox(folderId), {
-            pageSize,
-            cursor,
-          }),
+          await mail.withConnectionLease(actor, (leased) =>
+            listUnread(actor, leased, mailbox, { pageSize, cursor }),
+          ),
         );
       } catch (err) {
         return mailErrorResult(err);
@@ -2539,7 +2590,13 @@ export function registerMailTools(
               quoted: null,
               now: new Date(),
             }),
-          (message) => appendDraft(actor, gate, mailbox, message),
+          // The lease is taken HERE, around the one write session, and not
+          // around this whole call: the staged reads before it and the
+          // deletes after it are R2 work and never hold the lease.
+          (message) =>
+            mail.withConnectionLease(actor, (leased) =>
+              appendDraft(actor, leased, mailbox, message),
+            ),
           Date.now(),
         );
 
@@ -2730,7 +2787,12 @@ export function registerMailTools(
         // the opaque id encodes the mailbox, the validity and the UID and NOT
         // the parent's Message-ID, so the threading headers cannot be built
         // from anything the caller holds. One session, serial, peeking.
-        const parent = await getReplyParent(actor, gate, ref);
+        // Its own lease, given back when this session closes. The write below
+        // takes a second one: two sessions, two leases (the expiry is sized
+        // to one session).
+        const parent = await mail.withConnectionLease(actor, (leased) =>
+          getReplyParent(actor, leased, ref),
+        );
 
         const recipients = replyRecipients(parent.headers, {
           self,
@@ -2769,7 +2831,13 @@ export function registerMailTools(
               quoted,
               now: new Date(),
             }),
-          (message) => appendDraft(actor, gate, mailbox, message),
+          // The lease is taken HERE, around the one write session, and not
+          // around this whole call: the staged reads before it and the
+          // deletes after it are R2 work and never hold the lease.
+          (message) =>
+            mail.withConnectionLease(actor, (leased) =>
+              appendDraft(actor, leased, mailbox, message),
+            ),
           Date.now(),
         );
 
@@ -2916,7 +2984,9 @@ export function registerMailTools(
         // undocumented per-account ceiling; the transfer decode and the
         // extraction are pure CPU over megabytes and race nothing. Moving
         // either inside would spend a connection on arithmetic.
-        const content = await getAttachmentContent(actor, gate, ref);
+        const content = await mail.withConnectionLease(actor, (leased) =>
+          getAttachmentContent(actor, leased, ref),
+        );
 
         if (!content.fetch.fetched) {
           // A part this server declined to ask for. A SUCCESSFUL call carrying
@@ -3179,7 +3249,9 @@ export function registerMailTools(
         // One session, and it is CLOSED before the next line runs. Every storage
         // operation is outside it — see `stageAttachmentContent`, whose
         // signature is what makes that structural rather than remembered.
-        const content = await getAttachmentContent(actor, gate, ref);
+        const content = await mail.withConnectionLease(actor, (leased) =>
+          getAttachmentContent(actor, leased, ref),
+        );
         const outcome = await stageAttachmentContent(
           env,
           actor.userId,
@@ -3353,9 +3425,9 @@ export function registerMailTools(
         // Decoded before any socket, as every other tool here does it: a bad
         // token is refused without spending a connection.
         const ref = decodeMessageId(id);
-        const outcome = read
-          ? await markRead(actor, gate, ref)
-          : await markUnread(actor, gate, ref);
+        const outcome = await mail.withConnectionLease(actor, (leased) =>
+          read ? markRead(actor, leased, ref) : markUnread(actor, leased, ref),
+        );
         return readStateToolResult(id, read, outcome);
       } catch (err) {
         return mailErrorResult(err);
@@ -3394,9 +3466,11 @@ export function registerMailTools(
         const actor = await principal;
         // Decoded before any socket: a bad token costs no connection.
         const ref = decodeMessageId(id);
-        const outcome = flagged
-          ? await flagMessage(actor, gate, ref)
-          : await unflagMessage(actor, gate, ref);
+        const outcome = await mail.withConnectionLease(actor, (leased) =>
+          flagged
+            ? flagMessage(actor, leased, ref)
+            : unflagMessage(actor, leased, ref),
+        );
         return flagStateToolResult(id, flagged, outcome);
       } catch (err) {
         return mailErrorResult(err);
@@ -3444,7 +3518,7 @@ export function registerMailTools(
         return await withMailConfirmationBoundary(() =>
           buildMovePreview(
             actor,
-            gate,
+            mail,
             { ids: [...ids], refs, destinationId: destination },
             { kind: "folder", mailbox: target.mailbox },
             "move",
@@ -3489,7 +3563,7 @@ export function registerMailTools(
         return await withMailConfirmationBoundary(() =>
           buildMovePreview(
             actor,
-            gate,
+            mail,
             { ids: [...ids], refs, destinationId: null },
             { kind: "role", role: "archive" },
             "move",
@@ -3537,7 +3611,7 @@ export function registerMailTools(
         return await withMailConfirmationBoundary(() =>
           buildMovePreview(
             actor,
-            gate,
+            mail,
             { ids: [...ids], refs, destinationId: null },
             { kind: "role", role: "trash" },
             "move",
@@ -3585,7 +3659,7 @@ export function registerMailTools(
       try {
         const actor = await principal;
         const applied = await withMailConfirmationBoundary(() =>
-          applyMailCommit(actor, gate, confirmToken, change),
+          applyMailCommit(actor, mail, confirmToken, change),
         );
         return mailCommitResult(change.ids, applied);
       } catch (err) {

@@ -29,6 +29,7 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
 import { createDavFetch } from "../../src/dav/transport";
 import type { Env } from "../../src/env";
+import { createLeasedMail } from "../../src/agent/lease";
 import { createSessionGate } from "../../src/mail/service";
 import { registerCalendarTools } from "../../src/mcp/tools/calendar";
 import { registerMailTools } from "../../src/mcp/tools/mail";
@@ -256,7 +257,7 @@ export function toolsFor(user: TestUser, extra?: ExtraTools): UserTools {
   principal.catch(() => {});
 
   try {
-    registerMailTools(server, createSessionGate(), principal);
+    registerMailTools(server, createLeasedMail(createSessionGate()), principal);
     registerCalendarTools(server, createDavFetch(principal), principal);
 
     // After the real registrations, onto the same list, so an extra tool is

@@ -12,3 +12,9 @@ import { oauthProviderOptions } from "./auth/oauth";
 import type { Env } from "./env";
 
 export default new OAuthProvider<Env>(oauthProviderOptions);
+
+// The per-person Durable Object class (Phase 24). Deploy and the test pool both
+// require a class bound in wrangler.jsonc to be exported from this entry module;
+// without this line the deploy refuses the binding and the pool cannot run the
+// object.
+export { UserAgent } from "./agent/user-agent";

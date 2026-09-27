@@ -1,4 +1,4 @@
-// The FND-05 error boundary: a closed vocabulary of exactly eight categories,
+// The FND-05 error boundary: a closed vocabulary of exactly nine categories,
 // and a translation function that dispatches on type rather than on text.
 //
 // Four through Phases 1-4. Two more arrived in Phase 5 (CALW-05 and CALW-04),
@@ -15,6 +15,11 @@
 // reported `connection_failed` against a server it had never contacted: a
 // failure that says nothing about iCloud, dressed as a transient fault the
 // model is told to retry.
+//
+// A ninth, `connection_busy`, arrived in Phase 24 (D-06, owner-accepted on
+// 2026-09-27), from the IMAP side, raised by the per-person connection lease.
+// It sits beside `rate_limited` rather than reusing it because that entry
+// blames iCloud, and on a held lease iCloud refused nothing.
 
 import { describe, expect, it } from "vitest";
 // Namespace imports, used by the reachability set-equality at the foot of this
@@ -38,6 +43,7 @@ import {
 } from "../src/dav/errors";
 import type { ErrorCategory } from "../src/errors";
 import {
+  ConnectionBusyError,
   ImapAuthError,
   ImapConnectError,
   ImapNotFoundError,
@@ -48,10 +54,10 @@ import {
 import { FAKE_APP_PASSWORD, FAKE_APPLE_ID } from "./fixtures/bound-secrets";
 
 /**
- * The eight values the vocabulary now holds, listed exhaustively.
+ * The nine values the vocabulary now holds, listed exhaustively.
  *
  * The record below is the type-level half of the exhaustiveness claim: adding
- * a ninth member to `ErrorCategory` makes it a compile error, and removing
+ * a tenth member to `ErrorCategory` makes it a compile error, and removing
  * one makes the excess key a compile error. `npx tsc --noEmit` is therefore
  * part of this assertion, not merely adjacent to it.
  */
@@ -64,14 +70,16 @@ const EVERY_CATEGORY: Record<ErrorCategory, true> = {
   confirmation_invalid: true,
   subscription_unreadable: true,
   request_unsendable: true,
+  connection_busy: true,
 };
 
 const CATEGORIES = Object.keys(EVERY_CATEGORY) as ErrorCategory[];
 
-/** The eight, sorted, so every set assertion below reads from one place. */
+/** The nine, sorted, so every set assertion below reads from one place. */
 const SORTED_CATEGORIES = [
   "auth_failed",
   "confirmation_invalid",
+  "connection_busy",
   "connection_failed",
   "not_found",
   "rate_limited",
@@ -113,13 +121,13 @@ const EVERY_INPUT: unknown[] = [
 ];
 
 describe("the category vocabulary", () => {
-  it("is exactly the eight values the vocabulary now holds, with no ninth", () => {
-    expect(CATEGORIES).toHaveLength(8);
+  it("is exactly the nine values the vocabulary now holds, with no tenth", () => {
+    expect(CATEGORIES).toHaveLength(9);
     expect([...CATEGORIES].sort()).toEqual(SORTED_CATEGORIES);
   });
 
   it("has one fixed safe message per category and no others", () => {
-    expect(Object.keys(SAFE_MESSAGES)).toHaveLength(8);
+    expect(Object.keys(SAFE_MESSAGES)).toHaveLength(9);
     expect([...Object.keys(SAFE_MESSAGES)].sort()).toEqual(
       [...CATEGORIES].sort(),
     );
@@ -230,6 +238,24 @@ describe("toErrorCategory", () => {
       "connection_failed",
     );
     expect(toErrorCategory(new ImapNotFoundError()).category).toBe("not_found");
+    expect(toErrorCategory(new ConnectionBusyError()).category).toBe(
+      "connection_busy",
+    );
+  });
+
+  it("gives a held connection lease its own fixed sentence, which does not blame iCloud (D-06)", () => {
+    // Pinned by value, in the order the plan fixed: what is happening, that
+    // nothing was started or changed, how to retry, and when it clears.
+    expect(toErrorCategory(new ConnectionBusyError())).toEqual({
+      category: "connection_busy",
+      message:
+        "Another request on this account is already using its iCloud mail " +
+        "connection, so this request was not started and nothing was changed. " +
+        "Wait a few seconds before retrying, and do not retry in a loop. A " +
+        "request that stopped part-way clears itself within half a minute.",
+    });
+    expect(SAFE_MESSAGES.connection_busy).not.toBe(SAFE_MESSAGES.rate_limited);
+    expect(SAFE_MESSAGES.connection_busy).not.toContain("refusing");
   });
 
   it("reaches not_found without the vocabulary growing a member for it", () => {
@@ -240,12 +266,12 @@ describe("toErrorCategory", () => {
     // class rather than in a deliberate vocabulary edit would fail here and in
     // the `EVERY_CATEGORY` record above, which `npx tsc --noEmit` checks.
     expect(toErrorCategory(new ImapNotFoundError()).category).toBe("not_found");
-    expect(CATEGORIES).toHaveLength(8);
+    expect(CATEGORIES).toHaveLength(9);
 
     const produced = new Set(
       EVERY_INPUT.map((input) => toErrorCategory(input).category),
     );
-    // The IMAP tree reaches four of the eight. The four categories that
+    // The IMAP tree reaches four of the nine from these inputs. The four categories that
     // arrived after Phase 1 (the two from Phase 5, plus
     // `subscription_unreadable` and `request_unsendable`) are raised from the
     // DAV tree only, which is why this is a subset assertion and not an
@@ -300,7 +326,7 @@ describe("the connection-limit detail (WINDOWS.md ledger entry 6)", () => {
     expect(toErrorCategory(new ImapThrottleError(REFUSAL)).category).toBe(
       "rate_limited",
     );
-    expect(CATEGORIES).toHaveLength(8);
+    expect(CATEGORIES).toHaveLength(9);
     expect([...CATEGORIES].sort()).toEqual(SORTED_CATEGORIES);
   });
 
@@ -433,8 +459,9 @@ describe("every category is reachable, and every reachable answer is a category"
    *
    * The two trees share a vocabulary and nothing else at runtime, so neither
    * translation function can prove this on its own: the IMAP tree reaches four
-   * of the eight, and the four categories that arrived after Phase 1 are
-   * raised only from the DAV side. The union is the only thing the claim can
+   * of the first eight plus Phase 24's `connection_busy`, and the four
+   * categories that arrived between Phase 1 and Phase 24 are raised only from
+   * the DAV side. The union is the only thing the claim can
    * be made over.
    */
   const REACHABLE_CATEGORIES = new Set<ErrorCategory>([
@@ -443,6 +470,7 @@ describe("every category is reachable, and every reachable answer is a category"
       new ImapConnectError(),
       new ImapThrottleError(),
       new ImapNotFoundError(),
+      new ConnectionBusyError(),
     ].map((err) => toErrorCategory(err).category),
     ...[
       new DavAuthError(),
@@ -660,15 +688,19 @@ describe("the wait outcome is one answer, not two that happen to agree (CONF-06)
 });
 
 describe("the floor, and what it is allowed to promise (CONF-06)", () => {
-  it("still holds exactly eight categories, with no ninth added beside the wait outcome", () => {
+  it("holds exactly nine categories; the one added beside the wait outcome was a decision (D-06)", () => {
     // Stated here as well as in the vocabulary block above, because THIS is
     // the plan that had the obvious reason to add one. A server asking the
     // caller to wait already has its own entry; inventing a second beside it
     // would have put a category in the model's vocabulary that duplicates a
     // shipped one, which is the hazard `src/errors.ts`'s own header names from
     // the other direction.
-    expect(CATEGORIES).toHaveLength(8);
-    expect(Object.keys(SAFE_MESSAGES)).toHaveLength(8);
+    //
+    // Phase 24 did add one, `connection_busy`, and the owner decided it on
+    // 2026-09-27. It is not a duplicate: `rate_limited` says iCloud is
+    // refusing, and a held lease is the person's own other request.
+    expect(CATEGORIES).toHaveLength(9);
+    expect(Object.keys(SAFE_MESSAGES)).toHaveLength(9);
     expect(CATEGORIES).not.toContain("throttled");
     expect(CATEGORIES).not.toContain("service_unavailable");
   });
@@ -809,8 +841,8 @@ describe("every error class this repository exports is named in a dispatcher bra
     // LOUDLY, which is the opposite of one written in prose.
     expect(
       EXPORTED_ERROR_CLASSES.size,
-      "four Imap* classes, one Mail* class and ten Dav* classes ship today",
-    ).toBe(15);
+      "four Imap* classes, one Mail* class, ConnectionBusyError and ten Dav* classes ship today",
+    ).toBe(16);
     // Phase 21: the mail tree's translation of a refused confirmation.
     expect([...EXPORTED_ERROR_CLASSES.keys()]).toContain("MailConfirmationError");
     expect([...EXPORTED_ERROR_CLASSES.keys()]).toContain("ImapThrottleError");

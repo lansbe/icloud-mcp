@@ -11,6 +11,8 @@
 // behavioural half is a recorded manual UAT owned by plan 02-13.
 
 import type { McpServer } from "@modelcontextprotocol/server";
+import { listDurableObjectIds } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
@@ -35,6 +37,7 @@ import type {
   MessageSummary,
   SearchPage,
 } from "../src/mail/service";
+import { createLeasedMail } from "../src/agent/lease";
 import { PAGE_SIZE_DEFAULT, createSessionGate } from "../src/mail/service";
 import type {
   AttachmentReport,
@@ -1019,7 +1022,7 @@ describe("the registrations themselves", () => {
     // socket or reads a credential.
     registerMailTools(
       server as unknown as McpServer,
-      createSessionGate(),
+      createLeasedMail(createSessionGate()),
       ownerPrincipal(),
     );
     return recorded;
@@ -1749,7 +1752,7 @@ describe("the search and unread registrations", () => {
     };
     registerMailTools(
       server as unknown as McpServer,
-      createSessionGate(),
+      createLeasedMail(createSessionGate()),
       ownerPrincipal(),
     );
     return recorded;
@@ -2178,7 +2181,7 @@ describe("the compose registration", () => {
     };
     registerMailTools(
       server as unknown as McpServer,
-      createSessionGate(),
+      createLeasedMail(createSessionGate()),
       ownerPrincipal(),
     );
     return recorded;
@@ -2417,7 +2420,7 @@ describe("the reply registration", () => {
     };
     registerMailTools(
       server as unknown as McpServer,
-      createSessionGate(),
+      createLeasedMail(createSessionGate()),
       ownerPrincipal(),
     );
     return recorded;
@@ -3061,7 +3064,7 @@ describe("the mail_get_attachment registration", () => {
     };
     registerMailTools(
       server as unknown as McpServer,
-      createSessionGate(),
+      createLeasedMail(createSessionGate()),
       ownerPrincipal(),
     );
     return recorded;
@@ -3220,7 +3223,7 @@ describe("the mail_stage_attachment registration", () => {
     };
     registerMailTools(
       server as unknown as McpServer,
-      createSessionGate(),
+      createLeasedMail(createSessionGate()),
       ownerPrincipal(),
     );
     return recorded;
@@ -3500,7 +3503,7 @@ describe("the mail_confirm_upload registration", () => {
     };
     registerMailTools(
       server as unknown as McpServer,
-      createSessionGate(),
+      createLeasedMail(createSessionGate()),
       ownerPrincipal(),
     );
     return recorded;
@@ -3574,7 +3577,18 @@ describe("the mail_confirm_upload registration", () => {
 // and nothing below it runs: the gate is never touched, so no socket opens. An
 // unset Worker secret is exactly this case, because the env constructor rejects
 // with the auth error.
+//
+// Since Phase 24 the lease sits in front of the gate, and a refused principal
+// must not reach it either: no per-person object is created for a caller the
+// door turned away (T-24-11). The object list is read before and after, rather
+// than required to be empty, because storage persists across cases in a file.
 describe("a principal that was refused opens nothing", () => {
+  async function objectIds(): Promise<string[]> {
+    return (await listDurableObjectIds(env.USER_AGENT))
+      .map((id) => id.toString())
+      .sort();
+  }
+
   type Callback = (args: Record<string, unknown>) => Promise<{
     isError?: boolean;
     content: { type: string; text: string }[];
@@ -3600,7 +3614,7 @@ describe("a principal that was refused opens nothing", () => {
         callbacks.set(name, callback);
       },
     };
-    registerMailTools(server as unknown as McpServer, gate, rejected);
+    registerMailTools(server as unknown as McpServer, createLeasedMail(gate), rejected);
     return { gate, acquire, callbacks };
   }
 
@@ -3610,6 +3624,7 @@ describe("a principal that was refused opens nothing", () => {
 
   it("mail_list_folders answers auth_failed with the fixed message and never acquires the gate", async () => {
     const { gate, acquire, callbacks } = refusedTools();
+    const before = await objectIds();
 
     const result = await callbacks.get("mail_list_folders")!({});
 
@@ -3620,6 +3635,7 @@ describe("a principal that was refused opens nothing", () => {
     });
     expect(acquire).not.toHaveBeenCalled();
     expect(gate.held).toBe(false);
+    expect(await objectIds()).toEqual(before);
   });
 
   it("every mail tool does the same, whatever its arguments would have been", async () => {
@@ -3628,6 +3644,7 @@ describe("a principal that was refused opens nothing", () => {
     // means the await really is ahead of everything else in the try, the
     // storage-only tool included.
     const { gate, acquire, callbacks } = refusedTools();
+    const before = await objectIds();
 
     for (const [name, callback] of callbacks) {
       const result = await callback({});
@@ -3635,6 +3652,8 @@ describe("a principal that was refused opens nothing", () => {
 
       expect(result.isError, name).toBe(true);
       expect(body.category, name).toBe("auth_failed");
+      // No object reached for this caller, after each call.
+      expect(await objectIds(), name).toEqual(before);
     }
     expect(acquire).not.toHaveBeenCalled();
     expect(gate.held).toBe(false);

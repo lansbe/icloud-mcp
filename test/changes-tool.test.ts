@@ -8,6 +8,7 @@
 // keeps. The redactor is copied from there rather than imported.
 
 import type { McpServer } from "@modelcontextprotocol/server";
+import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -27,6 +28,7 @@ import {
 import { encodeCalendarId } from "../src/dav/ids";
 import { createDavFetch } from "../src/dav/transport";
 import type { DavFetch } from "../src/dav/transport";
+import { createLeasedMail } from "../src/agent/lease";
 import type { MailSessionOptions } from "../src/mail/service";
 import { createSessionGate } from "../src/mail/service";
 import { connectImap } from "../src/mail/socket";
@@ -44,7 +46,8 @@ import {
   importConfirmationKey,
   mintConfirmation,
 } from "../src/confirm";
-import { ImapAuthError } from "../src/errors";
+import type { UserAgent } from "../src/agent/user-agent";
+import { ConnectionBusyError, ImapAuthError, SAFE_MESSAGES } from "../src/errors";
 import { decodeFolderId, encodeFolderId } from "../src/mail/ids";
 import { TOKEN_ENCODER, toBase64Url } from "../src/tokens";
 import {
@@ -92,7 +95,7 @@ function changesCallback(
   };
   registerChangesTool(
     server as unknown as McpServer,
-    createSessionGate(),
+    createLeasedMail(createSessionGate()),
     ownerPrincipal(),
     davFetch,
     options,
@@ -925,7 +928,7 @@ function changesSchema(): { safeParse(input: unknown): any } {
   };
   registerChangesTool(
     server as unknown as McpServer,
-    createSessionGate(),
+    createLeasedMail(createSessionGate()),
     ownerPrincipal(),
     createDavFetch(ownerPrincipal()),
   );
@@ -1709,7 +1712,7 @@ describe("an unusable signing key is refused before any socket, apart from a bad
     };
     registerChangesTool(
       server as unknown as McpServer,
-      createSessionGate(),
+      createLeasedMail(createSessionGate()),
       ownerPrincipal(),
       createDavFetch(ownerPrincipal()),
       {},
@@ -1785,5 +1788,120 @@ describe("since is per source when a source was carried (WR-05)", () => {
       since: new Date(1780000000 * 1000).toISOString(),
     });
     expect(trusted.counts[0].since).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 24-02: the connection lease, once per mail session (DOBJ-02, DOBJ-03)
+// ---------------------------------------------------------------------------
+
+describe("changes_since takes the lease once per mail session (Phase 24)", () => {
+  /** The owner's object, reached by user id as the tests may. */
+  async function ownerObject() {
+    return env.USER_AGENT.getByName((await ownerPrincipal()).userId);
+  }
+
+  /** Store a live lease record owned by some other request. */
+  async function seedHeld(): Promise<void> {
+    await runInDurableObject(await ownerObject(), (_instance, state) => {
+      state.storage.kv.put("lease", {
+        token: "another-request",
+        expiresAt: Date.now() + 60000,
+      });
+    });
+  }
+
+  async function readLease(): Promise<unknown> {
+    return runInDurableObject(await ownerObject(), (_instance, state) =>
+      state.storage.kv.get("lease"),
+    );
+  }
+
+  async function clearLease(): Promise<void> {
+    await runInDurableObject(await ownerObject(), (_instance, state) => {
+      state.storage.kv.delete("lease");
+    });
+  }
+
+  beforeEach(async () => {
+    await clearLease();
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await clearLease();
+  });
+
+  it("held before the status session: the whole call answers connection_busy, no marker, no socket", async () => {
+    const marker = await markerFor(inboxMarkerContent());
+    await seedHeld();
+
+    const answer = await changesCallback()({ marker });
+
+    expect(answer).toEqual(mailErrorResult(new ConnectionBusyError()));
+    expect(JSON.parse(answer.content[0]!.text)).toEqual({
+      category: "connection_busy",
+      message: SAFE_MESSAGES.connection_busy,
+    });
+    expect(answer.content[0]!.text).not.toContain("marker");
+    expect(connectImap).not.toHaveBeenCalled();
+  });
+
+  it("taken by another request between sessions: the folders left are not_checked with reason busy", async () => {
+    const marker = await markerFor({
+      folders: [
+        { mailbox: "Receipts", uidValidity: 7, uidNext: 40, highestModseq: null },
+        { mailbox: "Archive", uidValidity: 8, uidNext: 900, highestModseq: null },
+      ],
+      calendar: null,
+      mintedAt: 1790000000,
+    });
+    // One status session, and both folders show new mail, so two searches
+    // would follow. They never open.
+    vi.mocked(connectImap).mockReturnValueOnce(
+      statusSessionFor([
+        { mailbox: "Receipts", uidValidity: 7, uidNext: 42 },
+        { mailbox: "Archive", uidValidity: 8, uidNext: 901 },
+      ]) as never,
+    );
+    // Another request takes the lease the moment the status session gives it
+    // back: the object's release, for this one call, writes that request's
+    // record instead of freeing the lease. The next acquire then runs the
+    // object's own, unmodified logic and finds the lease held.
+    await runInDurableObject(await ownerObject(), (instance: UserAgent) => {
+      const prototype = Object.getPrototypeOf(instance) as UserAgent;
+      vi.spyOn(prototype, "release").mockImplementationOnce(function (this: UserAgent) {
+        (this as unknown as { ctx: DurableObjectState }).ctx.storage.kv.put("lease", {
+          token: "another-request",
+          expiresAt: Date.now() + 60000,
+        });
+      });
+    });
+
+    const answer = await changesCallback()({ marker, folders: [RECEIPTS, ARCHIVE] });
+
+    expect(answer.isError).toBeUndefined();
+    expect(connectImap).toHaveBeenCalledTimes(1);
+    const trusted = trustedOf(answer);
+    expect(
+      trusted.counts.map((one: any) => [one.folder, one.state, one.reason]),
+    ).toEqual([
+      [RECEIPTS, "not_checked", "busy"],
+      [ARCHIVE, "not_checked", "busy"],
+    ]);
+    expect(trusted.overall).toMatch(/could not be checked/);
+    // The seeded record is untouched: the refused acquire changed nothing.
+    expect(await readLease()).toMatchObject({ token: "another-request" });
+
+    // Each folder keeps its OLD state, so the next call covers the gap.
+    const { userId } = await ownerPrincipal();
+    const reading = await readMarker(trusted.marker, userId, env.CONFIRM_SECRET);
+    if (reading.kind !== "current") throw new Error("expected a current marker");
+    expect(
+      reading.content.folders.map((one) => [one.mailbox, one.uidNext]),
+    ).toEqual([
+      ["Receipts", 40],
+      ["Archive", 900],
+    ]);
   });
 });

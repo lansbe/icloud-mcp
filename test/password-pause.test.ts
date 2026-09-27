@@ -1178,7 +1178,11 @@ describe("LIFE-04: the dead-password pause", () => {
       // Every registration that receives it, by name. A registrar added to this
       // list is a tool that answers while a user is paused, which is a change to
       // the safety boundary rather than a refactor.
-      expect(SERVER_SOURCE).toContain("registerDiagnoseTool(server, unpaused)");
+      // The IMAP diagnostic also takes the leased mail since Phase 24 (D-07);
+      // the principal it answers for is still the unpaused one.
+      expect(SERVER_SOURCE).toContain(
+        "registerDiagnoseTool(server, leasedMail, unpaused)",
+      );
       expect(SERVER_SOURCE).toContain(
         "registerDavDiagnoseTool(server, davFetch, unpaused)",
       );

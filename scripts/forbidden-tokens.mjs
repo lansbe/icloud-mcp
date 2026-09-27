@@ -496,12 +496,19 @@ export const FORBIDDEN = [
   // hole is closed here by a test instead: it reads every function
   // src/mail/triage.ts exports and runs a fan-out around each through this
   // rule, so a verb added later without a name here turns that test red.
+  //
+  // Phase 24 (D-10 e) names the lease runner too, `withConnectionLease` in
+  // src/agent/lease.ts. Every mail tool now reaches its session through it,
+  // so it is the outermost name a fan-out would be written around. The
+  // structural half does refuse a second concurrent lease for the same person,
+  // but it refuses it as connection_busy at run time, after the fan-out was
+  // already written and shipped. The scan refuses it at commit time.
   {
     id: "concurrent-session",
     scope: "src/",
     pattern:
-      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|markRead|markUnread|flagMessage|unflagMessage|moveMessages|readMoveSet|buildMovePreview|applyMailCommit)/g,
-    why: "A concurrent combinator wrapped around either mail session orchestrator (read-only or mutating), the core under them, a triage verb in src/mail/triage.ts (mark read or unread, flag or unflag, move), or the mail move composites (readMoveSet, buildMovePreview, applyMailCommit). Each of those opens a session, and every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial, and a list of messages is worked through one at a time in one session: pass the whole list to moveMessages rather than mapping a verb over it.",
+      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|readMoveSet|buildMovePreview|applyMailCommit)/g,
+    why: "A concurrent combinator wrapped around the per-person lease runner (withConnectionLease in src/agent/lease.ts), either mail session orchestrator (read-only or mutating), the core under them, a triage verb in src/mail/triage.ts (mark read or unread, flag or unflag, move), or the mail move composites (readMoveSet, buildMovePreview, applyMailCommit). Each of those opens a session, and every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial, and a list of messages is worked through one at a time in one session: pass the whole list to moveMessages rather than mapping a verb over it.",
   },
   // The same property one protocol over, and the reason is deliberately NOT the
   // same. The two rules above lean on the six-connection platform cap. That cap
@@ -1000,6 +1007,78 @@ export const FORBIDDEN = [
     scope: "src/",
     pattern: /\benv\s*(?:[?!]\s*)?\.\s*(?:APPLE_ID|APPLE_APP_PASSWORD)\b/g,
     why: "A read of one of the two deleted account bindings off the environment object, under src/. Phase 13 removed both from the platform and removed the constructor that read them, so nothing supplies either value any more -- this rule replaced the count that used to permit exactly one reader, because with the reader gone that count's missing arm could never fire, and a constraint whose missing arm cannot fire looks exactly like one that was never added. A read here means somebody is identifying the caller from the deployment again instead of from the grant they signed in with, on a server that now serves more than one person. Take the signed-in principal the door already built and read its Apple ID field, or hand the principal to one of the two password owners. If this fired on a comment, describe the read by role -- write \"the account bindings\" and not the spelled read -- which is what src/principal.ts and src/env.ts both do. Do not narrow the pattern, do not rename the environment object to hide the read, and do not fold the login gate's own secret in: that one is not an Apple credential and has its own reader.",
+  },
+
+  // ------------------------------------------------------ per-person object
+  // Phase 24, D-10 (b) to (d). The structural half is plan 24-01's: one
+  // function, `agentFor` in src/agent/lease.ts, builds the stub for a person's
+  // object, and it takes a Principal, so no request field can choose whose
+  // object is reached. These three rules are the detective half. They keep that
+  // true through a future edit nobody reviews. The fourth, the count on reads
+  // of the namespace binding, sits with the other counts below.
+  //
+  // None of these can be seen by `store-key-without-a-user`. An object name is
+  // not a store key built from a prefix constant, and a key inside the object's
+  // own storage is not reachable from any other object. So the count and these
+  // rules are what hold the object name, not that rule.
+  //
+  // (b) The name argument. `getByName` is the by-name accessor on the
+  // namespace, and its first argument IS the object's identity. The permitted
+  // shape is an identifier chain ending in `.userId`: `principal.userId`,
+  // `actor.userId`, `ctx.actor.userId`. Anything else fires, including a bare
+  // identifier (`getByName(userId)`), because a bare name is exactly what a
+  // value lifted off a request looks like once it has been assigned. The
+  // `.userId` member is the one a Principal carries, and only the door and the
+  // login page build a Principal (the principal-constructor count).
+  //
+  // WHAT IT DOES NOT SEE. A `.userId` member on an object that is not a
+  // Principal: `request.userId`. The rule reads text, not types. The compiler
+  // is the first check there, because `agentFor` takes a Principal. A call
+  // through a bracket access or an alias of the method is not seen either.
+  //
+  // The whitespace after the open parenthesis sits INSIDE the lookahead. Outside
+  // it, the engine backtracks that whitespace to zero, starts the lookahead on
+  // the space or newline, and fires on `getByName( principal.userId )`.
+  {
+    id: "agent-name-not-from-principal",
+    scope: "src/",
+    pattern:
+      /\bgetByName\s*\((?!\s*[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\.\s*userId\s*[,)])/g,
+    why: "A stub for a per-person Durable Object built from a name that is not a Principal's userId member. DOBJ-01: the object is named from the signed-in principal the door built, never from a request field, a tool argument, a string literal or a bare variable. The object's name IS whose lease it holds, so a name a caller can influence reaches another person's object: it can hold their lease and refuse every mail call they make. Nothing in store-key-without-a-user can see an object name, so this rule and the namespace-read count are what hold it. Build the stub through agentFor(principal) in src/agent/lease.ts, which is the one construction site. If a second way to name an object is genuinely needed, that is a decision on the isolation boundary, not a refactor: get it, then change the owner, never the pattern.",
+  },
+  // (c) The three other id helpers on the namespace: the name-to-id helper,
+  // the string-to-id helper and the random-id helper. The string-to-id one is
+  // the dangerous one. It takes a 64-hex string, and a user id is a 64-hex
+  // string, so a call passing a user id typechecks and reads as right while
+  // meaning something else: a raw object id, which no name was ever hashed to.
+  // The other two are a second way to reach a stub beside the one site. Plan
+  // 24-01's modules describe all three by role, so the real tree passes.
+  //
+  // Scoped to `src/`. Tests may reach an object directly.
+  {
+    id: "durable-object-id-helper",
+    scope: "src/",
+    pattern: /\b(?:idFromName|idFromString|newUniqueId)\s*\(/g,
+    why: "One of the Durable Object namespace's id helpers, under src/. The string-to-id helper takes a 64-hex string and a user id is a 64-hex string, so a call passing a user id typechecks and looks right while naming a raw object id that no person was ever hashed to. The name-to-id and random-id helpers are a second way to reach a stub beside the one construction site, agentFor(principal) in src/agent/lease.ts, which names the object through the by-name accessor from the signed-in principal's userId. Use agentFor. If this fired on a comment, describe the helper by role, which is what src/agent/user-agent.ts does. Do not narrow the pattern.",
+  },
+  // (d) The object module's imports. The object holds a lease and never a
+  // session. It must not import mail, DAV, tool, auth, staging or feed code.
+  // The reason is cost and time: an open socket keeps a Durable Object resident
+  // and billed for up to 15 minutes per connection, and a socket held there
+  // would escape the 20-second call deadline that bounds every mail
+  // conversation in the Worker request (ARCHITECTURE §3.2). Phase 28's alarm
+  // reaches mail through /mcp, never from inside the object.
+  //
+  // Scoped to the object module itself. src/agent/lease.ts is the Worker-side
+  // half and correctly imports the session gate's type. Static and dynamic
+  // imports, and re-exports, are all seen. The socket module is already held by
+  // the socket-importer count.
+  {
+    id: "agent-object-reaches-mail",
+    scope: "src/agent/user-agent.ts",
+    pattern:
+      /(?:\bfrom\s*|\bimport\s*(?:\(\s*)?)["']\.\.\/(?:mail|dav|mcp|auth|staging|feed)(?:\/[^"'\n]*)?["']/g,
+    why: "The per-person Durable Object module imports mail, DAV, tool, auth, staging or feed code. The object holds a connection lease and never a session. An open socket keeps a Durable Object resident and billed for up to 15 minutes per connection, and a socket held in the object escapes the 20-second call deadline that bounds every mail conversation in the Worker request (ARCHITECTURE §3.2). The socket stays in the Worker request; the object only records that one conversation is open until a time. Phase 28's alarm reaches mail through /mcp, never directly. Move the work into the Worker request and take the lease there with withConnectionLease. A mail path inside the object is a decision on the boundary, not a refactor.",
   },
 ];
 
@@ -1606,6 +1685,75 @@ export function collectRemovalSites(relativePath, contents) {
     file: relativePath,
     ...positionOf(code, match.index),
   }));
+}
+
+/**
+ * A read of the per-person Durable Object namespace binding, permitted in
+ * exactly one file of the source tree (Phase 24, D-10 a, DOBJ-01).
+ *
+ * THE RULE. Exactly one file under `src/` names the binding in code, and it is
+ * `src/agent/lease.ts`, whose `agentFor(principal)` is the one stub
+ * construction. Its type declaration in `src/env.ts` is not a read.
+ *
+ * WHY A COUNT. A second reader is a second place an object can be named, and
+ * nothing in `store-key-without-a-user` can see an object name: it looks for
+ * store keys built from a prefix constant, and an object name is neither. So
+ * this count, the `agent-name-not-from-principal` rule and the two-people
+ * case in test/lease.test.ts are what hold the name. Zero readers is a
+ * violation too. It means the construction site was moved, renamed or emptied,
+ * and that direction is the quieter one: nothing fails on the way out, because
+ * the tests that covered the deleted code leave with it.
+ *
+ * THE SHAPE. Any line that names the binding as a whole word, except the
+ * interface member that declares it (`USER_AGENT: DurableObjectNamespace`,
+ * optionally `readonly` or optional). So member access, destructuring
+ * (`const { USER_AGENT } = env`) and bracket access with the name as a string
+ * all count. The exception names the declared type on purpose: an object
+ * literal line such as `USER_AGENT: env.USER_AGENT,` is a read and is seen.
+ *
+ * COMMENTS. Matched against the file with comment LINES blanked
+ * (`withoutCommentLines`), so a commented-out read does not satisfy the count
+ * and cannot keep the missing arm quiet, and prose describing the binding is
+ * not a reader. `src/env.ts` mentions it in a doc comment and is not counted.
+ *
+ * WHAT IT DOES NOT SEE. A name assembled from fragments and indexed
+ * (`env["USER_" + "AGENT"]`), and a whole-environment alias handed to a
+ * function that reads the namespace off it under another name. Both are
+ * deliberate evasions, not mistakes. The compiler does not see them either.
+ *
+ * Collected from `src/` only. Tests reach an object directly on purpose, and
+ * a test is not a code path.
+ *
+ * No `g` flag: the collector takes the first match only, so a file that reads
+ * the binding twice is one entry.
+ */
+export const AGENT_NAMESPACE_READ =
+  /^(?![ \t]*(?:readonly[ \t]+)?USER_AGENT[ \t]*\??[ \t]*:[ \t]*DurableObjectNamespace\b)[^\n]*\bUSER_AGENT\b/m;
+
+/** The one file under `AGENT_NAMESPACE_SCOPE` permitted to match
+ *  `AGENT_NAMESPACE_READ`. */
+export const AGENT_NAMESPACE_OWNER = "src/agent/lease.ts";
+
+/** The tree `AGENT_NAMESPACE_READ` is collected from. */
+export const AGENT_NAMESPACE_SCOPE = "src/";
+
+/**
+ * The readers of the namespace binding one file contributes, as `scan()`
+ * collects them. At most one entry per file, at the first reading line, with
+ * the column of the binding's name on that line. Comment lines blanked,
+ * positions unchanged. An empty list outside `AGENT_NAMESPACE_SCOPE`.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectAgentNamespaceReads(relativePath, contents) {
+  if (!relativePath.startsWith(AGENT_NAMESPACE_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  const match = AGENT_NAMESPACE_READ.exec(code);
+  if (match === null) return [];
+  const index = match.index + match[0].search(/\bUSER_AGENT\b/);
+  return [{ file: relativePath, ...positionOf(code, index) }];
 }
 
 /**
@@ -2349,6 +2497,8 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "removal-mark-missing",
   "removal-site-duplicated",
   "removal-site-missing",
+  "agent-namespace-read-outside-owner",
+  "agent-namespace-read-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -2466,7 +2616,8 @@ function walk(absoluteDir, collected = []) {
  * the middle of a line may sit inside a string or a regex literal, and reading
  * one of those as a comment would blank real code. So a comment trailing code
  * is kept, and so is a block comment opened after code. Used by the two
- * mutating-path counts and the three move-step counts only.
+ * mutating-path counts, the three move-step counts, the namespace-read
+ * count and the Durable Object config checks only.
  *
  * @param {string} text
  * @returns {string}
@@ -2597,6 +2748,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const copySites = [];
   const removalMarks = [];
   const removalSites = [];
+  const agentNamespaceReaders = [];
   const davWriteExports = {};
 
   for (const absolute of files) {
@@ -2723,6 +2875,12 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
     copySites.push(...collectCopySites(relativePath, contents));
     removalMarks.push(...collectRemovalMarks(relativePath, contents));
     removalSites.push(...collectRemovalSites(relativePath, contents));
+    // The per-person object's namespace binding (phase 24). The lease module is
+    // not skipped: it holds the one read. First match per file, comment lines
+    // blanked, and the type declaration in src/env.ts is not a read.
+    agentNamespaceReaders.push(
+      ...collectAgentNamespaceReads(relativePath, contents),
+    );
     // The write-module manifest collects NAMES rather than a match position, so
     // it is the one collector that keys by module instead of appending to a list.
     // A declared module that is never walked therefore has no key at all, which
@@ -2751,6 +2909,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   violations.push(...checkCopySiteOwnership(copySites));
   violations.push(...checkRemovalMarkOwnership(removalMarks));
   violations.push(...checkRemovalSiteOwnership(removalSites));
+  violations.push(...checkAgentNamespaceReadOwnership(agentNamespaceReaders));
   violations.push(...checkDavWriteCoverage(davWriteExports));
 
   return violations.sort(
@@ -3335,6 +3494,42 @@ export function checkRemovalSiteOwnership(sites) {
 }
 
 /**
+ * The one reader of the per-person object namespace, as a pure function over a
+ * list of readers.
+ *
+ * One owner, a non-owner is reported, and an empty list is the missing arm. See
+ * the `AGENT_NAMESPACE_READ` docstring for why this is a count and for what it
+ * cannot see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} readers
+ */
+export function checkAgentNamespaceReadOwnership(readers) {
+  const violations = [];
+  for (const reader of readers) {
+    if (reader.file === AGENT_NAMESPACE_OWNER) continue;
+    violations.push({
+      file: reader.file,
+      line: reader.line,
+      column: reader.column,
+      pattern: "agent-namespace-read-outside-owner",
+      patternIndex: FORBIDDEN.length + 33,
+      why: `A read of the per-person Durable Object namespace binding under ${AGENT_NAMESPACE_SCOPE} outside ${AGENT_NAMESPACE_OWNER}. A second reader is a second place an object can be named, and the object's name is whose connection lease it holds: a name built anywhere else can reach another person's object, hold their lease and refuse every mail call they make. Nothing in store-key-without-a-user can see an object name, so this count is what holds it. Call agentFor(principal) from ${AGENT_NAMESPACE_OWNER} instead. A second reader is a decision on the isolation boundary, not a refactor: get the decision, then change the owner, never the pattern.`,
+    });
+  }
+  if (readers.length === 0) {
+    violations.push({
+      file: AGENT_NAMESPACE_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "agent-namespace-read-missing",
+      patternIndex: FORBIDDEN.length + 34,
+      why: `No file under ${AGENT_NAMESPACE_SCOPE} reads the per-person Durable Object namespace binding, which means agentFor in ${AGENT_NAMESPACE_OWNER} was deleted, renamed, emptied, or rewired to reach the namespace some other way. Zero is as much a violation as two, and it is the quieter of the pair: "no second reader" is trivially true of a tree where the construction site is gone, and nothing fails on the way out. A read that survives only in a comment counts as zero. Restore the read in agentFor. If the construction site really moved, that is a change to the isolation boundary: get a decision, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
  * The names in the trailing alternation group of the shipped
  * `dav-concurrent-request` rule.
  *
@@ -3543,6 +3738,102 @@ export function checkCommitHook(hookPath = ".husky/pre-commit") {
 }
 
 /**
+ * The Durable Object lifecycle checks, over one config file's text (Phase 24,
+ * D-10 f, DOBJ-06).
+ *
+ * The per-person object's storage backend is chosen once. Once the namespace
+ * exists, the choice cannot be changed without deleting every object's data,
+ * and after the first deploy with the lifecycle field a rollback to an earlier
+ * version is refused. So the wrong value is not a bug a later commit can fix.
+ * These checks make the recorded choice something a commit cannot silently
+ * contradict or delete.
+ *
+ * Three violations:
+ *
+ *   - `do-exports-and-migrations`: both lifecycle keys, the declarative
+ *     exports block and the legacy migrations array, in one file.
+ *   - `do-storage-not-sqlite`: a `"storage"` value other than the string
+ *     `"sqlite"`, or the legacy key-value class-list key anywhere (it only
+ *     means something inside a migration, and it makes a key-value-backed
+ *     class).
+ *   - `do-backend-reason-missing`: an exports block with no line that reads,
+ *     once trimmed, exactly `// STORAGE BACKEND: sqlite`. Trimmed because the
+ *     marker is indented like every other top-level comment in the file.
+ *
+ * The structural checks read the text with comment lines blanked
+ * (`withoutCommentLines`), so a key or value that appears only in the prose
+ * beside the block fires nothing. The marker check reads the raw text, because
+ * the marker IS a comment. Positions are unchanged by the blanking.
+ *
+ * Pure and exported so the tests can drive each violation from inline text,
+ * firing and not firing, without a fixture file on disk.
+ *
+ * @param {string} file  repo-relative path, reported in each violation
+ * @param {string} text  the config file's contents
+ */
+export function checkDurableObjectConfig(file, text) {
+  const violations = [];
+  const code = withoutCommentLines(text);
+  const at = (index, pattern, why) => ({
+    file,
+    ...positionOf(code, index),
+    pattern,
+    patternIndex: 2,
+    why,
+  });
+
+  const exportsIndex = code.search(/"exports"\s*:/);
+  const migrationsIndex = code.search(/"migrations"\s*:/);
+  if (exportsIndex !== -1 && migrationsIndex !== -1) {
+    violations.push(
+      at(
+        migrationsIndex,
+        "do-exports-and-migrations",
+        "The Worker config holds both Durable Object lifecycle fields: the declarative exports block and the legacy migrations array. Cloudflare rejects a config with both, and the two are one-or-the-other for the life of the Worker: a Worker that has deployed with exports cannot go back to the array. Keep the exports block and delete the migrations array. The reason is recorded beside the block under the STORAGE BACKEND marker.",
+      ),
+    );
+  }
+
+  // The whitespace after the colon sits INSIDE the lookahead. Outside it, the
+  // engine backtracks that whitespace to zero and fires on the correct value.
+  for (const match of code.matchAll(/"storage"\s*:(?!\s*"sqlite"\s*[,}\n])/g)) {
+    violations.push(
+      at(
+        match.index,
+        "do-storage-not-sqlite",
+        "A Durable Object storage value other than \"sqlite\". The key-value storage backend is closed to new namespaces on this account and every account, and the object uses storage calls that exist only on SQLite. The storage type is immutable once the namespace exists: the only way to change it later is to delete the namespace, which destroys every object's data with no trash. So a wrong value here is not fixable by a later commit. Set it back to \"sqlite\". Changing it is a decision, not a refactor.",
+      ),
+    );
+  }
+  for (const match of code.matchAll(/"new_classes"\s*:/g)) {
+    violations.push(
+      at(
+        match.index,
+        "do-storage-not-sqlite",
+        "A legacy Durable Object migration that creates a key-value-backed class. The key-value storage backend is closed to new namespaces on this account and every account, and the storage type is immutable once the namespace exists: the only way to change it later is to delete the namespace and every object's data with it. This project declares its object through the exports block with SQLite storage, and a legacy migrations array beside that block is refused as well. Delete the migration.",
+      ),
+    );
+  }
+
+  if (exportsIndex !== -1) {
+    const hasMarker = text
+      .split("\n")
+      .some((line) => line.trim() === "// STORAGE BACKEND: sqlite");
+    if (!hasMarker) {
+      violations.push(
+        at(
+          exportsIndex,
+          "do-backend-reason-missing",
+          "The Worker config has a Durable Object exports block but no line reading \"// STORAGE BACKEND: sqlite\". DOBJ-06: the storage backend is immutable once the namespace exists, and a rollback past the first deploy with this block is refused, so the reason for the choice must sit beside it where the next person to edit the block will read it. Deleting that comment must not be silent. Restore the marker line and the reason under it; wrangler.jsonc.example carries the full text.",
+        ),
+      );
+    }
+  }
+
+  return violations;
+}
+
+/**
  * Configuration checks the deploy tooling cannot make for us.
  *
  * Wave 1 established that `wrangler deploy --dry-run` does not validate inside a
@@ -3581,6 +3872,9 @@ export function scanWranglerConfig(
   for (const path of configPaths) {
     const config = readOrNull(path);
     if (config === null) continue;
+
+    // The Durable Object lifecycle checks (phase 24, DOBJ-06), over both files.
+    violations.push(...checkDurableObjectConfig(path, config));
 
     const index = config.search(/simultaneousConnections/);
     if (index !== -1) {

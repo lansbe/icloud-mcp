@@ -1,0 +1,19 @@
+// Known-violating sample for scanWranglerConfig's Durable Object checks
+// (Phase 24, DOBJ-06).
+//
+// This file deliberately breaks all three: it has both lifecycle fields, a
+// storage value other than the one this project records, and no backend-reason
+// marker line. The test points scanWranglerConfig at this path and asserts all
+// three fire, so the checks are proven to run from scanWranglerConfig and not
+// only when called directly. Nothing deploys this file; it is data for the
+// scanner, not config.
+{
+  "name": "durable-object-config-sample",
+  "durable_objects": {
+    "bindings": [{ "name": "SAMPLE", "class_name": "Sample" }]
+  },
+  "exports": {
+    "Sample": { "type": "durable-object", "storage": "legacy-kv" }
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Sample"] }]
+}

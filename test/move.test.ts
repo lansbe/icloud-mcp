@@ -37,6 +37,7 @@ import {
   mintConfirmation,
 } from "../src/confirm";
 import { ImapConnectError } from "../src/errors";
+import { createLeasedMail } from "../src/agent/lease";
 import { createSessionGate, resolveRoleFolder } from "../src/mail/service";
 import type { FolderListing, FolderSummary } from "../src/mail/service";
 import { decodeModifiedUtf7, resolveFolderRole } from "../src/mail/imap-parser";
@@ -81,7 +82,7 @@ function tools(): { move: Callback; commit: Callback } {
       callbacks.set(name, handler);
     },
   };
-  registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
+  registerMailTools(server as unknown as McpServer, createLeasedMail(createSessionGate()), ownerPrincipal());
   expect(callbacks.get("mail_move"), "mail_move is not registered").toBeDefined();
   expect(callbacks.get("mail_commit"), "mail_commit is not registered").toBeDefined();
   return { move: callbacks.get("mail_move")!, commit: callbacks.get("mail_commit")! };
@@ -1543,7 +1544,7 @@ function allTools(): Map<string, Callback> {
       callbacks.set(name, handler);
     },
   };
-  registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
+  registerMailTools(server as unknown as McpServer, createLeasedMail(createSessionGate()), ownerPrincipal());
   for (const name of ["mail_archive", "mail_trash", "mail_commit"]) {
     expect(callbacks.get(name), `${name} is not registered`).toBeDefined();
   }

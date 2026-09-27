@@ -6,6 +6,7 @@
 
 import { McpServer } from "@modelcontextprotocol/server";
 import type { McpServerFactory } from "@modelcontextprotocol/server";
+import { createLeasedMail } from "../agent/lease";
 import { createDavFetch } from "../dav/transport";
 import { createSessionGate } from "../mail/service";
 import { answersDuringPause } from "../password-pause";
@@ -72,6 +73,19 @@ export function createServerFactory(
     // whole isolate into a single-file line. Both belong here; neither belongs
     // at module scope.
     const gate = createSessionGate();
+    // The per-person connection lease over that same gate (Phase 24, DOBJ-04).
+    // Request-scoped for the gate's own reason: built here, in this body, and
+    // never at module scope. It wraps the gate and replaces nothing. The gate
+    // is still the structural guard inside ONE request; the lease is the guard
+    // ACROSS requests, so two overlapping requests from one Apple ID cannot
+    // each open an iCloud mail connection.
+    //
+    // This is the only thing the gate is handed to. No registrar below
+    // receives the gate itself, so a tool can reach a session only through
+    // `withConnectionLease`, which takes the lease first. A new registrar that
+    // wants the raw gate is a decision, not a refactor
+    // (`test/lease-coverage.test.ts` fails on it).
+    const leasedMail = createLeasedMail(gate);
     // **The per-tool opt-out from the dead-password pause, and the ONLY place it
     // is granted (owner decision, 2026-09-22 — code review WR-04).** The same
     // principal, armed exactly as `principal` is, with the pause check removed.
@@ -103,7 +117,10 @@ export function createServerFactory(
     // it sends, so the login and the cache key always belong to one identity
     // (D-13) — it is the same person either way, since the two promises differ
     // only in whether the pause refuses.
-    registerDiagnoseTool(server, unpaused);
+    //
+    // The IMAP diagnostic takes the lease too (D-07): it opens a real iCloud
+    // mail connection, which counts against the same per-account ceiling.
+    registerDiagnoseTool(server, leasedMail, unpaused);
     // The "which Apple ID is this connection signed in as" answer (LIFE-06).
     // It returns the WHOLE address, not a mask. D4 chose the mask on
     // 2026-09-21 and the owner REVERSED it on 2026-09-23, because the masked
@@ -117,13 +134,14 @@ export function createServerFactory(
     // environment. It cannot reach a socket or a DAV host, which is exactly why
     // it needs neither.
     registerAccountTool(server, principal);
-    registerMailTools(server, gate, principal);
-    // The change check (CHNG-01). The same gate as the mail tools, so a
+    registerMailTools(server, leasedMail, principal);
+    // The change check (CHNG-01). The same leased gate as the mail tools, so a
     // second session while one is held is refused rather than opening a
-    // second socket; the gate does not queue. And
-    // the same `davFetch` the calendar tools get below, so its calendar
-    // requests share their one queue.
-    registerChangesTool(server, gate, principal, davFetch);
+    // second socket; neither the gate nor the lease queues. It takes the
+    // lease once per mail session, never across two. And the same `davFetch`
+    // the calendar tools get below, so its calendar requests share their one
+    // queue. The calendar side is DAV and takes no lease (D-07).
+    registerChangesTool(server, leasedMail, principal, davFetch);
     registerDavDiagnoseTool(server, davFetch, unpaused);
     // The same `davFetch` the diagnostic takes, deliberately: one queue per
     // request means a calendar call and a diagnosis issued in the same request
