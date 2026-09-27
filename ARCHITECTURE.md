@@ -120,7 +120,7 @@ person's derived id.
 | `server.ts` | Per-request server factory; session gate + DAV fetch; all tool registrations. |
 | `untrusted.ts` | The untrusted-content fence (notice + nonce + trusted/untrusted split). |
 | `tools/diagnose.ts` | `mail_imap_diagnose`. |
-| `tools/mail.ts` | The 10 mail tools and their response shapers. |
+| `tools/mail.ts` | The 11 mail tools and their response shapers. |
 | `tools/dav-diagnose.ts` | `dav_diagnose`. |
 | `tools/calendar.ts` | The 9 calendar tools; preview/commit logic. |
 | `tools/contacts.ts` | The 2 contact tools. |
@@ -130,7 +130,8 @@ person's derived id.
 | File | Role |
 |------|------|
 | `socket.ts` | **The only module that may open a TCP socket.** `connectImap()` takes no parameters. |
-| `service.ts` | **The one session orchestrator** (`withMailSession`, `withMailSessionOver`, `createSessionGate`); the sole draft-write (`APPEND`) site. |
+| `service.ts` | **The two session orchestrators** over one private core: read (`withMailSession`, `withMailSessionOver`) and mutating (`withMutatingMailbox`, `withMutatingMailboxOver`), plus `createSessionGate`. The sole draft-write (`APPEND`) site, and the one place a mailbox is opened in the mutating form. |
+| `triage.ts` | **The only user of the mutating orchestrator.** Hands out verbs, never a session. Today: mark one message read or unread. Fetches no message body. |
 | `imap-session.ts` | The IMAP wire conversation over a `DuplexLike` (socket-free, no logging). |
 | `imap-parser.ts` | Pure IMAP line parsing, no I/O. |
 | `mime.ts` | Raw RFC822 → decoded message (`postal-mime`, `HTMLRewriter`). |
@@ -173,14 +174,17 @@ person's derived id.
   (`secureTransport: "on"`, implicit TLS) are literals at the `connect()` call.
   There is no value a caller can pass that reaches the socket. `MAX_CONCURRENT_CONNECTIONS = 3`
   documents the ceiling; it does not enforce it.
-- **`service.ts`** holds the one orchestrator. `createSessionGate()` returns a
-  gate whose `acquire()` throws if already held. `withMailSessionOver()` calls
-  `gate.acquire()` before its `try`, with no `await` ahead of it, so a refused
-  second caller can neither release the first caller's slot nor interleave into
-  it. `withMailSession()` checks the gate, opens a socket, and delegates.
+- **`service.ts`** holds two orchestrators, read and mutating, over one private
+  core. `createSessionGate()` returns a gate whose `acquire()` throws if already
+  held. Both kinds share it, so one request gets one session of either kind. The
+  core calls `gate.acquire()` before its `try`, with no `await` ahead of it, so
+  a refused second caller can neither release the first caller's slot nor
+  interleave into it. `withMailSession()` and `withMutatingMailbox()` check the
+  gate, open a socket, and delegate.
 - **Flow:** connect → `LOGIN` → `EXAMINE` (read-only) → work → `LOGOUT` → close,
-  every call. Decoding, extraction, and storage all happen *outside* the
-  session.
+  every call. The one exception is `triage.ts`: it opens its mailbox in the
+  mutating form, refuses unless iCloud says the mailbox is writable, and changes
+  one flag. Decoding, extraction, and storage all happen *outside* the session.
 
 Why one connection: production allows six platform connections per Worker
 invocation, shared across KV, outbound fetch, and sockets — one already spent by
@@ -279,17 +283,19 @@ this is the summary.
    the opportunistic path is the least reliable part of the socket API.
 
 2. **No mail sending, ever.** SMTP ports (25/465/587) and mail-sending libraries
-   are banned. The draft `APPEND` is the entire write path, built in exactly one
-   module (`src/mail/service.ts`) — enforced as a *count*, so zero writers is as
-   much a violation as two. The human review step is the backstop against
-   prompt-injected content going out. (Calendar invitations are reconciled
-   separately: the send is iCloud's, attendees are caller-supplied, and any
-   create with attendees is gated by preview/commit.)
+   are banned. The draft `APPEND` is the only write that places a message, built
+   in exactly one module (`src/mail/service.ts`) — enforced as a *count*, so
+   zero writers is as much a violation as two. The one other mail write changes
+   one flag, and places and sends nothing (item 5). The human review step is the
+   backstop against prompt-injected content going out. (Calendar invitations are
+   reconciled separately: the send is iCloud's, attendees are caller-supplied,
+   and any create with attendees is gated by preview/commit.)
 
-3. **One socket importer.** `cloudflare:sockets` is imported by exactly one file.
-   `connectImap()` takes no parameters, so the forbidden state is unspeakable.
-   The one-connection property is defended again one layer up: one session
-   orchestrator, and no concurrent combinator around it or the socket open.
+3. **One socket importer.** `cloudflare:sockets` is imported by exactly one
+   file. `connectImap()` takes no parameters, so the forbidden state is
+   unspeakable. The one-connection property is defended again one layer up: two
+   session orchestrators, read and mutating, over one private core and one
+   request gate, and no concurrent combinator around either or the socket open.
 
 4. **Credentials never reach a log or an error.** There are no logging calls
    anywhere in `src/`. IMAP `LOGIN` carries the password inline, so there is no
@@ -297,9 +303,12 @@ this is the summary.
    naming the `env` object or a secret binding is banned in `scripts/` and
    `test/` too.
 
-5. **Reading mail does not mark it read.** Mailboxes are opened read-only
-   (`EXAMINE`), and every fetch uses the peeking form. Non-peeking fetch items
-   are banned.
+5. **Reading mail does not mark it read.** Every mailbox opened on a read path
+   is opened read-only (`EXAMINE`), and every fetch uses the peeking form.
+   Non-peeking fetch items are banned. One separate path, used only by
+   `src/mail/triage.ts`, opens a mailbox in the mutating form to mark one
+   message read or unread when the user asks. It is counted, kept apart by type,
+   and fetches no body.
 
 ### Enforcement
 

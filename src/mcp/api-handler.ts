@@ -138,10 +138,12 @@ const HANDLER_OPTIONS: HandlerOptions = {
   //     rather than merely defended. It is now a race that `createSessionGate`
   //     WINS. CLAUDE.md §3's socket cap is intact, and for a specific reason
   //     rather than a hopeful one: `gate.acquire()` sits BEFORE the `try` in
-  //     `withMailSessionOver`, so a refused second caller never reaches the
-  //     `finally` and cannot release the first caller's slot; and
-  //     `withMailSession`'s `if (gate.held)` → `connectImap()` →
-  //     `withMailSessionOver` chain has no `await` ahead of that acquire, so
+  //     the private session core, `withMailSessionCore`, so a refused second
+  //     caller never reaches the `finally` and cannot release the first
+  //     caller's slot; and `withMailSession`'s `if (gate.held)` →
+  //     `connectImap()` → `withMailSessionOver` → `withMailSessionCore` chain
+  //     has no `await` ahead of that acquire (the wrapper reaches the core
+  //     with no await ahead of it), so
   //     there is no suspension point for a second entrant to interleave into.
   //     Anyone editing either of those is editing this guarantee, from a file
   //     that does not mention it. The promise of the principal the door makes

@@ -252,6 +252,34 @@ export function parseUidValidity(line: string): number | null {
 }
 
 /**
+ * The flag list carried by an untagged `PERMANENTFLAGS` response code, or
+ * `null`.
+ *
+ * It arrives on an untagged `OK` when a mailbox opens:
+ * `* OK [PERMANENTFLAGS (\Answered \Seen \*)] Limited`. RFC 3501 §7.1 says a
+ * flag missing from this list can be changed, but only for this session. The
+ * change is gone when the session ends. So a mailbox can open read-write and
+ * still not keep a read-state change.
+ *
+ * `null` means the code was ABSENT. RFC 3501 §6.3.1 says what that means: the
+ * client should assume all flags can be changed permanently. That is the
+ * opposite of `parseUidValidity`'s absent case, and it is the RFC's rule, not a
+ * default picked here.
+ *
+ * The flags come back verbatim, in order, split on spaces. Flags are atoms,
+ * which cannot hold a space or a parenthesis. Comparing them is the caller's
+ * job, and it must ignore case. `\*` is returned like any other entry. It says
+ * new keywords can be created. It does not say `\Seen` is kept, so a caller
+ * must not read it as covering `\Seen`.
+ */
+export function parsePermanentFlags(line: string): string[] | null {
+  if (!/^\* +OK\b/i.test(line)) return null;
+  const match = /\[PERMANENTFLAGS +\(([^()]*)\)\]/i.exec(line);
+  if (match === null) return null;
+  return match[1].split(" ").filter((flag) => flag !== "");
+}
+
+/**
  * The message count carried by an untagged `EXISTS` response, or `null`.
  *
  * Not a response code but a counted untagged response — `* 172 EXISTS` — which
@@ -263,6 +291,105 @@ export function parseUidValidity(line: string): number | null {
 export function parseExists(line: string): number | null {
   const match = /^\* +(\d+) +EXISTS\b/i.exec(line);
   return match === null ? null : Number(match[1]);
+}
+
+/**
+ * The access code on a mailbox open's tagged completion, or `null`.
+ *
+ * RFC 3501 §6.3.1 puts it there: `a4 OK [READ-WRITE] ... completed`. Only a
+ * bracketed code IMMEDIATELY after an OK counts. A NO, a code further along in
+ * the human text, and an untagged line are all `null`. Response codes are
+ * case-insensitive atoms, so the match is too.
+ *
+ * Three answers, not two, and that is the point (PITFALLS #33). `null` means the
+ * server did not say. A caller that read `null` as "writable" would go on to
+ * change a mailbox the server never agreed to open for changing, so every
+ * caller must treat `null` exactly as it treats `"read-only"`.
+ */
+export function parseAccessCode(
+  taggedLine: string,
+): "read-write" | "read-only" | null {
+  const parsed = parseTaggedResponse(taggedLine);
+  if (parsed === null || parsed.status !== "OK") return null;
+  const match = /^\[(READ-WRITE|READ-ONLY)\]/i.exec(parsed.text);
+  if (match === null) return null;
+  return match[1].toUpperCase() === "READ-WRITE" ? "read-write" : "read-only";
+}
+
+/**
+ * The response code on a tagged completion of any status, upper-cased, or
+ * `null`.
+ *
+ * `a5 NO [NONEXISTENT] No such message` gives `NONEXISTENT`. Only a bracketed
+ * code IMMEDIATELY after the status counts, as in `parseAccessCode`; the same
+ * letters further along are prose the server chose to write. Only the code's
+ * first atom is returned, never its arguments and never the human text, so no
+ * server-chosen sentence travels any further than this function.
+ *
+ * `null` means the server gave no code, which is the common case.
+ */
+export function parseCompletionCode(taggedLine: string): string | null {
+  const parsed = parseTaggedResponse(taggedLine);
+  if (parsed === null) return null;
+  const match = /^\[([A-Za-z0-9-]+)[\] ]/.exec(parsed.text);
+  return match === null ? null : match[1].toUpperCase();
+}
+
+/**
+ * Whether the FETCH reply for one UID says the message is seen, or `null`.
+ *
+ * Reads the untagged FETCH replies a command produced. It finds the reply whose
+ * OWN UID item equals `uid`, and never goes by position or by the
+ * sequence-number prefix. Those can name another message, and the answer would
+ * then be about the wrong one while looking right. `fetchReplies` in
+ * `./service.ts` records the same rule for the read path.
+ *
+ * When more than one reply names this UID, the LAST one wins. One command can
+ * carry several: an unsolicited flag update (another device changed the
+ * message) can arrive before the command's own reply. The server's final word
+ * is the last one it sent, so an earlier one is stale.
+ *
+ * The seen flag is compared without regard to case. `null` means no reply for
+ * this UID carried a flag list, which is how a message that no longer exists
+ * shows up: the server answers OK and sends nothing about it.
+ *
+ * Pure: it reads the lines it is handed and touches nothing else.
+ */
+export function seenStateOf(
+  untagged: readonly ResponseLine[],
+  uid: number,
+): boolean | null {
+  let seen: boolean | null = null;
+  for (const line of untagged) {
+    const parsed = parseSExpr(line);
+    if (parsed[0] !== "*") continue;
+    if (typeof parsed[2] !== "string" || parsed[2].toUpperCase() !== "FETCH") {
+      continue;
+    }
+    const list = parsed[3];
+    if (!Array.isArray(list)) continue;
+
+    let replyUid: string | null = null;
+    let flags: SExpr | undefined;
+    for (let index = 0; index + 1 < list.length; index += 2) {
+      const key = list[index];
+      if (typeof key !== "string") continue;
+      const upper = key.toUpperCase();
+      const value = list[index + 1];
+      if (upper === "UID" && typeof value === "string") replyUid = value;
+      if (upper === "FLAGS") flags = value;
+    }
+
+    if (replyUid === null || !/^[1-9]\d*$/.test(replyUid)) continue;
+    if (Number(replyUid) !== uid) continue;
+    if (!Array.isArray(flags)) continue;
+
+    // Keep going: a later reply for the same UID replaces this one.
+    seen = flags.some(
+      (flag) => typeof flag === "string" && flag.toLowerCase() === "\\seen",
+    );
+  }
+  return seen;
 }
 
 /**

@@ -1107,6 +1107,32 @@ describe("the registrations themselves", () => {
     expect(String(tool!.options.description)).toContain(UNTRUSTED_NOTICE);
   });
 
+  it("takes exactly a message id and a read boolean on the mark-read tool", () => {
+    // One message per call, named by an id this server minted. No folder, no
+    // search term, no list and no address (D-09).
+    const tool = registered().find((one) => one.name === "mail_mark_read");
+    const schema = tool!.options.inputSchema as z.ZodObject<z.ZodRawShape>;
+
+    expect(Object.keys(schema.shape).sort()).toEqual(["id", "read"]);
+    expect(schema.safeParse({ id: "x", read: true }).success).toBe(true);
+    expect(schema.safeParse({ id: "x", read: false }).success).toBe(true);
+    expect(schema.safeParse({ id: "x" }).success).toBe(false);
+    expect(schema.safeParse({ id: "x", read: "true" }).success).toBe(false);
+    expect(schema.safeParse({ read: true }).success).toBe(false);
+  });
+
+  it("says undoing takes the opposite value, not a repeat of the same call (IN-01)", () => {
+    // Calling again with the same value changes nothing. A model reading
+    // "call again to undo" could do exactly that.
+    const tool = registered().find((one) => one.name === "mail_mark_read");
+    const description = String(tool!.options.description);
+
+    expect(description).toContain("undo with the opposite read.");
+    expect(description).not.toContain("call again to undo");
+    expect(description).toContain(UNTRUSTED_NOTICE);
+    expect(description.length).toBeLessThan(280);
+  });
+
   it("keeps every description terse, because it is a tax paid on every call", () => {
     for (const tool of registered()) {
       expect(String(tool.options.description).length).toBeLessThan(280);
@@ -1651,7 +1677,7 @@ describe("the search and unread registrations", () => {
     return String((shape as z.ZodType).description);
   }
 
-  it("registers the five read tools D-17 names plus the five that act on one, and no others", () => {
+  it("registers the five read tools D-17 names, the five that act on one, and the one that changes a mailbox, and no others", () => {
     // One tool per requirement, so the model's intent is unambiguous at the
     // call site rather than buried in a filter parameter. Compose-new and
     // compose-reply are two NAMES rather than one tool with an optional parent
@@ -1678,6 +1704,9 @@ describe("the search and unread registrations", () => {
       "mail_list_folders",
       "mail_list_messages",
       "mail_list_unread",
+      // The eleventh, and the first tool that changes a mailbox. Its placement
+      // in this module is what keeps mail at one error shaper.
+      "mail_mark_read",
       "mail_search",
       // The ninth, and the ONE place D-80's departure is actually spent: a
       // single name carrying a source discriminator, rather than one name per
@@ -1835,7 +1864,7 @@ describe("the search and unread registrations", () => {
     // the model arrives unwarned — and a per-tool assertion is a list somebody
     // has to remember to extend.
     const tools = registered();
-    expect(tools).toHaveLength(10);
+    expect(tools).toHaveLength(11);
 
     for (const tool of tools) {
       expect(
@@ -2244,12 +2273,13 @@ describe("the compose registration", () => {
     }
   });
 
-  it("registers exactly TEN tools, and the tenth is the whole of plan 04-10", () => {
+  it("registers exactly ELEVEN tools: the tenth is the whole of plan 04-10, the eleventh is mail_mark_read", () => {
     // Nine through plan 04-09, plus mail_confirm_upload. The presigned INGRESS
     // added no registration at all — it is a third value on an existing
     // discriminator, which is precisely what D-80 bought and precisely what it
-    // paid for with a union on the output.
-    expect(registered()).toHaveLength(10);
+    // paid for with a union on the output. Phase 20 added the eleventh, the
+    // first tool that changes a mailbox.
+    expect(registered()).toHaveLength(11);
   });
 });
 
@@ -3460,8 +3490,8 @@ describe("a principal that was refused opens nothing", () => {
     return { gate, acquire, callbacks };
   }
 
-  it("registers all ten tools, so the table below leaves none out", () => {
-    expect(refusedTools().callbacks.size).toBe(10);
+  it("registers all eleven tools, so the table below leaves none out", () => {
+    expect(refusedTools().callbacks.size).toBe(11);
   });
 
   it("mail_list_folders answers auth_failed with the fixed message and never acquires the gate", async () => {

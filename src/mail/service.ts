@@ -1,9 +1,25 @@
-// The one mail session orchestrator (D-43).
+// The mail session orchestrators, over one private core (D-43).
 //
-// Every mail tool in this phase, and Phase 4's draft tools after it, reaches
-// iCloud through `withMailSession` and through nothing else. That is what makes
+// Every mail tool reaches iCloud through an orchestrator in this module and
+// through nothing else. Each orchestrator is a thin wrapper over one
+// module-private core, `withMailSessionCore`, which owns the whole lifecycle:
+// the gate, the channel, the sign-in, the call deadline and the teardown. The
+// core exists so there is one teardown for every mail path. That is what makes
 // "exactly one socket per Worker invocation" a property of the code rather than
 // a convention each call site has to remember.
+//
+// Every read opens its mailbox read-only. The read orchestrator must never gain
+// a mode argument. A mode parameter is how the read-only guarantee dies without
+// a single test failing: every read call site becomes one argument away from a
+// mailbox opened for changing (PITFALLS #32). A second orchestrator, if one
+// exists, is a separate named function with its own open step.
+//
+// One does exist. `withMutatingMailbox` and `withMutatingMailboxOver` sit beside
+// the read pair, over the same private core and the same request-scoped gate,
+// and open their mailbox in the mutating form. Only `./triage.ts` may import
+// them, and a scan count holds that in both directions. They take no mode, and
+// neither does the read pair: which kind of session a caller gets is decided by
+// which function it names, never by an argument it passes.
 //
 // Concurrency: exactly one socket is opened per invocation, and the connect
 // call is never wrapped in any concurrent combinator. See
@@ -42,9 +58,11 @@ import type {
 import {
   correlateStatus,
   decodeModifiedUtf7,
+  parseAccessCode,
   parseCapabilityLine,
   parseExists,
   parseListLine,
+  parsePermanentFlags,
   parseSExpr,
   parseSearchLine,
   parseStatusLine,
@@ -188,8 +206,15 @@ export interface MailSessionOptions
  * optional mailbox. `null` there is a fact rather than a missing value: no
  * mailbox was opened, so the server never reported a validity or a count for
  * one, and a zero would be a claim this server cannot make.
+ *
+ * `access` is the discriminant that keeps this type apart from
+ * `MutatingMailSession`. TypeScript compares shapes, not names, so without two
+ * different literal values here a mutating session would be accepted wherever a
+ * read session is asked for, and the other way round.
  */
 export interface MailSession {
+  /** Always `"read-only"`. Never widened: see `MutatingMailSession`. */
+  readonly access: "read-only";
   channel: ImapChannel;
   /** The raw wire mailbox name that was opened, or `null` if none was. */
   mailbox: string | null;
@@ -282,62 +307,58 @@ function firstCapability(untagged: ResponseLine[]): string | null {
 }
 
 /**
- * Hold a whole mail session over an already-open stream pair.
+ * The open step of one session, supplied by the orchestrator that owns it.
  *
- * Separated from the socket for the same reason `runDiagnosticOver` is: no
- * automated job in this repository may authenticate against the real Apple ID,
- * and the test environment offers no interception facility, so a version welded
- * to a socket would be untestable rather than merely awkward.
+ * It runs on the authenticated channel, opens a mailbox or deliberately does
+ * not, and hands back the work to run. The core races that work against the
+ * call deadline and never the open itself.
+ *
+ * A callback rather than a value, and that is the point. The open command stays
+ * a literal inside the orchestrator that sends it, so the core has no open
+ * command of its own and no argument that could choose one. The core also never
+ * sees a session type: each orchestrator builds its own session inside this
+ * step, so each can only ever hand its caller its own kind.
+ */
+type OpenStep<T> = (
+  channel: ImapChannel,
+  capability: string | null,
+) => Promise<() => Promise<T>>;
+
+/**
+ * The session lifecycle every mail path shares. Module-private on purpose.
+ *
+ * Exporting it would be a raw escape hatch past the orchestrators: a caller
+ * could supply any open step it liked, including one that opens a mailbox for
+ * changing. The orchestrators are the only ways in, and each one names the open
+ * it performs.
  *
  * The sequence is `greeting → CAPABILITY → authenticate → CAPABILITY →
- * EXAMINE → UIDVALIDITY gate → fn() → teardown`, strictly sequential
- * throughout — one command in flight at a time, as Phase 1 built it (D-44).
- * Nothing here pipelines and nothing later in this phase should: pipelining is
- * the classic source of parser desynchronisation, and the parser is the one
- * component this phase cannot afford to get subtly wrong.
+ * open step → fn() → teardown`, strictly sequential throughout — one command in
+ * flight at a time, as Phase 1 built it (D-44). Nothing here pipelines and
+ * nothing later in this phase should: pipelining is the classic source of
+ * parser desynchronisation, and the parser is the one component this phase
+ * cannot afford to get subtly wrong.
  *
- * **The mailbox is OPTIONAL, and one entry point serves both shapes rather than
- * two.** A folder listing runs from the authenticated state and needs no
- * mailbox at all, so `null` here skips the open and the validity gate while
- * keeping everything that makes this the one orchestrator: the request-scoped
- * gate, the call deadline, and the guaranteed teardown. The alternative — a
- * sibling entry point for authenticated-state-only work — is precisely what
- * `./diagnose.ts` argues against where it refuses a second exported entry point:
- * "two entry points is a choice a later author makes without knowing they are
- * making it, and the simpler signature is the one they pick." A sibling here
- * would have its own lifecycle semantics, and D-43's whole claim is that one
- * teardown covers every mail path.
- *
- * The three mailbox-shaped fields on `MailSession` go null together in that
- * case, so a caller cannot read one and infer another that was never
- * established.
- *
- * **The mailbox is opened with `EXAMINE`, and that is structural rather than
- * stylistic.** RFC 3501: "the selected mailbox is identified as read-only. No
- * changes to the permanent state of the mailbox, including per-user state, are
- * permitted". So a fetch that forgot the peeking form — the exact slip D-47
- * exists to prevent, and the one whose blast radius is a whole page of mail
- * marked read — is refused by Apple's server rather than silently succeeding.
- * It makes `\Seen` mutation unspeakable for the whole session in the same way
- * `connectImap()`'s empty parameter list makes the banned transport unspeakable
- * at the call site. Switching to `SELECT` is a decision, not a refactor.
+ * `gate.acquire()` is the first statement, before the `try`. A refused second
+ * caller therefore never reaches the `finally` and cannot release the first
+ * caller's slot. `src/mcp/api-handler.ts` depends on that placement for the
+ * legacy-batch race it describes.
  *
  * **The deadline races the work, never the whole session.** Teardown has to run
  * AFTER the deadline fires; racing the outer call would abandon teardown along
  * with the work and leak exactly the connection the deadline exists to release.
+ * It does not race the open step either, exactly as before the split.
  *
  * This is the only production construction site for `ImapChannel` and
  * `teardown` on the mail path, which is what makes D-51's injectable bounds
  * auditable in one place rather than at every call site.
  */
-export async function withMailSessionOver<T>(
+async function withMailSessionCore<T>(
   duplex: DuplexLike,
   principal: Principal,
   gate: SessionGate,
-  mailbox: string | null,
-  expectedUidValidity: number | null,
-  fn: (session: MailSession) => Promise<T>,
-  options: MailSessionOptions = {},
+  options: MailSessionOptions,
+  open: OpenStep<T>,
 ): Promise<T> {
   gate.acquire();
 
@@ -400,61 +421,12 @@ export async function withMailSessionOver<T>(
     const postLogin = await sendCommand(channel, channel.nextTag(), "CAPABILITY");
     const capability = firstCapability(postLogin.untagged);
 
-    let uidValidity: number | null = null;
-    let exists: number | null = null;
-
-    // `null` means the caller does authenticated-state-only work. Everything
-    // below this point is the mailbox open and its gate, and skipping it is the
-    // entire difference between the two shapes — the gate, the deadline and the
-    // teardown are all outside it and run either way.
-    if (mailbox !== null) {
-      // Refuse rather than repair, exactly as `credentials.ts` does one layer
-      // over: a mailbox name carrying CR or LF would terminate the command line
-      // early and inject a second command built from the name's own bytes.
-      const quoted = quoteMailbox(mailbox);
-      if (quoted === null) throw new ImapNotFoundError();
-
-      const examine = await sendCommand(
-        channel,
-        channel.nextTag(),
-        `EXAMINE ${quoted}`,
-      );
-      if (examine.status !== "OK") throw new ImapNotFoundError();
-
-      exists = 0;
-      for (const line of examine.untagged) {
-        const validity = parseUidValidity(line.text);
-        if (validity !== null) uidValidity = validity;
-        const count = parseExists(line.text);
-        if (count !== null) exists = count;
-      }
-
-      // Absent fails closed, and this is the clause most easily skipped. The
-      // RFC defines a missing UIDVALIDITY as "the server does not support
-      // unique identifiers" — so every UID this call would return or accept is
-      // meaningless. iCloud advertises UIDPLUS and will send it in practice,
-      // but "will be present in practice" is not a check.
-      if (uidValidity === null) throw new ImapNotFoundError();
-
-      // D-23 / MAIL-06: refuse rather than silently restarting from page one. A
-      // mismatch means the identifiers the caller is holding name different
-      // messages now, and answering with whatever sits at that UID today would
-      // be a wrong answer reported as the right one.
-      if (expectedUidValidity !== null && expectedUidValidity !== uidValidity) {
-        throw new ImapNotFoundError();
-      }
-    }
-
-    const session: MailSession = {
-      channel,
-      mailbox,
-      uidValidity,
-      exists,
-      capability,
-    };
+    // The orchestrator's own open, and the session it builds. Outside the
+    // deadline, as it was before the split.
+    const work = await open(channel, capability);
 
     const outcome = await withDeadline<T | typeof DEADLINE_EXPIRED>(
-      fn(session),
+      work(),
       options.callDeadlineMs ?? CALL_DEADLINE_MS,
       () => DEADLINE_EXPIRED,
     );
@@ -490,6 +462,139 @@ export async function withMailSessionOver<T>(
 }
 
 /**
+ * The validity and message count an open reported, checked.
+ *
+ * Shared by every open, so each orchestrator refuses the same replies in the
+ * same way. Both refusals are `ImapNotFoundError`.
+ */
+function checkedMailboxFacts(
+  untagged: readonly ResponseLine[],
+  expectedUidValidity: number | null,
+): { uidValidity: number; exists: number } {
+  let uidValidity: number | null = null;
+  let exists = 0;
+  for (const line of untagged) {
+    const validity = parseUidValidity(line.text);
+    if (validity !== null) uidValidity = validity;
+    const count = parseExists(line.text);
+    if (count !== null) exists = count;
+  }
+
+  // Absent fails closed, and this is the clause most easily skipped. The
+  // RFC defines a missing UIDVALIDITY as "the server does not support
+  // unique identifiers" — so every UID this call would return or accept is
+  // meaningless. iCloud advertises UIDPLUS and will send it in practice,
+  // but "will be present in practice" is not a check.
+  if (uidValidity === null) throw new ImapNotFoundError();
+
+  // D-23 / MAIL-06: refuse rather than silently restarting from page one. A
+  // mismatch means the identifiers the caller is holding name different
+  // messages now, and answering with whatever sits at that UID today would
+  // be a wrong answer reported as the right one.
+  if (expectedUidValidity !== null && expectedUidValidity !== uidValidity) {
+    throw new ImapNotFoundError();
+  }
+
+  return { uidValidity, exists };
+}
+
+/**
+ * Hold a read session over an already-open stream pair.
+ *
+ * Separated from the socket for the same reason `runDiagnosticOver` is: no
+ * automated job in this repository may authenticate against the real Apple ID,
+ * and the test environment offers no interception facility, so a version welded
+ * to a socket would be untestable rather than merely awkward.
+ *
+ * The lifecycle — gate, channel, sign-in, deadline, teardown — is the private
+ * core's. This function supplies only the open step, and the call into the core
+ * is its first and only statement, so nothing awaits ahead of the gate.
+ *
+ * **The mailbox is OPTIONAL, and one entry point serves both shapes rather than
+ * two.** A folder listing runs from the authenticated state and needs no
+ * mailbox at all, so `null` here skips the open and the validity gate while
+ * keeping everything that makes this the one read orchestrator: the
+ * request-scoped gate, the call deadline, and the guaranteed teardown. The
+ * alternative — a sibling entry point for authenticated-state-only work — is
+ * precisely what `./diagnose.ts` argues against where it refuses a second
+ * exported entry point: "two entry points is a choice a later author makes
+ * without knowing they are making it, and the simpler signature is the one they
+ * pick." A sibling here would have its own lifecycle semantics, and D-43's whole
+ * claim is that one teardown covers every mail path.
+ *
+ * The three mailbox-shaped fields on `MailSession` go null together in that
+ * case, so a caller cannot read one and infer another that was never
+ * established.
+ *
+ * **The mailbox is opened with `EXAMINE`, and that is structural rather than
+ * stylistic.** RFC 3501: "the selected mailbox is identified as read-only. No
+ * changes to the permanent state of the mailbox, including per-user state, are
+ * permitted". So a fetch that forgot the peeking form — the exact slip D-47
+ * exists to prevent, and the one whose blast radius is a whole page of mail
+ * marked read — is refused by Apple's server rather than silently succeeding.
+ * It makes `\Seen` mutation unspeakable for the whole session in the same way
+ * `connectImap()`'s empty parameter list makes the banned transport unspeakable
+ * at the call site. Opening a mailbox in the mutating form on this path is a
+ * decision, not a refactor.
+ */
+export async function withMailSessionOver<T>(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string | null,
+  expectedUidValidity: number | null,
+  fn: (session: MailSession) => Promise<T>,
+  options: MailSessionOptions = {},
+): Promise<T> {
+  return withMailSessionCore(
+    duplex,
+    principal,
+    gate,
+    options,
+    async (channel, capability) => {
+      let uidValidity: number | null = null;
+      let exists: number | null = null;
+
+      // `null` means the caller does authenticated-state-only work. Everything
+      // in this branch is the mailbox open and its gate, and skipping it is the
+      // entire difference between the two shapes — the gate, the deadline and
+      // the teardown are all in the core and run either way.
+      if (mailbox !== null) {
+        // Refuse rather than repair, exactly as `credentials.ts` does one layer
+        // over: a mailbox name carrying CR or LF would terminate the command
+        // line early and inject a second command built from the name's own
+        // bytes.
+        const quoted = quoteMailbox(mailbox);
+        if (quoted === null) throw new ImapNotFoundError();
+
+        const examine = await sendCommand(
+          channel,
+          channel.nextTag(),
+          `EXAMINE ${quoted}`,
+        );
+        if (examine.status !== "OK") throw new ImapNotFoundError();
+
+        ({ uidValidity, exists } = checkedMailboxFacts(
+          examine.untagged,
+          expectedUidValidity,
+        ));
+      }
+
+      const session: MailSession = {
+        access: "read-only",
+        channel,
+        mailbox,
+        uidValidity,
+        exists,
+        capability,
+      };
+
+      return () => fn(session);
+    },
+  );
+}
+
+/**
  * Open one socket and hold a mail session over it.
  *
  * The thin transport wrapper, copying `runDiagnosticOutcome`'s bare
@@ -503,7 +608,8 @@ export async function withMailSessionOver<T>(
  * are making it, and the simpler signature is the one they pick.
  *
  * The gate is checked BEFORE the socket is opened, and the check is not
- * redundant with the `acquire()` inside `withMailSessionOver`. Acquiring only
+ * redundant with the `acquire()` inside the private core, `withMailSessionCore`,
+ * which `withMailSessionOver` reaches with no await ahead of it. Acquiring only
  * after the connect would open a second socket and then refuse it, spending the
  * connection the gate exists to protect. Nothing awaits between the check here
  * and that acquire — `connectImap()` is synchronous and an async function's
@@ -535,6 +641,198 @@ export async function withMailSession<T>(
   }
 
   return withMailSessionOver(
+    sock,
+    principal,
+    gate,
+    mailbox,
+    expectedUidValidity,
+    fn,
+    options,
+  );
+}
+
+/**
+ * An authenticated session with one mailbox opened in the mutating form.
+ *
+ * Built only by `withMutatingMailboxOver`, and only after the server said the
+ * mailbox is writable. A mutating session always has a mailbox open, so none of
+ * the three mailbox fields can be `null` here, unlike on `MailSession`.
+ *
+ * `access` is `"read-write"` and `MailSession`'s is `"read-only"`. Those two
+ * different literal values are what make the types unassignable to each other.
+ * Without them TypeScript would compare the shapes, find them compatible, and
+ * let a read helper take a mutating session or a verb take a read-only one.
+ */
+export interface MutatingMailSession {
+  /** Always `"read-write"`. The discriminant that keeps the two kinds apart. */
+  readonly access: "read-write";
+  channel: ImapChannel;
+  /** The raw wire mailbox name that was opened. */
+  mailbox: string;
+  /** The UIDVALIDITY the server reported, already checked against the id's. */
+  uidValidity: number;
+  /** How many messages the mailbox holds. */
+  exists: number;
+  /** The post-authentication capability list, verbatim, or `null`. */
+  capability: string | null;
+}
+
+/**
+ * What the mutating orchestrator resolves to when the mailbox did not open for
+ * writing.
+ *
+ * The server answered the open with OK but said the mailbox is read-only, or
+ * gave no access code at all. Both are the same refusal (PITFALLS #33): absent
+ * is not read-write. A third shape gets the same refusal: the mailbox opened
+ * read-write, but its permanent-flags list leaves out the seen flag. A change
+ * to that flag would then last only until logout, and the answer would report
+ * a change that is gone a moment later.
+ *
+ * A value and not an exception, on purpose. The return type carries it, so
+ * TypeScript makes every caller handle it. An exception could fall through to
+ * `toErrorCategory`'s floor and come out as `connection_failed`, which tells the
+ * model to retry something that will fail the same way every time.
+ */
+export const MAILBOX_NOT_WRITABLE: unique symbol = Symbol("mailbox-not-writable");
+
+/**
+ * Whether a mailbox open says a change to the seen flag is kept.
+ *
+ * RFC 3501 §7.1: a flag missing from the permanent-flags list can change for
+ * this session only. So the list must name the seen flag, compared without
+ * regard to case. `\*` does not count. It says new keywords can be created,
+ * and the seen flag is not a keyword.
+ *
+ * An open with no permanent-flags list at all is `true`. RFC 3501 §6.3.1 says
+ * to assume then that every flag is kept. If a server sends the list twice,
+ * the last one is its final word.
+ */
+function keepsSeenFlag(untagged: readonly ResponseLine[]): boolean {
+  let permanent: string[] | null = null;
+  for (const line of untagged) {
+    const flags = parsePermanentFlags(line.text);
+    if (flags !== null) permanent = flags;
+  }
+  if (permanent === null) return true;
+  return permanent.some((flag) => flag.toLowerCase() === "\\seen");
+}
+
+/**
+ * Hold a session over an already-open stream pair, with one mailbox opened in
+ * the mutating form.
+ *
+ * The lifecycle is the private core's, exactly as for the read orchestrator:
+ * the same gate, the same sign-in, the same deadline, the same teardown. The
+ * call into the core is the only statement, so nothing awaits ahead of the
+ * gate. One session per request holds whichever kind of session it is.
+ *
+ * The mailbox and its validity are required, not nullable. A change is always
+ * to a message the caller already holds an id for, and that id carries the
+ * validity it was minted under.
+ *
+ * The open step, in order:
+ *
+ * 1. Quote the mailbox, refusing a name with CR, LF or NUL.
+ * 2. Open it in the mutating form. This is the one place in the source tree
+ *    that builds that command, and a scan count holds it there. Anything other
+ *    than OK is `ImapNotFoundError`.
+ * 3. Check the validity against the id's, before anything can change. Absent
+ *    or different is `ImapNotFoundError`.
+ * 4. Read the access code off the tagged completion. Only read-write goes on.
+ *    Read-only and absent both resolve to `MAILBOX_NOT_WRITABLE`, and no
+ *    command is sent after the open.
+ * 5. Read the permanent-flags list off the untagged replies. If it is there
+ *    and does not name the seen flag, that is `MAILBOX_NOT_WRITABLE` too, and
+ *    no command is sent after the open. If it is not there, RFC 3501 says every
+ *    flag is kept, so the open goes on.
+ * 6. Build the `MutatingMailSession` and hand it to `fn`.
+ *
+ * No mode argument, and none may be added. The read orchestrator takes none
+ * either. Only `./triage.ts` imports this, and it exports verbs, never a session.
+ */
+export async function withMutatingMailboxOver<T>(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string,
+  expectedUidValidity: number,
+  fn: (session: MutatingMailSession) => Promise<T>,
+  options: MailSessionOptions = {},
+): Promise<T | typeof MAILBOX_NOT_WRITABLE> {
+  return withMailSessionCore<T | typeof MAILBOX_NOT_WRITABLE>(
+    duplex,
+    principal,
+    gate,
+    options,
+    async (channel, capability) => {
+      // Refuse rather than repair, as the read open does: a CR or LF in the
+      // name would end the command line early and inject a second command.
+      const quoted = quoteMailbox(mailbox);
+      if (quoted === null) throw new ImapNotFoundError();
+
+      const opened = await sendCommand(
+        channel,
+        channel.nextTag(),
+        `SELECT ${quoted}`,
+      );
+      if (opened.status !== "OK") throw new ImapNotFoundError();
+
+      // Before the access check, so a changed folder is not_found whether or
+      // not it is writable. Nothing has been changed at this point either way.
+      const { uidValidity, exists } = checkedMailboxFacts(
+        opened.untagged,
+        expectedUidValidity,
+      );
+
+      // OK alone does not mean writable. Only an explicit read-write code does.
+      if (parseAccessCode(opened.tagged.text) !== "read-write") {
+        return async () => MAILBOX_NOT_WRITABLE;
+      }
+
+      // Read-write alone does not mean the seen flag is kept past logout.
+      if (!keepsSeenFlag(opened.untagged)) {
+        return async () => MAILBOX_NOT_WRITABLE;
+      }
+
+      const session: MutatingMailSession = {
+        access: "read-write",
+        channel,
+        mailbox,
+        uidValidity,
+        exists,
+        capability,
+      };
+
+      return () => fn(session);
+    },
+  );
+}
+
+/**
+ * Open one socket and hold a mutating session over it.
+ *
+ * The same shape as `withMailSession`, for the same reasons: the gate is
+ * checked before the socket opens, nothing awaits between that check and the
+ * core's acquire, and a connect failure is a context-free `ImapConnectError`.
+ */
+export async function withMutatingMailbox<T>(
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string,
+  expectedUidValidity: number,
+  fn: (session: MutatingMailSession) => Promise<T>,
+  options: MailSessionOptions = {},
+): Promise<T | typeof MAILBOX_NOT_WRITABLE> {
+  if (gate.held) throw new ImapThrottleError();
+
+  let sock: DuplexLike;
+  try {
+    sock = connectImap();
+  } catch {
+    throw new ImapConnectError();
+  }
+
+  return withMutatingMailboxOver(
     sock,
     principal,
     gate,
