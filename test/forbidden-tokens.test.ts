@@ -926,6 +926,30 @@ describe("the fan-out rule reaches the triage verbs (Phase 21, D-10)", () => {
   });
 });
 
+// Phase 22, plan 01 (C-13). The draft delete adds one triage verb and one read
+// the preview opens a session for. Each is named in the fan-out rule, prefix
+// matched so its over-a-stream variant is covered too.
+describe("the fan-out rule reaches the draft delete (Phase 22, C-13)", () => {
+  const rule = FORBIDDEN.find((r) => r.id === "concurrent-session")!;
+  /** A fresh copy per probe, so no `lastIndex` carries between samples. */
+  const fires = (sample: string): boolean =>
+    new RegExp(rule.pattern.source, rule.pattern.flags).test(sample);
+  const fanOut = (name: string): string =>
+    `await Promise.all(ids.map((id) => ${name}(actor, gate, id)));`;
+
+  it("refuses a fan-out around deleteDraft", () => {
+    expect(fires(fanOut("deleteDraft")), `missed ${fanOut("deleteDraft")}`).toBe(true);
+    expect(fires(fanOut("deleteDraftOver"))).toBe(true);
+  });
+
+  it("refuses a fan-out around readDraftForChange", () => {
+    expect(fires(fanOut("readDraftForChange")), `missed ${fanOut("readDraftForChange")}`).toBe(
+      true,
+    );
+    expect(fires(fanOut("readDraftForChangeOver"))).toBe(true);
+  });
+});
+
 describe("the ban list itself", () => {
   it("gives every rule a non-empty reason, because the hook prints it on rejection", () => {
     expect(FORBIDDEN.length).toBeGreaterThan(0);

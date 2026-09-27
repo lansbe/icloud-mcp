@@ -2427,6 +2427,205 @@ export async function readMoveSet(
 }
 
 // ---------------------------------------------------------------------------
+// The draft delete's preview read (Phase 22, D-05, D-07, D-08)
+//
+// The move preview's shape, for one draft. A preview writes nothing, so it runs
+// on the READ path: the draft's folder is opened read-only through the read
+// orchestrator, with its validity gate. One folder listing, which finds the
+// drafts folder by the same ladder the compose tools use and the Trash folder
+// by the server's own special-use attribute. Then one fetch of the draft's
+// fingerprint and a peek at four header fields. No body is read.
+// ---------------------------------------------------------------------------
+
+/**
+ * The draft preview's fetch items: the fingerprint, plus a peek at four headers.
+ *
+ * The peeking form, so reading the subject cannot mark the draft read.
+ */
+const DRAFT_PREVIEW_ITEMS =
+  `${FINGERPRINT_ITEMS.slice(0, -1)} BODY.PEEK[HEADER.FIELDS (SUBJECT TO CC DATE)])`;
+
+/**
+ * Why a draft preview refused. Each wrote nothing and needs no retry advice.
+ *
+ * - `not-in-drafts`: the message is not in the folder the drafts ladder
+ *   resolves (D-07).
+ * - `no-trash-folder`: no folder carries the server's special-use Trash
+ *   attribute. A folder merely NAMED Trash does not count (D-08).
+ * - `ambiguous-role-folder`: two folders carry it, so none is picked.
+ * - `no-change-numbers`: the folder reports no MODSEQ, so a delete could not
+ *   be bound to "nothing changed" (D-05).
+ * - `not-a-draft`: the message does not carry the draft flag (D-07).
+ * - `already-marked-for-removal`: the draft already carries the removal mark,
+ *   and its copy in Trash would carry it too (D-05).
+ */
+export type DraftPreviewRefusal =
+  | "not-in-drafts"
+  | "no-trash-folder"
+  | "ambiguous-role-folder"
+  | "no-change-numbers"
+  | "not-a-draft"
+  | "already-marked-for-removal";
+
+/** What a draft preview found, for the confirmation and the answer. */
+export interface DraftForChange {
+  /** Size, internal date and MODSEQ, which the confirmation seals. */
+  fingerprint: Fingerprint;
+  /** The draft's subject line. Not vouched for: any app can write a draft. */
+  subject: string | null;
+  /** The To addresses, as the draft declares them. */
+  to: string[];
+  /** The Cc addresses, as the draft declares them. */
+  cc: string[];
+  /** The draft's own Date header. */
+  date: string | null;
+  /** The drafts folder's wire name, as the listing spelled it. */
+  draftsMailbox: string;
+  /** Which tier of the ladder found the drafts folder. */
+  draftsRoleSource: RoleSource;
+  /** The Trash folder's wire name, as the listing spelled it. */
+  trashMailbox: string;
+  /** The Trash folder's decoded name, for display only. */
+  trashDisplayName: string;
+}
+
+/** A draft preview's answer: a refusal by name, or the facts. */
+export type DraftReadOutcome =
+  | { refusal: DraftPreviewRefusal }
+  | { draft: DraftForChange };
+
+/** Whether a flag list holds `flag`, compared without case. */
+function hasFlag(flags: readonly string[], flag: string): boolean {
+  const wanted = flag.toLowerCase();
+  return flags.some((one) => one.toLowerCase() === wanted);
+}
+
+/** Every address a parsed header field carries, name-only entries by name. */
+function addressList(
+  list: readonly { name: string | null; address: string | null }[],
+): string[] {
+  const found: string[] = [];
+  for (const entry of list) {
+    const value = entry.address ?? entry.name;
+    if (value !== null && value.length > 0) found.push(value);
+  }
+  return found;
+}
+
+/**
+ * Read what a draft delete's preview needs, inside a session already open
+ * read-only on the draft's folder.
+ *
+ * In order, and each step refuses before the next is sent:
+ * 1. The folder listing. The drafts folder is the one the compose tools write
+ *    to; with none, this is `not_found` and nothing is guessed. A message in
+ *    any other folder is `not-in-drafts`, and no fetch is sent.
+ * 2. Trash, from the same listing: exactly one folder the server marks as
+ *    Trash. A name match does not count here (D-08).
+ * 3. One fetch of the fingerprint and four headers.
+ * 4. The draft flag must be there, and the removal mark must not.
+ */
+async function readDraftIn(
+  session: MailSession,
+  ref: MessageRef,
+): Promise<DraftReadOutcome> {
+  if (!isWireNumber(ref.uid) || ref.uid <= 0) throw new ImapNotFoundError();
+
+  const listing = await listAllFolders(session);
+  const drafts = resolveAppendTarget(listing, null);
+  if (ref.mailbox !== drafts.mailbox) return { refusal: "not-in-drafts" };
+
+  // A tie is `ambiguous-role-folder` only when it is a tie between folders the
+  // server itself marks as Trash. Two folders that merely share a Trash-like
+  // name mean no folder carries the attribute, and that is `no-trash-folder`.
+  const trash = resolveRoleFolder(listing, "trash");
+  if ("refusal" in trash) {
+    const marked = listing.folders.some(
+      (folder) => folder.role === "trash" && folder.roleSource === "special-use",
+    );
+    return {
+      refusal: trash.refusal === "ambiguous" && marked ? "ambiguous-role-folder" : "no-trash-folder",
+    };
+  }
+  if (trash.folder.roleSource !== "special-use") return { refusal: "no-trash-folder" };
+
+  const fetched = await sendCommand(
+    session.channel,
+    session.channel.nextTag(),
+    `UID FETCH ${ref.uid} ${DRAFT_PREVIEW_ITEMS}`,
+  );
+  if (fetched.status === "BAD") return { refusal: "no-change-numbers" };
+  if (fetched.status !== "OK") throw new ImapNotFoundError();
+
+  const items = fetchReplies(fetched.untagged).get(ref.uid);
+  if (items === undefined) throw new ImapNotFoundError();
+  const fingerprint = parseFingerprint(fetched.untagged, ref.uid);
+  if (fingerprint === null) {
+    // No MODSEQ at all is the folder saying it has none. Anything else that
+    // does not parse cannot be sealed, and is treated as not found.
+    if (!items.has("MODSEQ")) return { refusal: "no-change-numbers" };
+    throw new ImapNotFoundError();
+  }
+
+  if (!hasFlag(fingerprint.flags, "\\Draft")) return { refusal: "not-a-draft" };
+  if (hasFlag(fingerprint.flags, "\\Deleted")) {
+    return { refusal: "already-marked-for-removal" };
+  }
+
+  const header = headerBlockOf(items);
+  const parsed = header === null ? null : await extractMessage(header);
+  return {
+    draft: {
+      fingerprint,
+      subject: parsed?.subject ?? null,
+      to: addressList(parsed?.to ?? []),
+      cc: addressList(parsed?.cc ?? []),
+      date: parsed?.date ?? null,
+      draftsMailbox: drafts.mailbox,
+      draftsRoleSource: drafts.roleSource,
+      trashMailbox: trash.folder.wireName,
+      trashDisplayName: trash.folder.displayName,
+    },
+  };
+}
+
+/** Read a draft delete's preview facts over an already-open stream pair. */
+export async function readDraftForChangeOver(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  ref: MessageRef,
+  options: MailSessionOptions = {},
+): Promise<DraftReadOutcome> {
+  return withMailSessionOver(
+    duplex,
+    principal,
+    gate,
+    ref.mailbox,
+    ref.uidValidity,
+    (session) => readDraftIn(session, ref),
+    options,
+  );
+}
+
+/** Read a draft delete's preview facts: one socket, one read-only session. */
+export async function readDraftForChange(
+  principal: Principal,
+  gate: SessionGate,
+  ref: MessageRef,
+  options: MailSessionOptions = {},
+): Promise<DraftReadOutcome> {
+  return withMailSession(
+    principal,
+    gate,
+    ref.mailbox,
+    ref.uidValidity,
+    (session) => readDraftIn(session, ref),
+    options,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // The change check's mail reads (CHNG-01, CHNG-07)
 //
 // Two reads, in two sessions, one after the other. The first asks each folder

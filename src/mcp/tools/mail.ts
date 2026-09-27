@@ -30,6 +30,7 @@ import {
   ConfirmationInvalidError,
   changeHashMatches,
   composeConfirmationLine,
+  draftChangeHashOf,
   mailMoveChangeHashOf,
   mintConfirmation,
   reserveConfirmation,
@@ -38,6 +39,7 @@ import {
 import type {
   MailConfirmPayload,
   MailSetEntry,
+  NormalizedDraftChange,
   NormalizedMailMove,
 } from "../../confirm";
 import type { Env } from "../../env";
@@ -77,6 +79,7 @@ import { transferDecode } from "../../mail/mime";
 import type {
   AppendOutcome,
   AttachmentContent,
+  DraftPreviewRefusal,
   FolderListing,
   MessageDetail,
   MessagePage,
@@ -91,12 +94,14 @@ import {
   listFolders,
   listMessages,
   listUnread,
+  readDraftForChange,
   readMoveSet,
   resolveRoleFolder,
   searchMessages,
 } from "../../mail/service";
 import type { FolderSummary } from "../../mail/service";
 import type {
+  DraftDeleteOutcome,
   FlagStateOutcome,
   MessageMoveResult,
   MoveOutcome,
@@ -104,6 +109,7 @@ import type {
 } from "../../mail/triage";
 import {
   MOVE_SET_CAP,
+  deleteDraft,
   flagMessage,
   markRead,
   markUnread,
@@ -2051,11 +2057,16 @@ export async function buildMovePreview(
   );
 }
 
-/** A mail commit's change, as the schema admits it. */
-export type MailCommitChange = { op: "move"; ids: string[]; destination: string };
+/** A mail commit's change, as the schema admits it: a move, or a draft delete. */
+export type MailCommitChange =
+  | { op: "move"; ids: string[]; destination: string }
+  | { op: "draft-delete"; id: string; subject: string | null };
 
-/** What a mail commit produced, with the names its answer needs. */
+/** What a move commit produced, with the names its answer needs. */
 export interface MailCommitApplied {
+  op: "move";
+  /** The caller's ids, in the caller's order, from the handed-back change. */
+  ids: string[];
   outcome: MoveOutcome;
   /** The destination folder id the confirmation sealed. */
   destinationId: string;
@@ -2063,6 +2074,19 @@ export interface MailCommitApplied {
   destinationMailbox: string;
   /** The destination's role as the preview resolved it, from the sealed `qr`. */
   role: "archive" | "trash" | null;
+}
+
+/** What a draft-delete commit produced, with the names its answer needs. */
+export interface DraftDeleteApplied {
+  op: "draft-delete";
+  /** The caller's draft id, from the handed-back change. */
+  id: string;
+  /** The subject the preview read, from the handed-back change. */
+  subject: string | null;
+  outcome: DraftDeleteOutcome;
+  /** The Trash folder id the confirmation sealed. */
+  trashId: string;
+  trashMailbox: string;
 }
 
 /**
@@ -2081,19 +2105,86 @@ export interface MailCommitApplied {
  * nothing was started or changed, and a spent slot would be a change the user
  * then has to repair with a fresh preview. The reservation is one small
  * storage write, not a session and not staged-file work.
+ *
+ * A draft delete (Phase 22) takes its own branch, in the same order: kind
+ * `delete` and op `draft-delete`; Trash as the sealed role; exactly one sealed
+ * entry; the hash in the draft-delete domain; the caller's id agreeing with the
+ * sealed folder, validity and UID; then the lease, the reservation and one
+ * `deleteDraft` call.
  */
 export async function applyMailCommit(
   actor: Principal,
   mail: LeasedMail,
   confirmToken: string,
   change: MailCommitChange,
-): Promise<MailCommitApplied> {
+): Promise<MailCommitApplied | DraftDeleteApplied> {
   const payload = await verifyConfirmation(
     confirmToken,
     env.CONFIRM_SECRET,
     actor.userId,
     "mail",
   );
+
+  // The draft-delete arm (Phase 22, D-06, D-16), in the move arm's order. A
+  // delete token is refused as a move and a move token as a delete, by kind
+  // and op here and again by hash domain below.
+  if (change.op === "draft-delete") {
+    if (payload.k !== "delete") throw new ConfirmationInvalidError();
+    if (payload.qr !== "trash" || payload.q === null) throw new ConfirmationInvalidError();
+    if (payload.l.length !== 1) throw new ConfirmationInvalidError();
+    const entry = payload.l[0]!;
+
+    const normalized: NormalizedDraftChange = {
+      op: change.op,
+      id: change.id,
+      subject: change.subject,
+    };
+    if (!(await changeHashMatches(await draftChangeHashOf(normalized), payload.h))) {
+      throw new ConfirmationInvalidError();
+    }
+
+    let draftsMailbox: string;
+    let trashMailbox: string;
+    let ref: MessageRef;
+    try {
+      draftsMailbox = decodeFolderId(payload.m).mailbox;
+      trashMailbox = decodeFolderId(payload.q).mailbox;
+      ref = decodeMessageId(change.id);
+    } catch {
+      throw new ConfirmationInvalidError();
+    }
+    if (
+      ref.mailbox !== draftsMailbox ||
+      ref.uidValidity !== payload.uv ||
+      ref.uid !== entry.i
+    ) {
+      throw new ConfirmationInvalidError();
+    }
+
+    // The lease after every check and before the reservation, held across
+    // the reservation and the one delete session, exactly as the move arm
+    // below: a busy refusal never spends the confirmation (C-14).
+    const trashId = payload.q;
+    const outcome = await mail.withConnectionLease(actor, async (leased) => {
+      await reserveConfirmation(env.CONFIRM_KV, actor.userId, payload.j, payload.x);
+
+      return deleteDraft(actor, leased, {
+        draftsMailbox,
+        uidValidity: payload.uv,
+        entry: { uid: entry.i, size: entry.z, internalDate: entry.d, modSeq: entry.n },
+        trashMailbox,
+      });
+    });
+    return {
+      op: "draft-delete",
+      id: change.id,
+      subject: change.subject,
+      outcome,
+      trashId,
+      trashMailbox,
+    };
+  }
+
   if (payload.k !== "move" || change.op !== "move") {
     throw new ConfirmationInvalidError();
   }
@@ -2151,6 +2242,8 @@ export async function applyMailCommit(
     );
   });
   return {
+    op: "move",
+    ids: [...change.ids],
     outcome,
     destinationId: payload.q,
     sourceMailbox,
@@ -2225,6 +2318,193 @@ function mailCommitResult(ids: readonly string[], applied: MailCommitApplied): T
   }));
   return {
     content: [{ type: "text", text: JSON.stringify({ confirmationLine, results }) }],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Deleting one draft: the preview and the commit's answer (Phase 22)
+//
+// A draft delete is a move of one draft to Trash, previewed first and applied
+// by `mail_commit` like every mail change. The preview reads on the read path
+// and writes nothing. The draft must be in the drafts folder, carry the draft
+// flag, and go to the folder the server itself marks as Trash. Nothing here
+// finds a draft by subject or header: a draft that changed or went away is
+// refused, never searched for (D-14).
+// ---------------------------------------------------------------------------
+
+/**
+ * The guarantee every draft preview and commit answer carries, word for word
+ * (D-14, DRFT-07).
+ *
+ * It says what the tool checks and what it does not. It cannot fit into the
+ * tool's description beside the untrusted notice, so it lives in the answers,
+ * and no description may claim anything stronger.
+ */
+export const DRAFT_GUARANTEE =
+  "This acts only on a draft, in the drafts folder, exactly as you were just shown it. " +
+  "It does not check who wrote the draft.";
+
+/** The fixed reason for each draft refusal. ASCII, and no server text. */
+const DRAFT_REFUSAL_REASONS = {
+  "not-in-drafts":
+    "This message is not in the drafts folder, so nothing was changed. Only a draft in " +
+    "Drafts can be moved to Trash this way.",
+  "not-a-draft": "This message is not marked as a draft, so nothing was changed.",
+  "already-marked-for-removal":
+    "This draft is already marked for removal by another app. Moving it would carry that " +
+    "mark to the copy in Trash, where another app could remove it for good. Nothing was " +
+    "changed.",
+  "no-change-numbers":
+    "The drafts folder does not report change numbers, so this cannot be checked against " +
+    "later changes. Nothing was changed.",
+  "no-trash-folder":
+    "The account's folder list shows no folder the server marks as Trash, so nothing was " +
+    "changed and no folder was guessed.",
+  "ambiguous-role-folder":
+    "Two folders are both marked as Trash, so none was picked and nothing was changed.",
+  "mailbox-read-only": "The drafts folder opened read-only, so nothing was changed.",
+  "removal-not-kept":
+    "The drafts folder does not keep the mark a move needs, so nothing was changed.",
+  "commands-unavailable":
+    "iCloud did not offer the commands a safe move needs, so nothing was changed.",
+  "changed-since-preview":
+    "The draft changed or is gone since the preview. Nothing was changed. Preview it again.",
+} as const;
+
+type DraftRefusal = keyof typeof DRAFT_REFUSAL_REASONS;
+
+/** A draft refusal answer: plain JSON with the guarantee, never `isError`. */
+function draftRefusalResult(
+  refusal: DraftRefusal,
+  extra: Record<string, unknown> = {},
+): ToolResult {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({
+          refusal,
+          reason: DRAFT_REFUSAL_REASONS[refusal],
+          ...extra,
+          guarantee: DRAFT_GUARANTEE,
+        }),
+      },
+    ],
+  };
+}
+
+/**
+ * Preview moving one draft to Trash: one read session, then a confirmation,
+ * and nothing written.
+ *
+ * The lease is taken around the one read session and nothing else, as
+ * `buildMovePreview` does: it is given back before the confirmation is minted.
+ * The confirmation is the mail arm's set shape with exactly one entry: the
+ * drafts folder, its validity, the Trash folder and its role, and the draft's
+ * UID, size, internal date and MODSEQ, every value read from the server here.
+ */
+async function buildDraftDeletePreview(
+  actor: Principal,
+  mail: LeasedMail,
+  id: string,
+  ref: MessageRef,
+): Promise<ToolResult> {
+  const facts = await mail.withConnectionLease(actor, (leased) =>
+    readDraftForChange(actor, leased, ref),
+  );
+  if ("refusal" in facts) {
+    const refusal: DraftPreviewRefusal = facts.refusal;
+    return draftRefusalResult(refusal, { id });
+  }
+
+  const { draft } = facts;
+  const change: NormalizedDraftChange = { op: "draft-delete", id, subject: draft.subject };
+  const draftsId = encodeFolderId({ mailbox: draft.draftsMailbox });
+  const trashId = encodeFolderId({ mailbox: draft.trashMailbox });
+  const confirmToken = await mintMailConfirmation(actor, {
+    k: "delete",
+    h: await draftChangeHashOf(change),
+    m: draftsId,
+    uv: ref.uidValidity,
+    q: trashId,
+    qr: "trash",
+    l: [
+      {
+        i: ref.uid,
+        z: draft.fingerprint.size,
+        d: draft.fingerprint.internalDate,
+        n: draft.fingerprint.modSeq,
+      },
+    ],
+  });
+  const confirmationLine = composeConfirmationLine(
+    { kind: "draft", name: draft.subject, outcome: null },
+    "would",
+  );
+
+  return untrustedToolResult(
+    {
+      confirmToken,
+      expiresInSeconds: CONFIRM_TTL_SECONDS,
+      change,
+      confirmationLine,
+      guarantee: DRAFT_GUARANTEE,
+    },
+    {
+      subject: draft.subject,
+      to: draft.to,
+      cc: draft.cc,
+      date: draft.date,
+      size: draft.fingerprint.size,
+      trashName: draft.trashDisplayName,
+    },
+  );
+}
+
+/**
+ * A draft-delete commit's answer. Plain JSON; a refusal is not `isError`.
+ *
+ * The move answer's shape for one message, plus the guarantee: the caller's
+ * id, what happened, why, and the copy's new id in Trash when the server's
+ * reply proved it, minted with Trash's validity from that reply.
+ */
+function draftCommitResult(applied: DraftDeleteApplied): ToolResult {
+  const { outcome } = applied;
+  if (!outcome.applied) {
+    return draftRefusalResult(
+      outcome.refusal,
+      outcome.refusal === "changed-since-preview" ? { changedIds: [applied.id] } : {},
+    );
+  }
+
+  const { result } = outcome;
+  const confirmationLine = composeConfirmationLine(
+    { kind: "draft", name: applied.subject, outcome: result.outcome },
+    "did",
+  );
+  const results = [
+    {
+      id: applied.id,
+      outcome: result.outcome,
+      reason: result.reason,
+      newId:
+        result.newUid !== null && result.destinationUidValidity !== null
+          ? encodeMessageId({
+              mailbox: applied.trashMailbox,
+              uidValidity: result.destinationUidValidity,
+              uid: result.newUid,
+            })
+          : null,
+      destination: applied.trashId,
+    },
+  ];
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({ confirmationLine, results, guarantee: DRAFT_GUARANTEE }),
+      },
+    ],
   };
 }
 
@@ -3624,17 +3904,51 @@ export function registerMailTools(
   );
 
   /**
+   * Preview moving one draft to Trash (Phase 22, DRFT-03 to DRFT-07).
+   *
+   * Exactly one input: a draft's message id, as a listing of the drafts folder
+   * or a compose answer gave it. No folder, no list, no search term and no
+   * subject, so nothing this server read can choose the draft (D-19). Writes
+   * nothing; `mail_commit` applies it. The id is decoded before the lease and
+   * before any socket, so a bad id costs no connection.
+   */
+  server.registerTool(
+    "mail_delete_draft",
+    {
+      description:
+        "Preview moving one draft to Trash. Writes nothing; apply with " +
+        `mail_commit. ${UNTRUSTED_NOTICE}`,
+      inputSchema: z.object({
+        id: z
+          .string()
+          .describe("A draft's message id, from a listing of the drafts folder."),
+      }),
+    },
+    async ({ id }) => {
+      try {
+        const actor = await principal;
+        const ref = decodeMessageId(id);
+        return await withMailConfirmationBoundary(() =>
+          buildDraftDeletePreview(actor, mail, id, ref),
+        );
+      } catch (err) {
+        return mailErrorResult(err);
+      }
+    },
+  );
+
+  /**
    * Apply a previewed mail change (D-05).
    *
    * A mail commit tool of its own, so a mail confirmation and a calendar or
    * contact one can never be spent at each other's endpoint. The change is a
-   * union on `op`; today it has one arm.
+   * union on `op`: a move (Phase 21) or a draft delete (Phase 22).
    */
   server.registerTool(
     "mail_commit",
     {
       description:
-        "Apply a move, archive or trash preview. Pass its confirmToken and " +
+        "Apply a move, archive, trash or draft preview. Pass confirmToken and " +
         `change back unaltered. ${UNTRUSTED_NOTICE}`,
       inputSchema: z.object({
         confirmToken: z
@@ -3651,6 +3965,11 @@ export function registerMailTools(
               ids: z.array(z.string()),
               destination: z.string(),
             }),
+            z.object({
+              op: z.literal("draft-delete"),
+              id: z.string(),
+              subject: z.string().nullable(),
+            }),
           ])
           .describe("The change object from the preview, unaltered."),
       }),
@@ -3661,7 +3980,8 @@ export function registerMailTools(
         const applied = await withMailConfirmationBoundary(() =>
           applyMailCommit(actor, mail, confirmToken, change),
         );
-        return mailCommitResult(change.ids, applied);
+        if (applied.op === "draft-delete") return draftCommitResult(applied);
+        return mailCommitResult(applied.ids, applied);
       } catch (err) {
         return mailErrorResult(err);
       }

@@ -87,7 +87,7 @@ enforcement, and the module map — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ## Tools
 
-38 tools in five groups. Every tool description carries an untrusted-content
+39 tools in five groups. Every tool description carries an untrusted-content
 notice; event titles, message bodies, and contact fields are treated as data,
 never as instructions.
 
@@ -113,7 +113,8 @@ never as instructions.
 | `mail_move` | Preview moving up to 25 messages from one folder to a folder you name, by folder id. Writes nothing; apply with `mail_commit`. |
 | `mail_archive` | Preview moving up to 25 messages to the account's own archive folder. Refuses if the account has none, rather than guessing. Writes nothing; apply with `mail_commit`. |
 | `mail_trash` | Preview moving up to 25 messages to Trash, where they can be moved back. Writes nothing; apply with `mail_commit`. |
-| `mail_commit` | Apply a move, archive or Trash preview, only if the messages are unchanged since. Reports each message as `moved`, `copied_not_removed`, `not_copied` or `unknown`. Never removes mail for good. |
+| `mail_delete_draft` | Preview moving one draft to Trash. Acts only on a draft in the drafts folder, exactly as the preview showed it. Writes nothing; apply with `mail_commit`. |
+| `mail_commit` | Apply a move, archive, Trash or draft-delete preview, only if the messages are unchanged since. Reports each message as `moved`, `copied_not_removed`, `not_copied` or `unknown`. Never removes mail for good. |
 | `mail_get_attachment` | Read one attachment as text (PDF text is extracted). |
 | `mail_compose_new` | Compose a new message **into Drafts** (never sent). |
 | `mail_compose_reply` | Reply to a message **into Drafts**, threaded (never sent). |
@@ -485,7 +486,7 @@ which runs both from the test suite and from a pre-commit hook:
 2. No mail sending — no SMTP, one draft-write path, enforced as a count.
 3. One and only one module may open a TCP socket.
 4. No credential ever reaches a log or an error (there is no logging in `src/`).
-5. Reading mail never marks it read (read paths open mailboxes read-only, fetches peek). One separate path changes mail only when you ask: it marks a message read or unread, flags it, or moves messages to another folder. A move is previewed first, and nothing removes mail for good.
+5. Reading mail never marks it read (read paths open mailboxes read-only, fetches peek). One separate path changes mail only when you ask: it marks a message read or unread, flags it, moves messages to another folder, or moves one draft to Trash. A move is previewed first, and nothing removes mail for good.
 
 Changing any of these is a change to the project's safety boundary. The rules,
 their reasons, and how they are enforced are documented in

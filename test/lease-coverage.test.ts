@@ -38,6 +38,7 @@ import type { UserAgent } from "../src/agent/user-agent";
 import {
   CONFIRM_TTL_SECONDS,
   CONFIRM_VERSION,
+  draftChangeHashOf,
   mailMoveChangeHashOf,
   mintConfirmation,
   reserveConfirmation,
@@ -141,6 +142,7 @@ function heldByAnotherRequest(): StoredLease {
 // ---------------------------------------------------------------------------
 
 const MESSAGE_ID = encodeMessageId({ mailbox: "INBOX", uidValidity: 7, uid: 42 });
+const DRAFT_ID = encodeMessageId({ mailbox: "Drafts", uidValidity: 7, uid: 42 });
 const FOLDER_ID = encodeFolderId({ mailbox: "Receipts" });
 const ATTACHMENT_ID = encodeAttachmentId({
   mailbox: "INBOX",
@@ -191,6 +193,33 @@ async function mintedMove(): Promise<{ confirmToken: string; jti: string; expiry
   return { confirmToken, jti, expiry };
 }
 
+const DRAFT_CHANGE = { op: "draft-delete" as const, id: DRAFT_ID, subject: "Thanks" };
+
+/** A real, unspent draft-delete confirmation for DRAFT_CHANGE, and its slot id. */
+async function mintedDraftDelete(): Promise<{ confirmToken: string; jti: string; expiry: number }> {
+  const actor = await ownerPrincipal();
+  const jti = crypto.randomUUID();
+  const expiry = Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS;
+  const confirmToken = await mintConfirmation(
+    {
+      v: CONFIRM_VERSION,
+      t: "mail",
+      k: "delete",
+      j: jti,
+      m: encodeFolderId({ mailbox: "Drafts" }),
+      uv: 7,
+      q: encodeFolderId({ mailbox: "Deleted Messages" }),
+      qr: "trash",
+      l: [{ i: 42, z: 1200, d: 1790000000, n: "9001" }],
+      h: await draftChangeHashOf(DRAFT_CHANGE),
+      x: expiry,
+      u: actor.userId,
+    },
+    env.CONFIRM_SECRET,
+  );
+  return { confirmToken, jti, expiry };
+}
+
 type Args = Record<string, unknown> | (() => Promise<Record<string, unknown>>);
 
 async function argsOf(args: Args): Promise<Record<string, unknown>> {
@@ -222,6 +251,7 @@ const LEASED: ReadonlyArray<{ name: string; args: Args }> = [
   { name: "mail_move", args: { ids: [MESSAGE_ID], destination: FOLDER_ID } },
   { name: "mail_archive", args: { ids: [MESSAGE_ID] } },
   { name: "mail_trash", args: { ids: [MESSAGE_ID] } },
+  { name: "mail_delete_draft", args: { id: DRAFT_ID } },
   {
     name: "mail_commit",
     args: async () => ({ confirmToken: (await mintedMove()).confirmToken, change: MOVE_CHANGE }),
@@ -420,6 +450,26 @@ describe("with the lease held by another request (DOBJ-02, DOBJ-03)", () => {
     const answer = await tools.get("mail_commit")!({ confirmToken, change: MOVE_CHANGE });
 
     expect(bodyOf(answer)).toEqual(BUSY);
+    // The one-time slot is still free: claiming it now succeeds. Had the busy
+    // refusal spent it, this would throw.
+    const { userId } = await ownerPrincipal();
+    await expect(
+      reserveConfirmation(env.CONFIRM_KV, userId, jti, expiry),
+    ).resolves.toBeUndefined();
+  });
+
+  it("a draft-delete mail_commit refused as busy opens no socket and does not spend the confirmation", async () => {
+    const tools = realTools();
+    const { confirmToken, jti, expiry } = await mintedDraftDelete();
+    const held = heldByAnotherRequest();
+    await seedLease(held);
+
+    const answer = await tools.get("mail_commit")!({ confirmToken, change: DRAFT_CHANGE });
+
+    expect(answer.isError).toBe(true);
+    expect(bodyOf(answer)).toEqual(BUSY);
+    expect(connectImap).not.toHaveBeenCalled();
+    expect(await readLease()).toEqual(held);
     // The one-time slot is still free: claiming it now succeeds. Had the busy
     // refusal spent it, this would throw.
     const { userId } = await ownerPrincipal();

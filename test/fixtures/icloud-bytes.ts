@@ -785,3 +785,84 @@ export const ATTACHMENT_MESSAGE_STRUCTURE_FETCH = structureFetchReply(
   ATTACHMENT_MESSAGE_STRUCTURE,
   { uid: 4831, wireSize: ATTACHMENT_MESSAGE_BYTES.byteLength },
 );
+
+// ---------------------------------------------------------------------------
+// Deleting one draft (Phase 22)
+//
+// iCloud lists its drafts folder with no special-use attribute, so the drafts
+// ladder finds it by name, and lists "Deleted Messages" with the special-use
+// Trash attribute (04-UAT). The draft delete accepts only the attribute.
+// ---------------------------------------------------------------------------
+
+/** The drafts folder's UIDVALIDITY in these scripts. */
+export const DRAFTS_UIDVALIDITY = 1_725_000_401;
+
+/**
+ * Trash's UIDVALIDITY, deliberately DIFFERENT from the drafts folder's, so a
+ * new id minted with the wrong one cannot pass (PITFALLS #35).
+ */
+export const TRASH_UIDVALIDITY = 1_726_000_902;
+
+/** The folders iCloud lists for a draft delete: INBOX, Drafts and its Trash. */
+export const DRAFT_FOLDERS: readonly [string, string][] = [
+  ["INBOX", "\\HasNoChildren"],
+  ["Drafts", "\\HasNoChildren"],
+  ["Deleted Messages", "\\HasNoChildren \\Trash"],
+];
+
+/** A listing of `folders` with their counts, then its completion. */
+export function draftListingReply(
+  tag: string,
+  folders: readonly (readonly [string, string])[] = DRAFT_FOLDERS,
+): Uint8Array {
+  return wire(
+    ...folders.flatMap(([name, attributes]) => [
+      `* LIST (${attributes}) "/" "${name}"`,
+      `* STATUS "${name}" (MESSAGES 3 UNSEEN 0)`,
+    ]),
+    `${tag} OK LIST completed`,
+  );
+}
+
+/** One draft, as the fixtures describe it. */
+export interface DraftFixture {
+  uid: number;
+  size: number;
+  modSeq: string;
+  /** The flag list's inside, verbatim. */
+  flags: string;
+  internalDate: string;
+  subject: string;
+  to: string;
+}
+
+/** The fingerprint items of one draft, as a FETCH reply's list. */
+function draftFingerprintItems(draft: DraftFixture): string {
+  return (
+    `UID ${draft.uid} FLAGS (${draft.flags}) RFC822.SIZE ${draft.size} ` +
+    `INTERNALDATE "${draft.internalDate}" MODSEQ (${draft.modSeq})`
+  );
+}
+
+/** The draft preview's fetch reply: the fingerprint plus a header literal. */
+export function draftPreviewFetchReply(tag: string, draft: DraftFixture): Uint8Array {
+  const header = ENCODER.encode(
+    `Subject: ${draft.subject}\r\nTo: ${draft.to}\r\n` +
+      "Date: Thu, 24 Sep 2026 10:02:11 -0700\r\n\r\n",
+  );
+  const head = ENCODER.encode(
+    `* 1 FETCH (${draftFingerprintItems(draft)} ` +
+      `BODY[HEADER.FIELDS (SUBJECT TO CC DATE)] {${header.byteLength}}\r\n`,
+  );
+  const tail = ENCODER.encode(`)\r\n${tag} OK FETCH completed\r\n`);
+  const joined = new Uint8Array(head.byteLength + header.byteLength + tail.byteLength);
+  joined.set(head, 0);
+  joined.set(header, head.byteLength);
+  joined.set(tail, head.byteLength + header.byteLength);
+  return joined;
+}
+
+/** The commit's fingerprint re-read reply for one draft. */
+export function draftFingerprintReply(tag: string, draft: DraftFixture): Uint8Array {
+  return wire(`* 1 FETCH (${draftFingerprintItems(draft)})`, `${tag} OK FETCH completed`);
+}

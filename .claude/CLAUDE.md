@@ -570,7 +570,8 @@ command it protects.
 
 Phase 20 adds a tool that marks one message read or unread. To do that, it has
 to open a mailbox in the form that allows changes. This is the one place that
-happens. Phase 21 adds flag and move on the same path.
+happens. Phase 21 adds flag and move on the same path. Phase 22 adds one more
+verb: moving one draft to Trash.
 
 1. **Which paths are read-only.** Every other mail tool goes through the read
    orchestrator. When it opens a mailbox, it opens it read-only. The sign-in
@@ -582,9 +583,9 @@ happens. Phase 21 adds flag and move on the same path.
    private core and the same one-per-request gate as the read one. Only
    `src/mail/triage.ts` may use it. That module hands out verbs, never a
    session. Its verbs mark one message read or unread, flag or unflag one
-   message, and move a list of messages from one folder to another. Archive
-   and Trash are moves to a folder the account itself names. Each verb acts
-   only when the user asks.
+   message, move a list of messages from one folder to another, and move one
+   draft from the drafts folder to Trash. Archive and Trash are moves to a
+   folder the account itself names. Each verb acts only when the user asks.
 
 3. **What this gives up.** Before Phase 20, iCloud itself refused a read-status
    change in every session this server opened. Now that is true only on read
@@ -611,6 +612,17 @@ happens. Phase 21 adds flag and move on the same path.
      moved back.
    - Every move is previewed. The commit acts only on the messages the preview
      named, and only if they are unchanged since.
+   - The draft delete acts only on one message in the drafts folder that
+     carries the draft flag. Its answers carry this sentence, word for word:
+     "This acts only on a draft, in the drafts folder, exactly as you were just shown it. It does not check who wrote the draft."
+     It never finds a draft by subject or message id. A draft that changed or
+     went away is refused, not searched for.
+   - The draft delete's Trash is the folder iCloud marks as Trash. A folder
+     that is only named Trash is refused.
+   - There is no revise verb. A revision is a new draft from the compose tools,
+     then this delete. The server does not check the order. The instructions
+     tell the model to write the new draft first. A wrong order loses nothing
+     for good, because the old draft is in Trash.
 
 5. **How the read side is proved.** `test/read-path-wire.test.ts` holds the
    exact commands every read sends. They were recorded before the split. Editing
@@ -624,6 +636,9 @@ happens. Phase 21 adds flag and move on the same path.
    - A new verb beyond these.
    - A way to remove mail in place, or to empty Trash.
    - A second site for the copy, the removal mark or the removal.
+   - Using the draft delete on a message outside the drafts folder, or on one
+     without the draft flag.
+   - Finding a draft by subject or message id.
 
 ### Enforcement
 
