@@ -107,6 +107,35 @@ import type { TwoUserDavStub } from "./fixtures/two-user-dav";
 import type { Attempt, RecordedToolResult } from "./fixtures/two-users";
 import type { Principal } from "../src/principal";
 import { ownerPrincipal } from "./fixtures/bound-secrets";
+import type { McpServer } from "@modelcontextprotocol/server";
+import { connectImap } from "../src/mail/socket";
+import { createSessionGate } from "../src/mail/service";
+import {
+  CHANGES_TOOL_NAME,
+  refusedMarkerResult,
+  registerChangesTool,
+} from "../src/mcp/tools/changes";
+import {
+  GREETING,
+  INBOX_UIDVALIDITY,
+  POST_AUTH_CAPABILITY,
+  PRE_AUTH_CAPABILITY,
+  capabilityResponse,
+  logoutExchange,
+  statusResponse,
+  taggedOk,
+} from "./fixtures/icloud-bytes";
+import { createFakeDuplex } from "./fixtures/fake-duplex";
+import type { TestUser } from "./fixtures/two-users";
+
+// The socket module, spied on for the change-marker describe at the bottom.
+// The real function stays the default, so every other case in this file
+// reaches exactly what it reached before; that describe queues a fake session
+// per call and counts the connects.
+vi.mock("../src/mail/socket", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../src/mail/socket")>();
+  return { ...original, connectImap: vi.fn(original.connectImap) };
+});
 
 // The owner's principal, as the PROMISE the real env constructor returns over
 // the pool's ambient environment. The DAV fetch builder and the registrars take
@@ -1751,5 +1780,79 @@ describe("an invitation answer belongs to the person who gave it", () => {
     expect(stub.writesUnder.A.length).toBe(1);
     expect(stub.writesUnder.A[0]!.user).toBe("A");
     expect(stub.writesUnder.B).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The change marker (D-12, D-34, T-23-13)
+// ---------------------------------------------------------------------------
+
+type ChangesAnswer = { content: { type: "text"; text: string }[]; isError?: boolean };
+type ChangesCall = (args: { marker?: string }) => Promise<ChangesAnswer>;
+
+/** The change tool's callback, registered for one user on their own gate. */
+function changesFor(user: TestUser): ChangesCall {
+  let callback: ChangesCall | undefined;
+  const server = {
+    registerTool(name: string, _options: unknown, handler: ChangesCall) {
+      if (name === CHANGES_TOOL_NAME) callback = handler;
+    },
+  } as unknown as McpServer;
+  const who = testPrincipal(user);
+  who.catch(() => {});
+  registerChangesTool(server, createSessionGate(), who);
+  if (callback === undefined) throw new Error("the change tool is not registered");
+  return callback;
+}
+
+/** One fake session answering one inbox status command. */
+function inboxStatusSession() {
+  return createFakeDuplex([
+    GREETING,
+    capabilityResponse("a1", PRE_AUTH_CAPABILITY),
+    taggedOk("a2", "LOGIN completed"),
+    capabilityResponse("a3", POST_AUTH_CAPABILITY),
+    statusResponse("a4", "INBOX", INBOX_UIDVALIDITY, 4392, 172, "118"),
+    logoutExchange("a5"),
+  ]);
+}
+
+/** A marker minted for `user` through their own call. */
+async function markerMintedBy(user: TestUser): Promise<string> {
+  vi.mocked(connectImap).mockReturnValueOnce(inboxStatusSession() as never);
+  const answer = await changesFor(user)({});
+  const marker = JSON.parse(answer.content[0]!.text).marker;
+  expect(typeof marker, `no marker came back for ${user.label}`).toBe("string");
+  return marker as string;
+}
+
+describe("change marker: a marker belongs to the user it was minted for", () => {
+  beforeEach(() => {
+    vi.mocked(connectImap).mockClear();
+  });
+
+  it("B presenting A's marker is refused and opens no socket; A presenting it is accepted", async () => {
+    const markerA = await markerMintedBy(USER_A);
+    expect(connectImap).toHaveBeenCalledTimes(1);
+
+    const answerB = await changesFor(USER_B)({ marker: markerA });
+    expect(answerB, "B's answer is not the one refusal").toEqual(refusedMarkerResult());
+    expect(connectImap, "B's call opened a socket").toHaveBeenCalledTimes(1);
+
+    vi.mocked(connectImap).mockReturnValueOnce(inboxStatusSession() as never);
+    const answerA = await changesFor(USER_A)({ marker: markerA });
+    const trusted = JSON.parse(answerA.content[0]!.text);
+    expect(trusted.refusal, "A's own marker was refused").toBeUndefined();
+    expect(trusted.counts[0].state).toBe("no_changes");
+    expect(connectImap).toHaveBeenCalledTimes(2);
+  });
+
+  it("A presenting B's marker is refused and opens no socket", async () => {
+    const markerB = await markerMintedBy(USER_B);
+    expect(connectImap).toHaveBeenCalledTimes(1);
+
+    const answerA = await changesFor(USER_A)({ marker: markerB });
+    expect(answerA, "A's answer is not the one refusal").toEqual(refusedMarkerResult());
+    expect(connectImap, "A's call opened a socket").toHaveBeenCalledTimes(1);
   });
 });
