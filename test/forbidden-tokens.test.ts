@@ -817,6 +817,104 @@ describe("the removal and move-command rules (TRIA-07)", () => {
   });
 });
 
+// Phase 21, plan 05 (D-10, TRIA-04). The fan-out rule lists the triage verbs
+// and the move composites, now that list operations exist. A list is worked
+// through one message at a time in one session, never by mapping a verb.
+describe("the fan-out rule reaches the triage verbs (Phase 21, D-10)", () => {
+  const rule = FORBIDDEN.find((r) => r.id === "concurrent-session")!;
+  /** A fresh copy per probe, so no `lastIndex` carries between samples. */
+  const fires = (sample: string): boolean =>
+    new RegExp(rule.pattern.source, rule.pattern.flags).test(sample);
+  /** The realistic fan-out, with one name substituted in. */
+  const fanOut = (name: string): string =>
+    `await Promise.all(ids.map((id) => ${name}(actor, gate, id)));`;
+
+  /** `concurrent-session` exactly as it shipped before plan 21-05, typed out
+   *  so the widening has something to be measured against. */
+  const CONCURRENT_SESSION_BEFORE_21_05 =
+    /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox)/g;
+
+  const ADDED = [
+    "markRead",
+    "markUnread",
+    "flagMessage",
+    "unflagMessage",
+    "moveMessages",
+    "readMoveSet",
+    "buildMovePreview",
+    "applyMailCommit",
+  ];
+
+  for (const name of ADDED) {
+    it(`refuses a fan-out around ${name}`, () => {
+      expect(fires(fanOut(name)), `missed ${fanOut(name)}`).toBe(true);
+      // And its over-a-stream variant, which the prefix match covers.
+      expect(fires(fanOut(`${name}Over`))).toBe(true);
+    });
+  }
+
+  it("the rule as it shipped before 21-05 misses every added name, so the widening has teeth", () => {
+    for (const name of ADDED) {
+      const old = new RegExp(
+        CONCURRENT_SESSION_BEFORE_21_05.source,
+        CONCURRENT_SESSION_BEFORE_21_05.flags,
+      );
+      expect(old.test(fanOut(name)), `the old pattern already saw ${name}`).toBe(false);
+    }
+    // And the typed-out text really was the rule: it still fires where the
+    // widened rule fires on the two orchestrators.
+    for (const name of ["withMailSession", "withMutatingMailbox"]) {
+      const old = new RegExp(
+        CONCURRENT_SESSION_BEFORE_21_05.source,
+        CONCURRENT_SESSION_BEFORE_21_05.flags,
+      );
+      expect(old.test(fanOut(name))).toBe(true);
+      expect(fires(fanOut(name))).toBe(true);
+    }
+  });
+
+  it("covers every function src/mail/triage.ts exports, read from the source", () => {
+    // Measured, not listed. A verb added later without a name in the rule
+    // turns this red, which is the hole DAV_WRITE_MODULES closes for the DAV
+    // rule.
+    const names = exportedFunctionNames(rawSourceOf("src/mail/triage.ts"));
+    for (const expected of [
+      "markRead",
+      "markReadOver",
+      "markUnread",
+      "markUnreadOver",
+      "flagMessage",
+      "flagMessageOver",
+      "unflagMessage",
+      "unflagMessageOver",
+      "moveMessages",
+      "moveMessagesOver",
+    ]) {
+      expect(names, `${expected} was not read from the source`).toContain(expected);
+    }
+    for (const name of names) {
+      expect(
+        matchRule(rule, FORBIDDEN.indexOf(rule), "src/mcp/tools/mail.ts", fanOut(name)).length,
+        `a fan-out around ${name} passes the rule`,
+      ).toBeGreaterThan(0);
+    }
+  });
+
+  it("does not fire on one awaited verb, or on the whole list handed to one move", () => {
+    for (const permitted of [
+      "const outcome = await markRead(principal, gate, ref);",
+      "return moveMessages(principal, gate, source, entries, destination, options);",
+      "const preview = await buildMovePreview(principal, gate, request);",
+    ]) {
+      expect(fires(permitted), `false-positived on ${permitted}`).toBe(false);
+    }
+  });
+
+  it("finds no fan-out in the real tree", () => {
+    expect(scan().map((v) => v.pattern)).not.toContain("concurrent-session");
+  });
+});
+
 describe("the ban list itself", () => {
   it("gives every rule a non-empty reason, because the hook prints it on rejection", () => {
     expect(FORBIDDEN.length).toBeGreaterThan(0);

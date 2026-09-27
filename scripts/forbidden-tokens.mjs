@@ -472,19 +472,36 @@ export const FORBIDDEN = [
   // src/mail/service.ts and runs a fan-out around each through this rule, so
   // a new orchestrator whose name escapes both prefixes goes red there.
   //
-  // The triage verbs are NOT listed. A fan-out written around a verb at the
-  // tool layer is refused at run time by the shared gate, which the verbs
-  // reach through the mutating orchestrator. Listing names is also not free: a
-  // name missing from an alternation is invisible to every set check, which
-  // is the hole `DAV_WRITE_MODULES` exists to close for the DAV rule below.
-  // Phase 21, which adds list operations over several messages, is where
-  // listing the verbs gets revisited.
+  // Phase 21 (D-10) lists the triage verbs too, and the move composites above
+  // them. Phase 20 left them out and said this phase would revisit it. It
+  // does, because list operations now exist: "archive all of these" is one
+  // sentence, and a combinator over a map of moves is the first thing anyone
+  // writes for it. The shared gate would refuse that at run time, since every
+  // verb reaches the mutating orchestrator. The scan refusing it at commit
+  // time is cheaper, as CLAUDE.md section 3 says, because nothing has to run.
+  //
+  // So the alternation now also names, innermost outwards:
+  //
+  //   - the verbs exported from src/mail/triage.ts: markRead, markUnread,
+  //     flagMessage, unflagMessage, moveMessages. Prefix matches again, so
+  //     each `...Over` variant is covered by the same name. `unflagMessage` is
+  //     listed on its own for legibility, even though `flagMessage` already
+  //     matches inside it: the tests read names, not prefixes;
+  //   - readMoveSet, the read the move preview opens a session for;
+  //   - buildMovePreview and applyMailCommit, the composites in
+  //     src/mcp/tools/mail.ts that a tool reaches for.
+  //
+  // A name missing from an alternation is invisible to every set check, which
+  // is the hole `DAV_WRITE_MODULES` closes for the DAV rule below. The same
+  // hole is closed here by a test instead: it reads every function
+  // src/mail/triage.ts exports and runs a fan-out around each through this
+  // rule, so a verb added later without a name here turns that test red.
   {
     id: "concurrent-session",
     scope: "src/",
     pattern:
-      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox)/g,
-    why: "A concurrent combinator wrapped around either mail session orchestrator (read-only or mutating) or the core under them. Every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial.",
+      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|markRead|markUnread|flagMessage|unflagMessage|moveMessages|readMoveSet|buildMovePreview|applyMailCommit)/g,
+    why: "A concurrent combinator wrapped around either mail session orchestrator (read-only or mutating), the core under them, a triage verb in src/mail/triage.ts (mark read or unread, flag or unflag, move), or the mail move composites (readMoveSet, buildMovePreview, applyMailCommit). Each of those opens a session, and every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial, and a list of messages is worked through one at a time in one session: pass the whole list to moveMessages rather than mapping a verb over it.",
   },
   // The same property one protocol over, and the reason is deliberately NOT the
   // same. The two rules above lean on the six-connection platform cap. That cap
