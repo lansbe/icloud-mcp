@@ -219,7 +219,8 @@ write are always caller-supplied — never derived from content the server read.
 
 IMAP sessions are opened, used, and closed within a single request; there is no
 connection pooling and no fan-out. This is enforced structurally (one socket
-importer, one session orchestrator, no concurrent combinator around either) so
+importer, two session orchestrators — read and mutating — over one private core
+and one request gate, no concurrent combinator around any of them) so
 the server cannot exhaust iCloud's per-account connection ceiling and lock you
 out of your own mail.
 
