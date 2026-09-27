@@ -2225,6 +2225,44 @@ async function listAllFolders(session: MailSession): Promise<FolderListing> {
   return { folders, delimiter, countsSource };
 }
 
+/** Why a role folder could not be named: there was none, or there were two. */
+export type RoleFolderRefusal = "none" | "ambiguous";
+
+/**
+ * Find the account's own archive or Trash folder in a listing it already has.
+ *
+ * Pure: it reads the listing and sends nothing. Only folders whose resolved
+ * role is the one asked for are looked at, in two tiers.
+ *
+ * - **The attribute tier first.** Exactly one folder the server itself marked
+ *   with the role's special-use attribute wins. An attribute is the server's own
+ *   answer about its own mailbox.
+ * - **The name tier only when no folder carries the attribute.** Exactly one
+ *   folder whose top-level name matched the ladder wins. A name is a claim
+ *   anyone can make (T-02-24): any user or mail client can make a folder called
+ *   "Archive". So a name never outranks an attribute.
+ *
+ * **Two in the same tier is a refusal, never a pick** (D-03: never guess). The
+ * listing order is the server's and says nothing about which one the user
+ * means. None in either tier is a refusal too. There is no fallback to a
+ * folder named anything, because a guess that happens to be right is still a
+ * guess, and a wrong one files the user's mail where they will not look.
+ *
+ * Phase 22 reuses this for its Trash, and adds its own stricter check on top.
+ */
+export function resolveRoleFolder(
+  listing: FolderListing,
+  role: "archive" | "trash",
+): { folder: FolderSummary } | { refusal: RoleFolderRefusal } {
+  const candidates = listing.folders.filter((folder) => folder.role === role);
+  for (const tier of ["special-use", "name-match"] as const) {
+    const matched = candidates.filter((folder) => folder.roleSource === tier);
+    if (matched.length === 1) return { folder: matched[0]! };
+    if (matched.length > 1) return { refusal: "ambiguous" };
+  }
+  return { refusal: "none" };
+}
+
 /** List every folder over an already-open stream pair. */
 export async function listFoldersOver(
   duplex: DuplexLike,

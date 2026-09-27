@@ -92,8 +92,10 @@ import {
   listMessages,
   listUnread,
   readMoveSet,
+  resolveRoleFolder,
   searchMessages,
 } from "../../mail/service";
+import type { FolderSummary } from "../../mail/service";
 import type {
   MessageMoveResult,
   MoveOutcome,
@@ -1718,27 +1720,65 @@ const MOVE_REFUSAL_REASONS = {
     "iCloud did not offer the commands a safe move needs, so nothing was moved.",
   "changed-since-preview":
     "These messages changed after the preview, so nothing was moved. Preview the move again.",
+  "already-in-destination":
+    "The messages are already in the folder this would move them to. Nothing was moved.",
 } as const;
 
 type MoveRefusal = keyof typeof MOVE_REFUSAL_REASONS;
+
+/**
+ * The fixed reasons for the refusals that depend on which role was asked for.
+ * ASCII, no server text, and no Trash reason says the mail is gone (D-04).
+ */
+const ROLE_REFUSAL_REASONS = {
+  archive: {
+    "no-archive-folder":
+      "The account's folder list shows no archive folder, so nothing was moved and no " +
+      "folder was guessed. mail_move with a folder id from mail_list_folders moves mail " +
+      "to a folder the user names.",
+    "ambiguous-role-folder":
+      "Two folders both look like the archive folder, so none was picked and nothing was " +
+      "moved. mail_move with a folder id from mail_list_folders moves mail to the one the " +
+      "user names.",
+  },
+  trash: {
+    "no-trash-folder":
+      "The account's folder list shows no Trash folder, so nothing was moved and no " +
+      "folder was guessed. mail_move with a folder id from mail_list_folders moves mail " +
+      "to a folder the user names.",
+    "ambiguous-role-folder":
+      "Two folders both look like the Trash folder, so none was picked and nothing was " +
+      "moved. mail_move with a folder id from mail_list_folders moves mail to the one the " +
+      "user names.",
+  },
+} as const;
 
 /** A refusal answer: plain JSON, never `isError`. */
 function moveRefusalResult(
   refusal: MoveRefusal,
   extra: Record<string, unknown> = {},
 ): ToolResult {
+  return refusalAnswer(refusal, MOVE_REFUSAL_REASONS[refusal], extra);
+}
+
+/** A refusal answer with its reason already chosen. Plain JSON, never `isError`. */
+function refusalAnswer(
+  refusal: string,
+  reason: string,
+  extra: Record<string, unknown> = {},
+): ToolResult {
   return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify({ refusal, reason: MOVE_REFUSAL_REASONS[refusal], ...extra }),
-      },
-    ],
+    content: [{ type: "text", text: JSON.stringify({ refusal, reason, ...extra }) }],
   };
 }
 
-/** Where a move is going. 21-03 adds a role kind beside this one. */
-export type MoveDestination = { kind: "folder"; mailbox: string };
+/**
+ * Where a move is going: a folder the caller named, or a role the server
+ * resolves from the account's own folder list (archive and Trash, D-03, D-04).
+ */
+export type MoveDestination =
+  | { kind: "folder"; mailbox: string }
+  | { kind: "role"; role: "archive" | "trash" };
 
 /** What the caller named, decoded, in the caller's order. */
 export interface MoveRequest {
@@ -1746,8 +1786,35 @@ export interface MoveRequest {
   ids: string[];
   /** The same ids, decoded. All from one folder and one validity. */
   refs: MessageRef[];
-  /** The caller's destination id, verbatim. It goes into the change. */
-  destinationId: string;
+  /**
+   * The caller's destination id, verbatim. It goes into the change. `null` for
+   * a role destination: the caller named no folder, and the change carries the
+   * id of the folder the preview resolved instead.
+   */
+  destinationId: string | null;
+}
+
+/**
+ * The refusals every move tool gives before any socket opens: too many ids,
+ * the same message twice, and messages from more than one folder. `null` when
+ * the list passes all three.
+ */
+function moveListRefusal(ids: readonly string[], refs: readonly MessageRef[]): ToolResult | null {
+  if (ids.length > MOVE_SET_CAP) {
+    return moveRefusalResult("too-many", { cap: MOVE_SET_CAP });
+  }
+  const keys = refs.map((ref) => JSON.stringify([ref.mailbox, ref.uidValidity, ref.uid]));
+  const repeated = ids.filter((_id, index) => keys.indexOf(keys[index]!) !== index);
+  if (repeated.length > 0) {
+    return moveRefusalResult("duplicate-ids", { ids: repeated });
+  }
+  const first = refs[0]!;
+  if (
+    refs.some((ref) => ref.mailbox !== first.mailbox || ref.uidValidity !== first.uidValidity)
+  ) {
+    return moveRefusalResult("mixed-folders");
+  }
+  return null;
 }
 
 /** Whether a folder's attributes say it cannot hold messages. */
@@ -1801,12 +1868,37 @@ export async function buildMovePreview(
     return moveRefusalResult("no-change-numbers", { ids: [...request.ids] });
   }
 
-  const target = facts.listing.folders.find(
-    (folder) => folder.wireName === destination.mailbox,
-  );
-  if (target === undefined) return moveRefusalResult("destination-not-found");
-  if (destination.mailbox === source.mailbox) {
-    return moveRefusalResult("destination-is-source");
+  // A folder destination is looked up by its wire name. A role destination is
+  // resolved from the SAME listing this read already holds, so it costs no
+  // further command, and it refuses rather than guesses (D-03).
+  let target: FolderSummary;
+  let role: "archive" | "trash" | null;
+  if (destination.kind === "folder") {
+    const named = facts.listing.folders.find(
+      (folder) => folder.wireName === destination.mailbox,
+    );
+    if (named === undefined) return moveRefusalResult("destination-not-found");
+    if (destination.mailbox === source.mailbox) {
+      return moveRefusalResult("destination-is-source");
+    }
+    target = named;
+    role = null;
+  } else {
+    const resolved = resolveRoleFolder(facts.listing, destination.role);
+    if ("refusal" in resolved) {
+      const reasons = ROLE_REFUSAL_REASONS[destination.role];
+      if (resolved.refusal === "ambiguous") {
+        return refusalAnswer("ambiguous-role-folder", reasons["ambiguous-role-folder"]);
+      }
+      return destination.role === "archive"
+        ? refusalAnswer("no-archive-folder", ROLE_REFUSAL_REASONS.archive["no-archive-folder"])
+        : refusalAnswer("no-trash-folder", ROLE_REFUSAL_REASONS.trash["no-trash-folder"]);
+    }
+    if (resolved.folder.wireName === source.mailbox) {
+      return moveRefusalResult("already-in-destination");
+    }
+    target = resolved.folder;
+    role = destination.role;
   }
   if (isUnselectable(target.attributes)) {
     return moveRefusalResult("destination-not-selectable");
@@ -1823,13 +1915,15 @@ export async function buildMovePreview(
     };
   });
 
+  const sourceId = encodeFolderId({ mailbox: source.mailbox });
+  const destinationId = encodeFolderId({ mailbox: target.wireName });
   const change: NormalizedMailMove = {
     op,
     ids: [...request.ids],
-    destination: request.destinationId,
+    // A named folder goes back verbatim; a resolved role carries the id of the
+    // folder this listing resolved, which is also what the confirmation seals.
+    destination: request.destinationId ?? destinationId,
   };
-  const sourceId = encodeFolderId({ mailbox: source.mailbox });
-  const destinationId = encodeFolderId({ mailbox: destination.mailbox });
 
   const confirmToken = await mintMailConfirmation(actor, {
     k: "move",
@@ -1837,7 +1931,7 @@ export async function buildMovePreview(
     m: sourceId,
     uv: source.uidValidity,
     q: destinationId,
-    qr: null,
+    qr: role,
     l,
   });
 
@@ -1852,7 +1946,7 @@ export async function buildMovePreview(
       noun: "message",
       from: sourceName,
       to: destinationName,
-      role: null,
+      role,
       count: l.length,
       outcome: null,
     },
@@ -1866,7 +1960,7 @@ export async function buildMovePreview(
       change,
       confirmationLine,
       source: { id: sourceId },
-      destination: { id: destinationId, role: null },
+      destination: { id: destinationId, role },
       count: l.length,
     },
     {
@@ -1896,6 +1990,8 @@ export interface MailCommitApplied {
   destinationId: string;
   sourceMailbox: string;
   destinationMailbox: string;
+  /** The destination's role as the preview resolved it, from the sealed `qr`. */
+  role: "archive" | "trash" | null;
 }
 
 /**
@@ -1974,7 +2070,13 @@ export async function applyMailCommit(
     })),
     destinationMailbox,
   );
-  return { outcome, destinationId: payload.q, sourceMailbox, destinationMailbox };
+  return {
+    outcome,
+    destinationId: payload.q,
+    sourceMailbox,
+    destinationMailbox,
+    role: payload.qr,
+  };
 }
 
 /** The per-message tally a did-tense line is built from. */
@@ -2021,7 +2123,7 @@ function mailCommitResult(ids: readonly string[], applied: MailCommitApplied): T
       noun: "message",
       from: decodeModifiedUtf7(applied.sourceMailbox),
       to: decodeModifiedUtf7(applied.destinationMailbox),
-      role: null,
+      role: applied.role,
       count: outcome.results.length,
       outcome: tallyOf(outcome.results),
     },
@@ -3229,22 +3331,8 @@ export function registerMailTools(
         const refs = ids.map((id) => decodeMessageId(id));
         const target = decodeFolderId(destination);
 
-        if (ids.length > MOVE_SET_CAP) {
-          return moveRefusalResult("too-many", { cap: MOVE_SET_CAP });
-        }
-        const keys = refs.map((ref) => JSON.stringify([ref.mailbox, ref.uidValidity, ref.uid]));
-        const repeated = ids.filter((_id, index) => keys.indexOf(keys[index]!) !== index);
-        if (repeated.length > 0) {
-          return moveRefusalResult("duplicate-ids", { ids: repeated });
-        }
-        const first = refs[0]!;
-        if (
-          refs.some(
-            (ref) => ref.mailbox !== first.mailbox || ref.uidValidity !== first.uidValidity,
-          )
-        ) {
-          return moveRefusalResult("mixed-folders");
-        }
+        const refused = moveListRefusal(ids, refs);
+        if (refused !== null) return refused;
 
         return await withMailConfirmationBoundary(() =>
           buildMovePreview(
@@ -3252,6 +3340,99 @@ export function registerMailTools(
             gate,
             { ids: [...ids], refs, destinationId: destination },
             { kind: "folder", mailbox: target.mailbox },
+            "move",
+          ),
+        );
+      } catch (err) {
+        return mailErrorResult(err);
+      }
+    },
+  );
+
+  /**
+   * Preview moving messages to this account's archive folder (TRIA-03, D-03).
+   *
+   * The folder is resolved from the account's own folder list at preview time,
+   * special-use attribute first and then the name ladder, and never hardcoded.
+   * No archive folder, or two that tie, is a refusal: nothing moves and nothing
+   * is guessed. The move itself is `mail_move`'s, applied by `mail_commit`.
+   */
+  server.registerTool(
+    "mail_archive",
+    {
+      description:
+        "Preview moving emails to this account's archive. Writes nothing; apply " +
+        `with mail_commit. ${UNTRUSTED_NOTICE}`,
+      inputSchema: z.object({
+        ids: z
+          .array(z.string())
+          .min(1)
+          .describe(
+            `Message ids from a listing, all from one folder, at most ${MOVE_SET_CAP}.`,
+          ),
+      }),
+    },
+    async ({ ids }) => {
+      try {
+        const actor = await principal;
+        const refs = ids.map((id) => decodeMessageId(id));
+        const refused = moveListRefusal(ids, refs);
+        if (refused !== null) return refused;
+
+        return await withMailConfirmationBoundary(() =>
+          buildMovePreview(
+            actor,
+            gate,
+            { ids: [...ids], refs, destinationId: null },
+            { kind: "role", role: "archive" },
+            "move",
+          ),
+        );
+      } catch (err) {
+        return mailErrorResult(err);
+      }
+    },
+  );
+
+  /**
+   * Preview moving messages to this account's Trash folder (D-04).
+   *
+   * D-04 was decided by the owner on 2026-09-26, overriding FEATURES.md's
+   * "deferred": ordinary mail may go to Trash. Trash is a move and nothing
+   * more. It is previewed like any other move, resolved from the account's own
+   * folder list like the archive, and every sentence says the messages can be
+   * moved back out of Trash. There is no way here to empty Trash or to remove a
+   * message in place, and adding one is a decision on the safety boundary, not
+   * a refactor.
+   */
+  server.registerTool(
+    "mail_trash",
+    {
+      description:
+        "Preview moving emails to Trash; they can be moved back. Writes nothing " +
+        `until mail_commit. ${UNTRUSTED_NOTICE}`,
+      inputSchema: z.object({
+        ids: z
+          .array(z.string())
+          .min(1)
+          .describe(
+            `Message ids from a listing, all from one folder, at most ${MOVE_SET_CAP}.`,
+          ),
+      }),
+    },
+    async ({ ids }) => {
+      try {
+        const actor = await principal;
+        const refs = ids.map((id) => decodeMessageId(id));
+        const refused = moveListRefusal(ids, refs);
+        if (refused !== null) return refused;
+
+        return await withMailConfirmationBoundary(() =>
+          buildMovePreview(
+            actor,
+            gate,
+            { ids: [...ids], refs, destinationId: null },
+            { kind: "role", role: "trash" },
             "move",
           ),
         );
@@ -3272,8 +3453,8 @@ export function registerMailTools(
     "mail_commit",
     {
       description:
-        "Apply a mail_move preview. Pass its confirmToken and change back " +
-        `unaltered. ${UNTRUSTED_NOTICE}`,
+        "Apply a move, archive or trash preview. Pass its confirmToken and " +
+        `change back unaltered. ${UNTRUSTED_NOTICE}`,
       inputSchema: z.object({
         confirmToken: z
           .string()

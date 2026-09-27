@@ -1136,6 +1136,31 @@ describe("the registrations themselves", () => {
     expect(String(tool!.options.description).length).toBeLessThan(280);
   });
 
+  it.each(["mail_archive", "mail_trash"])(
+    "takes exactly message ids on %s, and no destination: the server resolves it (TRIA-03, TRIA-09)",
+    (name) => {
+      // Ids only. The destination is the account's own folder for the role,
+      // found from its folder list, so there is nothing for a caller to name.
+      const tool = registered().find((one) => one.name === name);
+      const schema = tool!.options.inputSchema as z.ZodObject<z.ZodRawShape>;
+
+      expect(Object.keys(schema.shape).sort()).toEqual(["ids"]);
+      expect(schema.safeParse({ ids: ["x"] }).success).toBe(true);
+      expect(schema.safeParse({ ids: [] }).success).toBe(false);
+      expect(schema.safeParse({}).success).toBe(false);
+      expect(String(tool!.options.description)).toContain(UNTRUSTED_NOTICE);
+      expect(String(tool!.options.description).length).toBeLessThan(280);
+    },
+  );
+
+  it("never says Trash deletes anything in mail_trash's description (D-04)", () => {
+    const tool = registered().find((one) => one.name === "mail_trash");
+    const description = String(tool!.options.description);
+
+    expect(description).not.toMatch(/delet/i);
+    expect(description).toContain("moved back");
+  });
+
   it("takes exactly a confirmToken and a change on the mail commit, and the change is one op today", () => {
     const tool = registered().find((one) => one.name === "mail_commit");
     const schema = tool!.options.inputSchema as z.ZodObject<z.ZodRawShape>;
@@ -1717,6 +1742,9 @@ describe("the search and unread registrations", () => {
     // departure is present here. Both are registered in this module rather than
     // a sibling, which is what keeps the untrusted fence at one call site.
     expect(registered().map((one) => one.name).sort()).toEqual([
+      // The fourteenth: a move preview whose destination is the account's own
+      // archive folder, resolved from its folder list (TRIA-03, D-03).
+      "mail_archive",
       // The thirteenth, and the only way a mail preview becomes a write. Its own
       // name, so a mail confirmation can never be spent at another tree's commit.
       "mail_commit",
@@ -1748,6 +1776,9 @@ describe("the search and unread registrations", () => {
       // single name carrying a source discriminator, rather than one name per
       // ingress. The price is named at the registration itself.
       "mail_stage_attachment",
+      // The fifteenth: a move preview whose destination is the account's own
+      // Trash, resolved the same way (D-04). A move, and nothing more.
+      "mail_trash",
     ]);
   });
 
@@ -1900,7 +1931,7 @@ describe("the search and unread registrations", () => {
     // the model arrives unwarned — and a per-tool assertion is a list somebody
     // has to remember to extend.
     const tools = registered();
-    expect(tools).toHaveLength(13);
+    expect(tools).toHaveLength(15);
 
     for (const tool of tools) {
       expect(
@@ -2309,14 +2340,14 @@ describe("the compose registration", () => {
     }
   });
 
-  it("registers exactly THIRTEEN tools: the tenth is the whole of plan 04-10, the eleventh is mail_mark_read, the twelfth and thirteenth are mail_move and mail_commit", () => {
+  it("registers exactly FIFTEEN tools: the tenth is the whole of plan 04-10, the eleventh is mail_mark_read, the twelfth and thirteenth are mail_move and mail_commit, the fourteenth and fifteenth are mail_archive and mail_trash", () => {
     // Nine through plan 04-09, plus mail_confirm_upload. The presigned INGRESS
     // added no registration at all — it is a third value on an existing
     // discriminator, which is precisely what D-80 bought and precisely what it
     // paid for with a union on the output. Phase 20 added the eleventh, the
     // first tool that changes a mailbox. Phase 21 added the move preview and
-    // the mail commit.
-    expect(registered()).toHaveLength(13);
+    // the mail commit, then the archive and Trash previews.
+    expect(registered()).toHaveLength(15);
   });
 });
 
@@ -3527,8 +3558,8 @@ describe("a principal that was refused opens nothing", () => {
     return { gate, acquire, callbacks };
   }
 
-  it("registers all thirteen tools, so the table below leaves none out", () => {
-    expect(refusedTools().callbacks.size).toBe(13);
+  it("registers all fifteen tools, so the table below leaves none out", () => {
+    expect(refusedTools().callbacks.size).toBe(15);
   });
 
   it("mail_list_folders answers auth_failed with the fixed message and never acquires the gate", async () => {

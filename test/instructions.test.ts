@@ -82,6 +82,7 @@ const EXPECTED_TOOLS: readonly string[] = [
   "contacts_search",
   "contacts_update",
   "dav_diagnose",
+  "mail_archive",
   "mail_commit",
   "mail_compose_new",
   "mail_compose_reply",
@@ -96,6 +97,7 @@ const EXPECTED_TOOLS: readonly string[] = [
   "mail_move",
   "mail_search",
   "mail_stage_attachment",
+  "mail_trash",
 ];
 
 /** The sentence every failure below ends with. */

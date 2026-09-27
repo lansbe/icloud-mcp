@@ -1364,3 +1364,160 @@ describe("the move tools refuse by name", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Archive and Trash: the same move, with a destination the server finds itself
+// ---------------------------------------------------------------------------
+
+/** Every registered mail callback, by name, on one gate. */
+function allTools(): Map<string, Callback> {
+  const callbacks = new Map<string, Callback>();
+  const server = {
+    registerTool(name: string, _options: unknown, handler: Callback) {
+      callbacks.set(name, handler);
+    },
+  };
+  registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
+  for (const name of ["mail_archive", "mail_trash", "mail_commit"]) {
+    expect(callbacks.get(name), `${name} is not registered`).toBeDefined();
+  }
+  return callbacks;
+}
+
+/**
+ * A folder listing with INBOX and the given folders, then its completion. Each
+ * entry is `[wireName, attributes]`; the attributes are written verbatim.
+ */
+function listingOf(tag: string, folders: [string, string][], delimiter = "/"): Uint8Array {
+  return wire(
+    `* LIST (\\HasNoChildren) "${delimiter}" "INBOX"`,
+    '* STATUS "INBOX" (MESSAGES 172 UNSEEN 3)',
+    ...folders.flatMap(([name, attributes]) => [
+      `* LIST (${attributes}) "${delimiter}" "${name}"`,
+      `* STATUS "${name}" (MESSAGES 10 UNSEEN 0)`,
+    ]),
+    `${tag} OK LIST completed`,
+  );
+}
+
+/** A preview conversation over a chosen listing. Its logout is tag `a7`. */
+function rolePreviewServer(
+  folders: [string, string][],
+  messages: Fixture[],
+  sourceMailbox = "INBOX",
+): FakeDuplex {
+  return createFakeDuplex([
+    ...authPrefix(),
+    examineResponse("a4"),
+    listingOf("a5", folders),
+    previewFetchReply("a6", messages),
+    logoutExchange("a7"),
+  ]);
+}
+
+/** A commit conversation that moves one message cleanly. */
+function oneMoveServer(message: Fixture): FakeDuplex {
+  return createFakeDuplex([
+    ...authPrefix(),
+    selectResponse("a4", "[READ-WRITE]"),
+    fingerprintReply("a5", [message]),
+    copyReply("a6", message.uid, 88),
+    markEcho("a7", message.uid, "743"),
+    wire("* 1 EXPUNGE", "a8 OK EXPUNGE completed"),
+    searchReply("a9", []),
+    logoutExchange("a10"),
+  ]);
+}
+
+/** The commit's whole recorded line array for one message copied to `mailbox`. */
+function oneMoveLines(mailbox: string): string[] {
+  return [
+    ...SIGN_IN,
+    'a4 SELECT "INBOX"',
+    "a5 UID FETCH 4242 (UID FLAGS RFC822.SIZE INTERNALDATE MODSEQ)",
+    `a6 UID COPY 4242 "${mailbox}"`,
+    "a7 UID STORE 4242 (UNCHANGEDSINCE 742) +FLAGS (\\Deleted)",
+    "a8 UID EXPUNGE 4242",
+    "a9 UID SEARCH UID 4242",
+    "a10 LOGOUT",
+  ];
+}
+
+describe("archive and Trash, resolved from the account, previewed and committed", () => {
+  const MESSAGE: Fixture = { uid: 4242, size: 18_431, modSeq: "742", subject: "Receipt" };
+
+  it("archives into the folder the listing names Archive, and says so in both tenses", async () => {
+    const callbacks = allTools();
+    const preview = rolePreviewServer([["Archive", "\\HasNoChildren"]], [MESSAGE]);
+    const committed = oneMoveServer(MESSAGE);
+    vi.mocked(connectImap)
+      .mockReturnValueOnce(preview as never)
+      .mockReturnValueOnce(committed as never);
+
+    const ids = [idOf(MESSAGE.uid)];
+    const previewed = await callbacks.get("mail_archive")!({ ids });
+
+    expect(previewed.isError).toBeUndefined();
+    expect(wireOf(preview)).toEqual(previewLines([MESSAGE.uid]));
+    const trusted = body(previewed);
+    const archiveId = encodeFolderId({ mailbox: "Archive" });
+    expect(trusted.change).toEqual({ op: "move", ids, destination: archiveId });
+    expect(trusted.destination).toEqual({ id: archiveId, role: "archive" });
+    expect(trusted.confirmationLine).toBe(
+      "Moving 1 message from 'INBOX' to the archive folder 'Archive'. It can be moved back.",
+    );
+
+    const answer = await callbacks.get("mail_commit")!({
+      confirmToken: trusted.confirmToken,
+      change: trusted.change,
+    });
+
+    expect(connectImap).toHaveBeenCalledTimes(2);
+    expect(answer.isError).toBeUndefined();
+    expect(wireOf(committed)).toEqual(oneMoveLines("Archive"));
+    const result = body(answer) as { confirmationLine: string; results: { outcome: string }[] };
+    expect(result.confirmationLine).toBe(
+      "Moved 1 message from 'INBOX' to the archive folder 'Archive'. It can be moved back.",
+    );
+    expect(result.results[0]!.outcome).toBe("moved");
+  });
+
+  it("sends to Trash by the name Deleted Messages, and never says deleted", async () => {
+    const callbacks = allTools();
+    const preview = rolePreviewServer([["Deleted Messages", "\\HasNoChildren"]], [MESSAGE]);
+    const committed = oneMoveServer(MESSAGE);
+    vi.mocked(connectImap)
+      .mockReturnValueOnce(preview as never)
+      .mockReturnValueOnce(committed as never);
+
+    const ids = [idOf(MESSAGE.uid)];
+    const previewed = await callbacks.get("mail_trash")!({ ids });
+
+    expect(previewed.isError).toBeUndefined();
+    expect(wireOf(preview)).toEqual(previewLines([MESSAGE.uid]));
+    const trusted = body(previewed);
+    const trashId = encodeFolderId({ mailbox: "Deleted Messages" });
+    expect(trusted.change).toEqual({ op: "move", ids, destination: trashId });
+    expect(trusted.destination).toEqual({ id: trashId, role: "trash" });
+    expect(trusted.confirmationLine).toBe(
+      "Moving 1 message from 'INBOX' to Trash. It can be moved back out of Trash until " +
+        "Trash is emptied.",
+    );
+
+    const answer = await callbacks.get("mail_commit")!({
+      confirmToken: trusted.confirmToken,
+      change: trusted.change,
+    });
+
+    expect(connectImap).toHaveBeenCalledTimes(2);
+    expect(answer.isError).toBeUndefined();
+    expect(wireOf(committed)).toEqual(oneMoveLines("Deleted Messages"));
+    const result = body(answer) as { confirmationLine: string; results: { outcome: string }[] };
+    expect(result.confirmationLine).toBe(
+      "Moved 1 message from 'INBOX' to Trash. It can be moved back out of Trash until " +
+        "Trash is emptied.",
+    );
+    expect(result.results[0]!.outcome).toBe("moved");
+    expect(String(trusted.confirmationLine)).not.toMatch(/delet/i);
+    expect(result.confirmationLine).not.toMatch(/delet/i);
+  });
+});
