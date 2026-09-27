@@ -31,6 +31,7 @@ import {
   DavNotFoundError,
   DavStaleResourceError,
   DavSubscriptionError,
+  DavSyncTokenError,
   DavThrottleError,
   DavUnsendableError,
   davToErrorCategory,
@@ -453,6 +454,7 @@ describe("every category is reachable, and every reachable answer is a category"
       new DavConfirmationError(),
       new DavSubscriptionError(),
       new DavUnsendableError(),
+      new DavSyncTokenError(),
     ].map((err) => davToErrorCategory(err).category),
   ]);
 
@@ -506,6 +508,21 @@ describe("every category is reachable, and every reachable answer is a category"
     expect(davToErrorCategory(new DavConfirmationError()).message).toBe(
       SAFE_MESSAGES.confirmation_invalid,
     );
+  });
+
+  it("answers an expired sync token as stale_resource, whose remedy is to read again (D-28)", () => {
+    // The change check catches this class and answers "restarted"; it should
+    // never reach a caller. If it ever does, stale_resource's guidance (read
+    // the resource again) is the right remedy, and auth_failed's would be the
+    // wrong one: the password is fine.
+    expect(davToErrorCategory(new DavSyncTokenError())).toEqual({
+      category: "stale_resource",
+      message: SAFE_MESSAGES.stale_resource,
+    });
+    const err = new DavSyncTokenError();
+    expect(err.message).toMatch(/^dav-[a-z-]+$/);
+    expect(err.name).toBe("DavSyncTokenError");
+    expect(Object.keys(err).sort()).toEqual(["kind", "name"]);
   });
 });
 
@@ -792,8 +809,8 @@ describe("every error class this repository exports is named in a dispatcher bra
     // LOUDLY, which is the opposite of one written in prose.
     expect(
       EXPORTED_ERROR_CLASSES.size,
-      "four Imap* classes and eight Dav* classes ship today",
-    ).toBe(12);
+      "four Imap* classes and nine Dav* classes ship today",
+    ).toBe(13);
     expect([...EXPORTED_ERROR_CLASSES.keys()]).toContain("ImapThrottleError");
     expect([...EXPORTED_ERROR_CLASSES.keys()]).toContain("DavUnsendableError");
   });

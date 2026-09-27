@@ -23,12 +23,14 @@ import {
   DavConnectError,
   DavNotFoundError,
   DavStaleResourceError,
+  DavSyncTokenError,
   DavThrottleError,
   DavUnsendableError,
   davToErrorCategory,
 } from "../src/dav/errors";
 import { createDavFetch, davAuthHeader } from "../src/dav/transport";
 import { SAFE_MESSAGES } from "../src/errors";
+import { guardAgainstPause } from "../src/password-pause";
 import type { Principal } from "../src/principal";
 import { principalFromProps } from "../src/principal";
 import {
@@ -940,5 +942,273 @@ describe("a method this runtime cannot send", () => {
     expect(serialized).not.toContain("icloud");
     expect(serialized).not.toContain(FAKE_APPLE_ID);
     expect(serialized).not.toContain(FAKE_APP_PASSWORD);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 23 (D-28): an expired sync token is told apart from a wrong password.
+//
+// RFC 6578 names the precondition a stale token fails, `DAV:valid-sync-token`,
+// and does NOT fix the status. Servers answer 403 (CalendarServer, SabreDAV),
+// 410 (Google) or 409. Before this branch each of those read as something false:
+// a rejected password, a moved shard, a transient fault. The transport now reads
+// a bounded prefix of the body for a REPORT answered one of those three, and
+// nothing else changes. Every case below drives the real `createDavFetch`.
+// ---------------------------------------------------------------------------
+
+describe("createDavFetch — an expired sync token (D-28)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const REPORT: RequestInit = { method: "REPORT" };
+
+  /** An RFC 6578 precondition body, with the element under a chosen prefix. */
+  function syncTokenBody(prefix: string): string {
+    const open = prefix === "" ? "" : `${prefix}:`;
+    const ns = prefix === "" ? 'xmlns="DAV:"' : `xmlns:${prefix}="DAV:"`;
+    return `<?xml version="1.0" encoding="utf-8"?><${open}error ${ns}><${open}valid-sync-token/></${open}error>`;
+  }
+
+  /** Answer every request with this status and this body. */
+  function bodyStub(status: number, body: string): Stub {
+    return stubFetch(
+      () =>
+        new Response(body, {
+          status,
+          headers: { "content-type": "application/xml" },
+        }),
+    );
+  }
+
+  it.each([403, 409, 410])(
+    "a REPORT answered %i naming the element raises DavSyncTokenError",
+    async (status) => {
+      vi.stubGlobal("fetch", bodyStub(status, syncTokenBody("D")).fetch);
+      const raised = await raise(createDavFetch(owner), REPORT);
+      expect(raised).toBeInstanceOf(DavSyncTokenError);
+    },
+  );
+
+  it.each([
+    ["no prefix", ""],
+    ["a different prefix", "x"],
+    ["a long prefix", "webdav"],
+  ])("finds the element with %s", async (_label, prefix) => {
+    vi.stubGlobal("fetch", bodyStub(403, syncTokenBody(prefix)).fetch);
+    const raised = await raise(createDavFetch(owner), REPORT);
+    expect(raised).toBeInstanceOf(DavSyncTokenError);
+  });
+
+  it("matches the method case-insensitively", async () => {
+    vi.stubGlobal("fetch", bodyStub(403, syncTokenBody("D")).fetch);
+    const raised = await raise(createDavFetch(owner), { method: "report" });
+    expect(raised).toBeInstanceOf(DavSyncTokenError);
+  });
+
+  it("finds it with an opening tag carrying whitespace and attributes", async () => {
+    const body = `<D:error xmlns:D="DAV:"><D:valid-sync-token\n  a="b"></D:valid-sync-token></D:error>`;
+    vi.stubGlobal("fetch", bodyStub(410, body).fetch);
+    expect(await raise(createDavFetch(owner), REPORT)).toBeInstanceOf(
+      DavSyncTokenError,
+    );
+  });
+
+  it("a REPORT 403 whose body names no such element is still DavAuthError", async () => {
+    const body = `<D:error xmlns:D="DAV:"><D:need-privileges/></D:error>`;
+    vi.stubGlobal("fetch", bodyStub(403, body).fetch);
+    expect(await raise(createDavFetch(owner), REPORT)).toBeInstanceOf(
+      DavAuthError,
+    );
+  });
+
+  it("the name as text, not as an element, does not count", async () => {
+    const body = `<D:error xmlns:D="DAV:"><D:description>valid-sync-token</D:description><D:valid-sync-tokens/></D:error>`;
+    vi.stubGlobal("fetch", bodyStub(403, body).fetch);
+    expect(await raise(createDavFetch(owner), REPORT)).toBeInstanceOf(
+      DavAuthError,
+    );
+  });
+
+  it("a REPORT 410 without the element is still a re-discovery-eligible DavNotFoundError", async () => {
+    vi.stubGlobal("fetch", bodyStub(410, "<multistatus/>").fetch);
+    const raised = await raise(createDavFetch(owner), REPORT);
+    expect(raised).toBeInstanceOf(DavNotFoundError);
+    expect((raised as DavNotFoundError).rediscoverable).toBe(true);
+  });
+
+  it("a REPORT 409 without the element is still DavConnectError", async () => {
+    vi.stubGlobal("fetch", bodyStub(409, "<multistatus/>").fetch);
+    expect(await raise(createDavFetch(owner), REPORT)).toBeInstanceOf(
+      DavConnectError,
+    );
+  });
+
+  it("a PROPFIND 403 WITH the element is still DavAuthError: the branch is REPORT-only", async () => {
+    vi.stubGlobal("fetch", bodyStub(403, syncTokenBody("D")).fetch);
+    expect(
+      await raise(createDavFetch(owner), { method: "PROPFIND" }),
+    ).toBeInstanceOf(DavAuthError);
+  });
+
+  it.each(["PUT", "DELETE"])(
+    "a %s 403 with the element is still DavAuthError",
+    async (method) => {
+      vi.stubGlobal("fetch", bodyStub(403, syncTokenBody("D")).fetch);
+      expect(await raise(createDavFetch(owner), { method })).toBeInstanceOf(
+        DavAuthError,
+      );
+    },
+  );
+
+  it.each([
+    [410, DavNotFoundError],
+    [409, DavConnectError],
+  ] as const)(
+    "a request with no method answered %i with the element is unchanged",
+    async (status, klass) => {
+      vi.stubGlobal("fetch", bodyStub(status, syncTokenBody("D")).fetch);
+      const raised = await raise(createDavFetch(owner));
+      expect(raised).toBeInstanceOf(klass);
+      expect(raised).not.toBeInstanceOf(DavSyncTokenError);
+    },
+  );
+
+  it.each([400, 404, 412, 500, 503])(
+    "a REPORT answered %i with the element is classified exactly as before",
+    async (status) => {
+      vi.stubGlobal("fetch", bodyStub(status, syncTokenBody("D")).fetch);
+      const raised = await raise(createDavFetch(owner), REPORT);
+      expect(raised).not.toBeInstanceOf(DavSyncTokenError);
+      vi.stubGlobal("fetch", statusStub(status).fetch);
+      const plain = await raise(createDavFetch(owner), REPORT);
+      expect((raised as Error).constructor).toBe((plain as Error).constructor);
+    },
+  );
+
+  it("reads a bounded prefix only: the element past 8 KB is not seen", async () => {
+    // The padding sits INSIDE the error element as whitespace, so the body is
+    // still well-formed XML naming the precondition. Only the bound hides it.
+    const padding = " ".repeat(9000);
+    const body = `<D:error xmlns:D="DAV:">${padding}<D:valid-sync-token/></D:error>`;
+    vi.stubGlobal("fetch", bodyStub(403, body).fetch);
+    expect(await raise(createDavFetch(owner), REPORT)).toBeInstanceOf(
+      DavAuthError,
+    );
+  });
+
+  it("finds the element just inside the bound", async () => {
+    const padding = " ".repeat(7000);
+    const body = `<D:error xmlns:D="DAV:">${padding}<D:valid-sync-token/></D:error>`;
+    vi.stubGlobal("fetch", bodyStub(403, body).fetch);
+    expect(await raise(createDavFetch(owner), REPORT)).toBeInstanceOf(
+      DavSyncTokenError,
+    );
+  });
+
+  it("stops reading at the bound, and cancels the rest of a long body", async () => {
+    // A body that would never end. Reading it to the end would hang the case;
+    // a bounded read returns and cancels the stream.
+    let cancelled = false;
+    let pulled = 0;
+    const chunk = new TextEncoder().encode(" ".repeat(1024));
+    vi.stubGlobal(
+      "fetch",
+      stubFetch(
+        () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              pull(controller) {
+                pulled += 1;
+                controller.enqueue(chunk);
+              },
+              cancel() {
+                cancelled = true;
+              },
+            }),
+            { status: 403 },
+          ),
+      ).fetch,
+    );
+    expect(await raise(createDavFetch(owner), REPORT)).toBeInstanceOf(
+      DavAuthError,
+    );
+    expect(cancelled).toBe(true);
+    expect(pulled).toBeLessThan(20);
+  });
+
+  it("a body that fails to read counts as no element", async () => {
+    vi.stubGlobal(
+      "fetch",
+      stubFetch(
+        () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              pull(controller) {
+                controller.error(new Error("the read failed"));
+              },
+            }),
+            { status: 403 },
+          ),
+      ).fetch,
+    );
+    expect(await raise(createDavFetch(owner), REPORT)).toBeInstanceOf(
+      DavAuthError,
+    );
+  });
+
+  it("a REPORT 207 is returned untouched, with its body still readable", async () => {
+    const body = `<d:multistatus xmlns:d="DAV:"><d:sync-token>t2</d:sync-token></d:multistatus>`;
+    vi.stubGlobal("fetch", bodyStub(207, body).fetch);
+    const response = await createDavFetch(owner)(TARGET, REPORT);
+    expect(response.status).toBe(207);
+    expect(await response.text()).toBe(body);
+  });
+
+  it("a 401 on a REPORT still reports the refusal before throwing DavAuthError", async () => {
+    const puts: string[] = [];
+    const kv = {
+      get: async () => null,
+      put: async (key: string) => {
+        puts.push(key);
+      },
+    } as unknown as KVNamespace;
+    vi.stubGlobal("fetch", bodyStub(401, syncTokenBody("D")).fetch);
+    const davFetch = createDavFetch(guardAgainstPause(ownerPrincipal(), kv));
+
+    expect(await raise(davFetch, REPORT)).toBeInstanceOf(DavAuthError);
+    expect(puts).toHaveLength(1);
+  });
+
+  it("the error carries no byte of the body", async () => {
+    const MARK = "BODY-TEXT-MUST-NOT-TRAVEL";
+    const body = `<D:error xmlns:D="DAV:"><D:valid-sync-token/><D:href>${TARGET}${MARK}</D:href></D:error>`;
+    vi.stubGlobal("fetch", bodyStub(403, body).fetch);
+    const raised = (await raise(createDavFetch(owner), REPORT)) as Error;
+
+    expect(raised).toBeInstanceOf(DavSyncTokenError);
+    expect(Object.keys(ownFields(raised)).sort()).toEqual(["kind", "name"]);
+    expect(raised.message).toMatch(/^dav-[a-z-]+$/);
+    const serialized = `${JSON.stringify(raised)}${JSON.stringify(ownFields(raised))}${raised.message}`;
+    expect(serialized).not.toContain(MARK);
+    expect(serialized).not.toContain("http");
+    expect(serialized).not.toContain("valid-sync-token");
+    expect(serialized).not.toContain("DAV:");
+  });
+
+  it("maps to stale_resource and that category's fixed message", async () => {
+    vi.stubGlobal("fetch", bodyStub(409, syncTokenBody("D")).fetch);
+    const raised = await raise(createDavFetch(owner), REPORT);
+    expect(davToErrorCategory(raised)).toEqual({
+      category: "stale_resource",
+      message: SAFE_MESSAGES.stale_resource,
+    });
+  });
+
+  it("sends exactly one request: nothing is retried", async () => {
+    const stub = bodyStub(410, syncTokenBody("D"));
+    vi.stubGlobal("fetch", stub.fetch);
+    await raise(createDavFetch(owner), REPORT);
+    expect(stub.observed).toHaveLength(1);
   });
 });
