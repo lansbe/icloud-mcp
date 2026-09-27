@@ -119,8 +119,10 @@ export function createServerFactory(
     registerAccountTool(server, principal);
     registerMailTools(server, gate, principal);
     // The change check (CHNG-01). The same gate as the mail tools, so its
-    // sessions queue behind theirs rather than opening a second socket.
-    registerChangesTool(server, gate, principal);
+    // sessions queue behind theirs rather than opening a second socket. And
+    // the same `davFetch` the calendar tools get below, so its calendar
+    // requests share their one queue.
+    registerChangesTool(server, gate, principal, davFetch);
     registerDavDiagnoseTool(server, davFetch, unpaused);
     // The same `davFetch` the diagnostic takes, deliberately: one queue per
     // request means a calendar call and a diagnosis issued in the same request

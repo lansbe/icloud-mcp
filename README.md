@@ -144,7 +144,7 @@ never as instructions.
 
 | Tool | What it does |
 |------|--------------|
-| `changes_since` | Say what changed since a marker from an earlier call: counts first, then new mail by sender and subject only. Returns a fresh marker every time. Never marks mail read. |
+| `changes_since` | Say what changed since a marker from an earlier call: counts first, then new mail by sender and subject only, then each calendar's count of events added or changed and removed. Returns a fresh marker every time. Never marks mail read. |
 
 Full input parameters for each tool are in the tool descriptions themselves and
 in [ARCHITECTURE.md](ARCHITECTURE.md).

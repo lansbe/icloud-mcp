@@ -9,19 +9,29 @@
 // and each one exists because the alternative was a second implementation that
 // agreed with the first only until someone edited one of them.
 //
-// **There is no multi-collection operation here at all any more, and that is a
-// safety property rather than a tidying.** ./.claude/CLAUDE.md §3 records the
+// **There is exactly one multi-collection operation here, the change check,
+// and it is serial by design. That is a safety property rather than a
+// tidying.** ./.claude/CLAUDE.md §3 records the
 // budget: production allows six simultaneous connections per Worker invocation,
 // KV reads and outbound fetches count against the same six, and iCloud's own
 // per-account ceiling is lower, undocumented, and deliberately unmeasured —
 // because exhausting it does not fail politely, it locks the user out of their
 // own mail in Mail.app on their own devices. The account-wide listing was where
 // a fan-out was genuinely tempting, and it was withdrawn: `calendarId` is
-// required, so every read here touches exactly one calendar. The two bans
+// required, so every read here but the change check touches exactly one
+// calendar. The two bans
 // remain in force over what is left — structurally by the request-scoped queue
 // in `./transport.ts`, detectively by the `dav-concurrent-request` scan rule
 // that reads this file — because re-adding the sweep must be a decision that
 // trips them rather than a change that slips past.
+//
+// The one exception is `calendarChangesSince` (Phase 23). It answers what
+// changed since a set of sync tokens, and it has to look at every calendar,
+// because "what changed" means every calendar. It pays one PROPFIND for every
+// token and one REPORT only where a token moved, one calendar at a time. It
+// cannot fan out: the concurrent version returns the same counts, so nothing in
+// the answer would show it, which is why its entry points are named on the
+// `dav-concurrent-request` rule rather than trusted to stay serial.
 //
 // This module contains no logging calls of any kind and must never acquire any.
 
@@ -34,9 +44,16 @@ import {
   fetchCalendarObjects,
   fetchCalendarUserAddresses,
   propfind,
+  syncCollection,
   updateCalendarObject,
 } from "tsdav";
 import type { DAVResponse } from "tsdav";
+import {
+  MAX_CHANGE_CALENDARS,
+  MAX_SYNC_TOKEN_LENGTH,
+  calendarKeyOf,
+} from "../change-marker";
+import type { CalendarBlock, CalendarState } from "../change-marker";
 import type { Env } from "../env";
 import { fetchSubscriptionFeed } from "../feed/subscription-feed";
 import { assertUnderHome, davAccountFor, withRediscovery } from "./discovery";
@@ -46,6 +63,7 @@ import {
   DavConnectError,
   DavNotFoundError,
   DavSubscriptionError,
+  DavSyncTokenError,
   DavThrottleError,
 } from "./errors";
 import {
@@ -398,6 +416,14 @@ interface Collection {
    * closed.
    */
   source: string | null;
+  /**
+   * The collection's `DAV:sync-token`, or `null` when the answer carried none.
+   *
+   * Only the change check's listing asks for it; the ordinary listing does
+   * not, so it is `null` there. Never surfaced past this module except as the
+   * token a fresh marker holds.
+   */
+  syncToken: string | null;
 }
 
 /**
@@ -558,6 +584,7 @@ function collectionsFrom(
       // events from either way, so it is marked a subscription regardless.
       subscribed: isSubscribed,
       source: sourceHrefOf(props.source),
+      syncToken: syncTokenOf(props.syncToken),
     });
   }
 
@@ -650,6 +677,430 @@ export async function listCalendars(
         subscribed: one.subscribed,
       })),
       cacheHit: resolved.cacheHit,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// CHNG-01, CHNG-04, CHNG-05 — what changed on every calendar since a marker
+// ---------------------------------------------------------------------------
+
+/** One calendar's state in a change check. The same closed list as the mail side (D-05). */
+export type CalendarChangeState =
+  | "started"
+  | "no_changes"
+  | "changes"
+  | "restarted"
+  | "not_checked"
+  | "gone";
+
+/** Why a calendar could not be checked. A subset of D-05's closed list. */
+export type CalendarNotCheckedReason =
+  | "throttled"
+  | "connection"
+  | "unavailable"
+  | "no_usable_answer";
+
+/**
+ * Which path answered, so the first live check settles assumption A2.
+ *
+ * `propfind-token` means the home listing's `DAV:sync-token` decided it with
+ * no further request. `sync-report` means one sync REPORT ran.
+ */
+export type CalendarSyncMechanism = "propfind-token" | "sync-report";
+
+/**
+ * Why a calendar restarted during a check, when it was not the whole marker.
+ *
+ * `token_refused`: iCloud named the expired-token precondition (D-28).
+ * `listing_refused`: the REPORT was refused 403 with no such element, right
+ * after the home listing succeeded with the same credential, so the password is
+ * not the problem.
+ */
+export type CalendarRestartWhy = "token_refused" | "listing_refused";
+
+/** What the change check found for one calendar. */
+export interface CalendarChange {
+  calendarId: string;
+  /** Stranger-authored or the owner's text. For the fenced block only. */
+  displayName: string;
+  state: CalendarChangeState;
+  /** Only for `changes` and `no_changes`; `null` otherwise. */
+  addedOrChanged: number | null;
+  /** Only for `changes` and `no_changes`; `null` otherwise. */
+  removed: number | null;
+  /** True when iCloud cut the answer short and more remains (D-27). */
+  more: boolean;
+  mechanism: CalendarSyncMechanism | null;
+  why?: CalendarRestartWhy;
+  reason?: CalendarNotCheckedReason;
+}
+
+/** Everything `calendarChangesSince` answers. */
+export interface CalendarChanges {
+  /** One per non-subscribed calendar the listing shows, in URL order. */
+  calendars: CalendarChange[];
+  /** Subscriptions: pointer records with no members, never checked (D-22). */
+  notCovered: { calendarId: string; displayName: string }[];
+  /** Calendars in the prior block that no longer exist. */
+  gone: number;
+  /** The calendar block for the fresh marker. */
+  fresh: CalendarBlock;
+}
+
+/** What one sync answer said, once every element has been checked. */
+export interface SyncAnswer {
+  /** A multistatus carrying a new token and no failed element. */
+  usable: boolean;
+  token: string | null;
+  addedOrChanged: string[];
+  removed: string[];
+  /** The collection itself answered 507: more remains (RFC 6578 §3.6). */
+  truncated: boolean;
+}
+
+/**
+ * A sync token as this module will carry it, or `null`.
+ *
+ * The XML layer turns a numeric-looking text into a number, so a safe integer
+ * is read back as its digits. Anything longer than the marker can hold is no
+ * usable token, rather than a marker the seal would refuse.
+ */
+function syncTokenOf(value: unknown): string | null {
+  const text =
+    typeof value === "number" && Number.isSafeInteger(value)
+      ? String(value)
+      : value;
+  if (typeof text !== "string") return null;
+  if (text.length === 0 || text.length > MAX_SYNC_TOKEN_LENGTH) return null;
+  return text;
+}
+
+/** The same URL with or without its trailing slash. */
+function sameCollection(a: string, b: string): boolean {
+  const trim = (url: string) => (url.endsWith("/") ? url.slice(0, -1) : url);
+  return trim(a) === trim(b);
+}
+
+/**
+ * Read a sync REPORT's answer (D-24, D-25). Pure: it issues no request.
+ *
+ * Usable only if the answer is a multistatus carrying a non-empty new sync
+ * token and no element failed, other than a member answered 404 (removed) or
+ * the collection itself answered 507 (truncated). The raw library helper does
+ * not throw on a failed answer, so this is the check that stops one reading as
+ * "nothing changed".
+ *
+ * The collection's own href is not a change: iCloud includes it (measured
+ * 2026-08-22). Every other href is resolved against the collection URL and
+ * must be under the calendar home, or it is not counted. Hrefs are
+ * de-duplicated.
+ */
+export function readSyncAnswer(
+  responses: readonly DAVResponse[],
+  collectionUrl: string,
+  homeUrl: string,
+): SyncAnswer {
+  let token: string | null = null;
+  let failed = false;
+  let truncated = false;
+  const changed = new Set<string>();
+  const gone = new Set<string>();
+
+  for (const response of responses) {
+    const raw = (response as { raw?: unknown }).raw;
+    if (token === null && raw !== null && typeof raw === "object") {
+      const multistatus = (raw as { multistatus?: unknown }).multistatus;
+      if (multistatus !== null && typeof multistatus === "object") {
+        token = syncTokenOf((multistatus as { syncToken?: unknown }).syncToken);
+      }
+    }
+
+    const status = response.status;
+    const href = response.href;
+    if (typeof href !== "string" || href.length === 0) {
+      // The whole-answer element an empty multistatus produces.
+      if (!(typeof status === "number" && status >= 200 && status < 300)) {
+        failed = true;
+      }
+      continue;
+    }
+
+    let url: string;
+    try {
+      url = new URL(href, collectionUrl).href;
+    } catch {
+      // An href this module cannot resolve is not counted. Nothing is read
+      // from the caught value.
+      continue;
+    }
+
+    if (sameCollection(url, collectionUrl)) {
+      if (status === 507) truncated = true;
+      else if (!(status >= 200 && status < 300)) failed = true;
+      continue;
+    }
+
+    if (status === 404) {
+      try {
+        assertUnderHome(url, homeUrl);
+      } catch {
+        continue;
+      }
+      gone.add(url);
+    } else if (status >= 200 && status < 300) {
+      try {
+        assertUnderHome(url, homeUrl);
+      } catch {
+        continue;
+      }
+      changed.add(url);
+    } else {
+      failed = true;
+    }
+  }
+
+  return {
+    usable: token !== null && !failed,
+    token,
+    addedOrChanged: [...changed],
+    removed: [...gone],
+    truncated,
+  };
+}
+
+/**
+ * The home listing with every calendar's sync token (D-23).
+ *
+ * The same PROPFIND `fetchCollections` sends, plus `DAV:sync-token`, through
+ * the same filter, so "every calendar" means what the listing means.
+ * `fetchCollections` itself is untouched: its request bytes do not change.
+ */
+async function fetchCollectionStates(
+  davFetch: DavFetch,
+  resolved: ResolvedDavAccount,
+): Promise<Collection[]> {
+  const responses = await propfind({
+    url: resolved.homeUrl,
+    props: {
+      "d:displayname": {},
+      "d:resourcetype": {},
+      "c:supported-calendar-component-set": {},
+      "ca:calendar-color": {},
+      "cs:source": {},
+      "cs:getctag": {},
+      "d:sync-token": {},
+    },
+    depth: "1",
+    headers: {},
+    fetch: davFetch,
+  });
+
+  return collectionsFrom(responses, resolved.homeUrl);
+}
+
+/**
+ * One sync REPORT for one calendar, etag only, at sync-level 1.
+ *
+ * Headers are empty: the transport attaches the credential. The answer is read
+ * by `readSyncAnswer`, never trusted as it comes.
+ */
+async function syncOneCalendar(
+  davFetch: DavFetch,
+  collectionUrl: string,
+  homeUrl: string,
+  token: string,
+): Promise<SyncAnswer> {
+  const responses = await syncCollection({
+    url: collectionUrl,
+    props: { "d:getetag": {} },
+    syncLevel: 1,
+    syncToken: token,
+    headers: {},
+    fetch: davFetch,
+  });
+  return readSyncAnswer(responses, collectionUrl, homeUrl);
+}
+
+/**
+ * What changed on every calendar since a marker's calendar block.
+ *
+ * One PROPFIND at the home gives every calendar's token. A calendar whose
+ * token did not move costs nothing more. A calendar whose token moved costs
+ * one sync REPORT. **One calendar at a time, each awaited before the next:**
+ * this is the only multi-collection read in this module, and the concurrent
+ * version would return the same counts, so nothing in the answer would reveal
+ * a fan-out. The request-scoped queue in `./transport.ts` and the scan's
+ * `dav-concurrent-request` rule hold the same line from two other sides.
+ *
+ * A throttle or a connection failure on a REPORT stops the loop at once
+ * (D-29). That calendar and every one after it are `not_checked`, keep their
+ * old tokens, and nothing more is sent. No retry.
+ *
+ * Failures at the home listing are thrown to the caller, which decides what
+ * the whole calendar side says. A sign-in refusal there is a real one.
+ *
+ * Nothing here writes and nothing is cached.
+ */
+export async function calendarChangesSince(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  prior: CalendarBlock | null,
+  restartAll: boolean,
+): Promise<CalendarChanges> {
+  return withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
+    const collections = await fetchCollectionStates(davFetch, resolved);
+
+    const priorByKey = new Map<string, CalendarState>(
+      (prior?.calendars ?? []).map((one) => [one.key, one]),
+    );
+    const carryOf = (old: CalendarState): CalendarState => ({
+      key: old.key,
+      syncToken: old.syncToken,
+      takenAt: old.takenAt ?? prior?.takenAt ?? Math.floor(Date.now() / 1000),
+    });
+
+    const calendars: CalendarChange[] = [];
+    const notCovered: CalendarChanges["notCovered"] = [];
+    const freshStates: CalendarState[] = [];
+    const seenKeys = new Set<string>();
+    let stopped: CalendarNotCheckedReason | null = null;
+
+    for (const collection of collections) {
+      const calendarId = encodeCalendarId({ collectionUrl: collection.url });
+      if (collection.subscribed) {
+        notCovered.push({ calendarId, displayName: collection.displayName });
+        continue;
+      }
+      // More calendars than one marker may hold: the rest are named, not checked.
+      if (seenKeys.size >= MAX_CHANGE_CALENDARS) {
+        notCovered.push({ calendarId, displayName: collection.displayName });
+        continue;
+      }
+
+      const key = await calendarKeyOf(collection.url);
+      seenKeys.add(key);
+      const old = priorByKey.get(key) ?? null;
+      const base = {
+        calendarId,
+        displayName: collection.displayName,
+        addedOrChanged: null,
+        removed: null,
+        more: false,
+      };
+      const notChecked = (
+        reason: CalendarNotCheckedReason,
+        mechanism: CalendarSyncMechanism | null,
+      ): void => {
+        calendars.push({ ...base, state: "not_checked", mechanism, reason });
+        if (old !== null) freshStates.push(carryOf(old));
+      };
+
+      if (stopped !== null) {
+        notChecked(stopped, null);
+        continue;
+      }
+
+      const property = collection.syncToken;
+      if (property === null) {
+        // No token property. Plan 23-05 adds the REPORT fallback; until then
+        // this calendar is not checked and keeps its old token.
+        notChecked("no_usable_answer", null);
+        continue;
+      }
+
+      if (prior === null || restartAll || old === null) {
+        calendars.push({
+          ...base,
+          state: restartAll ? "restarted" : "started",
+          mechanism: "propfind-token",
+        });
+        freshStates.push({ key, syncToken: property });
+        continue;
+      }
+
+      if (property === old.syncToken) {
+        calendars.push({
+          ...base,
+          state: "no_changes",
+          addedOrChanged: 0,
+          removed: 0,
+          mechanism: "propfind-token",
+        });
+        freshStates.push({ key, syncToken: property });
+        continue;
+      }
+
+      try {
+        assertUnderHome(collection.url, resolved.homeUrl);
+      } catch {
+        notChecked("unavailable", null);
+        continue;
+      }
+
+      let answer: SyncAnswer;
+      try {
+        answer = await syncOneCalendar(
+          davFetch,
+          collection.url,
+          resolved.homeUrl,
+          old.syncToken,
+        );
+      } catch (err) {
+        if (err instanceof DavSyncTokenError || err instanceof DavAuthError) {
+          calendars.push({
+            ...base,
+            state: "restarted",
+            mechanism: "sync-report",
+            why: err instanceof DavSyncTokenError ? "token_refused" : "listing_refused",
+          });
+          freshStates.push({ key, syncToken: property });
+        } else if (err instanceof DavThrottleError) {
+          stopped = "throttled";
+          notChecked(stopped, "sync-report");
+        } else if (err instanceof DavConnectError) {
+          stopped = "connection";
+          notChecked(stopped, "sync-report");
+        } else if (err instanceof DavNotFoundError) {
+          calendars.push({ ...base, state: "gone", mechanism: "sync-report" });
+        } else {
+          notChecked("no_usable_answer", "sync-report");
+        }
+        continue;
+      }
+
+      if (!answer.usable || answer.token === null) {
+        notChecked("no_usable_answer", "sync-report");
+        continue;
+      }
+
+      const addedOrChanged = answer.addedOrChanged.length;
+      const removedCount = answer.removed.length;
+      calendars.push({
+        ...base,
+        state:
+          addedOrChanged + removedCount > 0 || answer.truncated
+            ? "changes"
+            : "no_changes",
+        addedOrChanged,
+        removed: removedCount,
+        more: answer.truncated,
+        mechanism: "sync-report",
+      });
+      freshStates.push({ key, syncToken: answer.token });
+    }
+
+    let gone = 0;
+    for (const key of priorByKey.keys()) {
+      if (!seenKeys.has(key)) gone += 1;
+    }
+
+    return {
+      calendars,
+      notCovered,
+      gone,
+      fresh: { takenAt: Math.floor(Date.now() / 1000), calendars: freshStates },
     };
   });
 }

@@ -67,8 +67,13 @@ export const MAX_CHANGE_FOLDERS = 5;
 /** The most calendars one marker may hold. */
 export const MAX_CHANGE_CALENDARS = 64;
 
-/** A sync token longer than this is refused. iCloud's are far shorter. */
-const MAX_SYNC_TOKEN_LENGTH = 511;
+/**
+ * A sync token longer than this is refused. iCloud's are far shorter.
+ *
+ * Exported so the calendar check treats a longer token from the server as no
+ * usable answer, rather than building a marker this module would refuse to seal.
+ */
+export const MAX_SYNC_TOKEN_LENGTH = 511;
 
 /** A mailbox name longer than this is refused. */
 const MAX_MAILBOX_LENGTH = 1024;
@@ -109,6 +114,14 @@ export interface CalendarState {
   /** `calendarKeyOf(collectionUrl)`: twelve base64url characters. */
   key: string;
   syncToken: string;
+  /**
+   * When THIS calendar's token was taken, in seconds, when that differs from
+   * the block's own time. Set only on a calendar that could not be checked and
+   * was carried forward with its old token (D-16), so a later check compares
+   * against the time the token was really taken rather than the newer block
+   * time. Absent everywhere else.
+   */
+  takenAt?: number;
 }
 
 /** The calendar half of a marker. */
@@ -186,7 +199,7 @@ interface WirePayload {
   v: number;
   t: number;
   f: [string, number, number, string | null][];
-  c: { t: number; s: [string, string][] } | null;
+  c: { t: number; s: ([string, string] | [string, string, number])[] } | null;
 }
 
 function isUint32(value: unknown): value is number {
@@ -267,12 +280,18 @@ function contentOf(wire: unknown): MarkerContent | null {
     const calendars: CalendarState[] = [];
     const seenKeys = new Set<string>();
     for (const entry of list) {
-      if (!Array.isArray(entry) || entry.length !== 2) return null;
-      const [key, syncToken] = entry;
+      if (!Array.isArray(entry)) return null;
+      if (entry.length !== 2 && entry.length !== 3) return null;
+      const [key, syncToken, takenAt] = entry;
       if (!isCalendarKey(key) || !isSyncToken(syncToken)) return null;
+      if (entry.length === 3 && !isSeconds(takenAt)) return null;
       if (seenKeys.has(key)) return null;
       seenKeys.add(key);
-      calendars.push({ key, syncToken });
+      calendars.push(
+        entry.length === 3
+          ? { key, syncToken, takenAt: takenAt as number }
+          : { key, syncToken },
+      );
     }
     calendar = { takenAt: wire.c.t, calendars };
   }
@@ -295,10 +314,12 @@ function wireOf(content: MarkerContent): WirePayload {
         ? null
         : {
             t: content.calendar.takenAt,
-            s: content.calendar.calendars.map((entry) => [
-              entry.key,
-              entry.syncToken,
-            ]),
+            s: content.calendar.calendars.map(
+              (entry): [string, string] | [string, string, number] =>
+                entry.takenAt === undefined
+                  ? [entry.key, entry.syncToken]
+                  : [entry.key, entry.syncToken, entry.takenAt],
+            ),
           },
   };
 }

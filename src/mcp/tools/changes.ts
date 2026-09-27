@@ -10,7 +10,10 @@
 // **It writes nothing and marks nothing read.** The mail half asks each folder
 // for its numbers without opening it, and opens a folder only when its next
 // UID moved, read-only, through the mail orchestrator. Header fields only, and
-// every fetch peeks.
+// every fetch peeks. The calendar half runs after the mail half has finished:
+// one PROPFIND for every calendar's sync token, and one sync REPORT only for a
+// calendar whose token moved, one calendar at a time. It counts; it lists no
+// event yet.
 //
 // **The protocol trees meet here and nowhere else.** The mail tree and the DAV
 // tree never import each other. The marker module is protocol-neutral, and this
@@ -26,7 +29,11 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
 import { z } from "zod";
-import type { FolderState, MarkerContent } from "../../change-marker";
+import type {
+  CalendarBlock,
+  FolderState,
+  MarkerContent,
+} from "../../change-marker";
 import {
   MAX_CHANGE_FOLDERS,
   MarkerRefusedError,
@@ -38,6 +45,14 @@ import {
   ImapNotFoundError,
   ImapThrottleError,
 } from "../../errors";
+import { calendarChangesSince } from "../../dav/calendar";
+import type { CalendarChange } from "../../dav/calendar";
+import {
+  DavAuthError,
+  DavConnectError,
+  DavThrottleError,
+} from "../../dav/errors";
+import type { DavFetch } from "../../dav/transport";
 import type { StatusSnapshot } from "../../mail/imap-parser";
 import { decodeFolderId, encodeFolderId } from "../../mail/ids";
 import { decodeModifiedUtf7 } from "../../mail/imap-parser";
@@ -55,6 +70,7 @@ import {
 import type { Principal } from "../../principal";
 import type { ToolResult } from "../untrusted";
 import { UNTRUSTED_NOTICE, untrustedToolResult } from "../untrusted";
+import { davErrorResult } from "./dav-diagnose";
 import { mailErrorResult } from "./mail";
 
 /**
@@ -115,9 +131,26 @@ export interface MailFolderAnswer {
   rows: NewMailRow[];
 }
 
+/** What the calendar half found. */
+export interface CalendarSideAnswer {
+  /** One per non-subscribed calendar, in URL order. */
+  calendars: CalendarChange[];
+  /** Subscriptions, never checked (D-22). Ids trusted, names fenced. */
+  notCovered: { calendarId: string; displayName: string }[];
+  /** Calendars in the marker that no longer exist. */
+  gone: number;
+  /**
+   * Set when the calendar side as a whole could not be checked: the home
+   * listing was throttled, failed to connect, or was not found. The marker's
+   * old calendar block is carried unchanged.
+   */
+  unchecked: NotCheckedReason | null;
+}
+
 /** Everything `changesResult` needs. */
 export interface ChangesAnswer {
   mail: MailFolderAnswer[];
+  calendar: CalendarSideAnswer;
   /**
    * Folders in the presented marker that this call did not ask about, by
    * trusted key, carried into the fresh marker unchanged (D-16).
@@ -489,15 +522,34 @@ function overallSentence(
   return parts.join(" ");
 }
 
+/** One calendar's counts entry. Ids and integers only. */
+function calendarCount(one: CalendarChange) {
+  return {
+    source: "calendar" as const,
+    calendar: one.calendarId as string | null,
+    state: one.state,
+    addedOrChanged: one.addedOrChanged,
+    removed: one.removed,
+    more: one.more,
+    mechanism: one.mechanism,
+    ...(one.why !== undefined ? { why: one.why } : {}),
+    ...(one.state === "not_checked" && one.reason !== undefined
+      ? { reason: one.reason }
+      : {}),
+  };
+}
+
 /**
  * Shape the answer. The pure half, with no transport in it.
  *
- * The trusted block's keys, in this order: `counts`, `carried`, `overall`,
- * `since`, `marker`. Counts come before any detail (CHNG-06). The fenced block holds
- * everything stranger-authored.
+ * The trusted block's keys, in this order: `counts`, `carried`, `notCovered`,
+ * `goneCalendars`, `overall`, `since`, `marker`. Counts come before any detail
+ * (CHNG-06): mail folders first, then calendars in URL order. Calendars are
+ * named by id only. The fenced block holds everything stranger-authored,
+ * calendar names included.
  */
 export function changesResult(answer: ChangesAnswer): ToolResult {
-  const counts = answer.mail.map((folder) => ({
+  const mailCounts = answer.mail.map((folder) => ({
     source: "mail" as const,
     folder: folder.folder,
     state: folder.state,
@@ -509,13 +561,36 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
       : {}),
   }));
 
+  // A calendar side that could not be checked at all is one source, named by
+  // no id, because no calendar was listed.
+  const calendarCounts =
+    answer.calendar.unchecked !== null
+      ? [
+          {
+            source: "calendar" as const,
+            calendar: null as string | null,
+            state: "not_checked" as const,
+            addedOrChanged: null,
+            removed: null,
+            more: false,
+            mechanism: null,
+            reason: answer.calendar.unchecked,
+          },
+        ]
+      : answer.calendar.calendars.map(calendarCount);
+
+  const states: SourceState[] = [
+    ...answer.mail.map((folder) => folder.state),
+    ...calendarCounts.map((one) => one.state),
+    ...Array.from({ length: answer.calendar.gone }, () => "gone" as const),
+  ];
+
   const trusted = {
-    counts,
+    counts: [...mailCounts, ...calendarCounts],
     carried: answer.carried,
-    overall: overallSentence(
-      answer.mail.map((folder) => folder.state),
-      answer.carried.length,
-    ),
+    notCovered: answer.calendar.notCovered.map((one) => one.calendarId),
+    goneCalendars: answer.calendar.gone,
+    overall: overallSentence(states, answer.carried.length),
     since:
       answer.since === null
         ? null
@@ -528,7 +603,10 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
   // all of it is fenced. A folder other than the inbox is always listed, so
   // the key in the counts can be matched to a name; the inbox only when it
   // has rows, since its key is already its name.
-  const untrusted: Record<string, { name: string; rows: NewMailRow[] }> = {};
+  const untrusted: Record<
+    string,
+    { name: string; rows: NewMailRow[] } | { name: string }
+  > = {};
   for (const folder of answer.mail) {
     if (folder.rows.length > 0 || folder.folder !== DEFAULT_MAILBOX) {
       untrusted[folder.folder] = {
@@ -536,6 +614,14 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
         rows: folder.rows,
       };
     }
+  }
+  // Calendar names, keyed by the calendar id the counts carry (D-04). The
+  // not-covered subscriptions too, so their ids can be matched to a name.
+  for (const one of [
+    ...answer.calendar.calendars,
+    ...answer.calendar.notCovered,
+  ]) {
+    untrusted[one.calendarId] = { name: one.displayName };
   }
 
   return untrustedToolResult(trusted, untrusted);
@@ -593,12 +679,15 @@ export function refusedMarkerResult(): ToolResult {
  *
  * The marker is read BEFORE any socket, so a refused one costs no iCloud
  * contact. The mail source runs in sessions awaited one after another on the
- * request-scoped gate.
+ * request-scoped gate. The calendar source runs only after the last mail
+ * session has closed, through the one request-scoped DAV fetch.
  */
 export function registerChangesTool(
   server: McpServer,
   gate: SessionGate,
   principal: Promise<Principal>,
+  /** The same request-scoped DAV fetch the calendar tools get. */
+  davFetch: DavFetch,
   /** The session bounds. Production passes none; tests inject short ones. */
   options: MailSessionOptions = {},
 ): void {
@@ -606,11 +695,13 @@ export function registerChangesTool(
     CHANGES_TOOL_NAME,
     {
       description:
-        "What changed since a marker from an earlier call. Counts first, then " +
-        "new mail: sender and subject only, never a body. The inbox by " +
-        "default, or up to five folder ids. Call with no marker for a " +
-        "starting point. Every answer returns a fresh marker; pass it back " +
-        `exactly next time. Never marks mail read. ${UNTRUSTED_NOTICE}`,
+        "What changed since a marker from an earlier call, in mail and on " +
+        "every calendar. Counts first, then new mail: sender and subject " +
+        "only, never a body. Events are counted as added or changed, and " +
+        "removed. The inbox by default, or up to five folder ids. Call with " +
+        "no marker for a starting point. Every answer returns a fresh " +
+        "marker; pass it back exactly. Never marks mail read. " +
+        UNTRUSTED_NOTICE,
       inputSchema: z.object({
         marker: z
           .string()
@@ -685,6 +776,45 @@ export function registerChangesTool(
           options,
         );
 
+        // The calendar side, only after the mail side has finished (D-32).
+        // A sign-in refusal answers for the whole call with no marker (D-08).
+        // Any other failure at the home listing leaves the calendar side not
+        // checked and carries the old block unchanged.
+        let calendar: CalendarSideAnswer;
+        let freshCalendar: CalendarBlock | null;
+        try {
+          const result = await calendarChangesSince(
+            env,
+            actor,
+            davFetch,
+            prior?.calendar ?? null,
+            restartAll,
+          );
+          calendar = {
+            calendars: result.calendars,
+            notCovered: result.notCovered,
+            gone: result.gone,
+            unchecked: null,
+          };
+          freshCalendar = result.fresh;
+        } catch (err) {
+          if (err instanceof DavAuthError || err instanceof ImapAuthError) {
+            return davErrorResult(err);
+          }
+          calendar = {
+            calendars: [],
+            notCovered: [],
+            gone: 0,
+            unchecked:
+              err instanceof DavThrottleError
+                ? "throttled"
+                : err instanceof DavConnectError
+                  ? "connection"
+                  : "unavailable",
+          };
+          freshCalendar = prior?.calendar ?? null;
+        }
+
         const fresh = await sealMarker(
           {
             folders: [
@@ -693,7 +823,7 @@ export function registerChangesTool(
               ),
               ...carried,
             ],
-            calendar: prior?.calendar ?? null,
+            calendar: freshCalendar,
             mintedAt: Math.floor(Date.now() / 1000),
           },
           actor.userId,
@@ -702,6 +832,7 @@ export function registerChangesTool(
 
         return changesResult({
           mail: checks.map((check) => check.answer),
+          calendar,
           carried: carried.map((one) => folderKeyOf(one.mailbox)),
           since: prior?.mintedAt ?? null,
           marker: fresh,
