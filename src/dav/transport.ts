@@ -50,6 +50,7 @@ import { passwordOf } from "../principal";
 import type { Principal } from "../principal";
 import {
   DavAuthError,
+  DavForbiddenError,
   DavConnectError,
   DavNotFoundError,
   DavStaleResourceError,
@@ -269,7 +270,10 @@ export type DavFetch = typeof globalThis.fetch;
  */
 function throwForStatus(status: number): void {
   if (status >= 200 && status < 300) return;
-  if (status === 401 || status === 403) throw new DavAuthError();
+  // A 403 raises the one subclass, so the change check can tell it from a
+  // 401. Every other caller catches both as `DavAuthError`, unchanged.
+  if (status === 403) throw new DavForbiddenError();
+  if (status === 401) throw new DavAuthError();
   if (status === 429 || status === 503) throw new DavThrottleError();
   if (status === 415 || status === 501) throw new DavNotFoundError(false);
   if (status === 412) throw new DavStaleResourceError();

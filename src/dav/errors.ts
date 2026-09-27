@@ -45,6 +45,19 @@ export class DavAuthError extends Error {
   }
 }
 
+/**
+ * The one `DavAuthError` that was a 403, told apart from a 401 (WR-02).
+ *
+ * A subclass, so every caller that catches `DavAuthError` catches this exactly
+ * as before: same name, same message, same `kind`, no field of its own. Only a
+ * caller that asks for it by type sees the difference. The change check asks,
+ * because a 403 on a sync REPORT right after the home listing succeeded is not
+ * a dead password (D-28's second layer), and a 401 always is. Reading the two
+ * as one reported a failed sign-in as "the marker was too old" and threw away
+ * the changes in the gap.
+ */
+export class DavForbiddenError extends DavAuthError {}
+
 /** Thrown when the DAV request could not be made, or came back unusable. */
 export class DavConnectError extends Error {
   readonly kind = "connect" as const;

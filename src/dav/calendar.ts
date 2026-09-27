@@ -62,6 +62,7 @@ import type { ResolvedDavAccount } from "./discovery";
 import {
   DavAuthError,
   DavConnectError,
+  DavForbiddenError,
   DavNotFoundError,
   DavSubscriptionError,
   DavSyncTokenError,
@@ -1124,7 +1125,10 @@ async function reportOutcome(
     answer = await syncOneCalendar(davFetch, collectionUrl, homeUrl, token);
   } catch (err) {
     if (err instanceof DavSyncTokenError) return { kind: "refused", why: "token_refused" };
-    if (err instanceof DavAuthError) return { kind: "refused", why: "listing_refused" };
+    // Only a 403 is D-28's second layer. A 401 is a failed sign-in and is
+    // answered as one, with the caller's marker untouched (D-08, WR-02).
+    if (err instanceof DavForbiddenError) return { kind: "refused", why: "listing_refused" };
+    if (err instanceof DavAuthError) throw err;
     if (err instanceof DavThrottleError) return { kind: "stop", reason: "throttled" };
     if (err instanceof DavConnectError) return { kind: "stop", reason: "connection" };
     if (err instanceof DavNotFoundError) return { kind: "gone" };

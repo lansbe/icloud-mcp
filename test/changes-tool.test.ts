@@ -1598,3 +1598,32 @@ describe("the tool never hands out a marker its own schema refuses (CR-01)", () 
     expect(body.marker).toBeUndefined();
   });
 });
+
+describe("a sign-in refusal on the sync REPORT is auth_failed, not too old (WR-02)", () => {
+  it("401 on the REPORT: auth_failed for the whole call, no marker, nothing restarted", async () => {
+    vi.mocked(connectImap).mockReturnValueOnce(statusSession(4392, "118") as never);
+    vi.stubGlobal(
+      "fetch",
+      davStub(
+        [{ url: WORK_CAL, name: "Work", token: "w-2" }],
+        () => new Response(null, { status: 401 }),
+      ).fetch,
+    );
+    const marker = await markerFor({
+      folders: [
+        { mailbox: "INBOX", uidValidity: INBOX_UIDVALIDITY, uidNext: 4392, highestModseq: "118" },
+      ],
+      calendar: {
+        takenAt: 1790000000,
+        calendars: [{ key: await calendarKeyOf(WORK_CAL), syncToken: "w-1" }],
+      },
+      mintedAt: 1790000000,
+    });
+
+    const answer = await changesCallback()({ marker });
+    expect(answer.isError).toBe(true);
+    expect(JSON.parse(answer.content[0]!.text).category).toBe("auth_failed");
+    expect(answer.content[0]!.text).not.toContain("marker");
+    expect(answer.content[0]!.text).not.toContain("restarted");
+  });
+});

@@ -1148,3 +1148,22 @@ describe("calendarChangesSince: every kept state fits the marker (CR-01)", () =>
     expect(result.gone).toBe(0);
   });
 });
+
+describe("calendarChangesSince: a sign-in refusal on the sync REPORT (WR-02)", () => {
+  it("a REPORT answered 401 is thrown as the sign-in failure it is, never a restart", async () => {
+    const stub = davStub(TWO, () => new Response(null, { status: 401 }));
+    await warm(stub);
+    await expect(
+      calendarChangesSince(
+        env,
+        principal,
+        createDavFetch(owner),
+        await block([
+          [WORK, "work-1"],
+          [FAMILY, "family-1"],
+        ]),
+        false,
+      ),
+    ).rejects.toBeInstanceOf(DavAuthError);
+  });
+});

@@ -19,6 +19,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DavAuthError,
+  DavForbiddenError,
   DavConfirmationError,
   DavConnectError,
   DavNotFoundError,
@@ -547,6 +548,23 @@ describe("createDavFetch — status to typed error (D-60)", () => {
       expect(await raise(createDavFetch(owner))).toBeInstanceOf(DavAuthError);
     },
   );
+
+  it("tells a 403 apart from a 401 by type only: same name, message and fields (WR-02)", async () => {
+    vi.stubGlobal("fetch", statusStub(403).fetch);
+    const forbidden = await raise(createDavFetch(owner));
+    vi.stubGlobal("fetch", statusStub(401).fetch);
+    const unauthorised = await raise(createDavFetch(owner));
+
+    expect(forbidden).toBeInstanceOf(DavForbiddenError);
+    expect(unauthorised).toBeInstanceOf(DavAuthError);
+    expect(unauthorised).not.toBeInstanceOf(DavForbiddenError);
+    expect((forbidden as Error).name).toBe((unauthorised as Error).name);
+    expect((forbidden as Error).message).toBe((unauthorised as Error).message);
+    expect(Object.keys(forbidden as object).sort()).toEqual(
+      Object.keys(unauthorised as object).sort(),
+    );
+    expect(davToErrorCategory(forbidden)).toEqual(davToErrorCategory(unauthorised));
+  });
 
   it.each([429, 503])(
     "throws DavThrottleError on %i, which is never retried",
