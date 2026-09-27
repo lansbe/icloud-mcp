@@ -231,8 +231,14 @@ export const CONFIRM_VERSION = 4;
  * what it meant. The other direction is covered by the predicate rather than by
  * the version: a build that predates this kind refuses a reply token through
  * its own `hasConfirmPayloadBase`, which admits only the kinds it knows.
+ *
+ * **`move` joined the same way, and for the same reason (Phase 21).** It is the
+ * mail arm's first kind: a move of a list of messages to another folder. No
+ * field of any token already in flight changes meaning, every existing token
+ * still names one of the four kinds above, and a build that predates `move`
+ * refuses one through its own `hasConfirmPayloadBase`. So no version bump.
  */
-export type ConfirmKind = "create" | "update" | "delete" | "reply";
+export type ConfirmKind = "create" | "update" | "delete" | "reply" | "move";
 
 /**
  * How long a confirmation stays usable: five minutes.
@@ -672,45 +678,16 @@ export interface DavCollectionConfirmPayload extends ConfirmPayloadBase {
 }
 
 /**
- * A confirmation naming ONE message in ONE mailbox.
- *
- * No call site until the mutating mail paths land, so this arm is built against
- * tests rather than against a caller. That is stated rather than left to be
- * discovered: a reader looking for the preview that mints one of these will not
- * find it, and the absence is the schedule rather than a gap.
+ * The most messages one mail confirmation names. The move verb's cap, restated
+ * here because this module imports nothing from the mail tree.
  */
-export interface MailConfirmPayload extends ConfirmPayloadBase {
-  /** The kind of resource this confirmation names. See `DavObjectConfirmPayload.t`. */
-  t: "mail";
-  /**
-   * The mailbox the message lives in, as the opaque folder token.
-   *
-   * **The token, never a display name and never a wire name reconstructed
-   * later.** The folder token stores the raw wire name, so reopening the
-   * mailbox from it is byte-exact by construction — which is the established
-   * reason the token exists at all rather than a preference expressed here.
-   *
-   * The silent failure a display name would reach: mailbox names are not ASCII
-   * and not case-normalised, and a name round-tripped through a display form
-   * comes back subtly different. The reopen then selects a mailbox that either
-   * does not exist, or — worse — exists and is not the one the preview read.
-   * A token carried whole cannot do that.
-   */
-  m: string;
-  /**
-   * The mailbox's UIDVALIDITY at preview, a whole number.
-   *
-   * **Two characters rather than one, deliberately.** The message-id and
-   * page-cursor wire formats already spell this value `uv`, and a reader
-   * meeting all three should meet one word for one thing. A second single
-   * letter would have been cheaper by one byte and would have cost a reader
-   * the recognition.
-   *
-   * It is the half of the pair that says whether `i` still means anything: a
-   * server that renumbers a mailbox bumps this, and every UID under the old
-   * value stops naming what it named.
-   */
-  uv: number;
+export const MAIL_CONFIRM_SET_MAX = 25;
+
+/**
+ * One message in a mail confirmation's set: its UID and the fingerprint the
+ * preview read.
+ */
+export interface MailSetEntry {
   /**
    * The message's UID, a whole number.
    *
@@ -743,23 +720,6 @@ export interface MailConfirmPayload extends ConfirmPayloadBase {
    */
   d: number;
   /**
-   * Where the message is GOING, as the same opaque folder token — or `null`
-   * for an operation that has no destination.
-   *
-   * **Nullable and never optional, in `e`'s own register and for `e`'s own
-   * reason.** An absent key and an explicit `null` are different bytes for the
-   * same meaning, and a field that can be ABSENT is a field a later build reads
-   * as `undefined` in the slot naming where a message is about to go. `null`
-   * is a value the predicate can see and a type can require; absent is a state
-   * that looks identical to a field nobody thought about.
-   *
-   * The predicate carries the `"q" in candidate` companion, on the same
-   * footing as `s`: the type ADMITS `null`, so an absent field and a present
-   * null are both `candidate.q === null` and nothing else in the check can
-   * tell them apart.
-   */
-  q: string | null;
-  /**
    * The MODSEQ the preview observed, as decimal digits in a string.
    *
    * **A string and NOT a number, and this is the field's whole reason for
@@ -782,6 +742,89 @@ export interface MailConfirmPayload extends ConfirmPayloadBase {
    * what the module header's mail carve-out is written to stop being claimed.
    */
   n: string;
+}
+
+/**
+ * A confirmation naming a SET of messages in ONE mailbox.
+ *
+ * Every entry in `l` shares the source folder `m` and its validity `uv`. A list
+ * from two folders would need two mailbox opens in one session, and the
+ * mutating open has one site (R-1), so the tool refuses a mixed list before
+ * anything is minted.
+ *
+ * **Reshaped in place from one message to a set, with no version bump.** Until
+ * Phase 21 this arm named one message, with its fields at the top level. No
+ * mail confirmation was ever minted under that shape, because the arm had no
+ * call site, so no token in flight changes meaning. The reshaped predicate
+ * refuses the old shape outright. A one-message case is a list of one.
+ *
+ * The minter is `buildMovePreview` in `src/mcp/tools/mail.ts`.
+ *
+ * The letters avoid every field of the DAV arms (`c o r e s f g b`), so no
+ * payload can be read under two arms.
+ */
+export interface MailConfirmPayload extends ConfirmPayloadBase {
+  /** The kind of resource this confirmation names. See `DavObjectConfirmPayload.t`. */
+  t: "mail";
+  /**
+   * The mailbox the messages live in, as the opaque folder token.
+   *
+   * **The token, never a display name and never a wire name reconstructed
+   * later.** The folder token stores the raw wire name, so reopening the
+   * mailbox from it is byte-exact by construction — which is the established
+   * reason the token exists at all rather than a preference expressed here.
+   *
+   * The silent failure a display name would reach: mailbox names are not ASCII
+   * and not case-normalised, and a name round-tripped through a display form
+   * comes back subtly different. The reopen then selects a mailbox that either
+   * does not exist, or — worse — exists and is not the one the preview read.
+   * A token carried whole cannot do that.
+   */
+  m: string;
+  /**
+   * The mailbox's UIDVALIDITY at preview, a whole number.
+   *
+   * **Two characters rather than one, deliberately.** The message-id and
+   * page-cursor wire formats already spell this value `uv`, and a reader
+   * meeting all three should meet one word for one thing. A second single
+   * letter would have been cheaper by one byte and would have cost a reader
+   * the recognition.
+   *
+   * It is the half of the pair that says whether each `i` still means
+   * anything: a server that renumbers a mailbox bumps this, and every UID under
+   * the old value stops naming what it named.
+   */
+  uv: number;
+  /**
+   * Where the messages are GOING, as the same opaque folder token — or `null`
+   * for an operation that has no destination.
+   *
+   * **Nullable and never optional, in `e`'s own register and for `e`'s own
+   * reason.** An absent key and an explicit `null` are different bytes for the
+   * same meaning, and a field that can be ABSENT is a field a later build reads
+   * as `undefined` in the slot naming where a message is about to go. `null`
+   * is a value the predicate can see and a type can require; absent is a state
+   * that looks identical to a field nobody thought about.
+   *
+   * The predicate carries the `"q" in candidate` companion, on the same
+   * footing as `s`: the type ADMITS `null`, so an absent field and a present
+   * null are both `candidate.q === null` and nothing else in the check can
+   * tell them apart.
+   */
+  q: string | null;
+  /**
+   * The destination's role as the preview resolved it, or `null` for a folder
+   * the caller named.
+   *
+   * Nullable and never optional, on `q`'s rule, with the same `"qr" in
+   * candidate` companion in the predicate.
+   */
+  qr: "archive" | "trash" | null;
+  /**
+   * The messages, 1 to `MAIL_CONFIRM_SET_MAX` of them, no two with the same
+   * UID, in the order the caller named them.
+   */
+  l: MailSetEntry[];
 }
 
 /**
@@ -1528,6 +1571,45 @@ export async function replyChangeHashOf(
 }
 
 /**
+ * The change a mail move reduces to, before it is hashed.
+ *
+ * Exactly what the caller hands back to the mail commit: the op, the message
+ * ids in the caller's order, and the destination folder id. Its own shape and
+ * its own hash domain, on `NormalizedReplyChange`'s reasoning, so no calendar
+ * or contact change can hash to the same value.
+ */
+export interface NormalizedMailMove {
+  op: "move";
+  ids: string[];
+  destination: string;
+}
+
+/** The domain string a mail move's tuple starts with. Used by no other change. */
+const MAIL_MOVE_DOMAIN = "mail-move";
+
+/**
+ * The bytes a mail move hashes to, as a fixed-order tuple.
+ *
+ * Every field read by name, so key order in what a caller passed back cannot
+ * reach the output. The ids keep the caller's order: the confirmation's list is
+ * in that order, and the commit pairs them position by position.
+ */
+export function canonicalMailMove(change: NormalizedMailMove): string {
+  return JSON.stringify([MAIL_MOVE_DOMAIN, change.op, [...change.ids], change.destination]);
+}
+
+/** The canonical mail move, digested and carried as base64url. */
+export async function mailMoveChangeHashOf(
+  change: NormalizedMailMove,
+): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    TOKEN_ENCODER.encode(canonicalMailMove(change)),
+  );
+  return toBase64Url(new Uint8Array(digest));
+}
+
+/**
  * The resource words this server will ever name in a composed line.
  *
  * A CLOSED vocabulary rather than a caller-supplied string, on `changedFields`'
@@ -1594,8 +1676,12 @@ export type ConfirmationTense = "would" | "did";
  * cheerfully state the number somebody asked for.
  */
 export interface ConfirmationSummary {
-  /** The operation, matching the confirmation's own `k`. */
-  kind: ConfirmKind;
+  /**
+   * The operation, matching the confirmation's own `k`. Never `move`: a move
+   * has its own summary, `MoveLineSummary`, whose fields are about folders and
+   * counts rather than about one resource.
+   */
+  kind: Exclude<ConfirmKind, "move">;
   /** The resource word, from the closed vocabulary. */
   noun: ConfirmationNoun;
   /** The resource's own name, or `null` when there is none to give. */
@@ -1685,6 +1771,37 @@ export interface ReplyLineSummary {
 }
 
 /**
+ * What the line says about a mail move (Phase 21).
+ *
+ * A separate member of the composer's input rather than more nullable fields
+ * on `ConfirmationSummary`: a field that does not belong to a move does not
+ * exist on it, which is the `ConfirmPayload` union's own argument.
+ */
+export interface MoveLineSummary {
+  kind: "move";
+  /** `message` for ordinary mail, `draft` for a draft. */
+  noun: "message" | "draft";
+  /** The source folder's decoded name. Folded before it is embedded. */
+  from: string;
+  /** The destination folder's decoded name. Folded before it is embedded. */
+  to: string;
+  /** The destination's role, or `null` for a folder the caller named. */
+  role: "archive" | "trash" | null;
+  /** How many messages the move names. */
+  count: number;
+  /**
+   * The per-message tally on a commit, or `null` on a preview. The counts come
+   * from the results, which come from re-reads, never from the request.
+   */
+  outcome: {
+    moved: number;
+    copiedNotRemoved: number;
+    notCopied: number;
+    unknown: number;
+  } | null;
+}
+
+/**
  * Which way a reminder change goes.
  *
  * Three literals rather than a pair of booleans or a signed count, for
@@ -1728,6 +1845,7 @@ const CONFIRMATION_VERBS: Record<
   update: { would: "Overwriting", did: "Overwrote" },
   delete: { would: "Deleting", did: "Deleted" },
   reply: { would: "Answering", did: "Answered" },
+  move: { would: "Moving", did: "Moved" },
 };
 
 /**
@@ -1769,6 +1887,9 @@ const CONFIRMATION_CONSEQUENCES: Record<ConfirmKind, string> = {
   // anybody is told, so it must not under-warn: it says the one thing that is
   // true if somebody is.
   reply: "A reply cannot be unsent.",
+  // Kept so the table stays total. The move branch of the composer picks its
+  // own consequence, because it depends on the count and on the destination.
+  move: "They can be moved back.",
 };
 
 /**
@@ -2013,9 +2134,53 @@ function quotedName(name: string): string {
  * a failed preview.
  */
 export function composeConfirmationLine(
-  summary: ConfirmationSummary,
+  summary: ConfirmationSummary | MoveLineSummary,
   tense: ConfirmationTense,
 ): string {
+  // A mail move has its own sentence, still this function's: one composer, one
+  // tense table, one quoting rule. It returns early because none of the clauses
+  // below can apply to a move. Both folder names are folded, because a folder
+  // name is text any mail client on the account could have chosen.
+  if (summary.kind === "move") {
+    const n = summary.count;
+    const word = n === 1 ? summary.noun : CONFIRMATION_PLURALS[summary.noun];
+    const from = quotedName(summary.from);
+    const to = quotedName(summary.to);
+    const fromPart = from.length > 0 ? `from '${from}'` : "from its folder";
+    // Trash is named by role and never by folder name: iCloud's is called
+    // "Deleted Messages", and D-04 says this server's own words never say a
+    // message is deleted when it is recoverable.
+    const toPart =
+      summary.role === "trash"
+        ? "to Trash"
+        : summary.role === "archive"
+          ? to.length > 0
+            ? `to the archive folder '${to}'`
+            : "to the archive folder"
+          : to.length > 0
+            ? `to '${to}'`
+            : "to another folder";
+    const pronoun = n === 1 ? "It" : "They";
+    // Tense-free, for `CONFIRMATION_VERBS`' reason.
+    const consequence =
+      summary.role === "trash"
+        ? `${pronoun} can be moved back out of Trash until Trash is emptied.`
+        : `${pronoun} can be moved back.`;
+    const verb = CONFIRMATION_VERBS.move[tense];
+    const outcome = summary.outcome;
+    if (tense === "would" || outcome === null || outcome.moved === n) {
+      return `${verb} ${n} ${word} ${fromPart} ${toPart}. ${consequence}`;
+    }
+    const clauses: string[] = [];
+    if (outcome.copiedNotRemoved > 0) {
+      clauses.push(`${outcome.copiedNotRemoved} copied but not removed`);
+    }
+    if (outcome.notCopied > 0) clauses.push(`${outcome.notCopied} not copied`);
+    if (outcome.unknown > 0) clauses.push(`${outcome.unknown} not confirmed`);
+    const tail = clauses.length > 0 ? `; ${clauses.join(", ")}` : "";
+    return `${verb} ${outcome.moved} of ${n} ${word} ${fromPart} ${toPart}${tail}. ${consequence}`;
+  }
+
   const safeName = summary.name === null ? null : quotedName(summary.name);
   const subject =
     safeName === null || safeName.length === 0
@@ -2259,7 +2424,8 @@ function hasConfirmPayloadBase(candidate: Record<string, unknown>): boolean {
     (candidate.k === "create" ||
       candidate.k === "update" ||
       candidate.k === "delete" ||
-      candidate.k === "reply") &&
+      candidate.k === "reply" ||
+      candidate.k === "move") &&
     typeof candidate.j === "string" &&
     typeof candidate.h === "string" &&
     // No `"u" in candidate` companion, and the difference from `s` on the
@@ -2382,12 +2548,6 @@ function hasMailArm(candidate: Record<string, unknown>): boolean {
     candidate.m.length > 0 &&
     typeof candidate.uv === "number" &&
     Number.isInteger(candidate.uv) &&
-    typeof candidate.i === "number" &&
-    Number.isInteger(candidate.i) &&
-    typeof candidate.z === "number" &&
-    Number.isInteger(candidate.z) &&
-    typeof candidate.d === "number" &&
-    Number.isInteger(candidate.d) &&
     // Null is "no destination"; an empty string is not a quieter way of saying
     // that, it is a destination nobody named. A move to it moves a message to a
     // mailbox that does not exist, which is the one shape on this arm whose
@@ -2398,19 +2558,56 @@ function hasMailArm(candidate: Record<string, unknown>): boolean {
     // predicate's `u` comment gives: `q`'s type ADMITS null, so an absent key
     // and a present null both read as `candidate.q === null`.
     "q" in candidate &&
-    // Digits, never a number. See `MailConfirmPayload.n` for what a value that
-    // went through a JSON number does instead of failing.
-    typeof candidate.n === "string" &&
-    DECIMAL_DIGITS.test(candidate.n) &&
+    // The destination's role: one of three values, present, never absent.
+    (candidate.qr === null || candidate.qr === "archive" || candidate.qr === "trash") &&
+    "qr" in candidate &&
+    hasMailSet(candidate.l) &&
     // And none of the DAV arms' fields. The mail arm shares no field with
     // either of them, so a payload carrying one is a payload that could be read
     // under two arms, which is the thing the discriminator exists to forbid.
+    // `g` joined the list with the set shape: the collection arm's count was
+    // missing from it, and refusing more is the safe side.
     !("c" in candidate) &&
     !("o" in candidate) &&
     !("r" in candidate) &&
     !("e" in candidate) &&
     !("s" in candidate) &&
     !("b" in candidate) &&
-    !("f" in candidate)
+    !("f" in candidate) &&
+    !("g" in candidate)
   );
+}
+
+/**
+ * Whether a mail confirmation's message list is well formed: 1 to
+ * `MAIL_CONFIRM_SET_MAX` entries, no two with the same UID, and every entry
+ * carrying the single-message arm's own refusals.
+ */
+function hasMailSet(list: unknown): boolean {
+  if (!Array.isArray(list)) return false;
+  if (list.length === 0 || list.length > MAIL_CONFIRM_SET_MAX) return false;
+  const seen = new Set<number>();
+  for (const entry of list) {
+    if (typeof entry !== "object" || entry === null) return false;
+    const one = entry as Record<string, unknown>;
+    if (
+      !(
+        typeof one.i === "number" &&
+        Number.isInteger(one.i) &&
+        typeof one.z === "number" &&
+        Number.isInteger(one.z) &&
+        typeof one.d === "number" &&
+        Number.isInteger(one.d) &&
+        // Digits, never a number. See `MailSetEntry.n` for what a value that
+        // went through a JSON number does instead of failing.
+        typeof one.n === "string" &&
+        DECIMAL_DIGITS.test(one.n)
+      )
+    ) {
+      return false;
+    }
+    if (seen.has(one.i)) return false;
+    seen.add(one.i);
+  }
+  return true;
 }

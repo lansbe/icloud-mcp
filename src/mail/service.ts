@@ -49,6 +49,7 @@ import {
   isWireNumber,
 } from "./ids";
 import type {
+  Fingerprint,
   FolderRole,
   MailboxListLine,
   MailboxStatus,
@@ -58,12 +59,14 @@ import type {
   StatusSnapshot,
 } from "./imap-parser";
 import {
+  FINGERPRINT_ITEMS,
   correlateStatus,
   decodeModifiedUtf7,
   parseAccessCode,
   parseCapabilityLine,
   parseCompletionCode,
   parseExists,
+  parseFingerprint,
   parseListLine,
   parsePermanentFlags,
   parseSExpr,
@@ -679,6 +682,13 @@ export interface MutatingMailSession {
   exists: number;
   /** The post-authentication capability list, verbatim, or `null`. */
   capability: string | null;
+  /**
+   * The last permanent-flags list the open reported, or `null` when it sent
+   * none. RFC 3501 §6.3.1: no list means every flag is kept, so `null` is not
+   * "unknown". Each verb checks the flag it needs against this itself (D-08),
+   * which is why the orchestrator takes no mode argument.
+   */
+  readonly permanentFlags: readonly string[] | null;
 }
 
 /**
@@ -719,6 +729,22 @@ function keepsSeenFlag(untagged: readonly ResponseLine[]): boolean {
   }
   if (permanent === null) return true;
   return permanent.some((flag) => flag.toLowerCase() === "\\seen");
+}
+
+/**
+ * The last permanent-flags list among an open's untagged replies, or `null`.
+ *
+ * The same reading `keepsSeenFlag` makes, kept for the session so each verb can
+ * ask about the flag it needs. If a server sends the list twice, the last one is
+ * its final word.
+ */
+function permanentFlagsOf(untagged: readonly ResponseLine[]): string[] | null {
+  let permanent: string[] | null = null;
+  for (const line of untagged) {
+    const flags = parsePermanentFlags(line.text);
+    if (flags !== null) permanent = flags;
+  }
+  return permanent;
 }
 
 /**
@@ -805,6 +831,7 @@ export async function withMutatingMailboxOver<T>(
         uidValidity,
         exists,
         capability,
+        permanentFlags: permanentFlagsOf(opened.untagged),
       };
 
       return () => fn(session);
@@ -2230,6 +2257,157 @@ export async function listFolders(
   options: MailSessionOptions = {},
 ): Promise<FolderListing> {
   return withMailSession(principal, gate, null, null, listAllFolders, options);
+}
+
+// ---------------------------------------------------------------------------
+// The move preview's read (Phase 21, D-09)
+//
+// A preview writes nothing, so it runs on the READ path: the source folder is
+// opened read-only through the read orchestrator, exactly as a listing opens
+// it. One folder listing to resolve the destination, and one fetch that reads
+// each message's fingerprint and a peek at three header fields. No new open
+// command, no mode argument, and nothing on the read path changes.
+// ---------------------------------------------------------------------------
+
+/**
+ * The preview's fetch items: the fingerprint, plus a peek at three headers.
+ *
+ * The peeking form, as `PAGE_ITEMS` uses, so reading the subject for the
+ * preview cannot mark the message read.
+ */
+const MOVE_PREVIEW_ITEMS =
+  `${FINGERPRINT_ITEMS.slice(0, -1)} BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])`;
+
+/** One message a move preview found, with the three fields it shows. */
+export interface MoveCandidate {
+  /** Size, internal date and MODSEQ, which the confirmation seals. */
+  fingerprint: Fingerprint;
+  /** The sender's subject line. Stranger-authored. */
+  subject: string | null;
+  /** The sender's declared address, or their name without one. Stranger-authored. */
+  from: string | null;
+  /** The sender's own Date header. Stranger-authored. */
+  date: string | null;
+}
+
+/** Everything a move preview's one read session established. */
+export interface MoveSetFacts {
+  /** Every folder in the account, as the listing tool reports them. */
+  listing: FolderListing;
+  /** The messages found, in the order the UIDs were asked for. */
+  found: MoveCandidate[];
+  /** The UIDs the fetch had no reply for. */
+  missing: number[];
+  /**
+   * Whether the folder reported mod-sequences. `"unavailable"` when the fetch
+   * was answered BAD, or a message came back with no MODSEQ item: RFC 7162
+   * §3.1.2 says a folder without persistent mod-sequences answers a MODSEQ
+   * fetch that way. A move cannot be bound to "nothing changed" without them.
+   */
+  changeNumbers: "available" | "unavailable";
+}
+
+/** The folder a move leaves from: its wire name and the validity its ids carry. */
+export interface MoveSource {
+  mailbox: string;
+  uidValidity: number;
+}
+
+/**
+ * Read what a move preview needs, inside a session already open read-only.
+ *
+ * The validity gate has run by the time this is called: the read orchestrator
+ * refuses a changed folder before any fetch is written.
+ */
+async function readMoveSetIn(
+  session: MailSession,
+  uids: readonly number[],
+): Promise<MoveSetFacts> {
+  if (uids.length === 0 || !uids.every((uid) => isWireNumber(uid) && uid > 0)) {
+    throw new ImapNotFoundError();
+  }
+
+  const listing = await listAllFolders(session);
+
+  const fetched = await sendCommand(
+    session.channel,
+    session.channel.nextTag(),
+    `UID FETCH ${uids.join(",")} ${MOVE_PREVIEW_ITEMS}`,
+  );
+  if (fetched.status === "BAD") {
+    return { listing, found: [], missing: [], changeNumbers: "unavailable" };
+  }
+  if (fetched.status !== "OK") throw new ImapNotFoundError();
+
+  const replies = fetchReplies(fetched.untagged);
+  const found: MoveCandidate[] = [];
+  const missing: number[] = [];
+  let changeNumbers: MoveSetFacts["changeNumbers"] = "available";
+
+  for (const uid of uids) {
+    const items = replies.get(uid);
+    if (items === undefined) {
+      missing.push(uid);
+      continue;
+    }
+    const fingerprint = parseFingerprint(fetched.untagged, uid);
+    if (fingerprint === null) {
+      // No MODSEQ at all is the folder saying it has none. Anything else that
+      // does not parse cannot be sealed, and is treated as not found.
+      if (!items.has("MODSEQ")) changeNumbers = "unavailable";
+      else missing.push(uid);
+      continue;
+    }
+
+    const header = headerBlockOf(items);
+    const parsed = header === null ? null : await extractMessage(header);
+    found.push({
+      fingerprint,
+      subject: parsed?.subject ?? null,
+      from: parsed?.fromAddress ?? parsed?.fromName ?? null,
+      date: parsed?.date ?? null,
+    });
+  }
+
+  return { listing, found, missing, changeNumbers };
+}
+
+/** Read a move preview's facts over an already-open stream pair. */
+export async function readMoveSetOver(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  source: MoveSource,
+  uids: readonly number[],
+  options: MailSessionOptions = {},
+): Promise<MoveSetFacts> {
+  return withMailSessionOver(
+    duplex,
+    principal,
+    gate,
+    source.mailbox,
+    source.uidValidity,
+    (session) => readMoveSetIn(session, uids),
+    options,
+  );
+}
+
+/** Read a move preview's facts: one socket, one read-only session. */
+export async function readMoveSet(
+  principal: Principal,
+  gate: SessionGate,
+  source: MoveSource,
+  uids: readonly number[],
+  options: MailSessionOptions = {},
+): Promise<MoveSetFacts> {
+  return withMailSession(
+    principal,
+    gate,
+    source.mailbox,
+    source.uidValidity,
+    (session) => readMoveSetIn(session, uids),
+    options,
+  );
 }
 
 // ---------------------------------------------------------------------------

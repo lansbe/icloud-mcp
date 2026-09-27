@@ -23,10 +23,27 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
 import { z } from "zod";
+import {
+  CONFIRM_TTL_SECONDS,
+  CONFIRM_VERSION,
+  ConfirmationInvalidError,
+  changeHashMatches,
+  composeConfirmationLine,
+  mailMoveChangeHashOf,
+  mintConfirmation,
+  reserveConfirmation,
+  verifyConfirmation,
+} from "../../confirm";
+import type {
+  MailConfirmPayload,
+  MailSetEntry,
+  NormalizedMailMove,
+} from "../../confirm";
 import type { Env } from "../../env";
 import {
   ImapAuthError,
   ImapNotFoundError,
+  MailConfirmationError,
   toErrorCategory,
 } from "../../errors";
 import type { BuildResult, DraftAttachment } from "../../mail/compose";
@@ -42,6 +59,8 @@ import {
   extractAttachmentText,
 } from "../../mail/extract";
 import type { FolderRole, RoleSource } from "../../mail/imap-parser";
+import { decodeModifiedUtf7 } from "../../mail/imap-parser";
+import type { MessageRef } from "../../mail/ids";
 import {
   STAGED_ID_TTL_MS,
   decodeAttachmentId,
@@ -49,6 +68,7 @@ import {
   decodeMessageId,
   decodeStagedId,
   decodeUploadId,
+  encodeFolderId,
   encodeMessageId,
   encodeUploadId,
 } from "../../mail/ids";
@@ -71,10 +91,20 @@ import {
   listFolders,
   listMessages,
   listUnread,
+  readMoveSet,
   searchMessages,
 } from "../../mail/service";
-import type { ReadStateOutcome } from "../../mail/triage";
-import { markRead, markUnread } from "../../mail/triage";
+import type {
+  MessageMoveResult,
+  MoveOutcome,
+  ReadStateOutcome,
+} from "../../mail/triage";
+import {
+  MOVE_SET_CAP,
+  markRead,
+  markUnread,
+  moveMessages,
+} from "../../mail/triage";
 import type { Principal } from "../../principal";
 import type { ConfirmRefusal } from "../../staging/presign";
 import {
@@ -1611,6 +1641,411 @@ export function readStateToolResult(
   return { content: [{ type: "text", text: JSON.stringify(body) }] };
 }
 
+// ---------------------------------------------------------------------------
+// Moving mail: the preview and the mail commit (Phase 21, D-02, D-05, D-09)
+//
+// A move is previewed first and applied only by `mail_commit` with the
+// preview's confirmation, passed back unaltered. The preview reads on the read
+// path and writes nothing. The commit checks the confirmation fully, claims its
+// one-time slot, and makes one verb call. This module never imports the
+// mutating orchestrator; the verbs come from `../../mail/triage`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Run something that may raise the NEUTRAL confirmation refusal, and translate.
+ *
+ * The mail tree's copy of calendar's boundary, for the same reason:
+ * `toErrorCategory` dispatches on TYPE, and a neutral refusal that escaped
+ * untranslated would reach the model as a failed connection. Wrapped around the
+ * preview's mint as well as the commit, because minting raises the same class
+ * when the signing key is unusable. Nothing is read off the caught value.
+ */
+async function withMailConfirmationBoundary<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    if (err instanceof ConfirmationInvalidError) throw new MailConfirmationError();
+    throw err;
+  }
+}
+
+/** The mail-arm fields a preview supplies; the rest are filled in here. */
+type MailConfirmationFields = Omit<MailConfirmPayload, "v" | "t" | "j" | "x" | "u">;
+
+/**
+ * Mint a mail confirmation for the signed-in person.
+ *
+ * Fills the version, the target, a fresh single-use id, an absolute expiry and
+ * the principal's own id, and signs with the Worker's confirmation key. The
+ * user id comes from the principal and from nothing else.
+ */
+async function mintMailConfirmation(
+  actor: Principal,
+  fields: MailConfirmationFields,
+): Promise<string> {
+  return mintConfirmation(
+    {
+      v: CONFIRM_VERSION,
+      t: "mail",
+      j: crypto.randomUUID(),
+      x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+      u: actor.userId,
+      ...fields,
+    },
+    env.CONFIRM_SECRET,
+  );
+}
+
+/** The fixed reason for each move refusal. ASCII, and no server text. */
+const MOVE_REFUSAL_REASONS = {
+  "too-many": `A move takes at most ${MOVE_SET_CAP} messages. Split the list and preview each part.`,
+  "duplicate-ids": "The same message is named more than once. Name each message once.",
+  "mixed-folders":
+    "The messages are in different folders. One move takes messages from one folder.",
+  "messages-not-found": "These messages are no longer in the folder. List the folder again.",
+  "already-marked-for-removal":
+    "These messages are already marked for removal by another app. Moving them would " +
+    "carry that mark to the copy, where another app could remove it for good.",
+  "no-change-numbers":
+    "This folder does not report change numbers, so a move cannot be checked against " +
+    "later changes. Nothing was moved.",
+  "destination-not-found": "The destination folder was not found. List the folders again.",
+  "destination-is-source": "The destination is the folder the messages are already in.",
+  "destination-not-selectable": "The destination folder cannot hold messages.",
+  "mailbox-read-only": "The folder opened read-only, so nothing was moved.",
+  "removal-not-kept": "The folder does not keep the mark a move needs, so nothing was moved.",
+  "commands-unavailable":
+    "iCloud did not offer the commands a safe move needs, so nothing was moved.",
+  "changed-since-preview":
+    "These messages changed after the preview, so nothing was moved. Preview the move again.",
+} as const;
+
+type MoveRefusal = keyof typeof MOVE_REFUSAL_REASONS;
+
+/** A refusal answer: plain JSON, never `isError`. */
+function moveRefusalResult(
+  refusal: MoveRefusal,
+  extra: Record<string, unknown> = {},
+): ToolResult {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({ refusal, reason: MOVE_REFUSAL_REASONS[refusal], ...extra }),
+      },
+    ],
+  };
+}
+
+/** Where a move is going. 21-03 adds a role kind beside this one. */
+export type MoveDestination = { kind: "folder"; mailbox: string };
+
+/** What the caller named, decoded, in the caller's order. */
+export interface MoveRequest {
+  /** The caller's message ids, verbatim. */
+  ids: string[];
+  /** The same ids, decoded. All from one folder and one validity. */
+  refs: MessageRef[];
+  /** The caller's destination id, verbatim. It goes into the change. */
+  destinationId: string;
+}
+
+/** Whether a folder's attributes say it cannot hold messages. */
+function isUnselectable(attributes: readonly string[]): boolean {
+  return attributes.some((attribute) => {
+    const lowered = attribute.toLowerCase();
+    return lowered === "\\noselect" || lowered === "\\nonexistent";
+  });
+}
+
+/**
+ * Preview a move: one read session, then a confirmation, and nothing written.
+ *
+ * The read opens the source read-only, lists the folders and fetches each
+ * message's fingerprint with a peek at three headers. Every refusal is a
+ * plain-JSON answer. Otherwise the confirmation seals the source folder, its
+ * validity, the destination and each message's size, internal date and MODSEQ,
+ * in the caller's order.
+ */
+export async function buildMovePreview(
+  actor: Principal,
+  gate: SessionGate,
+  request: MoveRequest,
+  destination: MoveDestination,
+  op: "move",
+): Promise<ToolResult> {
+  const first = request.refs[0]!;
+  const source = { mailbox: first.mailbox, uidValidity: first.uidValidity };
+  const facts = await readMoveSet(
+    actor,
+    gate,
+    source,
+    request.refs.map((ref) => ref.uid),
+  );
+
+  const idOf = new Map(request.refs.map((ref, index) => [ref.uid, request.ids[index]!]));
+  const idsFor = (uids: readonly number[]): string[] => uids.map((uid) => idOf.get(uid)!);
+
+  if (facts.missing.length > 0) {
+    return moveRefusalResult("messages-not-found", { ids: idsFor(facts.missing) });
+  }
+  const marked = facts.found.filter((candidate) =>
+    candidate.fingerprint.flags.some((flag) => flag.toLowerCase() === "\\deleted"),
+  );
+  if (marked.length > 0) {
+    return moveRefusalResult("already-marked-for-removal", {
+      ids: idsFor(marked.map((candidate) => candidate.fingerprint.uid)),
+    });
+  }
+  if (facts.changeNumbers === "unavailable") {
+    return moveRefusalResult("no-change-numbers", { ids: [...request.ids] });
+  }
+
+  const target = facts.listing.folders.find(
+    (folder) => folder.wireName === destination.mailbox,
+  );
+  if (target === undefined) return moveRefusalResult("destination-not-found");
+  if (destination.mailbox === source.mailbox) {
+    return moveRefusalResult("destination-is-source");
+  }
+  if (isUnselectable(target.attributes)) {
+    return moveRefusalResult("destination-not-selectable");
+  }
+
+  const byUid = new Map(facts.found.map((candidate) => [candidate.fingerprint.uid, candidate]));
+  const l: MailSetEntry[] = request.refs.map((ref) => {
+    const fingerprint = byUid.get(ref.uid)!.fingerprint;
+    return {
+      i: ref.uid,
+      z: fingerprint.size,
+      d: fingerprint.internalDate,
+      n: fingerprint.modSeq,
+    };
+  });
+
+  const change: NormalizedMailMove = {
+    op,
+    ids: [...request.ids],
+    destination: request.destinationId,
+  };
+  const sourceId = encodeFolderId({ mailbox: source.mailbox });
+  const destinationId = encodeFolderId({ mailbox: destination.mailbox });
+
+  const confirmToken = await mintMailConfirmation(actor, {
+    k: "move",
+    h: await mailMoveChangeHashOf(change),
+    m: sourceId,
+    uv: source.uidValidity,
+    q: destinationId,
+    qr: null,
+    l,
+  });
+
+  const sourceFolder = facts.listing.folders.find(
+    (folder) => folder.wireName === source.mailbox,
+  );
+  const sourceName = sourceFolder?.displayName ?? decodeModifiedUtf7(source.mailbox);
+  const destinationName = target.displayName;
+  const confirmationLine = composeConfirmationLine(
+    {
+      kind: "move",
+      noun: "message",
+      from: sourceName,
+      to: destinationName,
+      role: null,
+      count: l.length,
+      outcome: null,
+    },
+    "would",
+  );
+
+  return untrustedToolResult(
+    {
+      confirmToken,
+      expiresInSeconds: CONFIRM_TTL_SECONDS,
+      change,
+      confirmationLine,
+      source: { id: sourceId },
+      destination: { id: destinationId, role: null },
+      count: l.length,
+    },
+    {
+      sourceName,
+      destinationName,
+      messages: request.refs.map((ref, index) => {
+        const candidate = byUid.get(ref.uid)!;
+        return {
+          id: request.ids[index],
+          subject: candidate.subject,
+          from: candidate.from,
+          date: candidate.date,
+          size: candidate.fingerprint.size,
+        };
+      }),
+    },
+  );
+}
+
+/** A mail commit's change, as the schema admits it. */
+export type MailCommitChange = { op: "move"; ids: string[]; destination: string };
+
+/** What a mail commit produced, with the names its answer needs. */
+export interface MailCommitApplied {
+  outcome: MoveOutcome;
+  /** The destination folder id the confirmation sealed. */
+  destinationId: string;
+  sourceMailbox: string;
+  destinationMailbox: string;
+}
+
+/**
+ * Check a mail confirmation fully, claim its slot, and make one verb call.
+ *
+ * `applyCommit`'s order, one tree over: verify (seal, version, target, user,
+ * expiry); the signed kind and the supplied op; a destination; the change hash;
+ * the ids agreeing with the sealed list, position by position; then the
+ * reservation; then one call. Every refusal before the reservation is the one
+ * `ConfirmationInvalidError`, so none of them spends the slot and none of them
+ * says which check failed.
+ */
+export async function applyMailCommit(
+  actor: Principal,
+  gate: SessionGate,
+  confirmToken: string,
+  change: MailCommitChange,
+): Promise<MailCommitApplied> {
+  const payload = await verifyConfirmation(
+    confirmToken,
+    env.CONFIRM_SECRET,
+    actor.userId,
+    "mail",
+  );
+  if (payload.k !== "move" || change.op !== "move") {
+    throw new ConfirmationInvalidError();
+  }
+  if (payload.q === null) throw new ConfirmationInvalidError();
+
+  const normalized: NormalizedMailMove = {
+    op: change.op,
+    ids: [...change.ids],
+    destination: change.destination,
+  };
+  if (!(await changeHashMatches(await mailMoveChangeHashOf(normalized), payload.h))) {
+    throw new ConfirmationInvalidError();
+  }
+
+  let sourceMailbox: string;
+  let destinationMailbox: string;
+  try {
+    sourceMailbox = decodeFolderId(payload.m).mailbox;
+    destinationMailbox = decodeFolderId(payload.q).mailbox;
+  } catch {
+    throw new ConfirmationInvalidError();
+  }
+
+  if (change.ids.length !== payload.l.length) throw new ConfirmationInvalidError();
+  for (let index = 0; index < change.ids.length; index += 1) {
+    let ref: MessageRef;
+    try {
+      ref = decodeMessageId(change.ids[index]!);
+    } catch {
+      throw new ConfirmationInvalidError();
+    }
+    if (
+      ref.mailbox !== sourceMailbox ||
+      ref.uidValidity !== payload.uv ||
+      ref.uid !== payload.l[index]!.i
+    ) {
+      throw new ConfirmationInvalidError();
+    }
+  }
+
+  await reserveConfirmation(env.CONFIRM_KV, actor.userId, payload.j, payload.x);
+
+  const outcome = await moveMessages(
+    actor,
+    gate,
+    { mailbox: sourceMailbox, uidValidity: payload.uv },
+    payload.l.map((entry) => ({
+      uid: entry.i,
+      size: entry.z,
+      internalDate: entry.d,
+      modSeq: entry.n,
+    })),
+    destinationMailbox,
+  );
+  return { outcome, destinationId: payload.q, sourceMailbox, destinationMailbox };
+}
+
+/** The per-message tally a did-tense line is built from. */
+function tallyOf(results: readonly MessageMoveResult[]): {
+  moved: number;
+  copiedNotRemoved: number;
+  notCopied: number;
+  unknown: number;
+} {
+  const tally = { moved: 0, copiedNotRemoved: 0, notCopied: 0, unknown: 0 };
+  for (const result of results) {
+    if (result.outcome === "moved") tally.moved += 1;
+    else if (result.outcome === "copied_not_removed") tally.copiedNotRemoved += 1;
+    else if (result.outcome === "not_copied") tally.notCopied += 1;
+    else tally.unknown += 1;
+  }
+  return tally;
+}
+
+/**
+ * The mail commit's answer. Plain JSON; a refusal is not `isError`.
+ *
+ * Each result carries the caller's id at its position, what happened, why, and
+ * the copy's new id when the server's reply proved it. The new id is minted
+ * with the DESTINATION's validity from that reply, never the source's.
+ */
+function mailCommitResult(ids: readonly string[], applied: MailCommitApplied): ToolResult {
+  const { outcome } = applied;
+  if (!outcome.applied) {
+    const extra =
+      outcome.refusal === "changed-since-preview"
+        ? {
+            changedIds: ids.filter((id) =>
+              outcome.changedUids.includes(decodeMessageId(id).uid),
+            ),
+          }
+        : {};
+    return moveRefusalResult(outcome.refusal, extra);
+  }
+
+  const confirmationLine = composeConfirmationLine(
+    {
+      kind: "move",
+      noun: "message",
+      from: decodeModifiedUtf7(applied.sourceMailbox),
+      to: decodeModifiedUtf7(applied.destinationMailbox),
+      role: null,
+      count: outcome.results.length,
+      outcome: tallyOf(outcome.results),
+    },
+    "did",
+  );
+  const results = outcome.results.map((result, index) => ({
+    id: ids[index],
+    outcome: result.outcome,
+    reason: result.reason,
+    newId:
+      result.newUid !== null && result.destinationUidValidity !== null
+        ? encodeMessageId({
+            mailbox: applied.destinationMailbox,
+            uidValidity: result.destinationUidValidity,
+            uid: result.newUid,
+          })
+        : null,
+    destination: applied.destinationId,
+  }));
+  return {
+    content: [{ type: "text", text: JSON.stringify({ confirmationLine, results }) }],
+  };
+}
+
 /**
  * Register the mail tools on a per-request server instance.
  *
@@ -2754,6 +3189,117 @@ export function registerMailTools(
           ? await markRead(actor, gate, ref)
           : await markUnread(actor, gate, ref);
         return readStateToolResult(id, read, outcome);
+      } catch (err) {
+        return mailErrorResult(err);
+      }
+    },
+  );
+
+  /**
+   * Preview moving messages to another folder (TRIA-02, D-05).
+   *
+   * Ids only, as the user supplies them: message ids from a listing and a
+   * folder id from mail_list_folders. No search term, no body, no folder name
+   * and nothing else this server read can be the source of the set (TRIA-09).
+   * Writes nothing; `mail_commit` applies it.
+   */
+  server.registerTool(
+    "mail_move",
+    {
+      description:
+        "Preview moving emails to another folder. Writes nothing; apply with " +
+        `mail_commit. ${UNTRUSTED_NOTICE}`,
+      inputSchema: z.object({
+        ids: z
+          .array(z.string())
+          .min(1)
+          .describe(
+            `Message ids from a listing, all from one folder, at most ${MOVE_SET_CAP}.`,
+          ),
+        destination: z
+          .string()
+          .describe("The destination folder id from mail_list_folders."),
+      }),
+    },
+    async ({ ids, destination }) => {
+      try {
+        const actor = await principal;
+        // Every id and the destination decoded before any socket: a bad token
+        // is refused without spending a connection.
+        const refs = ids.map((id) => decodeMessageId(id));
+        const target = decodeFolderId(destination);
+
+        if (ids.length > MOVE_SET_CAP) {
+          return moveRefusalResult("too-many", { cap: MOVE_SET_CAP });
+        }
+        const keys = refs.map((ref) => JSON.stringify([ref.mailbox, ref.uidValidity, ref.uid]));
+        const repeated = ids.filter((_id, index) => keys.indexOf(keys[index]!) !== index);
+        if (repeated.length > 0) {
+          return moveRefusalResult("duplicate-ids", { ids: repeated });
+        }
+        const first = refs[0]!;
+        if (
+          refs.some(
+            (ref) => ref.mailbox !== first.mailbox || ref.uidValidity !== first.uidValidity,
+          )
+        ) {
+          return moveRefusalResult("mixed-folders");
+        }
+
+        return await withMailConfirmationBoundary(() =>
+          buildMovePreview(
+            actor,
+            gate,
+            { ids: [...ids], refs, destinationId: destination },
+            { kind: "folder", mailbox: target.mailbox },
+            "move",
+          ),
+        );
+      } catch (err) {
+        return mailErrorResult(err);
+      }
+    },
+  );
+
+  /**
+   * Apply a previewed mail change (D-05).
+   *
+   * A mail commit tool of its own, so a mail confirmation and a calendar or
+   * contact one can never be spent at each other's endpoint. The change is a
+   * union on `op`; today it has one arm.
+   */
+  server.registerTool(
+    "mail_commit",
+    {
+      description:
+        "Apply a mail_move preview. Pass its confirmToken and change back " +
+        `unaltered. ${UNTRUSTED_NOTICE}`,
+      inputSchema: z.object({
+        confirmToken: z
+          .string()
+          .describe(
+            "The confirmToken from the preview, unaltered. The user must have " +
+              "seen the preview's confirmationLine word for word. It can be " +
+              "spent once.",
+          ),
+        change: z
+          .discriminatedUnion("op", [
+            z.object({
+              op: z.literal("move"),
+              ids: z.array(z.string()),
+              destination: z.string(),
+            }),
+          ])
+          .describe("The change object from the preview, unaltered."),
+      }),
+    },
+    async ({ confirmToken, change }) => {
+      try {
+        const actor = await principal;
+        const applied = await withMailConfirmationBoundary(() =>
+          applyMailCommit(actor, gate, confirmToken, change),
+        );
+        return mailCommitResult(change.ids, applied);
       } catch (err) {
         return mailErrorResult(err);
       }

@@ -8,6 +8,10 @@
 // each, because growing the union twice would open a window in which a
 // category existed that nothing could raise.
 //
+// The classes below map to the categories. `MailConfirmationError` joined them
+// in Phase 21: the mail tree's translation of a refused confirmation, the twin
+// of `DavConfirmationError` in `src/dav/errors.ts`.
+//
 // ARCHITECTURE.md Q7 lists four that have NOT arrived (operation_rejected,
 // protocol_error, forbidden, service_unavailable); those arrive with the
 // phases that can actually produce them, on exactly the footing the two above
@@ -188,6 +192,28 @@ export class ImapNotFoundError extends Error {
 }
 
 /**
+ * Thrown when the confirmation supplied with a mail commit was not accepted.
+ *
+ * The mail tree's twin of `DavConfirmationError`, and here for the same
+ * contract. `src/confirm.ts` is protocol-neutral and throws its own
+ * `ConfirmationInvalidError`; the mail tools catch that at their own boundary
+ * and rethrow this, because `toErrorCategory` dispatches on TYPE and would
+ * otherwise report a refused confirmation as a failed connection, telling the
+ * model to retry something that will be refused the same way every time.
+ *
+ * Every cause answers the same way, and it takes no constructor argument, so
+ * there is nowhere for a cause to ride even by accident.
+ */
+export class MailConfirmationError extends Error {
+  readonly kind = "confirmation" as const;
+
+  constructor() {
+    super("mail-confirmation-rejected");
+    this.name = "MailConfirmationError";
+  }
+}
+
+/**
  * Fixed, human-readable text for each category, including retry guidance.
  *
  * These strings are the ONLY error prose that ever reaches a caller. They are
@@ -319,6 +345,7 @@ export function toErrorCategory(err: unknown): {
   else if (err instanceof ImapThrottleError) category = "rate_limited";
   else if (err instanceof ImapNotFoundError) category = "not_found";
   else if (err instanceof ImapConnectError) category = "connection_failed";
+  else if (err instanceof MailConfirmationError) category = "confirmation_invalid";
 
   return { category, message: SAFE_MESSAGES[category] };
 }

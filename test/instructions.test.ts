@@ -82,6 +82,7 @@ const EXPECTED_TOOLS: readonly string[] = [
   "contacts_search",
   "contacts_update",
   "dav_diagnose",
+  "mail_commit",
   "mail_compose_new",
   "mail_compose_reply",
   "mail_confirm_upload",
@@ -92,6 +93,7 @@ const EXPECTED_TOOLS: readonly string[] = [
   "mail_list_messages",
   "mail_list_unread",
   "mail_mark_read",
+  "mail_move",
   "mail_search",
   "mail_stage_attachment",
 ];

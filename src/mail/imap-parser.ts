@@ -5,6 +5,12 @@
 // sequences with nothing attached to it. Plan 01-03 writes those tests, and
 // Phase 2 extends this module with byte-counted literal handling rather than
 // rewriting it.
+//
+// The one import is the identifier layer's wire-number bound. It is a pure
+// predicate, and sharing it is what keeps "a number that can name a message"
+// defined in one place rather than two.
+
+import { isWireNumber } from "./ids";
 
 /**
  * One logical IMAP response, with its literal payloads lifted out.
@@ -1244,4 +1250,243 @@ export function indicatesCredentialRefusal(line: string): boolean {
   // line is a second fence rather than the only one — but the two functions
   // must not be able to disagree about the same reply.
   return !indicatesConnectionLimit(line);
+}
+
+// ---------------------------------------------------------------------------
+// Moving a message (Phase 21)
+//
+// Four pure readers for the move step in `./triage.ts` and the preview read in
+// `./service.ts`: the items that identify one message well enough to tell it
+// has changed, the reader for those items, the proof a copy landed, and the
+// list of messages a conditional flag change did not touch.
+// ---------------------------------------------------------------------------
+
+/**
+ * The fetch items that fingerprint one message, and nothing else.
+ *
+ * UID, flags, size, internal date and MODSEQ. No body item of any kind, so this
+ * list is safe on a mailbox opened read-only and on one opened for changing
+ * alike: nothing here can set the seen flag. RFC 7162 §3.1 makes a fetch that
+ * names MODSEQ a CONDSTORE-enabling command, so no separate enable is sent.
+ */
+export const FINGERPRINT_ITEMS = "(UID FLAGS RFC822.SIZE INTERNALDATE MODSEQ)";
+
+/** What `FINGERPRINT_ITEMS` says about one message. */
+export interface Fingerprint {
+  /** The UID, from the reply's own UID item. */
+  uid: number;
+  /** The flag list, verbatim. */
+  flags: string[];
+  /** RFC822.SIZE, in octets. */
+  size: number;
+  /** INTERNALDATE, as whole seconds since the epoch. */
+  internalDate: number;
+  /**
+   * The message's mod-sequence, as the digits the server sent.
+   *
+   * Never a number: RFC 7162 permits 63 bits, and a JS number holds 53 exactly.
+   * `MailConfirmPayload`'s `n` field carries the same argument.
+   */
+  modSeq: string;
+}
+
+/** The twelve month names RFC 3501's `date-month` allows, in order. */
+const DATE_MONTHS = [
+  "jan", "feb", "mar", "apr", "may", "jun",
+  "jul", "aug", "sep", "oct", "nov", "dec",
+];
+
+/**
+ * RFC 3501 §9 `date-time`: `"dd-Mon-yyyy hh:mm:ss +zzzz"`, quotes already gone.
+ *
+ * `date-day-fixed` lets the day be a space and one digit, so that form is
+ * accepted too.
+ */
+const DATE_TIME =
+  /^( ?\d|\d{2})-([A-Za-z]{3})-(\d{4}) (\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$/;
+
+/**
+ * An internal date as whole seconds since the epoch, or `null`.
+ *
+ * Every part is range-checked, and a day that does not exist in its month is
+ * refused rather than rolled into the next one. A fingerprint built from a date
+ * this server could not read would compare equal to nothing, or to the wrong
+ * thing.
+ */
+function internalDateSeconds(value: string): number | null {
+  const match = DATE_TIME.exec(value);
+  if (match === null) return null;
+  const day = Number(match[1].trim());
+  const month = DATE_MONTHS.indexOf(match[2].toLowerCase());
+  const year = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const zoneHours = Number(match[8]);
+  const zoneMinutes = Number(match[9]);
+  if (month < 0 || day < 1 || hour > 23 || minute > 59 || second > 60) return null;
+  if (zoneMinutes > 59) return null;
+
+  const local = Date.UTC(year, month, day, hour, minute, second);
+  if (new Date(local).getUTCDate() !== day) return null;
+
+  const offset = (zoneHours * 60 + zoneMinutes) * 60_000;
+  const utc = match[7] === "+" ? local - offset : local + offset;
+  return Math.floor(utc / 1000);
+}
+
+/** One mod-sequence as digits: 1 to 19 of them, no leading zero, 63 bits. */
+function modSeqOf(value: SExpr | undefined): string | null {
+  if (!Array.isArray(value) || value.length !== 1) return null;
+  const digits = value[0];
+  if (typeof digits !== "string") return null;
+  if (!/^[1-9]\d{0,18}$/.test(digits)) return null;
+  return BigInt(digits) <= MAX_MODSEQ ? digits : null;
+}
+
+/**
+ * The fingerprint the reply for one UID carries, or `null`.
+ *
+ * Reads the untagged FETCH replies a command produced and pairs each one's
+ * items. It matches on the reply's OWN UID item, never on its position or its
+ * sequence number, for the reason `seenStateOf` gives. When several replies
+ * name the UID, the LAST one carrying all five items wins: an unsolicited
+ * update can arrive first, and the server's final word is the last one.
+ *
+ * `null` when no reply for the UID carries all five items, or when any of them
+ * does not parse: a size outside the wire-number bound, an unreadable date, or
+ * a MODSEQ that is not 1 to 19 digits (RFC 7162 §3.1.1, `mod-sequence-value`).
+ */
+export function parseFingerprint(
+  untagged: readonly ResponseLine[],
+  uid: number,
+): Fingerprint | null {
+  let found: Fingerprint | null = null;
+  for (const line of untagged) {
+    const parsed = parseSExpr(line);
+    if (parsed[0] !== "*") continue;
+    if (typeof parsed[2] !== "string" || parsed[2].toUpperCase() !== "FETCH") {
+      continue;
+    }
+    const list = parsed[3];
+    if (!Array.isArray(list)) continue;
+
+    const items = new Map<string, SExpr>();
+    for (let index = 0; index + 1 < list.length; index += 2) {
+      const key = list[index];
+      if (typeof key === "string") items.set(key.toUpperCase(), list[index + 1]);
+    }
+    if (items.get("UID") !== String(uid)) continue;
+
+    const flags = items.get("FLAGS");
+    const size = items.get("RFC822.SIZE");
+    const date = items.get("INTERNALDATE");
+    const modSeq = modSeqOf(items.get("MODSEQ"));
+    if (!Array.isArray(flags) || !flags.every((flag) => typeof flag === "string")) {
+      continue;
+    }
+    if (typeof size !== "string" || !/^\d+$/.test(size)) continue;
+    const octets = Number(size);
+    if (!isWireNumber(octets)) continue;
+    if (typeof date !== "string") continue;
+    const internalDate = internalDateSeconds(date);
+    if (internalDate === null || modSeq === null) continue;
+
+    found = {
+      uid,
+      flags: flags as string[],
+      size: octets,
+      internalDate,
+      modSeq,
+    };
+  }
+  return found;
+}
+
+/** The most UIDs one set is expanded to. More than a move list ever names. */
+const MAX_SET_UIDS = 100;
+
+/**
+ * Expand an RFC 4315 `uid-set` into its UIDs, in order, or `null`.
+ *
+ * Comma-separated numbers and ranges. A range is inclusive and either way round
+ * ("2:4 and 4:2 are equivalent", RFC 4315 §4). Every number must be a non-zero
+ * wire number. More than `MAX_SET_UIDS` in total is `null`, so a hostile reply
+ * cannot make this allocate without bound.
+ */
+function expandUidSet(set: string): number[] | null {
+  const uids: number[] = [];
+  for (const part of set.split(",")) {
+    const range = /^(\d+)(?::(\d+))?$/.exec(part);
+    if (range === null) return null;
+    const first = Number(range[1]);
+    const last = range[2] === undefined ? first : Number(range[2]);
+    if (!isWireNumber(first) || !isWireNumber(last) || first === 0 || last === 0) {
+      return null;
+    }
+    const low = Math.min(first, last);
+    const high = Math.max(first, last);
+    if (uids.length + (high - low + 1) > MAX_SET_UIDS) return null;
+    for (let uid = low; uid <= high; uid += 1) uids.push(uid);
+  }
+  return uids;
+}
+
+/**
+ * The proof a copy landed, read off the copy's tagged completion, or `null`.
+ *
+ * RFC 4315 §3: "COPYUID: Followed by the UIDVALIDITY of the destination
+ * mailbox, a UID set containing the UIDs of the message(s) in the source
+ * mailbox that were copied to the destination mailbox and containing the UIDs
+ * assigned to the copied message(s) in the destination mailbox". So the FIRST
+ * field is the DESTINATION's validity. PITFALLS #31's bullet has it backwards,
+ * and a fixture where the two validities are equal passes either reading.
+ *
+ * The code must sit immediately after an OK. A NO, a BAD, an untagged line and
+ * any other code are `null`. So is a set that does not parse, a zero, a number
+ * outside the wire bound, and a source set whose length differs from the
+ * destination's: the two sets correspond position by position (§3), and a
+ * mismatch proves nothing about any one message.
+ *
+ * `null` is an ordinary answer. RFC 4315 lets a server leave the code out for a
+ * mailbox whose UIDs are not sticky, and the copy still happened.
+ */
+export function parseCopyUid(
+  taggedText: string,
+): { uidValidity: number; source: number[]; destination: number[] } | null {
+  const parsed = parseTaggedResponse(taggedText);
+  if (parsed === null || parsed.status !== "OK") return null;
+  const match = /^\[COPYUID (\d+) ([\d:,]+) ([\d:,]+)\]/i.exec(parsed.text);
+  if (match === null) return null;
+
+  const uidValidity = Number(match[1]);
+  if (!isWireNumber(uidValidity) || uidValidity === 0) return null;
+  const source = expandUidSet(match[2]);
+  const destination = expandUidSet(match[3]);
+  if (source === null || destination === null) return null;
+  if (source.length !== destination.length) return null;
+
+  return { uidValidity, source, destination };
+}
+
+/**
+ * The UIDs a conditional flag change did NOT change, or `null` when the reply
+ * carries no such list.
+ *
+ * RFC 7162 §3.1.3: a message whose mod-sequence moved past the one the request
+ * named is left alone, and its UID comes back in `[MODIFIED <set>]` on the
+ * tagged reply. That reply can be OK: "d105 OK [MODIFIED 7,9] Conditional STORE
+ * failed". So an OK alone does not mean the flag was set.
+ *
+ * Read after an OK or a NO. A MODIFIED code whose set does not parse is an
+ * empty list, never `null`: the server said something was not changed, and
+ * reading that as "nothing to report" would treat an unchanged message as
+ * changed.
+ */
+export function parseModifiedUids(taggedText: string): number[] | null {
+  const parsed = parseTaggedResponse(taggedText);
+  if (parsed === null || parsed.status === "BAD") return null;
+  const match = /^\[MODIFIED ([^\]]*)\]/i.exec(parsed.text);
+  if (match === null) return null;
+  return expandUidSet(match[1].trim()) ?? [];
 }
