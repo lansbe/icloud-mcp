@@ -2616,8 +2616,8 @@ function walk(absoluteDir, collected = []) {
  * the middle of a line may sit inside a string or a regex literal, and reading
  * one of those as a comment would blank real code. So a comment trailing code
  * is kept, and so is a block comment opened after code. Used by the two
- * mutating-path counts, the three move-step counts and the namespace-read
- * count only.
+ * mutating-path counts, the three move-step counts, the namespace-read
+ * count and the Durable Object config checks only.
  *
  * @param {string} text
  * @returns {string}
@@ -3738,6 +3738,102 @@ export function checkCommitHook(hookPath = ".husky/pre-commit") {
 }
 
 /**
+ * The Durable Object lifecycle checks, over one config file's text (Phase 24,
+ * D-10 f, DOBJ-06).
+ *
+ * The per-person object's storage backend is chosen once. Once the namespace
+ * exists, the choice cannot be changed without deleting every object's data,
+ * and after the first deploy with the lifecycle field a rollback to an earlier
+ * version is refused. So the wrong value is not a bug a later commit can fix.
+ * These checks make the recorded choice something a commit cannot silently
+ * contradict or delete.
+ *
+ * Three violations:
+ *
+ *   - `do-exports-and-migrations`: both lifecycle keys, the declarative
+ *     exports block and the legacy migrations array, in one file.
+ *   - `do-storage-not-sqlite`: a `"storage"` value other than the string
+ *     `"sqlite"`, or the legacy key-value class-list key anywhere (it only
+ *     means something inside a migration, and it makes a key-value-backed
+ *     class).
+ *   - `do-backend-reason-missing`: an exports block with no line that reads,
+ *     once trimmed, exactly `// STORAGE BACKEND: sqlite`. Trimmed because the
+ *     marker is indented like every other top-level comment in the file.
+ *
+ * The structural checks read the text with comment lines blanked
+ * (`withoutCommentLines`), so a key or value that appears only in the prose
+ * beside the block fires nothing. The marker check reads the raw text, because
+ * the marker IS a comment. Positions are unchanged by the blanking.
+ *
+ * Pure and exported so the tests can drive each violation from inline text,
+ * firing and not firing, without a fixture file on disk.
+ *
+ * @param {string} file  repo-relative path, reported in each violation
+ * @param {string} text  the config file's contents
+ */
+export function checkDurableObjectConfig(file, text) {
+  const violations = [];
+  const code = withoutCommentLines(text);
+  const at = (index, pattern, why) => ({
+    file,
+    ...positionOf(code, index),
+    pattern,
+    patternIndex: 2,
+    why,
+  });
+
+  const exportsIndex = code.search(/"exports"\s*:/);
+  const migrationsIndex = code.search(/"migrations"\s*:/);
+  if (exportsIndex !== -1 && migrationsIndex !== -1) {
+    violations.push(
+      at(
+        migrationsIndex,
+        "do-exports-and-migrations",
+        "The Worker config holds both Durable Object lifecycle fields: the declarative exports block and the legacy migrations array. Cloudflare rejects a config with both, and the two are one-or-the-other for the life of the Worker: a Worker that has deployed with exports cannot go back to the array. Keep the exports block and delete the migrations array. The reason is recorded beside the block under the STORAGE BACKEND marker.",
+      ),
+    );
+  }
+
+  // The whitespace after the colon sits INSIDE the lookahead. Outside it, the
+  // engine backtracks that whitespace to zero and fires on the correct value.
+  for (const match of code.matchAll(/"storage"\s*:(?!\s*"sqlite"\s*[,}\n])/g)) {
+    violations.push(
+      at(
+        match.index,
+        "do-storage-not-sqlite",
+        "A Durable Object storage value other than \"sqlite\". The key-value storage backend is closed to new namespaces on this account and every account, and the object uses storage calls that exist only on SQLite. The storage type is immutable once the namespace exists: the only way to change it later is to delete the namespace, which destroys every object's data with no trash. So a wrong value here is not fixable by a later commit. Set it back to \"sqlite\". Changing it is a decision, not a refactor.",
+      ),
+    );
+  }
+  for (const match of code.matchAll(/"new_classes"\s*:/g)) {
+    violations.push(
+      at(
+        match.index,
+        "do-storage-not-sqlite",
+        "A legacy Durable Object migration that creates a key-value-backed class. The key-value storage backend is closed to new namespaces on this account and every account, and the storage type is immutable once the namespace exists: the only way to change it later is to delete the namespace and every object's data with it. This project declares its object through the exports block with SQLite storage, and a legacy migrations array beside that block is refused as well. Delete the migration.",
+      ),
+    );
+  }
+
+  if (exportsIndex !== -1) {
+    const hasMarker = text
+      .split("\n")
+      .some((line) => line.trim() === "// STORAGE BACKEND: sqlite");
+    if (!hasMarker) {
+      violations.push(
+        at(
+          exportsIndex,
+          "do-backend-reason-missing",
+          "The Worker config has a Durable Object exports block but no line reading \"// STORAGE BACKEND: sqlite\". DOBJ-06: the storage backend is immutable once the namespace exists, and a rollback past the first deploy with this block is refused, so the reason for the choice must sit beside it where the next person to edit the block will read it. Deleting that comment must not be silent. Restore the marker line and the reason under it; wrangler.jsonc.example carries the full text.",
+        ),
+      );
+    }
+  }
+
+  return violations;
+}
+
+/**
  * Configuration checks the deploy tooling cannot make for us.
  *
  * Wave 1 established that `wrangler deploy --dry-run` does not validate inside a
@@ -3776,6 +3872,9 @@ export function scanWranglerConfig(
   for (const path of configPaths) {
     const config = readOrNull(path);
     if (config === null) continue;
+
+    // The Durable Object lifecycle checks (phase 24, DOBJ-06), over both files.
+    violations.push(...checkDurableObjectConfig(path, config));
 
     const index = config.search(/simultaneousConnections/);
     if (index !== -1) {

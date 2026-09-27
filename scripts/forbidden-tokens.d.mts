@@ -57,6 +57,8 @@ export declare function scanWranglerConfig(
   hostnameSourcePath?: string,
 ): Violation[];
 export declare function formatViolation(violation: Violation): string;
+/** The Durable Object lifecycle checks over one config file's text (DOBJ-06). */
+export declare function checkDurableObjectConfig(file: string, text: string): Violation[];
 
 /**
  * Exported so a scope test can drive the real prefix mechanism. A test that

@@ -73,6 +73,7 @@ import {
   checkAddressHashOwnership,
   checkAppendOwnership,
   checkCommitHook,
+  checkDurableObjectConfig,
   checkConfirmLineOwnership,
   checkCopySiteOwnership,
   checkDavFetchOwnership,
@@ -759,6 +760,7 @@ const RAW_SOURCES: Record<string, string> = import.meta.glob(
     "../src/index.ts",
     "../src/mcp/server.ts",
     "../scripts/forbidden-tokens.mjs",
+    "../wrangler.jsonc.example",
   ],
   { query: "?raw", import: "default", eager: true },
 );
@@ -2654,6 +2656,165 @@ describe("the current tree", () => {
       "test/fixtures/hostname-hardcoded-sample.ts",
     );
     expect(violations.map((v) => v.pattern)).toEqual(["hostname-hardcoded"]);
+  });
+});
+
+// Phase 24, D-10 (f), DOBJ-06. The per-person object's lifecycle is chosen once
+// and cannot be undone after deploy, so the recorded choice and its reason are
+// checked on every commit, over both config files.
+describe("the Durable Object config checks (Phase 24, DOBJ-06)", () => {
+  const MARKER = "  // STORAGE BACKEND: sqlite";
+  const BINDING = '  "durable_objects": { "bindings": [{ "name": "USER_AGENT", "class_name": "UserAgent" }] },';
+  const EXPORTS_SQLITE = '  "exports": {\n    "UserAgent": { "type": "durable-object", "storage": "sqlite" }\n  },';
+  const config = (...lines: string[]) => `{\n${lines.join("\n")}\n  "name": "x"\n}\n`;
+  const ids = (text: string) =>
+    checkDurableObjectConfig("wrangler.jsonc", text).map((v) => v.pattern);
+
+  it("passes the shape both real files carry: the marker, the binding and sqlite exports", () => {
+    expect(ids(config(MARKER, BINDING, EXPORTS_SQLITE))).toEqual([]);
+  });
+
+  it("passes a config with no Durable Object at all, which needs no marker", () => {
+    expect(ids(config('  "main": "src/index.ts",'))).toEqual([]);
+  });
+
+  it("refuses both lifecycle fields in one file", () => {
+    const text = config(
+      MARKER,
+      BINDING,
+      EXPORTS_SQLITE,
+      '  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UserAgent"] }],',
+    );
+    expect(ids(text)).toEqual(["do-exports-and-migrations"]);
+  });
+
+  it("refuses a storage value other than sqlite", () => {
+    for (const value of ['"legacy-kv"', '"kv"', '"SQLite"', '"sqlite-v2"', "null", '""']) {
+      const text = config(
+        MARKER,
+        BINDING,
+        `  "exports": {\n    "UserAgent": { "type": "durable-object", "storage": ${value} }\n  },`,
+      );
+      expect(ids(text), value).toEqual(["do-storage-not-sqlite"]);
+    }
+  });
+
+  it("accepts sqlite however it is spaced", () => {
+    for (const shape of [
+      '"storage":"sqlite"}',
+      '"storage" :  "sqlite" }',
+      '"storage": "sqlite",\n      "type": "durable-object" }',
+      '"storage": "sqlite"\n    }',
+    ]) {
+      const text = config(MARKER, `  "exports": { "UserAgent": { ${shape} },`);
+      expect(ids(text), shape).toEqual([]);
+    }
+  });
+
+  it("refuses a legacy migration that creates a key-value-backed class", () => {
+    const text = config(
+      BINDING,
+      '  "migrations": [{ "tag": "v1", "new_classes": ["UserAgent"] }],',
+    );
+    expect(ids(text)).toEqual(["do-storage-not-sqlite"]);
+    // The SQLite form of the same migration is not a storage violation. It is
+    // still refused beside an exports block, by the lifecycle check above.
+    expect(
+      ids(config(BINDING, '  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UserAgent"] }],')),
+    ).toEqual([]);
+  });
+
+  it("refuses an exports block with no marker line", () => {
+    expect(ids(config(BINDING, EXPORTS_SQLITE))).toEqual(["do-backend-reason-missing"]);
+    // A marker that says something else, or sits inside a longer line, is not
+    // the marker.
+    for (const near of [
+      "  // STORAGE BACKEND: kv",
+      "  // STORAGE BACKEND: sqlite (see below)",
+      "  // storage backend: sqlite",
+      '  "note": "// STORAGE BACKEND: sqlite",',
+    ]) {
+      expect(ids(config(near, BINDING, EXPORTS_SQLITE)), near).toEqual([
+        "do-backend-reason-missing",
+      ]);
+    }
+  });
+
+  it("accepts the marker at any indentation, because the check trims the line", () => {
+    for (const marker of ["// STORAGE BACKEND: sqlite", "    // STORAGE BACKEND: sqlite  ", "\t// STORAGE BACKEND: sqlite"]) {
+      expect(ids(config(marker, BINDING, EXPORTS_SQLITE)), JSON.stringify(marker)).toEqual([]);
+    }
+  });
+
+  it("fires none of the three on keys and values that appear only in comments", () => {
+    const prose = [
+      MARKER,
+      '  // Why `"exports"` and no legacy `"migrations": [...]` array.',
+      '  // Never write "storage": "legacy-kv", and never write "new_classes": [...].',
+      "  /*",
+      '   "migrations": [{ "tag": "v1", "new_classes": ["UserAgent"] }],',
+      '   "storage": "kv"',
+      "  */",
+    ];
+    expect(ids(config(...prose, BINDING, EXPORTS_SQLITE))).toEqual([]);
+    // And with no real exports block, commented keys do not demand the marker.
+    expect(ids(config('  // "exports": { "UserAgent": { "storage": "sqlite" } },'))).toEqual([]);
+  });
+
+  it("reports the line of the offending key", () => {
+    const text = config(MARKER, BINDING, EXPORTS_SQLITE.replace('"sqlite"', '"legacy-kv"'));
+    const [violation] = checkDurableObjectConfig("wrangler.jsonc.example", text);
+    expect(violation!.file).toBe("wrangler.jsonc.example");
+    expect(text.split("\n")[violation!.line - 1]).toContain('"storage"');
+  });
+
+  it("gives each violation a reason longer than a label", () => {
+    const all = [
+      ...checkDurableObjectConfig("x", config(MARKER, BINDING, EXPORTS_SQLITE, '  "migrations": [],')),
+      ...checkDurableObjectConfig("x", config(BINDING, EXPORTS_SQLITE.replace('"sqlite"', '"kv"'))),
+      ...checkDurableObjectConfig("x", config('  "migrations": [{ "new_classes": ["A"] }],')),
+    ];
+    expect(new Set(all.map((v) => v.pattern))).toEqual(
+      new Set(["do-exports-and-migrations", "do-storage-not-sqlite", "do-backend-reason-missing"]),
+    );
+    for (const violation of all) {
+      expect(violation.why.length, violation.pattern).toBeGreaterThan(80);
+    }
+  });
+
+  it("passes the tracked template, and the template's marker is what keeps it passing", () => {
+    const template = rawSourceOf("wrangler.jsonc.example");
+    expect(template).toMatch(/"exports"\s*:/);
+    expect(template).toContain('"storage": "sqlite"');
+    expect(checkDurableObjectConfig("wrangler.jsonc.example", template)).toEqual([]);
+    // Delete the marker line and the same text fails, so the check is not
+    // vacuous on the real file.
+    const withoutMarker = template
+      .split("\n")
+      .filter((line) => line.trim() !== "// STORAGE BACKEND: sqlite")
+      .join("\n");
+    expect(withoutMarker).not.toBe(template);
+    expect(
+      checkDurableObjectConfig("wrangler.jsonc.example", withoutMarker).map((v) => v.pattern),
+    ).toEqual(["do-backend-reason-missing"]);
+  });
+
+  it("is wired into scanWranglerConfig: a known-violating file fires all three", () => {
+    // Without this, scanWranglerConfig could stop calling the check and every
+    // case above would stay green, because they call it directly.
+    const violations = scanWranglerConfig("test/fixtures/durable-object-config-sample.jsonc");
+    expect(violations.map((v) => v.pattern).sort()).toEqual([
+      "do-backend-reason-missing",
+      "do-exports-and-migrations",
+      "do-storage-not-sqlite",
+    ]);
+  });
+
+  it("runs over both config files through scanWranglerConfig, and both pass", () => {
+    // The real config is git-ignored; when present it is checked too.
+    expect(scanWranglerConfig("wrangler.jsonc.example").map(formatViolation)).toEqual([]);
+    expect(scanWranglerConfig("wrangler.jsonc").map(formatViolation)).toEqual([]);
+    expect(scanWranglerConfig().map(formatViolation)).toEqual([]);
   });
 });
 
