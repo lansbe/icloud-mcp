@@ -497,6 +497,38 @@ describe("the mutating path refuses and reports honestly", () => {
     ]);
   });
 
+  it("reports the LAST reply for the message when an earlier one disagrees (WR-02)", async () => {
+    // Another device's unsolicited flag update lands first and says unseen.
+    // The flag change's own echo comes after it and says seen. The last word
+    // is the server's answer.
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      wire(
+        `* 17 FETCH (UID ${UID} FLAGS (\\Flagged))`,
+        `* 17 FETCH (UID ${UID} FLAGS (\\Flagged \\Seen))`,
+        "a5 OK STORE completed",
+      ),
+      logoutExchange("a6"),
+    ]);
+
+    const outcome = await markReadOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      REF,
+      FAST_BOUNDS,
+    );
+
+    expect(outcome).toEqual({ applied: true, seen: true, source: "store-echo" });
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      `a5 UID STORE ${UID} +FLAGS (\\Seen)`,
+      "a6 LOGOUT",
+    ]);
+  });
+
   it("reports the echo when it disagrees with the request (PITFALLS #33)", async () => {
     // Asked read; the server's own reply says the flag is not set. The answer
     // is the server's word, never the request echoed back.

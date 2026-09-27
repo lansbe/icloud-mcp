@@ -1100,6 +1100,34 @@ describe("seenStateOf", () => {
     expect(seenStateOf(untagged, 4)).toBeNull();
   });
 
+  it("takes the LAST reply for the UID when there are several (WR-02)", async () => {
+    // An unsolicited flag update from another device can arrive before the
+    // command's own reply. The server's final word is the last one, both ways.
+    const seenLast = await untaggedFrom(
+      "* 4 FETCH (UID 11 FLAGS ())",
+      "* 4 FETCH (UID 11 FLAGS (\\Seen))",
+    );
+    const unseenLast = await untaggedFrom(
+      "* 4 FETCH (UID 11 FLAGS (\\Seen))",
+      "* 7 FETCH (UID 12 FLAGS (\\Seen))",
+      "* 4 FETCH (UID 11 FLAGS (\\Flagged))",
+    );
+
+    expect(seenStateOf(seenLast, 11)).toBe(true);
+    expect(seenStateOf(unseenLast, 11)).toBe(false);
+  });
+
+  it("keeps an earlier flag list when a later reply for the UID carries none", async () => {
+    // A later reply with no flag list says nothing about the flag, so it
+    // cannot replace a reply that did.
+    const untagged = await untaggedFrom(
+      "* 4 FETCH (UID 11 FLAGS (\\Seen))",
+      "* 4 FETCH (UID 11 MODSEQ (124))",
+    );
+
+    expect(seenStateOf(untagged, 11)).toBe(true);
+  });
+
   it("is null when the matching reply carries no flag list", async () => {
     const untagged = await untaggedFrom("* 4 FETCH (UID 11 MODSEQ (123))");
 

@@ -325,6 +325,11 @@ export function parseAccessCode(
  * then be about the wrong one while looking right. `fetchReplies` in
  * `./service.ts` records the same rule for the read path.
  *
+ * When more than one reply names this UID, the LAST one wins. One command can
+ * carry several: an unsolicited flag update (another device changed the
+ * message) can arrive before the command's own reply. The server's final word
+ * is the last one it sent, so an earlier one is stale.
+ *
  * The seen flag is compared without regard to case. `null` means no reply for
  * this UID carried a flag list, which is how a message that no longer exists
  * shows up: the server answers OK and sends nothing about it.
@@ -335,6 +340,7 @@ export function seenStateOf(
   untagged: readonly ResponseLine[],
   uid: number,
 ): boolean | null {
+  let seen: boolean | null = null;
   for (const line of untagged) {
     const parsed = parseSExpr(line);
     if (parsed[0] !== "*") continue;
@@ -359,11 +365,12 @@ export function seenStateOf(
     if (Number(replyUid) !== uid) continue;
     if (!Array.isArray(flags)) continue;
 
-    return flags.some(
+    // Keep going: a later reply for the same UID replaces this one.
+    seen = flags.some(
       (flag) => typeof flag === "string" && flag.toLowerCase() === "\\seen",
     );
   }
-  return null;
+  return seen;
 }
 
 /**
