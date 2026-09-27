@@ -906,6 +906,32 @@ describe("every way a move can end", () => {
     expect(outcome).toEqual({ applied: false, refusal: "removal-not-kept" });
   });
 
+  it("a permanent-flags list with the removal mark but not the seen flag: goes on and moves (D-08)", async () => {
+    // Before 21-04 the orchestrator refused any open without the seen flag.
+    // A move needs only the removal mark, so it now goes on.
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]", 172, INBOX_UIDVALIDITY, "\\Deleted"),
+      fingerprintReply("a5", [ONE]),
+      ...fullMoveReplies(6, ONE, 88),
+      logoutExchange("a10"),
+    ]);
+
+    const outcome = await runMove(duplex, [ONE]);
+
+    expect(wireOf(duplex)).toEqual([
+      ...openAndCheckLines([ONE]),
+      ...fullMoveLines(6, ONE),
+      "a10 LOGOUT",
+    ]);
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "moved", reason: "verified-gone", newUid: 88, destinationUidValidity: RECEIPTS_UIDVALIDITY },
+      ],
+    });
+  });
+
   it.each([
     ["UIDPLUS", POST_AUTH_CAPABILITY.replace(" UIDPLUS", "")],
     ["CONDSTORE", POST_AUTH_CAPABILITY.replace(" CONDSTORE", "")],

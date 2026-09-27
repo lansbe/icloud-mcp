@@ -38,6 +38,8 @@ import {
   parseTaggedResponse,
   resolveFolderRole,
   seenStateOf,
+  flagStateOf,
+  keepsFlag,
 } from "../src/mail/imap-parser";
 import { ImapChannel, readUntilTag } from "../src/mail/imap-session";
 import { createFakeDuplex } from "./fixtures/fake-duplex";
@@ -1311,3 +1313,77 @@ describe("parseFingerprint", () => {
   });
 });
 
+
+describe("keepsFlag (D-08)", () => {
+  const FLAGS = ["\\Seen", "\\Flagged", "\\Deleted"] as const;
+
+  it("is true for every flag when the open sent no list (RFC 3501 §6.3.1)", () => {
+    for (const flag of FLAGS) expect(keepsFlag(null, flag), flag).toBe(true);
+  });
+
+  it("is false for every flag on an empty list", () => {
+    for (const flag of FLAGS) expect(keepsFlag([], flag), flag).toBe(false);
+  });
+
+  it.each(FLAGS)("finds %s when present, in any case, and not when absent", (flag) => {
+    const others = FLAGS.filter((one) => one !== flag);
+    expect(keepsFlag([flag], flag)).toBe(true);
+    expect(keepsFlag(["\\Answered", flag.toUpperCase()], flag)).toBe(true);
+    expect(keepsFlag([flag.toLowerCase()], flag)).toBe(true);
+    expect(keepsFlag(others, flag)).toBe(false);
+  });
+
+  it.each(FLAGS)("does not count \\* alone for %s: it is about keywords", (flag) => {
+    expect(keepsFlag(["\\*"], flag)).toBe(false);
+  });
+});
+
+describe("flagStateOf", () => {
+  it("finds the reply whose own UID matches, among several", async () => {
+    const untagged = await untaggedFrom(
+      "* 3 FETCH (UID 10 FLAGS (\\Seen))",
+      "* 4 FETCH (UID 11 FLAGS (\\Flagged))",
+      "* 5 FETCH (UID 12 FLAGS ())",
+    );
+
+    expect(flagStateOf(untagged, 11, "\\Flagged")).toBe(true);
+    expect(flagStateOf(untagged, 10, "\\Flagged")).toBe(false);
+    expect(flagStateOf(untagged, 12, "\\Flagged")).toBe(false);
+    expect(flagStateOf(untagged, 10, "\\Seen")).toBe(true);
+  });
+
+  it("lets the last reply for the UID win", async () => {
+    const flaggedLast = await untaggedFrom(
+      "* 4 FETCH (UID 11 FLAGS ())",
+      "* 4 FETCH (UID 11 FLAGS (\\flagged))",
+    );
+    const clearedLast = await untaggedFrom(
+      "* 4 FETCH (UID 11 FLAGS (\\Flagged))",
+      "* 4 FETCH (UID 11 FLAGS ())",
+    );
+
+    expect(flagStateOf(flaggedLast, 11, "\\Flagged")).toBe(true);
+    expect(flagStateOf(clearedLast, 11, "\\Flagged")).toBe(false);
+  });
+
+  it("keys on the UID item, never on the sequence-number prefix", async () => {
+    const untagged = await untaggedFrom("* 11 FETCH (UID 40 FLAGS (\\Flagged))");
+
+    expect(flagStateOf(untagged, 11, "\\Flagged")).toBeNull();
+    expect(flagStateOf(untagged, 40, "\\Flagged")).toBe(true);
+  });
+
+  it("is null when no reply for the UID carries a flag list", async () => {
+    const untagged = await untaggedFrom("* 4 FETCH (UID 11 RFC822.SIZE 100)");
+
+    expect(flagStateOf(untagged, 11, "\\Flagged")).toBeNull();
+    expect(flagStateOf([], 11, "\\Flagged")).toBeNull();
+  });
+
+  it("does not read the other flag as this one", async () => {
+    const untagged = await untaggedFrom("* 4 FETCH (UID 11 FLAGS (\\Seen))");
+
+    expect(flagStateOf(untagged, 11, "\\Flagged")).toBe(false);
+    expect(flagStateOf(untagged, 11, "\\Seen")).toBe(true);
+  });
+});
