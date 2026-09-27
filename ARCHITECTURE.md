@@ -120,7 +120,7 @@ person's derived id.
 | `server.ts` | Per-request server factory; session gate + DAV fetch; all tool registrations. |
 | `untrusted.ts` | The untrusted-content fence (notice + nonce + trusted/untrusted split). |
 | `tools/diagnose.ts` | `mail_imap_diagnose`. |
-| `tools/mail.ts` | The 11 mail tools and their response shapers. |
+| `tools/mail.ts` | The 16 mail tools and their response shapers. |
 | `tools/dav-diagnose.ts` | `dav_diagnose`. |
 | `tools/calendar.ts` | The 9 calendar tools; preview/commit logic. |
 | `tools/contacts.ts` | The 2 contact tools. |
@@ -131,7 +131,7 @@ person's derived id.
 |------|------|
 | `socket.ts` | **The only module that may open a TCP socket.** `connectImap()` takes no parameters. |
 | `service.ts` | **The two session orchestrators** over one private core: read (`withMailSession`, `withMailSessionOver`) and mutating (`withMutatingMailbox`, `withMutatingMailboxOver`), plus `createSessionGate`. The sole draft-write (`APPEND`) site, and the one place a mailbox is opened in the mutating form. |
-| `triage.ts` | **The only user of the mutating orchestrator.** Hands out verbs, never a session. Today: mark one message read or unread. Fetches no message body. |
+| `triage.ts` | **The only user of the mutating orchestrator.** Hands out verbs, never a session. Marks one message read or unread, flags or unflags one message, and moves a list of messages to another folder: a copy, then the removal of that one original. Fetches no message body. |
 | `imap-session.ts` | The IMAP wire conversation over a `DuplexLike` (socket-free, no logging). |
 | `imap-parser.ts` | Pure IMAP line parsing, no I/O. |
 | `mime.ts` | Raw RFC822 → decoded message (`postal-mime`, `HTMLRewriter`). |
@@ -183,8 +183,9 @@ person's derived id.
   gate, open a socket, and delegate.
 - **Flow:** connect → `LOGIN` → `EXAMINE` (read-only) → work → `LOGOUT` → close,
   every call. The one exception is `triage.ts`: it opens its mailbox in the
-  mutating form, refuses unless iCloud says the mailbox is writable, and changes
-  one flag. Decoding, extraction, and storage all happen *outside* the session.
+  mutating form, refuses unless iCloud says the mailbox is writable, and then
+  either changes one flag or moves the messages it was given, one at a time.
+  Decoding, extraction, and storage all happen *outside* the session.
 
 Why one connection: production allows six platform connections per Worker
 invocation, shared across KV, outbound fetch, and sockets — one already spent by
@@ -283,19 +284,22 @@ this is the summary.
    the opportunistic path is the least reliable part of the socket API.
 
 2. **No mail sending, ever.** SMTP ports (25/465/587) and mail-sending libraries
-   are banned. The draft `APPEND` is the only write that places a message, built
-   in exactly one module (`src/mail/service.ts`) — enforced as a *count*, so
-   zero writers is as much a violation as two. The one other mail write changes
-   one flag, and places and sends nothing (item 5). The human review step is the
-   backstop against prompt-injected content going out. (Calendar invitations are
-   reconciled separately: the send is iCloud's, attendees are caller-supplied,
-   and any create with attendees is gated by preview/commit.)
+   are banned. The draft `APPEND` is the only write that composes a message,
+   built in exactly one module (`src/mail/service.ts`) — enforced as a *count*,
+   so zero writers is as much a violation as two. The other mail writes send
+   nothing. Two change one flag. A move copies a message the user already has
+   into another folder, then removes the original (item 5). That copy has one
+   counted site too. The human review step is the backstop against
+   prompt-injected content going out. (Calendar invitations are reconciled
+   separately: the send is iCloud's, attendees are caller-supplied, and any
+   create with attendees is gated by preview/commit.)
 
 3. **One socket importer.** `cloudflare:sockets` is imported by exactly one
    file. `connectImap()` takes no parameters, so the forbidden state is
    unspeakable. The one-connection property is defended again one layer up: two
    session orchestrators, read and mutating, over one private core and one
-   request gate, and no concurrent combinator around either or the socket open.
+   request gate, and no concurrent combinator around either, around a triage
+   verb, or around the socket open.
 
 4. **Credentials never reach a log or an error.** There are no logging calls
    anywhere in `src/`. IMAP `LOGIN` carries the password inline, so there is no
@@ -306,9 +310,11 @@ this is the summary.
 5. **Reading mail does not mark it read.** Every mailbox opened on a read path
    is opened read-only (`EXAMINE`), and every fetch uses the peeking form.
    Non-peeking fetch items are banned. One separate path, used only by
-   `src/mail/triage.ts`, opens a mailbox in the mutating form to mark one
-   message read or unread when the user asks. It is counted, kept apart by type,
-   and fetches no body.
+   `src/mail/triage.ts`, opens a mailbox in the mutating form when the user
+   asks: to mark one message read or unread, to flag it, or to move messages.
+   It is counted, kept apart by type, and fetches no body. A move copies first,
+   and removes only the one original whose copy iCloud proved. Nothing removes
+   mail in place or empties Trash.
 
 ### Enforcement
 

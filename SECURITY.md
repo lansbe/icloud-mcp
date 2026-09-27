@@ -183,11 +183,11 @@ did not work.
 ### The assistant cannot send mail
 
 There is no SMTP path and no mail-sending library. The assistant writes drafts
-into the iCloud Drafts folder via IMAP `APPEND` and nothing else. A human
-reviews every draft and sends it. This is the backstop against prompt-injected
-content in an email reaching an outbound message under your name. The draft
-write is built in exactly one module, enforced as a count (zero writers is as
-much a violation as two).
+into the iCloud Drafts folder via IMAP `APPEND`, and composes no other mail. A
+human reviews every draft and sends it. This is the backstop against
+prompt-injected content in an email reaching an outbound message under your
+name. The draft write is built in exactly one module, enforced as a count (zero
+writers is as much a violation as two).
 
 ### Reading mail does not change it
 
@@ -195,6 +195,19 @@ Every read opens its mailbox **read-only**, and every fetch uses the peeking
 form, so the assistant reading your mail never sets the seen flag. Read status
 stays a field *you* control. It changes only when you ask the assistant to mark
 a message read or unread, one message at a time.
+Flagging works the same way: one message at a time, only when you ask.
+
+### Moving mail is previewed, and nothing is removed for good
+
+Moving mail to another folder, to the archive folder or to Trash **writes
+nothing on the first call**. It returns a preview. The move happens only when
+`mail_commit` replays the preview's confirmation unchanged, and only if the
+messages have not changed since. Each message is copied first. The original is
+removed only after iCloud proves where the copy landed, so a failure part-way
+leaves a message in both folders, never in neither. Nothing removes mail for
+good or empties Trash, and a message in Trash can be moved back. The list of
+messages is always the one you picked, never one built from a search or from
+what a message says.
 
 ### Destructive calendar actions are gated
 

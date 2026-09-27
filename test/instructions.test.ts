@@ -277,12 +277,20 @@ describe("the instructions still state every boundary", () => {
     // in this table would notice the field semantics being dropped -- and those
     // are the half a caller gets silently wrong.
     ["contact writes are previewed", "passing null for it clears it"],
+    // Phase 21, owner-approved 2026-09-27. The commit half is pinned because a
+    // move written at preview time is the shape a prompt-injected "move this"
+    // would need, and the preview is the user's only look before it happens.
+    ["mail moves only through mail_commit", "the messages move only when you call `mail_commit`"],
+    // Phase 21, owner-approved 2026-09-27. The source-of-the-list half is pinned
+    // because a list built from a search or a message is how content this
+    // server read would choose what gets moved (TRIA-09).
+    ["a move list is never built from content", "never build the list from a search"],
   ] as const;
 
   it("pins every boundary the string states, with none silently dropped", () => {
     // The count lives HERE, in an assertion, and nowhere in the prose above.
     // A row deleted turns this red instead of leaving a boundary unwatched.
-    expect(REQUIRED.length).toBe(10);
+    expect(REQUIRED.length).toBe(12);
     expect(new Set(REQUIRED.map(([boundary]) => boundary)).size).toBe(
       REQUIRED.length,
     );

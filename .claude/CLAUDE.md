@@ -222,11 +222,15 @@ strangers all day, and the only thing standing between that and a message sent
 under the user's name is a person looking at it first. Removing the step would
 be a safety regression dressed up as a feature.
 
-A draft reaches the iCloud Drafts folder via IMAP `APPEND`. One other mail write
-exists. It places nothing and sends nothing: it changes one flag on one message,
-when the user asks, through the separate path in §5 under "One path may change a
-mailbox, and it is not a read path". The drafts write is the only write that
-places a message, and deliberately so.
+A draft reaches the iCloud Drafts folder via IMAP `APPEND`. The other mail
+writes go through the separate path in §5 under "One path may change a mailbox,
+and it is not a read path", and none of them sends anything. Two change one flag
+on one message, when the user asks: read status, and the flag. One moves mail.
+It copies a message the user already has into another folder, then removes the
+original. That copy places a message, so it is now the one other write that
+does. It only ever places a copy of mail already in the account, never new
+content. It has one counted site, like the drafts write. The drafts write is
+still the only write that composes a message.
 
 **That write is constructed in exactly one module, `src/mail/service.ts`, and
 the constraint is a count rather than a prohibition.** Zero constructors is as
@@ -251,8 +255,9 @@ it does is worse than one whose limits are written down.
 
 Nothing is given up here either. A second path that places a message would be a
 second thing this project can do to the user's account. So one arrives only with
-a decision, never as a refactor. The flag change in §5 arrived that way, in
-Phase 20, and places no message.
+a decision, never as a refactor. The flag changes arrived that way, in Phases 20
+and 21, and place no message. The move's copy arrived that way too, in Phase 21,
+and places only a copy of mail the user already has.
 
 One consequence lands on every module added under `src/` from now on. The rule's
 scope is the whole source tree and it walks that tree on every commit, so
@@ -400,7 +405,8 @@ already-open stream. The mutating one is `withMutatingMailbox`, plus
 hatch past either orchestrator. Both take the same request gate, so one request
 gets one session, whichever kind it is. A concurrent combinator wrapped around
 any of them is rejected by the scan, exactly as one wrapped around the socket
-open is.
+open is. The scan also refuses one wrapped around a triage verb, because a list
+of moves is worked through one message at a time, in one session.
 
 That rule exists because a fan-out here is genuinely tempting rather than
 hypothetical. An account-wide unread sweep and an account-wide search are both
@@ -552,7 +558,7 @@ command it protects.
 
 Phase 20 adds a tool that marks one message read or unread. To do that, it has
 to open a mailbox in the form that allows changes. This is the one place that
-happens.
+happens. Phase 21 adds flag and move on the same path.
 
 1. **Which paths are read-only.** Every other mail tool goes through the read
    orchestrator. When it opens a mailbox, it opens it read-only. The sign-in
@@ -563,8 +569,10 @@ happens.
    `withMutatingMailbox`, plus `withMutatingMailboxOver`. It runs over the same
    private core and the same one-per-request gate as the read one. Only
    `src/mail/triage.ts` may use it. That module hands out verbs, never a
-   session. Today its only verbs mark one message read or unread, and only when
-   the user asks.
+   session. Its verbs mark one message read or unread, flag or unflag one
+   message, and move a list of messages from one folder to another. Archive
+   and Trash are moves to a folder the account itself names. Each verb acts
+   only when the user asks.
 
 3. **What this gives up.** Before Phase 20, iCloud itself refused a read-status
    change in every session this server opened. Now that is true only on read
@@ -578,7 +586,19 @@ happens.
      session stand in for it, or the other way round.
    - The verbs fetch no message body.
    - If a mailbox opens read-only anyway, the verb refuses and says so by name.
+   - Each verb checks that the mailbox keeps the one flag it changes. If not,
+     it refuses by name and sends nothing.
    - The answer reports what iCloud sent back, not what was asked for.
+   - A move copies first. It removes the original only after iCloud's reply
+     proves where the copy landed. So a failure part-way leaves the message in
+     both folders, and never in neither.
+   - The only removal names the one message just copied. The folder-wide form
+     is banned by the scan. The copy, the removal mark and the removal each
+     have one counted site.
+   - Nothing removes mail in place or empties Trash. A message in Trash can be
+     moved back.
+   - Every move is previewed. The commit acts only on the messages the preview
+     named, and only if they are unchanged since.
 
 5. **How the read side is proved.** `test/read-path-wire.test.ts` holds the
    exact commands every read sends. They were recorded before the split. Editing
@@ -589,8 +609,9 @@ happens.
    - A second place that opens a mailbox in the mutating form.
    - A second module that uses the mutating path.
    - A verb that fetches a message body.
-   - Any new verb. Phase 21's flag and move will each be decided in their own
-     phase.
+   - A new verb beyond these.
+   - A way to remove mail in place, or to empty Trash.
+   - A second site for the copy, the removal mark or the removal.
 
 ### Enforcement
 
