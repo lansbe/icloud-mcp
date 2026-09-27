@@ -73,6 +73,48 @@ export const FORBIDDEN = [
     why: "A mail-sending library import. This project must not acquire the ability to send mail; see the SMTP submission port entry for why that boundary is load-bearing.",
   },
 
+  // ------------------------------------------------------------------ removal
+  // Phase 21, TRIA-07, D-10. iCloud has no move command, so a move here is the
+  // copy, proven from the server's reply, then the removal of that ONE UID.
+  // These two rules ban the two ways to get that wrong on the wire.
+  //
+  // WHAT EACH CATCHES. `mailbox-wide-expunge` catches a command line that starts
+  // with the bare removal command or with CLOSE, either after an interpolated
+  // tag (`${tag} ...`) or at the head of a string handed to the generic sender.
+  // RFC 3501 gives both the same reach: every message in the folder that
+  // carries the removal flag, including ones Apple Mail flagged and the user
+  // can still recover (PITFALLS #31; CLOSE per RFC 3501 §6.4.2). Its second
+  // half catches the UID-scoped removal when it names a range or a star, which
+  // reaches every flagged message in that range just as the bare form does.
+  // `move-command` catches the RFC 6851 move command, with or without its UID
+  // prefix, at the same two anchors.
+  //
+  // WHAT NEITHER SEES. A lowercase command word. A command word held in a
+  // variable and handed to the sender. A range built somewhere the pattern
+  // cannot see and interpolated as one value. Those are held one layer up, by
+  // the byte-exact recorded lines in test/move.test.ts, which read what was
+  // actually written rather than the shape of the code that wrote it.
+  //
+  // THE PROSE DISCIPLINE. Both patterns read comments, and both are scoped to
+  // the whole of `src/`. So describe both commands BY ROLE anywhere under
+  // `src/` -- "the removal of that one UID", "the move command" -- and never
+  // quote them. A comment that quotes one fails the check it was explaining,
+  // and the failure arrives as a pre-commit rejection in an unrelated plan.
+  // Tests and fixtures spell these on purpose, which is why the scope is `src/`.
+  {
+    id: "mailbox-wide-expunge",
+    scope: "src/",
+    pattern:
+      /(?:\$\{[^}\n]*\}\s*|["'`]\s*)(?:EXPUNGE|CLOSE)\b|\bUID EXPUNGE\s+[^"'`\n]*[:*]/g,
+    why: "A removal that can reach a message this call did not copy. RFC 3501's bare removal command and CLOSE both remove EVERY message flagged for removal in the folder, including ones Apple Mail flagged and the user can still recover (PITFALLS #31), and a UID-scoped removal naming a range or a star reaches every flagged message in that range the same way. The only removal this project permits is the UID-scoped one naming the single UID whose copy COPYUID just proved (TRIA-07), and the teardown sends LOGOUT only. The answer is the move step in src/mail/triage.ts, never a narrower pattern.",
+  },
+  {
+    id: "move-command",
+    scope: "src/",
+    pattern: /(?:\$\{[^}\n]*\}\s*|["'`]\s*)(?:UID\s+)?MOVE\s/g,
+    why: "The RFC 6851 move command. iCloud does not advertise it, and RFC 6851 §3 forbids a client from issuing it unless the server advertises it, so \"try it and fall back\" is a protocol violation that works until the day it does not. Every move in this project is the copy, proven from COPYUID, then the conditional removal mark, then the removal of that one UID -- in src/mail/triage.ts. Use that step; do not narrow this pattern.",
+  },
+
   // ------------------------------------------------------- credentials in logs
   // FND-03, Pitfall 6. IMAP's LOGIN command carries the password inline in the
   // command stream, so there is no separately-named field a redactor could

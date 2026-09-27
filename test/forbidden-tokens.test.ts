@@ -743,6 +743,60 @@ function rawSourceOf(repoRelative: string): string {
   return text;
 }
 
+// Phase 21, TRIA-07. The two removal rules, shape by shape, each through a
+// fresh copy of the rule's pattern. The standing samples above prove each rule
+// fires once; these prove WHICH shapes it fires on, including the one it must
+// not: the UID-scoped removal of one interpolated UID is the move step itself.
+describe("the removal and move-command rules (TRIA-07)", () => {
+  function fires(id: string, text: string): boolean {
+    const rule = FORBIDDEN.find((one) => one.id === id)!;
+    return new RegExp(rule.pattern.source, rule.pattern.flags).test(text);
+  }
+
+  it("fires on the bare removal after an interpolated tag", () => {
+    expect(fires("mailbox-wide-expunge", "await channel.write(`${tag} EXPUNGE`);")).toBe(true);
+  });
+
+  it("fires on CLOSE handed to the sender", () => {
+    expect(fires("mailbox-wide-expunge", 'await sendCommand(channel, tag, "CLOSE");')).toBe(true);
+  });
+
+  it("fires on a UID-scoped removal naming a star", () => {
+    expect(fires("mailbox-wide-expunge", "await sendCommand(channel, tag, `UID EXPUNGE 1:*`);")).toBe(
+      true,
+    );
+  });
+
+  it("fires on a UID-scoped removal naming an interpolated range", () => {
+    expect(
+      fires("mailbox-wide-expunge", "await sendCommand(channel, tag, `UID EXPUNGE ${first}:${last}`);"),
+    ).toBe(true);
+  });
+
+  it("does not fire on the UID-scoped removal of one interpolated UID", () => {
+    expect(
+      fires("mailbox-wide-expunge", "await sendCommand(channel, tag, `UID EXPUNGE ${ref.uid}`);"),
+    ).toBe(false);
+  });
+
+  it("does not fire on the server's removal notice, a copy, or prose about closing a socket", () => {
+    expect(fires("mailbox-wide-expunge", 'const notice = "* 5 EXPUNGE";')).toBe(false);
+    expect(fires("mailbox-wide-expunge", "`UID COPY ${uid} ${quoted}`")).toBe(false);
+    expect(fires("mailbox-wide-expunge", '"close the socket"')).toBe(false);
+  });
+
+  it("fires on the move command and not on a word that ends in it", () => {
+    expect(fires("move-command", 'const line = "MOVE 1 \"Archive\"";')).toBe(true);
+    expect(fires("move-command", 'const word = "REMOVE";')).toBe(false);
+  });
+
+  it("finds neither in the real tree", () => {
+    const ids = scan().map((violation) => violation.pattern);
+    expect(ids).not.toContain("mailbox-wide-expunge");
+    expect(ids).not.toContain("move-command");
+  });
+});
+
 describe("the ban list itself", () => {
   it("gives every rule a non-empty reason, because the hook prints it on rejection", () => {
     expect(FORBIDDEN.length).toBeGreaterThan(0);
@@ -874,6 +928,12 @@ describe("the patterns have teeth", () => {
     // actually taken, and it is one line earlier than the call the rule would
     // otherwise first see.
     "tsdav-make-calendar": 'import { makeCalendar } from "tsdav";',
+    // Phase 21, TRIA-07. The bare removal handed straight to the generic
+    // sender: the shape a "clean up the folder afterwards" edit would write.
+    "mailbox-wide-expunge": 'await sendCommand(channel, channel.nextTag(), "EXPUNGE");',
+    // Phase 21. The RFC 6851 command, UID-scoped, as a "try it first" branch
+    // would write it.
+    "move-command": "await sendCommand(channel, tag, `UID MOVE ${uid} ${quoted}`);",
   };
 
   it("covers every rule with a known-violating sample", () => {

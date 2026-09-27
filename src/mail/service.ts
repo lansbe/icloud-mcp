@@ -1015,8 +1015,9 @@ function fetchItems(list: SExpr[]): Map<string, SExpr> {
  * The item list of the first untagged FETCH reply, or `null`.
  *
  * **The sequence-number prefix is discarded here and never travels further.**
- * Every untagged FETCH carries one — `message-data = nz-number SP ("EXPUNGE" /
- * ("FETCH" SP msg-att))` — even in reply to a `UID FETCH`. It is the single
+ * Every untagged FETCH carries one — RFC 3501's `message-data` production puts
+ * a sequence number in front of either the removal notice or a FETCH — even in
+ * reply to a `UID FETCH`. It is the single
  * place in this phase where a sequence number is handed to the client unasked,
  * and MAIL-06 requires a UID-only surface, so it is dropped at the parse site
  * rather than filtered later by everyone who touches the result.
