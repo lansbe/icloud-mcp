@@ -856,6 +856,18 @@ export const HOME_EXEMPT_REQUEST_SITES: readonly ExemptSite[] = Object.freeze([
     reason:
       "the target is a collection URL fetchCollectionStates enumerated from resolved.homeUrl in the same call; the change marker carries only a digest of each collection URL, never the URL, so no token can name the target, and calendarChangesSince asserts the enumerated URL is under the home before calling here"
   },
+  // Exempt for the same reason as the REPORT above it: the collection is one
+  // the home listing produced and calendarChangesSince already checked. The
+  // object URLs are the sync answer's member hrefs, never a caller's, and each
+  // is checked against the home inside changedEventRows before it is named
+  // (D-25), on top of readSyncAnswer's own check.
+  {
+    file: CALENDAR,
+    fn: "changedEventRows",
+    request: "calendarMultiGet",
+    reason:
+      "the target is the same enumerated collection syncOneCalendar reports on, already checked against the home by calendarChangesSince; the object URLs are member hrefs from iCloud's own sync answer, never from a token or a caller, and each is asserted under the home before it is named in the multiget"
+  },
 ]);
 
 // ---------------------------------------------------------------------------

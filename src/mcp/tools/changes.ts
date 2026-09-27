@@ -46,7 +46,7 @@ import {
   ImapThrottleError,
 } from "../../errors";
 import { calendarChangesSince } from "../../dav/calendar";
-import type { CalendarChange } from "../../dav/calendar";
+import type { CalendarChange, ChangedEventRow } from "../../dav/calendar";
 import {
   DavAuthError,
   DavConnectError,
@@ -528,6 +528,8 @@ function calendarCount(one: CalendarChange) {
     source: "calendar" as const,
     calendar: one.calendarId as string | null,
     state: one.state,
+    added: one.added,
+    changed: one.changed,
     addedOrChanged: one.addedOrChanged,
     removed: one.removed,
     more: one.more,
@@ -570,6 +572,8 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
             source: "calendar" as const,
             calendar: null as string | null,
             state: "not_checked" as const,
+            added: null,
+            changed: null,
             addedOrChanged: null,
             removed: null,
             more: false,
@@ -605,7 +609,9 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
   // has rows, since its key is already its name.
   const untrusted: Record<
     string,
-    { name: string; rows: NewMailRow[] } | { name: string }
+    | { name: string; rows: NewMailRow[] }
+    | { name: string; rows: ChangedEventRow[] }
+    | { name: string }
   > = {};
   for (const folder of answer.mail) {
     if (folder.rows.length > 0 || folder.folder !== DEFAULT_MAILBOX) {
@@ -615,12 +621,17 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
       };
     }
   }
-  // Calendar names, keyed by the calendar id the counts carry (D-04). The
+  // Calendar names, keyed by the calendar id the counts carry (D-04), with
+  // that calendar's event rows when it has any (D-26): titles are
+  // stranger-authored, so a row never appears in the trusted block. The
   // not-covered subscriptions too, so their ids can be matched to a name.
-  for (const one of [
-    ...answer.calendar.calendars,
-    ...answer.calendar.notCovered,
-  ]) {
+  for (const one of answer.calendar.calendars) {
+    untrusted[one.calendarId] =
+      one.events.length > 0
+        ? { name: one.displayName, rows: one.events }
+        : { name: one.displayName };
+  }
+  for (const one of answer.calendar.notCovered) {
     untrusted[one.calendarId] = { name: one.displayName };
   }
 

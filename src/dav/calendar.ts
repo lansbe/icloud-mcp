@@ -74,6 +74,7 @@ import {
   buildVEvent,
   countOccurrences,
   dropOverride,
+  eventChangeFactsOf,
   expandOccurrences,
   expandWithinBudget,
   findOccurrence,
@@ -705,9 +706,46 @@ export type CalendarNotCheckedReason =
  * Which path answered, so the first live check settles assumption A2.
  *
  * `propfind-token` means the home listing's `DAV:sync-token` decided it with
- * no further request. `sync-report` means one sync REPORT ran.
+ * no further request. `sync-report` means one sync REPORT ran because that
+ * token moved. `report-token` means the listing gave no token for this
+ * calendar, so the sync REPORT itself was the only source of one (D-23).
  */
-export type CalendarSyncMechanism = "propfind-token" | "sync-report";
+export type CalendarSyncMechanism = "propfind-token" | "sync-report" | "report-token";
+
+/**
+ * At most this many event rows come back from one change check, across every
+ * calendar (D-26). It also bounds the events fetched: each calendar's multiget
+ * names at most what is left of it, so a large change set costs no more reads
+ * than a small one. The counts stay exact; only the rows stop.
+ */
+export const MAX_CHANGE_EVENT_ROWS = 25;
+
+/**
+ * One changed event, as a change row (D-26, CHNG-09).
+ *
+ * Exactly these keys. No description, location, attendees, organiser or
+ * alarms: every one of those is text a stranger may have written, and a change
+ * check reports on many events at once. The detail call is for one event.
+ */
+export interface ChangedEventRow {
+  /** The event id `calendar_get_event` takes. Minted here. */
+  id: string;
+  /** The calendar id. Minted here. */
+  calendar: string;
+  /** The title, verbatim. **Stranger-authored: fenced only.** */
+  title: string | null;
+  /** See `EventChangeFacts.start` for the three shapes. */
+  start: string;
+  end: string;
+  allDay: boolean;
+  cancelled: boolean;
+  /**
+   * `added` when CREATED is at or after the time the calendar's token was
+   * taken, `changed` when it is before. ABSENT when there is no CREATED to
+   * compare: that event is counted as added-or-changed, never guessed.
+   */
+  kind?: "added" | "changed";
+}
 
 /**
  * Why a calendar restarted during a check, when it was not the whole marker.
@@ -725,10 +763,19 @@ export interface CalendarChange {
   /** Stranger-authored or the owner's text. For the fenced block only. */
   displayName: string;
   state: CalendarChangeState;
-  /** Only for `changes` and `no_changes`; `null` otherwise. */
+  /**
+   * The four counts, only for `changes` and `no_changes`; `null` otherwise.
+   * `added` and `changed` are the events a row classified by CREATED.
+   * `addedOrChanged` is every other changed event: no CREATED, a body that
+   * could not be read, or beyond the row cap. The three sum to every changed
+   * member the sync answer named.
+   */
+  added: number | null;
+  changed: number | null;
   addedOrChanged: number | null;
-  /** Only for `changes` and `no_changes`; `null` otherwise. */
   removed: number | null;
+  /** The event rows for this calendar, in URL order. Fenced at the tool. */
+  events: ChangedEventRow[];
   /** True when iCloud cut the answer short and more remains (D-27). */
   more: boolean;
   mechanism: CalendarSyncMechanism | null;
@@ -922,6 +969,151 @@ async function syncOneCalendar(
   return readSyncAnswer(responses, collectionUrl, homeUrl);
 }
 
+/** What one calendar's detail read produced. */
+interface EventRowsAnswer {
+  rows: ChangedEventRow[];
+  added: number;
+  changed: number;
+  addedOrChanged: number;
+  /** Hrefs named in the multiget: what this calendar spent of the budget. */
+  asked: number;
+  /** Set when the multiget was throttled or could not connect (D-29). */
+  stop: CalendarNotCheckedReason | null;
+}
+
+/**
+ * The rows for one calendar's changed events (D-26): one calendar-multiget.
+ *
+ * It names at most `budget` of the hrefs, in URL order, each checked against
+ * the home first (D-25): a member outside it is neither fetched nor counted.
+ * Object URLs go out as paths, matching the form the library's own object
+ * fetch sends. Headers are empty: the transport attaches the credential.
+ *
+ * Every body is read by `eventChangeFactsOf`, so no iCalendar byte is parsed
+ * in this module. The split is by CREATED against `since`, the time this
+ * calendar's token was taken: at or after is added, before is changed, and no
+ * CREATED is added-or-changed. A member the answer does not return, returns
+ * with a failed status, or returns in a form that does not parse gets no row
+ * and is counted as added-or-changed. So is every href beyond the budget.
+ *
+ * A failed multiget is never an error for the check: the sync answer already
+ * gave exact counts, so the rows are simply missing. The library raises on
+ * any failed member, which drops every row for that calendar, not just the
+ * failed one. A throttle or a connection failure is reported back so the
+ * caller stops the calendar side (D-29).
+ */
+async function changedEventRows(
+  davFetch: DavFetch,
+  collectionUrl: string,
+  homeUrl: string,
+  hrefs: readonly string[],
+  budget: number,
+  since: number,
+): Promise<EventRowsAnswer> {
+  const inHome: string[] = [];
+  for (const href of [...hrefs].sort()) {
+    try {
+      assertUnderHome(href, homeUrl);
+    } catch {
+      continue;
+    }
+    inHome.push(href);
+  }
+  const asked = inHome.slice(0, Math.max(0, budget));
+
+  const answer: EventRowsAnswer = {
+    rows: [],
+    added: 0,
+    changed: 0,
+    addedOrChanged: 0,
+    asked: asked.length,
+    stop: null,
+  };
+
+  let responses: DAVResponse[] = [];
+  if (asked.length > 0) {
+    try {
+      responses = await calendarMultiGet({
+        url: collectionUrl,
+        props: { "d:getetag": {}, "c:calendar-data": {} },
+        objectUrls: asked.map((url) => new URL(url).pathname),
+        depth: "1",
+        headers: {},
+        fetch: davFetch,
+      });
+    } catch (err) {
+      // Nothing is read from the caught value beyond its type.
+      if (err instanceof DavThrottleError) answer.stop = "throttled";
+      else if (err instanceof DavConnectError) answer.stop = "connection";
+      responses = [];
+    }
+  }
+  const returned = responses.filter(
+    (one) => typeof one.status !== "number" || (one.status >= 200 && one.status < 300),
+  );
+
+  const calendar = encodeCalendarId({ collectionUrl });
+  for (const objectUrl of asked) {
+    const body = bodyFor(returned, collectionUrl, objectUrl);
+    if (body === null) continue;
+    let facts: ReturnType<typeof eventChangeFactsOf>;
+    try {
+      facts = eventChangeFactsOf(body);
+    } catch {
+      // An event this server cannot read gets no row. Nothing is read from
+      // the caught value.
+      continue;
+    }
+    const row: ChangedEventRow = {
+      id: encodeEventId({ calendarUrl: collectionUrl, objectUrl, recurrenceId: null }),
+      calendar,
+      title: facts.summary,
+      start: facts.start,
+      end: facts.end,
+      allDay: facts.allDay,
+      cancelled: facts.cancelled,
+    };
+    if (facts.created !== null) {
+      row.kind = facts.created >= since ? "added" : "changed";
+      if (row.kind === "added") answer.added += 1;
+      else answer.changed += 1;
+    }
+    answer.rows.push(row);
+  }
+  answer.addedOrChanged = inHome.length - answer.added - answer.changed;
+  return answer;
+}
+
+/** How one sync REPORT ended, once its failure has been sorted by type. */
+type ReportOutcome =
+  | { kind: "answer"; answer: SyncAnswer }
+  | { kind: "refused"; why: CalendarRestartWhy }
+  | { kind: "stop"; reason: CalendarNotCheckedReason }
+  | { kind: "gone" }
+  | { kind: "unusable" };
+
+/** One sync REPORT, with its failure sorted by type and nothing else read. */
+async function reportOutcome(
+  davFetch: DavFetch,
+  collectionUrl: string,
+  homeUrl: string,
+  token: string,
+): Promise<ReportOutcome> {
+  let answer: SyncAnswer;
+  try {
+    answer = await syncOneCalendar(davFetch, collectionUrl, homeUrl, token);
+  } catch (err) {
+    if (err instanceof DavSyncTokenError) return { kind: "refused", why: "token_refused" };
+    if (err instanceof DavAuthError) return { kind: "refused", why: "listing_refused" };
+    if (err instanceof DavThrottleError) return { kind: "stop", reason: "throttled" };
+    if (err instanceof DavConnectError) return { kind: "stop", reason: "connection" };
+    if (err instanceof DavNotFoundError) return { kind: "gone" };
+    return { kind: "unusable" };
+  }
+  if (!answer.usable || answer.token === null) return { kind: "unusable" };
+  return { kind: "answer", answer };
+}
+
 /**
  * What changed on every calendar since a marker's calendar block.
  *
@@ -933,9 +1125,19 @@ async function syncOneCalendar(
  * a fan-out. The request-scoped queue in `./transport.ts` and the scan's
  * `dav-concurrent-request` rule hold the same line from two other sides.
  *
+ * A calendar whose token moved also costs one calendar-multiget for its event
+ * rows, at most `MAX_CHANGE_EVENT_ROWS` across the whole call (D-26). That
+ * multiget finishes before the next calendar's first request starts.
+ *
+ * A calendar the listing gives no token for falls back to the sync REPORT
+ * itself (D-23): with its old token when the marker holds one, and with an
+ * empty token otherwise, whose members are discarded because they are the
+ * whole calendar rather than changes. Its `mechanism` is `report-token`.
+ *
  * A throttle or a connection failure on a REPORT stops the loop at once
  * (D-29). That calendar and every one after it are `not_checked`, keep their
- * old tokens, and nothing more is sent. No retry.
+ * old tokens, and nothing more is sent. No retry. The same failure on a detail
+ * read stops the loop after that calendar, whose counts are already exact.
  *
  * Failures at the home listing are thrown to the caller, which decides what
  * the whole calendar side says. A sign-in refusal there is a real one.
@@ -966,6 +1168,7 @@ export async function calendarChangesSince(
     const freshStates: CalendarState[] = [];
     const seenKeys = new Set<string>();
     let stopped: CalendarNotCheckedReason | null = null;
+    let rowBudget = MAX_CHANGE_EVENT_ROWS;
 
     for (const collection of collections) {
       const calendarId = encodeCalendarId({ collectionUrl: collection.url });
@@ -985,9 +1188,12 @@ export async function calendarChangesSince(
       const base = {
         calendarId,
         displayName: collection.displayName,
+        added: null,
+        changed: null,
         addedOrChanged: null,
         removed: null,
         more: false,
+        events: [] as ChangedEventRow[],
       };
       const notChecked = (
         reason: CalendarNotCheckedReason,
@@ -1003,27 +1209,21 @@ export async function calendarChangesSince(
       }
 
       const property = collection.syncToken;
-      if (property === null) {
-        // No token property. Plan 23-05 adds the REPORT fallback; until then
-        // this calendar is not checked and keeps its old token.
-        notChecked("no_usable_answer", null);
-        continue;
-      }
+      const starting = prior === null || restartAll || old === null;
+      const startState: CalendarChangeState = restartAll ? "restarted" : "started";
 
-      if (prior === null || restartAll || old === null) {
-        calendars.push({
-          ...base,
-          state: restartAll ? "restarted" : "started",
-          mechanism: "propfind-token",
-        });
+      if (property !== null && starting) {
+        calendars.push({ ...base, state: startState, mechanism: "propfind-token" });
         freshStates.push({ key, syncToken: property });
         continue;
       }
 
-      if (property === old.syncToken) {
+      if (property !== null && old !== null && property === old.syncToken) {
         calendars.push({
           ...base,
           state: "no_changes",
+          added: 0,
+          changed: 0,
           addedOrChanged: 0,
           removed: 0,
           mechanism: "propfind-token",
@@ -1032,6 +1232,10 @@ export async function calendarChangesSince(
         continue;
       }
 
+      // A REPORT is needed from here: the token moved, or the listing gave no
+      // token and the REPORT is the only source of one (D-23).
+      const mechanism: CalendarSyncMechanism =
+        property === null ? "report-token" : "sync-report";
       try {
         assertUnderHome(collection.url, resolved.homeUrl);
       } catch {
@@ -1039,56 +1243,99 @@ export async function calendarChangesSince(
         continue;
       }
 
-      let answer: SyncAnswer;
-      try {
-        answer = await syncOneCalendar(
-          davFetch,
-          collection.url,
-          resolved.homeUrl,
-          old.syncToken,
-        );
-      } catch (err) {
-        if (err instanceof DavSyncTokenError || err instanceof DavAuthError) {
+      // No token anywhere: one REPORT with an empty token gives a starting
+      // point. Its members are the whole calendar, not changes, so they are
+      // discarded and nothing is fetched.
+      const startFromReport = async (
+        state: CalendarChangeState,
+        why?: CalendarRestartWhy,
+      ): Promise<void> => {
+        const outcome = await reportOutcome(davFetch, collection.url, resolved.homeUrl, "");
+        if (outcome.kind === "answer") {
           calendars.push({
             ...base,
-            state: "restarted",
-            mechanism: "sync-report",
-            why: err instanceof DavSyncTokenError ? "token_refused" : "listing_refused",
+            state,
+            mechanism,
+            ...(why !== undefined ? { why } : {}),
           });
-          freshStates.push({ key, syncToken: property });
-        } else if (err instanceof DavThrottleError) {
-          stopped = "throttled";
-          notChecked(stopped, "sync-report");
-        } else if (err instanceof DavConnectError) {
-          stopped = "connection";
-          notChecked(stopped, "sync-report");
-        } else if (err instanceof DavNotFoundError) {
-          calendars.push({ ...base, state: "gone", mechanism: "sync-report" });
+          freshStates.push({ key, syncToken: outcome.answer.token as string });
+        } else if (outcome.kind === "stop") {
+          stopped = outcome.reason;
+          notChecked(stopped, mechanism);
+        } else if (outcome.kind === "gone") {
+          calendars.push({ ...base, state: "gone", mechanism });
         } else {
-          notChecked("no_usable_answer", "sync-report");
+          notChecked("no_usable_answer", mechanism);
+        }
+      };
+
+      if (starting || old === null) {
+        await startFromReport(startState);
+        continue;
+      }
+
+      const outcome = await reportOutcome(
+        davFetch,
+        collection.url,
+        resolved.homeUrl,
+        old.syncToken,
+      );
+      if (outcome.kind === "refused") {
+        if (property !== null) {
+          calendars.push({ ...base, state: "restarted", mechanism, why: outcome.why });
+          freshStates.push({ key, syncToken: property });
+        } else {
+          // The old token was refused and the listing gave none: a second,
+          // empty-token REPORT is the only way to a new starting point.
+          await startFromReport("restarted", outcome.why);
         }
         continue;
       }
-
-      if (!answer.usable || answer.token === null) {
-        notChecked("no_usable_answer", "sync-report");
+      if (outcome.kind === "stop") {
+        stopped = outcome.reason;
+        notChecked(stopped, mechanism);
+        continue;
+      }
+      if (outcome.kind === "gone") {
+        calendars.push({ ...base, state: "gone", mechanism });
+        continue;
+      }
+      if (outcome.kind === "unusable") {
+        notChecked("no_usable_answer", mechanism);
         continue;
       }
 
-      const addedOrChanged = answer.addedOrChanged.length;
+      const answer = outcome.answer;
+      // The rows, against the time THIS calendar's token was taken: a carried
+      // calendar keeps its own, older time (D-16).
+      const detail = await changedEventRows(
+        davFetch,
+        collection.url,
+        resolved.homeUrl,
+        answer.addedOrChanged,
+        rowBudget,
+        old.takenAt ?? (prior as CalendarBlock).takenAt,
+      );
+      rowBudget -= detail.asked;
       const removedCount = answer.removed.length;
       calendars.push({
         ...base,
         state:
-          addedOrChanged + removedCount > 0 || answer.truncated
+          answer.addedOrChanged.length + removedCount > 0 || answer.truncated
             ? "changes"
             : "no_changes",
-        addedOrChanged,
+        added: detail.added,
+        changed: detail.changed,
+        addedOrChanged: detail.addedOrChanged,
         removed: removedCount,
         more: answer.truncated,
-        mechanism: "sync-report",
+        mechanism,
+        events: detail.rows,
       });
-      freshStates.push({ key, syncToken: answer.token });
+      freshStates.push({ key, syncToken: answer.token as string });
+      // A throttle or a lost connection on the detail read stops the calendar
+      // side after this calendar, whose counts are already exact (D-29).
+      if (detail.stop !== null) stopped = detail.stop;
     }
 
     let gone = 0;
