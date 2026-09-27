@@ -8,8 +8,11 @@ import { describe, expect, it } from "vitest";
 import type { MarkerContent } from "../src/change-marker";
 import {
   MARKER_VERSION,
+  MAX_MARKER_LENGTH,
   MarkerRefusedError,
   calendarKeyOf,
+  fitsInMarker,
+  sealedLength,
   classifyVersion,
   readMarker,
   sealMarker,
@@ -241,5 +244,66 @@ describe("the marker's size", () => {
     const token = await sealMarker(big, userId, env.CONFIRM_SECRET);
     expect(token.length).toBeLessThanOrEqual(1500);
     expect((await readMarker(token, userId, env.CONFIRM_SECRET)).kind).toBe("current");
+  });
+});
+
+describe("the marker never outgrows what the tool will read back (CR-01)", () => {
+  /** Three folders, the last one's name padded to `pad` characters. */
+  function padded(pad: number): MarkerContent {
+    return {
+      folders: [
+        { mailbox: "INBOX", uidValidity: 1, uidNext: 2, highestModseq: null },
+        { mailbox: "A".repeat(1000), uidValidity: 1, uidNext: 2, highestModseq: null },
+        { mailbox: "B".repeat(pad), uidValidity: 1, uidNext: 2, highestModseq: null },
+      ],
+      calendar: {
+        takenAt: 1790000000,
+        calendars: Array.from({ length: 4 }, (_, index) => ({
+          key: `AAAAAAAAAAA${index}`,
+          syncToken: "t".repeat(400),
+        })),
+      },
+      mintedAt: 1790000000,
+    };
+  }
+
+  it("sealedLength is the sealed marker's exact length", async () => {
+    const { userId } = await ownerPrincipal();
+    for (const content of [CONTENT, padded(1), padded(10)]) {
+      const token = await sealMarker(content, userId, env.CONFIRM_SECRET);
+      expect(sealedLength(content)).toBe(token.length);
+    }
+  });
+
+  it("at the cap it seals and reads back; one byte past it, sealing refuses", async () => {
+    const { userId } = await ownerPrincipal();
+    let pad = 1;
+    while (sealedLength(padded(pad)) < MAX_MARKER_LENGTH) pad += 1;
+    // Base64 grows by one or two characters per byte, so step until exact.
+    while (sealedLength(padded(pad)) !== MAX_MARKER_LENGTH) pad -= 1;
+    expect(pad).toBeGreaterThan(0);
+
+    const atCap = padded(pad);
+    expect(fitsInMarker(atCap)).toBe(true);
+    const token = await sealMarker(atCap, userId, env.CONFIRM_SECRET);
+    expect(token).toHaveLength(MAX_MARKER_LENGTH);
+    expect((await readMarker(token, userId, env.CONFIRM_SECRET)).kind).toBe("current");
+
+    const over = padded(pad + 1);
+    expect(sealedLength(over)).toBeGreaterThan(MAX_MARKER_LENGTH);
+    expect(fitsInMarker(over)).toBe(false);
+    await expect(sealMarker(over, userId, env.CONFIRM_SECRET)).rejects.toBeInstanceOf(
+      MarkerRefusedError,
+    );
+  });
+
+  it("a marker longer than the cap is refused on reading, before the seal is checked", async () => {
+    const { userId } = await ownerPrincipal();
+    const token = await sealMarker(CONTENT, userId, env.CONFIRM_SECRET);
+    const [payload, mac] = token.split(".");
+    const long = `${payload}${"A".repeat(MAX_MARKER_LENGTH)}.${mac}`;
+    await expect(readMarker(long, userId, env.CONFIRM_SECRET)).rejects.toBeInstanceOf(
+      MarkerRefusedError,
+    );
   });
 });

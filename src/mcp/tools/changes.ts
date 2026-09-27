@@ -31,12 +31,15 @@ import { env } from "cloudflare:workers";
 import { z } from "zod";
 import type {
   CalendarBlock,
+  CalendarState,
   FolderState,
   MarkerContent,
 } from "../../change-marker";
 import {
   MAX_CHANGE_FOLDERS,
+  MAX_MARKER_LENGTH,
   MarkerRefusedError,
+  fitsInMarker,
   readMarker,
   sealMarker,
 } from "../../change-marker";
@@ -81,8 +84,11 @@ import { mailErrorResult } from "./mail";
  */
 export const CHANGES_TOOL_NAME = "changes_since";
 
-/** A marker longer than this is refused by the input schema. */
-export const MAX_MARKER_LENGTH = 4096;
+/**
+ * A marker longer than this is refused by the input schema. Defined once, in
+ * the marker module, which refuses to seal past it (CR-01).
+ */
+export { MAX_MARKER_LENGTH };
 
 /** Each source's state. A closed list (D-05). */
 export type SourceState =
@@ -152,6 +158,11 @@ export interface CalendarSideAnswer {
    * old calendar block is carried unchanged.
    */
   unchecked: NotCheckedReason | null;
+  /**
+   * Calendars dropped from the carried block because the marker had no room
+   * for them next to this call's mail states. Only when `unchecked` is set.
+   */
+  dropped?: number;
 }
 
 /** Everything `changesResult` needs. */
@@ -617,7 +628,7 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
       answer.carried.length,
       answer.calendar.calendars.filter(
         (one) => one.state === "not_checked" && one.reason === "marker_full",
-      ).length,
+      ).length + (answer.calendar.dropped ?? 0),
     ),
     since:
       answer.since === null
@@ -661,6 +672,33 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
 
   return untrustedToolResult(trusted, untrusted);
 }
+
+const MARKER_TOO_LONG =
+  "These folders' names are too long to track together in one marker. " +
+  "Ask about fewer folders, or ones with shorter names.";
+
+/**
+ * The answer when the folders asked about, with the ones the marker already
+ * holds, could not fit in one marker however their numbers came back (CR-01).
+ * Given before any socket, on the success arm, with no marker.
+ */
+export function markerTooLongResult(): ToolResult {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({
+          refusal: "marker-too-long",
+          overall: MARKER_TOO_LONG,
+        }),
+      },
+    ],
+  };
+}
+
+/** The largest numbers a folder's state can carry, for the worst-case size. */
+const LARGEST_UID = 0xffffffff;
+const LARGEST_MODSEQ = "9223372036854775807";
 
 const TOO_MANY_FOLDERS =
   "At most five folders can be watched with one marker, counting the ones it " +
@@ -798,6 +836,26 @@ export function registerChangesTool(
         if (mailboxes.length + carried.length > MAX_CHANGE_FOLDERS) {
           return tooManyFoldersResult();
         }
+        // The mail states at their largest, with an empty calendar block, must
+        // fit one marker, or no answer this call gives could be passed back.
+        const now = Math.floor(Date.now() / 1000);
+        if (
+          !fitsInMarker({
+            folders: [
+              ...mailboxes.map((mailbox) => ({
+                mailbox,
+                uidValidity: LARGEST_UID,
+                uidNext: LARGEST_UID,
+                highestModseq: LARGEST_MODSEQ,
+              })),
+              ...carried,
+            ],
+            calendar: { takenAt: now, calendars: [] },
+            mintedAt: now,
+          })
+        ) {
+          return markerTooLongResult();
+        }
 
         const priorFolders = new Map<string, FolderState>(
           (prior?.folders ?? []).map((one) => [one.mailbox, one]),
@@ -810,6 +868,18 @@ export function registerChangesTool(
           restartAll,
           options,
         );
+
+        const freshFolders: FolderState[] = [
+          ...checks.flatMap((check) => (check.state === null ? [] : [check.state])),
+          ...carried,
+        ];
+        // What the calendar side may keep: whatever still fits beside the mail.
+        const fits = (states: readonly CalendarState[]): boolean =>
+          fitsInMarker({
+            folders: freshFolders,
+            calendar: { takenAt: now, calendars: [...states] },
+            mintedAt: now,
+          });
 
         // The calendar side, only after the mail side has finished (D-32).
         // A sign-in refusal answers for the whole call with no marker (D-08).
@@ -824,6 +894,7 @@ export function registerChangesTool(
             davFetch,
             prior?.calendar ?? null,
             restartAll,
+            fits,
           );
           calendar = {
             calendars: result.calendars,
@@ -836,6 +907,11 @@ export function registerChangesTool(
           if (err instanceof DavAuthError || err instanceof ImapAuthError) {
             return davErrorResult(err);
           }
+          // The old block, carried whole where it fits beside this call's
+          // mail states. What does not fit is dropped from the end and said.
+          const kept = [...(prior?.calendar?.calendars ?? [])];
+          while (kept.length > 0 && !fits(kept)) kept.pop();
+          const dropped = (prior?.calendar?.calendars.length ?? 0) - kept.length;
           calendar = {
             calendars: [],
             notCovered: [],
@@ -846,18 +922,15 @@ export function registerChangesTool(
                 : err instanceof DavConnectError
                   ? "connection"
                   : "unavailable",
+            ...(dropped > 0 ? { dropped } : {}),
           };
-          freshCalendar = prior?.calendar ?? null;
+          freshCalendar =
+            prior?.calendar == null ? null : { takenAt: prior.calendar.takenAt, calendars: kept };
         }
 
         const fresh = await sealMarker(
           {
-            folders: [
-              ...checks.flatMap((check) =>
-                check.state === null ? [] : [check.state],
-              ),
-              ...carried,
-            ],
+            folders: freshFolders,
             calendar: freshCalendar,
             mintedAt: Math.floor(Date.now() / 1000),
           },

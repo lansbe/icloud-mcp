@@ -68,6 +68,20 @@ export const MAX_CHANGE_FOLDERS = 5;
 export const MAX_CHANGE_CALENDARS = 64;
 
 /**
+ * The longest marker, sealed, in characters. The one bound on size.
+ *
+ * The tool's input schema refuses a longer marker, so a marker this server
+ * seals must never be longer: one that was could never be passed back, and the
+ * only way out would be a new starting point, every time. `sealMarker` refuses
+ * to seal past it, `readMarker` refuses to read past it, and the change check
+ * budgets against it through `fitsInMarker` so that it is never reached.
+ */
+export const MAX_MARKER_LENGTH = 4096;
+
+/** A seal is HMAC-SHA-256: 32 bytes, 43 base64url characters. */
+const SEAL_LENGTH = 43;
+
+/**
  * A sync token longer than this is refused. iCloud's are far shorter.
  *
  * Exported so the calendar check treats a longer token from the server as no
@@ -324,6 +338,25 @@ function wireOf(content: MarkerContent): WirePayload {
   };
 }
 
+/**
+ * The length a sealed marker for this content will have, exactly. Pure.
+ *
+ * The seal's own length is fixed, so nothing needs signing to know it.
+ */
+export function sealedLength(content: MarkerContent): number {
+  const payloadPart = toBase64Url(TOKEN_ENCODER.encode(JSON.stringify(wireOf(content))));
+  return payloadPart.length + SEPARATOR.length + SEAL_LENGTH;
+}
+
+/**
+ * Whether this content would seal into a marker this server reads back: the
+ * shape check reading uses, and the size bound the tool's schema uses. Pure.
+ */
+export function fitsInMarker(content: MarkerContent): boolean {
+  if (contentOf(JSON.parse(JSON.stringify(wireOf(content)))) === null) return false;
+  return sealedLength(content) <= MAX_MARKER_LENGTH;
+}
+
 /** The bytes the seal covers: the label, the user id, a colon, the payload part. */
 function signedBytes(userId: string, payloadPart: string): Uint8Array {
   return TOKEN_ENCODER.encode(`${DOMAIN_LABEL}${userId}:${payloadPart}`);
@@ -333,7 +366,8 @@ function signedBytes(userId: string, payloadPart: string): Uint8Array {
  * Seal a marker for one user.
  *
  * Refuses content that would not read back, with the same shape check reading
- * uses. Refuses with the confirmation module's own error when the key is
+ * uses, and content that would seal longer than `MAX_MARKER_LENGTH`. Refuses
+ * with the confirmation module's own error when the key is
  * unusable, because that is a server fault and not a bad marker.
  */
 export async function sealMarker(
@@ -350,6 +384,10 @@ export async function sealMarker(
   }
 
   const payloadPart = toBase64Url(TOKEN_ENCODER.encode(JSON.stringify(wire)));
+  // Never a marker the tool's schema would refuse on the way back in.
+  if (payloadPart.length + SEPARATOR.length + SEAL_LENGTH > MAX_MARKER_LENGTH) {
+    throw new MarkerRefusedError();
+  }
   const mac = await crypto.subtle.sign(
     "HMAC",
     key,
@@ -376,6 +414,7 @@ export async function readMarker(
   secret: string | undefined,
 ): Promise<MarkerReading> {
   if (typeof token !== "string") throw new MarkerRefusedError();
+  if (token.length > MAX_MARKER_LENGTH) throw new MarkerRefusedError();
   const parts = token.split(SEPARATOR);
   if (parts.length !== 2) throw new MarkerRefusedError();
   const [payloadPart, macPart] = parts;

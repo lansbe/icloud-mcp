@@ -52,6 +52,7 @@ import {
   MAX_CHANGE_CALENDARS,
   MAX_SYNC_TOKEN_LENGTH,
   calendarKeyOf,
+  fitsInMarker,
 } from "../change-marker";
 import type { CalendarBlock, CalendarState } from "../change-marker";
 import type { Env } from "../env";
@@ -1150,6 +1151,14 @@ async function reportOutcome(
  * Failures at the home listing are thrown to the caller, which decides what
  * the whole calendar side says. A sign-in refusal there is a real one.
  *
+ * **Every kept state must fit the marker (CR-01).** `fits` answers whether a
+ * list of calendar states still seals into a marker the tool reads back; the
+ * caller passes one that includes its own mail states. A calendar whose state
+ * would not fit, and every calendar after it in URL order, is `not_checked`
+ * with `marker_full`: no further request is sent for it and no state is kept.
+ * A marker the tool's own schema refused could never be passed back, so
+ * change detection would never work again for that account.
+ *
  * Nothing here writes and nothing is cached.
  */
 export async function calendarChangesSince(
@@ -1158,6 +1167,14 @@ export async function calendarChangesSince(
   davFetch: DavFetch,
   prior: CalendarBlock | null,
   restartAll: boolean,
+  fits: (calendars: readonly CalendarState[]) => boolean = (calendars) => {
+    const now = Math.floor(Date.now() / 1000);
+    return fitsInMarker({
+      folders: [],
+      calendar: { takenAt: now, calendars: [...calendars] },
+      mintedAt: now,
+    });
+  },
 ): Promise<CalendarChanges> {
   return withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
     const collections = await fetchCollectionStates(davFetch, resolved);
@@ -1177,6 +1194,10 @@ export async function calendarChangesSince(
     const seenKeys = new Set<string>();
     let stopped: CalendarNotCheckedReason | null = null;
     let rowBudget = MAX_CHANGE_EVENT_ROWS;
+    // Set once a state did not fit: every calendar after it is marker_full.
+    let full = false;
+    const room = (state: CalendarState): boolean =>
+      freshStates.length < MAX_CHANGE_CALENDARS && fits([...freshStates, state]);
 
     for (const collection of collections) {
       const calendarId = encodeCalendarId({ collectionUrl: collection.url });
@@ -1200,18 +1221,33 @@ export async function calendarChangesSince(
         events: [] as ChangedEventRow[],
       };
 
-      // More calendars than one marker may hold: the rest are not checked, cost
-      // no request, and keep no state, because there is no room to keep one.
-      if (freshStates.length >= MAX_CHANGE_CALENDARS) {
+      // No room left in the marker: not checked, no request, and no state
+      // kept, because there is nowhere to keep one.
+      const markFull = (): void => {
+        full = true;
         calendars.push({ ...base, state: "not_checked", mechanism: null, reason: "marker_full" });
+      };
+      // Every answer that keeps a state goes through here, so none is kept
+      // that would push the marker past what the tool reads back.
+      const keep = (change: CalendarChange, state: CalendarState): void => {
+        if (!room(state)) {
+          markFull();
+          return;
+        }
+        calendars.push(change);
+        freshStates.push(state);
+      };
+      if (full || freshStates.length >= MAX_CHANGE_CALENDARS) {
+        markFull();
         continue;
       }
       const notChecked = (
         reason: CalendarNotCheckedReason,
         mechanism: CalendarSyncMechanism | null,
       ): void => {
-        calendars.push({ ...base, state: "not_checked", mechanism, reason });
-        if (old !== null) freshStates.push(carryOf(old));
+        const change: CalendarChange = { ...base, state: "not_checked", mechanism, reason };
+        if (old === null) calendars.push(change);
+        else keep(change, carryOf(old));
       };
 
       if (stopped !== null) {
@@ -1224,22 +1260,23 @@ export async function calendarChangesSince(
       const startState: CalendarChangeState = restartAll ? "restarted" : "started";
 
       if (property !== null && starting) {
-        calendars.push({ ...base, state: startState, mechanism: "propfind-token" });
-        freshStates.push({ key, syncToken: property });
+        keep({ ...base, state: startState, mechanism: "propfind-token" }, { key, syncToken: property });
         continue;
       }
 
       if (property !== null && old !== null && property === old.syncToken) {
-        calendars.push({
-          ...base,
-          state: "no_changes",
-          added: 0,
-          changed: 0,
-          addedOrChanged: 0,
-          removed: 0,
-          mechanism: "propfind-token",
-        });
-        freshStates.push({ key, syncToken: property });
+        keep(
+          {
+            ...base,
+            state: "no_changes",
+            added: 0,
+            changed: 0,
+            addedOrChanged: 0,
+            removed: 0,
+            mechanism: "propfind-token",
+          },
+          { key, syncToken: property },
+        );
         continue;
       }
 
@@ -1263,13 +1300,10 @@ export async function calendarChangesSince(
       ): Promise<void> => {
         const outcome = await reportOutcome(davFetch, collection.url, resolved.homeUrl, "");
         if (outcome.kind === "answer") {
-          calendars.push({
-            ...base,
-            state,
-            mechanism,
-            ...(why !== undefined ? { why } : {}),
-          });
-          freshStates.push({ key, syncToken: outcome.answer.token as string });
+          keep(
+            { ...base, state, mechanism, ...(why !== undefined ? { why } : {}) },
+            { key, syncToken: outcome.answer.token as string },
+          );
         } else if (outcome.kind === "stop") {
           stopped = outcome.reason;
           notChecked(stopped, mechanism);
@@ -1293,8 +1327,10 @@ export async function calendarChangesSince(
       );
       if (outcome.kind === "refused") {
         if (property !== null) {
-          calendars.push({ ...base, state: "restarted", mechanism, why: outcome.why });
-          freshStates.push({ key, syncToken: property });
+          keep(
+            { ...base, state: "restarted", mechanism, why: outcome.why },
+            { key, syncToken: property },
+          );
         } else {
           // The old token was refused and the listing gave none: a second,
           // empty-token REPORT is the only way to a new starting point.
@@ -1317,6 +1353,13 @@ export async function calendarChangesSince(
       }
 
       const answer = outcome.answer;
+      const freshState: CalendarState = { key, syncToken: answer.token as string };
+      // Checked before the detail read, so no row is fetched for a calendar
+      // whose state the marker has no room to keep.
+      if (!room(freshState)) {
+        markFull();
+        continue;
+      }
       // The rows, against the time THIS calendar's token was taken: a carried
       // calendar keeps its own, older time (D-16).
       const detail = await changedEventRows(
@@ -1343,7 +1386,7 @@ export async function calendarChangesSince(
         mechanism,
         events: detail.rows,
       });
-      freshStates.push({ key, syncToken: answer.token as string });
+      freshStates.push(freshState);
       // A throttle or a lost connection on the detail read stops the calendar
       // side after this calendar, whose counts are already exact (D-29).
       if (detail.stop !== null) stopped = detail.stop;

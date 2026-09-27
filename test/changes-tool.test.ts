@@ -19,6 +19,7 @@ vi.mock("../src/mail/socket", async (importOriginal) => ({
 import type { MarkerContent } from "../src/change-marker";
 import {
   MARKER_VERSION,
+  MAX_MARKER_LENGTH,
   calendarKeyOf,
   readMarker,
   sealMarker,
@@ -1542,5 +1543,58 @@ describe("changes_since names the changed events, inside the fence (CHNG-01, CHN
     }
     // A calendar with no rows keeps the name-only entry.
     expect(untrusted[encodeCalendarId({ collectionUrl: FAMILY_CAL })]).toEqual({ name: "Family" });
+  });
+});
+
+describe("the tool never hands out a marker its own schema refuses (CR-01)", () => {
+  const cal = (n: number) => `${DAV_HOME}c${String(n).padStart(2, "0")}/`;
+
+  it("forty calendars with long tokens: the marker stops at the cap, the rest are marker_full, and it is accepted back", async () => {
+    const cals = Array.from({ length: 40 }, (_, n) => ({
+      url: cal(n),
+      name: `Cal ${n}`,
+      token: `${String(n).padStart(2, "0")}${"t".repeat(98)}`,
+    }));
+    vi.stubGlobal("fetch", davStub(cals).fetch);
+    vi.mocked(connectImap).mockReturnValueOnce(statusSession(4392, "118") as never);
+
+    const answer = await changesCallback()({});
+    expect(answer.isError).toBeUndefined();
+    const trusted = trustedOf(answer);
+    expect(trusted.marker.length).toBeLessThanOrEqual(MAX_MARKER_LENGTH);
+    expect(changesSchema().safeParse({ marker: trusted.marker }).success).toBe(true);
+
+    const calendars = trusted.counts.filter((one: any) => one.source === "calendar");
+    const kept = calendars.filter((one: any) => one.state === "started");
+    const full = calendars.filter((one: any) => one.reason === "marker_full");
+    expect(kept.length).toBeGreaterThan(0);
+    expect(full.length).toBeGreaterThan(0);
+    expect(kept.length + full.length).toBe(40);
+    // URL order: every kept calendar comes before every one left out.
+    expect(calendars.slice(0, kept.length).every((one: any) => one.state === "started")).toBe(true);
+    expect(trusted.overall).toMatch(/not tracked/);
+
+    const { userId } = await ownerPrincipal();
+    const reading = await readMarker(trusted.marker, userId, env.CONFIRM_SECRET);
+    if (reading.kind !== "current") throw new Error("marker not current");
+    expect(reading.content.calendar!.calendars).toHaveLength(kept.length);
+
+    // Passed back, it is read, not refused, and nothing is gone.
+    vi.mocked(connectImap).mockReturnValueOnce(statusSession(4392, "118") as never);
+    const again = trustedOf(await changesCallback()({ marker: trusted.marker }));
+    expect(again.refusal).toBeUndefined();
+    expect(again.goneCalendars).toBe(0);
+    expect(again.marker.length).toBeLessThanOrEqual(MAX_MARKER_LENGTH);
+  });
+
+  it("folder names too long to fit one marker are refused before any socket", async () => {
+    const folders = ["A", "B", "C"].map((letter) =>
+      encodeFolderId({ mailbox: letter.repeat(1000) }),
+    );
+    const answer = await changesCallback()({ folders });
+    expect(connectImap).not.toHaveBeenCalled();
+    const body = trustedOf(answer);
+    expect(body.refusal).toBe("marker-too-long");
+    expect(body.marker).toBeUndefined();
   });
 });

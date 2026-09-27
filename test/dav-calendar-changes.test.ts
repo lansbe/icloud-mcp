@@ -1086,3 +1086,41 @@ describe("calendarChangesSince: calendars past what one marker holds (WR-06)", (
     expect(result.fresh.calendars.map((one) => one.syncToken)).not.toContain("t-64");
   });
 });
+
+describe("calendarChangesSince: every kept state fits the marker (CR-01)", () => {
+  it("a moved calendar whose new state does not fit is marker_full: no detail read, nothing kept, not gone", async () => {
+    const cals: Cal[] = [
+      { url: FAMILY, name: "Family", token: "family-2" },
+      { url: WORK, name: "Work", token: "work-2" },
+    ];
+    const stub = davStub(cals, (url) => syncAnswer(ok(`${new URL(url).pathname}x.ics`), "n"));
+    await warm(stub);
+    const result = await calendarChangesSince(
+      env,
+      principal,
+      createDavFetch(owner),
+      await block([
+        [FAMILY, "family-1"],
+        [WORK, "work-1"],
+      ]),
+      false,
+      (states) => states.length <= 1,
+    );
+
+    // Family: its sync REPORT and its multiget. Work: its sync REPORT only.
+    expect(stub.log.map((one) => `${one.method} ${one.url}`)).toEqual([
+      `PROPFIND ${HOME}`,
+      `REPORT ${FAMILY}`,
+      `REPORT ${FAMILY}`,
+      `REPORT ${WORK}`,
+    ]);
+    expect(result.calendars.map((one) => [one.state, one.reason])).toEqual([
+      ["changes", undefined],
+      ["not_checked", "marker_full"],
+    ]);
+    expect(result.fresh.calendars).toEqual([
+      { key: await calendarKeyOf(FAMILY), syncToken: "n" },
+    ]);
+    expect(result.gone).toBe(0);
+  });
+});
