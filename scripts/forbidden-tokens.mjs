@@ -1353,6 +1353,245 @@ export function collectMutatingSessionImports(relativePath, contents) {
 }
 
 /**
+ * The copy of one message into another folder, built in exactly one place of
+ * the source tree.
+ *
+ * THE RULE. Exactly one site under `src/` builds the `UID COPY` command line,
+ * and it is inside the move step in `src/mail/triage.ts` (phase 21,
+ * `moveMessageWithin`, step 2). A move is copy, then mark, then remove, and the
+ * copy is the half that places a message.
+ *
+ * WHY A COUNT. Zero is a violation as two is. The copy places a message into a
+ * folder, and CLAUDE.md §2 already says a second path that places a message is
+ * a decision, never a refactor: the drafts write is counted for that reason,
+ * and this one is counted for the same one. Zero means the move step was
+ * deleted, renamed or emptied. That direction is the quieter one: nothing
+ * fails on the way out, because the tests that covered the deleted code leave
+ * with it.
+ *
+ * WHY THE OWNER FILE MAY HOLD ONLY ONE. The collector takes EVERY match with a
+ * fresh global copy per file, as the mutating open's does, and the checker
+ * allows the owner one entry. A second copy inside `src/mail/triage.ts` itself
+ * is a second site, exactly as one in another file is.
+ *
+ * COMMENTS. The collector matches against the file with its comment LINES
+ * blanked (`withoutCommentLines`), so a commented-out copy does not satisfy the
+ * count and cannot keep the missing arm quiet (20-REVIEW WR-06). A comment
+ * trailing code on the same line still counts, for the reason the
+ * `MUTATING_OPEN_COMMAND` docstring gives, and a test pins that row.
+ *
+ * WHAT IT DOES NOT SEE. Three shapes are outside this pattern's reach:
+ *
+ *   1. a command line carrying a literal tag rather than an interpolated one;
+ *   2. the command words held in a variable and handed to the generic sender
+ *      in `src/mail/imap-session.ts`;
+ *   3. a lowercase command word. The wire is case-insensitive, so it would
+ *      work on the server. The pattern stays case-sensitive so ordinary prose
+ *      cannot trip it.
+ *
+ * The one real site is held one layer up instead, by the byte-exact recorded
+ * command lines in `test/move.test.ts`, which read what was actually sent
+ * rather than the shape of the source that sent it.
+ *
+ * PROSE DISCIPLINE. Describe this command BY ROLE under `src/` -- "the copy",
+ * "step 2 of the move" -- and never by its name followed by an argument. A
+ * trailing comment still counts. Phase 22 must reuse the move step rather than
+ * build its own copy (its contract C-05); a second copy is exactly what this
+ * count refuses.
+ *
+ * THE SHAPE. The same anchoring as `APPEND_COMMAND`: after an interpolated tag,
+ * or at the head of a quoted string, case-sensitive, with a trailing space.
+ * Measured before arming: exactly one match under `src/`, in the owner.
+ *
+ * Collected from `src/` only. Tests and fixtures spell the command on purpose,
+ * to script the server's side and to assert the recorded line byte for byte,
+ * and a fixture is not a code path.
+ *
+ * No `g` flag. The collector builds its own global copy per file.
+ */
+export const COPY_COMMAND = /(?:\$\{[^}\n]*\}|["'`])\s*UID COPY /;
+
+/** The one file under `COPY_SCOPE` permitted to match `COPY_COMMAND`, and only
+ *  once. */
+export const COPY_OWNER = "src/mail/triage.ts";
+
+/** The tree `COPY_COMMAND` is collected from. Tests and fixtures spell the
+ *  command on purpose. */
+export const COPY_SCOPE = "src/";
+
+/**
+ * The copy sites one file contributes, as `scan()` collects them.
+ *
+ * EVERY match, with a fresh global copy per call, against the file with its
+ * comment lines blanked; positions are unchanged by the blanking. An empty
+ * list for a file outside `COPY_SCOPE`. Exported so the tests can feed the
+ * checker a real source sample through the collector `scan()` itself uses.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectCopySites(relativePath, contents) {
+  if (!relativePath.startsWith(COPY_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  return [...code.matchAll(new RegExp(COPY_COMMAND, "g"))].map((match) => ({
+    file: relativePath,
+    ...positionOf(code, match.index),
+  }));
+}
+
+/**
+ * The removal mark on one message, set in exactly one place of the source
+ * tree.
+ *
+ * THE RULE. Exactly one site under `src/` writes the source text `(\\Deleted)`
+ * -- the mark inside a flag-change string, which is two backslash characters in
+ * the file -- and it is inside the move step in `src/mail/triage.ts` (step 4,
+ * the conditional flag change that follows a proven copy).
+ *
+ * WHY A COUNT. Zero is a violation as two is. D-04: no permanent delete exists
+ * anywhere, and the only removal is the one that follows a proven copy. A
+ * message carrying the mark is one removal away from gone, so a second place
+ * that sets it is the first half of a permanent delete arriving without a
+ * decision. Zero means the move step was deleted, renamed or emptied, and
+ * nothing fails on the way out.
+ *
+ * WHY THE OWNER FILE MAY HOLD ONLY ONE. The collector takes every match, so a
+ * second mark inside `src/mail/triage.ts` itself counts as a second site.
+ *
+ * COMMENTS. Whole-line comments are blanked before matching, so a mark that
+ * survives only in a comment counts as zero. A comment trailing code on the
+ * same line still counts, and a test pins that row.
+ *
+ * WHAT IT DOES NOT SEE. The pattern is anchored on the flag inside its own
+ * parentheses, not on a command word, so a literal tag is irrelevant to it.
+ * Four shapes are outside its reach:
+ *
+ *   1. a lowercase flag name. Flag names are case-insensitive on the wire;
+ *   2. the flag held in a variable and interpolated into the parentheses, or
+ *      the whole line held in a variable and handed to the generic sender;
+ *   3. the mark listed beside another flag inside the same parentheses;
+ *   4. the flag check strings the move step reads (`"\\Deleted"` with no
+ *      parentheses), which are reads of the server's reply and are not counted
+ *      on purpose.
+ *
+ * The one real site is held one layer up by the byte-exact recorded command
+ * lines in `test/move.test.ts`.
+ *
+ * PROSE DISCIPLINE. Describe the mark BY ROLE under `src/` -- "the removal
+ * mark" -- and never spell it in parentheses. Phase 22 reuses the move step
+ * rather than setting the mark itself (its contract C-05).
+ *
+ * Measured before arming: exactly one match under `src/`, in the owner.
+ *
+ * Collected from `src/` only. Tests and fixtures spell the mark on purpose.
+ *
+ * No `g` flag. The collector builds its own global copy per file.
+ */
+export const REMOVAL_MARK = /\(\\\\Deleted\)/;
+
+/** The one file under `REMOVAL_MARK_SCOPE` permitted to match `REMOVAL_MARK`,
+ *  and only once. */
+export const REMOVAL_MARK_OWNER = "src/mail/triage.ts";
+
+/** The tree `REMOVAL_MARK` is collected from. Tests and fixtures spell the mark
+ *  on purpose. */
+export const REMOVAL_MARK_SCOPE = "src/";
+
+/**
+ * The removal-mark sites one file contributes, as `scan()` collects them.
+ * Every match, fresh global copy per call, comment lines blanked, positions
+ * unchanged. An empty list outside `REMOVAL_MARK_SCOPE`.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectRemovalMarks(relativePath, contents) {
+  if (!relativePath.startsWith(REMOVAL_MARK_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  return [...code.matchAll(new RegExp(REMOVAL_MARK, "g"))].map((match) => ({
+    file: relativePath,
+    ...positionOf(code, match.index),
+  }));
+}
+
+/**
+ * The removal of one marked message, built in exactly one place of the source
+ * tree.
+ *
+ * THE RULE. Exactly one site under `src/` builds the `UID EXPUNGE` command
+ * line, and it is inside the move step in `src/mail/triage.ts` (step 5, sent
+ * only when the copy was proven and the mark was set). The folder-wide forms
+ * are banned outright by `mailbox-wide-expunge` (21-01); this count is the
+ * other half, and stops a second UID-scoped removal appearing anywhere.
+ *
+ * WHY A COUNT. Zero is a violation as two is. D-04: the only removal anywhere
+ * follows a proven copy. A second removal site is how a permanent delete would
+ * arrive without a decision: it is the same one line, somewhere the copy did
+ * not come first. Zero means the move step was deleted, renamed or emptied, and
+ * nothing fails on the way out, because the tests that covered it leave with
+ * it.
+ *
+ * WHY THE OWNER FILE MAY HOLD ONLY ONE. The collector takes every match, so a
+ * second removal inside `src/mail/triage.ts` itself -- a "delete" verb written
+ * beside the move step -- counts as a second site.
+ *
+ * COMMENTS. Whole-line comments are blanked before matching, so a removal that
+ * survives only in a comment counts as zero. A comment trailing code on the
+ * same line still counts, and a test pins that row.
+ *
+ * WHAT IT DOES NOT SEE. Three shapes are outside this pattern's reach:
+ *
+ *   1. a command line carrying a literal tag rather than an interpolated one;
+ *   2. the command words held in a variable and handed to the generic sender
+ *      in `src/mail/imap-session.ts`;
+ *   3. a lowercase command word, which the wire would accept.
+ *
+ * The one real site is held one layer up by the byte-exact recorded command
+ * lines in `test/move.test.ts`.
+ *
+ * PROSE DISCIPLINE. Describe this command BY ROLE under `src/` -- "the
+ * removal", "step 5 of the move" -- and never by its name followed by an
+ * argument. Phase 22 must reuse the move step rather than build its own
+ * removal (its contract C-05).
+ *
+ * THE SHAPE. The same anchoring as `APPEND_COMMAND`. Measured before arming:
+ * exactly one match under `src/`, in the owner.
+ *
+ * Collected from `src/` only. Tests and fixtures spell the command on purpose.
+ *
+ * No `g` flag. The collector builds its own global copy per file.
+ */
+export const REMOVAL_COMMAND = /(?:\$\{[^}\n]*\}|["'`])\s*UID EXPUNGE /;
+
+/** The one file under `REMOVAL_SCOPE` permitted to match `REMOVAL_COMMAND`, and
+ *  only once. */
+export const REMOVAL_OWNER = "src/mail/triage.ts";
+
+/** The tree `REMOVAL_COMMAND` is collected from. Tests and fixtures spell the
+ *  command on purpose. */
+export const REMOVAL_SCOPE = "src/";
+
+/**
+ * The removal sites one file contributes, as `scan()` collects them. Every
+ * match, fresh global copy per call, comment lines blanked, positions
+ * unchanged. An empty list outside `REMOVAL_SCOPE`.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectRemovalSites(relativePath, contents) {
+  if (!relativePath.startsWith(REMOVAL_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  return [...code.matchAll(new RegExp(REMOVAL_COMMAND, "g"))].map((match) => ({
+    file: relativePath,
+    ...positionOf(code, match.index),
+  }));
+}
+
+/**
  * A bare network call, permitted in exactly one module of the subscription-feed
  * tree.
  *
@@ -2087,6 +2326,12 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "mutating-open-missing",
   "mutating-session-importer-outside-triage",
   "mutating-session-importer-missing",
+  "copy-site-duplicated",
+  "copy-site-missing",
+  "removal-mark-duplicated",
+  "removal-mark-missing",
+  "removal-site-duplicated",
+  "removal-site-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -2204,7 +2449,7 @@ function walk(absoluteDir, collected = []) {
  * the middle of a line may sit inside a string or a regex literal, and reading
  * one of those as a comment would blank real code. So a comment trailing code
  * is kept, and so is a block comment opened after code. Used by the two
- * mutating-path counts only.
+ * mutating-path counts and the three move-step counts only.
  *
  * @param {string} text
  * @returns {string}
@@ -2332,6 +2577,9 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const confirmLineComposers = [];
   const mutatingOpens = [];
   const mutatingSessionImporters = [];
+  const copySites = [];
+  const removalMarks = [];
+  const removalSites = [];
   const davWriteExports = {};
 
   for (const absolute of files) {
@@ -2452,6 +2700,12 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
     mutatingSessionImporters.push(
       ...collectMutatingSessionImports(relativePath, contents),
     );
+    // The three move-step counts (phase 21). The verbs module is not skipped:
+    // it holds the one site of each. Every match, comment lines blanked, a
+    // fresh global copy per file.
+    copySites.push(...collectCopySites(relativePath, contents));
+    removalMarks.push(...collectRemovalMarks(relativePath, contents));
+    removalSites.push(...collectRemovalSites(relativePath, contents));
     // The write-module manifest collects NAMES rather than a match position, so
     // it is the one collector that keys by module instead of appending to a list.
     // A declared module that is never walked therefore has no key at all, which
@@ -2477,6 +2731,9 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   violations.push(
     ...checkMutatingSessionImportOwnership(mutatingSessionImporters),
   );
+  violations.push(...checkCopySiteOwnership(copySites));
+  violations.push(...checkRemovalMarkOwnership(removalMarks));
+  violations.push(...checkRemovalSiteOwnership(removalSites));
   violations.push(...checkDavWriteCoverage(davWriteExports));
 
   return violations.sort(
@@ -2940,6 +3197,121 @@ export function checkMutatingSessionImportOwnership(importers) {
       pattern: "mutating-session-importer-missing",
       patternIndex: FORBIDDEN.length + 26,
       why: `No file under ${MUTATING_SESSION_SCOPE} imports the mutating orchestrator, which means ${MUTATING_SESSION_OWNER} was deleted, renamed, emptied, or rewired to reach it some other way. Zero is as much a violation as two: "no second importer" is trivially true of a tree where the verbs are gone, and nothing reports their absence. Restore the import in ${MUTATING_SESSION_OWNER}. If the verbs really moved, that is a change to the safety boundary: get a decision, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The one copy, as a pure function over a list of construction sites.
+ *
+ * The mutating open's checker body: the owner is permitted ONE site, and a
+ * second site inside the owner gets the same id as one in another file. See the
+ * `COPY_COMMAND` docstring for why this is a count and for what it cannot see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} sites
+ */
+export function checkCopySiteOwnership(sites) {
+  const violations = [];
+  let ownerSites = 0;
+  for (const site of sites) {
+    if (site.file === COPY_OWNER) {
+      ownerSites += 1;
+      if (ownerSites === 1) continue;
+    }
+    violations.push({
+      file: site.file,
+      line: site.line,
+      column: site.column,
+      pattern: "copy-site-duplicated",
+      patternIndex: FORBIDDEN.length + 27,
+      why: `A second site that builds the copy command -- either in another module under ${COPY_SCOPE}, or a second one inside ${COPY_OWNER} itself, which counts the same. The copy places a message into a folder, and CLAUDE.md section 2 says a second path that places a message is a decision, never a refactor. The one copy lives in the move step in ${COPY_OWNER}, where it is followed by the proof, the mark and the re-read. Call moveMessages (or a tool built on it) instead of building a copy of your own. If a second site genuinely belongs, get a decision on the safety boundary, then change the owner, never the pattern.`,
+    });
+  }
+  if (sites.length === 0) {
+    violations.push({
+      file: COPY_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "copy-site-missing",
+      patternIndex: FORBIDDEN.length + 28,
+      why: `No file under ${COPY_SCOPE} builds the copy command, which means the move step in ${COPY_OWNER} was deleted, renamed, or emptied. Zero is as much a violation as two, and it is the quieter of the pair: nothing goes red on the way out, because the tests that covered the deleted code leave with it. A copy that survives only in a comment counts as zero. Restore the copy inside the move step. If it really moved, that is a change to the safety boundary: get a decision, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The one removal mark, as a pure function over a list of sites.
+ *
+ * The mutating open's checker body. See the `REMOVAL_MARK` docstring for why
+ * this is a count and for what it cannot see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} sites
+ */
+export function checkRemovalMarkOwnership(sites) {
+  const violations = [];
+  let ownerSites = 0;
+  for (const site of sites) {
+    if (site.file === REMOVAL_MARK_OWNER) {
+      ownerSites += 1;
+      if (ownerSites === 1) continue;
+    }
+    violations.push({
+      file: site.file,
+      line: site.line,
+      column: site.column,
+      pattern: "removal-mark-duplicated",
+      patternIndex: FORBIDDEN.length + 29,
+      why: `A second site that sets the removal mark -- either in another module under ${REMOVAL_MARK_SCOPE}, or a second one inside ${REMOVAL_MARK_OWNER} itself, which counts the same. D-04: no permanent delete exists anywhere, and the only removal follows a proven copy. A message carrying the mark is one step from gone, so a second place that sets it is the first half of a permanent delete arriving without a decision. Use the move step in ${REMOVAL_MARK_OWNER} (moveMessages) instead; moving to Trash is the recoverable answer. If a second site genuinely belongs, get a decision on the safety boundary, then change the owner, never the pattern.`,
+    });
+  }
+  if (sites.length === 0) {
+    violations.push({
+      file: REMOVAL_MARK_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "removal-mark-missing",
+      patternIndex: FORBIDDEN.length + 30,
+      why: `No file under ${REMOVAL_MARK_SCOPE} sets the removal mark, which means the move step in ${REMOVAL_MARK_OWNER} was deleted, renamed, or emptied. Zero is as much a violation as two, and it is the quieter of the pair: nothing goes red on the way out, because the tests that covered the deleted code leave with it. A mark that survives only in a comment counts as zero. Restore the mark inside the move step. If it really moved, that is a change to the safety boundary: get a decision, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The one removal, as a pure function over a list of construction sites.
+ *
+ * The mutating open's checker body. See the `REMOVAL_COMMAND` docstring for why
+ * this is a count and for what it cannot see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} sites
+ */
+export function checkRemovalSiteOwnership(sites) {
+  const violations = [];
+  let ownerSites = 0;
+  for (const site of sites) {
+    if (site.file === REMOVAL_OWNER) {
+      ownerSites += 1;
+      if (ownerSites === 1) continue;
+    }
+    violations.push({
+      file: site.file,
+      line: site.line,
+      column: site.column,
+      pattern: "removal-site-duplicated",
+      patternIndex: FORBIDDEN.length + 31,
+      why: `A second site that builds the removal command -- either in another module under ${REMOVAL_SCOPE}, or a second one inside ${REMOVAL_OWNER} itself, which counts the same. D-04: the only removal anywhere follows a proven copy, and a second removal site is exactly how a permanent delete would arrive without a decision. Use the move step in ${REMOVAL_OWNER} (moveMessages) instead; moving to Trash is the recoverable answer. If a permanent delete is genuinely wanted, that is a decision on the safety boundary: get it, then change the owner, never the pattern.`,
+    });
+  }
+  if (sites.length === 0) {
+    violations.push({
+      file: REMOVAL_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "removal-site-missing",
+      patternIndex: FORBIDDEN.length + 32,
+      why: `No file under ${REMOVAL_SCOPE} builds the removal command, which means the move step in ${REMOVAL_OWNER} was deleted, renamed, or emptied. Zero is as much a violation as two, and it is the quieter of the pair: nothing goes red on the way out, because the tests that covered the deleted code leave with it. A removal that survives only in a comment counts as zero. Restore the removal inside the move step. If it really moved, that is a change to the safety boundary: get a decision, then change the owner, never the pattern.`,
     });
   }
   return violations;

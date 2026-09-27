@@ -23,6 +23,9 @@ import {
   CONFIRM_LINE_COMPOSER,
   CONFIRM_LINE_OWNER,
   CONFIRM_LINE_SCOPE,
+  COPY_COMMAND,
+  COPY_OWNER,
+  COPY_SCOPE,
   DAV_FETCH_CALL,
   DAV_FETCH_OWNER,
   DAV_HOST_LITERAL,
@@ -38,6 +41,9 @@ import {
   MUTATING_SESSION_SCOPE,
   collectMutatingOpens,
   collectMutatingSessionImports,
+  collectCopySites,
+  collectRemovalMarks,
+  collectRemovalSites,
   withoutCommentLines,
   OWNERSHIP_VIOLATION_IDS,
   PASSWORD_READER_IMPORT,
@@ -49,6 +55,12 @@ import {
   PROPS_READER,
   PROPS_READER_OWNER,
   PROPS_READER_SCOPE,
+  REMOVAL_COMMAND,
+  REMOVAL_MARK,
+  REMOVAL_MARK_OWNER,
+  REMOVAL_MARK_SCOPE,
+  REMOVAL_OWNER,
+  REMOVAL_SCOPE,
   SOCKET_IMPORT,
   SOCKET_OWNER,
   SUBSCRIPTION_FEED_FETCH_CALL,
@@ -57,6 +69,7 @@ import {
   checkAppendOwnership,
   checkCommitHook,
   checkConfirmLineOwnership,
+  checkCopySiteOwnership,
   checkDavFetchOwnership,
   checkDavHostOwnership,
   checkDavWriteCoverage,
@@ -65,6 +78,8 @@ import {
   checkPasswordReaderOwnership,
   checkPrincipalConstructorOwnership,
   checkPropsReaderOwnership,
+  checkRemovalMarkOwnership,
+  checkRemovalSiteOwnership,
   checkSocketOwnership,
   checkSubscriptionFeedFetchOwnership,
   davAlternationNames,
@@ -730,7 +745,12 @@ const NO_EXCLUSIONS = { excluded: new Set<string>() };
 // name as stale.
 // @ts-expect-error — Vite's `import.meta.glob` has no ambient declaration here; see above.
 const RAW_SOURCES: Record<string, string> = import.meta.glob(
-  ["../src/dav/*.ts", "../src/mail/service.ts", "../scripts/forbidden-tokens.mjs"],
+  [
+    "../src/dav/*.ts",
+    "../src/mail/service.ts",
+    "../src/mail/triage.ts",
+    "../scripts/forbidden-tokens.mjs",
+  ],
   { query: "?raw", import: "default", eager: true },
 );
 
@@ -4691,6 +4711,234 @@ describe("the mutating session has one importer (Phase 20, D-05, D-06)", () => {
   });
 });
 
+// Phase 21, plan 05 (TRIA-07, D-04). The copy, the removal mark and the removal
+// each have one site, inside the move step in src/mail/triage.ts. The three
+// counts share a shape, so one table drives one describe per count. The
+// commands are spelled out here on purpose: the counts are collected from src/
+// only, and this file is skipped by path for every rule.
+type MoveStepCount = {
+  title: string;
+  owner: string;
+  scope: string;
+  pattern: RegExp;
+  collect: (relativePath: string, contents: string) => Array<{ file: string; line: number; column: number }>;
+  check: (sites: ReadonlyArray<{ file: string; line: number; column: number }>) => Array<{
+    file: string;
+    line: number;
+    column: number;
+    pattern: string;
+    patternIndex: number;
+    why: string;
+  }>;
+  duplicated: string;
+  missing: string;
+  offset: number;
+  /** The shipped line, as it sits in the owner, with its indent. */
+  shipped: string;
+  /** Where the pattern's match starts on that line, 1-based. The two command
+   *  counts anchor on the backtick; the mark anchors on its own parenthesis. */
+  column: number;
+  /** The same site with other arguments: a second one. */
+  another: string;
+  /** Shapes the pattern must not fire on. */
+  quiet: string[];
+};
+
+const MOVE_STEP_COUNTS: MoveStepCount[] = [
+  {
+    title: "the copy has one site (Phase 21, CLAUDE.md section 2)",
+    owner: COPY_OWNER,
+    scope: COPY_SCOPE,
+    pattern: COPY_COMMAND,
+    collect: collectCopySites,
+    check: checkCopySiteOwnership,
+    duplicated: "copy-site-duplicated",
+    missing: "copy-site-missing",
+    offset: 27,
+    shipped: "      `UID COPY ${ref.uid} ${quoted}`,",
+    column: 7,
+    another: 'const line = "UID COPY 5 \\"Archive\\"";',
+    quiet: [
+      // The server's completion carrying the proof: a reply, not a command.
+      'const done = "a6 OK [COPYUID 7 4242 88] UID COPY completed";',
+      // A literal tag: outside the pattern's reach, listed in its docstring.
+      'const line = "a6 UID COPY 4242 x";',
+      // Prose that names the command bare.
+      " * The copy (UID COPY) comes first.",
+    ],
+  },
+  {
+    title: "the removal mark has one site (Phase 21, D-04)",
+    owner: REMOVAL_MARK_OWNER,
+    scope: REMOVAL_MARK_SCOPE,
+    pattern: REMOVAL_MARK,
+    collect: collectRemovalMarks,
+    check: checkRemovalMarkOwnership,
+    duplicated: "removal-mark-duplicated",
+    missing: "removal-mark-missing",
+    offset: 29,
+    // Two backslash characters in the source, as in the owner.
+    shipped: "      `UID STORE ${ref.uid} (UNCHANGEDSINCE ${modSeq}) +FLAGS (\\\\Deleted)`,",
+    column: 63,
+    another: 'const line = "UID STORE 5 +FLAGS.SILENT (\\\\Deleted)";',
+    quiet: [
+      // The flag check the move step reads: no parentheses around it.
+      '  if (!keepsFlag(session.permanentFlags, "\\\\Deleted")) {',
+      // The mark beside another flag: outside the pattern's reach, listed in
+      // its docstring.
+      'const line = "UID STORE 5 +FLAGS (\\\\Seen \\\\Deleted)";',
+      // A lowercase flag name, which the wire would accept: listed too.
+      'const line = "UID STORE 5 +FLAGS (\\\\deleted)";',
+    ],
+  },
+  {
+    title: "the removal has one site (Phase 21, D-04)",
+    owner: REMOVAL_OWNER,
+    scope: REMOVAL_SCOPE,
+    pattern: REMOVAL_COMMAND,
+    collect: collectRemovalSites,
+    check: checkRemovalSiteOwnership,
+    duplicated: "removal-site-duplicated",
+    missing: "removal-site-missing",
+    offset: 31,
+    shipped: "      `UID EXPUNGE ${ref.uid}`,",
+    column: 7,
+    another: "const line = `${tag} UID EXPUNGE ${uid}`;",
+    quiet: [
+      // The server's untagged removal notice: a reply, not a command.
+      'const notice = "* 5 EXPUNGE";',
+      // A literal tag: outside the pattern's reach, listed in its docstring.
+      'const line = "a8 UID EXPUNGE 4242";',
+      // Prose that names the command bare.
+      " * The removal (UID EXPUNGE) comes last.",
+    ],
+  },
+];
+
+for (const count of MOVE_STEP_COUNTS) {
+  describe(count.title, () => {
+    const owner = { file: count.owner, line: 640, column: 7 };
+    // The realistic second site: the tool layer, which holds the user's
+    // request and could build the command itself.
+    const elsewhere = { file: "src/mcp/tools/mail.ts", line: 120, column: 9 };
+    /** A fresh copy per probe, so no state can carry between samples. */
+    const fires = (sample: string): boolean =>
+      new RegExp(count.pattern.source, count.pattern.flags).test(sample);
+    /** The shipped line with its leading `` ` `` or quote, in a comment. */
+    const quoted = count.shipped.trim().replace(/,$/, "");
+
+    it("names the verbs module as the owner, and collects from the source tree only", () => {
+      expect(count.owner).toBe("src/mail/triage.ts");
+      expect(count.scope).toBe("src/");
+      expect(count.pattern.flags).toBe("");
+    });
+
+    it("passes when the owner holds one site", () => {
+      expect(count.check([owner])).toEqual([]);
+      expect(count.check(count.collect(count.owner, `${count.shipped}\n`))).toEqual([]);
+    });
+
+    it("reports the SECOND site inside the owner, not the first", () => {
+      const second = { file: count.owner, line: 700, column: 11 };
+      const violations = count.check([owner, second]);
+      expect(violations.map((v) => v.pattern)).toEqual([count.duplicated]);
+      expect(violations[0]!.file).toBe(count.owner);
+      expect(violations[0]!.line).toBe(second.line);
+      expect(violations[0]!.column).toBe(second.column);
+      expect(violations[0]!.why).toContain(count.owner);
+      // Collected, not hand-made: two sites in one owner file are two.
+      const collected = count.collect(count.owner, `${count.shipped}\n${count.another}\n`);
+      expect(collected).toHaveLength(2);
+      expect(count.check(collected).map((v) => v.pattern)).toEqual([count.duplicated]);
+    });
+
+    it("reports a site in the tool layer as duplicated, naming that file", () => {
+      const violations = count.check([owner, elsewhere]);
+      expect(violations.map((v) => v.pattern)).toEqual([count.duplicated]);
+      expect(violations[0]!.file).toBe(elsewhere.file);
+      expect(violations[0]!.line).toBe(elsewhere.line);
+      expect(violations[0]!.column).toBe(elsewhere.column);
+      const collected = [
+        ...count.collect(count.owner, `${count.shipped}\n`),
+        ...count.collect("src/mcp/tools/mail.ts", `${count.shipped}\n`),
+      ];
+      expect(count.check(collected).map((v) => [v.pattern, v.file])).toEqual([
+        [count.duplicated, "src/mcp/tools/mail.ts"],
+      ]);
+    });
+
+    it("reports the owner as missing when nothing builds it", () => {
+      const violations = count.check([]);
+      expect(violations.map((v) => v.pattern)).toEqual([count.missing]);
+      expect(violations[0]!.file).toBe(count.owner);
+      expect(violations[0]!.line).toBe(0);
+      expect(violations[0]!.column).toBe(0);
+    });
+
+    it("counts a site that survives only in a comment as zero", () => {
+      for (const sample of [
+        `// was ${quoted}\n`,
+        `    // ${quoted}\n`,
+        `/**\n * The old line, ${quoted}, lived here.\n */\n`,
+        `  /* was: ${quoted} */\n`,
+      ]) {
+        const collected = count.collect(count.owner, sample);
+        expect(collected, JSON.stringify(sample)).toEqual([]);
+        expect(count.check(collected).map((v) => v.pattern)).toEqual([count.missing]);
+      }
+    });
+
+    it("counts a real site with a comment after it, at the right line and column", () => {
+      const sample = [
+        "/**",
+        ` * was ${quoted}`,
+        " */",
+        `// and ${quoted}`,
+        "const sent = await sendCommand(",
+        `${count.shipped} // the one site`,
+        ");",
+      ].join("\n");
+      expect(count.collect(count.owner, sample)).toEqual([
+        { file: count.owner, line: 6, column: count.column },
+      ]);
+      // Outside the scope it is nobody's business: fixtures spell it on purpose.
+      expect(count.collect("test/fixtures/x.ts", sample)).toEqual([]);
+    });
+
+    it("pins the one comment shape still counted: a comment trailing code", () => {
+      // The docstring lists this. If the collector later blanks it, move this
+      // row out and update the docstring.
+      expect(count.collect(count.owner, `done(); // was ${quoted}\n`)).toHaveLength(1);
+    });
+
+    it("stays quiet on replies, literal tags and bare prose", () => {
+      for (const sample of count.quiet) {
+        expect(fires(sample), `false-positived on ${sample}`).toBe(false);
+      }
+      expect(fires(count.shipped)).toBe(true);
+      expect(fires(count.another)).toBe(true);
+    });
+
+    it("finds exactly one site in the shipped owner", () => {
+      expect(count.collect(count.owner, rawSourceOf(count.owner))).toHaveLength(1);
+    });
+
+    it("is wired into scan(): scripts/ alone reports it missing, the real tree reports neither", () => {
+      expect(scan("scripts").map((v) => v.pattern)).toContain(count.missing);
+      const patterns = scan().map((v) => v.pattern);
+      expect(patterns).not.toContain(count.missing);
+      expect(patterns).not.toContain(count.duplicated);
+    });
+
+    it("gives the two ids distinct sort keys after the mutating-session count's", () => {
+      const duplicated = count.check([owner, elsewhere])[0]!;
+      const missing = count.check([])[0]!;
+      expect(duplicated.patternIndex).toBe(FORBIDDEN.length + count.offset);
+      expect(missing.patternIndex).toBe(FORBIDDEN.length + count.offset + 1);
+    });
+  });
+}
+
 describe("the count constraints as a set", () => {
   /** A barrel's named re-export of the mutating orchestrator (WR-05). */
   const BARREL_REEXPORT = 'export { withMutatingMailbox } from "./service";\n';
@@ -4698,6 +4946,16 @@ describe("the count constraints as a set", () => {
   /** The owners with the real site deleted and only a comment left (WR-06). */
   const COMMENTED_OPEN = "// the old open was `SELECT ${quoted}`\n";
   const COMMENTED_IMPORT = '// was: import { withMutatingMailbox } from "./service";\n';
+
+  /** The move step's three sites, each deleted with only a comment left. */
+  const COMMENTED_COPY = "// the old copy was `UID COPY ${ref.uid} ${quoted}`\n";
+  const COMMENTED_MARK = " * it set `+FLAGS (\\\\Deleted)` here\n";
+  const COMMENTED_REMOVAL = "  /* was: `UID EXPUNGE ${ref.uid}` */\n";
+  /** Each of the three, built in the tool layer. */
+  const TOOL_COPY = "await sendCommand(channel, tag, `UID COPY ${uid} ${quoted}`);\n";
+  const TOOL_MARK = "await sendCommand(channel, tag, `UID STORE ${uid} +FLAGS (\\\\Deleted)`);\n";
+  const TOOL_REMOVAL = "await sendCommand(channel, tag, `UID EXPUNGE ${uid}`);\n";
+  const TOOL_LAYER = "src/mcp/tools/mail.ts";
 
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
@@ -4757,6 +5015,21 @@ describe("the count constraints as a set", () => {
       ...checkMutatingSessionImportOwnership(
         collectMutatingSessionImports(MUTATING_SESSION_OWNER, COMMENTED_IMPORT),
       ).map((v) => v.pattern),
+      // The three phase 21 move-step counts, one owner each, both arms fed
+      // through scan()'s own collectors: a site in the tool layer, and an owner
+      // whose only match is inside a comment.
+      ...checkCopySiteOwnership(collectCopySites(TOOL_LAYER, TOOL_COPY)).map((v) => v.pattern),
+      ...checkCopySiteOwnership(collectCopySites(COPY_OWNER, COMMENTED_COPY)).map((v) => v.pattern),
+      ...checkRemovalMarkOwnership(collectRemovalMarks(TOOL_LAYER, TOOL_MARK)).map((v) => v.pattern),
+      ...checkRemovalMarkOwnership(
+        collectRemovalMarks(REMOVAL_MARK_OWNER, `/**\n${COMMENTED_MARK} */\n`),
+      ).map((v) => v.pattern),
+      ...checkRemovalSiteOwnership(collectRemovalSites(TOOL_LAYER, TOOL_REMOVAL)).map(
+        (v) => v.pattern,
+      ),
+      ...checkRemovalSiteOwnership(collectRemovalSites(REMOVAL_OWNER, COMMENTED_REMOVAL)).map(
+        (v) => v.pattern,
+      ),
       // The second two-owner count, fed the same pair of lists the password
       // count is fed and for the same reason.
       ...checkPrincipalConstructorOwnership([
@@ -4826,6 +5099,16 @@ describe("the count constraints as a set", () => {
       ...checkMutatingSessionImportOwnership(
         collectMutatingSessionImports(MUTATING_SESSION_OWNER, COMMENTED_IMPORT),
       ),
+      // The three move-step counts, fed the same collected samples as above:
+      // one site outside the owner, and an owner with only a commented site.
+      ...checkCopySiteOwnership(collectCopySites(TOOL_LAYER, TOOL_COPY)),
+      ...checkCopySiteOwnership(collectCopySites(COPY_OWNER, COMMENTED_COPY)),
+      ...checkRemovalMarkOwnership(collectRemovalMarks(TOOL_LAYER, TOOL_MARK)),
+      ...checkRemovalMarkOwnership(
+        collectRemovalMarks(REMOVAL_MARK_OWNER, `/**\n${COMMENTED_MARK} */\n`),
+      ),
+      ...checkRemovalSiteOwnership(collectRemovalSites(TOOL_LAYER, TOOL_REMOVAL)),
+      ...checkRemovalSiteOwnership(collectRemovalSites(REMOVAL_OWNER, COMMENTED_REMOVAL)),
       // TWO owners again, so the same asymmetric pair the password count needs:
       // both owners plus a non-owner is exactly one outside, and one owner
       // alone is exactly one missing.
@@ -4873,6 +5156,13 @@ describe("the count constraints as a set", () => {
     // Asserted directly as well, so the check above does not rest on the two
     // owners staying the same file.
     expect(EXCLUDED.has(MUTATING_OPEN_OWNER)).toBe(false);
+    // And for the move step. The copy, the removal mark and the removal share
+    // one owner, the verbs module, and it must stay inside every pattern rule:
+    // the removal ban, the fan-out ban and the logging ban most of all.
+    expect(COPY_OWNER).toBe(MUTATING_SESSION_OWNER);
+    expect(REMOVAL_MARK_OWNER).toBe(COPY_OWNER);
+    expect(REMOVAL_OWNER).toBe(COPY_OWNER);
+    expect(EXCLUDED.has(COPY_OWNER)).toBe(false);
     // And for both minting sites. These two are the files that hold a live
     // credential longest — the door holds a decrypted grant, the login page
     // holds a value somebody just typed — so they are the two that most need

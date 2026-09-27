@@ -113,6 +113,15 @@ export declare const MUTATING_OPEN_SCOPE: string;
 export declare const MUTATING_SESSION_IMPORT: RegExp;
 export declare const MUTATING_SESSION_OWNER: string;
 export declare const MUTATING_SESSION_SCOPE: string;
+export declare const COPY_COMMAND: RegExp;
+export declare const COPY_OWNER: string;
+export declare const COPY_SCOPE: string;
+export declare const REMOVAL_MARK: RegExp;
+export declare const REMOVAL_MARK_OWNER: string;
+export declare const REMOVAL_MARK_SCOPE: string;
+export declare const REMOVAL_COMMAND: RegExp;
+export declare const REMOVAL_OWNER: string;
+export declare const REMOVAL_SCOPE: string;
 export declare const OWNERSHIP_VIOLATION_IDS: readonly string[];
 
 /** One declared DAV write module: why it is declared, and a disposition for
@@ -169,6 +178,27 @@ export declare function collectMutatingOpens(
 /** `text` with every whole-line comment blanked, positions unchanged. */
 export declare function withoutCommentLines(text: string): string;
 export declare function collectMutatingSessionImports(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+export declare function checkCopySiteOwnership(
+  sites: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function checkRemovalMarkOwnership(
+  sites: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function checkRemovalSiteOwnership(
+  sites: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function collectCopySites(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+export declare function collectRemovalMarks(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+export declare function collectRemovalSites(
   relativePath: string,
   contents: string,
 ): OwnershipMatch[];
