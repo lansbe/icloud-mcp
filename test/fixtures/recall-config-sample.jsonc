@@ -1,0 +1,12 @@
+// A known-violating Worker config for the recall config checks (Phase 25,
+// D-16, D-17). It fires each Worker-side check once per binding: a remote key
+// on the vector index entry, a remote key on the AI object, and a vector index
+// block with no marker line beside it. Never deployed; read only by
+// test/forbidden-tokens.test.ts through scanWranglerConfig.
+{
+  "name": "recall-config-sample",
+  "vectorize": [
+    { "binding": "RECALL_INDEX", "index_name": "sample", "remote": true }
+  ],
+  "ai": { "binding": "AI", "remote": true }
+}

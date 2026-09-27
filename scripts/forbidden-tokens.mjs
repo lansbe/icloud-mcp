@@ -4131,6 +4131,147 @@ export function checkDurableObjectConfig(file, text) {
 }
 
 /**
+ * The marker line that must sit beside a `vectorize` block, trimmed. The
+ * dimension and the metric are fixed when the index is created, so the reason
+ * for both has to live where the next person to edit the block will read it.
+ */
+export const RECALL_INDEX_MARKER = "// RECALL INDEX: 1024 cosine";
+
+/** The three recall config violation ids, in the order the checks run. */
+export const RECALL_CONFIG_VIOLATION_IDS = [
+  "recall-binding-remote",
+  "recall-index-reason-missing",
+  "recall-pool-remote-bindings-missing",
+];
+
+/**
+ * The text of every block opened at `openIndex` (the opening bracket or brace)
+ * through its matching close, or through the end of `code` when it never
+ * closes. Brackets inside strings are counted too; the config's own values
+ * hold none, and over-reading a block can only make the remote-key check see
+ * more, never less.
+ */
+function blockFrom(code, openIndex) {
+  const open = code[openIndex];
+  const close = open === "[" ? "]" : "}";
+  let depth = 0;
+  for (let i = openIndex; i < code.length; i += 1) {
+    if (code[i] === open) depth += 1;
+    else if (code[i] === close) {
+      depth -= 1;
+      if (depth === 0) return code.slice(openIndex, i + 1);
+    }
+  }
+  return code.slice(openIndex);
+}
+
+/** Whether a Worker config's code (comment lines blanked) declares the vector
+ *  index binding block or the AI binding. */
+function declaresRecallBinding(code) {
+  return /"vectorize"\s*:/.test(code) || /"ai"\s*:/.test(code);
+}
+
+/**
+ * The recall binding checks over one Worker config file's text (Phase 25,
+ * D-16, D-17). Two violations:
+ *
+ *   - `recall-binding-remote`: a `remote` key inside a `vectorize` entry or
+ *     inside the `ai` object. A remote flag routes `wrangler dev`, and the
+ *     test pool, to the real index or the real model on the account. The index
+ *     holds every signed-in person's mail snippets.
+ *   - `recall-index-reason-missing`: a `vectorize` block with no line that,
+ *     trimmed, reads exactly `RECALL_INDEX_MARKER`. The dimension and metric
+ *     cannot be changed after the index exists, so the reason sits beside the
+ *     block.
+ *
+ * The structural check reads the text with comment lines blanked, so the prose
+ * beside the block that explains why there is no remote flag fires nothing.
+ * The marker check reads the raw text, because the marker IS a comment.
+ *
+ * Pure and exported so the tests can drive each violation from inline text.
+ *
+ * @param {string} file  repo-relative path, reported in each violation
+ * @param {string} text  the config file's contents
+ */
+export function checkRecallConfig(file, text) {
+  const violations = [];
+  const code = withoutCommentLines(text);
+  const at = (index, pattern, why) => ({
+    file,
+    ...positionOf(code, index),
+    pattern,
+    patternIndex: 3 + RECALL_CONFIG_VIOLATION_IDS.indexOf(pattern),
+    why,
+  });
+
+  const blocks = [
+    ...[...code.matchAll(/"vectorize"\s*:\s*\[/g)].map(
+      (m) => m.index + m[0].length - 1,
+    ),
+    ...[...code.matchAll(/"ai"\s*:\s*\{/g)].map((m) => m.index + m[0].length - 1),
+  ];
+  for (const openIndex of blocks) {
+    const block = blockFrom(code, openIndex);
+    const remote = block.search(/"remote"\s*:/);
+    if (remote === -1) continue;
+    violations.push(
+      at(
+        openIndex + remote,
+        "recall-binding-remote",
+        "A remote key on the vector index binding or on the Workers AI binding. A remote flag routes wrangler dev, and the test pool, to the real index or the real model on the Cloudflare account: the index holds every signed-in person's mail snippets, and a test or a local run would read or write it. Delete the key. Neither binding carries one, on purpose, and the reason is recorded beside the block under the RECALL INDEX marker. Pointing local work at the account is a decision, not a config tweak.",
+      ),
+    );
+  }
+
+  const vectorizeIndex = code.search(/"vectorize"\s*:/);
+  if (vectorizeIndex !== -1) {
+    const hasMarker = text
+      .split("\n")
+      .some((line) => line.trim() === RECALL_INDEX_MARKER);
+    if (!hasMarker) {
+      violations.push(
+        at(
+          vectorizeIndex,
+          "recall-index-reason-missing",
+          `The Worker config has a vector index block but no line reading "${RECALL_INDEX_MARKER}". The index's dimension and metric are fixed when it is created and cannot be changed after, and the metadata index on the user field must exist before the first vector, so the reason for all three must sit beside the block where the next person to edit it will read it. Deleting that comment must not be silent. Restore the marker line and the reason under it; wrangler.jsonc.example carries the full text.`,
+        ),
+      );
+    }
+  }
+
+  return violations;
+}
+
+/**
+ * The test pool check (Phase 25, D-16): when the Worker config declares either
+ * recall binding, the pool config must turn remote bindings off, outside a
+ * comment. Without it the pool opens a remote session against the Cloudflare
+ * account when the suite starts, because the AI binding has no local
+ * simulator. A missing or unreadable pool config fails too.
+ *
+ * Pure and exported so the tests can drive it from inline text.
+ *
+ * @param {string} poolFile  repo-relative path, reported in the violation
+ * @param {string | null} poolText  the pool config's contents, or null if absent
+ * @param {boolean} bindingDeclared  whether any Worker config declares a recall binding
+ */
+export function checkRecallPoolConfig(poolFile, poolText, bindingDeclared) {
+  if (!bindingDeclared) return [];
+  const code = poolText === null ? "" : withoutCommentLines(poolText);
+  if (/\bremoteBindings\s*:\s*false\b/.test(code)) return [];
+  return [
+    {
+      file: poolFile,
+      line: 0,
+      column: 0,
+      pattern: "recall-pool-remote-bindings-missing",
+      patternIndex: 5,
+      why: `The Worker config declares the vector index or the Workers AI binding, and ${poolFile} does not set remoteBindings: false outside a comment. Without it the test pool opens a remote session against the Cloudflare account at suite start, because the AI binding has no local simulator, and a test could then reach the real index or model. Restore remoteBindings: false in the pool's miniflare options, with the reason beside it. Tests pass fakes to the store's and the embedder's factories and never need the account.`,
+    },
+  ];
+}
+
+/**
  * Configuration checks the deploy tooling cannot make for us.
  *
  * Wave 1 established that `wrangler deploy --dry-run` does not validate inside a
@@ -4151,6 +4292,7 @@ export function checkDurableObjectConfig(file, text) {
 export function scanWranglerConfig(
   configPath = ["wrangler.jsonc.example", "wrangler.jsonc"],
   hostnameSourcePath = "src/mcp/api-handler.ts",
+  poolConfigPath = "vitest.config.ts",
 ) {
   const readOrNull = (relativePath) => {
     try {
@@ -4166,12 +4308,18 @@ export function scanWranglerConfig(
   // present -- the template is what reviewers see, the real config is what
   // deploys. A fresh checkout has only the template; that is fine.
   const configPaths = Array.isArray(configPath) ? configPath : [configPath];
+  let recallBindingDeclared = false;
   for (const path of configPaths) {
     const config = readOrNull(path);
     if (config === null) continue;
 
     // The Durable Object lifecycle checks (phase 24, DOBJ-06), over both files.
     violations.push(...checkDurableObjectConfig(path, config));
+    // The recall binding checks (phase 25, D-16, D-17), over both files.
+    violations.push(...checkRecallConfig(path, config));
+    if (declaresRecallBinding(withoutCommentLines(config))) {
+      recallBindingDeclared = true;
+    }
 
     const index = config.search(/simultaneousConnections/);
     if (index !== -1) {
@@ -4184,6 +4332,17 @@ export function scanWranglerConfig(
       });
     }
   }
+
+  // Once over the pool config, read from the repository root the way the
+  // Worker configs are, and only when a Worker config declares a recall
+  // binding.
+  violations.push(
+    ...checkRecallPoolConfig(
+      poolConfigPath,
+      readOrNull(poolConfigPath),
+      recallBindingDeclared,
+    ),
+  );
 
   const hostnameSource = readOrNull(hostnameSourcePath);
   const hardcoded = hostnameSource

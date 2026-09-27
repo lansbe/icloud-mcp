@@ -84,6 +84,10 @@ import {
   checkAppendOwnership,
   checkCommitHook,
   checkDurableObjectConfig,
+  checkRecallConfig,
+  checkRecallPoolConfig,
+  RECALL_INDEX_MARKER,
+  RECALL_CONFIG_VIOLATION_IDS,
   checkConfirmLineOwnership,
   checkCopySiteOwnership,
   checkDavFetchOwnership,
@@ -6109,5 +6113,113 @@ describe("the recall store's scan rules (Phase 25, D-17)", () => {
         expect(hits("concurrent-session", RECALL_TOOL, permitted), permitted).toBe(0);
       }
     });
+  });
+});
+
+// Phase 25, D-16 and D-17. A config edit that would point the tests or local
+// dev at the real index or model is refused at commit, over both Worker config
+// files and the pool config.
+describe("the recall config checks (Phase 25, D-16, D-17)", () => {
+  const MARKER = `  ${"// RECALL INDEX: 1024 cosine"}`;
+  const VECTORIZE = '  "vectorize": [\n    { "binding": "RECALL_INDEX", "index_name": "icloud-mcp-recall" }\n  ],';
+  const AI = '  "ai": { "binding": "AI" },';
+  const config = (...lines: string[]) => `{\n${lines.join("\n")}\n  "name": "x"\n}\n`;
+  const ids = (text: string) => checkRecallConfig("wrangler.jsonc", text).map((v) => v.pattern);
+  const POOL_OK = "miniflare: {\n  remoteBindings: false,\n},\n";
+
+  /** One known-violating sample per config id, set-equality-checked below. */
+  const samples: Record<string, () => string[]> = {
+    "recall-binding-remote": () =>
+      ids(config(MARKER, VECTORIZE.replace('"icloud-mcp-recall" }', '"icloud-mcp-recall", "remote": true }'), AI)),
+    "recall-index-reason-missing": () => ids(config(VECTORIZE, AI)),
+    "recall-pool-remote-bindings-missing": () =>
+      checkRecallPoolConfig("vitest.config.ts", "miniflare: {},\n", true).map((v) => v.pattern),
+  };
+
+  it("has a known-violating sample for every config id, and each fires its own id", () => {
+    expect(Object.keys(samples).sort()).toEqual([...RECALL_CONFIG_VIOLATION_IDS].sort());
+    for (const [id, run] of Object.entries(samples)) {
+      expect(run(), id).toEqual([id]);
+    }
+  });
+
+  it("keeps the marker constant in step with the text the real config carries", () => {
+    expect(RECALL_INDEX_MARKER).toBe("// RECALL INDEX: 1024 cosine");
+    expect(rawSourceOf("wrangler.jsonc.example").split("\n").map((l) => l.trim()))
+      .toContain(RECALL_INDEX_MARKER);
+  });
+
+  it("passes the shape both real files carry: the marker, the index and the AI object", () => {
+    expect(ids(config(MARKER, VECTORIZE, AI))).toEqual([]);
+    expect(checkRecallConfig("wrangler.jsonc.example", rawSourceOf("wrangler.jsonc.example")))
+      .toEqual([]);
+  });
+
+  it("fires on a remote key on the vector index entry, and on the AI object", () => {
+    const remoteIndex = VECTORIZE.replace('"icloud-mcp-recall" }', '"icloud-mcp-recall", "remote": true }');
+    expect(ids(config(MARKER, remoteIndex, AI))).toEqual(["recall-binding-remote"]);
+    expect(ids(config(MARKER, VECTORIZE, '  "ai": { "binding": "AI", "remote": true },')))
+      .toEqual(["recall-binding-remote"]);
+    expect(ids(config(MARKER, '  "vectorize": [{ "binding": "R", "index_name": "i", "remote": false }],')))
+      .toEqual(["recall-binding-remote"]);
+    expect(ids(config(MARKER, '  "ai": {\n    "binding": "AI",\n    "remote": true\n  },')))
+      .toEqual(["recall-binding-remote"]);
+  });
+
+  it("does not fire on a remote key in prose, or on another binding's remote key", () => {
+    expect(ids(config(MARKER, '  // a "remote": true key here would reach the account', VECTORIZE, AI)))
+      .toEqual([]);
+    expect(
+      ids(config(MARKER, VECTORIZE, AI, '  "r2_buckets": [{ "binding": "B", "bucket_name": "b", "remote": true }],')),
+    ).toEqual([]);
+  });
+
+  it("fires on a vector index block without the marker, and not on a config with no index", () => {
+    expect(ids(config(VECTORIZE))).toEqual(["recall-index-reason-missing"]);
+    expect(ids(config("  // RECALL INDEX: 768 cosine", VECTORIZE))).toEqual(["recall-index-reason-missing"]);
+    expect(ids(config(AI))).toEqual([]);
+    expect(ids(config('  "name2": "y",'))).toEqual([]);
+  });
+
+  it("fires on a pool config without remoteBindings: false only when a recall binding is declared", () => {
+    for (const pool of ["miniflare: {},\n", "// remoteBindings: false,\nminiflare: {},\n", "remoteBindings: true,\n", null]) {
+      expect(checkRecallPoolConfig("vitest.config.ts", pool, true).map((v) => v.pattern), String(pool))
+        .toEqual(["recall-pool-remote-bindings-missing"]);
+      expect(checkRecallPoolConfig("vitest.config.ts", pool, false), String(pool)).toEqual([]);
+    }
+    expect(checkRecallPoolConfig("vitest.config.ts", POOL_OK, true)).toEqual([]);
+  });
+
+  it("is wired into scanWranglerConfig: a known-violating config and pool fire all three", () => {
+    const violations = scanWranglerConfig(
+      "test/fixtures/recall-config-sample.jsonc",
+      "src/mcp/api-handler.ts",
+      "test/fixtures/recall-pool-sample.txt",
+    );
+    expect(violations.map((v) => v.pattern).sort()).toEqual([
+      "recall-binding-remote",
+      "recall-binding-remote",
+      "recall-index-reason-missing",
+      "recall-pool-remote-bindings-missing",
+    ]);
+    // The same config with the real pool: the pool line is there, so only the
+    // Worker-side ids fire.
+    expect(
+      scanWranglerConfig("test/fixtures/recall-config-sample.jsonc").map((v) => v.pattern).sort(),
+    ).toEqual(["recall-binding-remote", "recall-binding-remote", "recall-index-reason-missing"]);
+  });
+
+  it("reads the pool only when a Worker config declares a binding", () => {
+    // A config with neither binding: the violating pool is not reported.
+    const violations = scanWranglerConfig(
+      "test/fixtures/durable-object-config-sample.jsonc",
+      "src/mcp/api-handler.ts",
+      "test/fixtures/recall-pool-sample.txt",
+    );
+    expect(violations.map((v) => v.pattern)).not.toContain("recall-pool-remote-bindings-missing");
+  });
+
+  it("passes both real configs and the real pool", () => {
+    expect(scanWranglerConfig().map(formatViolation)).toEqual([]);
   });
 });

@@ -53,12 +53,23 @@ export declare function checkSocketOwnership(
 ): Violation[];
 export declare function checkCommitHook(hookPath?: string): Violation[];
 export declare function scanWranglerConfig(
-  configPath?: string,
+  configPath?: string | readonly string[],
   hostnameSourcePath?: string,
+  poolConfigPath?: string,
 ): Violation[];
 export declare function formatViolation(violation: Violation): string;
 /** The Durable Object lifecycle checks over one config file's text (DOBJ-06). */
 export declare function checkDurableObjectConfig(file: string, text: string): Violation[];
+/** The recall binding checks over one Worker config file's text (Phase 25, D-16, D-17). */
+export declare function checkRecallConfig(file: string, text: string): Violation[];
+/** The test pool's remote-bindings check, given whether a recall binding is declared. */
+export declare function checkRecallPoolConfig(
+  poolFile: string,
+  poolText: string | null,
+  bindingDeclared: boolean,
+): Violation[];
+export declare const RECALL_INDEX_MARKER: string;
+export declare const RECALL_CONFIG_VIOLATION_IDS: readonly string[];
 
 /**
  * Exported so a scope test can drive the real prefix mechanism. A test that
