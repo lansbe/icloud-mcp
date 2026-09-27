@@ -687,6 +687,108 @@ export function withParsedResource<T>(
 }
 
 /**
+ * The few facts a change row reads off one event (CHNG-09, D-26).
+ *
+ * Seven keys and no more: the title, the start and end, whether it is all day,
+ * whether it was cancelled, when it was created, and whether it repeats.
+ */
+export interface EventChangeFacts {
+  /** The title, verbatim. **Stranger-authored.** Null when absent. */
+  summary: string | null;
+  /**
+   * The start. A date (`YYYY-MM-DD`) for an all-day event, an ISO instant
+   * ending in `Z` for a timed one, or the wall clock with no suffix when the
+   * time has no instant (floating, or a zone the resource never defined).
+   */
+  start: string;
+  /** The end, in the same three shapes as `start`. */
+  end: string;
+  allDay: boolean;
+  /** True when the event's STATUS is CANCELLED. */
+  cancelled: boolean;
+  /** CREATED as seconds since the epoch, or null when it cannot be known. */
+  created: number | null;
+  /** True when the resource is a series, or part of one. */
+  recurring: boolean;
+}
+
+/**
+ * Read the facts a change row needs out of one resource, and nothing else.
+ *
+ * The facts come from the master when there is one. An override-only or
+ * server-expanded resource has none, so its first event is read instead, and
+ * it counts as recurring because an override is part of a series.
+ *
+ * **What it deliberately does not read:** description, location, attendees,
+ * organiser and alarms. A change check can report on many events at once, and
+ * every one of those fields is text a stranger may have written into an
+ * invitation. The detail call exists for one event the caller has asked about
+ * (CHNG-09, D-26).
+ *
+ * **Why `created` is null rather than guessed.** The caller splits changed
+ * events into added and changed by comparing CREATED with the time its token
+ * was taken. With no CREATED there is nothing to compare, and a guess would
+ * put a label on the event that nobody measured. So an absent value, one that
+ * does not parse, and one with no zone (which has no instant) all read as null,
+ * and the caller counts that event as added-or-changed. The library parses the
+ * value only when it is read, which is why a bad CREATED does not fail the
+ * resource: the read is caught here, and nothing is taken from the caught value.
+ *
+ * Times use the module's own reader. The seconds-since-epoch accessor is the
+ * only conversion; the host-runtime date conversion is never used here (see
+ * `readEventTime`). An unparseable resource throws what `parseCalendarResource`
+ * throws, and so does a resource with no event in it.
+ */
+export function eventChangeFactsOf(icsText: string): EventChangeFacts {
+  return withParsedResource(icsText, (resource) => {
+    const component = resource.master ?? resource.components[0];
+    if (component === undefined) throw new DavConnectError();
+    const event = new ICAL.Event(component);
+    const start = readEventTime(event.startDate, requestedTzidOf(component, "dtstart"));
+    const end = readEventTime(event.endDate, endTzidOf(component));
+    const status = textOf(component.getFirstPropertyValue("status"));
+    return {
+      summary: textOf(component.getFirstPropertyValue("summary")),
+      start: changeTimeText(start),
+      end: changeTimeText(end),
+      allDay: start.allDay,
+      cancelled: status !== null && status.toUpperCase() === "CANCELLED",
+      created: createdSecondsOf(component),
+      recurring: resource.master === null || isRecurringResource(resource),
+    };
+  });
+}
+
+/** One end of an event as change-row text. See `EventChangeFacts.start`. */
+function changeTimeText(time: EventTime): string {
+  if (time.allDay || time.utc === undefined) return time.local;
+  return utcTimeAt(time.utc).toString();
+}
+
+/**
+ * CREATED as seconds since the epoch, or null when it cannot be known.
+ *
+ * RFC 5545 requires CREATED in UTC. A value with no zone is a wall clock with
+ * nothing to anchor it, so it is null rather than read as UTC.
+ */
+function createdSecondsOf(component: IcalComponent): number | null {
+  const property = component.getFirstProperty("created");
+  if (property === null) return null;
+  let value: unknown;
+  try {
+    value = property.getFirstValue();
+  } catch {
+    // Nothing is read from the caught value. A CREATED that does not parse is
+    // an unknown creation time, not a broken event.
+    return null;
+  }
+  if (!(value instanceof ICAL.Time) || value.isDate) return null;
+  if (value.zone.tzid === FLOATING_TZID) return null;
+  const seconds = value.toUnixTime();
+  return Number.isFinite(seconds) ? seconds : null;
+}
+
+/**
  * Expand one resource into the occurrences that fall inside a range.
  *
  * **The boundary rule is half-open and it is stated once here for both edges:
