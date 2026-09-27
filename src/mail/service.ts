@@ -29,6 +29,7 @@
 
 import PostalMime from "postal-mime";
 import type { Address } from "postal-mime";
+import { MAX_CHANGE_FOLDERS } from "../change-marker";
 import type { Principal } from "../principal";
 import { reportRefusal } from "../password-pause";
 import {
@@ -54,18 +55,21 @@ import type {
   ResponseLine,
   RoleSource,
   SExpr,
+  StatusSnapshot,
 } from "./imap-parser";
 import {
   correlateStatus,
   decodeModifiedUtf7,
   parseAccessCode,
   parseCapabilityLine,
+  parseCompletionCode,
   parseExists,
   parseListLine,
   parsePermanentFlags,
   parseSExpr,
   parseSearchLine,
   parseStatusLine,
+  parseStatusSnapshot,
   parseUidValidity,
   quoteMailbox,
   resolveFolderRole,
@@ -2226,6 +2230,322 @@ export async function listFolders(
   options: MailSessionOptions = {},
 ): Promise<FolderListing> {
   return withMailSession(principal, gate, null, null, listAllFolders, options);
+}
+
+// ---------------------------------------------------------------------------
+// The change check's mail reads (CHNG-01, CHNG-07)
+//
+// Two reads, in two sessions, one after the other. The first asks each folder
+// for its numbers and opens no mailbox. The second runs only for a folder whose
+// next UID moved, and it opens that folder read-only through the orchestrator.
+// A folder where nothing arrived is never opened at all.
+// ---------------------------------------------------------------------------
+
+export { MAX_CHANGE_FOLDERS };
+
+/** What the status command asks for, in this order. */
+const SNAPSHOT_ITEMS = "(UIDVALIDITY UIDNEXT MESSAGES HIGHESTMODSEQ)";
+
+/**
+ * One folder's answer to the status command, or the fact that it gave none.
+ *
+ * `answered: false` covers a name that could not be sent, a refused command,
+ * and a reply that left out the validity or the next UID. The tool reports
+ * each of those as "not checked" and keeps the folder's old state, so a folder
+ * that did not answer is never reported as unchanged.
+ */
+export type FolderSnapshotOutcome =
+  | { mailbox: string; answered: true; snapshot: StatusSnapshot }
+  | { mailbox: string; answered: false; gone?: false }
+  /**
+   * The server refused the status command with the NONEXISTENT response code
+   * (RFC 5530): the folder does not exist. Only that code. Any other refusal
+   * is plain `answered: false`, so a wrong reading of iCloud's refusals costs a
+   * repeated "not checked", never a folder dropped from the marker.
+   */
+  | { mailbox: string; answered: false; gone: true };
+
+/** The one response code that says a folder is gone. */
+const FOLDER_GONE_CODE = "NONEXISTENT";
+
+/**
+ * Ask each folder for its numbers, one at a time, in one session.
+ *
+ * The status command runs from the authenticated state, so no mailbox is
+ * opened. The reply is matched to the folder by exact name, the way
+ * `correlateStatus` matches, never by position.
+ */
+async function snapshotsIn(
+  session: MailSession,
+  mailboxes: readonly string[],
+): Promise<FolderSnapshotOutcome[]> {
+  const outcomes: FolderSnapshotOutcome[] = [];
+  for (const mailbox of mailboxes) {
+    // A name carrying CR, LF or NUL cannot be sent without injecting a second
+    // command, so no line is sent for it at all.
+    const quoted = quoteMailbox(mailbox);
+    if (quoted === null) {
+      outcomes.push({ mailbox, answered: false });
+      continue;
+    }
+
+    const result = await sendCommand(
+      session.channel,
+      session.channel.nextTag(),
+      `STATUS ${quoted} ${SNAPSHOT_ITEMS}`,
+    );
+    if (result.status !== "OK") {
+      const gone =
+        result.status === "NO" &&
+        parseCompletionCode(result.tagged.text) === FOLDER_GONE_CODE;
+      outcomes.push(
+        gone ? { mailbox, answered: false, gone: true } : { mailbox, answered: false },
+      );
+      continue;
+    }
+
+    let snapshot: StatusSnapshot | null = null;
+    for (const line of result.untagged) {
+      const candidate = parseStatusSnapshot(line);
+      if (candidate !== null && candidate.name === mailbox) {
+        snapshot = candidate;
+        break;
+      }
+    }
+    if (
+      snapshot === null ||
+      snapshot.uidValidity === null ||
+      snapshot.uidNext === null
+    ) {
+      outcomes.push({ mailbox, answered: false });
+      continue;
+    }
+    outcomes.push({ mailbox, answered: true, snapshot });
+  }
+  return outcomes;
+}
+
+/** Refuse more folders than the change check allows, before any socket. */
+function assertFolderCount(mailboxes: readonly string[]): void {
+  if (mailboxes.length > MAX_CHANGE_FOLDERS) throw new ImapNotFoundError();
+}
+
+/** Each folder's numbers, over an already-open stream pair. */
+export async function folderSnapshotsOver(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  mailboxes: readonly string[],
+  options: MailSessionOptions = {},
+): Promise<FolderSnapshotOutcome[]> {
+  assertFolderCount(mailboxes);
+  return withMailSessionOver(
+    duplex,
+    principal,
+    gate,
+    // No mailbox: the status command needs none, so none is opened.
+    null,
+    null,
+    (session) => snapshotsIn(session, mailboxes),
+    options,
+  );
+}
+
+/**
+ * Each folder's numbers: validity, next UID, message count, mod-sequence.
+ *
+ * One session, no mailbox opened. At most `MAX_CHANGE_FOLDERS` folders; more is
+ * refused before any socket is opened.
+ */
+export async function folderSnapshots(
+  principal: Principal,
+  gate: SessionGate,
+  mailboxes: readonly string[],
+  options: MailSessionOptions = {},
+): Promise<FolderSnapshotOutcome[]> {
+  assertFolderCount(mailboxes);
+  return withMailSession(
+    principal,
+    gate,
+    null,
+    null,
+    (session) => snapshotsIn(session, mailboxes),
+    options,
+  );
+}
+
+/**
+ * The most new-mail rows one folder returns. The count is exact regardless.
+ */
+export const MAX_NEW_MAIL_ROWS = 25;
+
+/**
+ * The row fetch's items: UID, flags, receipt time, and a peek of two header
+ * fields. Nothing else.
+ *
+ * **A narrower row than `MessageSummary`, on purpose (CHNG-09).** The change
+ * check says who new mail is from and what it is about. It fetches no snippet
+ * window, no structure and no size, so it can carry no preview and no
+ * attachment flag. A snippet is the start of a body, and the change check does
+ * not read bodies. The header item is the peeking form, so nothing is marked
+ * read even on a server that ignored the read-only open.
+ */
+const NEW_MAIL_ROW_ITEMS =
+  "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])";
+
+/**
+ * One new message: who it is from and what it is about, and nothing more.
+ *
+ * `id`, `uid`, `unread` and `receivedAt` are this server's or the protocol's.
+ * `fromName`, `fromAddress` and `subject` are stranger-authored and belong in
+ * the fenced block.
+ */
+export interface NewMailRow {
+  id: string;
+  uid: number;
+  unread: boolean;
+  /** The server's INTERNALDATE, verbatim: when iCloud received it. */
+  receivedAt: string | null;
+  fromName: string | null;
+  fromAddress: string | null;
+  subject: string | null;
+}
+
+/** The new mail in one folder's UID range. */
+export interface NewMail {
+  /** How many messages in the range are still present. Exact. */
+  count: number;
+  /** Up to `MAX_NEW_MAIL_ROWS`, newest first. */
+  rows: NewMailRow[];
+}
+
+/**
+ * Count the messages still present in `[fromUid, toUidExclusive)`.
+ *
+ * **The range is bounded on both ends, and that is the point.** The open-ended
+ * form always includes the newest message in the folder, even when nothing new
+ * arrived, and it would also count mail that arrived after the status reply,
+ * which the fresh marker does not cover. The upper end is the status reply's
+ * next UID minus one, so what is counted is exactly what the fresh marker moves
+ * past. Mail that arrives in between is left for the next call.
+ *
+ * Counted from what the search found, never from the difference between the
+ * two next UIDs: that difference counts mail that arrived and was then deleted.
+ * Only UIDs inside the range are kept, because a server may answer a range with
+ * a UID outside it.
+ */
+async function newMailIn(
+  session: MailSession,
+  fromUid: number,
+  toUidExclusive: number,
+): Promise<NewMail> {
+  if (toUidExclusive <= fromUid) return { count: 0, rows: [] };
+  const mailbox = session.mailbox;
+  const uidValidity = session.uidValidity;
+  // Unreachable under an opened mailbox, and asserted rather than assumed: a
+  // row with no validity would mint an id no later call could gate.
+  if (mailbox === null || uidValidity === null) throw new ImapNotFoundError();
+
+  const last = toUidExclusive - 1;
+  const result = await sendCommand(
+    session.channel,
+    session.channel.nextTag(),
+    `UID SEARCH UID ${fromUid}:${last}`,
+  );
+  if (result.status !== "OK") throw new ImapNotFoundError();
+
+  const found = new Set<number>();
+  for (const line of result.untagged) {
+    const identifiers = parseSearchLine(line);
+    if (identifiers === null) continue;
+    for (const uid of identifiers) {
+      if (uid >= fromUid && uid <= last) found.add(uid);
+    }
+  }
+
+  const page = [...found].sort((a, b) => b - a).slice(0, MAX_NEW_MAIL_ROWS);
+  if (page.length === 0) return { count: 0, rows: [] };
+
+  const fetched = await sendCommand(
+    session.channel,
+    session.channel.nextTag(),
+    `UID FETCH ${page.join(",")} ${NEW_MAIL_ROW_ITEMS}`,
+  );
+  if (fetched.status !== "OK") throw new ImapNotFoundError();
+  const replies = fetchReplies(fetched.untagged);
+
+  const rows: NewMailRow[] = [];
+  for (const uid of page) {
+    const items = replies.get(uid);
+    // Expunged between the search and the fetch: an ordinary race, and the row
+    // is simply absent. The count still says what the search found.
+    if (items === undefined) continue;
+
+    const header = headerBlockOf(items);
+    // The same header parser the listing uses, so decoding cannot drift.
+    const parsed = header === null ? null : await extractMessage(header);
+    const internalDate = items.get("INTERNALDATE");
+
+    rows.push({
+      id: encodeMessageId({ mailbox, uidValidity, uid }),
+      uid,
+      unread: !isSeen(items.get("FLAGS") ?? null),
+      receivedAt: typeof internalDate === "string" ? internalDate : null,
+      fromName: parsed?.fromName ?? null,
+      fromAddress: parsed?.fromAddress ?? null,
+      subject: parsed?.subject ?? null,
+    });
+  }
+
+  return { count: found.size, rows };
+}
+
+/** New mail in one folder's range, over an already-open stream pair. */
+export async function newMailOver(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string,
+  uidValidity: number,
+  fromUid: number,
+  toUidExclusive: number,
+  options: MailSessionOptions = {},
+): Promise<NewMail> {
+  return withMailSessionOver(
+    duplex,
+    principal,
+    gate,
+    mailbox,
+    uidValidity,
+    (session) => newMailIn(session, fromUid, toUidExclusive),
+    options,
+  );
+}
+
+/**
+ * New mail in one folder, between two next-UID values.
+ *
+ * The folder is opened read-only through the orchestrator, with the validity
+ * the status reply gave as the expected one, so a folder whose validity moved
+ * in between is refused rather than searched.
+ */
+export async function newMail(
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string,
+  uidValidity: number,
+  fromUid: number,
+  toUidExclusive: number,
+  options: MailSessionOptions = {},
+): Promise<NewMail> {
+  return withMailSession(
+    principal,
+    gate,
+    mailbox,
+    uidValidity,
+    (session) => newMailIn(session, fromUid, toUidExclusive),
+    options,
+  );
 }
 
 // ---------------------------------------------------------------------------

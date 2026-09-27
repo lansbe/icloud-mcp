@@ -29,6 +29,19 @@
 // banned transport tokens are described in prose in ./.claude/CLAUDE.md rather
 // than spelled here, because the scan reads this file too.
 //
+// **This module reads an error body in exactly one place, and only to choose an
+// error's type (Phase 23, D-28).** A sync REPORT whose token has expired fails
+// RFC 6578's `DAV:valid-sync-token` precondition, and the RFC does not fix the
+// status: servers answer 403, 409 or 410. By number alone those read as a
+// rejected password, a moved shard and a transient fault, and 403 would tell the
+// user their password is wrong when it is not. So for a REPORT answered one of
+// those three, and nothing else, `createDavFetch` reads at most a fixed prefix of
+// the body and raises `DavSyncTokenError` if the prefix names that element. It is
+// REPORT-only because only a sync REPORT can carry that precondition, and
+// bounded because the body is server-supplied. The text is held in a local, is
+// never returned, stored or attached, and decides the type and nothing else.
+// Every other status on every method is classified exactly as before.
+//
 // This module contains no logging calls of any kind and must never acquire any.
 
 import { isConfiguredSecret } from "../auth/login-handler";
@@ -37,9 +50,11 @@ import { passwordOf } from "../principal";
 import type { Principal } from "../principal";
 import {
   DavAuthError,
+  DavForbiddenError,
   DavConnectError,
   DavNotFoundError,
   DavStaleResourceError,
+  DavSyncTokenError,
   DavThrottleError,
   DavUnsendableError,
 } from "./errors";
@@ -241,10 +256,24 @@ export type DavFetch = typeof globalThis.fetch;
  * never work — try the same write again.
  *
  * Everything else non-2xx is a transport fault this layer cannot classify.
+ *
+ * **One status path is decided before this function runs, and this table is
+ * otherwise exactly what it was (Phase 23, D-28).** A REPORT answered 403, 409
+ * or 410 whose bounded body names RFC 6578's `DAV:valid-sync-token` element is
+ * an expired sync token, and `createDavFetch` raises `DavSyncTokenError` for it
+ * without reaching here. RFC 6578 does not fix the status for that
+ * precondition, and read here by number it would be a wrong password (403), a
+ * moved shard (410) or a transient fault (409). The check is REPORT-only and
+ * reads at most `SYNC_TOKEN_BODY_BOUND` bytes; see `namesValidSyncToken`. A
+ * REPORT answered one of those three WITHOUT the element, and every other
+ * method, still lands on the rows above unchanged.
  */
 function throwForStatus(status: number): void {
   if (status >= 200 && status < 300) return;
-  if (status === 401 || status === 403) throw new DavAuthError();
+  // A 403 raises the one subclass, so the change check can tell it from a
+  // 401. Every other caller catches both as `DavAuthError`, unchanged.
+  if (status === 403) throw new DavForbiddenError();
+  if (status === 401) throw new DavAuthError();
   if (status === 429 || status === 503) throw new DavThrottleError();
   if (status === 415 || status === 501) throw new DavNotFoundError(false);
   if (status === 412) throw new DavStaleResourceError();
@@ -253,6 +282,68 @@ function throwForStatus(status: number): void {
   }
   if (status >= 300 && status < 400) throw new DavNotFoundError(true);
   throw new DavConnectError();
+}
+
+/**
+ * How much of an error body the sync-token check may read, in bytes.
+ *
+ * An RFC 6578 precondition body is a few hundred bytes. The bound is there
+ * because the body is server-supplied: a check that read to the end would let
+ * the server decide how long this request holds the queue.
+ */
+const SYNC_TOKEN_BODY_BOUND = 8192;
+
+/** The statuses a server may carry the `DAV:valid-sync-token` precondition on. */
+const SYNC_TOKEN_STATUSES: ReadonlySet<number> = new Set([403, 409, 410]);
+
+/**
+ * The precondition as an ELEMENT: an opening angle bracket, an optional
+ * namespace prefix and colon, the local name, then whitespace, a slash or the
+ * closing bracket. The name appearing as text, or as the prefix of a longer
+ * name, does not match.
+ */
+const VALID_SYNC_TOKEN_ELEMENT = /<(?:[A-Za-z_][\w.-]*:)?valid-sync-token[\s/>]/;
+
+/**
+ * Whether a refused sync REPORT's body names the `DAV:valid-sync-token` element.
+ *
+ * Reads at most `SYNC_TOKEN_BODY_BOUND` bytes, then cancels the rest. A read
+ * that fails counts as "no element", so the status falls through to
+ * `throwForStatus` exactly as it did before this check existed. The decoded
+ * text lives in a local and is tested against one pattern; it is never
+ * returned, stored, attached to anything, or compared with anything else. The
+ * caught value is never read.
+ */
+async function namesValidSyncToken(response: Response): Promise<boolean> {
+  const body = response.body;
+  if (body === null) return false;
+
+  const reader = body.getReader();
+  const bytes = new Uint8Array(SYNC_TOKEN_BODY_BOUND);
+  let filled = 0;
+  let failed = false;
+  try {
+    while (filled < SYNC_TOKEN_BODY_BOUND) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const take = Math.min(value.byteLength, SYNC_TOKEN_BODY_BOUND - filled);
+      bytes.set(value.subarray(0, take), filled);
+      filled += take;
+    }
+  } catch {
+    // Never read the caught value. A failed read is "no element".
+    failed = true;
+  }
+  try {
+    await reader.cancel();
+  } catch {
+    // Never read the caught value. Nothing more is wanted from this body.
+  }
+  if (failed) return false;
+
+  return VALID_SYNC_TOKEN_ELEMENT.test(
+    new TextDecoder().decode(bytes.subarray(0, filled)),
+  );
 }
 
 /**
@@ -416,6 +507,18 @@ export function createDavFetch(principal: Promise<Principal>): DavFetch {
       // rejected, is deliberately left alone: that is THIS SERVER refusing, not
       // Apple. Only a door-armed principal reports.
       if (response.status === 401) await reportRefusal(actor);
+
+      // D-28: an expired sync token, told apart from a wrong password. REPORT
+      // only, three statuses only, a bounded read only. See this module's
+      // header and `throwForStatus`'s docstring. Everything else falls through
+      // to the table below unchanged.
+      if (
+        init?.method?.toUpperCase() === "REPORT" &&
+        SYNC_TOKEN_STATUSES.has(response.status) &&
+        (await namesValidSyncToken(response))
+      ) {
+        throw new DavSyncTokenError();
+      }
 
       throwForStatus(response.status);
       return response;

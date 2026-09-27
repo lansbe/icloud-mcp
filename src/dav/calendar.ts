@@ -9,19 +9,29 @@
 // and each one exists because the alternative was a second implementation that
 // agreed with the first only until someone edited one of them.
 //
-// **There is no multi-collection operation here at all any more, and that is a
-// safety property rather than a tidying.** ./.claude/CLAUDE.md §3 records the
+// **There is exactly one multi-collection operation here, the change check,
+// and it is serial by design. That is a safety property rather than a
+// tidying.** ./.claude/CLAUDE.md §3 records the
 // budget: production allows six simultaneous connections per Worker invocation,
 // KV reads and outbound fetches count against the same six, and iCloud's own
 // per-account ceiling is lower, undocumented, and deliberately unmeasured —
 // because exhausting it does not fail politely, it locks the user out of their
 // own mail in Mail.app on their own devices. The account-wide listing was where
 // a fan-out was genuinely tempting, and it was withdrawn: `calendarId` is
-// required, so every read here touches exactly one calendar. The two bans
+// required, so every read here but the change check touches exactly one
+// calendar. The two bans
 // remain in force over what is left — structurally by the request-scoped queue
 // in `./transport.ts`, detectively by the `dav-concurrent-request` scan rule
 // that reads this file — because re-adding the sweep must be a decision that
 // trips them rather than a change that slips past.
+//
+// The one exception is `calendarChangesSince` (Phase 23). It answers what
+// changed since a set of sync tokens, and it has to look at every calendar,
+// because "what changed" means every calendar. It pays one PROPFIND for every
+// token and one REPORT only where a token moved, one calendar at a time. It
+// cannot fan out: the concurrent version returns the same counts, so nothing in
+// the answer would show it, which is why its entry points are named on the
+// `dav-concurrent-request` rule rather than trusted to stay serial.
 //
 // This module contains no logging calls of any kind and must never acquire any.
 
@@ -34,9 +44,17 @@ import {
   fetchCalendarObjects,
   fetchCalendarUserAddresses,
   propfind,
+  syncCollection,
   updateCalendarObject,
 } from "tsdav";
 import type { DAVResponse } from "tsdav";
+import {
+  MAX_CHANGE_CALENDARS,
+  MAX_SYNC_TOKEN_LENGTH,
+  calendarKeyOf,
+  fitsInMarker,
+} from "../change-marker";
+import type { CalendarBlock, CalendarState } from "../change-marker";
 import type { Env } from "../env";
 import { fetchSubscriptionFeed } from "../feed/subscription-feed";
 import { assertUnderHome, davAccountFor, withRediscovery } from "./discovery";
@@ -44,8 +62,10 @@ import type { ResolvedDavAccount } from "./discovery";
 import {
   DavAuthError,
   DavConnectError,
+  DavForbiddenError,
   DavNotFoundError,
   DavSubscriptionError,
+  DavSyncTokenError,
   DavThrottleError,
 } from "./errors";
 import {
@@ -56,6 +76,7 @@ import {
   buildVEvent,
   countOccurrences,
   dropOverride,
+  eventChangeFactsOf,
   expandOccurrences,
   expandWithinBudget,
   findOccurrence,
@@ -398,6 +419,14 @@ interface Collection {
    * closed.
    */
   source: string | null;
+  /**
+   * The collection's `DAV:sync-token`, or `null` when the answer carried none.
+   *
+   * Only the change check's listing asks for it; the ordinary listing does
+   * not, so it is `null` there. Never surfaced past this module except as the
+   * token a fresh marker holds.
+   */
+  syncToken: string | null;
 }
 
 /**
@@ -558,6 +587,7 @@ function collectionsFrom(
       // events from either way, so it is marked a subscription regardless.
       subscribed: isSubscribed,
       source: sourceHrefOf(props.source),
+      syncToken: syncTokenOf(props.syncToken),
     });
   }
 
@@ -650,6 +680,761 @@ export async function listCalendars(
         subscribed: one.subscribed,
       })),
       cacheHit: resolved.cacheHit,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// CHNG-01, CHNG-04, CHNG-05 — what changed on every calendar since a marker
+// ---------------------------------------------------------------------------
+
+/** One calendar's state in a change check. The same closed list as the mail side (D-05). */
+export type CalendarChangeState =
+  | "started"
+  | "no_changes"
+  | "changes"
+  | "restarted"
+  | "not_checked"
+  | "gone";
+
+/**
+ * Why a calendar could not be checked. D-05's closed list, plus one.
+ *
+ * `marker_full` is the one this list adds. The marker has no room left for
+ * this calendar, so it is not checked and no state is kept for it. Unlike
+ * every other reason, the fresh marker does NOT keep an old starting point
+ * for it, and the tool's sentence says so rather than promising a gap covered.
+ */
+export type CalendarNotCheckedReason =
+  | "throttled"
+  | "connection"
+  | "unavailable"
+  | "no_usable_answer"
+  | "marker_full";
+
+/**
+ * Which path answered, so the first live check settles assumption A2.
+ *
+ * `propfind-token` means the home listing's `DAV:sync-token` decided it with
+ * no further request. `sync-report` means one sync REPORT ran because that
+ * token moved. `report-token` means the listing gave no token for this
+ * calendar, so the sync REPORT itself was the only source of one (D-23).
+ */
+export type CalendarSyncMechanism = "propfind-token" | "sync-report" | "report-token";
+
+/**
+ * At most this many event rows come back from one change check, across every
+ * calendar (D-26). It also bounds the events fetched: each calendar's multiget
+ * names at most what is left of it, so a large change set costs no more reads
+ * than a small one. The counts stay exact; only the rows stop.
+ */
+export const MAX_CHANGE_EVENT_ROWS = 25;
+
+/**
+ * One changed event, as a change row (D-26, CHNG-09).
+ *
+ * Exactly these keys. No description, location, attendees, organiser or
+ * alarms: every one of those is text a stranger may have written, and a change
+ * check reports on many events at once. The detail call is for one event.
+ */
+export interface ChangedEventRow {
+  /** The event id `calendar_get_event` takes. Minted here. */
+  id: string;
+  /** The calendar id. Minted here. */
+  calendar: string;
+  /** The title, verbatim. **Stranger-authored: fenced only.** */
+  title: string | null;
+  /** See `EventChangeFacts.start` for the three shapes. */
+  start: string;
+  end: string;
+  allDay: boolean;
+  cancelled: boolean;
+  /**
+   * `added` when CREATED is at or after the time the calendar's token was
+   * taken, `changed` when it is before. ABSENT when there is no CREATED to
+   * compare: that event is counted as added-or-changed, never guessed.
+   */
+  kind?: "added" | "changed";
+}
+
+/**
+ * Why a calendar restarted during a check, when it was not the whole marker.
+ *
+ * `token_refused`: iCloud named the expired-token precondition (D-28).
+ * `listing_refused`: the REPORT was refused 403 with no such element, right
+ * after the home listing succeeded with the same credential, so the password is
+ * not the problem.
+ */
+export type CalendarRestartWhy = "token_refused" | "listing_refused";
+
+/** What the change check found for one calendar. */
+export interface CalendarChange {
+  calendarId: string;
+  /** Stranger-authored or the owner's text. For the fenced block only. */
+  displayName: string;
+  state: CalendarChangeState;
+  /**
+   * The four counts, only for `changes` and `no_changes`; `null` otherwise.
+   * `added` and `changed` are the events a row classified by CREATED.
+   * `addedOrChanged` is every other changed event: no CREATED, a body that
+   * could not be read, or beyond the row cap. The three sum to every changed
+   * member the sync answer named.
+   */
+  added: number | null;
+  changed: number | null;
+  addedOrChanged: number | null;
+  removed: number | null;
+  /** The event rows for this calendar, in URL order. Fenced at the tool. */
+  events: ChangedEventRow[];
+  /** True when iCloud cut the answer short and more remains (D-27). */
+  more: boolean;
+  mechanism: CalendarSyncMechanism | null;
+  why?: CalendarRestartWhy;
+  reason?: CalendarNotCheckedReason;
+  /**
+   * When the token this calendar was compared against was taken, in seconds.
+   * Only on `changes` and `no_changes`, and only when that differs from the
+   * block's own time: a calendar carried forward unchecked from an older call
+   * (WR-05). The counts are since then, not since the marker's time.
+   */
+  since?: number;
+}
+
+/** Everything `calendarChangesSince` answers. */
+export interface CalendarChanges {
+  /** One per non-subscribed calendar the listing shows, in URL order. */
+  calendars: CalendarChange[];
+  /** Subscriptions: pointer records with no members, never checked (D-22). */
+  notCovered: { calendarId: string; displayName: string }[];
+  /** Calendars in the prior block that no longer exist. */
+  gone: number;
+  /** The calendar block for the fresh marker. */
+  fresh: CalendarBlock;
+}
+
+/** What one sync answer said, once every element has been checked. */
+export interface SyncAnswer {
+  /** A multistatus carrying a new token, no failed element, and no dropped member. */
+  usable: boolean;
+  token: string | null;
+  addedOrChanged: string[];
+  removed: string[];
+  /** The collection itself answered 507: more remains (RFC 6578 §3.6). */
+  truncated: boolean;
+}
+
+/**
+ * A sync token as this module will carry it, or `null`.
+ *
+ * The XML layer turns a numeric-looking text into a number, so a safe integer
+ * is read back as its digits. Anything longer than the marker can hold is no
+ * usable token, rather than a marker the seal would refuse.
+ */
+function syncTokenOf(value: unknown): string | null {
+  const text =
+    typeof value === "number" && Number.isSafeInteger(value)
+      ? String(value)
+      : value;
+  if (typeof text !== "string") return null;
+  if (text.length === 0 || text.length > MAX_SYNC_TOKEN_LENGTH) return null;
+  return text;
+}
+
+/** The same URL with or without its trailing slash. */
+function sameCollection(a: string, b: string): boolean {
+  const trim = (url: string) => (url.endsWith("/") ? url.slice(0, -1) : url);
+  return trim(a) === trim(b);
+}
+
+/**
+ * Read a sync REPORT's answer (D-24, D-25). Pure: it issues no request.
+ *
+ * Usable only if the answer is a multistatus carrying a non-empty new sync
+ * token and no element failed, other than a member answered 404 (removed) or
+ * the collection itself answered 507 (truncated). The raw library helper does
+ * not throw on a failed answer, so this is the check that stops one reading as
+ * "nothing changed".
+ *
+ * The collection's own href is not a change: iCloud includes it (measured
+ * 2026-08-22). Every other href is resolved against the collection URL and
+ * must be under the calendar home, or it is not counted. Hrefs are
+ * de-duplicated.
+ *
+ * **A member that is not counted makes the answer unusable (WR-01).** An href
+ * that does not resolve, or resolves outside the home, is a change iCloud
+ * reported and this check cannot use. Counting the rest and moving the token on
+ * would skip it for good, and an answer made only of such members would read
+ * as "nothing changed". So the calendar is `not_checked` and keeps its old
+ * token instead.
+ */
+export function readSyncAnswer(
+  responses: readonly DAVResponse[],
+  collectionUrl: string,
+  homeUrl: string,
+): SyncAnswer {
+  let token: string | null = null;
+  let failed = false;
+  let truncated = false;
+  let dropped = 0;
+  const changed = new Set<string>();
+  const gone = new Set<string>();
+
+  for (const response of responses) {
+    const raw = (response as { raw?: unknown }).raw;
+    if (token === null && raw !== null && typeof raw === "object") {
+      const multistatus = (raw as { multistatus?: unknown }).multistatus;
+      if (multistatus !== null && typeof multistatus === "object") {
+        token = syncTokenOf((multistatus as { syncToken?: unknown }).syncToken);
+      }
+    }
+
+    const status = response.status;
+    const href = response.href;
+    if (typeof href !== "string" || href.length === 0) {
+      // The whole-answer element an empty multistatus produces.
+      if (!(typeof status === "number" && status >= 200 && status < 300)) {
+        failed = true;
+      }
+      continue;
+    }
+
+    let url: string;
+    try {
+      url = new URL(href, collectionUrl).href;
+    } catch {
+      // An href this module cannot resolve is not counted. Nothing is read
+      // from the caught value.
+      dropped += 1;
+      continue;
+    }
+
+    if (sameCollection(url, collectionUrl)) {
+      if (status === 507) truncated = true;
+      else if (!(status >= 200 && status < 300)) failed = true;
+      continue;
+    }
+
+    if (status === 404) {
+      try {
+        assertUnderHome(url, homeUrl);
+      } catch {
+        dropped += 1;
+        continue;
+      }
+      gone.add(url);
+    } else if (status >= 200 && status < 300) {
+      try {
+        assertUnderHome(url, homeUrl);
+      } catch {
+        dropped += 1;
+        continue;
+      }
+      changed.add(url);
+    } else {
+      failed = true;
+    }
+  }
+
+  return {
+    usable: token !== null && !failed && dropped === 0,
+    token,
+    addedOrChanged: [...changed],
+    removed: [...gone],
+    truncated,
+  };
+}
+
+/**
+ * The home listing with every calendar's sync token (D-23).
+ *
+ * The same PROPFIND `fetchCollections` sends, plus `DAV:sync-token`, through
+ * the same filter, so "every calendar" means what the listing means.
+ * `fetchCollections` itself is untouched: its request bytes do not change.
+ */
+async function fetchCollectionStates(
+  davFetch: DavFetch,
+  resolved: ResolvedDavAccount,
+): Promise<Collection[]> {
+  const responses = await propfind({
+    url: resolved.homeUrl,
+    props: {
+      "d:displayname": {},
+      "d:resourcetype": {},
+      "c:supported-calendar-component-set": {},
+      "ca:calendar-color": {},
+      "cs:source": {},
+      "cs:getctag": {},
+      "d:sync-token": {},
+    },
+    depth: "1",
+    headers: {},
+    fetch: davFetch,
+  });
+
+  return collectionsFrom(responses, resolved.homeUrl);
+}
+
+/**
+ * One sync REPORT for one calendar, etag only, at sync-level 1.
+ *
+ * Headers are empty: the transport attaches the credential. The answer is read
+ * by `readSyncAnswer`, never trusted as it comes.
+ */
+async function syncOneCalendar(
+  davFetch: DavFetch,
+  collectionUrl: string,
+  homeUrl: string,
+  token: string,
+): Promise<SyncAnswer> {
+  const responses = await syncCollection({
+    url: collectionUrl,
+    props: { "d:getetag": {} },
+    syncLevel: 1,
+    syncToken: token,
+    headers: {},
+    fetch: davFetch,
+  });
+  return readSyncAnswer(responses, collectionUrl, homeUrl);
+}
+
+/** What one calendar's detail read produced. */
+interface EventRowsAnswer {
+  rows: ChangedEventRow[];
+  added: number;
+  changed: number;
+  addedOrChanged: number;
+  /** Hrefs named in the multiget: what this calendar spent of the budget. */
+  asked: number;
+  /** Set when the multiget was throttled or could not connect (D-29). */
+  stop: CalendarNotCheckedReason | null;
+}
+
+/**
+ * The rows for one calendar's changed events (D-26): one calendar-multiget.
+ *
+ * It names at most `budget` of the hrefs, in URL order, each checked against
+ * the home first (D-25): a member outside it is neither fetched nor counted.
+ * Object URLs go out as paths, matching the form the library's own object
+ * fetch sends. Headers are empty: the transport attaches the credential.
+ *
+ * Every body is read by `eventChangeFactsOf`, so no iCalendar byte is parsed
+ * in this module. The split is by CREATED against `since`, the time this
+ * calendar's token was taken: at or after is added, before is changed, and no
+ * CREATED is added-or-changed. A member the answer does not return, returns
+ * with a failed status, or returns in a form that does not parse gets no row
+ * and is counted as added-or-changed. So is every href beyond the budget.
+ *
+ * A failed multiget is never an error for the check: the sync answer already
+ * gave exact counts, so the rows are simply missing. The library raises on
+ * any failed member, which drops every row for that calendar, not just the
+ * failed one. A throttle or a connection failure is reported back so the
+ * caller stops the calendar side (D-29).
+ */
+async function changedEventRows(
+  davFetch: DavFetch,
+  collectionUrl: string,
+  homeUrl: string,
+  hrefs: readonly string[],
+  budget: number,
+  since: number,
+): Promise<EventRowsAnswer> {
+  const inHome: string[] = [];
+  for (const href of [...hrefs].sort()) {
+    try {
+      assertUnderHome(href, homeUrl);
+    } catch {
+      continue;
+    }
+    inHome.push(href);
+  }
+  const asked = inHome.slice(0, Math.max(0, budget));
+
+  const answer: EventRowsAnswer = {
+    rows: [],
+    added: 0,
+    changed: 0,
+    addedOrChanged: 0,
+    asked: asked.length,
+    stop: null,
+  };
+
+  let responses: DAVResponse[] = [];
+  if (asked.length > 0) {
+    try {
+      responses = await calendarMultiGet({
+        url: collectionUrl,
+        props: { "d:getetag": {}, "c:calendar-data": {} },
+        objectUrls: asked.map((url) => new URL(url).pathname),
+        depth: "1",
+        headers: {},
+        fetch: davFetch,
+      });
+    } catch (err) {
+      // Nothing is read from the caught value beyond its type.
+      if (err instanceof DavThrottleError) answer.stop = "throttled";
+      else if (err instanceof DavConnectError) answer.stop = "connection";
+      responses = [];
+    }
+  }
+  const returned = responses.filter(
+    (one) => typeof one.status !== "number" || (one.status >= 200 && one.status < 300),
+  );
+
+  const calendar = encodeCalendarId({ collectionUrl });
+  for (const objectUrl of asked) {
+    const body = bodyFor(returned, collectionUrl, objectUrl);
+    if (body === null) continue;
+    let facts: ReturnType<typeof eventChangeFactsOf>;
+    try {
+      facts = eventChangeFactsOf(body);
+    } catch {
+      // An event this server cannot read gets no row. Nothing is read from
+      // the caught value.
+      continue;
+    }
+    const row: ChangedEventRow = {
+      id: encodeEventId({ calendarUrl: collectionUrl, objectUrl, recurrenceId: null }),
+      calendar,
+      title: facts.summary,
+      start: facts.start,
+      end: facts.end,
+      allDay: facts.allDay,
+      cancelled: facts.cancelled,
+    };
+    if (facts.created !== null) {
+      row.kind = facts.created >= since ? "added" : "changed";
+      if (row.kind === "added") answer.added += 1;
+      else answer.changed += 1;
+    }
+    answer.rows.push(row);
+  }
+  answer.addedOrChanged = inHome.length - answer.added - answer.changed;
+  return answer;
+}
+
+/** How one sync REPORT ended, once its failure has been sorted by type. */
+type ReportOutcome =
+  | { kind: "answer"; answer: SyncAnswer }
+  | { kind: "refused"; why: CalendarRestartWhy }
+  | { kind: "stop"; reason: CalendarNotCheckedReason }
+  | { kind: "gone" }
+  | { kind: "unusable" };
+
+/** One sync REPORT, with its failure sorted by type and nothing else read. */
+async function reportOutcome(
+  davFetch: DavFetch,
+  collectionUrl: string,
+  homeUrl: string,
+  token: string,
+): Promise<ReportOutcome> {
+  let answer: SyncAnswer;
+  try {
+    answer = await syncOneCalendar(davFetch, collectionUrl, homeUrl, token);
+  } catch (err) {
+    if (err instanceof DavSyncTokenError) return { kind: "refused", why: "token_refused" };
+    // Only a 403 is D-28's second layer. A 401 is a failed sign-in and is
+    // answered as one, with the caller's marker untouched (D-08, WR-02).
+    if (err instanceof DavForbiddenError) return { kind: "refused", why: "listing_refused" };
+    if (err instanceof DavAuthError) throw err;
+    if (err instanceof DavThrottleError) return { kind: "stop", reason: "throttled" };
+    if (err instanceof DavConnectError) return { kind: "stop", reason: "connection" };
+    if (err instanceof DavNotFoundError) return { kind: "gone" };
+    return { kind: "unusable" };
+  }
+  if (!answer.usable || answer.token === null) return { kind: "unusable" };
+  return { kind: "answer", answer };
+}
+
+/**
+ * What changed on every calendar since a marker's calendar block.
+ *
+ * One PROPFIND at the home gives every calendar's token. A calendar whose
+ * token did not move costs nothing more. A calendar whose token moved costs
+ * one sync REPORT. **One calendar at a time, each awaited before the next:**
+ * this is the only multi-collection read in this module, and the concurrent
+ * version would return the same counts, so nothing in the answer would reveal
+ * a fan-out. The request-scoped queue in `./transport.ts` and the scan's
+ * `dav-concurrent-request` rule hold the same line from two other sides.
+ *
+ * A calendar whose token moved also costs one calendar-multiget for its event
+ * rows, at most `MAX_CHANGE_EVENT_ROWS` across the whole call (D-26). That
+ * multiget finishes before the next calendar's first request starts.
+ *
+ * A calendar the listing gives no token for falls back to the sync REPORT
+ * itself (D-23): with its old token when the marker holds one, and with an
+ * empty token otherwise, whose members are discarded because they are the
+ * whole calendar rather than changes. Its `mechanism` is `report-token`.
+ *
+ * A throttle or a connection failure on a REPORT stops the loop at once
+ * (D-29). That calendar and every one after it are `not_checked`, keep their
+ * old tokens, and nothing more is sent. No retry. The same failure on a detail
+ * read stops the loop after that calendar, whose counts are already exact.
+ *
+ * Failures at the home listing are thrown to the caller, which decides what
+ * the whole calendar side says. A sign-in refusal there is a real one.
+ *
+ * **Every kept state must fit the marker (CR-01).** `fits` answers whether a
+ * list of calendar states still seals into a marker the tool reads back; the
+ * caller passes one that includes its own mail states. A calendar whose state
+ * would not fit, and every calendar after it in URL order, is `not_checked`
+ * with `marker_full`: no further request is sent for it and no state is kept.
+ * A marker the tool's own schema refused could never be passed back, so
+ * change detection would never work again for that account.
+ *
+ * Nothing here writes and nothing is cached.
+ */
+export async function calendarChangesSince(
+  env: Env,
+  principal: Principal,
+  davFetch: DavFetch,
+  prior: CalendarBlock | null,
+  restartAll: boolean,
+  fits: (calendars: readonly CalendarState[]) => boolean = (calendars) => {
+    const now = Math.floor(Date.now() / 1000);
+    return fitsInMarker({
+      folders: [],
+      calendar: { takenAt: now, calendars: [...calendars] },
+      mintedAt: now,
+    });
+  },
+): Promise<CalendarChanges> {
+  return withRediscovery(env, principal, davFetch, "caldav", async (resolved) => {
+    const collections = await fetchCollectionStates(davFetch, resolved);
+
+    const priorByKey = new Map<string, CalendarState>(
+      (prior?.calendars ?? []).map((one) => [one.key, one]),
+    );
+    const carryOf = (old: CalendarState): CalendarState => ({
+      key: old.key,
+      syncToken: old.syncToken,
+      takenAt: old.takenAt ?? prior?.takenAt ?? Math.floor(Date.now() / 1000),
+    });
+
+    const calendars: CalendarChange[] = [];
+    const notCovered: CalendarChanges["notCovered"] = [];
+    const freshStates: CalendarState[] = [];
+    const seenKeys = new Set<string>();
+    let stopped: CalendarNotCheckedReason | null = null;
+    let rowBudget = MAX_CHANGE_EVENT_ROWS;
+    // Set once a state did not fit: every calendar after it is marker_full.
+    let full = false;
+    const room = (state: CalendarState): boolean =>
+      freshStates.length < MAX_CHANGE_CALENDARS && fits([...freshStates, state]);
+
+    for (const collection of collections) {
+      const calendarId = encodeCalendarId({ collectionUrl: collection.url });
+      if (collection.subscribed) {
+        notCovered.push({ calendarId, displayName: collection.displayName });
+        continue;
+      }
+      // The key first, before any cap: a calendar that exists is never counted
+      // as gone, whether or not this call checks it.
+      const key = await calendarKeyOf(collection.url);
+      seenKeys.add(key);
+      const old = priorByKey.get(key) ?? null;
+      const base = {
+        calendarId,
+        displayName: collection.displayName,
+        added: null,
+        changed: null,
+        addedOrChanged: null,
+        removed: null,
+        more: false,
+        events: [] as ChangedEventRow[],
+      };
+
+      // No room left in the marker: not checked, no request, and no state
+      // kept, because there is nowhere to keep one.
+      const markFull = (): void => {
+        full = true;
+        calendars.push({ ...base, state: "not_checked", mechanism: null, reason: "marker_full" });
+      };
+      // Every answer that keeps a state goes through here, so none is kept
+      // that would push the marker past what the tool reads back.
+      const keep = (change: CalendarChange, state: CalendarState): void => {
+        if (!room(state)) {
+          markFull();
+          return;
+        }
+        calendars.push(change);
+        freshStates.push(state);
+      };
+      if (full || freshStates.length >= MAX_CHANGE_CALENDARS) {
+        markFull();
+        continue;
+      }
+      // A carried calendar was compared against its own, older token time.
+      const since = old?.takenAt !== undefined ? { since: old.takenAt } : {};
+      const notChecked = (
+        reason: CalendarNotCheckedReason,
+        mechanism: CalendarSyncMechanism | null,
+      ): void => {
+        const change: CalendarChange = { ...base, state: "not_checked", mechanism, reason };
+        if (old === null) calendars.push(change);
+        else keep(change, carryOf(old));
+      };
+
+      if (stopped !== null) {
+        notChecked(stopped, null);
+        continue;
+      }
+
+      const property = collection.syncToken;
+      const starting = prior === null || restartAll || old === null;
+      const startState: CalendarChangeState = restartAll ? "restarted" : "started";
+
+      if (property !== null && starting) {
+        keep({ ...base, state: startState, mechanism: "propfind-token" }, { key, syncToken: property });
+        continue;
+      }
+
+      if (property !== null && old !== null && property === old.syncToken) {
+        keep(
+          {
+            ...base,
+            state: "no_changes",
+            added: 0,
+            changed: 0,
+            addedOrChanged: 0,
+            removed: 0,
+            mechanism: "propfind-token",
+            ...since,
+          },
+          { key, syncToken: property },
+        );
+        continue;
+      }
+
+      // A REPORT is needed from here: the token moved, or the listing gave no
+      // token and the REPORT is the only source of one (D-23).
+      const mechanism: CalendarSyncMechanism =
+        property === null ? "report-token" : "sync-report";
+      try {
+        assertUnderHome(collection.url, resolved.homeUrl);
+      } catch {
+        notChecked("unavailable", null);
+        continue;
+      }
+
+      // No token anywhere: one REPORT with an empty token gives a starting
+      // point. Its members are the whole calendar, not changes, so they are
+      // discarded and nothing is fetched.
+      //
+      // A truncated answer is no starting point (WR-03). Its token is a
+      // continuation token, so recording it would make the next check report
+      // the rest of the calendar's existing events as added or changed. The
+      // calendar is not_checked instead, and nothing partial is kept.
+      const startFromReport = async (
+        state: CalendarChangeState,
+        why?: CalendarRestartWhy,
+      ): Promise<void> => {
+        const outcome = await reportOutcome(davFetch, collection.url, resolved.homeUrl, "");
+        if (outcome.kind === "answer" && outcome.answer.truncated) {
+          notChecked("no_usable_answer", mechanism);
+        } else if (outcome.kind === "answer") {
+          keep(
+            { ...base, state, mechanism, ...(why !== undefined ? { why } : {}) },
+            { key, syncToken: outcome.answer.token as string },
+          );
+        } else if (outcome.kind === "stop") {
+          stopped = outcome.reason;
+          notChecked(stopped, mechanism);
+        } else if (outcome.kind === "gone") {
+          calendars.push({ ...base, state: "gone", mechanism });
+        } else {
+          notChecked("no_usable_answer", mechanism);
+        }
+      };
+
+      if (starting || old === null) {
+        await startFromReport(startState);
+        continue;
+      }
+
+      const outcome = await reportOutcome(
+        davFetch,
+        collection.url,
+        resolved.homeUrl,
+        old.syncToken,
+      );
+      if (outcome.kind === "refused") {
+        if (property !== null) {
+          keep(
+            { ...base, state: "restarted", mechanism, why: outcome.why },
+            { key, syncToken: property },
+          );
+        } else {
+          // The old token was refused and the listing gave none: a second,
+          // empty-token REPORT is the only way to a new starting point.
+          await startFromReport("restarted", outcome.why);
+        }
+        continue;
+      }
+      if (outcome.kind === "stop") {
+        stopped = outcome.reason;
+        notChecked(stopped, mechanism);
+        continue;
+      }
+      if (outcome.kind === "gone") {
+        calendars.push({ ...base, state: "gone", mechanism });
+        continue;
+      }
+      if (outcome.kind === "unusable") {
+        notChecked("no_usable_answer", mechanism);
+        continue;
+      }
+
+      const answer = outcome.answer;
+      const freshState: CalendarState = { key, syncToken: answer.token as string };
+      // Checked before the detail read, so no row is fetched for a calendar
+      // whose state the marker has no room to keep.
+      if (!room(freshState)) {
+        markFull();
+        continue;
+      }
+      // The rows, against the time THIS calendar's token was taken: a carried
+      // calendar keeps its own, older time (D-16).
+      const detail = await changedEventRows(
+        davFetch,
+        collection.url,
+        resolved.homeUrl,
+        answer.addedOrChanged,
+        rowBudget,
+        old.takenAt ?? (prior as CalendarBlock).takenAt,
+      );
+      rowBudget -= detail.asked;
+      const removedCount = answer.removed.length;
+      calendars.push({
+        ...base,
+        state:
+          answer.addedOrChanged.length + removedCount > 0 || answer.truncated
+            ? "changes"
+            : "no_changes",
+        added: detail.added,
+        changed: detail.changed,
+        addedOrChanged: detail.addedOrChanged,
+        removed: removedCount,
+        more: answer.truncated,
+        mechanism,
+        events: detail.rows,
+        ...since,
+      });
+      freshStates.push(freshState);
+      // A throttle or a lost connection on the detail read stops the calendar
+      // side after this calendar, whose counts are already exact (D-29).
+      if (detail.stop !== null) stopped = detail.stop;
+    }
+
+    let gone = 0;
+    for (const key of priorByKey.keys()) {
+      if (!seenKeys.has(key)) gone += 1;
+    }
+
+    return {
+      calendars,
+      notCovered,
+      gone,
+      fresh: { takenAt: Math.floor(Date.now() / 1000), calendars: freshStates },
     };
   });
 }

@@ -75,6 +75,7 @@ const EXPECTED_TOOLS: readonly string[] = [
   "calendar_search",
   "calendar_update_calendar",
   "calendar_update_event",
+  "changes_since",
   "contacts_commit",
   "contacts_create",
   "contacts_get",
@@ -326,11 +327,11 @@ describe("the tool set is pinned against the instructions", () => {
       "the ?raw import of README.md loaded nothing",
     ).toBeGreaterThan(1000);
 
-    const stated = README.match(/^(\d+) tools in four groups/m);
+    const stated = README.match(/^(\d+) tools in [a-z]+ groups/m);
     expect(
       stated,
-      "README.md no longer carries an 'N tools in four groups' line for this " +
-        "gate to check. Restore it or delete this test deliberately.",
+      "README.md no longer carries an 'N tools in <count> groups' line for " +
+        "this gate to check. Restore it or delete this test deliberately.",
     ).not.toBeNull();
 
     expect(

@@ -13,6 +13,7 @@ import type { Principal } from "../principal";
 import { SERVER_INSTRUCTIONS } from "./instructions";
 import { registerAccountTool } from "./tools/account";
 import { registerCalendarTools } from "./tools/calendar";
+import { registerChangesTool } from "./tools/changes";
 import { registerContactsTools } from "./tools/contacts";
 import { registerDavDiagnoseTool } from "./tools/dav-diagnose";
 import { registerDiagnoseTool } from "./tools/diagnose";
@@ -117,6 +118,12 @@ export function createServerFactory(
     // it needs neither.
     registerAccountTool(server, principal);
     registerMailTools(server, gate, principal);
+    // The change check (CHNG-01). The same gate as the mail tools, so a
+    // second session while one is held is refused rather than opening a
+    // second socket; the gate does not queue. And
+    // the same `davFetch` the calendar tools get below, so its calendar
+    // requests share their one queue.
+    registerChangesTool(server, gate, principal, davFetch);
     registerDavDiagnoseTool(server, davFetch, unpaused);
     // The same `davFetch` the diagnostic takes, deliberately: one queue per
     // request means a calendar call and a diagnosis issued in the same request

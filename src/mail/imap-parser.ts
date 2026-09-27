@@ -606,6 +606,95 @@ export function correlateStatus(
   }));
 }
 
+/** What one `* STATUS` reply said about a folder, for the change check. */
+export interface StatusSnapshot {
+  /** The mailbox the reply named, exactly as the server spelled it. */
+  name: string;
+  uidValidity: number | null;
+  uidNext: number | null;
+  messages: number | null;
+  /** The digits exactly as sent, or `null` when the server sent none. */
+  highestModseq: string | null;
+}
+
+/** The largest mod-sequence RFC 7162 allows: a 63-bit value. */
+const MAX_MODSEQ = 9223372036854775807n;
+
+/** A 32-bit unsigned value from a digit string, or `null`. */
+function uint32Of(value: string): number | null {
+  if (!/^\d{1,10}$/.test(value)) return null;
+  const number = Number(value);
+  return number <= 0xffffffff ? number : null;
+}
+
+/**
+ * Parse an untagged status reply into the four facts the change check reads.
+ *
+ * The same S-expression walk and the same mailbox-name handling as
+ * `parseStatusLine`, so a name that arrives quoted, bare or as a literal is
+ * read the same way on both paths.
+ *
+ * **The mod-sequence is kept as the digits the server sent, never as a
+ * number.** It is a 63-bit value (RFC 7162), and a JS number holds 53 bits
+ * exactly. Above that, two different mod-sequences can turn into the same
+ * number, and "nothing else changed" would then be said about a folder where
+ * something did. `parseStatusLine` converts every value with `Number`, which is
+ * why this is its own reader. The digits are checked against the 63-bit limit
+ * with `BigInt`.
+ *
+ * **Absent is `null`, never zero.** A folder whose reply left out a value is a
+ * different fact from a folder whose value is zero.
+ *
+ * Returns `null` for anything that is not a status reply.
+ */
+export function parseStatusSnapshot(line: ResponseLine): StatusSnapshot | null {
+  const parsed = parseSExpr(line);
+  if (parsed[0] !== "*") return null;
+
+  const command = parsed[1];
+  if (typeof command !== "string" || command.toUpperCase() !== "STATUS") {
+    return null;
+  }
+
+  const name = mailboxName(parsed[2]);
+  if (name === null) return null;
+
+  const attributeList = parsed[3];
+  if (!Array.isArray(attributeList)) return null;
+
+  const snapshot: StatusSnapshot = {
+    name,
+    uidValidity: null,
+    uidNext: null,
+    messages: null,
+    highestModseq: null,
+  };
+  for (let index = 0; index + 1 < attributeList.length; index += 2) {
+    const key = attributeList[index];
+    const value = attributeList[index + 1];
+    if (typeof key !== "string" || typeof value !== "string") continue;
+    switch (key.toUpperCase()) {
+      case "UIDVALIDITY":
+        snapshot.uidValidity = uint32Of(value);
+        break;
+      case "UIDNEXT":
+        snapshot.uidNext = uint32Of(value);
+        break;
+      case "MESSAGES":
+        snapshot.messages = uint32Of(value);
+        break;
+      case "HIGHESTMODSEQ":
+        snapshot.highestModseq =
+          /^(?:0|[1-9]\d{0,18})$/.test(value) && BigInt(value) <= MAX_MODSEQ
+            ? value
+            : null;
+        break;
+    }
+  }
+
+  return snapshot;
+}
+
 /**
  * The modified base64 alphabet, with a comma in the sixty-third position.
  *

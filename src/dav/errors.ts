@@ -45,6 +45,19 @@ export class DavAuthError extends Error {
   }
 }
 
+/**
+ * The one `DavAuthError` that was a 403, told apart from a 401 (WR-02).
+ *
+ * A subclass, so every caller that catches `DavAuthError` catches this exactly
+ * as before: same name, same message, same `kind`, no field of its own. Only a
+ * caller that asks for it by type sees the difference. The change check asks,
+ * because a 403 on a sync REPORT right after the home listing succeeded is not
+ * a dead password (D-28's second layer), and a 401 always is. Reading the two
+ * as one reported a failed sign-in as "the marker was too old" and threw away
+ * the changes in the gap.
+ */
+export class DavForbiddenError extends DavAuthError {}
+
 /** Thrown when the DAV request could not be made, or came back unusable. */
 export class DavConnectError extends Error {
   readonly kind = "connect" as const;
@@ -134,6 +147,35 @@ export class DavStaleResourceError extends Error {
   constructor() {
     super("dav-resource-changed");
     this.name = "DavStaleResourceError";
+  }
+}
+
+/**
+ * Thrown when iCloud refuses a sync REPORT because the token is no longer valid.
+ *
+ * RFC 6578 §3.2 names the precondition a stale token fails,
+ * `DAV:valid-sync-token`, and deliberately does not fix the status that carries
+ * it. Servers answer 403, 409 or 410. Read by status number alone, each of those
+ * is something false here: a rejected password, a moved shard, a transient
+ * fault. So `./transport.ts` raises this, and only this, for a REPORT answered
+ * one of those three whose bounded body names that element. It is the only
+ * class in this file chosen by reading an error body, and the body decides the
+ * TYPE and nothing else.
+ *
+ * The change check catches it and answers "too old": that calendar is
+ * restarted from its current token (D-09). It should never reach a caller. If
+ * it ever does, it maps to `stale_resource`, whose guidance is to read again,
+ * and that is the right remedy. The password is fine.
+ *
+ * No constructor argument, on `DavStaleResourceError`'s register: no status, no
+ * body, no URL, and no field for one to ride in.
+ */
+export class DavSyncTokenError extends Error {
+  readonly kind = "sync-token" as const;
+
+  constructor() {
+    super("dav-sync-token-expired");
+    this.name = "DavSyncTokenError";
   }
 }
 
@@ -301,6 +343,7 @@ export function davToErrorCategory(err: unknown): {
   } else if (err instanceof DavThrottleError) category = "rate_limited";
   else if (err instanceof DavNotFoundError) category = "not_found";
   else if (err instanceof DavStaleResourceError) category = "stale_resource";
+  else if (err instanceof DavSyncTokenError) category = "stale_resource";
   else if (err instanceof DavConfirmationError) {
     category = "confirmation_invalid";
   } else if (err instanceof DavSubscriptionError) {
