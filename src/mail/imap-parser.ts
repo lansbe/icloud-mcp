@@ -1565,12 +1565,67 @@ export function parseModifiedUids(taggedText: string): number[] | null {
 }
 
 /**
- * The COUNT of one count-form search reply, or `null` when the line is not
- * that reply for THIS command.
+ * The COUNT of one count-form search reply, or `null` when the line is not that
+ * reply for THIS command.
  *
- * RFC 4731: `* ESEARCH (TAG "<tag>") UID COUNT <n>`. A stub until 21-08's
- * implementation lands.
+ * RFC 4731: `esearch-response = "ESEARCH" [search-correlator] [SP "UID"]
+ * *(SP search-return-data)`, with `search-correlator = SP "(" "TAG" SP
+ * tag-string ")"` and `"COUNT" SP number` as one of the return data items.
+ * iCloud answers `UID SEARCH RETURN (COUNT) UID <n>` with exactly
+ * `* ESEARCH (TAG "a6") UID COUNT 0` (21-UAT.md, "Probe, 2026-09-27").
+ *
+ * Why this form exists here at all: when a plain UID search matches nothing,
+ * iCloud sends the completion and no untagged search line, so "gone" and "never
+ * answered" look the same. The count form always carries a number.
+ *
+ * The rules, and why each one:
+ *
+ * - **The tag must be this command's.** RFC 4731 correlates a reply to its
+ *   command by tag, and a count meant for another command is not an answer to
+ *   this one. A line with no correlator is refused for the same reason.
+ * - **Return data items come in any order,** and items other than COUNT are
+ *   skipped as name and value pairs. `ALL` carries a set, which is one atom.
+ * - **COUNT must be a plain number** in the unsigned 32-bit range, with no
+ *   leading zero. A missing, non-numeric or repeated COUNT is `null`: a count
+ *   that cannot be read is not a count of zero.
+ * - **The `UID` marker is optional.** It says the data are UIDs, which does not
+ *   change what a count means.
+ * - **Case is ignored** on the response name, the correlator key and the item
+ *   names. The tag is compared exactly.
+ *
+ * Pure: it reads the `ResponseLine` it is handed and touches nothing else.
  */
-export function parseEsearchCount(_line: ResponseLine, _tag: string): number | null {
-  return null;
+export function parseEsearchCount(line: ResponseLine, tag: string): number | null {
+  const parsed = parseSExpr(line);
+  if (parsed[0] !== "*") return null;
+
+  const command = parsed[1];
+  if (typeof command !== "string" || command.toUpperCase() !== "ESEARCH") return null;
+
+  const correlator = parsed[2];
+  if (!Array.isArray(correlator) || correlator.length !== 2) return null;
+  const [key, value] = correlator;
+  if (typeof key !== "string" || key.toUpperCase() !== "TAG") return null;
+  if (typeof value !== "string" || value !== tag) return null;
+
+  let index = 3;
+  const marker = parsed[index];
+  if (typeof marker === "string" && marker.toUpperCase() === "UID") index += 1;
+
+  let count: number | null = null;
+  for (; index < parsed.length; index += 2) {
+    const name = parsed[index];
+    if (typeof name !== "string") return null;
+    if (index + 1 >= parsed.length) return null;
+    if (name.toUpperCase() !== "COUNT") continue;
+
+    if (count !== null) return null;
+    const digits = parsed[index + 1];
+    if (typeof digits !== "string" || !/^(0|[1-9]\d*)$/.test(digits)) return null;
+    const number = Number(digits);
+    if (!isWireNumber(number)) return null;
+    count = number;
+  }
+
+  return count;
 }

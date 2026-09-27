@@ -46,7 +46,7 @@ import {
   parseModifiedUids,
   flagStateOf,
   keepsFlag,
-  parseSearchLine,
+  parseEsearchCount,
   quoteMailbox,
   seenStateOf,
 } from "./imap-parser";
@@ -446,12 +446,13 @@ export const MOVE_SET_CAP = 25;
 /**
  * What happened to one message. Exactly one per message, never a bare success.
  *
- * - `moved`: a re-read of the source no longer lists it, and the copy was
+ * - `moved`: a re-read of the source counts it as gone, and the copy was
  *   proven. Only the re-read can say this; a tagged OK never does (TRIA-05).
  * - `copied_not_removed`: the copy landed and the original is still in the
  *   source. Two copies exist; nothing is lost.
  * - `not_copied`: nothing was written for this message.
- * - `unknown`: a write was sent and its answer never came back.
+ * - `unknown`: a write was sent and where the message ended was not proven:
+ *   its answer never came back, or the re-read gave no count.
  */
 export type MoveResultCode = "moved" | "copied_not_removed" | "not_copied" | "unknown";
 
@@ -465,6 +466,7 @@ export type MoveReason =
   | "removal-refused"
   | "still-in-source"
   | "verify-refused"
+  | "verify-unanswered"
   | "connection-lost"
   | "stopped-for-time"
   | "not-attempted"
@@ -526,6 +528,18 @@ function hasMoveCommands(capability: string | null): boolean {
   return atoms.has("UIDPLUS") && atoms.has("CONDSTORE");
 }
 
+/**
+ * Whether the capability line advertises the count form of search (RFC 4731).
+ *
+ * Needed for the verdict only, never for the move. The copy, the mark and the
+ * removal need UIDPLUS and CONDSTORE and nothing else, so a server without this
+ * still gets the move; it gets no re-read, and the answer says so.
+ */
+function hasCountSearch(capability: string | null): boolean {
+  if (capability === null) return false;
+  return capability.split(" ").some((atom) => atom.toUpperCase() === "ESEARCH");
+}
+
 /** One message's result, spelled once. */
 function resultOf(
   uid: number,
@@ -542,7 +556,8 @@ function resultOf(
  *
  * In order, and the order is the design: the copy, proven; then the removal
  * mark, conditional on the MODSEQ the preview sealed; then the removal of that
- * one UID; then a re-read. A failure at any step leaves the original in place.
+ * one UID; then a re-read that asks for a count. A failure at any step leaves
+ * the original in place.
  *
  * It never throws once its first write is handed over. A throw from the
  * channel after that is `unknown`, because the write may have landed.
@@ -643,27 +658,38 @@ async function moveMessageWithin(
     }
 
     // Step 6. The verdict comes from a re-read, never from an OK (TRIA-06).
+    //
+    // The count form, because iCloud sends no untagged search line when a plain
+    // search matches nothing, and "no line" is also what a server that never
+    // looked sends (21-UAT.md, "Probe, 2026-09-27"). A count always carries a
+    // number: 0 is proof the original is gone.
+    if (!hasCountSearch(session.capability)) {
+      return resultOf(ref.uid, "unknown", "verify-unanswered", newUid, destinationUidValidity);
+    }
+    const verifyTag = session.channel.nextTag();
     const verified = await sendCommand(
       session.channel,
-      session.channel.nextTag(),
-      `UID SEARCH UID ${ref.uid}`,
+      verifyTag,
+      `UID SEARCH RETURN (COUNT) UID ${ref.uid}`,
     );
     if (verified.status !== "OK") {
       return resultOf(ref.uid, "unknown", "verify-refused", newUid, destinationUidValidity);
     }
-    let answered = false;
-    let listed = false;
+    let count: number | null = null;
+    let disagreed = false;
     for (const line of verified.untagged) {
-      const uids = parseSearchLine(line);
-      if (uids === null) continue;
-      answered = true;
-      if (uids.includes(ref.uid)) listed = true;
+      const found = parseEsearchCount(line, verifyTag);
+      if (found === null) continue;
+      if (count !== null && count !== found) disagreed = true;
+      count = found;
     }
-    // No search reply at all is no evidence either way.
-    if (!answered) {
-      return resultOf(ref.uid, "unknown", "verify-refused", newUid, destinationUidValidity);
+    // An OK with no count for this command is no evidence either way. It is
+    // exactly iCloud's reply to a plain search that found nothing, and it must
+    // never read as moved. Two counts that disagree are no evidence either.
+    if (count === null || disagreed) {
+      return resultOf(ref.uid, "unknown", "verify-unanswered", newUid, destinationUidValidity);
     }
-    if (!listed) {
+    if (count === 0) {
       return resultOf(ref.uid, "moved", "verified-gone", newUid, destinationUidValidity);
     }
     return resultOf(

@@ -1165,6 +1165,7 @@ describe("the re-read asks for a count, and only a count for this command is an 
     ["a count line for another command's tag", wire(MEASURED_ESEARCH_GONE_LINE, "a9 OK SEARCH completed")],
     ["an empty plain search line instead of a count", wire("* SEARCH", "a9 OK SEARCH completed")],
     ["a count line with no number", wire('* ESEARCH (TAG "a9") UID COUNT', "a9 OK SEARCH completed")],
+    ["two count lines for this tag that disagree", wire('* ESEARCH (TAG "a9") UID COUNT 0', '* ESEARCH (TAG "a9") UID COUNT 1', "a9 OK SEARCH completed")],
   ])("%s: unknown, verify-unanswered, never moved", async (_label, reread) => {
     const duplex = oneMoveWith(reread);
 
