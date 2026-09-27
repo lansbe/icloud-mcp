@@ -17,7 +17,7 @@ import { calendarChangesSince, readSyncAnswer } from "../src/dav/calendar";
 import type { CalendarChanges } from "../src/dav/calendar";
 import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
 import { DavAuthError, DavThrottleError } from "../src/dav/errors";
-import { encodeCalendarId } from "../src/dav/ids";
+import { decodeEventId, encodeCalendarId } from "../src/dav/ids";
 import { createDavFetch } from "../src/dav/transport";
 import type { Principal } from "../src/principal";
 import { ownerPrincipal } from "./fixtures/bound-secrets";
@@ -277,7 +277,7 @@ describe("calendarChangesSince: the cheap path (D-23)", () => {
 describe("calendarChangesSince: a moved token (D-23, D-24, D-25)", () => {
   const WORK_PATH = new URL(WORK).pathname;
 
-  it("costs exactly one REPORT carrying the old token; the collection's own href is not counted", async () => {
+  it("costs one sync REPORT carrying the old token, then one multiget; the collection's own href is not counted", async () => {
     const stub = davStub(TWO, () =>
       syncAnswer(
         ok(WORK_PATH, '"coll"') +
@@ -296,7 +296,14 @@ describe("calendarChangesSince: a moved token (D-23, D-24, D-25)", () => {
     expect(stub.log.map((one) => `${one.method} ${one.url}`)).toEqual([
       `PROPFIND ${HOME}`,
       `REPORT ${WORK}`,
+      `REPORT ${WORK}`,
     ]);
+    // The second REPORT is the detail read: the two changed members, never the
+    // removed one and never the collection itself.
+    expect(stub.log[2]!.body).toContain("calendar-multiget");
+    expect(stub.log[2]!.body).toContain(`${WORK_PATH}a.ics`);
+    expect(stub.log[2]!.body).toContain(`${WORK_PATH}b.ics`);
+    expect(stub.log[2]!.body).not.toContain(`${WORK_PATH}c.ics`);
     const report = stub.log[1]!.body;
     expect(report).toContain("sync-collection");
     expect(report).toContain("work-1");
@@ -505,24 +512,6 @@ describe("calendarChangesSince: which calendars (D-22)", () => {
     expect(result.fresh.calendars.map((one) => one.syncToken)).toEqual(["family-1"]);
   });
 
-  it("a calendar with no token property is not_checked for now, and keeps its old token", async () => {
-    const cals: Cal[] = [
-      { url: WORK, name: "Work", token: null },
-      { url: FAMILY, name: "Family", token: "family-1" },
-    ];
-    const stub = davStub(cals);
-    const result = await run(stub, await block([[WORK, "work-1"], [FAMILY, "family-1"]]));
-    expect(stub.log.map((one) => one.method)).toEqual(["PROPFIND"]);
-    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
-    expect(work.state).toBe("not_checked");
-    expect(work.reason).toBe("no_usable_answer");
-    expect(result.fresh.calendars).toContainEqual({
-      key: await calendarKeyOf(WORK),
-      syncToken: "work-1",
-      takenAt: 1790000000,
-    });
-  });
-
   it("holds at most one request in flight across several moved calendars", async () => {
     const cals: Cal[] = [
       { url: FAMILY, name: "Family", token: "family-2" },
@@ -538,12 +527,19 @@ describe("calendarChangesSince: which calendars (D-22)", () => {
         [WORK, "work-1"],
       ]),
     );
+    // One sync REPORT and one multiget per calendar, never overlapping.
     expect(stub.log.map((one) => one.method)).toEqual([
       "PROPFIND",
       "REPORT",
       "REPORT",
       "REPORT",
+      "REPORT",
+      "REPORT",
+      "REPORT",
     ]);
+    expect(
+      stub.log.slice(1).map((one) => one.body.includes("calendar-multiget")),
+    ).toEqual([false, true, false, true, false, true]);
     expect(result.calendars.every((one) => one.state === "changes")).toBe(true);
     expect(stub.maxInFlight).toBe(1);
   });
@@ -632,5 +628,429 @@ describe("readSyncAnswer (pure)", () => {
         HOME,
       ),
     ).toEqual({ usable: true, token: "t9", addedOrChanged: [], removed: [], truncated: false });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 23-05: which events changed (D-26), the no-token fallback (D-23), and the
+// remaining arms (D-25, D-27)
+// ---------------------------------------------------------------------------
+
+/** The prior block's time is 2026-09-21. One CREATED after it, one before. */
+const AFTER = "20260925T000000Z";
+const BEFORE = "20260101T000000Z";
+
+const ROW_KEYS = ["allDay", "calendar", "cancelled", "end", "id", "start", "title"];
+
+function xmlText(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** An event carrying fields no change row may copy. */
+function eventIcs(
+  uid: string,
+  options: { created?: string; summary?: string; status?: string } = {},
+): string {
+  return [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Example//Change fixture//EN",
+    "BEGIN:VEVENT",
+    `UID:${uid}`,
+    "DTSTAMP:20260926T000000Z",
+    ...(options.created === undefined ? [] : [`CREATED:${options.created}`]),
+    `SUMMARY:${options.summary ?? uid}`,
+    "DESCRIPTION:Private notes that must not travel",
+    "LOCATION:Room four",
+    "ATTENDEE;CN=Sam Lee:mailto:sam.lee@example.invalid",
+    "ORGANIZER;CN=Priya:mailto:priya@example.invalid",
+    ...(options.status === undefined ? [] : [`STATUS:${options.status}`]),
+    "DTSTART:20261001T160000Z",
+    "DTEND:20261001T170000Z",
+    "BEGIN:VALARM",
+    "ACTION:DISPLAY",
+    "DESCRIPTION:Alarm text",
+    "TRIGGER:-PT15M",
+    "END:VALARM",
+    "END:VEVENT",
+    "END:VCALENDAR",
+    "",
+  ].join("\r\n");
+}
+
+function memberWithData(href: string, ics: string): string {
+  return (
+    `<response><href>${href}</href><propstat><prop><getetag>"e"</getetag>` +
+    `<C:calendar-data>${xmlText(ics)}</C:calendar-data></prop>` +
+    `<status>HTTP/1.1 200 OK</status></propstat></response>`
+  );
+}
+
+/** The paths a multiget body names, in the order it names them. */
+function multigetPaths(body: string): string[] {
+  return [...body.matchAll(/<(?:d:)?href>([^<]+)<\/(?:d:)?href>/g)].map((m) => m[1]!);
+}
+
+/**
+ * A REPORT router: sync REPORTs go to `sync`; a multiget is answered from
+ * `events`, keyed by path, for the paths it names that `events` holds.
+ */
+function router(
+  sync: (url: string, body: string) => Response,
+  events: Record<string, string> = {},
+  multiget?: (url: string, body: string) => Response,
+): (url: string, body: string) => Response {
+  return (url, body) => {
+    if (!body.includes("calendar-multiget")) return sync(url, body);
+    if (multiget !== undefined) return multiget(url, body);
+    return multistatus(
+      multigetPaths(body)
+        .filter((path) => path in events)
+        .map((path) => memberWithData(path, events[path]!))
+        .join(""),
+    );
+  };
+}
+
+const multigets = (stub: Stub) =>
+  stub.log.filter((one) => one.method === "REPORT" && one.body.includes("calendar-multiget"));
+
+describe("calendarChangesSince: which events were added or changed (D-26)", () => {
+  const WORK_PATH = new URL(WORK).pathname;
+  const FAMILY_PATH = new URL(FAMILY).pathname;
+
+  it("splits by CREATED against the token time: one multiget naming both, one added and one changed", async () => {
+    const stub = davStub(
+      TWO,
+      router(() => syncAnswer(ok(`${WORK_PATH}new.ics`) + ok(`${WORK_PATH}old.ics`), "work-3"), {
+        [`${WORK_PATH}new.ics`]: eventIcs("new", { created: AFTER, summary: "Interview loop" }),
+        [`${WORK_PATH}old.ics`]: eventIcs("old", { created: BEFORE, summary: "Team lunch" }),
+      }),
+    );
+    const result = await run(stub, await block([[WORK, "work-1"], [FAMILY, "family-1"]]));
+
+    expect(multigets(stub).map((one) => one.url)).toEqual([WORK]);
+    expect(multigetPaths(multigets(stub)[0]!.body)).toEqual([
+      `${WORK_PATH}new.ics`,
+      `${WORK_PATH}old.ics`,
+    ]);
+    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
+    expect(work).toMatchObject({
+      state: "changes",
+      added: 1,
+      changed: 1,
+      addedOrChanged: 0,
+      removed: 0,
+    });
+    expect(work.events).toHaveLength(2);
+    const byTitle = Object.fromEntries(work.events.map((row) => [row.title, row]));
+    expect(byTitle["Interview loop"]!.kind).toBe("added");
+    expect(byTitle["Team lunch"]!.kind).toBe("changed");
+    expect(stub.maxInFlight).toBe(1);
+  });
+
+  it("a row carries exactly the seven fields plus kind, and its id names the event", async () => {
+    const stub = davStub(
+      TWO,
+      router(() => syncAnswer(ok(`${WORK_PATH}new.ics`), "work-3"), {
+        [`${WORK_PATH}new.ics`]: eventIcs("new", { created: AFTER, summary: "Interview loop" }),
+      }),
+    );
+    const result = await run(stub, await block([[WORK, "work-1"], [FAMILY, "family-1"]]));
+    const row = result.calendars.find((one) => one.calendarId === idOf(WORK))!.events[0]!;
+
+    expect(Object.keys(row).sort()).toEqual([...ROW_KEYS, "kind"].sort());
+    expect(row).toEqual({
+      id: row.id,
+      calendar: idOf(WORK),
+      title: "Interview loop",
+      start: "2026-10-01T16:00:00Z",
+      end: "2026-10-01T17:00:00Z",
+      allDay: false,
+      cancelled: false,
+      kind: "added",
+    });
+    expect(decodeEventId(row.id)).toEqual({
+      calendarUrl: WORK,
+      objectUrl: `${WORK}new.ics`,
+      recurrenceId: null,
+    });
+    const text = JSON.stringify(result);
+    for (const leaked of ["Private notes", "Room four", "sam.lee", "Priya", "Alarm text"]) {
+      expect(text).not.toContain(leaked);
+    }
+  });
+
+  it("an event without CREATED is counted as added-or-changed, and its row carries no label", async () => {
+    const stub = davStub(
+      TWO,
+      router(() => syncAnswer(ok(`${WORK_PATH}plain.ics`), "work-3"), {
+        [`${WORK_PATH}plain.ics`]: eventIcs("plain", { status: "CANCELLED" }),
+      }),
+    );
+    const result = await run(stub, await block([[WORK, "work-1"], [FAMILY, "family-1"]]));
+    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
+    expect(work).toMatchObject({ added: 0, changed: 0, addedOrChanged: 1, removed: 0 });
+    expect(work.events).toHaveLength(1);
+    expect(Object.keys(work.events[0]!).sort()).toEqual(ROW_KEYS);
+    expect(work.events[0]!.cancelled).toBe(true);
+  });
+
+  it("thirty changes across two calendars: 25 rows, the first calendar first, the rest counted", async () => {
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const events: Record<string, string> = {};
+    let familyEntries = "";
+    for (let n = 0; n < 20; n += 1) {
+      familyEntries += ok(`${FAMILY_PATH}e${pad(n)}.ics`);
+      events[`${FAMILY_PATH}e${pad(n)}.ics`] = eventIcs(`f${n}`, { created: AFTER });
+    }
+    let workEntries = "";
+    for (let n = 0; n < 10; n += 1) {
+      workEntries += ok(`${WORK_PATH}e${pad(n)}.ics`);
+      events[`${WORK_PATH}e${pad(n)}.ics`] = eventIcs(`w${n}`, { created: AFTER });
+    }
+    const cals: Cal[] = [
+      { url: FAMILY, name: "Family", token: "family-2" },
+      { url: WORK, name: "Work", token: "work-2" },
+    ];
+    const stub = davStub(
+      cals,
+      router(
+        (url) =>
+          url === FAMILY ? syncAnswer(familyEntries, "family-3") : syncAnswer(workEntries, "work-3"),
+        events,
+      ),
+    );
+    const result = await run(stub, await block([[FAMILY, "family-1"], [WORK, "work-1"]]));
+
+    const [family, work] = result.calendars;
+    expect(family!.calendarId).toBe(idOf(FAMILY));
+    expect(family!.events).toHaveLength(20);
+    expect(family).toMatchObject({ added: 20, changed: 0, addedOrChanged: 0 });
+    expect(work!.events).toHaveLength(5);
+    expect(work).toMatchObject({ added: 5, changed: 0, addedOrChanged: 5 });
+
+    expect(multigets(stub).map((one) => one.url)).toEqual([FAMILY, WORK]);
+    expect(multigetPaths(multigets(stub)[1]!.body)).toEqual(
+      [0, 1, 2, 3, 4].map((n) => `${WORK_PATH}e${pad(n)}.ics`),
+    );
+    expect(stub.maxInFlight).toBe(1);
+  });
+
+  it("a member the multiget does not return gets no row and is counted as added-or-changed", async () => {
+    const stub = davStub(
+      TWO,
+      router(() => syncAnswer(ok(`${WORK_PATH}a.ics`) + ok(`${WORK_PATH}b.ics`), "work-3"), {
+        [`${WORK_PATH}a.ics`]: eventIcs("a", { created: AFTER }),
+      }),
+    );
+    const result = await run(stub, await block([[WORK, "work-1"], [FAMILY, "family-1"]]));
+    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
+    expect(work).toMatchObject({ state: "changes", added: 1, changed: 0, addedOrChanged: 1 });
+    expect(work.events.map((row) => row.title)).toEqual(["a"]);
+  });
+
+  it("a member the multiget answers 404 gets no row, is counted as added-or-changed, and is no error", async () => {
+    const stub = davStub(
+      TWO,
+      router(
+        () => syncAnswer(ok(`${WORK_PATH}a.ics`) + ok(`${WORK_PATH}b.ics`), "work-3"),
+        {},
+        () =>
+          multistatus(
+            memberWithData(`${WORK_PATH}a.ics`, eventIcs("a", { created: AFTER })) +
+              removed(`${WORK_PATH}b.ics`),
+          ),
+      ),
+    );
+    const result = await run(stub, await block([[WORK, "work-1"], [FAMILY, "family-1"]]));
+    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
+    expect(work.state).toBe("changes");
+    expect(work.events.map((row) => row.title)).not.toContain("b");
+    expect((work.added ?? 0) + (work.changed ?? 0) + (work.addedOrChanged ?? 0)).toBe(2);
+    expect(work.addedOrChanged).toBeGreaterThanOrEqual(1);
+    expect(result.fresh.calendars).toContainEqual({
+      key: await calendarKeyOf(WORK),
+      syncToken: "work-3",
+    });
+  });
+
+  it("an event that does not parse gets no row and is counted as added-or-changed", async () => {
+    const stub = davStub(
+      TWO,
+      router(() => syncAnswer(ok(`${WORK_PATH}bad.ics`), "work-3"), {
+        [`${WORK_PATH}bad.ics`]: "this is not a calendar",
+      }),
+    );
+    const result = await run(stub, await block([[WORK, "work-1"], [FAMILY, "family-1"]]));
+    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
+    expect(work).toMatchObject({ added: 0, changed: 0, addedOrChanged: 1 });
+    expect(work.events).toEqual([]);
+  });
+
+  it("a carried calendar is classified against its own takenAt, not the block's", async () => {
+    // Created 2026-07-25: after the calendar's own time, before the block's.
+    const stub = davStub(
+      TWO,
+      router(() => syncAnswer(ok(`${WORK_PATH}mid.ics`), "work-3"), {
+        [`${WORK_PATH}mid.ics`]: eventIcs("mid", { created: "20260725T000000Z" }),
+      }),
+    );
+    const prior: CalendarBlock = {
+      takenAt: 1790000000,
+      calendars: [
+        { key: await calendarKeyOf(WORK), syncToken: "work-1", takenAt: 1780000000 },
+        { key: await calendarKeyOf(FAMILY), syncToken: "family-1" },
+      ],
+    };
+    const result = await run(stub, prior);
+    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
+    expect(work).toMatchObject({ added: 1, changed: 0 });
+    expect(work.events[0]!.kind).toBe("added");
+  });
+
+  it("a member on another host, or outside the home, is neither counted nor fetched", async () => {
+    const stub = davStub(
+      TWO,
+      router(
+        () =>
+          syncAnswer(
+            ok("https://elsewhere.example/1234567890/calendars/work/x.ics") +
+              ok("/999/calendars/work/y.ics") +
+              ok(`${WORK_PATH}a.ics`),
+            "work-3",
+          ),
+        { [`${WORK_PATH}a.ics`]: eventIcs("a", { created: AFTER }) },
+      ),
+    );
+    const result = await run(stub, await block([[WORK, "work-1"], [FAMILY, "family-1"]]));
+    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
+    expect(work).toMatchObject({ added: 1, changed: 0, addedOrChanged: 0, removed: 0 });
+    const asked = multigetPaths(multigets(stub)[0]!.body);
+    expect(asked).toEqual([`${WORK_PATH}a.ics`]);
+    expect(stub.log.some((one) => one.url.includes("elsewhere"))).toBe(false);
+    expect(stub.log.some((one) => one.body.includes("/999/"))).toBe(false);
+  });
+
+  it("a truncated answer is changes with more, the rows it named, and the answer's token kept", async () => {
+    const stub = davStub(
+      TWO,
+      router(
+        () =>
+          syncAnswer(
+            `<response><href>${WORK_PATH}</href><status>HTTP/1.1 507 Insufficient Storage</status></response>` +
+              ok(`${WORK_PATH}a.ics`),
+            "work-3",
+          ),
+        { [`${WORK_PATH}a.ics`]: eventIcs("a", { created: AFTER }) },
+      ),
+    );
+    const result = await run(stub, await block([[WORK, "work-1"], [FAMILY, "family-1"]]));
+    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
+    expect(work).toMatchObject({ state: "changes", more: true, added: 1 });
+    expect(result.fresh.calendars).toContainEqual({
+      key: await calendarKeyOf(WORK),
+      syncToken: "work-3",
+    });
+  });
+});
+
+describe("calendarChangesSince: a calendar with no token property (D-23 fallback)", () => {
+  const WORK_PATH = new URL(WORK).pathname;
+  const NO_PROPERTY: Cal[] = [
+    { url: WORK, name: "Work", token: null },
+    { url: FAMILY, name: "Family", token: "family-1" },
+  ];
+
+  it("no prior token: one REPORT with an empty token, members discarded, started from the answer's token", async () => {
+    const stub = davStub(
+      NO_PROPERTY,
+      router(() => syncAnswer(ok(`${WORK_PATH}a.ics`) + ok(`${WORK_PATH}b.ics`), "work-9")),
+    );
+    const result = await run(stub, null);
+
+    expect(stub.log.map((one) => `${one.method} ${one.url}`)).toEqual([
+      `PROPFIND ${HOME}`,
+      `REPORT ${WORK}`,
+    ]);
+    expect(stub.log[1]!.body).toContain("sync-collection");
+    expect(stub.log[1]!.body).toMatch(/<d:sync-token\s*\/>|<d:sync-token><\/d:sync-token>/);
+    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
+    expect(work).toMatchObject({
+      state: "started",
+      mechanism: "report-token",
+      added: null,
+      addedOrChanged: null,
+    });
+    expect(work.events).toEqual([]);
+    expect(result.fresh.calendars).toContainEqual({
+      key: await calendarKeyOf(WORK),
+      syncToken: "work-9",
+    });
+  });
+
+  it("a prior token: one REPORT with it, handled like a moved token, recorded as report-token", async () => {
+    const stub = davStub(
+      NO_PROPERTY,
+      router(
+        (_url, body) =>
+          body.includes("work-1")
+            ? syncAnswer(ok(`${WORK_PATH}a.ics`), "work-2")
+            : new Response(null, { status: 500 }),
+        { [`${WORK_PATH}a.ics`]: eventIcs("a", { created: BEFORE }) },
+      ),
+    );
+    const result = await run(stub, await block([[WORK, "work-1"], [FAMILY, "family-1"]]));
+
+    const syncs = stub.log.filter(
+      (one) => one.method === "REPORT" && one.body.includes("sync-collection"),
+    );
+    expect(syncs).toHaveLength(1);
+    expect(syncs[0]!.body).toContain("work-1");
+    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
+    expect(work).toMatchObject({
+      state: "changes",
+      mechanism: "report-token",
+      added: 0,
+      changed: 1,
+      addedOrChanged: 0,
+    });
+    expect(result.fresh.calendars).toContainEqual({
+      key: await calendarKeyOf(WORK),
+      syncToken: "work-2",
+    });
+  });
+
+  it("an unusable starting answer is not_checked, never started", async () => {
+    const stub = davStub(NO_PROPERTY, router(() => syncAnswer("", null)));
+    const result = await run(stub, null);
+    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
+    expect(work).toMatchObject({
+      state: "not_checked",
+      reason: "no_usable_answer",
+      mechanism: "report-token",
+    });
+    expect(result.fresh.calendars.map((one) => one.syncToken)).toEqual(["family-1"]);
+  });
+
+  it("a refused prior token starts again from a fresh empty-token REPORT", async () => {
+    const stub = davStub(
+      NO_PROPERTY,
+      router((_url, body) =>
+        body.includes("work-1") ? syncTokenRefusal(403) : syncAnswer(ok(`${WORK_PATH}a.ics`), "work-9"),
+      ),
+    );
+    const result = await run(stub, await block([[WORK, "work-1"], [FAMILY, "family-1"]]));
+    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
+    expect(work).toMatchObject({
+      state: "restarted",
+      why: "token_refused",
+      mechanism: "report-token",
+    });
+    expect(result.fresh.calendars).toContainEqual({
+      key: await calendarKeyOf(WORK),
+      syncToken: "work-9",
+    });
+    expect(multigets(stub)).toEqual([]);
   });
 });
