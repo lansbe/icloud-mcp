@@ -295,3 +295,80 @@ export async function indexNextPage(
     throw new RecallBuildError();
   }
 }
+
+/**
+ * Remove what disappeared from `mailbox` since it was indexed (RCLL-04, D-12).
+ *
+ * Takes the same page slot as a build page, so it is paced, exclusive and
+ * counted the same way, and it is never refused as full. Reads the mailbox's
+ * UID list inside the lease, recomputes the ids that should exist, and removes
+ * every other ledger id for that mailbox: UIDs that are gone, and every id
+ * recorded under another UIDVALIDITY. Store first, then ledger. When the
+ * validity changed, the mailbox's build cursor is reset.
+ */
+export async function reconcileMailbox(
+  principal: Principal,
+  mailbox: string,
+  deps: BuildDeps,
+): Promise<BuildStatus> {
+  const slot = await beginSlot(principal, mailbox, "reconcile");
+  if (!slot.ok) return slot.reason;
+
+  try {
+    let snapshot: { uidValidity: number; uids: number[] };
+    try {
+      snapshot = await deps.leased.withConnectionLease(principal, (gate) =>
+        deps.source.uids(gate, principal, mailbox),
+      );
+    } catch (error) {
+      if (error instanceof ConnectionBusyError) {
+        await slot.end(KEEP);
+        return "lease_busy";
+      }
+      throw error;
+    }
+    if (!Number.isSafeInteger(snapshot.uidValidity) || !Array.isArray(snapshot.uids)) {
+      throw new RecallBuildError();
+    }
+
+    const wanted = new Set<string>();
+    for (const uid of snapshot.uids) {
+      const ref: MessageRef = { mailbox, uidValidity: snapshot.uidValidity, uid };
+      wanted.add(await vectorIdOf(principal, encodeMessageId(ref)));
+    }
+
+    const rows = await mailboxRows(principal, mailbox);
+    const validityChanged = rows.some((row) => row.uidValidity !== snapshot.uidValidity);
+    const doomed = rows
+      .filter((row) => row.uidValidity !== snapshot.uidValidity || !wanted.has(row.vectorId))
+      .map((row) => row.vectorId);
+    await removeIds(principal, doomed, deps);
+
+    await slot.end(validityChanged ? RESET : KEEP);
+    return "indexed";
+  } catch {
+    await slot.end(KEEP);
+    throw new RecallBuildError();
+  }
+}
+
+/**
+ * Remove named refs from the store and the ledger, without finding them first.
+ *
+ * Phase 26 calls this when a recall hit fails to open, so a dead ref is removed
+ * at once (ARCHITECTURE §4.6(a)). It reads no mail, so it takes no page slot
+ * and no lease. A ref that was never indexed is a harmless no-op.
+ */
+export async function forgetRefs(
+  principal: Principal,
+  refs: readonly MessageRef[],
+  deps: RecallDeps,
+): Promise<void> {
+  try {
+    const ids: string[] = [];
+    for (const ref of refs) ids.push(await vectorIdOf(principal, encodeMessageId(ref)));
+    await removeIds(principal, ids, deps);
+  } catch {
+    throw new RecallBuildError();
+  }
+}
