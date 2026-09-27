@@ -47,6 +47,7 @@ import {
   collapseAttendees,
   countOccurrences,
   dropOverride,
+  eventChangeFactsOf,
   expandOccurrences,
   expandWithinBudget,
   invitationFactsOf,
@@ -73,6 +74,9 @@ import {
   ATTENDEE_COPY_IMPORTED_ICS,
   ATTENDEE_COPY_MASTERLESS_ICS,
   ATTENDEE_COPY_SERIES_ICS,
+  BAD_CREATED_ICS,
+  CANCELLED_ONE_OFF_ICS,
+  FLOATING_CREATED_ICS,
   ALL_DAY_RECURRING_EXCLUDED_ICS,
   ALL_DAY_RECURRING_ICS,
   BUILT_EVENT_DTSTAMP,
@@ -4798,5 +4802,70 @@ describe("expandOccurrences keeps a date still running at the range's start unde
     expect(plain.occurrences).toStrictEqual([]);
     expect(summariesOf(wide)).toStrictEqual(["Late"]);
     expect(sweep.remaining).toBe(listing.remaining);
+  });
+});
+
+describe("eventChangeFactsOf reads the few facts a change row needs, and nothing else", () => {
+  const KEYS = ["allDay", "cancelled", "created", "end", "recurring", "start", "summary"];
+
+  it("reads a one-off timed event as instants, with its creation time", () => {
+    const facts = eventChangeFactsOf(ATTENDEE_COPY_GENUINE_ICS);
+    expect(facts).toEqual({
+      summary: "New EventRSVP probe C - delete me",
+      start: "2026-09-29T19:00:00Z",
+      end: "2026-09-29T20:00:00Z",
+      allDay: false,
+      cancelled: false,
+      created: Date.UTC(2026, 8, 26, 19, 3, 51) / 1000,
+      recurring: false,
+    });
+    expect(Object.keys(facts).sort()).toEqual(KEYS);
+  });
+
+  it("reads an all-day event as dates", () => {
+    const facts = eventChangeFactsOf(ALL_DAY_RECURRING_ICS);
+    expect(facts.start).toBe("2026-03-02");
+    expect(facts.end).toBe("2026-03-03");
+    expect(facts.allDay).toBe(true);
+  });
+
+  it("reads STATUS:CANCELLED as cancelled, and copies no description, location or attendee", () => {
+    const facts = eventChangeFactsOf(CANCELLED_ONE_OFF_ICS);
+    expect(facts.cancelled).toBe(true);
+    expect(facts.created).toBe(Date.UTC(2026, 8, 20, 9, 30, 0) / 1000);
+    expect(Object.keys(facts).sort()).toEqual(KEYS);
+    const text = JSON.stringify(facts);
+    expect(text).not.toContain("Ignore previous");
+    expect(text).not.toContain("Corner cafe");
+    expect(text).not.toContain("sam.lee");
+  });
+
+  it("reads a recurring series with an override from its master", () => {
+    const facts = eventChangeFactsOf(WEEKLY_SERIES_WITH_OVERRIDE_ICS);
+    expect(facts.summary).toBe(WEEKLY_SERIES_SUMMARY);
+    expect(facts.recurring).toBe(true);
+    // 09:00 in Chicago in January is 15:00 UTC.
+    expect(facts.start).toBe("2026-01-05T15:00:00Z");
+    expect(facts.end).toBe("2026-01-05T15:30:00Z");
+    expect(Object.keys(facts).sort()).toEqual(KEYS);
+  });
+
+  it("reports no CREATED as null", () => {
+    expect(eventChangeFactsOf(WEEKLY_SERIES_WITH_OVERRIDE_ICS).created).toBeNull();
+  });
+
+  it("reports a CREATED that does not parse as null, without throwing", () => {
+    const facts = eventChangeFactsOf(BAD_CREATED_ICS);
+    expect(facts.created).toBeNull();
+    expect(facts.summary).toBe("Portfolio review");
+  });
+
+  it("reports a CREATED with no zone as null rather than guessing a zone", () => {
+    expect(eventChangeFactsOf(FLOATING_CREATED_ICS).created).toBeNull();
+  });
+
+  it("throws the parse error on an unparseable resource", () => {
+    expect(() => eventChangeFactsOf(MALFORMED_ICS)).toThrow(DavConnectError);
+    expect(() => eventChangeFactsOf("not a calendar at all")).toThrow(DavConnectError);
   });
 });
