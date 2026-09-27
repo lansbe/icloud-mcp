@@ -37,7 +37,9 @@ import {
   mintConfirmation,
 } from "../src/confirm";
 import { ImapConnectError } from "../src/errors";
-import { createSessionGate } from "../src/mail/service";
+import { createSessionGate, resolveRoleFolder } from "../src/mail/service";
+import type { FolderListing, FolderSummary } from "../src/mail/service";
+import { decodeModifiedUtf7, resolveFolderRole } from "../src/mail/imap-parser";
 import { connectImap } from "../src/mail/socket";
 import { moveMessagesOver } from "../src/mail/triage";
 import type { MoveEntry, MoveOutcome } from "../src/mail/triage";
@@ -1519,5 +1521,291 @@ describe("archive and Trash, resolved from the account, previewed and committed"
     expect(result.results[0]!.outcome).toBe("moved");
     expect(String(trusted.confirmationLine)).not.toMatch(/delet/i);
     expect(result.confirmationLine).not.toMatch(/delet/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Every way the archive or Trash folder can fail to resolve
+// ---------------------------------------------------------------------------
+
+/**
+ * One folder as a listing would report it, with its role resolved by the SAME
+ * function the listing uses, so a row here cannot claim a role the real ladder
+ * would not give.
+ */
+function folderOf(wireName: string, attributes: string[] = [], delimiter = "/"): FolderSummary {
+  const displayName = decodeModifiedUtf7(wireName);
+  const { role, source } = resolveFolderRole(attributes, displayName, delimiter);
+  return {
+    id: encodeFolderId({ mailbox: wireName }),
+    wireName,
+    displayName,
+    attributes,
+    role,
+    roleSource: source,
+    totalCount: null,
+    unreadCount: null,
+  };
+}
+
+function listingFrom(folders: FolderSummary[]): FolderListing {
+  return { folders: [folderOf("INBOX"), ...folders], delimiter: "/", countsSource: "list-status" };
+}
+
+describe("resolveRoleFolder: the attribute first, then the name, and a tie refuses", () => {
+  it.each<{
+    name: string;
+    role: "archive" | "trash";
+    folders: FolderSummary[];
+    expected: { folder: string } | { refusal: "none" | "ambiguous" };
+  }>([
+    {
+      name: "one special-use archive wins over a top-level folder named Archive",
+      role: "archive",
+      folders: [folderOf("Archive"), folderOf("Kept", ["\\Archive"])],
+      expected: { folder: "Kept" },
+    },
+    {
+      name: "two special-use archives are ambiguous",
+      role: "archive",
+      folders: [folderOf("Kept", ["\\Archive"]), folderOf("Old", ["\\Archive"])],
+      expected: { refusal: "ambiguous" },
+    },
+    {
+      name: "no special-use and one name match wins",
+      role: "archive",
+      folders: [folderOf("Receipts"), folderOf("Archive")],
+      expected: { folder: "Archive" },
+    },
+    {
+      name: "Archive/2024 alone is none: the ladder is top-level only",
+      role: "archive",
+      folders: [folderOf("Archive/2024")],
+      expected: { refusal: "none" },
+    },
+    {
+      name: "two name matches, Archive and archive, are ambiguous",
+      role: "archive",
+      folders: [folderOf("Archive"), folderOf("archive")],
+      expected: { refusal: "ambiguous" },
+    },
+    {
+      name: "a \\Trash special-use folder wins over Deleted Messages by name",
+      role: "trash",
+      folders: [folderOf("Deleted Messages"), folderOf("Bin", ["\\Trash"])],
+      expected: { folder: "Bin" },
+    },
+    {
+      name: "Deleted Messages by name alone wins",
+      role: "trash",
+      folders: [folderOf("Deleted Messages")],
+      expected: { folder: "Deleted Messages" },
+    },
+    {
+      name: "a trash folder does not answer for the archive",
+      role: "archive",
+      folders: [folderOf("Deleted Messages", ["\\Trash"])],
+      expected: { refusal: "none" },
+    },
+    {
+      name: "none is none",
+      role: "trash",
+      folders: [folderOf("Receipts")],
+      expected: { refusal: "none" },
+    },
+  ])("$name", ({ role, folders, expected }) => {
+    const resolved = resolveRoleFolder(listingFrom(folders), role);
+    if ("folder" in expected) {
+      expect("folder" in resolved && resolved.folder.wireName).toBe(expected.folder);
+    } else {
+      expect(resolved).toEqual(expected);
+    }
+  });
+});
+
+/** The reason and confirmationLine of every answer, for the /delet/i check. */
+function serverWords(answer: ToolAnswer): string[] {
+  const parsed = body(answer);
+  return [parsed.reason, parsed.confirmationLine].filter(
+    (value): value is string => typeof value === "string",
+  );
+}
+
+describe("archive and Trash refuse rather than guess, and Trash never says deleted", () => {
+  const MESSAGE: Fixture = { uid: 4242, size: 18_431, modSeq: "742", subject: "Receipt" };
+  /** Every trash answer this block produces, checked at the end of each case. */
+  const trashAnswers: ToolAnswer[] = [];
+
+  beforeEach(() => {
+    trashAnswers.length = 0;
+  });
+
+  it("mail_archive with no archive folder: no-archive-folder, one read session, nothing written", async () => {
+    const callbacks = allTools();
+    const preview = rolePreviewServer([[RECEIPTS, "\\HasNoChildren"]], [MESSAGE]);
+    vi.mocked(connectImap).mockReturnValueOnce(preview as never);
+
+    const answer = await callbacks.get("mail_archive")!({ ids: [idOf(MESSAGE.uid)] });
+
+    expect(connectImap).toHaveBeenCalledTimes(1);
+    expect(answer.isError).toBeUndefined();
+    expect(wireOf(preview)).toEqual(previewLines([MESSAGE.uid]));
+    expectNoLine(wireOf(preview), "SELECT");
+    const parsed = body(answer);
+    expect(parsed.refusal).toBe("no-archive-folder");
+    expect(parsed.confirmToken).toBeUndefined();
+    expect(String(parsed.reason)).toContain("mail_move");
+    expect(String(parsed.reason)).toContain("no archive folder");
+  });
+
+  it("mail_trash with no Trash folder: no-trash-folder, the same shape", async () => {
+    const callbacks = allTools();
+    const preview = rolePreviewServer([[RECEIPTS, "\\HasNoChildren"]], [MESSAGE]);
+    vi.mocked(connectImap).mockReturnValueOnce(preview as never);
+
+    const answer = await callbacks.get("mail_trash")!({ ids: [idOf(MESSAGE.uid)] });
+    trashAnswers.push(answer);
+
+    expect(connectImap).toHaveBeenCalledTimes(1);
+    expect(answer.isError).toBeUndefined();
+    expect(wireOf(preview)).toEqual(previewLines([MESSAGE.uid]));
+    expectNoLine(wireOf(preview), "SELECT");
+    const parsed = body(answer);
+    expect(parsed.refusal).toBe("no-trash-folder");
+    expect(parsed.confirmToken).toBeUndefined();
+    expect(String(parsed.reason)).toContain("mail_move");
+    for (const words of trashAnswers.flatMap(serverWords)) expect(words).not.toMatch(/delet/i);
+  });
+
+  it("mail_archive with two tied archive folders: ambiguous-role-folder, and neither is picked", async () => {
+    const callbacks = allTools();
+    const preview = rolePreviewServer(
+      [
+        ["Kept", "\\HasNoChildren \\Archive"],
+        ["Old", "\\HasNoChildren \\Archive"],
+      ],
+      [MESSAGE],
+    );
+    vi.mocked(connectImap).mockReturnValueOnce(preview as never);
+
+    const answer = await callbacks.get("mail_archive")!({ ids: [idOf(MESSAGE.uid)] });
+
+    expect(connectImap).toHaveBeenCalledTimes(1);
+    expect(wireOf(preview)).toEqual(previewLines([MESSAGE.uid]));
+    const parsed = body(answer);
+    expect(parsed.refusal).toBe("ambiguous-role-folder");
+    expect(parsed.confirmToken).toBeUndefined();
+    expect(String(parsed.reason)).toContain("archive folder");
+    expect(String(parsed.reason)).toContain("mail_move");
+  });
+
+  it("mail_trash on messages already in Trash: already-in-destination", async () => {
+    const callbacks = allTools();
+    const preview = rolePreviewServer([["Deleted Messages", "\\HasNoChildren"]], [MESSAGE]);
+    vi.mocked(connectImap).mockReturnValueOnce(preview as never);
+    const id = encodeMessageId({
+      mailbox: "Deleted Messages",
+      uidValidity: INBOX_UIDVALIDITY,
+      uid: MESSAGE.uid,
+    });
+
+    const answer = await callbacks.get("mail_trash")!({ ids: [id] });
+    trashAnswers.push(answer);
+
+    expect(connectImap).toHaveBeenCalledTimes(1);
+    expect(wireOf(preview)[3]).toBe('a4 EXAMINE "Deleted Messages"');
+    const parsed = body(answer);
+    expect(parsed.refusal).toBe("already-in-destination");
+    expect(parsed.confirmToken).toBeUndefined();
+    for (const words of trashAnswers.flatMap(serverWords)) expect(words).not.toMatch(/delet/i);
+  });
+
+  it("a Trash marked by attribute on a folder named otherwise is where the copy goes", async () => {
+    const callbacks = allTools();
+    const preview = rolePreviewServer(
+      [
+        ["Deleted Messages", "\\HasNoChildren"],
+        ["Bin", "\\HasNoChildren \\Trash"],
+      ],
+      [MESSAGE],
+    );
+    const committed = oneMoveServer(MESSAGE);
+    vi.mocked(connectImap)
+      .mockReturnValueOnce(preview as never)
+      .mockReturnValueOnce(committed as never);
+
+    const ids = [idOf(MESSAGE.uid)];
+    const previewed = await callbacks.get("mail_trash")!({ ids });
+    trashAnswers.push(previewed);
+    const trusted = body(previewed);
+    expect(trusted.destination).toEqual({
+      id: encodeFolderId({ mailbox: "Bin" }),
+      role: "trash",
+    });
+
+    const answer = await callbacks.get("mail_commit")!({
+      confirmToken: trusted.confirmToken,
+      change: trusted.change,
+    });
+    trashAnswers.push(answer);
+
+    expect(wireOf(committed)).toEqual(oneMoveLines("Bin"));
+    expect(body(answer).confirmationLine).toBe(
+      "Moved 1 message from 'INBOX' to Trash. It can be moved back out of Trash until " +
+        "Trash is emptied.",
+    );
+    for (const words of trashAnswers.flatMap(serverWords)) expect(words).not.toMatch(/delet/i);
+  });
+
+  it("a trash commit refused for a change, and one partly done, still never say deleted", async () => {
+    const callbacks = allTools();
+    const folders: [string, string][] = [["Deleted Messages", "\\HasNoChildren"]];
+
+    // Refused: the message changed after the preview.
+    vi.mocked(connectImap).mockReturnValueOnce(rolePreviewServer(folders, [MESSAGE]) as never);
+    const first = await callbacks.get("mail_trash")!({ ids: [idOf(MESSAGE.uid)] });
+    trashAnswers.push(first);
+    vi.mocked(connectImap).mockReturnValueOnce(
+      createFakeDuplex([
+        ...authPrefix(),
+        selectResponse("a4", "[READ-WRITE]"),
+        fingerprintReply("a5", [{ ...MESSAGE, modSeq: "999" }]),
+        logoutExchange("a6"),
+      ]) as never,
+    );
+    const refused = await callbacks.get("mail_commit")!({
+      confirmToken: body(first).confirmToken,
+      change: body(first).change,
+    });
+    trashAnswers.push(refused);
+    expect(body(refused).refusal).toBe("changed-since-preview");
+
+    // Partly done: the copy is refused, so the message stays where it was.
+    vi.mocked(connectImap).mockReturnValueOnce(rolePreviewServer(folders, [MESSAGE]) as never);
+    const second = await callbacks.get("mail_trash")!({ ids: [idOf(MESSAGE.uid)] });
+    trashAnswers.push(second);
+    vi.mocked(connectImap).mockReturnValueOnce(
+      createFakeDuplex([
+        ...authPrefix(),
+        selectResponse("a4", "[READ-WRITE]"),
+        fingerprintReply("a5", [MESSAGE]),
+        wire("a6 NO [OVERQUOTA] COPY failed"),
+        logoutExchange("a7"),
+      ]) as never,
+    );
+    const partial = await callbacks.get("mail_commit")!({
+      confirmToken: body(second).confirmToken,
+      change: body(second).change,
+    });
+    trashAnswers.push(partial);
+    expect(body(partial).confirmationLine).toBe(
+      "Moved 0 of 1 message from 'INBOX' to Trash; 1 not copied. It can be moved back out " +
+        "of Trash until Trash is emptied.",
+    );
+
+    expect(trashAnswers).toHaveLength(4);
+    const words = trashAnswers.flatMap(serverWords);
+    expect(words.length).toBeGreaterThanOrEqual(4);
+    for (const line of words) expect(line).not.toMatch(/delet/i);
   });
 });
