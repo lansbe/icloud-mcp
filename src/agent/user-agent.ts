@@ -44,14 +44,34 @@
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
-import { RECALL_MAX_VECTORS, RECALL_TTL_MS } from "../recall/retention";
 import {
+  RECALL_MAX_PAGES_PER_DAY,
+  RECALL_MAX_VECTORS,
+  RECALL_PAGE_SIZE,
+  RECALL_TTL_MS,
+} from "../recall/retention";
+import {
+  clearCursor,
+  clearPageSlot,
   countNewIds,
+  countPageOn,
   countVectors,
   ensureRecallSchema,
+  forgetVectors,
+  idsForMailbox,
   type LedgerRowInput,
+  type MailboxRow,
+  type PageRefusal,
+  pagesOn,
+  readCursor,
+  readLastPageAt,
+  readPageSlot,
   recordVectors,
   type RecordRefusal,
+  utcDay,
+  writeCursor,
+  writeLastPageAt,
+  writePageSlot,
 } from "./recall-ledger";
 
 /**
@@ -87,6 +107,61 @@ const MAX_MAILBOX_CHARS = 1024;
 
 /** The answer to a record. Shapes, never throws: an error's class does not survive RPC. */
 export type RecordAnswer = { ok: true } | { ok: false; reason: RecordRefusal };
+
+/**
+ * The least time between the start of one recall page and the next, per person
+ * (Phase 25, D-15).
+ *
+ * This is what keeps a build from monopolising the person's one iCloud
+ * connection: a page holds that connection for one read, at most once a
+ * minute. The object enforces it, so no caller can shorten it; a caller that
+ * comes back early is told `paused`.
+ */
+export const RECALL_PAGE_PAUSE_MS = 60000;
+
+/**
+ * How long an in-flight page blocks another, in milliseconds.
+ *
+ * Longer than the connection lease (30 s) plus an embed call and a store write,
+ * so a live page is never overlapped. A page whose engine died stops blocking
+ * after this, with no clean-up needed.
+ */
+export const RECALL_PAGE_TTL_MS = 120000;
+
+/** The most characters of a stored build cursor. The object never decodes it. */
+const MAX_CURSOR_CHARS = 2048;
+
+/** The most ledger rows one scope read or one forget may touch. */
+const MAX_SCOPE_ROWS = 1000;
+
+/** The answer to a page start. Shapes, never throws. */
+export type BeginPageAnswer =
+  | { ok: true; pageToken: string; cursor: string | null }
+  | { ok: false; reason: PageRefusal | "invalid" | "unnamed" };
+
+/** What to do with a mailbox's cursor when a page ends. */
+export type CursorUpdate =
+  | { kind: "keep" }
+  | { kind: "set"; cursor: string }
+  | { kind: "reset" };
+
+/** Whether `value` is a mailbox name the ledger accepts. */
+function isMailbox(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= MAX_MAILBOX_CHARS;
+}
+
+/** `value` as a cursor update, or null when it is not exactly one. */
+function cursorUpdateOf(value: unknown): CursorUpdate | null {
+  if (typeof value !== "object" || value === null) return null;
+  const u = value as { kind?: unknown; cursor?: unknown };
+  if (u.kind === "keep") return { kind: "keep" };
+  if (u.kind === "reset") return { kind: "reset" };
+  if (u.kind === "set" && typeof u.cursor === "string") {
+    if (u.cursor.length < 1 || u.cursor.length > MAX_CURSOR_CHARS) return null;
+    return { kind: "set", cursor: u.cursor };
+  }
+  return null;
+}
 
 /** `rows` as ledger rows, or null when any part of it is malformed. */
 function validRows(rows: unknown): LedgerRowInput[] | null {
@@ -211,6 +286,103 @@ export class UserAgent extends DurableObject<Env> {
     if (countVectors(sql) + fresh > RECALL_MAX_VECTORS) return { ok: false, reason: "full" };
     recordVectors(sql, valid, Date.now(), RECALL_TTL_MS);
     return { ok: true };
+  }
+
+  /**
+   * Ask to start one recall page for `mailbox` (Phase 25, D-15, D-24).
+   *
+   * The object decides, not the caller. Refuses, in this order: `invalid` for a
+   * bad mailbox or a kind that is not exactly "build" or "reconcile"; `unnamed`
+   * when the object does not know whose it is; `busy` while another page's
+   * token has not expired; `paused` within RECALL_PAGE_PAUSE_MS of the last
+   * page's start; `quota` once RECALL_MAX_PAGES_PER_DAY pages began today
+   * (UTC), reconciles included; and, for a build only, `full` when one more
+   * page could take the ledger past RECALL_MAX_VECTORS. A reconcile only
+   * removes, so it is never refused as full.
+   *
+   * Otherwise it mints a page token, records the start, counts the page and
+   * answers the stored cursor. No `await`, so the check and the set are one
+   * atomic step. There is no `off` refusal: recall is inherent.
+   */
+  recallBeginPage(mailbox: unknown, kind: unknown): BeginPageAnswer {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
+    if (!isMailbox(mailbox)) return { ok: false, reason: "invalid" };
+    if (kind !== "build" && kind !== "reconcile") return { ok: false, reason: "invalid" };
+
+    const now = Date.now();
+    const slot = readPageSlot(sql);
+    if (slot !== null && slot.expiresAt > now) return { ok: false, reason: "busy" };
+    const last = readLastPageAt(sql);
+    if (last !== null && now - last < RECALL_PAGE_PAUSE_MS) return { ok: false, reason: "paused" };
+    const today = utcDay(now);
+    if (pagesOn(sql, today) >= RECALL_MAX_PAGES_PER_DAY) return { ok: false, reason: "quota" };
+    if (kind === "build" && countVectors(sql) + RECALL_PAGE_SIZE > RECALL_MAX_VECTORS) {
+      return { ok: false, reason: "full" };
+    }
+
+    const pageToken = crypto.randomUUID();
+    writePageSlot(sql, { token: pageToken, expiresAt: now + RECALL_PAGE_TTL_MS });
+    writeLastPageAt(sql, now);
+    countPageOn(sql, today);
+    return { ok: true, pageToken, cursor: readCursor(sql, mailbox) };
+  }
+
+  /**
+   * End a recall page, and apply its cursor update.
+   *
+   * Only when `pageToken` is the in-flight page's token: clears the token, then
+   * keeps, sets or resets `mailbox`'s cursor. Anything else changes nothing.
+   * Answers whether it applied.
+   */
+  recallEndPage(pageToken: unknown, mailbox: unknown, cursorUpdate: unknown): boolean {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    this.rememberOwnName();
+    if (typeof pageToken !== "string" || !isMailbox(mailbox)) return false;
+    const update = cursorUpdateOf(cursorUpdate);
+    if (update === null) return false;
+    const slot = readPageSlot(sql);
+    if (slot === null || slot.token !== pageToken) return false;
+
+    clearPageSlot(sql);
+    if (update.kind === "set") writeCursor(sql, mailbox, update.cursor);
+    if (update.kind === "reset") clearCursor(sql, mailbox);
+    return true;
+  }
+
+  /**
+   * Up to `limit` (1..1000) of `mailbox`'s ledger rows, ordered by id, strictly
+   * after `afterId` when it is a string. An invalid mailbox reads as empty.
+   */
+  recallIdsForMailbox(mailbox: unknown, afterId: unknown, limit: unknown): MailboxRow[] {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    this.rememberOwnName();
+    if (!isMailbox(mailbox)) return [];
+    const n =
+      typeof limit === "number" && Number.isFinite(limit)
+        ? Math.min(MAX_SCOPE_ROWS, Math.max(1, Math.floor(limit)))
+        : MAX_SCOPE_ROWS;
+    return idsForMailbox(sql, mailbox, typeof afterId === "string" ? afterId : null, n);
+  }
+
+  /**
+   * Remove these ids from the ledger, after the store delete has succeeded.
+   *
+   * Anything that is not a 64-character lower-case hex string is ignored, and
+   * at most 1000 entries are read per call. Answers how many rows went.
+   */
+  recallForget(ids: unknown): number {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    this.rememberOwnName();
+    if (!Array.isArray(ids)) return 0;
+    const valid = ids
+      .slice(0, MAX_SCOPE_ROWS)
+      .filter((id): id is string => typeof id === "string" && HEX_64.test(id));
+    return forgetVectors(sql, valid);
   }
 
   /**

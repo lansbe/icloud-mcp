@@ -46,6 +46,44 @@ export const RECORD_REFUSALS = ["invalid", "unnamed", "full"] as const;
 /** One reason a record was refused. */
 export type RecordRefusal = (typeof RECORD_REFUSALS)[number];
 
+/**
+ * The reasons a build or reconcile page may be refused, beside the record list.
+ * Plan 25-03 appends to this list and nowhere else. The build engine derives its
+ * status type from it, so a reason added here needs no change there.
+ */
+export const PAGE_REFUSALS = ["busy", "paused", "quota", "full"] as const;
+
+/** One reason a page was refused. */
+export type PageRefusal = (typeof PAGE_REFUSALS)[number];
+
+/** What a page is for. A reconcile only removes, so it is never refused as full. */
+export type PageKind = "build" | "reconcile";
+
+/** The in-flight page: a token the object minted, and when it stops blocking. */
+export interface PageSlot {
+  readonly token: string;
+  readonly expiresAt: number;
+}
+
+/** One ledger row, as a reconcile reads it. */
+export interface MailboxRow {
+  readonly vectorId: string;
+  readonly uidValidity: number;
+}
+
+/** The `recall_state` key of the in-flight page. */
+const PAGE_ROW = "page";
+
+/** The `recall_state` key of when the last page began. */
+const LAST_PAGE_ROW = "last_page_at";
+
+/** The `recall_state` keys of the current UTC day and its page count. */
+const DAY_ROW = "pages_day";
+const DAY_COUNT_ROW = "pages_count";
+
+/** The `recall_state` key of one mailbox's build cursor is this plus the mailbox. */
+const CURSOR_ROW = "cursor:";
+
 /** One row to record. */
 export interface LedgerRowInput {
   readonly vectorId: string;
@@ -121,4 +159,139 @@ export function countNewIds(sql: SqlStorage, ids: readonly string[]): number {
     if (row.n === 0) fresh += 1;
   }
   return fresh;
+}
+
+/** The value stored under `k` in `recall_state`, or null. */
+export function readState(sql: SqlStorage, k: string): string | null {
+  const rows = sql.exec<{ v: string }>(`select v from recall_state where k = ?`, k).toArray();
+  return rows.length === 0 ? null : rows[0]!.v;
+}
+
+/** Store `v` under `k` in `recall_state`. */
+export function writeState(sql: SqlStorage, k: string, v: string): void {
+  sql.exec(
+    `insert into recall_state (k, v) values (?, ?)
+     on conflict (k) do update set v = excluded.v`,
+    k,
+    v,
+  );
+}
+
+/** Remove `k` from `recall_state`. */
+export function clearState(sql: SqlStorage, k: string): void {
+  sql.exec(`delete from recall_state where k = ?`, k);
+}
+
+/** The in-flight page, or null when there is none or it is malformed. */
+export function readPageSlot(sql: SqlStorage): PageSlot | null {
+  const raw = readState(sql, PAGE_ROW);
+  if (raw === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const p = parsed as { token?: unknown; expiresAt?: unknown };
+  if (typeof p.token !== "string" || typeof p.expiresAt !== "number") return null;
+  return { token: p.token, expiresAt: p.expiresAt };
+}
+
+/** Store the in-flight page. */
+export function writePageSlot(sql: SqlStorage, slot: PageSlot): void {
+  writeState(sql, PAGE_ROW, JSON.stringify({ token: slot.token, expiresAt: slot.expiresAt }));
+}
+
+/** Clear the in-flight page. */
+export function clearPageSlot(sql: SqlStorage): void {
+  clearState(sql, PAGE_ROW);
+}
+
+/** When the last page began, in ms since the epoch, or null. */
+export function readLastPageAt(sql: SqlStorage): number | null {
+  const raw = readState(sql, LAST_PAGE_ROW);
+  if (raw === null) return null;
+  const at = Number(raw);
+  return Number.isFinite(at) ? at : null;
+}
+
+/** Record that a page began at `now`. */
+export function writeLastPageAt(sql: SqlStorage, now: number): void {
+  writeState(sql, LAST_PAGE_ROW, String(now));
+}
+
+/** The UTC day of `now`, as YYYY-MM-DD. */
+export function utcDay(now: number): string {
+  return new Date(now).toISOString().slice(0, 10);
+}
+
+/** How many pages began on `day` (UTC). Zero when the stored day is another. */
+export function pagesOn(sql: SqlStorage, day: string): number {
+  if (readState(sql, DAY_ROW) !== day) return 0;
+  const count = Number(readState(sql, DAY_COUNT_ROW) ?? "0");
+  return Number.isFinite(count) ? count : 0;
+}
+
+/** Count one more page on `day`, starting from zero on a new day. */
+export function countPageOn(sql: SqlStorage, day: string): void {
+  const next = pagesOn(sql, day) + 1;
+  writeState(sql, DAY_ROW, day);
+  writeState(sql, DAY_COUNT_ROW, String(next));
+}
+
+/** The stored build cursor for `mailbox`, or null. Opaque: never decoded here. */
+export function readCursor(sql: SqlStorage, mailbox: string): string | null {
+  return readState(sql, CURSOR_ROW + mailbox);
+}
+
+/** Store the build cursor for `mailbox`. */
+export function writeCursor(sql: SqlStorage, mailbox: string, cursor: string): void {
+  writeState(sql, CURSOR_ROW + mailbox, cursor);
+}
+
+/** Forget the build cursor for `mailbox`, so its build starts again from the top. */
+export function clearCursor(sql: SqlStorage, mailbox: string): void {
+  clearState(sql, CURSOR_ROW + mailbox);
+}
+
+/**
+ * Up to `limit` of `mailbox`'s rows, ordered by id, strictly after `afterId`
+ * when it is given.
+ */
+export function idsForMailbox(
+  sql: SqlStorage,
+  mailbox: string,
+  afterId: string | null,
+  limit: number,
+): MailboxRow[] {
+  const rows =
+    afterId === null
+      ? sql
+          .exec<{ vector_id: string; uid_validity: number }>(
+            `select vector_id, uid_validity from recall_vectors
+             where mailbox = ? order by vector_id limit ?`,
+            mailbox,
+            limit,
+          )
+          .toArray()
+      : sql
+          .exec<{ vector_id: string; uid_validity: number }>(
+            `select vector_id, uid_validity from recall_vectors
+             where mailbox = ? and vector_id > ? order by vector_id limit ?`,
+            mailbox,
+            afterId,
+            limit,
+          )
+          .toArray();
+  return rows.map((row) => ({ vectorId: row.vector_id, uidValidity: row.uid_validity }));
+}
+
+/** Remove the rows with these ids. Returns how many were removed. */
+export function forgetVectors(sql: SqlStorage, ids: readonly string[]): number {
+  let removed = 0;
+  for (const id of ids) {
+    removed += sql.exec(`delete from recall_vectors where vector_id = ?`, id).rowsWritten;
+  }
+  return removed;
 }
