@@ -503,12 +503,19 @@ export const FORBIDDEN = [
   // structural half does refuse a second concurrent lease for the same person,
   // but it refuses it as connection_busy at run time, after the fan-out was
   // already written and shipped. The scan refuses it at commit time.
+  //
+  // Phase 25 (D-17) names the two recall build entry points in
+  // src/recall/build.ts: `indexNextPage` and `reconcileMailbox`. Each takes the
+  // person's connection lease and reads mail through one session, so a fan-out
+  // over mailboxes or pages is the same N sockets as a fan-out over the lease
+  // runner itself. The object refuses a second page in flight at run time; the
+  // scan refuses the fan-out before it ships.
   {
     id: "concurrent-session",
     scope: "src/",
     pattern:
-      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit)/g,
-    why: "A concurrent combinator wrapped around the per-person lease runner (withConnectionLease in src/agent/lease.ts), either mail session orchestrator (read-only or mutating), the core under them, a triage verb in src/mail/triage.ts (mark read or unread, flag or unflag, move, or move one draft to Trash), or the mail move composites (readMoveSet, readDraftForChange, buildMovePreview, applyMailCommit). Each of those opens a session, and every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial, and a list of messages is worked through one at a time in one session: pass the whole list to moveMessages rather than mapping a verb over it.",
+      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit|indexNextPage|reconcileMailbox)/g,
+    why: "A concurrent combinator wrapped around the per-person lease runner (withConnectionLease in src/agent/lease.ts), either mail session orchestrator (read-only or mutating), the core under them, a triage verb in src/mail/triage.ts (mark read or unread, flag or unflag, move, or move one draft to Trash), the mail move composites (readMoveSet, readDraftForChange, buildMovePreview, applyMailCommit), or a recall build entry point in src/recall/build.ts (indexNextPage, reconcileMailbox). Each recall build entry point takes the person's connection lease and reads mail through one session, so it is a session like the others. Each of those opens a session, and every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial, and a list of messages is worked through one at a time in one session: pass the whole list to moveMessages rather than mapping a verb over it.",
   },
   // The same property one protocol over, and the reason is deliberately NOT the
   // same. The two rules above lean on the six-connection platform cap. That cap
@@ -1079,6 +1086,84 @@ export const FORBIDDEN = [
     pattern:
       /(?:\bfrom\s*|\bimport\s*(?:\(\s*)?)["']\.\.\/(?:mail|dav|mcp|auth|staging|feed)(?:\/[^"'\n]*)?["']/g,
     why: "The per-person Durable Object module imports mail, DAV, tool, auth, staging or feed code. The object holds a connection lease and never a session. An open socket keeps a Durable Object resident and billed for up to 15 minutes per connection, and a socket held in the object escapes the 20-second call deadline that bounds every mail conversation in the Worker request (ARCHITECTURE §3.2). The socket stays in the Worker request; the object only records that one conversation is open until a time. Phase 28's alarm reaches mail through /mcp, never directly. Move the work into the Worker request and take the lease there with withConnectionLease. A mail path inside the object is a decision on the boundary, not a refactor.",
+  },
+
+  // ------------------------------------------------------------ recall store
+  // Phase 25, D-17 (RCLL-02). The structural half is plan 25-01's: one module,
+  // src/recall/index.ts, reaches the vector index, and it sets the partition
+  // and the metadata filter from the signed-in principal on every write and
+  // every query, then drops any match that belongs to somebody else. These four
+  // rules are the detective half. The count on the binding itself sits with the
+  // other counts below.
+  //
+  // WHY THIS STORE NEEDS THEM. It fails open. A query with no partition reads
+  // every partition (SPIKE-09 (4)), so a second way in that forgets the
+  // partition is not an error the platform reports: it is a quiet answer with
+  // other people's mail in it. None of this is visible to
+  // `store-key-without-a-user`, which looks for key-value keys built from a
+  // prefix constant. A vector id is a digest and a partition is a query field.
+  //
+  // These are the one place, with the scanner's own test file, where the banned
+  // verbs are spelled. src/ describes them by role, or it would fail the check
+  // it was trying to explain.
+  //
+  // (a) The by-id read verb. It hands back vectors and their metadata by id,
+  // and it takes no partition at all. An id is a digest of a user id and a
+  // message token, so an id is guessable only by someone who already knows
+  // both; the rule does not lean on that. It is a cross-user read path by
+  // construction, and nothing in this project needs to read a vector back.
+  {
+    id: "recall-by-id-read",
+    scope: "src/",
+    pattern: /\bgetByIds\s*\(/g,
+    why: "The vector index's by-id read verb, under src/. It returns stored vectors and their metadata by id and takes no partition, so it is a read path that crosses people by construction: nothing in it asks whose vector this is. The recall store fails open, so there is no platform error to catch the mistake. Recall reads go through the store's query in src/recall/index.ts, which sets the partition and the filter from the signed-in principal and drops anything that is not theirs. If this fired on a comment, describe the verb by role. Do not narrow the pattern; a by-id read is a decision on the isolation boundary, not a refactor.",
+  },
+  // (b) The by-id query verb. It searches near a stored vector named by id.
+  // The partition is an option the caller may leave out, and left out it
+  // searches everyone. The one query path already exists and sets it.
+  {
+    id: "recall-by-id-query",
+    scope: "src/",
+    pattern: /\bqueryById\s*\(/g,
+    why: "The vector index's by-id query verb, under src/. It searches near a stored vector named by id, and the partition is an option a caller may leave out: left out, the index searches every person's vectors and says nothing (SPIKE-09 (4)). The one query path is the store's query in src/recall/index.ts, which takes the partition and the filter from the signed-in principal and spreads them last so no caller option can replace them. Use that. If this fired on a comment, describe the verb by role. Do not narrow the pattern; a second query path is a decision on the isolation boundary, not a refactor.",
+  },
+  // (c) The keep-first write verb, as a member call. It writes a vector only
+  // when the id is new, so re-indexing a message that changed keeps the first
+  // vector and snippet forever and says nothing (Pitfall 49). Every write in
+  // this store replaces what an id held.
+  //
+  // Scoped to `src/recall/`. The object's own SQL legitimately inserts rows in
+  // src/agent/, and that is a different verb on a different store.
+  {
+    id: "recall-keep-first-write",
+    scope: "src/recall/",
+    pattern: /\.\s*insert\s*\(/g,
+    why: "The vector index's keep-first write verb, called as a member under src/recall/. It writes a vector only when its id is new, so re-indexing a message that changed silently keeps the first vector and its snippet forever: recall keeps answering with a subject line the mailbox no longer holds, and nothing reports it (Pitfall 49). Every write in the recall store replaces what an id held. Use the replacing write the store already uses in src/recall/index.ts. If this fired on a comment, describe the verb by role. Do not narrow the pattern.",
+  },
+  // (d) Where the partition comes from. The partition is the store's only
+  // query-time boundary between people, so it must be the signed-in
+  // principal's user id and nothing else. The permitted shape is the one the
+  // object-name rule above permits: an identifier chain ending in `.userId`.
+  // A string literal fires, and so does a bare identifier, because a bare name
+  // is what a value lifted off a request looks like once it has been assigned.
+  // A property (`namespace: x`), an optional property type (`namespace?: x`)
+  // and an assignment after construction (`sent.namespace = x`) are all seen.
+  //
+  // Scoped to `src/recall/`. src/dav/ sets a key of the same name for XML, five
+  // sites measured on 2026-09-26, and those have nothing to do with the store.
+  //
+  // WHAT IT DOES NOT SEE. A shorthand property (`{ namespace }`), a spread of
+  // an object that carries one, and a `.userId` member on an object that is not
+  // a Principal (`request.userId`). The rule reads text, not types; the
+  // compiler is the first check on the last one, because the store takes a
+  // Principal. The whitespace after the colon sits inside the lookahead, for
+  // the reason the object-name rule gives.
+  {
+    id: "recall-namespace-not-from-principal",
+    scope: "src/recall/",
+    pattern:
+      /\bnamespace\s*\??\s*(?::|=(?!=))(?!\s*[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\.\s*userId\s*[,;)}\n])/g,
+    why: "A recall store partition, under src/recall/, whose value is not a Principal's userId member. The partition is the vector index's only query-time boundary between people, and the store fails open: a wrong partition does not error, it answers with somebody else's mail, or with everyone's. So it must come from the signed-in principal the door built, never from a request field, a tool argument, a string literal or a bare variable. Set it as principal.userId, as src/recall/index.ts does at the write and at the query. Do not narrow the pattern and do not widen its scope: src/dav/ uses a key of the same name for XML, and that is unrelated. A second source for the partition is a decision on the isolation boundary, not a refactor.",
   },
 ];
 
@@ -1754,6 +1839,135 @@ export function collectAgentNamespaceReads(relativePath, contents) {
   if (match === null) return [];
   const index = match.index + match[0].search(/\bUSER_AGENT\b/);
   return [{ file: relativePath, ...positionOf(code, index) }];
+}
+
+/**
+ * A mention of the recall vector index binding, permitted in exactly one file
+ * of the source tree (Phase 25, D-17, RCLL-02).
+ *
+ * THE RULE. Exactly one file under `src/` names the binding in code, and it is
+ * `src/recall/index.ts`, whose store sets the partition and the filter from the
+ * signed-in principal on every write and query. Its type declaration in
+ * `src/env.ts` is not a mention, excluded the way the namespace-read count
+ * above excludes its own: by exempting the interface member that declares it.
+ *
+ * WHY A COUNT. The isolation proof in plan 25-01 rests on one module being the
+ * only way to the index. A second module holding the binding is a second way
+ * in, and nothing makes it set the partition. Zero is a violation too. It
+ * means the store was moved, renamed or emptied, and that direction is the
+ * quieter one: nothing fails on the way out, because the tests that covered
+ * the deleted code leave with it.
+ *
+ * WHY THIS STORE IN PARTICULAR. It fails open. A query with no partition reads
+ * every partition (SPIKE-09 (4)), so the platform reports nothing when a
+ * second path forgets it. The answer simply has other people's mail in it.
+ *
+ * THE SHAPE. The namespace-read count's, with the name and the declared type
+ * swapped. Any line that names the binding as a whole word, except the
+ * interface member that declares it (`RECALL_INDEX: Vectorize`, optionally
+ * `readonly` or optional). So member access, destructuring
+ * (`const { RECALL_INDEX } = env`), bracket access with the name as a string
+ * and an object-literal line all count.
+ *
+ * COMMENTS. Matched against the file with comment LINES blanked, so a
+ * commented-out mention does not keep the missing arm quiet, and prose naming
+ * the binding is not a mention. `src/env.ts` names it in a doc comment and is
+ * not counted.
+ *
+ * WHAT IT DOES NOT SEE. A name assembled from fragments and indexed
+ * (`env["RECALL_" + "INDEX"]`), and a whole-environment alias handed to a
+ * function that reads the index off it under another name. Both are
+ * deliberate evasions, not mistakes. The compiler does not see them either.
+ *
+ * Collected from `src/` only. Tests pass a fake to the store's factory, and a
+ * test is not a code path. First match per file, so no `g` flag.
+ */
+export const RECALL_INDEX_READ =
+  /^(?![ \t]*(?:readonly[ \t]+)?RECALL_INDEX[ \t]*\??[ \t]*:[ \t]*Vectorize\b)[^\n]*\bRECALL_INDEX\b/m;
+
+/** The one file under `RECALL_INDEX_SCOPE` permitted to match
+ *  `RECALL_INDEX_READ`. */
+export const RECALL_INDEX_OWNER = "src/recall/index.ts";
+
+/** The tree `RECALL_INDEX_READ` is collected from. */
+export const RECALL_INDEX_SCOPE = "src/";
+
+/**
+ * The mentions of the vector index binding one file contributes, as `scan()`
+ * collects them. At most one entry per file, at the first mentioning line,
+ * with the column of the binding's name on that line. Comment lines blanked,
+ * positions unchanged. An empty list outside `RECALL_INDEX_SCOPE`.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectRecallIndexReads(relativePath, contents) {
+  if (!relativePath.startsWith(RECALL_INDEX_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  const match = RECALL_INDEX_READ.exec(code);
+  if (match === null) return [];
+  const index = match.index + match[0].search(/\bRECALL_INDEX\b/);
+  return [{ file: relativePath, ...positionOf(code, index) }];
+}
+
+/**
+ * A read of the Workers AI binding off the environment object, permitted in
+ * exactly one file of the source tree (Phase 25, D-17).
+ *
+ * THE RULE. Exactly one file under `src/` reads the binding off the
+ * environment, and it is `src/recall/embed.ts`, which also holds the one model
+ * id and the one check on what comes back. Its type declaration in
+ * `src/env.ts` is not a read: the pattern needs the environment object.
+ *
+ * WHY A COUNT. The embedder is where text from the person's mail leaves the
+ * Worker for the model. One reader keeps that to one place, with one model and
+ * one shape check, and it is the place a later phase looks when it asks what
+ * mail text went where. Zero is a violation too: a deleted reader guards
+ * nothing, and nothing fails on the way out.
+ *
+ * THE SHAPE. A member read (`env.AI`, `this.env.AI`, `env?.AI`, `env!.AI`) or
+ * a bracket read with the name as a string (`env["AI"]`). Narrower than the
+ * vector binding's count on purpose: the two letters appear as a whole word in
+ * ordinary strings ("Workers AI"), and a whole-word count would fire on those.
+ *
+ * COMMENTS. Matched with comment lines blanked, as the other counts are, so a
+ * commented-out read cannot keep the missing arm quiet.
+ *
+ * WHAT IT DOES NOT SEE. A destructured environment (`const { AI } = env`), an
+ * index access with the name assembled from fragments, and an alias of the
+ * environment object under another name (`const e = env; e.AI`). All three
+ * are deliberate evasions, not mistakes.
+ *
+ * Collected from `src/` only. Tests pass a fake to the embedder's factory.
+ * First match per file, so no `g` flag.
+ */
+export const AI_BINDING_READ =
+  /\benv\s*(?:[?!]\s*)?(?:\.\s*AI\b|\[\s*["'`]AI["'`]\s*\])/;
+
+/** The one file under `AI_BINDING_SCOPE` permitted to match
+ *  `AI_BINDING_READ`. */
+export const AI_BINDING_OWNER = "src/recall/embed.ts";
+
+/** The tree `AI_BINDING_READ` is collected from. */
+export const AI_BINDING_SCOPE = "src/";
+
+/**
+ * The reads of the AI binding one file contributes, as `scan()` collects
+ * them. At most one entry per file, at the first read, with the column where
+ * the environment object's name starts. Comment lines blanked, positions
+ * unchanged. An empty list outside `AI_BINDING_SCOPE`.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectAiBindingReads(relativePath, contents) {
+  if (!relativePath.startsWith(AI_BINDING_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  const match = AI_BINDING_READ.exec(code);
+  if (match === null) return [];
+  return [{ file: relativePath, ...positionOf(code, match.index) }];
 }
 
 /**
@@ -2499,6 +2713,10 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "removal-site-missing",
   "agent-namespace-read-outside-owner",
   "agent-namespace-read-missing",
+  "recall-index-read-outside-owner",
+  "recall-index-read-missing",
+  "ai-binding-read-outside-owner",
+  "ai-binding-read-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -2617,7 +2835,8 @@ function walk(absoluteDir, collected = []) {
  * one of those as a comment would blank real code. So a comment trailing code
  * is kept, and so is a block comment opened after code. Used by the two
  * mutating-path counts, the three move-step counts, the namespace-read
- * count and the Durable Object config checks only.
+ * count, the two recall binding counts, the Durable Object config checks and
+ * the recall config checks only.
  *
  * @param {string} text
  * @returns {string}
@@ -2749,6 +2968,8 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const removalMarks = [];
   const removalSites = [];
   const agentNamespaceReaders = [];
+  const recallIndexReaders = [];
+  const aiBindingReaders = [];
   const davWriteExports = {};
 
   for (const absolute of files) {
@@ -2881,6 +3102,12 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
     agentNamespaceReaders.push(
       ...collectAgentNamespaceReads(relativePath, contents),
     );
+    // The two recall bindings (phase 25). The store and the embedder are not
+    // skipped: each holds its binding's one read. First match per file,
+    // comment lines blanked, and the type declarations in src/env.ts are not
+    // reads.
+    recallIndexReaders.push(...collectRecallIndexReads(relativePath, contents));
+    aiBindingReaders.push(...collectAiBindingReads(relativePath, contents));
     // The write-module manifest collects NAMES rather than a match position, so
     // it is the one collector that keys by module instead of appending to a list.
     // A declared module that is never walked therefore has no key at all, which
@@ -2910,6 +3137,8 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   violations.push(...checkRemovalMarkOwnership(removalMarks));
   violations.push(...checkRemovalSiteOwnership(removalSites));
   violations.push(...checkAgentNamespaceReadOwnership(agentNamespaceReaders));
+  violations.push(...checkRecallIndexOwnership(recallIndexReaders));
+  violations.push(...checkAiBindingOwnership(aiBindingReaders));
   violations.push(...checkDavWriteCoverage(davWriteExports));
 
   return violations.sort(
@@ -3524,6 +3753,74 @@ export function checkAgentNamespaceReadOwnership(readers) {
       pattern: "agent-namespace-read-missing",
       patternIndex: FORBIDDEN.length + 34,
       why: `No file under ${AGENT_NAMESPACE_SCOPE} reads the per-person Durable Object namespace binding, which means agentFor in ${AGENT_NAMESPACE_OWNER} was deleted, renamed, emptied, or rewired to reach the namespace some other way. Zero is as much a violation as two, and it is the quieter of the pair: "no second reader" is trivially true of a tree where the construction site is gone, and nothing fails on the way out. A read that survives only in a comment counts as zero. Restore the read in agentFor. If the construction site really moved, that is a change to the isolation boundary: get a decision, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The recall vector index count constraint, as a pure function over the
+ * collected mentions (Phase 25, D-17). One owner, a non-owner is reported, and
+ * an empty list is the missing arm. See the `RECALL_INDEX_READ` docstring for
+ * why this is a count and for what it cannot see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} readers
+ */
+export function checkRecallIndexOwnership(readers) {
+  const violations = [];
+  for (const reader of readers) {
+    if (reader.file === RECALL_INDEX_OWNER) continue;
+    violations.push({
+      file: reader.file,
+      line: reader.line,
+      column: reader.column,
+      pattern: "recall-index-read-outside-owner",
+      patternIndex: FORBIDDEN.length + 35,
+      why: `The recall vector index binding named under ${RECALL_INDEX_SCOPE} outside ${RECALL_INDEX_OWNER}. The recall store fails open: a query with no partition reads every person's vectors, and the platform reports nothing (SPIKE-09 (4)). The only thing that makes every query carry the signed-in person's partition is that one module holds the binding and sets it. A second module holding it is a second way in that nothing makes careful. Nothing in store-key-without-a-user can see a vector partition, so this count is what holds it. Take the store from ${RECALL_INDEX_OWNER} instead. A second owner is a decision on the isolation boundary, not a refactor: get the decision, then change the owner, never the pattern.`,
+    });
+  }
+  if (readers.length === 0) {
+    violations.push({
+      file: RECALL_INDEX_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "recall-index-read-missing",
+      patternIndex: FORBIDDEN.length + 36,
+      why: `No file under ${RECALL_INDEX_SCOPE} names the recall vector index binding, which means the store in ${RECALL_INDEX_OWNER} was deleted, renamed, emptied, or rewired to reach the index some other way. Zero is as much a violation as two, and it is the quieter of the pair: "no second reader" is trivially true of a tree where the store is gone, and nothing fails on the way out. A mention that survives only in a comment counts as zero. Restore the binding read in the store's production accessor. If the store really moved, that is a change to the isolation boundary: get a decision, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The Workers AI binding count constraint, as a pure function over the
+ * collected reads (Phase 25, D-17). One owner, a non-owner is reported, and an
+ * empty list is the missing arm. See the `AI_BINDING_READ` docstring for why
+ * this is a count and for what it cannot see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} readers
+ */
+export function checkAiBindingOwnership(readers) {
+  const violations = [];
+  for (const reader of readers) {
+    if (reader.file === AI_BINDING_OWNER) continue;
+    violations.push({
+      file: reader.file,
+      line: reader.line,
+      column: reader.column,
+      pattern: "ai-binding-read-outside-owner",
+      patternIndex: FORBIDDEN.length + 37,
+      why: `A read of the Workers AI binding off the environment under ${AI_BINDING_SCOPE} outside ${AI_BINDING_OWNER}. The embedder is where text from a person's mail leaves the Worker for the model, and one reader keeps that to one place, one model and one check on what comes back. A second reader is a second place mail text can be sent, with no one watching what. Take the embedder from ${AI_BINDING_OWNER} instead. A second reader is a decision on the boundary, not a refactor: get the decision, then change the owner, never the pattern.`,
+    });
+  }
+  if (readers.length === 0) {
+    violations.push({
+      file: AI_BINDING_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "ai-binding-read-missing",
+      patternIndex: FORBIDDEN.length + 38,
+      why: `No file under ${AI_BINDING_SCOPE} reads the Workers AI binding off the environment, which means the embedder in ${AI_BINDING_OWNER} was deleted, renamed, emptied, or rewired to reach the model some other way. Zero is as much a violation as two, and it is the quieter of the pair: nothing fails on the way out, because the tests that covered the deleted code leave with it. A read that survives only in a comment counts as zero. Restore the read in the embedder's production accessor. If the embedder really moved, that is a decision, not a refactor: get it, then change the owner, never the pattern.`,
     });
   }
   return violations;

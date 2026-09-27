@@ -127,6 +127,12 @@ export declare const REMOVAL_SCOPE: string;
 export declare const AGENT_NAMESPACE_READ: RegExp;
 export declare const AGENT_NAMESPACE_OWNER: string;
 export declare const AGENT_NAMESPACE_SCOPE: string;
+export declare const RECALL_INDEX_READ: RegExp;
+export declare const RECALL_INDEX_OWNER: string;
+export declare const RECALL_INDEX_SCOPE: string;
+export declare const AI_BINDING_READ: RegExp;
+export declare const AI_BINDING_OWNER: string;
+export declare const AI_BINDING_SCOPE: string;
 export declare const OWNERSHIP_VIOLATION_IDS: readonly string[];
 
 /** One declared DAV write module: why it is declared, and a disposition for
@@ -211,6 +217,20 @@ export declare function checkAgentNamespaceReadOwnership(
   readers: ReadonlyArray<OwnershipMatch>,
 ): Violation[];
 export declare function collectAgentNamespaceReads(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+export declare function checkRecallIndexOwnership(
+  readers: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function collectRecallIndexReads(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+export declare function checkAiBindingOwnership(
+  readers: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function collectAiBindingReads(
   relativePath: string,
   contents: string,
 ): OwnershipMatch[];
