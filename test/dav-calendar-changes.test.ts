@@ -1167,3 +1167,40 @@ describe("calendarChangesSince: a sign-in refusal on the sync REPORT (WR-02)", (
     ).rejects.toBeInstanceOf(DavAuthError);
   });
 });
+
+describe("calendarChangesSince: a cut-short starting answer is no starting point (WR-03)", () => {
+  const WORK_PATH = new URL(WORK).pathname;
+  const NO_PROPERTY: Cal[] = [
+    { url: WORK, name: "Work", token: null },
+    { url: FAMILY, name: "Family", token: "family-1" },
+  ];
+  const truncated = () =>
+    syncAnswer(
+      `<response><href>${WORK_PATH}</href><status>HTTP/1.1 507 Insufficient Storage</status></response>` +
+        ok(`${WORK_PATH}a.ics`),
+      "work-partial",
+    );
+
+  it("no prior token and a truncated empty-token answer: not_checked, and the partial token is not kept", async () => {
+    const stub = davStub(NO_PROPERTY, router(truncated));
+    const result = await run(stub, null);
+    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
+    expect(work).toMatchObject({
+      state: "not_checked",
+      reason: "no_usable_answer",
+      mechanism: "report-token",
+    });
+    expect(result.fresh.calendars.map((one) => one.syncToken)).toEqual(["family-1"]);
+  });
+
+  it("a refused prior token, then a truncated empty-token answer: not_checked, and the old token is kept", async () => {
+    const stub = davStub(
+      NO_PROPERTY,
+      router((_url, body) => (body.includes("work-1") ? syncTokenRefusal(403) : truncated())),
+    );
+    const result = await run(stub, await block([[WORK, "work-1"], [FAMILY, "family-1"]]));
+    const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
+    expect(work).toMatchObject({ state: "not_checked", reason: "no_usable_answer" });
+    expect(result.fresh.calendars.map((one) => one.syncToken)).not.toContain("work-partial");
+  });
+});

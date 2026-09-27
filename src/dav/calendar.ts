@@ -1309,12 +1309,19 @@ export async function calendarChangesSince(
       // No token anywhere: one REPORT with an empty token gives a starting
       // point. Its members are the whole calendar, not changes, so they are
       // discarded and nothing is fetched.
+      //
+      // A truncated answer is no starting point (WR-03). Its token is a
+      // continuation token, so recording it would make the next check report
+      // the rest of the calendar's existing events as added or changed. The
+      // calendar is not_checked instead, and nothing partial is kept.
       const startFromReport = async (
         state: CalendarChangeState,
         why?: CalendarRestartWhy,
       ): Promise<void> => {
         const outcome = await reportOutcome(davFetch, collection.url, resolved.homeUrl, "");
-        if (outcome.kind === "answer") {
+        if (outcome.kind === "answer" && outcome.answer.truncated) {
+          notChecked("no_usable_answer", mechanism);
+        } else if (outcome.kind === "answer") {
           keep(
             { ...base, state, mechanism, ...(why !== undefined ? { why } : {}) },
             { key, syncToken: outcome.answer.token as string },
