@@ -1203,8 +1203,8 @@ export const MUTATING_OPEN_SCOPE = "src/";
  *
  *   1. a namespace import of the service module (`import * as s from ...`),
  *      followed by a call through it;
- *   2. a re-export of the orchestrator through another module, imported from
- *      there;
+ *   2. a star re-export of the service module (`export * from ...`) in another
+ *      module, with the orchestrator imported from there;
  *   3. a dynamic import of the service module (`await import(...)`);
  *   4. an alias: a module path alias that does not end in `/service`, or the
  *      orchestrator re-bound to another name inside the owner and handed on.
@@ -1212,11 +1212,17 @@ export const MUTATING_OPEN_SCOPE = "src/";
  * A renamed binding in the braces (`withMutatingMailbox as open`) IS seen,
  * because the orchestrator's own name is still spelled inside them.
  *
- * THE SHAPE. An import statement that names either orchestrator inside its
- * braces, from a module path ending in `/service` with an optional TypeScript
- * or JavaScript extension. A type-only import matches too, and so does an
- * import spread over several lines. It matched nothing under `src/`, `test/` or
+ * A named re-export (`export { withMutatingMailbox } from "./service"`) IS
+ * seen too. It is the cheapest way round an import-only count: one barrel line
+ * anywhere under `src/`, then an ordinary import from the barrel. The barrel
+ * line is itself the second importer, so it is counted as one.
+ *
+ * THE SHAPE. An import or export statement that names either orchestrator
+ * inside its braces, from a module path ending in `/service` with an optional
+ * TypeScript or JavaScript extension. A type-only one matches too, and so does
+ * one spread over several lines. It matched nothing under `src/`, `test/` or
  * `scripts/` before the owner existed, and it was armed in the same commit.
+ * Widening it to the export form also matched nothing new under `src/`.
  *
  * Collected from `src/` only. Tests import the stream-pair form to drive it
  * through the in-memory duplex, and a test is not a code path.
@@ -1225,7 +1231,7 @@ export const MUTATING_OPEN_SCOPE = "src/";
  * match only, so a file that imports it twice is one entry.
  */
 export const MUTATING_SESSION_IMPORT =
-  /import\s*(?:type\s*)?\{[^}]*\bwithMutatingMailbox(?:Over)?\b[^}]*\}\s*from\s*["'][^"'\n]*\/service(?:\.[cm]?[jt]s)?["']/;
+  /(?:import|export)\s*(?:type\s*)?\{[^}]*\bwithMutatingMailbox(?:Over)?\b[^}]*\}\s*from\s*["'][^"'\n]*\/service(?:\.[cm]?[jt]s)?["']/;
 
 /** The one file under `MUTATING_SESSION_SCOPE` permitted to match
  *  `MUTATING_SESSION_IMPORT`. */
@@ -1234,6 +1240,26 @@ export const MUTATING_SESSION_OWNER = "src/mail/triage.ts";
 /** The tree `MUTATING_SESSION_IMPORT` is collected from. Tests drive the
  *  orchestrator directly, and a test is not a code path. */
 export const MUTATING_SESSION_SCOPE = "src/";
+
+/**
+ * The importers of the mutating orchestrator one file contributes, as
+ * `scan()` collects them.
+ *
+ * Exported so the tests can feed the checker a real source sample, through
+ * the collector `scan()` itself uses, rather than a hand-made position. At most
+ * one entry per file: the first match, as `String.prototype.search` finds it.
+ * An empty list for a file outside `MUTATING_SESSION_SCOPE`.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectMutatingSessionImports(relativePath, contents) {
+  if (!relativePath.startsWith(MUTATING_SESSION_SCOPE)) return [];
+  const index = contents.search(MUTATING_SESSION_IMPORT);
+  if (index === -1) return [];
+  return [{ file: relativePath, ...positionOf(contents, index) }];
+}
 
 /**
  * A bare network call, permitted in exactly one module of the subscription-feed
@@ -2290,15 +2316,9 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
     }
     // The service module defines the orchestrator and imports nothing from
     // itself, so the pattern cannot match there.
-    if (relativePath.startsWith(MUTATING_SESSION_SCOPE)) {
-      const mutatingImportIndex = contents.search(MUTATING_SESSION_IMPORT);
-      if (mutatingImportIndex !== -1) {
-        mutatingSessionImporters.push({
-          file: relativePath,
-          ...positionOf(contents, mutatingImportIndex),
-        });
-      }
-    }
+    mutatingSessionImporters.push(
+      ...collectMutatingSessionImports(relativePath, contents),
+    );
     // The write-module manifest collects NAMES rather than a match position, so
     // it is the one collector that keys by module instead of appending to a list.
     // A declared module that is never walked therefore has no key at all, which

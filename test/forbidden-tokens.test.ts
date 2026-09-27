@@ -36,6 +36,7 @@ import {
   MUTATING_SESSION_IMPORT,
   MUTATING_SESSION_OWNER,
   MUTATING_SESSION_SCOPE,
+  collectMutatingSessionImports,
   OWNERSHIP_VIOLATION_IDS,
   PASSWORD_READER_IMPORT,
   PASSWORD_READER_OWNERS,
@@ -4432,17 +4433,35 @@ describe("the mutating session has one importer (Phase 20, D-05, D-06)", () => {
       // An explicit extension, single quotes.
       "import { withMutatingMailbox } from './service.ts';",
       'import { withMutatingMailbox } from "../../mail/service.js";',
+      // A named re-export: one barrel line, then an ordinary import from the
+      // barrel (WR-05). The barrel line is the second importer.
+      'export { withMutatingMailbox } from "./service";',
+      'export { withMutatingMailboxOver as open } from "../mail/service";',
+      'export type { withMutatingMailbox } from "./service";',
+      'export {\n  MAILBOX_NOT_WRITABLE,\n  withMutatingMailboxOver,\n} from "./service.ts";',
     ]) {
       expect(fires(sample), `missed ${JSON.stringify(sample)}`).toBe(true);
     }
+  });
+
+  it("collects a barrel's named re-export as a second importer, through scan()'s own collector (WR-05)", () => {
+    const barrel = 'export { withMutatingMailbox } from "./service";\n';
+    const collected = collectMutatingSessionImports("src/mail/index.ts", barrel);
+    expect(collected).toEqual([{ file: "src/mail/index.ts", line: 1, column: 1 }]);
+    expect(
+      checkMutatingSessionImportOwnership([owner, ...collected]).map((v) => v.pattern),
+    ).toEqual(["mutating-session-importer-outside-triage"]);
+    // Outside the scope it is nobody's business: tests import it on purpose.
+    expect(collectMutatingSessionImports("test/barrel.ts", barrel)).toEqual([]);
   });
 
   it("does not match another name, another module, or the bare word", () => {
     for (const sample of [
       // The type-only import of the session type, which the owner also carries.
       'import type {\n  MailSessionOptions,\n  MutatingMailSession,\n  SessionGate,\n} from "./service";',
-      // The read orchestrator.
+      // The read orchestrator, imported or re-exported.
       'import { withMailSession } from "./service";',
+      'export { withMailSession } from "./service";',
       // A longer identifier that merely begins with the name.
       'import { withMutatingMailboxes } from "./service";',
       // The orchestrator's name from another module.
@@ -4465,8 +4484,8 @@ describe("the mutating session has one importer (Phase 20, D-05, D-06)", () => {
       'import * as service from "./service";',
       // A dynamic import.
       'const { withMutatingMailbox } = await import("./service");',
-      // A re-export through another module.
-      'export { withMutatingMailbox } from "./service";',
+      // A star re-export through another module. The named form is seen.
+      'export * from "./service";',
       // A path alias that does not end in /service.
       'import { withMutatingMailbox } from "#mail";',
     ]) {
@@ -4496,6 +4515,9 @@ describe("the mutating session has one importer (Phase 20, D-05, D-06)", () => {
 });
 
 describe("the count constraints as a set", () => {
+  /** A barrel's named re-export of the mutating orchestrator (WR-05). */
+  const BARREL_REEXPORT = 'export { withMutatingMailbox } from "./service";\n';
+
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
 
@@ -4541,7 +4563,12 @@ describe("the count constraints as a set", () => {
       // The two phase 20 counts, one owner each, so the same pair of lists.
       ...checkMutatingOpenOwnership([nonOwner]).map((v) => v.pattern),
       ...checkMutatingOpenOwnership([]).map((v) => v.pattern),
-      ...checkMutatingSessionImportOwnership([nonOwner]).map((v) => v.pattern),
+      // The outside arm is fed a real source sample through scan()'s own
+      // collector: a barrel's named re-export, the cheapest way round an
+      // import-only count (WR-05).
+      ...checkMutatingSessionImportOwnership(
+        collectMutatingSessionImports("src/mail/index.ts", BARREL_REEXPORT),
+      ).map((v) => v.pattern),
       ...checkMutatingSessionImportOwnership([]).map((v) => v.pattern),
       // The second two-owner count, fed the same pair of lists the password
       // count is fed and for the same reason.
@@ -4604,7 +4631,9 @@ describe("the count constraints as a set", () => {
       // each id.
       ...checkMutatingOpenOwnership([nonOwner]),
       ...checkMutatingOpenOwnership([]),
-      ...checkMutatingSessionImportOwnership([nonOwner]),
+      ...checkMutatingSessionImportOwnership(
+        collectMutatingSessionImports("src/mail/index.ts", BARREL_REEXPORT),
+      ),
       ...checkMutatingSessionImportOwnership([]),
       // TWO owners again, so the same asymmetric pair the password count needs:
       // both owners plus a non-owner is exactly one outside, and one owner

@@ -162,6 +162,10 @@ export declare function checkMutatingOpenOwnership(
 export declare function checkMutatingSessionImportOwnership(
   importers: ReadonlyArray<OwnershipMatch>,
 ): Violation[];
+export declare function collectMutatingSessionImports(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
 
 /** Every name `contents` exports as a `function` declaration, in source order. */
 export declare function exportedFunctionNames(contents: string): string[];
