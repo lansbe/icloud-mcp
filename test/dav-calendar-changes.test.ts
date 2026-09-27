@@ -582,7 +582,7 @@ describe("readSyncAnswer (pure)", () => {
     });
   });
 
-  it("does not count a member outside the home", () => {
+  it("does not count a member outside the home, and a dropped member makes the answer unusable (WR-01)", () => {
     const answer = readSyncAnswer(
       responses(
         `<href>https://elsewhere.example/x.ics</href><status>HTTP/1.1 200` +
@@ -591,8 +591,22 @@ describe("readSyncAnswer (pure)", () => {
       COLLECTION,
       HOME,
     );
-    expect(answer.usable).toBe(true);
     expect(answer.addedOrChanged).toEqual([`${COLLECTION}a.ics`]);
+    // A member it could not use is a change it cannot report: never "nothing".
+    expect(answer.usable).toBe(false);
+  });
+
+  it("an answer whose only members were dropped is unusable, never an empty change (WR-01)", () => {
+    for (const body of [
+      `<href>https://elsewhere.example/x.ics</href><status>HTTP/1.1 200`,
+      `<href>/999/calendars/work/y.ics</href><status>HTTP/1.1 404`,
+      `<href>http://[bad</href><status>HTTP/1.1 200`,
+    ]) {
+      const answer = readSyncAnswer(responses(body), COLLECTION, HOME);
+      expect(answer.addedOrChanged).toEqual([]);
+      expect(answer.removed).toEqual([]);
+      expect(answer.usable).toBe(false);
+    }
   });
 
   it("is unusable with no token, with a blank token, or with a failed element", () => {
@@ -909,7 +923,7 @@ describe("calendarChangesSince: which events were added or changed (D-26)", () =
     expect(work.events[0]!.kind).toBe("added");
   });
 
-  it("a member on another host, or outside the home, is neither counted nor fetched", async () => {
+  it("a member on another host, or outside the home, is neither counted nor fetched, and the calendar is not_checked (WR-01)", async () => {
     const stub = davStub(
       TWO,
       router(
@@ -925,9 +939,19 @@ describe("calendarChangesSince: which events were added or changed (D-26)", () =
     );
     const result = await run(stub, await block([[WORK, "work-1"], [FAMILY, "family-1"]]));
     const work = result.calendars.find((one) => one.calendarId === idOf(WORK))!;
-    expect(work).toMatchObject({ added: 1, changed: 0, addedOrChanged: 0, removed: 0 });
-    const asked = multigetPaths(multigets(stub)[0]!.body);
-    expect(asked).toEqual([`${WORK_PATH}a.ics`]);
+    // Two changes it could not use: not "one change", and never "nothing".
+    expect(work).toMatchObject({
+      state: "not_checked",
+      reason: "no_usable_answer",
+      addedOrChanged: null,
+    });
+    expect(multigets(stub)).toEqual([]);
+    // The token does not move, so the next check asks about the same span.
+    expect(result.fresh.calendars).toContainEqual({
+      key: await calendarKeyOf(WORK),
+      syncToken: "work-1",
+      takenAt: 1790000000,
+    });
     expect(stub.log.some((one) => one.url.includes("elsewhere"))).toBe(false);
     expect(stub.log.some((one) => one.body.includes("/999/"))).toBe(false);
   });

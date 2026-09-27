@@ -806,7 +806,7 @@ export interface CalendarChanges {
 
 /** What one sync answer said, once every element has been checked. */
 export interface SyncAnswer {
-  /** A multistatus carrying a new token and no failed element. */
+  /** A multistatus carrying a new token, no failed element, and no dropped member. */
   usable: boolean;
   token: string | null;
   addedOrChanged: string[];
@@ -851,6 +851,13 @@ function sameCollection(a: string, b: string): boolean {
  * 2026-08-22). Every other href is resolved against the collection URL and
  * must be under the calendar home, or it is not counted. Hrefs are
  * de-duplicated.
+ *
+ * **A member that is not counted makes the answer unusable (WR-01).** An href
+ * that does not resolve, or resolves outside the home, is a change iCloud
+ * reported and this check cannot use. Counting the rest and moving the token on
+ * would skip it for good, and an answer made only of such members would read
+ * as "nothing changed". So the calendar is `not_checked` and keeps its old
+ * token instead.
  */
 export function readSyncAnswer(
   responses: readonly DAVResponse[],
@@ -860,6 +867,7 @@ export function readSyncAnswer(
   let token: string | null = null;
   let failed = false;
   let truncated = false;
+  let dropped = 0;
   const changed = new Set<string>();
   const gone = new Set<string>();
 
@@ -888,6 +896,7 @@ export function readSyncAnswer(
     } catch {
       // An href this module cannot resolve is not counted. Nothing is read
       // from the caught value.
+      dropped += 1;
       continue;
     }
 
@@ -901,6 +910,7 @@ export function readSyncAnswer(
       try {
         assertUnderHome(url, homeUrl);
       } catch {
+        dropped += 1;
         continue;
       }
       gone.add(url);
@@ -908,6 +918,7 @@ export function readSyncAnswer(
       try {
         assertUnderHome(url, homeUrl);
       } catch {
+        dropped += 1;
         continue;
       }
       changed.add(url);
@@ -917,7 +928,7 @@ export function readSyncAnswer(
   }
 
   return {
-    usable: token !== null && !failed,
+    usable: token !== null && !failed && dropped === 0,
     token,
     addedOrChanged: [...changed],
     removed: [...gone],
