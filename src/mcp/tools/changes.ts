@@ -28,6 +28,7 @@ import { env } from "cloudflare:workers";
 import { z } from "zod";
 import type { FolderState, MarkerContent } from "../../change-marker";
 import {
+  MAX_CHANGE_FOLDERS,
   MarkerRefusedError,
   readMarker,
   sealMarker,
@@ -38,7 +39,8 @@ import {
   ImapThrottleError,
 } from "../../errors";
 import type { StatusSnapshot } from "../../mail/imap-parser";
-import { encodeFolderId } from "../../mail/ids";
+import { decodeFolderId, encodeFolderId } from "../../mail/ids";
+import { decodeModifiedUtf7 } from "../../mail/imap-parser";
 import type {
   FolderSnapshotOutcome,
   MailSessionOptions,
@@ -92,6 +94,12 @@ export type MailMechanism = "status-modseq" | "status-uidnext";
 export interface MailFolderAnswer {
   /** How the folder is named in the trusted block. `INBOX` is a protocol literal. */
   folder: string;
+  /**
+   * The folder's display name, decoded as `mail_list_folders` decodes it. It
+   * is the account owner's or a stranger's text, so it goes in the fenced
+   * block only, keyed by `folder`, and never into the trusted block (D-04).
+   */
+  name?: string;
   state: SourceState;
   /** Exact, and only for `changes` and `no_changes`. */
   newMessages: number | null;
@@ -392,6 +400,9 @@ async function checkMail(
     check.state = search.fresh;
   }
 
+  for (const check of checks) {
+    check.answer.name = decodeModifiedUtf7(check.mailbox);
+  }
   return checks;
 }
 
@@ -481,8 +492,8 @@ function overallSentence(
 /**
  * Shape the answer. The pure half, with no transport in it.
  *
- * The trusted block's keys, in this order: `counts`, `overall`, `since`,
- * `marker`. Counts come before any detail (CHNG-06). The fenced block holds
+ * The trusted block's keys, in this order: `counts`, `carried`, `overall`,
+ * `since`, `marker`. Counts come before any detail (CHNG-06). The fenced block holds
  * everything stranger-authored.
  */
 export function changesResult(answer: ChangesAnswer): ToolResult {
@@ -500,6 +511,7 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
 
   const trusted = {
     counts,
+    carried: answer.carried,
     overall: overallSentence(
       answer.mail.map((folder) => folder.state),
       answer.carried.length,
@@ -511,14 +523,48 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
     marker: answer.marker,
   };
 
-  // The rows, under the folder they came from. Every value here is either
-  // stranger-authored or sits beside a value that is, so all of it is fenced.
-  const untrusted: Record<string, NewMailRow[]> = {};
+  // The rows and the display name, under the folder's trusted key. Every
+  // value here is either stranger-authored or sits beside a value that is, so
+  // all of it is fenced. A folder other than the inbox is always listed, so
+  // the key in the counts can be matched to a name; the inbox only when it
+  // has rows, since its key is already its name.
+  const untrusted: Record<string, { name: string; rows: NewMailRow[] }> = {};
   for (const folder of answer.mail) {
-    if (folder.rows.length > 0) untrusted[folder.folder] = folder.rows;
+    if (folder.rows.length > 0 || folder.folder !== DEFAULT_MAILBOX) {
+      untrusted[folder.folder] = {
+        name: folder.name ?? folder.folder,
+        rows: folder.rows,
+      };
+    }
   }
 
   return untrustedToolResult(trusted, untrusted);
+}
+
+const TOO_MANY_FOLDERS =
+  "At most five folders can be watched with one marker, counting the ones it " +
+  "already holds. Ask about fewer folders, or call with no marker to start over.";
+
+/**
+ * The answer when the folders asked about plus the ones the marker already
+ * holds would come to more than five (D-21). Given before any socket.
+ *
+ * On the success arm, like the marker refusal: nothing failed, and the
+ * caller's marker is still good for a smaller call. No marker comes back,
+ * because none was made.
+ */
+export function tooManyFoldersResult(): ToolResult {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({
+          refusal: "too-many-folders",
+          overall: TOO_MANY_FOLDERS,
+        }),
+      },
+    ],
+  };
 }
 
 /**
@@ -561,9 +607,10 @@ export function registerChangesTool(
     {
       description:
         "What changed since a marker from an earlier call. Counts first, then " +
-        "new mail: sender and subject only, never a body. Call with no marker " +
-        "for a starting point. Every answer returns a fresh marker; pass it " +
-        `back exactly next time. Never marks mail read. ${UNTRUSTED_NOTICE}`,
+        "new mail: sender and subject only, never a body. The inbox by " +
+        "default, or up to five folder ids. Call with no marker for a " +
+        "starting point. Every answer returns a fresh marker; pass it back " +
+        `exactly next time. Never marks mail read. ${UNTRUSTED_NOTICE}`,
       inputSchema: z.object({
         marker: z
           .string()
@@ -572,11 +619,31 @@ export function registerChangesTool(
           .describe(
             "The marker from the previous answer, exactly as given. Omit for a starting point.",
           ),
+        folders: z
+          .array(z.string())
+          .min(1, "Give at least one folder id, or leave folders out for the inbox.")
+          .max(
+            MAX_CHANGE_FOLDERS,
+            "At most five folders can be checked in one call.",
+          )
+          .optional()
+          .describe(
+            "Folder ids from mail_list_folders, one to five. Omit for the inbox only.",
+          ),
       }),
     },
-    async ({ marker }) => {
+    async ({ marker, folders }) => {
       try {
         const actor = await principal;
+
+        // Every id decoded before any socket, so a malformed or foreign one is
+        // refused as the mail tools refuse it, at no connection cost. The
+        // inbox is asked only by default or when listed (D-21). Duplicates are
+        // asked once, in first-seen order.
+        const mailboxes =
+          folders === undefined
+            ? [DEFAULT_MAILBOX]
+            : [...new Set(folders.map((id) => decodeFolderId(id).mailbox))];
 
         let prior: MarkerContent | null = null;
         let restartAll = false;
@@ -595,13 +662,24 @@ export function registerChangesTool(
           }
         }
 
+        // Marker folders this call does not ask about are carried forward
+        // unchanged (D-16). Checked and carried together may not pass five,
+        // refused before any socket.
+        const asked = new Set(mailboxes);
+        const carried = (prior?.folders ?? []).filter(
+          (one) => !asked.has(one.mailbox),
+        );
+        if (mailboxes.length + carried.length > MAX_CHANGE_FOLDERS) {
+          return tooManyFoldersResult();
+        }
+
         const priorFolders = new Map<string, FolderState>(
           (prior?.folders ?? []).map((one) => [one.mailbox, one]),
         );
         const checks = await checkMail(
           actor,
           gate,
-          [DEFAULT_MAILBOX],
+          mailboxes,
           priorFolders,
           restartAll,
           options,
@@ -609,9 +687,12 @@ export function registerChangesTool(
 
         const fresh = await sealMarker(
           {
-            folders: checks.flatMap((check) =>
-              check.state === null ? [] : [check.state],
-            ),
+            folders: [
+              ...checks.flatMap((check) =>
+                check.state === null ? [] : [check.state],
+              ),
+              ...carried,
+            ],
             calendar: prior?.calendar ?? null,
             mintedAt: Math.floor(Date.now() / 1000),
           },
@@ -621,7 +702,7 @@ export function registerChangesTool(
 
         return changesResult({
           mail: checks.map((check) => check.answer),
-          carried: [],
+          carried: carried.map((one) => folderKeyOf(one.mailbox)),
           since: prior?.mintedAt ?? null,
           marker: fresh,
         });
