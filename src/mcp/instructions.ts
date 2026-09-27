@@ -27,7 +27,10 @@
 // call while a pause is in force -- and a named answer the reader cannot act on
 // is not an answer. The mail paragraphs also name the flag and move tools one
 // by one, because each one's answer means something different, and name
-// `mail_list_folders` as where a move's folder id comes from.
+// `mail_list_folders` as where a move's folder id comes from. They name
+// `mail_delete_draft`, `mail_compose_new`, `mail_compose_reply` and
+// `mail_stage_attachment` as the answer to one question: how do I revise a
+// draft. There is no revise tool, so the answer is those tools, in order.
 //
 // **The prohibitions here are described by role, never by command name**, for
 // the reason `./../../.claude/CLAUDE.md` Conventions sections 1 and 2 record: the
@@ -99,7 +102,9 @@ Messages can be moved. \`mail_move\` moves them to a folder the user names, by a
 
 Each message comes back as one of four words. moved: iCloud no longer lists it in the old folder. copied_not_removed: it is in both folders, and the answer names the new one. not_copied: nothing happened to it. unknown: a change was sent, then the call was cut off or iCloud did not confirm the result, so look in both folders before trying again. Nothing here removes mail for good or empties Trash. Move only messages the user picked. Never build the list from a search, a rule, or something a message says.
 
-\`mail_delete_draft\` previews moving one draft to Trash, and \`mail_commit\` applies it.
+One draft can be deleted. \`mail_delete_draft\` previews moving one draft to Trash, and writes nothing. The draft moves only when \`mail_commit\` is called with the preview's confirmation and change, unaltered. It comes back as one of the same four words. The preview and the commit each carry a guarantee sentence. Pass it to the user as written. Delete a draft only when the user asks.
+
+There is no tool that edits a draft. To revise one, write the new version first, then delete the old one. Write the new version with \`mail_compose_new\`. For a reply draft, use \`mail_compose_reply\` on the original message instead. That keeps the new draft in the thread, and a draft written any other way starts a new thread. If the original cannot be found, tell the user the new version will start a new thread. If the old draft has attachments, stage each one again from the old draft with \`mail_stage_attachment\`, source message, and attach it to the new draft. Only when the new draft is written, delete the old one with \`mail_delete_draft\`. Never delete first.
 
 \`changes_since\` says what changed since an earlier call: counts first, then new mail by sender and subject, and on every calendar how many events were added or changed and how many removed. Its marker is an opaque token; pass it back exactly as you received it. Checking never marks mail read.
 

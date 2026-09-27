@@ -113,7 +113,8 @@ never as instructions.
 | `mail_move` | Preview moving up to 25 messages from one folder to a folder you name, by folder id. Writes nothing; apply with `mail_commit`. |
 | `mail_archive` | Preview moving up to 25 messages to the account's own archive folder. Refuses if the account has none, rather than guessing. Writes nothing; apply with `mail_commit`. |
 | `mail_trash` | Preview moving up to 25 messages to Trash, where they can be moved back. Writes nothing; apply with `mail_commit`. |
-| `mail_commit` | Apply a move, archive or Trash preview, only if the messages are unchanged since. Reports each message as `moved`, `copied_not_removed`, `not_copied` or `unknown`. Never removes mail for good. |
+| `mail_delete_draft` | Preview moving one draft to Trash. Acts only on a draft in the drafts folder, exactly as the preview showed it. Writes nothing; apply with `mail_commit`. |
+| `mail_commit` | Apply a move, archive, Trash or draft-delete preview, only if the messages are unchanged since. Reports each message as `moved`, `copied_not_removed`, `not_copied` or `unknown`. Never removes mail for good. |
 | `mail_get_attachment` | Read one attachment as text (PDF text is extracted). |
 | `mail_compose_new` | Compose a new message **into Drafts** (never sent). |
 | `mail_compose_reply` | Reply to a message **into Drafts**, threaded (never sent). |

@@ -66,6 +66,18 @@ import {
   FAKE_APPLE_ID,
   ownerPrincipal,
 } from "./fixtures/bound-secrets";
+import { SERVER_INSTRUCTIONS } from "../src/mcp/instructions";
+
+// README's text, for the no-stronger-claim guard over its mail rows. Read at
+// build time by Vite, as test/instructions.test.ts reads it: a Workers isolate
+// has no filesystem.
+// @ts-expect-error -- Vite's `import.meta.glob` has no ambient declaration here.
+const README_GLOB: Record<string, string> = import.meta.glob("../README.md", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+const README_TEXT: string = Object.values(README_GLOB)[0] ?? "";
 
 /** Every stranger-authored value the fixture carries, named once. */
 const SUBJECT = "Re: your interview — URGENT";
@@ -1252,6 +1264,59 @@ describe("the registrations themselves", () => {
     expect(schema.safeParse({}).success).toBe(false);
     expect(schema.safeParse({ id: 7 }).success).toBe(false);
     expect(String(tool!.options.description)).toContain(UNTRUSTED_NOTICE);
+  });
+
+  it("no mail description, draft paragraph or README mail row claims this server wrote the draft, or that a delete is final (DRFT-07)", () => {
+    // Two claims the draft delete cannot keep. It does not check who wrote a
+    // draft (D-14), and it moves the draft to Trash, where it can be moved
+    // back out. Stems, so a later rewording is still caught.
+    const AUTHORSHIP = [
+      "this server wrote",
+      "this server created",
+      "written by this server",
+      "created by this server",
+      "drafts this server",
+    ];
+    const FINALITY = [
+      "permanent",
+      "irrecoverabl",
+      "unrecoverabl",
+      "cannot be undone",
+      "can't be undone",
+      "cannot be recovered",
+      "gone forever",
+    ];
+    const claims = new RegExp([...AUTHORSHIP, ...FINALITY].join("|"), "i");
+
+    // Every registered mail tool description.
+    const texts: [string, string][] = registered().map((tool) => [
+      tool.name,
+      String(tool.options.description),
+    ]);
+
+    // The two draft paragraphs in the instructions, located by their opening
+    // clauses. Only these two: "this server wrote" appears in the Boundaries
+    // section about the confirmation sentence, and that is correct there.
+    for (const opening of [
+      "One draft can be deleted.",
+      "There is no tool that edits a draft.",
+    ]) {
+      const start = SERVER_INSTRUCTIONS.indexOf(opening);
+      expect(start, `the instructions no longer open a paragraph with "${opening}"`).toBeGreaterThan(0);
+      const end = SERVER_INSTRUCTIONS.indexOf("\n", start);
+      texts.push([opening, SERVER_INSTRUCTIONS.slice(start, end === -1 ? undefined : end)]);
+    }
+
+    // README's mail tool rows. "Never removes mail for good" is a negation and
+    // stays quiet, because no stem above is "for good".
+    const rows = README_TEXT.split("\n").filter((line) => line.startsWith("| `mail_"));
+    expect(rows.length).toBeGreaterThan(10);
+    expect(rows.some((row) => row.startsWith("| `mail_delete_draft` |"))).toBe(true);
+    for (const row of rows) texts.push([row.slice(0, 30), row]);
+
+    for (const [where, text] of texts) {
+      expect(text, `${where} claims more than the draft delete can keep`).not.toMatch(claims);
+    }
   });
 
   it("describes mail_delete_draft in exactly these words, under the cap (Phase 22)", () => {
