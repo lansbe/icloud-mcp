@@ -1555,9 +1555,16 @@ const UNCONFIRMED_NOTE =
  * The answer to marking one message read or unread.
  *
  * Plain JSON, not the untrusted fence. Every field is this server's own: the id
- * the caller passed, which decoded as a token this server minted (base64url,
- * so it cannot carry a sentence); the boolean the caller chose; and what iCloud
+ * the caller passed, which decoded as a well-formed id (strict base64url, so it
+ * cannot carry a sentence); the boolean the caller chose; and what iCloud
  * reported. No stranger-authored text reaches this answer.
+ *
+ * The id is NOT signed. Any caller can build one that decodes, for any mailbox
+ * and uid in the signed-in account. The server checks its shape when it
+ * decodes it, and checks its folder's validity when the mailbox opens. Neither
+ * check says where the id came from. What stands between a prompt-injected
+ * message and a mark-read is the instructions line "Change read status only
+ * when the user asks", not the id's origin.
  *
  * `state` is what iCloud said after the change, and it can differ from
  * `requested`. When it does, the answer shows both, so nobody reads the request
@@ -2712,9 +2719,11 @@ export function registerMailTools(
    * description says which value undoes it.
    *
    * The input is exactly an id and a boolean. No folder, no search term, no
-   * list and no address: one message per call, named by an id this server
-   * minted. The verbs come from `../../mail/triage`. This module never imports
-   * the mutating orchestrator, and the scan would refuse it if it did.
+   * list and no address: one message per call, named by a message id. The id
+   * is not signed: the server checks its shape on decode and its folder's
+   * validity on open, and that is all. The verbs come from
+   * `../../mail/triage`. This module never imports the mutating orchestrator,
+   * and the scan would refuse it if it did.
    */
   server.registerTool(
     "mail_mark_read",
