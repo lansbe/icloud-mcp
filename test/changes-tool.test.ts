@@ -1627,3 +1627,46 @@ describe("a sign-in refusal on the sync REPORT is auth_failed, not too old (WR-0
     expect(answer.content[0]!.text).not.toContain("restarted");
   });
 });
+
+describe("an unusable signing key is refused before any socket, apart from a bad marker (WR-04)", () => {
+  /** The tool, registered with a fresh copy of the environment and no key. */
+  function withoutSecret(): ChangesCallback {
+    let callback: ChangesCallback | undefined;
+    const server = {
+      registerTool(name: string, _options: unknown, handler: ChangesCallback) {
+        if (name === CHANGES_TOOL_NAME) callback = handler;
+      },
+    };
+    registerChangesTool(
+      server as unknown as McpServer,
+      createSessionGate(),
+      ownerPrincipal(),
+      createDavFetch(ownerPrincipal()),
+      {},
+      { ...env, CONFIRM_SECRET: "" },
+    );
+    return callback!;
+  }
+
+  it("with no marker: no socket, no DAV request, and not the bad-marker answer", async () => {
+    const stub = davStub([]);
+    vi.stubGlobal("fetch", stub.fetch);
+    const answer = await withoutSecret()({});
+    expect(connectImap).not.toHaveBeenCalled();
+    expect(stub.log).toEqual([]);
+    const body = trustedOf(answer);
+    expect(body.refusal).toBe("markers-unavailable");
+    expect(body.marker).toBeUndefined();
+    expect(answer.content[0]!.text).not.toBe(refusedMarkerResult().content[0]!.text);
+  });
+
+  it("with a marker: the same answer, which tells the caller to keep it", async () => {
+    const marker = await markerFor(inboxMarkerContent());
+    const answer = await withoutSecret()({ marker });
+    expect(connectImap).not.toHaveBeenCalled();
+    const body = trustedOf(answer);
+    expect(body.refusal).toBe("markers-unavailable");
+    expect(body.overall).toMatch(/keep the marker/i);
+    expect(body.overall).not.toMatch(/no marker/i);
+  });
+});

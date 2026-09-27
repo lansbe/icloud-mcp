@@ -28,6 +28,7 @@
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
+import type { Env } from "../../env";
 import { z } from "zod";
 import type {
   CalendarBlock,
@@ -40,6 +41,7 @@ import {
   MAX_MARKER_LENGTH,
   MarkerRefusedError,
   fitsInMarker,
+  importMarkerKey,
   readMarker,
   sealMarker,
 } from "../../change-marker";
@@ -700,6 +702,31 @@ export function markerTooLongResult(): ToolResult {
 const LARGEST_UID = 0xffffffff;
 const LARGEST_MODSEQ = "9223372036854775807";
 
+const MARKERS_UNAVAILABLE =
+  "This server cannot make or read markers right now, so nothing was " +
+  "checked. This is a fault on the server's side, not in the marker: keep " +
+  "the marker you have and pass it back later.";
+
+/**
+ * The answer when the signing key is unusable (WR-04). Given before any
+ * socket, and never the bad-marker answer: that one tells the caller to throw
+ * their marker away, and a server fault is no reason to. No marker comes back,
+ * because none could be made.
+ */
+export function markersUnavailableResult(): ToolResult {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({
+          refusal: "markers-unavailable",
+          overall: MARKERS_UNAVAILABLE,
+        }),
+      },
+    ],
+  };
+}
+
 const TOO_MANY_FOLDERS =
   "At most five folders can be watched with one marker, counting the ones it " +
   "already holds. Ask about fewer folders, or call with no marker to start over.";
@@ -750,8 +777,8 @@ export function refusedMarkerResult(): ToolResult {
 /**
  * Register `changes_since` on a per-request server instance.
  *
- * The marker is read BEFORE any socket, so a refused one costs no iCloud
- * contact. The mail source runs in sessions awaited one after another on the
+ * The signing key is imported first and the marker is read next, both BEFORE
+ * any socket, so an unusable key or a refused marker costs no iCloud contact. The mail source runs in sessions awaited one after another on the
  * request-scoped gate. The calendar source runs only after the last mail
  * session has closed, through the one request-scoped DAV fetch.
  */
@@ -763,6 +790,12 @@ export function registerChangesTool(
   davFetch: DavFetch,
   /** The session bounds. Production passes none; tests inject short ones. */
   options: MailSessionOptions = {},
+  /**
+   * The environment the key and the calendar check read. Production passes
+   * none and gets the Worker's own; a test passes a fresh copy with the key
+   * overridden, never a write onto the shared one.
+   */
+  workerEnv: Env = env,
 ): void {
   server.registerTool(
     CHANGES_TOOL_NAME,
@@ -800,6 +833,16 @@ export function registerChangesTool(
       try {
         const actor = await principal;
 
+        // The key first, before any socket and apart from the marker's own
+        // check, so an unusable secret is never read as a bad marker (WR-04).
+        let key: CryptoKey;
+        try {
+          key = await importMarkerKey(workerEnv.CONFIRM_SECRET);
+        } catch {
+          // Nothing is read from the caught value.
+          return markersUnavailableResult();
+        }
+
         // Every id decoded before any socket, so a malformed or foreign one is
         // refused as the mail tools refuse it, at no connection cost. The
         // inbox is asked only by default or when listed (D-21). Duplicates are
@@ -813,11 +856,7 @@ export function registerChangesTool(
         let restartAll = false;
         if (marker !== undefined) {
           try {
-            const reading = await readMarker(
-              marker,
-              actor.userId,
-              env.CONFIRM_SECRET,
-            );
+            const reading = await readMarker(marker, actor.userId, key);
             if (reading.kind === "current") prior = reading.content;
             else restartAll = true;
           } catch (err) {
@@ -889,7 +928,7 @@ export function registerChangesTool(
         let freshCalendar: CalendarBlock | null;
         try {
           const result = await calendarChangesSince(
-            env,
+            workerEnv,
             actor,
             davFetch,
             prior?.calendar ?? null,
@@ -935,7 +974,7 @@ export function registerChangesTool(
             mintedAt: Math.floor(Date.now() / 1000),
           },
           actor.userId,
-          env.CONFIRM_SECRET,
+          key,
         );
 
         return changesResult({

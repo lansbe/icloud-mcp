@@ -357,6 +357,27 @@ export function fitsInMarker(content: MarkerContent): boolean {
   return sealedLength(content) <= MAX_MARKER_LENGTH;
 }
 
+/**
+ * The key a marker is sealed with, or the confirmation module's own refusal
+ * when the secret is unusable (WR-04).
+ *
+ * The tool imports it once, before anything else, so an unprovisioned secret
+ * is answered as the server fault it is: before any socket, and never as a bad
+ * marker that tells the caller to throw theirs away.
+ */
+export function importMarkerKey(secret: string | undefined): Promise<CryptoKey> {
+  return importConfirmationKey(secret);
+}
+
+/** A key already imported, or the secret to import one from. */
+export type MarkerKey = CryptoKey | string | undefined;
+
+function keyOf(secret: MarkerKey): Promise<CryptoKey> {
+  return typeof secret === "object" && secret !== null
+    ? Promise.resolve(secret)
+    : importConfirmationKey(secret);
+}
+
 /** The bytes the seal covers: the label, the user id, a colon, the payload part. */
 function signedBytes(userId: string, payloadPart: string): Uint8Array {
   return TOKEN_ENCODER.encode(`${DOMAIN_LABEL}${userId}:${payloadPart}`);
@@ -373,9 +394,9 @@ function signedBytes(userId: string, payloadPart: string): Uint8Array {
 export async function sealMarker(
   content: MarkerContent,
   userId: string,
-  secret: string | undefined,
+  secret: MarkerKey,
 ): Promise<string> {
-  const key = await importConfirmationKey(secret);
+  const key = await keyOf(secret);
 
   const wire = wireOf(content);
   // Round-tripped through JSON, so the check sees exactly what reading will.
@@ -411,7 +432,7 @@ export async function sealMarker(
 export async function readMarker(
   token: string,
   userId: string,
-  secret: string | undefined,
+  secret: MarkerKey,
 ): Promise<MarkerReading> {
   if (typeof token !== "string") throw new MarkerRefusedError();
   if (token.length > MAX_MARKER_LENGTH) throw new MarkerRefusedError();
@@ -424,7 +445,7 @@ export async function readMarker(
 
   let parsed: unknown;
   try {
-    const key = await importConfirmationKey(secret);
+    const key = await keyOf(secret);
     const verified = await crypto.subtle.verify(
       "HMAC",
       key,
