@@ -138,6 +138,35 @@ export class DavStaleResourceError extends Error {
 }
 
 /**
+ * Thrown when iCloud refuses a sync REPORT because the token is no longer valid.
+ *
+ * RFC 6578 §3.2 names the precondition a stale token fails,
+ * `DAV:valid-sync-token`, and deliberately does not fix the status that carries
+ * it. Servers answer 403, 409 or 410. Read by status number alone, each of those
+ * is something false here: a rejected password, a moved shard, a transient
+ * fault. So `./transport.ts` raises this, and only this, for a REPORT answered
+ * one of those three whose bounded body names that element. It is the only
+ * class in this file chosen by reading an error body, and the body decides the
+ * TYPE and nothing else.
+ *
+ * The change check catches it and answers "too old": that calendar is
+ * restarted from its current token (D-09). It should never reach a caller. If
+ * it ever does, it maps to `stale_resource`, whose guidance is to read again,
+ * and that is the right remedy. The password is fine.
+ *
+ * No constructor argument, on `DavStaleResourceError`'s register: no status, no
+ * body, no URL, and no field for one to ride in.
+ */
+export class DavSyncTokenError extends Error {
+  readonly kind = "sync-token" as const;
+
+  constructor() {
+    super("dav-sync-token-expired");
+    this.name = "DavSyncTokenError";
+  }
+}
+
+/**
  * Thrown when the confirmation supplied with a commit was not accepted.
  *
  * **This class exists to satisfy a translation contract, and the contract is
@@ -301,6 +330,7 @@ export function davToErrorCategory(err: unknown): {
   } else if (err instanceof DavThrottleError) category = "rate_limited";
   else if (err instanceof DavNotFoundError) category = "not_found";
   else if (err instanceof DavStaleResourceError) category = "stale_resource";
+  else if (err instanceof DavSyncTokenError) category = "stale_resource";
   else if (err instanceof DavConfirmationError) {
     category = "confirmation_invalid";
   } else if (err instanceof DavSubscriptionError) {
