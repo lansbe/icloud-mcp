@@ -1539,6 +1539,19 @@ const READ_ONLY_REASON =
   "Retrying will not help.";
 
 /**
+ * The fixed sentence an unconfirmed change carries. Plain ASCII.
+ *
+ * iCloud accepted the change and then would not say what the flag is now. The
+ * sentence says both, so the `state` beside it is not read as iCloud's word,
+ * and it says that asking again is safe. It is: setting a flag that is already
+ * set changes nothing, and the next answer reports iCloud's own state.
+ */
+const UNCONFIRMED_NOTE =
+  "iCloud accepted the change but did not report the read state afterwards, " +
+  "so state is what was asked for, not what iCloud said. Calling again with " +
+  "the same value is safe and reports iCloud's own answer.";
+
+/**
  * The answer to marking one message read or unread.
  *
  * Plain JSON, not the untrusted fence. Every field is this server's own: the id
@@ -1550,6 +1563,11 @@ const READ_ONLY_REASON =
  * `requested`. When it does, the answer shows both, so nobody reads the request
  * as the result (PITFALLS #33). `stateSource` says which reply that came from.
  *
+ * One exception, and it is labelled. When iCloud accepted the change but then
+ * would not report the flag, `stateSource` is `unconfirmed`, `state` is the
+ * request, and a fixed `note` says exactly that. It is not `not_found`: the
+ * message was there and was just changed.
+ *
  * Neither arm is `isError`, following the `AppendOutcome` precedent: a
  * read-only folder is a successful call that reports a stated reason.
  */
@@ -1559,19 +1577,30 @@ export function readStateToolResult(
   outcome: ReadStateOutcome,
 ): ToolResult {
   const requested = requestedRead ? "read" : "unread";
-  const body = outcome.applied
-    ? {
-        id,
-        requested,
-        state: outcome.seen ? "read" : "unread",
-        stateSource: outcome.source,
-      }
-    : {
-        id,
-        requested,
-        refusal: outcome.refusal,
-        reason: READ_ONLY_REASON,
-      };
+  let body: Record<string, string>;
+  if (!outcome.applied) {
+    body = {
+      id,
+      requested,
+      refusal: outcome.refusal,
+      reason: READ_ONLY_REASON,
+    };
+  } else if (outcome.source === "unconfirmed") {
+    body = {
+      id,
+      requested,
+      state: requested,
+      stateSource: outcome.source,
+      note: UNCONFIRMED_NOTE,
+    };
+  } else {
+    body = {
+      id,
+      requested,
+      state: outcome.seen ? "read" : "unread",
+      stateSource: outcome.source,
+    };
+  }
   return { content: [{ type: "text", text: JSON.stringify(body) }] };
 }
 

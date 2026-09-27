@@ -317,6 +317,25 @@ export function parseAccessCode(
 }
 
 /**
+ * The response code on a tagged completion of any status, upper-cased, or
+ * `null`.
+ *
+ * `a5 NO [NONEXISTENT] No such message` gives `NONEXISTENT`. Only a bracketed
+ * code IMMEDIATELY after the status counts, as in `parseAccessCode`; the same
+ * letters further along are prose the server chose to write. Only the code's
+ * first atom is returned, never its arguments and never the human text, so no
+ * server-chosen sentence travels any further than this function.
+ *
+ * `null` means the server gave no code, which is the common case.
+ */
+export function parseCompletionCode(taggedLine: string): string | null {
+  const parsed = parseTaggedResponse(taggedLine);
+  if (parsed === null) return null;
+  const match = /^\[([A-Za-z0-9-]+)[\] ]/.exec(parsed.text);
+  return match === null ? null : match[1].toUpperCase();
+}
+
+/**
  * Whether the FETCH reply for one UID says the message is seen, or `null`.
  *
  * Reads the untagged FETCH replies a command produced. It finds the reply whose

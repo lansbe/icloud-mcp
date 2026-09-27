@@ -17,11 +17,15 @@
 //
 // This module contains no logging calls of any kind and must never acquire any.
 
-import { ImapNotFoundError } from "../errors";
+import {
+  ImapConnectError,
+  ImapNotFoundError,
+  ImapThrottleError,
+} from "../errors";
 import type { Principal } from "../principal";
 import type { MessageRef } from "./ids";
-import { seenStateOf } from "./imap-parser";
-import type { DuplexLike } from "./imap-session";
+import { parseCompletionCode, seenStateOf } from "./imap-parser";
+import type { CommandResult, DuplexLike } from "./imap-session";
 import { sendCommand } from "./imap-session";
 import type {
   MailSessionOptions,
@@ -48,6 +52,14 @@ import {
  * `seen` can disagree with what was asked. If it does, that is the answer: the
  * server's word about the message, not the request echoed back.
  *
+ * `source: "unconfirmed"` carries no `seen` at all, on purpose. The server
+ * accepted the flag change, sent no reply about the message, and then refused
+ * the re-read. The change has probably landed, but nothing the server said
+ * shows it, so there is no server state to report. Saying "does not exist"
+ * here would be false: the message was there a moment ago and was just
+ * changed. The caller reports the request, labelled as unconfirmed. Asking
+ * again is safe, because setting a flag that is already set changes nothing.
+ *
  * `applied: false` means the mailbox opened read-only, or opened without saying
  * it was writable. Nothing was changed. A value rather than an error, following
  * `AppendOutcome`: the call worked and reports a stated reason, and retrying
@@ -55,7 +67,39 @@ import {
  */
 export type ReadStateOutcome =
   | { applied: true; seen: boolean; source: "store-echo" | "read-back" }
+  | { applied: true; source: "unconfirmed" }
   | { applied: false; refusal: "mailbox-read-only" };
+
+/**
+ * Response codes that say the message itself is gone (RFC 5530).
+ *
+ * Only these make a refused command `not_found`. A refusal with no code says
+ * nothing about the message, so it is not evidence that the message is gone.
+ */
+const GONE_CODES: ReadonlySet<string> = new Set(["NONEXISTENT"]);
+
+/**
+ * Response codes that say the server is busy or at a limit for now (RFC 5530).
+ *
+ * These are `rate_limited`, whose fixed message says to wait before retrying.
+ */
+const BUSY_CODES: ReadonlySet<string> = new Set(["UNAVAILABLE", "INUSE", "LIMIT"]);
+
+/**
+ * The error for a refused command on the mutating path, chosen by its code.
+ *
+ * Gone is `ImapNotFoundError`. Busy is `ImapThrottleError`, with no detail,
+ * so no server text reaches the answer. Everything else, a BAD or a NO with no
+ * code or another code, is `ImapConnectError`: this server cannot tell what
+ * went wrong, and that category's fixed message says so. Neither of those two
+ * says the message does not exist, because nothing shows that it doesn't.
+ */
+function refusalOf(result: CommandResult): Error {
+  const code = parseCompletionCode(result.tagged.text);
+  if (code !== null && GONE_CODES.has(code)) return new ImapNotFoundError();
+  if (code !== null && BUSY_CODES.has(code)) return new ImapThrottleError();
+  return new ImapConnectError();
+}
 
 /**
  * Set or clear the seen flag on one message, and read back what the server
@@ -67,6 +111,11 @@ export type ReadStateOutcome =
  *
  * A message that no longer exists gets a tagged OK and no reply about it. The
  * re-read then finds nothing either, and that is `ImapNotFoundError`.
+ *
+ * A refused flag change throws by its code (see `refusalOf`). It is
+ * `not_found` only when the code says the message is gone. A refused re-read
+ * after an accepted flag change is the same when its code says gone, and is
+ * the `unconfirmed` outcome otherwise, because the change was accepted.
  */
 async function changeSeen(
   session: MutatingMailSession,
@@ -78,7 +127,7 @@ async function changeSeen(
     session.channel.nextTag(),
     `UID STORE ${ref.uid} ${direction}FLAGS (\\Seen)`,
   );
-  if (stored.status !== "OK") throw new ImapNotFoundError();
+  if (stored.status !== "OK") throw refusalOf(stored);
 
   const echoed = seenStateOf(stored.untagged, ref.uid);
   if (echoed !== null) {
@@ -91,7 +140,11 @@ async function changeSeen(
     session.channel.nextTag(),
     `UID FETCH ${ref.uid} (UID FLAGS)`,
   );
-  if (reread.status !== "OK") throw new ImapNotFoundError();
+  if (reread.status !== "OK") {
+    const refusal = refusalOf(reread);
+    if (refusal instanceof ImapNotFoundError) throw refusal;
+    return { applied: true, source: "unconfirmed" };
+  }
 
   const seen = seenStateOf(reread.untagged, ref.uid);
   if (seen === null) throw new ImapNotFoundError();

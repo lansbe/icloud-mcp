@@ -16,7 +16,11 @@
 // Apple ID (D-13: live Apple testing is owner-only).
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { ImapNotFoundError, ImapThrottleError } from "../src/errors";
+import {
+  ImapConnectError,
+  ImapNotFoundError,
+  ImapThrottleError,
+} from "../src/errors";
 import { encodeMessageId } from "../src/mail/ids";
 import type { MessageRef } from "../src/mail/ids";
 import { createSessionGate } from "../src/mail/service";
@@ -391,24 +395,116 @@ describe("the mutating path refuses and reports honestly", () => {
     expectClosedAfterRead(duplex);
   });
 
-  it("is not_found when the flag change is answered NO", async () => {
+  it("chooses the error for a refused flag change by its code, never not_found without evidence (WR-03)", async () => {
+    // Only a code that says the message is gone is not_found. A busy code is
+    // rate_limited. A bare NO, a BAD and any other code are connection_failed:
+    // nothing shows the message is gone, so the answer must not say it is.
+    const cases: [string, Uint8Array, new () => Error][] = [
+      ["NO [NONEXISTENT]", taggedNo("a5", "[NONEXISTENT] No such message"), ImapNotFoundError],
+      ["NO [UNAVAILABLE]", taggedNo("a5", "[UNAVAILABLE] Try later"), ImapThrottleError],
+      ["NO [INUSE]", taggedNo("a5", "[INUSE] Mailbox in use"), ImapThrottleError],
+      ["NO [LIMIT]", taggedNo("a5", "[LIMIT] Too many"), ImapThrottleError],
+      ["bare NO", taggedNo("a5", "STORE failed"), ImapConnectError],
+      ["NO [SERVERBUG]", taggedNo("a5", "[SERVERBUG] Oops"), ImapConnectError],
+      ["BAD", wire("a5 BAD Command syntax error"), ImapConnectError],
+    ];
+    for (const [label, reply, expected] of cases) {
+      const duplex = createFakeDuplex([
+        ...authPrefix(),
+        selectResponse("a4", "[READ-WRITE]"),
+        reply,
+        logoutExchange("a6"),
+      ]);
+
+      const call = markReadOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS);
+      await expect(call, label).rejects.toBeInstanceOf(expected);
+      if (expected !== ImapNotFoundError) {
+        await expect(call, label).rejects.not.toBeInstanceOf(ImapNotFoundError);
+      }
+
+      expect(wireOf(duplex), label).toEqual([
+        ...SIGN_IN,
+        'a4 SELECT "INBOX"',
+        `a5 UID STORE ${UID} +FLAGS (\\Seen)`,
+        "a6 LOGOUT",
+      ]);
+      expectClosedAfterRead(duplex);
+    }
+  });
+
+  it("reports an accepted change as unconfirmed when the re-read is refused, never not_found (WR-03)", async () => {
+    // The flag change was accepted. Then the re-read was refused, so nothing
+    // the server said shows the state. The message was there a moment ago and
+    // was just changed, so "does not exist" would be false.
+    for (const reread of [
+      taggedNo("a6", "FETCH failed"),
+      taggedNo("a6", "[UNAVAILABLE] Try later"),
+      wire("a6 BAD Command syntax error"),
+    ]) {
+      const duplex = createFakeDuplex([
+        ...authPrefix(),
+        selectResponse("a4", "[READ-WRITE]"),
+        taggedOk("a5", "STORE completed"),
+        reread,
+        logoutExchange("a7"),
+      ]);
+
+      const outcome = await markUnreadOver(
+        duplex,
+        principal,
+        createSessionGate(),
+        REF,
+        FAST_BOUNDS,
+      );
+
+      expect(outcome).toEqual({ applied: true, source: "unconfirmed" });
+      expect(wireOf(duplex)).toEqual([
+        ...SIGN_IN,
+        'a4 SELECT "INBOX"',
+        `a5 UID STORE ${UID} -FLAGS (\\Seen)`,
+        `a6 UID FETCH ${UID} (UID FLAGS)`,
+        "a7 LOGOUT",
+      ]);
+      expectClosedAfterRead(duplex);
+    }
+
+    // The answer shows the request, labels it unconfirmed, and says why.
+    const outcome = { applied: true, source: "unconfirmed" } as const;
+    const result = readStateToolResult("x", false, outcome);
+    expect(result.isError).toBeUndefined();
+    const answer = JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+    expect(Object.keys(answer).sort()).toEqual([
+      "id",
+      "note",
+      "requested",
+      "state",
+      "stateSource",
+    ]);
+    expect(answer).toMatchObject({
+      id: "x",
+      requested: "unread",
+      state: "unread",
+      stateSource: "unconfirmed",
+    });
+    expect(String(answer.note)).toContain("not what iCloud said");
+    expect(String(answer.note)).toContain("Calling again with the same value is safe");
+    expect(String(answer.note)).not.toMatch(/does not exist|not found/i);
+    // Plain ASCII, like every fixed sentence this server writes.
+    expect(/^[\x20-\x7e]*$/.test(String(answer.note))).toBe(true);
+  });
+
+  it("is not_found when the re-read after an accepted change says the message is gone", async () => {
     const duplex = createFakeDuplex([
       ...authPrefix(),
       selectResponse("a4", "[READ-WRITE]"),
-      taggedNo("a5", "STORE failed"),
-      logoutExchange("a6"),
+      taggedOk("a5", "STORE completed"),
+      taggedNo("a6", "[NONEXISTENT] No such message"),
+      logoutExchange("a7"),
     ]);
 
     await expect(
       markReadOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS),
     ).rejects.toBeInstanceOf(ImapNotFoundError);
-
-    expect(wireOf(duplex)).toEqual([
-      ...SIGN_IN,
-      'a4 SELECT "INBOX"',
-      `a5 UID STORE ${UID} +FLAGS (\\Seen)`,
-      "a6 LOGOUT",
-    ]);
     expectClosedAfterRead(duplex);
   });
 

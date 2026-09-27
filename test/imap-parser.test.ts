@@ -27,6 +27,7 @@ import {
   isUntagged,
   parseAccessCode,
   parseCapabilityLine,
+  parseCompletionCode,
   parseListLine,
   parsePermanentFlags,
   parseSearchLine,
@@ -1034,6 +1035,26 @@ describe("parseAccessCode", () => {
 
   it("is null on an untagged line", () => {
     expect(parseAccessCode("* OK [READ-WRITE] mailbox open")).toBeNull();
+  });
+});
+
+describe("parseCompletionCode", () => {
+  it("reads the code right after the status, on any status, upper-cased", () => {
+    expect(parseCompletionCode("a5 NO [NONEXISTENT] No such message")).toBe("NONEXISTENT");
+    expect(parseCompletionCode("a5 NO [unavailable] later")).toBe("UNAVAILABLE");
+    expect(parseCompletionCode("a5 BAD [CLIENTBUG] odd")).toBe("CLIENTBUG");
+    expect(parseCompletionCode("a4 OK [READ-WRITE] SELECT completed")).toBe("READ-WRITE");
+  });
+
+  it("returns the code's first atom only, never its arguments", () => {
+    expect(parseCompletionCode("a4 OK [UIDVALIDITY 5] done")).toBe("UIDVALIDITY");
+  });
+
+  it("is null with no code, a code later in the text, or an untagged line", () => {
+    expect(parseCompletionCode("a5 NO STORE failed")).toBeNull();
+    expect(parseCompletionCode("a5 NO")).toBeNull();
+    expect(parseCompletionCode("a5 NO failed [NONEXISTENT]")).toBeNull();
+    expect(parseCompletionCode("* NO [NONEXISTENT] gone")).toBeNull();
   });
 });
 
