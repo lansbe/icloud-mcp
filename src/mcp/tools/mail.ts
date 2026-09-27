@@ -23,6 +23,7 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { env } from "cloudflare:workers";
 import { z } from "zod";
+import { createLeasedMail } from "../../agent/lease";
 import {
   CONFIRM_TTL_SECONDS,
   CONFIRM_VERSION,
@@ -2231,12 +2232,20 @@ function mailCommitResult(ids: readonly string[], applied: MailCommitApplied): T
  *
  * The staging helpers still take the ambient `env`. They reach R2, not mail,
  * and hold no credential.
+ *
+ * `mail` is the per-person connection lease over the same gate (Phase 24). A
+ * leased tool takes the lease after the principal is awaited and before the
+ * service call, never inside the orchestrator's check-and-acquire span. Only
+ * `mail_list_folders` is leased so far (plan 24-01's tracer); plan 24-02
+ * converts the rest and moves this construction into the server factory.
  */
 export function registerMailTools(
   server: McpServer,
   gate: SessionGate,
   principal: Promise<Principal>,
 ): void {
+  const mail = createLeasedMail(gate);
+
   server.registerTool(
     "mail_get_message",
     {
@@ -2282,7 +2291,11 @@ export function registerMailTools(
     async () => {
       try {
         const actor = await principal;
-        return folderToolResult(await listFolders(actor, gate));
+        return folderToolResult(
+          await mail.withConnectionLease(actor, (leased) =>
+            listFolders(actor, leased),
+          ),
+        );
       } catch (err) {
         return mailErrorResult(err);
       }

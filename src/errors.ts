@@ -85,6 +85,13 @@
  *   second claim on top: this category is the only one in the union that says
  *   the remote end was never involved, so it is the only one that can stop a
  *   platform limit being written down as a server's answer.
+ * - `connection_busy` — another request on this same account already holds
+ *   the account's mail connection lease, so this one was refused before it
+ *   started. Arrived in Phase 24 (D-06, owner-accepted 2026-09-27), reachable
+ *   from the day it arrived via `ConnectionBusyError`, which
+ *   `src/agent/lease.ts` raises. Not a duplicate of `rate_limited`: that one
+ *   says iCloud is refusing, and here iCloud refused nothing. The cause is the
+ *   person's own other request, and the next step differs with it.
  */
 export type ErrorCategory =
   | "auth_failed"
@@ -94,7 +101,8 @@ export type ErrorCategory =
   | "stale_resource"
   | "confirmation_invalid"
   | "subscription_unreadable"
-  | "request_unsendable";
+  | "request_unsendable"
+  | "connection_busy";
 
 /**
  * Thrown when the server rejects the credentials.
@@ -214,6 +222,26 @@ export class MailConfirmationError extends Error {
 }
 
 /**
+ * Thrown when another request on the same account holds the connection lease.
+ *
+ * Raised by `withConnectionLease` in `src/agent/lease.ts` BEFORE any socket is
+ * opened, so nothing was started and nothing was changed. No server is
+ * involved at all, which is why this is not `ImapThrottleError`: that class
+ * maps to a sentence blaming iCloud, and iCloud said nothing here.
+ *
+ * Fixed internal label, no constructor argument, the same as the classes
+ * above, so there is nowhere for a cause to ride.
+ */
+export class ConnectionBusyError extends Error {
+  readonly kind = "busy" as const;
+
+  constructor() {
+    super("mail-connection-lease-held");
+    this.name = "ConnectionBusyError";
+  }
+}
+
+/**
  * Fixed, human-readable text for each category, including retry guidance.
  *
  * These strings are the ONLY error prose that ever reaches a caller. They are
@@ -321,6 +349,19 @@ export const SAFE_MESSAGES: Record<ErrorCategory, string> = {
     "iCloud never saw it. This says nothing about your account or about " +
     "iCloud. Retrying will not help — it is a limit of the platform this " +
     "server runs on, and it needs a code change.",
+  // Its own entry rather than a reuse of `rate_limited`, decided by the owner
+  // on 2026-09-27 (D-06). `rate_limited` says iCloud is refusing connections,
+  // and here iCloud refused nothing: another request of the person's own holds
+  // the one mail connection this account is allowed at a time. The guidance
+  // overlaps (wait, do not loop), the cause does not, and the cause is what
+  // tells the person where to look — another Claude app or window running a
+  // mail call right now. The last sentence is true because the lease carries
+  // an absolute 30-second expiry (`LEASE_TTL_MS`).
+  connection_busy:
+    "Another request on this account is already using its iCloud mail " +
+    "connection, so this request was not started and nothing was changed. " +
+    "Wait a few seconds before retrying, and do not retry in a loop. A " +
+    "request that stopped part-way clears itself within half a minute.",
 };
 
 /**
@@ -346,6 +387,7 @@ export function toErrorCategory(err: unknown): {
   else if (err instanceof ImapNotFoundError) category = "not_found";
   else if (err instanceof ImapConnectError) category = "connection_failed";
   else if (err instanceof MailConfirmationError) category = "confirmation_invalid";
+  else if (err instanceof ConnectionBusyError) category = "connection_busy";
 
   return { category, message: SAFE_MESSAGES[category] };
 }

@@ -9,6 +9,7 @@
 // construction and cannot drift apart.
 
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+import type { UserAgent } from "./agent/user-agent";
 
 declare global {
   namespace Cloudflare {
@@ -17,8 +18,9 @@ declare global {
        * Token, grant, and client storage for the OAuth provider.
        *
        * The binding name is NOT configurable: the library reads
-       * `env.OAUTH_KV` directly in its shipped JavaScript. No Durable Object
-       * is involved, which is why wrangler.jsonc carries no migrations block.
+       * `env.OAUTH_KV` directly in its shipped JavaScript. The one Durable
+       * Object this Worker declares, `USER_AGENT` below, never touches this
+       * namespace.
        */
       OAUTH_KV: KVNamespace;
 
@@ -207,6 +209,26 @@ declare global {
        * Typed `RateLimit` for the reason given on the binding above.
        */
       LOGIN_ID_LIMITER: RateLimit;
+
+      /**
+       * One Durable Object per signed-in person, holding that person's mail
+       * connection lease (Phase 24, DOBJ-01).
+       *
+       * Named ONLY by `agentFor` in `src/agent/lease.ts`, from the signed-in
+       * principal's user id. That function is the only reader of this binding
+       * under `src/`, so no request field can choose whose object is reached.
+       * The object holds a lease record and nothing else: no address, no
+       * credential, no socket.
+       *
+       * Declared in wrangler.jsonc through the `exports` field with SQLite
+       * storage. The reason, and why that choice cannot be undone, is written
+       * beside the block there.
+       *
+       * Typed `DurableObjectNamespace<UserAgent>`, NOT `... | undefined`, for
+       * the reason spelled out on `DAV_CACHE` above: a binding declared in
+       * config either resolves at deploy time or fails the deploy.
+       */
+      USER_AGENT: DurableObjectNamespace<UserAgent>;
 
       /**
        * The Cloudflare account id. A Worker var declared in wrangler.jsonc, not

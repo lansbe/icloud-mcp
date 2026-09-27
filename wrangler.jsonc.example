@@ -119,8 +119,8 @@
 
   // Required by @cloudflare/workers-oauth-provider for token storage. The
   // BINDING name OAUTH_KV is NOT configurable — the library reads
-  // env.OAUTH_KV directly in its shipped JavaScript. No Durable Object is
-  // involved, so this config carries no `migrations` block.
+  // env.OAUTH_KV directly in its shipped JavaScript. The one Durable Object
+  // this Worker declares is further down, and it never touches this namespace.
   //
   // The namespace TITLE, however, is free, and it is deliberately NOT
   // "OAUTH_KV": a namespace by that bare name already exists on this
@@ -352,6 +352,43 @@
       "simple": { "limit": 3, "period": 60 }
     }
   ],
+
+  // STORAGE BACKEND: sqlite
+  //
+  // One Durable Object per signed-in person, holding that person's mail
+  // connection lease (Phase 24). The class lives in src/agent/user-agent.ts and
+  // is exported from src/index.ts, which both the deploy and the test pool need.
+  //
+  // Why SQLite. The key-value storage backend is closed to new namespaces on
+  // this account, and on every account: Cloudflare no longer creates one. The
+  // object uses its storage's synchronous key-value calls, which exist only on
+  // the SQLite backend.
+  //
+  // The storage type cannot be changed later. Once the namespace exists, a
+  // switch between the two backends is refused. The only way to change it is to
+  // delete the namespace, which destroys every object's data with no trash.
+  //
+  // Why `exports` and no legacy migrations array. `exports` is the declarative
+  // lifecycle field that replaced that array. Wrangler rejects a config holding
+  // both. And a Worker that has deployed with `exports` cannot go back to the
+  // array.
+  //
+  // Rollback. After the first deploy with this block, `wrangler rollback` to
+  // any version from before it is refused. A bad deploy from here on is fixed
+  // forward, never rolled back.
+  //
+  // Changing the class name, the storage value, or this block at all is a
+  // decision in the same register as changing `connectImap()`'s signature, not
+  // a refactor. A rename needs a tombstone entry and a deploy of its own, and
+  // Phase 27 plans to keep a refresh token in this object.
+  "durable_objects": {
+    "bindings": [
+      { "name": "USER_AGENT", "class_name": "UserAgent" }
+    ]
+  },
+  "exports": {
+    "UserAgent": { "type": "durable-object", "storage": "sqlite" }
+  },
 
   "observability": {
     "enabled": true,
