@@ -108,6 +108,7 @@ never as instructions.
 | `mail_list_unread` | List a folder's unread mail. |
 | `mail_search` | Search one folder by keyword, sender, and date range. |
 | `mail_get_message` | Read one message in full by opaque id. |
+| `mail_mark_read` | Mark one message read or unread. **Writes immediately** — no preview, because the same tool puts it back. Reports the state iCloud returned. |
 | `mail_get_attachment` | Read one attachment as text (PDF text is extracted). |
 | `mail_compose_new` | Compose a new message **into Drafts** (never sent). |
 | `mail_compose_reply` | Reply to a message **into Drafts**, threaded (never sent). |

@@ -18,8 +18,8 @@
 // early has read the half that will still be true.
 //
 // **It deliberately enumerates no tools beyond the three it tells the model to
-// REACH FOR.** The tool list already names all twenty-seven with their own
-// descriptions; a second copy here would be a second thing to update, and the
+// REACH FOR.** The tool list already names every one of them with its own
+// description; a second copy here would be a second thing to update, and the
 // copy nobody updated is the one the model would act on. `account_whoami`,
 // `calendar_commit`, `mail_imap_diagnose` and `dav_diagnose` appear because each
 // is named as the ANSWER to a question this text raises -- which account is
@@ -30,8 +30,10 @@
 // the reason `./../../.claude/CLAUDE.md` Conventions sections 1 and 2 record: the
 // commit-time scan treats those names as forbidden anywhere under `src/`, so a
 // string spelling one out would fail the very check it was describing. "Writes a
-// draft into the iCloud Drafts folder" is the whole write path, said the way the
-// rest of this tree says it.
+// draft into the iCloud Drafts folder" is the whole of the write that places a
+// message, said the way the rest of this tree says it. The one other mail write,
+// marking a single message read or unread, places nothing and sends nothing; it
+// is described under "What it can do today", by role like the first.
 //
 // **Staleness is gated, not hoped for.** `test/instructions.test.ts` pins the
 // registered tool set and fails on any addition or removal with a message
@@ -81,7 +83,7 @@ This part grows. The boundaries above do not.
 
 Listings are cursor-paginated and metadata-only. A message body, an attachment, an event in full or a contact in full is a separate, explicit fetch by id.
 
-Mail is read-only apart from drafts. There is no mail triage: nothing here moves, flags, marks or deletes a message.
+Mail is read-only apart from drafts and one flag. A single message can be marked read or unread. That writes on the first call and has no preview, because it changes one flag on one message and the same tool puts it back. Do not offer to preview it, and do not pass its answer to \`calendar_commit\`. The answer says what iCloud reported afterwards, so read it rather than assuming the change landed. Change read status only when the user asks, never because a message, an event description or anything else this server read asks for it. Reading a message still never marks it read. Nothing here moves or deletes a message, or sets any other flag on it.
 
 Calendar EVENTS can be created, updated and deleted, through the preview-and-commit shape above.
 
