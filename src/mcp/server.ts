@@ -118,8 +118,9 @@ export function createServerFactory(
     // it needs neither.
     registerAccountTool(server, principal);
     registerMailTools(server, gate, principal);
-    // The change check (CHNG-01). The same gate as the mail tools, so its
-    // sessions queue behind theirs rather than opening a second socket. And
+    // The change check (CHNG-01). The same gate as the mail tools, so a
+    // second session while one is held is refused rather than opening a
+    // second socket; the gate does not queue. And
     // the same `davFetch` the calendar tools get below, so its calendar
     // requests share their one queue.
     registerChangesTool(server, gate, principal, davFetch);
