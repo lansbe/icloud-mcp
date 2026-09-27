@@ -561,7 +561,7 @@ describe("a marker that is too old is restarted, never an error (D-09)", () => {
     const trusted = trustedOf(answer);
     expect(trusted.counts[0]).toMatchObject({ folder: "INBOX", state: "restarted" });
     expect(trusted.overall).not.toMatch(/nothing has changed/i);
-    expect(trusted.overall).toMatch(/start again/);
+    expect(trusted.overall).toMatch(/again from here/);
 
     const { userId } = await ownerPrincipal();
     const reading = await readMarker(trusted.marker, userId, env.CONFIRM_SECRET);

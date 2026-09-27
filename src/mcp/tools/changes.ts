@@ -38,7 +38,13 @@ import {
   ImapThrottleError,
 } from "../../errors";
 import type { StatusSnapshot } from "../../mail/imap-parser";
-import type { NewMailRow, SessionGate } from "../../mail/service";
+import { encodeFolderId } from "../../mail/ids";
+import type {
+  FolderSnapshotOutcome,
+  MailSessionOptions,
+  NewMailRow,
+  SessionGate,
+} from "../../mail/service";
 import {
   DEFAULT_MAILBOX,
   folderSnapshots,
@@ -104,6 +110,11 @@ export interface MailFolderAnswer {
 /** Everything `changesResult` needs. */
 export interface ChangesAnswer {
   mail: MailFolderAnswer[];
+  /**
+   * Folders in the presented marker that this call did not ask about, by
+   * trusted key, carried into the fresh marker unchanged (D-16).
+   */
+  carried: string[];
   /** The presented marker's `mintedAt`, in seconds, or `null`. */
   since: number | null;
   marker: string;
@@ -138,7 +149,8 @@ function mechanismOf(
 /**
  * Compare a folder's old state with its status reply.
  *
- * No old state is a starting point. A different validity means the old UIDs
+ * With the restart flag, every folder is `restarted`, whatever the numbers
+ * say. No old state is a starting point. A different validity means the old UIDs
  * name different messages now, so the folder starts again. An unchanged next
  * UID means nothing arrived, and the mod-sequences, compared as strings, say
  * whether anything else happened. A moved next UID needs a search, because the
@@ -147,7 +159,18 @@ function mechanismOf(
 export function mailOutcome(
   prior: FolderState | null,
   snapshot: StatusSnapshot,
+  restartAll = false,
 ): MailStep {
+  // A marker from an older format: every source starts again (D-09). Its
+  // content is not read at all, so there is no old state to compare with.
+  if (restartAll) {
+    return {
+      kind: "settled",
+      state: "restarted",
+      otherActivity: null,
+      mechanism: mechanismOf(null, snapshot),
+    };
+  }
   const mechanism = mechanismOf(prior, snapshot);
   if (prior === null) {
     return { kind: "settled", state: "started", otherActivity: null, mechanism };
@@ -193,105 +216,183 @@ function notChecked(folder: string, reason: NotCheckedReason): MailFolderAnswer 
   };
 }
 
+/**
+ * How a folder is named in the trusted block (D-04).
+ *
+ * The inbox is `INBOX`, a protocol literal. Every other folder is its opaque
+ * folder id, the same one `mail_list_folders` hands out, so a folder's own
+ * name never reaches the trusted block.
+ */
+export function folderKeyOf(mailbox: string): string {
+  return mailbox === DEFAULT_MAILBOX ? DEFAULT_MAILBOX : encodeFolderId({ mailbox });
+}
+
+function goneAnswer(folder: string): MailFolderAnswer {
+  return {
+    folder,
+    state: "gone",
+    newMessages: null,
+    otherActivity: null,
+    mechanism: null,
+    rows: [],
+  };
+}
+
 /** One folder's answer, and the state the fresh marker keeps for it. */
 interface FolderCheck {
+  mailbox: string;
   answer: MailFolderAnswer;
-  /** `null` only when there was no old state and none could be taken. */
+  /** `null` when the folder leaves the marker: gone, or never had a state. */
   state: FolderState | null;
 }
 
+/** A folder whose next UID moved, waiting for its search. */
+interface PendingSearch {
+  index: number;
+  from: number;
+  fresh: FolderState;
+  mechanism: MailMechanism;
+}
+
 /**
- * Check one folder: its numbers first, then a search only if mail arrived.
+ * Check a list of folders: their numbers first, then a search only where mail
+ * arrived.
  *
- * Two sessions, awaited one after the other, never together. A sign-in refusal
- * is rethrown, so the tool answers it as every mail tool does. Any other
- * failure is `not_checked`, and the folder keeps its OLD state, so the next
- * call covers the gap.
+ * One status session for every folder, then one read-only session per folder
+ * whose next UID moved, each awaited before the next starts (D-18, CLAUDE.md
+ * §3). Never two at once.
+ *
+ * A sign-in refusal is rethrown, so the tool answers it as every mail tool
+ * does (D-08). A throttle or a connection failure stops the mail source at
+ * once (D-29): every folder not yet answered is `not_checked` with that reason,
+ * and nothing is retried. A refusal that is not NONEXISTENT is `unavailable`.
+ * Every `not_checked` folder keeps its OLD state, so the next call covers the
+ * gap. A NONEXISTENT folder is `gone` and leaves the marker.
  */
-async function checkMailFolder(
+async function checkMail(
   actor: Principal,
   gate: SessionGate,
-  mailbox: string,
-  prior: FolderState | null,
+  mailboxes: readonly string[],
+  prior: ReadonlyMap<string, FolderState>,
   restartAll: boolean,
-): Promise<FolderCheck> {
-  let snapshot: StatusSnapshot;
-  try {
-    const [outcome] = await folderSnapshots(actor, gate, [mailbox]);
-    if (outcome === undefined || !outcome.answered) {
-      return { answer: notChecked(mailbox, "unavailable"), state: prior };
-    }
-    snapshot = outcome.snapshot;
-  } catch (err) {
-    if (err instanceof ImapAuthError) throw err;
-    return { answer: notChecked(mailbox, reasonOf(err)), state: prior };
-  }
-
-  // Checked by `folderSnapshots` already; restated so the types agree.
-  if (snapshot.uidValidity === null || snapshot.uidNext === null) {
-    return { answer: notChecked(mailbox, "unavailable"), state: prior };
-  }
-  const fresh: FolderState = {
-    mailbox,
-    uidValidity: snapshot.uidValidity,
-    uidNext: snapshot.uidNext,
-    highestModseq: snapshot.highestModseq,
-  };
-
-  // A marker from an older format: every source starts again.
-  const step: MailStep = restartAll
-    ? {
-        kind: "settled",
-        state: "restarted",
-        otherActivity: null,
-        mechanism: mechanismOf(null, snapshot),
-      }
-    : mailOutcome(prior, snapshot);
-
-  if (step.kind === "settled") {
-    return {
-      answer: {
-        folder: mailbox,
-        state: step.state,
-        newMessages: step.state === "no_changes" ? 0 : null,
-        otherActivity: step.otherActivity,
-        mechanism: step.mechanism,
-        rows: [],
-      },
-      state: fresh,
-    };
-  }
-
-  // `search` is only returned with an old state in hand.
-  const from = prior!.uidNext;
-  let found: { count: number; rows: NewMailRow[] };
-  try {
-    found = await newMail(
-      actor,
-      gate,
+  options: MailSessionOptions,
+): Promise<FolderCheck[]> {
+  const priorOf = (mailbox: string) => prior.get(mailbox) ?? null;
+  const notCheckedAll = (reason: NotCheckedReason): FolderCheck[] =>
+    mailboxes.map((mailbox) => ({
       mailbox,
-      fresh.uidValidity,
-      from,
-      fresh.uidNext,
-    );
+      answer: notChecked(folderKeyOf(mailbox), reason),
+      state: priorOf(mailbox),
+    }));
+
+  let outcomes: FolderSnapshotOutcome[];
+  try {
+    outcomes = await folderSnapshots(actor, gate, mailboxes, options);
   } catch (err) {
     if (err instanceof ImapAuthError) throw err;
-    return { answer: notChecked(mailbox, reasonOf(err)), state: prior };
+    return notCheckedAll(reasonOf(err));
   }
 
-  return {
-    answer: {
-      folder: mailbox,
+  const checks: FolderCheck[] = [];
+  const pending: PendingSearch[] = [];
+  for (const mailbox of mailboxes) {
+    const key = folderKeyOf(mailbox);
+    const old = priorOf(mailbox);
+    const outcome = outcomes.find((one) => one.mailbox === mailbox);
+
+    if (outcome === undefined || !outcome.answered) {
+      checks.push(
+        outcome !== undefined && outcome.gone === true
+          ? { mailbox, answer: goneAnswer(key), state: null }
+          : { mailbox, answer: notChecked(key, "unavailable"), state: old },
+      );
+      continue;
+    }
+
+    const { snapshot } = outcome;
+    // Checked by `folderSnapshots` already; restated so the types agree.
+    if (snapshot.uidValidity === null || snapshot.uidNext === null) {
+      checks.push({ mailbox, answer: notChecked(key, "unavailable"), state: old });
+      continue;
+    }
+    const fresh: FolderState = {
+      mailbox,
+      uidValidity: snapshot.uidValidity,
+      uidNext: snapshot.uidNext,
+      highestModseq: snapshot.highestModseq,
+    };
+
+    const step = mailOutcome(old, snapshot, restartAll);
+    if (step.kind === "settled") {
+      checks.push({
+        mailbox,
+        answer: {
+          folder: key,
+          state: step.state,
+          newMessages: step.state === "no_changes" ? 0 : null,
+          otherActivity: step.otherActivity,
+          mechanism: step.mechanism,
+          rows: [],
+        },
+        state: fresh,
+      });
+      continue;
+    }
+
+    // `search` is only returned with an old state in hand. A placeholder holds
+    // the folder's place in the order until its search has run.
+    pending.push({
+      index: checks.length,
+      from: old!.uidNext,
+      fresh,
+      mechanism: step.mechanism,
+    });
+    checks.push({ mailbox, answer: notChecked(key, "unavailable"), state: old });
+  }
+
+  // One after another, each awaited before the next starts.
+  let stopped: NotCheckedReason | null = null;
+  for (const search of pending) {
+    const check = checks[search.index]!;
+    const key = check.answer.folder;
+    if (stopped !== null) {
+      check.answer = notChecked(key, stopped);
+      continue;
+    }
+
+    let found: { count: number; rows: NewMailRow[] };
+    try {
+      found = await newMail(
+        actor,
+        gate,
+        check.mailbox,
+        search.fresh.uidValidity,
+        search.from,
+        search.fresh.uidNext,
+        options,
+      );
+    } catch (err) {
+      if (err instanceof ImapAuthError) throw err;
+      const reason = reasonOf(err);
+      check.answer = notChecked(key, reason);
+      if (reason === "throttled" || reason === "connection") stopped = reason;
+      continue;
+    }
+
+    check.answer = {
+      folder: key,
       state: found.count === 0 ? "no_changes" : "changes",
       newMessages: found.count,
       // Mail arrived and left again, so something happened that this check
       // does not list. With new mail present it cannot say either way.
       otherActivity: found.count === 0 ? true : null,
-      mechanism: step.mechanism,
+      mechanism: search.mechanism,
       rows: found.rows,
-    },
-    state: fresh,
-  };
+    };
+    check.state = search.fresh;
+  }
+
+  return checks;
 }
 
 // ---------------------------------------------------------------------------
@@ -313,47 +414,65 @@ function sources(count: number): string {
 }
 
 /**
- * The overall sentence, from the states alone.
+ * The overall sentence, from the states and the carried count alone.
  *
- * "Nothing has changed" only when every source is `no_changes`. A source that
- * could not be checked is always named, with the fact that the marker keeps its
- * old starting point. Integers only.
+ * "Nothing has changed" only when every source is `no_changes` and no folder
+ * was carried unasked, because a carried folder was not looked at (D-07). A
+ * source that could not be checked is always named, with the fact that the
+ * marker keeps its old starting point. Integers only.
  */
-function overallSentence(states: readonly SourceState[]): string {
+function overallSentence(
+  states: readonly SourceState[],
+  carried: number,
+): string {
   const count = (state: SourceState) =>
     states.filter((one) => one === state).length;
+  const one = (n: number, singular: string, plural: string) =>
+    n === 1 ? singular : plural;
 
-  if (states.length > 0 && count("no_changes") === states.length) {
-    return NOTHING_CHANGED;
-  }
-  if (states.length > 0 && count("started") === states.length) {
-    return STARTING_POINT;
+  if (carried === 0 && states.length > 0) {
+    if (count("no_changes") === states.length) return NOTHING_CHANGED;
+    if (count("started") === states.length) return STARTING_POINT;
   }
 
   const parts: string[] = [];
-  if (count("changes") > 0) {
-    parts.push(`Changes were found in ${sources(count("changes"))}.`);
+  const changes = count("changes");
+  if (changes > 0) {
+    parts.push(`Changes were found in ${sources(changes)}.`);
   }
-  if (count("not_checked") > 0) {
+  const notCheckedCount = count("not_checked");
+  if (notCheckedCount > 0) {
     parts.push(
-      `${sources(count("not_checked"))} could not be checked; the marker keeps ` +
-        "the old starting point for them, so the next check covers the gap.",
+      `${sources(notCheckedCount)} could not be checked; the marker keeps ` +
+        `the old starting point for ${one(notCheckedCount, "it", "them")}, so ` +
+        "the next check covers the gap.",
     );
   }
-  if (count("restarted") > 0) {
+  const restarted = count("restarted");
+  if (restarted > 0) {
     parts.push(
-      `The marker was too old for ${sources(count("restarted"))}, so they ` +
-        "start again from here.",
+      `The marker was too old for ${sources(restarted)}, so ` +
+        `${one(restarted, "it starts", "they start")} again from here.`,
     );
   }
-  if (count("started") > 0) {
-    parts.push(`${sources(count("started"))} start from here.`);
+  const started = count("started");
+  if (started > 0) {
+    parts.push(`${sources(started)} ${one(started, "starts", "start")} from here.`);
   }
-  if (count("gone") > 0) {
-    parts.push(`${sources(count("gone"))} no longer exist.`);
+  const gone = count("gone");
+  if (gone > 0) {
+    parts.push(`${sources(gone)} no longer ${one(gone, "exists", "exist")}.`);
   }
-  if (count("no_changes") > 0) {
-    parts.push(`Nothing changed in ${sources(count("no_changes"))}.`);
+  const unchanged = count("no_changes");
+  if (unchanged > 0) {
+    parts.push(`Nothing changed in ${sources(unchanged)}.`);
+  }
+  if (carried > 0) {
+    parts.push(
+      carried === 1
+        ? "1 folder was not asked about this time and is kept as it was."
+        : `${carried} folders were not asked about this time and are kept as they were.`,
+    );
   }
   parts.push("Pass the new marker back next time.");
   return parts.join(" ");
@@ -381,7 +500,10 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
 
   const trusted = {
     counts,
-    overall: overallSentence(answer.mail.map((folder) => folder.state)),
+    overall: overallSentence(
+      answer.mail.map((folder) => folder.state),
+      answer.carried.length,
+    ),
     since:
       answer.since === null
         ? null
@@ -431,6 +553,8 @@ export function registerChangesTool(
   server: McpServer,
   gate: SessionGate,
   principal: Promise<Principal>,
+  /** The session bounds. Production passes none; tests inject short ones. */
+  options: MailSessionOptions = {},
 ): void {
   server.registerTool(
     CHANGES_TOOL_NAME,
@@ -471,17 +595,23 @@ export function registerChangesTool(
           }
         }
 
-        const inbox = await checkMailFolder(
+        const priorFolders = new Map<string, FolderState>(
+          (prior?.folders ?? []).map((one) => [one.mailbox, one]),
+        );
+        const checks = await checkMail(
           actor,
           gate,
-          DEFAULT_MAILBOX,
-          prior?.folders.find((one) => one.mailbox === DEFAULT_MAILBOX) ?? null,
+          [DEFAULT_MAILBOX],
+          priorFolders,
           restartAll,
+          options,
         );
 
         const fresh = await sealMarker(
           {
-            folders: inbox.state === null ? [] : [inbox.state],
+            folders: checks.flatMap((check) =>
+              check.state === null ? [] : [check.state],
+            ),
             calendar: prior?.calendar ?? null,
             mintedAt: Math.floor(Date.now() / 1000),
           },
@@ -490,7 +620,8 @@ export function registerChangesTool(
         );
 
         return changesResult({
-          mail: [inbox.answer],
+          mail: checks.map((check) => check.answer),
+          carried: [],
           since: prior?.mintedAt ?? null,
           marker: fresh,
         });

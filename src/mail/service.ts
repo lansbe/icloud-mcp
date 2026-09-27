@@ -62,6 +62,7 @@ import {
   decodeModifiedUtf7,
   parseAccessCode,
   parseCapabilityLine,
+  parseCompletionCode,
   parseExists,
   parseListLine,
   parsePermanentFlags,
@@ -2255,7 +2256,17 @@ const SNAPSHOT_ITEMS = "(UIDVALIDITY UIDNEXT MESSAGES HIGHESTMODSEQ)";
  */
 export type FolderSnapshotOutcome =
   | { mailbox: string; answered: true; snapshot: StatusSnapshot }
-  | { mailbox: string; answered: false };
+  | { mailbox: string; answered: false; gone?: false }
+  /**
+   * The server refused the status command with the NONEXISTENT response code
+   * (RFC 5530): the folder does not exist. Only that code. Any other refusal
+   * is plain `answered: false`, so a wrong reading of iCloud's refusals costs a
+   * repeated "not checked", never a folder dropped from the marker.
+   */
+  | { mailbox: string; answered: false; gone: true };
+
+/** The one response code that says a folder is gone. */
+const FOLDER_GONE_CODE = "NONEXISTENT";
 
 /**
  * Ask each folder for its numbers, one at a time, in one session.
@@ -2284,7 +2295,12 @@ async function snapshotsIn(
       `STATUS ${quoted} ${SNAPSHOT_ITEMS}`,
     );
     if (result.status !== "OK") {
-      outcomes.push({ mailbox, answered: false });
+      const gone =
+        result.status === "NO" &&
+        parseCompletionCode(result.tagged.text) === FOLDER_GONE_CODE;
+      outcomes.push(
+        gone ? { mailbox, answered: false, gone: true } : { mailbox, answered: false },
+      );
       continue;
     }
 

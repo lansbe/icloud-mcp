@@ -126,6 +126,36 @@ export interface MarkerContent {
   mintedAt: number;
 }
 
+/** How a verified marker's version compares with this build's. */
+export type VersionClass = "current" | "older" | "refuse";
+
+/**
+ * Classify a marker's version against the current one. Pure.
+ *
+ * `current` is read. `older` is a whole number from 1 up to one below the
+ * current version: the marker verified, but its format is one this build no
+ * longer reads, so every source starts again (D-09). Anything else is refused
+ * with the one refusal (D-13): zero, a negative, a fraction, a version from the
+ * future, or a value that is not a number at all.
+ *
+ * **The `older` arm cannot be reached today.** While `MARKER_VERSION` is 1
+ * there is no whole number from 1 up to 0. It becomes live on the first bump,
+ * with no further change here, which is why it is written and tested now
+ * against a current version of 3.
+ */
+export function classifyVersion(version: unknown, current: number): VersionClass {
+  if (version === current) return "current";
+  if (
+    typeof version === "number" &&
+    Number.isInteger(version) &&
+    version >= 1 &&
+    version < current
+  ) {
+    return "older";
+  }
+  return "refuse";
+}
+
 /** What reading a marker gives back when it is accepted. */
 export type MarkerReading =
   | { kind: "current"; content: MarkerContent }
@@ -348,15 +378,9 @@ export async function readMarker(
   }
 
   if (!isPlainObject(parsed)) throw new MarkerRefusedError();
-  const version = parsed.v;
-  if (
-    Number.isInteger(version) &&
-    (version as number) >= 1 &&
-    (version as number) < MARKER_VERSION
-  ) {
-    return { kind: "older-version" };
-  }
-  if (version !== MARKER_VERSION) throw new MarkerRefusedError();
+  const version = classifyVersion(parsed.v, MARKER_VERSION);
+  if (version === "older") return { kind: "older-version" };
+  if (version === "refuse") throw new MarkerRefusedError();
 
   const content = contentOf(parsed);
   if (content === null) throw new MarkerRefusedError();
