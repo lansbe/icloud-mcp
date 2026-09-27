@@ -97,15 +97,18 @@ import {
 } from "../../mail/service";
 import type { FolderSummary } from "../../mail/service";
 import type {
+  FlagStateOutcome,
   MessageMoveResult,
   MoveOutcome,
   ReadStateOutcome,
 } from "../../mail/triage";
 import {
   MOVE_SET_CAP,
+  flagMessage,
   markRead,
   markUnread,
   moveMessages,
+  unflagMessage,
 } from "../../mail/triage";
 import type { Principal } from "../../principal";
 import type { ConfirmRefusal } from "../../staging/presign";
@@ -1637,6 +1640,69 @@ export function readStateToolResult(
       id,
       requested,
       state: outcome.seen ? "read" : "unread",
+      stateSource: outcome.source,
+    };
+  }
+  return { content: [{ type: "text", text: JSON.stringify(body) }] };
+}
+
+/**
+ * The fixed sentence a flag-not-kept refusal carries. Plain ASCII.
+ *
+ * The folder opened for changing, but iCloud said the flag would not last past
+ * this session. It says that, that nothing changed, and that retrying will not
+ * help, for `READ_ONLY_REASON`'s reason.
+ */
+const FLAG_NOT_KEPT_REASON =
+  "iCloud said this folder does not keep the flag past the session, so " +
+  "nothing was changed. Retrying will not help.";
+
+/**
+ * The fixed sentence an unconfirmed flag change carries. Plain ASCII.
+ *
+ * `UNCONFIRMED_NOTE`'s meaning, for the flagged flag.
+ */
+const FLAG_UNCONFIRMED_NOTE =
+  "iCloud accepted the change but did not report the flag afterwards, so " +
+  "state is what was asked for, not what iCloud said. Calling again with the " +
+  "same value is safe and reports iCloud's own answer.";
+
+/**
+ * The answer to flagging or unflagging one message.
+ *
+ * `readStateToolResult`'s shape and reasons, for the flagged flag. `state` is
+ * what iCloud said after the change and can differ from `requested`; an
+ * unconfirmed change says so in a fixed `note`. Every field is this server's
+ * own, and neither arm is `isError`.
+ */
+export function flagStateToolResult(
+  id: string,
+  requestedFlagged: boolean,
+  outcome: FlagStateOutcome,
+): ToolResult {
+  const requested = requestedFlagged ? "flagged" : "unflagged";
+  let body: Record<string, string>;
+  if (!outcome.applied) {
+    body = {
+      id,
+      requested,
+      refusal: outcome.refusal,
+      reason:
+        outcome.refusal === "flag-not-kept" ? FLAG_NOT_KEPT_REASON : READ_ONLY_REASON,
+    };
+  } else if (outcome.source === "unconfirmed") {
+    body = {
+      id,
+      requested,
+      state: requested,
+      stateSource: outcome.source,
+      note: FLAG_UNCONFIRMED_NOTE,
+    };
+  } else {
+    body = {
+      id,
+      requested,
+      state: outcome.flagged ? "flagged" : "unflagged",
       stateSource: outcome.source,
     };
   }
@@ -3291,6 +3357,47 @@ export function registerMailTools(
           ? await markRead(actor, gate, ref)
           : await markUnread(actor, gate, ref);
         return readStateToolResult(id, read, outcome);
+      } catch (err) {
+        return mailErrorResult(err);
+      }
+    },
+  );
+
+  /**
+   * Flag or unflag one message (TRIA-01).
+   *
+   * **No preview, and that is the owner's decision (D-01, 2026-09-26).** It has
+   * mail_mark_read's shape for mail_mark_read's reasons: one flag on one
+   * message, harmless, and put back by the same tool with the opposite value.
+   * No condition on the change either; the conditional change belongs to the
+   * removal mark inside a previewed move.
+   *
+   * The input is exactly an id and a boolean. The flag is named in the verb's
+   * code, so a caller chooses only on or off and can reach no other flag
+   * (D-05). The verb checks that the folder keeps the flag before it writes.
+   */
+  server.registerTool(
+    "mail_flag",
+    {
+      description:
+        "Flag or unflag one email by id. Writes at once, no preview; " +
+        `undo with the opposite flagged. ${UNTRUSTED_NOTICE}`,
+      inputSchema: z.object({
+        id: z.string().describe("The opaque message id from a listing."),
+        flagged: z
+          .boolean()
+          .describe("true flags the message; false clears the flag."),
+      }),
+    },
+    async ({ id, flagged }) => {
+      try {
+        const actor = await principal;
+        // Decoded before any socket: a bad token costs no connection.
+        const ref = decodeMessageId(id);
+        const outcome = flagged
+          ? await flagMessage(actor, gate, ref)
+          : await unflagMessage(actor, gate, ref);
+        return flagStateToolResult(id, flagged, outcome);
       } catch (err) {
         return mailErrorResult(err);
       }

@@ -43,6 +43,8 @@ import { createFakeDuplex } from "./fixtures/fake-duplex";
 import type { FakeDuplex } from "./fixtures/fake-duplex";
 import type { Principal } from "../src/principal";
 import { ownerPrincipal } from "./fixtures/bound-secrets";
+import { flagMessageOver, unflagMessageOver } from "../src/mail/triage";
+import { flagStateToolResult } from "../src/mcp/tools/mail";
 
 // The verbs module's own source, for the no-body guard. Read at build time by
 // Vite, as test/service.test.ts reads the service module: a Workers isolate has
@@ -737,5 +739,80 @@ describe("one mark-read per request (D-08, MUTA-05)", () => {
     });
     expect(wroteFlagChange(firstDuplex)).toBe(true);
     expect(gate.held).toBe(false);
+  });
+});
+
+describe("flag and unflag, end to end", () => {
+  it("flags one message, and reports the flag state from the echo", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      flagEcho("a5", 17, UID, "\\Seen \\Flagged"),
+      logoutExchange("a6"),
+    ]);
+
+    const outcome = await flagMessageOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      REF,
+      FAST_BOUNDS,
+    );
+
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      `a5 UID STORE ${UID} +FLAGS (\\Flagged)`,
+      "a6 LOGOUT",
+    ]);
+    expect(outcome).toEqual({ applied: true, flagged: true, source: "store-echo" });
+
+    const id = encodeMessageId(REF);
+    const answer = JSON.parse(
+      flagStateToolResult(id, true, outcome).content[0]!.text,
+    ) as Record<string, unknown>;
+    expect(answer).toEqual({
+      id,
+      requested: "flagged",
+      state: "flagged",
+      stateSource: "store-echo",
+    });
+    expect(flagStateToolResult(id, true, outcome).isError).toBeUndefined();
+  });
+
+  it("unflags one message, and reports the flag state from the echo", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      flagEcho("a5", 17, UID, "\\Seen"),
+      logoutExchange("a6"),
+    ]);
+
+    const outcome = await unflagMessageOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      REF,
+      FAST_BOUNDS,
+    );
+
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      `a5 UID STORE ${UID} -FLAGS (\\Flagged)`,
+      "a6 LOGOUT",
+    ]);
+    expect(outcome).toEqual({ applied: true, flagged: false, source: "store-echo" });
+
+    const id = encodeMessageId(REF);
+    const answer = JSON.parse(
+      flagStateToolResult(id, false, outcome).content[0]!.text,
+    ) as Record<string, unknown>;
+    expect(answer).toEqual({
+      id,
+      requested: "unflagged",
+      state: "unflagged",
+      stateSource: "store-echo",
+    });
   });
 });

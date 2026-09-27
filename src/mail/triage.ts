@@ -7,8 +7,13 @@
 // orchestrator itself. A caller names what it wants done to one message; it
 // never gets a mailbox opened for changing to do its own work in.
 //
-// Two verbs mark one message read, and mark it unread. Each sends one flag
-// change and, when the server sent no echo, one flags-only re-read.
+// Two verbs mark one message read, and mark it unread. Two more flag one
+// message, and clear its flag. Each sends one flag change and, when the server
+// sent no echo, one flags-only re-read.
+//
+// Each verb checks the one flag it changes against the open's permanent-flags
+// list itself, before it sends anything (D-08). The orchestrator records the
+// list and takes no mode argument.
 //
 // Two more move a list of messages from one folder to another, one message at
 // a time, in one session. iCloud has no move command, so each message is
@@ -39,6 +44,8 @@ import {
   parseCopyUid,
   parseFingerprint,
   parseModifiedUids,
+  flagStateOf,
+  keepsFlag,
   parseSearchLine,
   quoteMailbox,
   seenStateOf,
@@ -136,12 +143,20 @@ function refusalOf(result: CommandResult): Error {
  * `not_found` only when the code says the message is gone. A refused re-read
  * after an accepted flag change is the same when its code says gone, and is
  * the `unconfirmed` outcome otherwise, because the change was accepted.
+ *
+ * First, the open's permanent-flags list must keep the seen flag (D-08). If it
+ * does not, a change would last only until logout, so nothing is sent and the
+ * answer is the read-only refusal Phase 20 gave from the orchestrator.
  */
 async function changeSeen(
   session: MutatingMailSession,
   ref: MessageRef,
   direction: "+" | "-",
 ): Promise<ReadStateOutcome> {
+  if (!keepsFlag(session.permanentFlags, "\\Seen")) {
+    return { applied: false, refusal: "mailbox-read-only" };
+  }
+
   const stored = await sendCommand(
     session.channel,
     session.channel.nextTag(),
@@ -262,6 +277,166 @@ export async function markUnread(
 }
 
 // ---------------------------------------------------------------------------
+// Flagging one message (Phase 21, D-01, D-08)
+// ---------------------------------------------------------------------------
+
+/**
+ * What flagging or unflagging one message produced.
+ *
+ * The same shape as `ReadStateOutcome`, for the flagged flag. `flagged` is what
+ * the server said after the change, from the store's own reply or from a
+ * flags-only re-read, and it can disagree with what was asked. If it does, that
+ * is the answer. `unconfirmed` means the change was accepted and the re-read
+ * was then refused, so there is no server state to report.
+ *
+ * Two refusals, and neither sent a change:
+ *
+ * - `mailbox-read-only`: the folder did not open for changing.
+ * - `flag-not-kept`: it did, but its permanent-flags list leaves out the
+ *   flagged flag, so a change would be gone at logout.
+ */
+export type FlagStateOutcome =
+  | { applied: true; flagged: boolean; source: "store-echo" | "read-back" }
+  | { applied: true; source: "unconfirmed" }
+  | { applied: false; refusal: "mailbox-read-only" | "flag-not-kept" };
+
+/**
+ * Set or clear the flagged flag on one message, and read back what the server
+ * says it now is.
+ *
+ * `changeSeen`'s shape, for the flagged flag. No preview and no condition on
+ * the change (D-01): it is one flag on one message, and the same tool puts it
+ * back. The flag is named here in the code; a caller chooses only on or off.
+ */
+async function changeFlagged(
+  session: MutatingMailSession,
+  ref: MessageRef,
+  direction: "+" | "-",
+): Promise<FlagStateOutcome> {
+  if (!keepsFlag(session.permanentFlags, "\\Flagged")) {
+    return { applied: false, refusal: "flag-not-kept" };
+  }
+
+  const stored = await sendCommand(
+    session.channel,
+    session.channel.nextTag(),
+    `UID STORE ${ref.uid} ${direction}FLAGS (\\Flagged)`,
+  );
+  if (stored.status !== "OK") throw refusalOf(stored);
+
+  const echoed = flagStateOf(stored.untagged, ref.uid, "\\Flagged");
+  if (echoed !== null) {
+    return { applied: true, flagged: echoed, source: "store-echo" };
+  }
+
+  // No reply for this message. Ask for its flags, and nothing else.
+  const reread = await sendCommand(
+    session.channel,
+    session.channel.nextTag(),
+    `UID FETCH ${ref.uid} (UID FLAGS)`,
+  );
+  if (reread.status !== "OK") {
+    const refusal = refusalOf(reread);
+    if (refusal instanceof ImapNotFoundError) throw refusal;
+    return { applied: true, source: "unconfirmed" };
+  }
+
+  const flagged = flagStateOf(reread.untagged, ref.uid, "\\Flagged");
+  if (flagged === null) throw new ImapNotFoundError();
+  return { applied: true, flagged, source: "read-back" };
+}
+
+/** Turn the orchestrator's refusal value into the flag verb's refusal arm. */
+function flagOutcomeOf(
+  result: FlagStateOutcome | typeof MAILBOX_NOT_WRITABLE,
+): FlagStateOutcome {
+  if (result === MAILBOX_NOT_WRITABLE) {
+    return { applied: false, refusal: "mailbox-read-only" };
+  }
+  return result;
+}
+
+/** Flag one message, over an already-open stream pair. */
+export async function flagMessageOver(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  ref: MessageRef,
+  options: MailSessionOptions = {},
+): Promise<FlagStateOutcome> {
+  return flagOutcomeOf(
+    await withMutatingMailboxOver(
+      duplex,
+      principal,
+      gate,
+      ref.mailbox,
+      ref.uidValidity,
+      (session) => changeFlagged(session, ref, "+"),
+      options,
+    ),
+  );
+}
+
+/** Flag one message. */
+export async function flagMessage(
+  principal: Principal,
+  gate: SessionGate,
+  ref: MessageRef,
+  options: MailSessionOptions = {},
+): Promise<FlagStateOutcome> {
+  return flagOutcomeOf(
+    await withMutatingMailbox(
+      principal,
+      gate,
+      ref.mailbox,
+      ref.uidValidity,
+      (session) => changeFlagged(session, ref, "+"),
+      options,
+    ),
+  );
+}
+
+/** Clear one message's flag, over an already-open stream pair. */
+export async function unflagMessageOver(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  ref: MessageRef,
+  options: MailSessionOptions = {},
+): Promise<FlagStateOutcome> {
+  return flagOutcomeOf(
+    await withMutatingMailboxOver(
+      duplex,
+      principal,
+      gate,
+      ref.mailbox,
+      ref.uidValidity,
+      (session) => changeFlagged(session, ref, "-"),
+      options,
+    ),
+  );
+}
+
+/** Clear one message's flag. */
+export async function unflagMessage(
+  principal: Principal,
+  gate: SessionGate,
+  ref: MessageRef,
+  options: MailSessionOptions = {},
+): Promise<FlagStateOutcome> {
+  return flagOutcomeOf(
+    await withMutatingMailbox(
+      principal,
+      gate,
+      ref.mailbox,
+      ref.uidValidity,
+      (session) => changeFlagged(session, ref, "-"),
+      options,
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Moving messages (Phase 21, D-06, D-07)
 // ---------------------------------------------------------------------------
 
@@ -351,17 +526,6 @@ function hasMoveCommands(capability: string | null): boolean {
   return atoms.has("UIDPLUS") && atoms.has("CONDSTORE");
 }
 
-/**
- * Whether the open says the removal mark is kept.
- *
- * `null` means the open sent no list, and RFC 3501 says every flag is kept
- * then. `\*` does not count, as in the seen-flag check: it is about keywords.
- */
-function keepsRemovalMark(permanentFlags: readonly string[] | null): boolean {
-  if (permanentFlags === null) return true;
-  return permanentFlags.some((flag) => flag.toLowerCase() === "\\deleted");
-}
-
 /** One message's result, spelled once. */
 function resultOf(
   uid: number,
@@ -398,7 +562,7 @@ async function moveMessageWithin(
   if (!hasMoveCommands(session.capability)) {
     return resultOf(ref.uid, "not_copied", "commands-unavailable");
   }
-  if (!keepsRemovalMark(session.permanentFlags)) {
+  if (!keepsFlag(session.permanentFlags, "\\Deleted")) {
     return resultOf(ref.uid, "not_copied", "removal-not-kept");
   }
   if (Date.now() >= deadlineAt) {
@@ -545,7 +709,7 @@ async function moveListWithin(
   if (!hasMoveCommands(session.capability)) {
     return { applied: false, refusal: "commands-unavailable" };
   }
-  if (!keepsRemovalMark(session.permanentFlags)) {
+  if (!keepsFlag(session.permanentFlags, "\\Deleted")) {
     return { applied: false, refusal: "removal-not-kept" };
   }
 

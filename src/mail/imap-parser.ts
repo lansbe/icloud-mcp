@@ -398,6 +398,79 @@ export function seenStateOf(
   return seen;
 }
 
+/** The three system flags a verb can need an open to keep (D-08). */
+export type KeptFlag = "\\Seen" | "\\Flagged" | "\\Deleted";
+
+/**
+ * Whether an open's permanent-flags list says a change to `flag` is kept past
+ * logout.
+ *
+ * `null` means the open sent no list, and RFC 3501 §6.3.1 says every flag is
+ * kept then, so it is `true`. Otherwise the list must name the flag, compared
+ * without regard to case. `\*` does not count: it says new keywords can be
+ * created, and these three are system flags, not keywords.
+ *
+ * Each verb asks about the one flag it changes, inside the verb (D-08). The
+ * orchestrator only records the list, and takes no mode argument.
+ *
+ * Pure.
+ */
+export function keepsFlag(permanent: readonly string[] | null, flag: KeptFlag): boolean {
+  if (permanent === null) return true;
+  const wanted = flag.toLowerCase();
+  return permanent.some((kept) => kept.toLowerCase() === wanted);
+}
+
+/**
+ * Whether the FETCH reply for one UID carries `flag`, or `null`.
+ *
+ * The same rules as `seenStateOf`, for any one of the flags a verb changes:
+ * keyed on the reply's OWN UID item and never on position or the sequence
+ * number; the last reply for the UID that carries a flag list wins; the flag is
+ * compared without regard to case. `null` means no reply for this UID carried a
+ * flag list.
+ *
+ * Pure.
+ */
+export function flagStateOf(
+  untagged: readonly ResponseLine[],
+  uid: number,
+  flag: "\\Seen" | "\\Flagged",
+): boolean | null {
+  const wanted = flag.toLowerCase();
+  let state: boolean | null = null;
+  for (const line of untagged) {
+    const parsed = parseSExpr(line);
+    if (parsed[0] !== "*") continue;
+    if (typeof parsed[2] !== "string" || parsed[2].toUpperCase() !== "FETCH") {
+      continue;
+    }
+    const list = parsed[3];
+    if (!Array.isArray(list)) continue;
+
+    let replyUid: string | null = null;
+    let flags: SExpr | undefined;
+    for (let index = 0; index + 1 < list.length; index += 2) {
+      const key = list[index];
+      if (typeof key !== "string") continue;
+      const upper = key.toUpperCase();
+      const value = list[index + 1];
+      if (upper === "UID" && typeof value === "string") replyUid = value;
+      if (upper === "FLAGS") flags = value;
+    }
+
+    if (replyUid === null || !/^[1-9]\d*$/.test(replyUid)) continue;
+    if (Number(replyUid) !== uid) continue;
+    if (!Array.isArray(flags)) continue;
+
+    // Keep going: a later reply for the same UID replaces this one.
+    state = flags.some(
+      (one) => typeof one === "string" && one.toLowerCase() === wanted,
+    );
+  }
+  return state;
+}
+
 /**
  * Decoder for mailbox names that arrived as literals.
  *

@@ -1121,6 +1121,49 @@ describe("the registrations themselves", () => {
     expect(schema.safeParse({ read: true }).success).toBe(false);
   });
 
+  it("takes exactly a message id and a flagged boolean on the flag tool (D-01, D-05)", () => {
+    // One message per call. The flag is named in the verb's code, so the
+    // caller chooses only on or off and never names a flag.
+    const tool = registered().find((one) => one.name === "mail_flag");
+    const schema = tool!.options.inputSchema as z.ZodObject<z.ZodRawShape>;
+    const description = String(tool!.options.description);
+
+    expect(Object.keys(schema.shape).sort()).toEqual(["flagged", "id"]);
+    expect(schema.safeParse({ id: "x", flagged: true }).success).toBe(true);
+    expect(schema.safeParse({ id: "x", flagged: false }).success).toBe(true);
+    expect(schema.safeParse({ id: "x" }).success).toBe(false);
+    expect(schema.safeParse({ id: "x", flagged: "true" }).success).toBe(false);
+    expect(schema.safeParse({ flagged: true }).success).toBe(false);
+    expect(description).toContain("undo with the opposite flagged.");
+    expect(description).toContain("no preview");
+    expect(description).toContain(UNTRUSTED_NOTICE);
+    expect(description.length).toBeLessThan(280);
+  });
+
+  it("lets no tool take a flag list or name the removal mark (D-05)", () => {
+    // Over the live list, so a tool added later is covered without anybody
+    // remembering to extend this. The removal mark is set only inside a
+    // previewed move, by name in the verb's code, and no caller can reach it.
+    const tools = registered();
+    expect(tools.length).toBeGreaterThan(0);
+
+    for (const tool of tools) {
+      expect(String(tool.options.description), tool.name).not.toMatch(/\\deleted/i);
+      // A tool that takes no input registers no schema, and has no key to check.
+      if (tool.options.inputSchema === undefined) continue;
+      const json = z.toJSONSchema(tool.options.inputSchema as z.ZodType, {
+        io: "input",
+      }) as { properties?: Record<string, unknown> };
+      for (const key of Object.keys(json.properties ?? {})) {
+        expect(["flags", "flag", "keywords"], `${tool.name}: ${key}`).not.toContain(
+          key.toLowerCase(),
+        );
+      }
+      // JSON escapes the backslash, so the mark appears doubled in the text.
+      expect(JSON.stringify(json), tool.name).not.toMatch(/\\\\deleted/i);
+    }
+  });
+
   it("takes exactly message ids and a destination on the move preview (TRIA-09)", () => {
     // Ids only, as the user supplies them. No search term, no body, no folder
     // name and no query: nothing this server read can be the source of the set.
@@ -1757,6 +1800,9 @@ describe("the search and unread registrations", () => {
       // licensed one tool carrying three ingresses, not two verbs behind one
       // name.
       "mail_confirm_upload",
+      // The sixteenth: flag or unflag one message, written at once with no
+      // preview, the same shape as mail_mark_read (D-01).
+      "mail_flag",
       // The eighth, and the one whose PLACEMENT is the assertion: research
       // names a sibling file as the most likely way to break the verified
       // one-fence-call-site property, because a tool that shapes its own
@@ -1931,7 +1977,7 @@ describe("the search and unread registrations", () => {
     // the model arrives unwarned — and a per-tool assertion is a list somebody
     // has to remember to extend.
     const tools = registered();
-    expect(tools).toHaveLength(15);
+    expect(tools).toHaveLength(16);
 
     for (const tool of tools) {
       expect(
@@ -2340,14 +2386,14 @@ describe("the compose registration", () => {
     }
   });
 
-  it("registers exactly FIFTEEN tools: the tenth is the whole of plan 04-10, the eleventh is mail_mark_read, the twelfth and thirteenth are mail_move and mail_commit, the fourteenth and fifteenth are mail_archive and mail_trash", () => {
+  it("registers exactly SIXTEEN tools: the tenth is the whole of plan 04-10, the eleventh is mail_mark_read, the twelfth and thirteenth are mail_move and mail_commit, the fourteenth and fifteenth are mail_archive and mail_trash, the sixteenth is mail_flag", () => {
     // Nine through plan 04-09, plus mail_confirm_upload. The presigned INGRESS
     // added no registration at all — it is a third value on an existing
     // discriminator, which is precisely what D-80 bought and precisely what it
     // paid for with a union on the output. Phase 20 added the eleventh, the
     // first tool that changes a mailbox. Phase 21 added the move preview and
-    // the mail commit, then the archive and Trash previews.
-    expect(registered()).toHaveLength(15);
+    // the mail commit, then the archive and Trash previews, then mail_flag.
+    expect(registered()).toHaveLength(16);
   });
 });
 
@@ -3558,8 +3604,8 @@ describe("a principal that was refused opens nothing", () => {
     return { gate, acquire, callbacks };
   }
 
-  it("registers all fifteen tools, so the table below leaves none out", () => {
-    expect(refusedTools().callbacks.size).toBe(15);
+  it("registers all sixteen tools, so the table below leaves none out", () => {
+    expect(refusedTools().callbacks.size).toBe(16);
   });
 
   it("mail_list_folders answers auth_failed with the fixed message and never acquires the gate", async () => {

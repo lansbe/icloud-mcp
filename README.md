@@ -87,7 +87,7 @@ enforcement, and the module map — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ## Tools
 
-37 tools in five groups. Every tool description carries an untrusted-content
+38 tools in five groups. Every tool description carries an untrusted-content
 notice; event titles, message bodies, and contact fields are treated as data,
 never as instructions.
 
@@ -109,6 +109,7 @@ never as instructions.
 | `mail_search` | Search one folder by keyword, sender, and date range. |
 | `mail_get_message` | Read one message in full by opaque id. |
 | `mail_mark_read` | Mark one message read or unread. **Writes immediately** — no preview, because the same tool puts it back. Reports the state iCloud returned. |
+| `mail_flag` | Flag or unflag one message. **Writes immediately** — no preview, because the same tool puts it back. Reports the flag state iCloud returned. |
 | `mail_get_attachment` | Read one attachment as text (PDF text is extracted). |
 | `mail_compose_new` | Compose a new message **into Drafts** (never sent). |
 | `mail_compose_reply` | Reply to a message **into Drafts**, threaded (never sent). |
