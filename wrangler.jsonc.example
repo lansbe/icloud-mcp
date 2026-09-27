@@ -353,6 +353,41 @@
     }
   ],
 
+  // RECALL INDEX: 1024 cosine
+  //
+  // Semantic recall over the signed-in person's recent mail (Phase 25). Two
+  // bindings: the vector index, bound as RECALL_INDEX, and Workers AI, bound as
+  // AI, which turns text into the vectors the index holds.
+  //
+  // THE INDEX IS ACCOUNT STATE AND IS NOT IN GIT. Wrangler does not create a
+  // Vectorize index on deploy, so the owner creates it by hand, once, before
+  // the first deploy that carries this block. Until it exists, a deploy from
+  // here fails. The config only points at the name.
+  //
+  // Its dimension and its metric are fixed when it is created: 1024, the
+  // length SPIKE-10 measured for the embedding model, and cosine. Neither can
+  // be changed later. Changing either means a new index and embedding every
+  // message again.
+  //
+  // A string metadata index on `u` must exist BEFORE the first vector is
+  // written. Vectors written earlier are never indexed for the filter, so the
+  // per-person filter would hide them.
+  //
+  // The name carries the project prefix for the same reason every namespace
+  // and the bucket above do: a bare name is the sort of name a sibling Worker
+  // on this account also reaches for.
+  //
+  // NEITHER BINDING CARRIES A REMOTE FLAG, on purpose. A remote flag routes
+  // local dev and the vitest pool to the real index on the account. The pool's
+  // own setting in vitest.config.ts keeps it off the account for the AI binding
+  // too.
+  //
+  // Shapes: `vectorize` is an array, `ai` is an object.
+  "vectorize": [
+    { "binding": "RECALL_INDEX", "index_name": "icloud-mcp-recall" }
+  ],
+  "ai": { "binding": "AI" },
+
   // STORAGE BACKEND: sqlite
   //
   // One Durable Object per signed-in person, holding that person's mail

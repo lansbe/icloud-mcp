@@ -50,6 +50,26 @@ export default defineConfig({
             // The pool reads the real Worker config, so tests see the same
             // compatibility flags, bindings, and entry point that deploys do.
             wrangler: { configPath: "wrangler.jsonc" },
+            // Keep the suite off the Cloudflare account (Phase 25, D-16).
+            //
+            // The pool defaults this to true. Wrangler marks the AI binding as
+            // never having a local simulator, so with the default, declaring
+            // that binding makes the pool open a remote session against the
+            // account at suite start. That needs the owner's login and the
+            // network, and every test call through the vector index or the AI
+            // binding would reach real resources and cost real money. The
+            // pre-commit hook would depend on the owner being signed in.
+            //
+            // With it off, both bindings still exist in tests, and every call
+            // through them fails. test/recall-store.test.ts pins that, so a
+            // change here that routes tests to the account turns a test red.
+            // Tests reach recall through fakes passed to the store and embedder
+            // factories instead.
+            //
+            // The pool prints a warning about the Vectorize binding having no
+            // local simulator. That warning is expected. Do not "fix" it by
+            // putting a remote flag on the binding.
+            remoteBindings: false,
             miniflare: {
               // Fake secrets for tests. Real Secrets live only in Cloudflare and
               // are never present locally, and D-09 forbids any automated login
