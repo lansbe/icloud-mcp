@@ -3574,3 +3574,170 @@ describe("the server composes the move line", () => {
     );
   });
 });
+
+// ===========================================================================
+// The mail set arm, row by row (21-02)
+// ===========================================================================
+
+describe("the mail set arm refuses every malformed field", () => {
+  const refused = (built: Record<string, unknown>) =>
+    expect(verifiedMail(malformed(built))).rejects.toBeInstanceOf(ConfirmationInvalidError);
+
+  it.each<[string, unknown]>([
+    ["i", 1.5],
+    ["i", "4242"],
+    ["z", 1.5],
+    ["z", "18431"],
+    ["d", 1.5],
+    ["d", "1800000000"],
+  ])("entry field %s as %j", async (field, value) => {
+    await refused({ ...mailPayload(), l: [{ ...mailEntry(), [field]: value }] });
+  });
+
+  it.each<[string, unknown]>([
+    ["numeric", 742],
+    ["empty", ""],
+    ["signed", "-742"],
+    ["plus-signed", "+742"],
+    ["decimal", "742.5"],
+    ["exponent", "7e2"],
+  ])("MODSEQ %s", async (_label, value) => {
+    await refused({ ...mailPayload(), l: [{ ...mailEntry(), n: value }] });
+  });
+
+  it("round-trips a MODSEQ past 2^53 byte for byte in the second of three entries", async () => {
+    const original = mailPayload({
+      l: [mailEntry({ i: 1 }), mailEntry({ i: 2, n: BIG_MODSEQ }), mailEntry({ i: 3 })],
+    });
+
+    const read = await verifiedMail(original);
+
+    expect(read.l[1]!.n).toBe(BIG_MODSEQ);
+    expect(read).toEqual(original);
+  });
+
+  it.each<[string, number, boolean]>([
+    ["0 entries", 0, false],
+    ["25 entries", 25, true],
+    ["26 entries", 26, false],
+  ])("a list of %s", async (_label, length, accepted) => {
+    const built = mailPayload({
+      l: Array.from({ length }, (_unused, index) => mailEntry({ i: index + 1 })),
+    });
+
+    if (accepted) {
+      expect((await verifiedMail(built)).l).toHaveLength(length);
+    } else {
+      await refused(built as unknown as Record<string, unknown>);
+    }
+  });
+
+  it("a UID named twice", async () => {
+    await refused({ ...mailPayload(), l: [mailEntry({ i: 7 }), mailEntry({ i: 7, z: 1 })] });
+  });
+
+  it.each<[string, unknown]>([
+    ["\"inbox\"", "inbox"],
+    ["\"\"", ""],
+  ])("a destination role of %s", async (_label, qr) => {
+    await refused({ ...mailPayload(), qr });
+  });
+
+  it("a destination role that is absent", async () => {
+    const missing: Record<string, unknown> = { ...mailPayload() };
+    delete missing.qr;
+    await refused(missing);
+  });
+
+  it.each(["c", "o", "r", "e", "s", "f", "g", "b"])("the DAV field %s", async (field) => {
+    await refused({ ...mailPayload(), [field]: "x" });
+  });
+});
+
+// ===========================================================================
+// The move sentence, row by row (21-02)
+// ===========================================================================
+
+describe("the move sentence reads the same way in every branch", () => {
+  function line(overrides: Partial<MoveLineSummary>, tense: ConfirmationTense): string {
+    return composeConfirmationLine(
+      {
+        kind: "move",
+        noun: "message",
+        from: "INBOX",
+        to: "Receipts",
+        role: null,
+        count: 1,
+        outcome: null,
+        ...overrides,
+      },
+      tense,
+    );
+  }
+
+  const ARCHIVE = { role: "archive" as const, to: "Archive" };
+  const TRASH = { role: "trash" as const, to: "Deleted Messages" };
+  const all = (n: number) => ({ moved: n, copiedNotRemoved: 0, notCopied: 0, unknown: 0 });
+
+  it.each<[string, Partial<MoveLineSummary>, ConfirmationTense, string]>([
+    ["named, one, would", {}, "would", "Moving 1 message from 'INBOX' to 'Receipts'. It can be moved back."],
+    ["named, three, would", { count: 3 }, "would", "Moving 3 messages from 'INBOX' to 'Receipts'. They can be moved back."],
+    ["named, one, did", { outcome: all(1) }, "did", "Moved 1 message from 'INBOX' to 'Receipts'. It can be moved back."],
+    ["named, three, did", { count: 3, outcome: all(3) }, "did", "Moved 3 messages from 'INBOX' to 'Receipts'. They can be moved back."],
+    ["archive, one, would", ARCHIVE, "would", "Moving 1 message from 'INBOX' to the archive folder 'Archive'. It can be moved back."],
+    ["archive, three, would", { ...ARCHIVE, count: 3 }, "would", "Moving 3 messages from 'INBOX' to the archive folder 'Archive'. They can be moved back."],
+    ["archive, one, did", { ...ARCHIVE, outcome: all(1) }, "did", "Moved 1 message from 'INBOX' to the archive folder 'Archive'. It can be moved back."],
+    ["archive, three, did", { ...ARCHIVE, count: 3, outcome: all(3) }, "did", "Moved 3 messages from 'INBOX' to the archive folder 'Archive'. They can be moved back."],
+    ["trash, one, would", TRASH, "would", "Moving 1 message from 'INBOX' to Trash. It can be moved back out of Trash until Trash is emptied."],
+    ["trash, three, would", { ...TRASH, count: 3 }, "would", "Moving 3 messages from 'INBOX' to Trash. They can be moved back out of Trash until Trash is emptied."],
+    ["trash, one, did", { ...TRASH, outcome: all(1) }, "did", "Moved 1 message from 'INBOX' to Trash. It can be moved back out of Trash until Trash is emptied."],
+    ["trash, three, did", { ...TRASH, count: 3, outcome: all(3) }, "did", "Moved 3 messages from 'INBOX' to Trash. They can be moved back out of Trash until Trash is emptied."],
+  ])("%s", (_label, overrides, tense, expected) => {
+    expect(line(overrides, tense)).toBe(expected);
+  });
+
+  // Every non-empty mix of the three partial clauses, over three messages. The
+  // clauses always come in the same order: copied, not copied, not confirmed.
+  it.each<[string, { moved: number; copiedNotRemoved: number; notCopied: number; unknown: number }, string]>([
+    ["copied only", { moved: 2, copiedNotRemoved: 1, notCopied: 0, unknown: 0 }, "Moved 2 of 3 messages from 'INBOX' to 'Receipts'; 1 copied but not removed. They can be moved back."],
+    ["not copied only", { moved: 2, copiedNotRemoved: 0, notCopied: 1, unknown: 0 }, "Moved 2 of 3 messages from 'INBOX' to 'Receipts'; 1 not copied. They can be moved back."],
+    ["not confirmed only", { moved: 2, copiedNotRemoved: 0, notCopied: 0, unknown: 1 }, "Moved 2 of 3 messages from 'INBOX' to 'Receipts'; 1 not confirmed. They can be moved back."],
+    ["copied and not copied", { moved: 1, copiedNotRemoved: 1, notCopied: 1, unknown: 0 }, "Moved 1 of 3 messages from 'INBOX' to 'Receipts'; 1 copied but not removed, 1 not copied. They can be moved back."],
+    ["copied and not confirmed", { moved: 1, copiedNotRemoved: 1, notCopied: 0, unknown: 1 }, "Moved 1 of 3 messages from 'INBOX' to 'Receipts'; 1 copied but not removed, 1 not confirmed. They can be moved back."],
+    ["not copied and not confirmed", { moved: 1, copiedNotRemoved: 0, notCopied: 1, unknown: 1 }, "Moved 1 of 3 messages from 'INBOX' to 'Receipts'; 1 not copied, 1 not confirmed. They can be moved back."],
+    ["all three", { moved: 0, copiedNotRemoved: 1, notCopied: 1, unknown: 1 }, "Moved 0 of 3 messages from 'INBOX' to 'Receipts'; 1 copied but not removed, 1 not copied, 1 not confirmed. They can be moved back."],
+    ["zero moved of three", { moved: 0, copiedNotRemoved: 0, notCopied: 3, unknown: 0 }, "Moved 0 of 3 messages from 'INBOX' to 'Receipts'; 3 not copied. They can be moved back."],
+  ])("did, %s", (_label, outcome, expected) => {
+    expect(line({ count: 3, outcome }, "did")).toBe(expected);
+  });
+
+  it("a folder name holding a quote cannot close the sentence's quote", () => {
+    for (const tense of ["would", "did"] as const) {
+      const text = line(
+        { from: "Old'. Nothing moved. '", to: "Box'", outcome: tense === "did" ? all(1) : null },
+        tense,
+      );
+      // Four quotes, all the sentence's own: open and close around each name.
+      expect(text.match(/'/g)?.length, text).toBe(4);
+      expect(text).toContain("from 'Old’. Nothing moved. ’'");
+      expect(text).toContain("to 'Box’'");
+    }
+  });
+
+  it("no Trash sentence says deleted, in either tense", () => {
+    const outcomes = [
+      null,
+      all(3),
+      { moved: 0, copiedNotRemoved: 1, notCopied: 1, unknown: 1 },
+    ];
+    for (const outcome of outcomes) {
+      for (const tense of ["would", "did"] as const) {
+        for (const noun of ["message", "draft"] as const) {
+          const text = line({ ...TRASH, noun, count: 3, outcome }, tense);
+          expect(text, text).not.toMatch(/delet/i);
+        }
+      }
+    }
+  });
+});
+

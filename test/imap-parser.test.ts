@@ -28,7 +28,10 @@ import {
   parseAccessCode,
   parseCapabilityLine,
   parseCompletionCode,
+  parseCopyUid,
+  parseFingerprint,
   parseListLine,
+  parseModifiedUids,
   parsePermanentFlags,
   parseSearchLine,
   parseStatusLine,
@@ -1171,3 +1174,140 @@ describe("seenStateOf", () => {
     expect(seenStateOf(untagged, 11)).toBe(false);
   });
 });
+
+// ===========================================================================
+// The move path's parsers (Phase 21)
+// ===========================================================================
+
+/**
+ * The destination's validity in every COPYUID row below.
+ *
+ * Different from every source validity in this file, and from the source UID,
+ * so a parser that read the fields in the wrong order cannot pass (RFC 4315 §3
+ * puts the DESTINATION's validity first; PITFALLS #35).
+ */
+const COPY_DESTINATION_VALIDITY = 1_700_000_001;
+
+describe("parseCopyUid", () => {
+  it("reads the destination's validity first, then the source set, then the destination set", () => {
+    expect(parseCopyUid(`a6 OK [COPYUID ${COPY_DESTINATION_VALIDITY} 4242 91] Done`)).toEqual({
+      uidValidity: COPY_DESTINATION_VALIDITY,
+      source: [4242],
+      destination: [91],
+    });
+  });
+
+  it.each<[string, string, { uidValidity: number; source: number[]; destination: number[] }]>([
+    ["a range written high to low equals low to high", "4:2 91:93", { uidValidity: COPY_DESTINATION_VALIDITY, source: [2, 3, 4], destination: [91, 92, 93] }],
+    ["a range written low to high", "2:4 91:93", { uidValidity: COPY_DESTINATION_VALIDITY, source: [2, 3, 4], destination: [91, 92, 93] }],
+    ["a list with a range expands in order", "1,3:4 91,92,93", { uidValidity: COPY_DESTINATION_VALIDITY, source: [1, 3, 4], destination: [91, 92, 93] }],
+    ["exactly 100 UIDs", "1:100 201:300", { uidValidity: COPY_DESTINATION_VALIDITY, source: Array.from({ length: 100 }, (_u, i) => i + 1), destination: Array.from({ length: 100 }, (_u, i) => i + 201) }],
+  ])("%s", (_label, sets, expected) => {
+    expect(parseCopyUid(`a6 OK [COPYUID ${COPY_DESTINATION_VALIDITY} ${sets}] Done`)).toEqual(expected);
+  });
+
+  it.each<[string, string]>([
+    ["unequal set lengths", `a6 OK [COPYUID ${COPY_DESTINATION_VALIDITY} 4242,4243 91] Done`],
+    ["more than 100 UIDs", `a6 OK [COPYUID ${COPY_DESTINATION_VALIDITY} 1:101 201:301] Done`],
+    ["a zero source UID", `a6 OK [COPYUID ${COPY_DESTINATION_VALIDITY} 0 91] Done`],
+    ["a zero destination UID", `a6 OK [COPYUID ${COPY_DESTINATION_VALIDITY} 4242 0] Done`],
+    ["a zero validity", "a6 OK [COPYUID 0 4242 91] Done"],
+    ["a NO line", `a6 NO [COPYUID ${COPY_DESTINATION_VALIDITY} 4242 91] Done`],
+    ["an untagged line", `* OK [COPYUID ${COPY_DESTINATION_VALIDITY} 4242 91] Done`],
+    ["another code", `a6 OK [APPENDUID ${COPY_DESTINATION_VALIDITY} 91] Done`],
+    ["the code later in the text", `a6 OK Done [COPYUID ${COPY_DESTINATION_VALIDITY} 4242 91]`],
+  ])("%s is null", (_label, text) => {
+    expect(parseCopyUid(text)).toBeNull();
+  });
+});
+
+describe("parseModifiedUids", () => {
+  it.each<[string, string, number[] | null]>([
+    ["on OK", "a7 OK [MODIFIED 4242] Conditional STORE failed", [4242]],
+    ["on NO", "a7 NO [MODIFIED 4242] Conditional STORE failed", [4242]],
+    ["a range and a list", "a7 OK [MODIFIED 7,9:11] Conditional STORE failed", [7, 9, 10, 11]],
+    ["absent", "a7 OK STORE completed", null],
+    ["absent on NO", "a7 NO STORE failed", null],
+  ])("%s", (_label, text, expected) => {
+    expect(parseModifiedUids(text)).toEqual(expected);
+  });
+});
+
+describe("parseFingerprint", () => {
+  const DATE = '"13-Aug-2026 09:14:02 -0700"';
+  const SECONDS = Date.UTC(2026, 7, 13, 16, 14, 2) / 1000;
+
+  function reply(seq: number, uid: number, size: string, date: string, modSeq: string | null): string {
+    const modSeqItem = modSeq === null ? "" : ` MODSEQ (${modSeq})`;
+    return `* ${seq} FETCH (UID ${uid} FLAGS (\\Seen) RFC822.SIZE ${size} INTERNALDATE ${date}${modSeqItem})`;
+  }
+
+  it("finds the reply whose own UID matches, among several", async () => {
+    const untagged = await untaggedFrom(
+      reply(1, 4241, "10", DATE, "1"),
+      reply(2, 4242, "18431", DATE, "742"),
+      reply(3, 4243, "30", DATE, "3"),
+    );
+
+    expect(parseFingerprint(untagged, 4242)).toEqual({
+      uid: 4242,
+      flags: ["\\Seen"],
+      size: 18_431,
+      internalDate: SECONDS,
+      modSeq: "742",
+    });
+  });
+
+  it("takes the last of two replies for one UID", async () => {
+    const untagged = await untaggedFrom(
+      reply(2, 4242, "18431", DATE, "742"),
+      reply(2, 4242, "18431", DATE, "743"),
+    );
+
+    expect(parseFingerprint(untagged, 4242)?.modSeq).toBe("743");
+  });
+
+  it("ignores the sequence number", async () => {
+    // Sequence number 4242 names a different message; only the UID item counts.
+    const untagged = await untaggedFrom(reply(4242, 7, "10", DATE, "1"));
+
+    expect(parseFingerprint(untagged, 4242)).toBeNull();
+    expect(parseFingerprint(untagged, 7)?.uid).toBe(7);
+  });
+
+  it.each<[string, string | null]>([
+    ["no MODSEQ", null],
+    ["a MODSEQ of 0", "0"],
+    ["a MODSEQ with a leading zero", "07"],
+    ["a 20-digit MODSEQ", "12345678901234567890"],
+  ])("%s is null", async (_label, modSeq) => {
+    const untagged = await untaggedFrom(reply(1, 4242, "18431", DATE, modSeq));
+
+    expect(parseFingerprint(untagged, 4242)).toBeNull();
+  });
+
+  it("keeps a 19-digit MODSEQ exactly, as digits", async () => {
+    const untagged = await untaggedFrom(reply(1, 4242, "18431", DATE, "9223372036854775807"));
+
+    expect(parseFingerprint(untagged, 4242)?.modSeq).toBe("9223372036854775807");
+  });
+
+  it("reads a day padded with a space", async () => {
+    const untagged = await untaggedFrom(reply(1, 4242, "18431", '" 3-Aug-2026 09:14:02 -0700"', "742"));
+
+    expect(parseFingerprint(untagged, 4242)?.internalDate).toBe(
+      Date.UTC(2026, 7, 3, 16, 14, 2) / 1000,
+    );
+  });
+
+  it.each<[string, string, string]>([
+    ["a day that does not exist", "18431", '"31-Feb-2026 09:14:02 -0700"'],
+    ["an unknown month", "18431", '"13-Foo-2026 09:14:02 -0700"'],
+    ["a size above the wire bound", "4294967296", DATE],
+  ])("%s is null", async (_label, size, date) => {
+    const untagged = await untaggedFrom(reply(1, 4242, size, date, "742"));
+
+    expect(parseFingerprint(untagged, 4242)).toBeNull();
+  });
+});
+
