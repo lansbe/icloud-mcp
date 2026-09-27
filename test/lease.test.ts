@@ -12,9 +12,9 @@
 // in, which is why this is its own file.
 
 import type { McpServer } from "@modelcontextprotocol/server";
-import { runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/mail/socket", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../src/mail/socket")>()),
@@ -22,8 +22,11 @@ vi.mock("../src/mail/socket", async (importOriginal) => ({
 }));
 
 import { createLeasedMail } from "../src/agent/lease";
-import { SAFE_MESSAGES } from "../src/errors";
-import { createSessionGate } from "../src/mail/service";
+import { LEASE_TTL_MS } from "../src/agent/user-agent";
+import type { UserAgent } from "../src/agent/user-agent";
+import { ConnectionBusyError, ImapConnectError, SAFE_MESSAGES } from "../src/errors";
+import { CLOSE_TIMEOUT_MS, DRAIN_TIMEOUT_MS } from "../src/mail/imap-session";
+import { CALL_DEADLINE_MS, createSessionGate } from "../src/mail/service";
 import { connectImap } from "../src/mail/socket";
 import { registerMailTools } from "../src/mcp/tools/mail";
 import type { Principal } from "../src/principal";
@@ -176,5 +179,163 @@ describe("mail_list_folders takes the per-person lease (tracer)", () => {
     expect(typeof during?.token).toBe("string");
     expect(during!.token.length).toBeGreaterThan(0);
     expect(await readLease(principal.userId)).toBeUndefined();
+  });
+});
+
+/**
+ * Make one RPC method of the object class throw, for the next call.
+ *
+ * The spy sits on the PROTOTYPE of the live instance, read through
+ * `runInDurableObject`. A spy on the instance itself does not work in this pool
+ * version: it puts a function on the instance as an own property, and the RPC
+ * layer then refuses the call with "The RPC receiver does not implement the
+ * method", which is not the failure being tested and left the object unable to
+ * evict. `vi.restoreAllMocks()` in the `afterEach` below takes the spy off.
+ */
+function breakMethod(userId: string, method: "acquire" | "release"): Promise<void> {
+  return runInDurableObject(objectFor(userId), (instance: UserAgent) => {
+    const prototype = Object.getPrototypeOf(instance) as UserAgent;
+    vi.spyOn(prototype, method).mockImplementation(() => {
+      throw new Error("the object could not answer");
+    });
+  });
+}
+
+describe("the lease (DOBJ-02, DOBJ-03)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("lasts the call deadline plus drain plus close plus a 5 000 ms margin, which is 30 000", () => {
+    expect(LEASE_TTL_MS).toBe(CALL_DEADLINE_MS + DRAIN_TIMEOUT_MS + CLOSE_TIMEOUT_MS + 5000);
+    expect(LEASE_TTL_MS).toBe(30000);
+  });
+
+  it("stores an absolute expiry LEASE_TTL_MS after the grant", async () => {
+    const before = Date.now();
+    const answer = await objectFor(OWNER_ID).acquire();
+    expect(answer.held).toBe(true);
+
+    const stored = await readLease(OWNER_ID);
+    expect(stored).toBeDefined();
+    expect(stored!.token).toBe((answer as { token: string }).token);
+    const lifetime = stored!.expiresAt - before;
+    expect(lifetime).toBeGreaterThanOrEqual(LEASE_TTL_MS - 2000);
+    expect(lifetime).toBeLessThanOrEqual(LEASE_TTL_MS + 2000);
+  });
+
+  it("refuses a second acquire while held, and leaves the record identical", async () => {
+    const first = await objectFor(OWNER_ID).acquire();
+    expect(first.held).toBe(true);
+    const stored = await readLease(OWNER_ID);
+
+    const second = await objectFor(OWNER_ID).acquire();
+
+    expect(second).toEqual({ held: false });
+    expect(await readLease(OWNER_ID)).toEqual(stored);
+  });
+
+  it("replaces an expired record with a new grant and a new token", async () => {
+    const expired: StoredLease = { token: "expired-holder", expiresAt: Date.now() - 1 };
+    await seedLease(OWNER_ID, expired);
+
+    const answer = await objectFor(OWNER_ID).acquire();
+
+    expect(answer.held).toBe(true);
+    const token = (answer as { token: string }).token;
+    expect(token).not.toBe(expired.token);
+    expect((await readLease(OWNER_ID))!.token).toBe(token);
+  });
+
+  it("ignores a release with the expired holder's old token once the lease was re-granted", async () => {
+    await seedLease(OWNER_ID, { token: "expired-holder", expiresAt: Date.now() - 1 });
+    const answer = await objectFor(OWNER_ID).acquire();
+    const current = await readLease(OWNER_ID);
+
+    await objectFor(OWNER_ID).release("expired-holder");
+
+    expect(answer.held).toBe(true);
+    expect(await readLease(OWNER_ID)).toEqual(current);
+  });
+
+  it("changes nothing, and does not throw, on a release with anything but the holder's token", async () => {
+    await objectFor(OWNER_ID).acquire();
+    const current = await readLease(OWNER_ID);
+
+    const wrong: unknown[] = ["not-the-token", 42, undefined, null, { token: current!.token }];
+    for (const value of wrong) {
+      await expect(objectFor(OWNER_ID).release(value)).resolves.toBeUndefined();
+      expect(await readLease(OWNER_ID)).toEqual(current);
+    }
+  });
+
+  it("deletes the record on the holder's own token, and the next acquire grants", async () => {
+    const answer = await objectFor(OWNER_ID).acquire();
+    const token = (answer as { token: string }).token;
+
+    await objectFor(OWNER_ID).release(token);
+
+    expect(await readLease(OWNER_ID)).toBeUndefined();
+    const next = await objectFor(OWNER_ID).acquire();
+    expect(next.held).toBe(true);
+  });
+
+  it("survives eviction: a held lease is still held after the object is evicted", async () => {
+    const answer = await objectFor(OWNER_ID).acquire();
+    expect(answer.held).toBe(true);
+
+    await evictDurableObject(objectFor(OWNER_ID));
+
+    expect(await objectFor(OWNER_ID).acquire()).toEqual({ held: false });
+  });
+
+  it("refuses with the floor category, and never runs the work, when the object cannot answer", async () => {
+    const principal = await ownerPrincipal();
+    await breakMethod(principal.userId, "acquire");
+    const fn = vi.fn(async () => "ran");
+
+    const call = createLeasedMail(createSessionGate()).withConnectionLease(principal, fn);
+
+    await expect(call).rejects.toBeInstanceOf(ImapConnectError);
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it("still answers with the work's value when the release fails", async () => {
+    const principal = await ownerPrincipal();
+    await breakMethod(principal.userId, "release");
+
+    const value = await createLeasedMail(createSessionGate()).withConnectionLease(
+      principal,
+      async () => "the work's value",
+    );
+
+    expect(value).toBe("the work's value");
+    // The record is still there, which proves the release really failed rather
+    // than the spy missing it. The expiry is what frees it now.
+    const left = await readLease(principal.userId);
+    expect(typeof left?.token).toBe("string");
+  });
+
+  it("frees the lease when the work fails, and passes the same error on", async () => {
+    const principal = await ownerPrincipal();
+    const failure = new Error("the work failed");
+
+    const call = createLeasedMail(createSessionGate()).withConnectionLease(principal, async () => {
+      throw failure;
+    });
+
+    await expect(call).rejects.toBe(failure);
+    expect(await readLease(principal.userId)).toBeUndefined();
+  });
+
+  it("never runs the work when the lease is held", async () => {
+    const principal = await ownerPrincipal();
+    await seedLease(principal.userId, { token: "held", expiresAt: Date.now() + 60000 });
+    const fn = vi.fn(async () => "ran");
+
+    const call = createLeasedMail(createSessionGate()).withConnectionLease(principal, fn);
+
+    await expect(call).rejects.toBeInstanceOf(ConnectionBusyError);
+    expect(fn).not.toHaveBeenCalled();
   });
 });
