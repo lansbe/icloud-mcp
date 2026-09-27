@@ -38,7 +38,7 @@ import {
   ImapThrottleError,
 } from "../../errors";
 import type { StatusSnapshot } from "../../mail/imap-parser";
-import type { SessionGate } from "../../mail/service";
+import type { NewMailRow, SessionGate } from "../../mail/service";
 import {
   DEFAULT_MAILBOX,
   folderSnapshots,
@@ -97,6 +97,8 @@ export interface MailFolderAnswer {
   mechanism: MailMechanism | null;
   /** Only for `not_checked`. */
   reason?: NotCheckedReason;
+  /** New-mail rows, newest first. Stranger-authored: fenced, never trusted. */
+  rows: NewMailRow[];
 }
 
 /** Everything `changesResult` needs. */
@@ -187,6 +189,7 @@ function notChecked(folder: string, reason: NotCheckedReason): MailFolderAnswer 
     otherActivity: null,
     mechanism: null,
     reason,
+    rows: [],
   };
 }
 
@@ -253,6 +256,7 @@ async function checkMailFolder(
         newMessages: step.state === "no_changes" ? 0 : null,
         otherActivity: step.otherActivity,
         mechanism: step.mechanism,
+        rows: [],
       },
       state: fresh,
     };
@@ -260,7 +264,7 @@ async function checkMailFolder(
 
   // `search` is only returned with an old state in hand.
   const from = prior!.uidNext;
-  let found: { count: number };
+  let found: { count: number; rows: NewMailRow[] };
   try {
     found = await newMail(
       actor,
@@ -284,6 +288,7 @@ async function checkMailFolder(
       // does not list. With new mail present it cannot say either way.
       otherActivity: found.count === 0 ? true : null,
       mechanism: step.mechanism,
+      rows: found.rows,
     },
     state: fresh,
   };
@@ -384,7 +389,14 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
     marker: answer.marker,
   };
 
-  return untrustedToolResult(trusted, {});
+  // The rows, under the folder they came from. Every value here is either
+  // stranger-authored or sits beside a value that is, so all of it is fenced.
+  const untrusted: Record<string, NewMailRow[]> = {};
+  for (const folder of answer.mail) {
+    if (folder.rows.length > 0) untrusted[folder.folder] = folder.rows;
+  }
+
+  return untrustedToolResult(trusted, untrusted);
 }
 
 /**

@@ -2358,10 +2358,49 @@ export async function folderSnapshots(
   );
 }
 
+/**
+ * The most new-mail rows one folder returns. The count is exact regardless.
+ */
+export const MAX_NEW_MAIL_ROWS = 25;
+
+/**
+ * The row fetch's items: UID, flags, receipt time, and a peek of two header
+ * fields. Nothing else.
+ *
+ * **A narrower row than `MessageSummary`, on purpose (CHNG-09).** The change
+ * check says who new mail is from and what it is about. It fetches no snippet
+ * window, no structure and no size, so it can carry no preview and no
+ * attachment flag. A snippet is the start of a body, and the change check does
+ * not read bodies. The header item is the peeking form, so nothing is marked
+ * read even on a server that ignored the read-only open.
+ */
+const NEW_MAIL_ROW_ITEMS =
+  "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])";
+
+/**
+ * One new message: who it is from and what it is about, and nothing more.
+ *
+ * `id`, `uid`, `unread` and `receivedAt` are this server's or the protocol's.
+ * `fromName`, `fromAddress` and `subject` are stranger-authored and belong in
+ * the fenced block.
+ */
+export interface NewMailRow {
+  id: string;
+  uid: number;
+  unread: boolean;
+  /** The server's INTERNALDATE, verbatim: when iCloud received it. */
+  receivedAt: string | null;
+  fromName: string | null;
+  fromAddress: string | null;
+  subject: string | null;
+}
+
 /** The new mail in one folder's UID range. */
 export interface NewMail {
   /** How many messages in the range are still present. Exact. */
   count: number;
+  /** Up to `MAX_NEW_MAIL_ROWS`, newest first. */
+  rows: NewMailRow[];
 }
 
 /**
@@ -2384,7 +2423,12 @@ async function newMailIn(
   fromUid: number,
   toUidExclusive: number,
 ): Promise<NewMail> {
-  if (toUidExclusive <= fromUid) return { count: 0 };
+  if (toUidExclusive <= fromUid) return { count: 0, rows: [] };
+  const mailbox = session.mailbox;
+  const uidValidity = session.uidValidity;
+  // Unreachable under an opened mailbox, and asserted rather than assumed: a
+  // row with no validity would mint an id no later call could gate.
+  if (mailbox === null || uidValidity === null) throw new ImapNotFoundError();
 
   const last = toUidExclusive - 1;
   const result = await sendCommand(
@@ -2402,7 +2446,42 @@ async function newMailIn(
       if (uid >= fromUid && uid <= last) found.add(uid);
     }
   }
-  return { count: found.size };
+
+  const page = [...found].sort((a, b) => b - a).slice(0, MAX_NEW_MAIL_ROWS);
+  if (page.length === 0) return { count: 0, rows: [] };
+
+  const fetched = await sendCommand(
+    session.channel,
+    session.channel.nextTag(),
+    `UID FETCH ${page.join(",")} ${NEW_MAIL_ROW_ITEMS}`,
+  );
+  if (fetched.status !== "OK") throw new ImapNotFoundError();
+  const replies = fetchReplies(fetched.untagged);
+
+  const rows: NewMailRow[] = [];
+  for (const uid of page) {
+    const items = replies.get(uid);
+    // Expunged between the search and the fetch: an ordinary race, and the row
+    // is simply absent. The count still says what the search found.
+    if (items === undefined) continue;
+
+    const header = headerBlockOf(items);
+    // The same header parser the listing uses, so decoding cannot drift.
+    const parsed = header === null ? null : await extractMessage(header);
+    const internalDate = items.get("INTERNALDATE");
+
+    rows.push({
+      id: encodeMessageId({ mailbox, uidValidity, uid }),
+      uid,
+      unread: !isSeen(items.get("FLAGS") ?? null),
+      receivedAt: typeof internalDate === "string" ? internalDate : null,
+      fromName: parsed?.fromName ?? null,
+      fromAddress: parsed?.fromAddress ?? null,
+      subject: parsed?.subject ?? null,
+    });
+  }
+
+  return { count: found.size, rows };
 }
 
 /** New mail in one folder's range, over an already-open stream pair. */
