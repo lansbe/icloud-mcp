@@ -50,6 +50,16 @@ import {
   AGENT_NAMESPACE_SCOPE,
   collectAgentNamespaceReads,
   checkAgentNamespaceReadOwnership,
+  RECALL_INDEX_OWNER,
+  RECALL_INDEX_READ,
+  RECALL_INDEX_SCOPE,
+  collectRecallIndexReads,
+  checkRecallIndexOwnership,
+  AI_BINDING_OWNER,
+  AI_BINDING_READ,
+  AI_BINDING_SCOPE,
+  collectAiBindingReads,
+  checkAiBindingOwnership,
   OWNERSHIP_VIOLATION_IDS,
   PASSWORD_READER_IMPORT,
   PASSWORD_READER_OWNERS,
@@ -74,6 +84,10 @@ import {
   checkAppendOwnership,
   checkCommitHook,
   checkDurableObjectConfig,
+  checkRecallConfig,
+  checkRecallPoolConfig,
+  RECALL_INDEX_MARKER,
+  RECALL_CONFIG_VIOLATION_IDS,
   checkConfirmLineOwnership,
   checkCopySiteOwnership,
   checkDavFetchOwnership,
@@ -756,6 +770,7 @@ const RAW_SOURCES: Record<string, string> = import.meta.glob(
     "../src/mail/service.ts",
     "../src/mail/triage.ts",
     "../src/agent/*.ts",
+    "../src/recall/*.ts",
     "../src/env.ts",
     "../src/index.ts",
     "../src/mcp/server.ts",
@@ -1099,6 +1114,16 @@ describe("the patterns have teeth", () => {
     // The object module reaching for the mail service, the first line of any
     // edit that tries to hold the session inside the object.
     "agent-object-reaches-mail": 'import { withMailSession } from "../mail/service";',
+    // Phase 25 (D-17). A tool reading stored vectors back by id: no partition
+    // anywhere in the call, so it reads whoever's ids it was handed.
+    "recall-by-id-read": "const found = await env.RECALL_INDEX.getByIds(ids);",
+    // Searching near one stored vector with the partition left out, which the
+    // index reads as searching everyone.
+    "recall-by-id-query": "const near = await index.queryById(id, { topK: 5 });",
+    // A re-index written with the keep-first verb: the first snippet stays.
+    "recall-keep-first-write": "await index.insert(vectors.slice(i, i + BATCH));",
+    // The partition taken from a tool argument after it was assigned.
+    "recall-namespace-not-from-principal": "        namespace: ns,",
   };
 
   it("covers every rule with a known-violating sample", () => {
@@ -5541,6 +5566,13 @@ describe("the count constraints as a set", () => {
    *  server factory, and an owner whose only read is inside a comment. */
   const FACTORY_NAMESPACE_READ = "const ns = env.USER_AGENT;\n";
   const COMMENTED_NAMESPACE_READ = "// return env.USER_AGENT.getByName(principal.userId);\n";
+  /** Phase 25: each recall binding read in a would-be recall tool, and each
+   *  owner with its only read inside a comment. */
+  const TOOL_RECALL_INDEX_READ = "const index = env.RECALL_INDEX;\n";
+  const COMMENTED_RECALL_INDEX_READ = "// return createRecallStore(env.RECALL_INDEX);\n";
+  const TOOL_AI_READ = "const model = env.AI;\n";
+  const COMMENTED_AI_READ = "// return createEmbedder(env.AI);\n";
+  const RECALL_TOOL = "src/mcp/tools/recall.ts";
 
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
@@ -5624,6 +5656,23 @@ describe("the count constraints as a set", () => {
       ]).map((v) => v.pattern),
       ...checkAgentNamespaceReadOwnership(
         collectAgentNamespaceReads(AGENT_NAMESPACE_OWNER, COMMENTED_NAMESPACE_READ),
+      ).map((v) => v.pattern),
+      // The two phase 25 recall binding counts, one owner each, both arms
+      // through scan()'s own collectors: a read in a would-be recall tool, and
+      // an owner whose only read is inside a comment.
+      ...checkRecallIndexOwnership([
+        ...collectRecallIndexReads(RECALL_INDEX_OWNER, "  return createRecallStore(env.RECALL_INDEX);\n"),
+        ...collectRecallIndexReads(RECALL_TOOL, TOOL_RECALL_INDEX_READ),
+      ]).map((v) => v.pattern),
+      ...checkRecallIndexOwnership(
+        collectRecallIndexReads(RECALL_INDEX_OWNER, COMMENTED_RECALL_INDEX_READ),
+      ).map((v) => v.pattern),
+      ...checkAiBindingOwnership([
+        ...collectAiBindingReads(AI_BINDING_OWNER, "  return createEmbedder(env.AI);\n"),
+        ...collectAiBindingReads(RECALL_TOOL, TOOL_AI_READ),
+      ]).map((v) => v.pattern),
+      ...checkAiBindingOwnership(
+        collectAiBindingReads(AI_BINDING_OWNER, COMMENTED_AI_READ),
       ).map((v) => v.pattern),
       // The second two-owner count, fed the same pair of lists the password
       // count is fed and for the same reason.
@@ -5712,6 +5761,14 @@ describe("the count constraints as a set", () => {
       ...checkAgentNamespaceReadOwnership(
         collectAgentNamespaceReads(AGENT_NAMESPACE_OWNER, COMMENTED_NAMESPACE_READ),
       ),
+      // The two recall binding counts: a lone reader in a would-be recall
+      // tool, and an owner whose only read is commented out, one of each id.
+      ...checkRecallIndexOwnership(collectRecallIndexReads(RECALL_TOOL, TOOL_RECALL_INDEX_READ)),
+      ...checkRecallIndexOwnership(
+        collectRecallIndexReads(RECALL_INDEX_OWNER, COMMENTED_RECALL_INDEX_READ),
+      ),
+      ...checkAiBindingOwnership(collectAiBindingReads(RECALL_TOOL, TOOL_AI_READ)),
+      ...checkAiBindingOwnership(collectAiBindingReads(AI_BINDING_OWNER, COMMENTED_AI_READ)),
       // TWO owners again, so the same asymmetric pair the password count needs:
       // both owners plus a non-owner is exactly one outside, and one owner
       // alone is exactly one missing.
@@ -5770,6 +5827,12 @@ describe("the count constraints as a set", () => {
     // object is named, so it must stay inside the name rule and the id-helper
     // ban, which a path exclusion would drop along with the count's exemption.
     expect(EXCLUDED.has(AGENT_NAMESPACE_OWNER)).toBe(false);
+    // And for the two recall owners. The store is the one module that sets the
+    // partition, and the embedder is where mail text leaves for the model, so
+    // both must stay inside the namespace rule, the verb bans and the logging
+    // ban, which a path exclusion would drop along with the count's exemption.
+    expect(EXCLUDED.has(RECALL_INDEX_OWNER)).toBe(false);
+    expect(EXCLUDED.has(AI_BINDING_OWNER)).toBe(false);
     // And for both minting sites. These two are the files that hold a live
     // credential longest — the door holds a decrypted grant, the login page
     // holds a value somebody just typed — so they are the two that most need
@@ -5811,5 +5874,352 @@ describe("the commit-time gate", () => {
     const patterns = checkCommitHook("package.json").map((v) => v.pattern);
     expect(patterns).toContain("commit-gate-no-set-e");
     expect(patterns).not.toContain("commit-gate-missing");
+  });
+});
+
+// Phase 25, D-17 (RCLL-02). The recall store fails open, so the one-module
+// rule on each binding, the banned verbs and the partition's source are held
+// at commit time as well as by the isolation tests.
+describe("the recall store's scan rules (Phase 25, D-17)", () => {
+  const rule = (id: string) => FORBIDDEN.find((r) => r.id === id)!;
+  /** Through the real scope mechanism, at a given path. */
+  const hits = (id: string, path: string, text: string): number =>
+    matchRule(rule(id), FORBIDDEN.indexOf(rule(id)), path, text).length;
+  const RECALL_TOOL = "src/mcp/tools/recall.ts";
+
+  describe("the vector index binding has one owner", () => {
+    it("names the store module as the owner, over src/", () => {
+      expect(RECALL_INDEX_OWNER).toBe("src/recall/index.ts");
+      expect(RECALL_INDEX_SCOPE).toBe("src/");
+    });
+
+    it("finds the store in the real tree, and not src/env.ts's declaration", () => {
+      const collected = [
+        "src/recall/index.ts",
+        "src/recall/embed.ts",
+        "src/recall/pipeline.ts",
+        "src/recall/build.ts",
+        "src/env.ts",
+      ].flatMap((file) => collectRecallIndexReads(file, rawSourceOf(file)));
+      expect(collected.map((reader) => reader.file)).toEqual([RECALL_INDEX_OWNER]);
+      expect(rawSourceOf("src/env.ts")).toMatch(/\bRECALL_INDEX\b/);
+      expect(collectRecallIndexReads("src/env.ts", rawSourceOf("src/env.ts"))).toEqual([]);
+    });
+
+    it("reports a second file naming the binding as the duplicate, at that file", () => {
+      const owner = collectRecallIndexReads(RECALL_INDEX_OWNER, rawSourceOf(RECALL_INDEX_OWNER));
+      const second = collectRecallIndexReads(RECALL_TOOL, "const index = env.RECALL_INDEX;\n");
+      const violations = checkRecallIndexOwnership([...owner, ...second]);
+      expect(violations.map((v) => v.pattern)).toEqual(["recall-index-read-outside-owner"]);
+      expect(violations[0]!.file).toBe(RECALL_TOOL);
+      expect(violations[0]!.line).toBe(1);
+    });
+
+    it("reports the owner missing when only src/env.ts names the binding", () => {
+      const onlyEnv = collectRecallIndexReads("src/env.ts", rawSourceOf("src/env.ts"));
+      const violations = checkRecallIndexOwnership(onlyEnv);
+      expect(violations.map((v) => v.pattern)).toEqual(["recall-index-read-missing"]);
+      expect(violations[0]!.file).toBe(RECALL_INDEX_OWNER);
+    });
+
+    it("is wired into scan(): scripts/ alone reports it missing, the real tree reports neither", () => {
+      expect(scan("scripts").map((v) => v.pattern)).toContain("recall-index-read-missing");
+      const patterns = scan().map((v) => v.pattern);
+      expect(patterns).not.toContain("recall-index-read-missing");
+      expect(patterns).not.toContain("recall-index-read-outside-owner");
+    });
+
+    it("counts member access, destructuring, bracket access and an object-literal line", () => {
+      const fires = (sample: string): boolean =>
+        new RegExp(RECALL_INDEX_READ.source, RECALL_INDEX_READ.flags).test(sample);
+      for (const sample of [
+        "  return createRecallStore(env.RECALL_INDEX);",
+        "const { RECALL_INDEX } = env;",
+        'const index = env["RECALL_INDEX"];',
+        "  RECALL_INDEX: env.RECALL_INDEX,",
+      ]) {
+        expect(fires(sample), `missed ${JSON.stringify(sample)}`).toBe(true);
+      }
+      for (const sample of [
+        "      RECALL_INDEX: Vectorize;",
+        "  readonly RECALL_INDEX: Vectorize;",
+        "  RECALL_INDEX?: Vectorize;",
+        "const n = RECALL_INDEX_NAME;",
+      ]) {
+        expect(fires(sample), `false-positived on ${JSON.stringify(sample)}`).toBe(false);
+      }
+    });
+
+    it("does not count a commented-out mention, and collects nothing outside src/", () => {
+      const commented = "// return createRecallStore(env.RECALL_INDEX);\n";
+      expect(collectRecallIndexReads(RECALL_INDEX_OWNER, commented)).toEqual([]);
+      expect(
+        collectRecallIndexReads("test/recall-store.test.ts", "const i = env.RECALL_INDEX;"),
+      ).toEqual([]);
+    });
+  });
+
+  describe("the AI binding has one reader", () => {
+    it("names the embedder as the owner, over src/", () => {
+      expect(AI_BINDING_OWNER).toBe("src/recall/embed.ts");
+      expect(AI_BINDING_SCOPE).toBe("src/");
+    });
+
+    it("finds the embedder in the real tree, and not src/env.ts's declaration", () => {
+      const collected = [
+        "src/recall/index.ts",
+        "src/recall/embed.ts",
+        "src/recall/pipeline.ts",
+        "src/recall/build.ts",
+        "src/env.ts",
+      ].flatMap((file) => collectAiBindingReads(file, rawSourceOf(file)));
+      expect(collected.map((reader) => reader.file)).toEqual([AI_BINDING_OWNER]);
+      expect(rawSourceOf("src/env.ts")).toMatch(/\bAI: Ai;/);
+    });
+
+    it("reports a second reader as the duplicate, and the owner missing when none reads it", () => {
+      const owner = collectAiBindingReads(AI_BINDING_OWNER, rawSourceOf(AI_BINDING_OWNER));
+      const second = collectAiBindingReads(RECALL_TOOL, "const model = this.env.AI;\n");
+      const duplicate = checkAiBindingOwnership([...owner, ...second]);
+      expect(duplicate.map((v) => v.pattern)).toEqual(["ai-binding-read-outside-owner"]);
+      expect(duplicate[0]!.file).toBe(RECALL_TOOL);
+      const onlyEnv = collectAiBindingReads("src/env.ts", rawSourceOf("src/env.ts"));
+      const missing = checkAiBindingOwnership(onlyEnv);
+      expect(missing.map((v) => v.pattern)).toEqual(["ai-binding-read-missing"]);
+      expect(missing[0]!.file).toBe(AI_BINDING_OWNER);
+    });
+
+    it("is wired into scan(): scripts/ alone reports it missing, the real tree reports neither", () => {
+      expect(scan("scripts").map((v) => v.pattern)).toContain("ai-binding-read-missing");
+      const patterns = scan().map((v) => v.pattern);
+      expect(patterns).not.toContain("ai-binding-read-missing");
+      expect(patterns).not.toContain("ai-binding-read-outside-owner");
+    });
+
+    it("counts member and bracket reads, and not the words in a string", () => {
+      const fires = (sample: string): boolean =>
+        new RegExp(AI_BINDING_READ.source, AI_BINDING_READ.flags).test(sample);
+      for (const sample of [
+        "  return createEmbedder(env.AI);",
+        "const m = this.env.AI;",
+        "const m = env?.AI;",
+        'const m = env["AI"];',
+      ]) {
+        expect(fires(sample), `missed ${JSON.stringify(sample)}`).toBe(true);
+      }
+      for (const sample of [
+        "      AI: Ai;",
+        'const label = "Workers AI";',
+        "const x = env.AI_GATEWAY;",
+        "const x = env.AIRPORT;",
+      ]) {
+        expect(fires(sample), `false-positived on ${JSON.stringify(sample)}`).toBe(false);
+      }
+    });
+
+    it("gives the four recall count ids distinct sort keys after the namespace-read count's", () => {
+      const index = [
+        ...checkRecallIndexOwnership([{ file: RECALL_TOOL, line: 1, column: 1 }]),
+        ...checkRecallIndexOwnership([]),
+        ...checkAiBindingOwnership([{ file: RECALL_TOOL, line: 1, column: 1 }]),
+        ...checkAiBindingOwnership([]),
+      ].map((v) => v.patternIndex - FORBIDDEN.length);
+      expect(index).toEqual([35, 36, 37, 38]);
+    });
+  });
+
+  describe("the by-id verbs, the keep-first write and the partition's source", () => {
+    it("fires the by-id read and by-id query bans anywhere under src/, and not in test/", () => {
+      const read = "const found = await env.RECALL_INDEX.getByIds(ids);";
+      const query = "const near = await index.queryById(id, { topK: 5 });";
+      for (const path of [RECALL_TOOL, "src/recall/index.ts", "src/agent/user-agent.ts"]) {
+        expect(hits("recall-by-id-read", path, read), path).toBe(1);
+        expect(hits("recall-by-id-query", path, query), path).toBe(1);
+      }
+      expect(hits("recall-by-id-read", "test/fixtures/fake-vectorize.ts", read)).toBe(0);
+      expect(hits("recall-by-id-query", "test/fixtures/fake-vectorize.ts", query)).toBe(0);
+      // The by-id delete the store really uses is not either verb.
+      expect(hits("recall-by-id-read", "src/recall/index.ts", "await index.deleteByIds(ids);")).toBe(0);
+    });
+
+    it("fires the keep-first write in src/recall/, and not outside it", () => {
+      const sample = "await index.insert(vectors.slice(i, i + BATCH));";
+      expect(hits("recall-keep-first-write", "src/recall/index.ts", sample)).toBe(1);
+      expect(hits("recall-keep-first-write", "src/recall/build.ts", "await x?.insert(v);")).toBe(1);
+      expect(hits("recall-keep-first-write", "src/agent/recall-ledger.ts", sample)).toBe(0);
+      expect(hits("recall-keep-first-write", RECALL_TOOL, sample)).toBe(0);
+      // The replacing write is untouched.
+      expect(hits("recall-keep-first-write", "src/recall/index.ts", "await index.upsert(v);")).toBe(0);
+    });
+
+    it("fires the partition rule on a string literal or a variable under src/recall/", () => {
+      for (const sample of [
+        '        namespace: "owner",',
+        "        namespace: ns,",
+        "        namespace: userId,",
+        "        namespace: args.user,",
+        "        namespace: `${principal.userId}`,",
+        "  sent.namespace = ns;",
+        "  namespace?: string;",
+      ]) {
+        expect(hits("recall-namespace-not-from-principal", "src/recall/index.ts", sample), sample)
+          .toBe(1);
+      }
+    });
+
+    it("does not fire the partition rule on a Principal's userId, or on src/dav/'s XML key", () => {
+      for (const sample of [
+        "          namespace: principal.userId,",
+        "        namespace: principal.userId,\n        filter: { u: principal.userId },",
+        "  namespace: ctx.actor.userId }",
+        "  sent.namespace = principal.userId;",
+        "        namespace: principal.userId\n",
+      ]) {
+        expect(hits("recall-namespace-not-from-principal", "src/recall/index.ts", sample), sample)
+          .toBe(0);
+      }
+      expect(hits("recall-namespace-not-from-principal", "src/dav/xml.ts", 'namespace: "d",')).toBe(0);
+    });
+
+    it("finds none of the four in the real tree", () => {
+      const ids = scan().map((violation) => violation.pattern);
+      for (const id of [
+        "recall-by-id-read",
+        "recall-by-id-query",
+        "recall-keep-first-write",
+        "recall-namespace-not-from-principal",
+      ]) {
+        expect(ids).not.toContain(id);
+      }
+    });
+  });
+
+  describe("the fan-out rule reaches the recall build entry points", () => {
+    it("fires on a combinator around indexNextPage or reconcileMailbox", () => {
+      for (const name of ["indexNextPage", "reconcileMailbox"]) {
+        for (const combinator of ["all", "allSettled", "any", "race"]) {
+          const sample = `await Promise.${combinator}(mailboxes.map((m) => ${name}(principal, deps, m)));`;
+          expect(hits("concurrent-session", RECALL_TOOL, sample), `${name} ${combinator}`).toBe(1);
+        }
+      }
+    });
+
+    it("does not fire on one awaited build call, or on a combinator around an unrelated call", () => {
+      for (const permitted of [
+        "const page = await indexNextPage(principal, deps);",
+        "await reconcileMailbox(principal, deps, mailbox, uids);",
+        "const vectors = await Promise.all(items.map((item) => vectorIdOf(principal, item.ref)));",
+      ]) {
+        expect(hits("concurrent-session", RECALL_TOOL, permitted), permitted).toBe(0);
+      }
+    });
+  });
+});
+
+// Phase 25, D-16 and D-17. A config edit that would point the tests or local
+// dev at the real index or model is refused at commit, over both Worker config
+// files and the pool config.
+describe("the recall config checks (Phase 25, D-16, D-17)", () => {
+  const MARKER = `  ${"// RECALL INDEX: 1024 cosine"}`;
+  const VECTORIZE = '  "vectorize": [\n    { "binding": "RECALL_INDEX", "index_name": "icloud-mcp-recall" }\n  ],';
+  const AI = '  "ai": { "binding": "AI" },';
+  const config = (...lines: string[]) => `{\n${lines.join("\n")}\n  "name": "x"\n}\n`;
+  const ids = (text: string) => checkRecallConfig("wrangler.jsonc", text).map((v) => v.pattern);
+  const POOL_OK = "miniflare: {\n  remoteBindings: false,\n},\n";
+
+  /** One known-violating sample per config id, set-equality-checked below. */
+  const samples: Record<string, () => string[]> = {
+    "recall-binding-remote": () =>
+      ids(config(MARKER, VECTORIZE.replace('"icloud-mcp-recall" }', '"icloud-mcp-recall", "remote": true }'), AI)),
+    "recall-index-reason-missing": () => ids(config(VECTORIZE, AI)),
+    "recall-pool-remote-bindings-missing": () =>
+      checkRecallPoolConfig("vitest.config.ts", "miniflare: {},\n", true).map((v) => v.pattern),
+  };
+
+  it("has a known-violating sample for every config id, and each fires its own id", () => {
+    expect(Object.keys(samples).sort()).toEqual([...RECALL_CONFIG_VIOLATION_IDS].sort());
+    for (const [id, run] of Object.entries(samples)) {
+      expect(run(), id).toEqual([id]);
+    }
+  });
+
+  it("keeps the marker constant in step with the text the real config carries", () => {
+    expect(RECALL_INDEX_MARKER).toBe("// RECALL INDEX: 1024 cosine");
+    expect(rawSourceOf("wrangler.jsonc.example").split("\n").map((l) => l.trim()))
+      .toContain(RECALL_INDEX_MARKER);
+  });
+
+  it("passes the shape both real files carry: the marker, the index and the AI object", () => {
+    expect(ids(config(MARKER, VECTORIZE, AI))).toEqual([]);
+    expect(checkRecallConfig("wrangler.jsonc.example", rawSourceOf("wrangler.jsonc.example")))
+      .toEqual([]);
+  });
+
+  it("fires on a remote key on the vector index entry, and on the AI object", () => {
+    const remoteIndex = VECTORIZE.replace('"icloud-mcp-recall" }', '"icloud-mcp-recall", "remote": true }');
+    expect(ids(config(MARKER, remoteIndex, AI))).toEqual(["recall-binding-remote"]);
+    expect(ids(config(MARKER, VECTORIZE, '  "ai": { "binding": "AI", "remote": true },')))
+      .toEqual(["recall-binding-remote"]);
+    expect(ids(config(MARKER, '  "vectorize": [{ "binding": "R", "index_name": "i", "remote": false }],')))
+      .toEqual(["recall-binding-remote"]);
+    expect(ids(config(MARKER, '  "ai": {\n    "binding": "AI",\n    "remote": true\n  },')))
+      .toEqual(["recall-binding-remote"]);
+  });
+
+  it("does not fire on a remote key in prose, or on another binding's remote key", () => {
+    expect(ids(config(MARKER, '  // a "remote": true key here would reach the account', VECTORIZE, AI)))
+      .toEqual([]);
+    expect(
+      ids(config(MARKER, VECTORIZE, AI, '  "r2_buckets": [{ "binding": "B", "bucket_name": "b", "remote": true }],')),
+    ).toEqual([]);
+  });
+
+  it("fires on a vector index block without the marker, and not on a config with no index", () => {
+    expect(ids(config(VECTORIZE))).toEqual(["recall-index-reason-missing"]);
+    expect(ids(config("  // RECALL INDEX: 768 cosine", VECTORIZE))).toEqual(["recall-index-reason-missing"]);
+    expect(ids(config(AI))).toEqual([]);
+    expect(ids(config('  "name2": "y",'))).toEqual([]);
+  });
+
+  it("fires on a pool config without remoteBindings: false only when a recall binding is declared", () => {
+    for (const pool of ["miniflare: {},\n", "// remoteBindings: false,\nminiflare: {},\n", "remoteBindings: true,\n", null]) {
+      expect(checkRecallPoolConfig("vitest.config.ts", pool, true).map((v) => v.pattern), String(pool))
+        .toEqual(["recall-pool-remote-bindings-missing"]);
+      expect(checkRecallPoolConfig("vitest.config.ts", pool, false), String(pool)).toEqual([]);
+    }
+    expect(checkRecallPoolConfig("vitest.config.ts", POOL_OK, true)).toEqual([]);
+  });
+
+  it("is wired into scanWranglerConfig: a known-violating config and pool fire all three", () => {
+    const violations = scanWranglerConfig(
+      "test/fixtures/recall-config-sample.jsonc",
+      "src/mcp/api-handler.ts",
+      "test/fixtures/recall-pool-sample.txt",
+    );
+    expect(violations.map((v) => v.pattern).sort()).toEqual([
+      "recall-binding-remote",
+      "recall-binding-remote",
+      "recall-index-reason-missing",
+      "recall-pool-remote-bindings-missing",
+    ]);
+    // The same config with the real pool: the pool line is there, so only the
+    // Worker-side ids fire.
+    expect(
+      scanWranglerConfig("test/fixtures/recall-config-sample.jsonc").map((v) => v.pattern).sort(),
+    ).toEqual(["recall-binding-remote", "recall-binding-remote", "recall-index-reason-missing"]);
+  });
+
+  it("reads the pool only when a Worker config declares a binding", () => {
+    // A config with neither binding: the violating pool is not reported.
+    const violations = scanWranglerConfig(
+      "test/fixtures/durable-object-config-sample.jsonc",
+      "src/mcp/api-handler.ts",
+      "test/fixtures/recall-pool-sample.txt",
+    );
+    expect(violations.map((v) => v.pattern)).not.toContain("recall-pool-remote-bindings-missing");
+  });
+
+  it("passes both real configs and the real pool", () => {
+    expect(scanWranglerConfig().map(formatViolation)).toEqual([]);
   });
 });

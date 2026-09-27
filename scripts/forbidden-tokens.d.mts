@@ -53,12 +53,23 @@ export declare function checkSocketOwnership(
 ): Violation[];
 export declare function checkCommitHook(hookPath?: string): Violation[];
 export declare function scanWranglerConfig(
-  configPath?: string,
+  configPath?: string | readonly string[],
   hostnameSourcePath?: string,
+  poolConfigPath?: string,
 ): Violation[];
 export declare function formatViolation(violation: Violation): string;
 /** The Durable Object lifecycle checks over one config file's text (DOBJ-06). */
 export declare function checkDurableObjectConfig(file: string, text: string): Violation[];
+/** The recall binding checks over one Worker config file's text (Phase 25, D-16, D-17). */
+export declare function checkRecallConfig(file: string, text: string): Violation[];
+/** The test pool's remote-bindings check, given whether a recall binding is declared. */
+export declare function checkRecallPoolConfig(
+  poolFile: string,
+  poolText: string | null,
+  bindingDeclared: boolean,
+): Violation[];
+export declare const RECALL_INDEX_MARKER: string;
+export declare const RECALL_CONFIG_VIOLATION_IDS: readonly string[];
 
 /**
  * Exported so a scope test can drive the real prefix mechanism. A test that
@@ -127,6 +138,12 @@ export declare const REMOVAL_SCOPE: string;
 export declare const AGENT_NAMESPACE_READ: RegExp;
 export declare const AGENT_NAMESPACE_OWNER: string;
 export declare const AGENT_NAMESPACE_SCOPE: string;
+export declare const RECALL_INDEX_READ: RegExp;
+export declare const RECALL_INDEX_OWNER: string;
+export declare const RECALL_INDEX_SCOPE: string;
+export declare const AI_BINDING_READ: RegExp;
+export declare const AI_BINDING_OWNER: string;
+export declare const AI_BINDING_SCOPE: string;
 export declare const OWNERSHIP_VIOLATION_IDS: readonly string[];
 
 /** One declared DAV write module: why it is declared, and a disposition for
@@ -211,6 +228,20 @@ export declare function checkAgentNamespaceReadOwnership(
   readers: ReadonlyArray<OwnershipMatch>,
 ): Violation[];
 export declare function collectAgentNamespaceReads(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+export declare function checkRecallIndexOwnership(
+  readers: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function collectRecallIndexReads(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+export declare function checkAiBindingOwnership(
+  readers: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function collectAiBindingReads(
   relativePath: string,
   contents: string,
 ): OwnershipMatch[];

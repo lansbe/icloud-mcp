@@ -231,6 +231,38 @@ declare global {
       USER_AGENT: DurableObjectNamespace<UserAgent>;
 
       /**
+       * The vector index for semantic recall over each person's recent mail
+       * (Phase 25, RCLL-01).
+       *
+       * Read by ONE module under `src/`: `src/recall/index.ts`. That module puts
+       * the signed-in principal's user id into the partition and the filter of
+       * every query and write, because the store fails open: a query that names
+       * no partition is read as searching everyone. A scan count holds the one
+       * reader, and zero readers is a violation too.
+       *
+       * Tests never read this binding for real work. They pass a fake to the
+       * store's factory, and the pool is set so that a call through the real
+       * binding fails rather than reaching the account.
+       *
+       * Typed `Vectorize`, NOT `... | undefined`, for the reason spelled out on
+       * `DAV_CACHE` above: a binding declared in config either resolves at
+       * deploy time or fails the deploy. The index itself is account state the
+       * owner creates by hand; wrangler.jsonc says why.
+       */
+      RECALL_INDEX: Vectorize;
+
+      /**
+       * Workers AI, used for one thing: turning text into the vectors the
+       * recall index holds (Phase 25, D-05).
+       *
+       * Read by ONE module under `src/`: `src/recall/embed.ts`, which also holds
+       * the one model id. Tests pass a fake to that module's factory instead.
+       *
+       * Typed non-optional for the reason given on the binding above.
+       */
+      AI: Ai;
+
+      /**
        * The Cloudflare account id. A Worker var declared in wrangler.jsonc, not
        * a Secret.
        *

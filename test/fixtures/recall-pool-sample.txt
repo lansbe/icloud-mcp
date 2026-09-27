@@ -1,0 +1,13 @@
+// A known-violating test pool config for the recall pool check (Phase 25,
+// D-16). The setting appears only in this comment, remoteBindings: false,
+// which must not count. Plain text so no test runner or type checker loads it;
+// read only by test/forbidden-tokens.test.ts through scanWranglerConfig.
+export default {
+  test: {
+    poolOptions: {
+      workers: {
+        miniflare: {},
+      },
+    },
+  },
+};
