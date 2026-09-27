@@ -23,6 +23,13 @@
 // was proven, so a failure at any step leaves a duplicate and never a loss.
 // Every outcome is judged from a re-read of the source folder afterwards.
 //
+// Two more move one draft from the drafts folder to Trash (Phase 22). They are
+// a move and nothing else: they reuse the move step above, and build no copy,
+// no removal mark and no removal of their own. Before the move step they
+// re-read the draft's fingerprint and check it still carries the draft flag
+// and not the removal mark, so a draft that changed after its preview is
+// refused before anything is written. They fetch no body.
+//
 // Nothing here fetches a message body, and nothing may: a body fetch on a
 // mailbox opened for changing is how mail gets marked read by accident.
 //
@@ -869,6 +876,170 @@ export async function moveMessages(
       source.uidValidity,
       (session) => moveListWithin(session, entries, destinationMailbox, options, ledger),
       options,
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Moving one draft to Trash (Phase 22, D-06, D-09, D-12, D-13)
+// ---------------------------------------------------------------------------
+
+/** One draft to move to Trash, every value from the verified confirmation. */
+export interface DraftDeleteTarget {
+  /** The drafts folder's wire name, from the sealed `m`. */
+  draftsMailbox: string;
+  /** Its UIDVALIDITY, from the sealed `uv`. */
+  uidValidity: number;
+  /** The draft's UID and the fingerprint its preview sealed, from `l[0]`. */
+  entry: MoveEntry;
+  /** The Trash folder's wire name, from the sealed `q`. */
+  trashMailbox: string;
+}
+
+/**
+ * What moving one draft to Trash produced.
+ *
+ * `applied: true` carries the move step's own per-message result, unchanged:
+ * never a bare success (D-12). The refusals wrote nothing at all:
+ *
+ * - `mailbox-read-only`: the drafts folder did not open for changing.
+ * - `removal-not-kept`: the open says the removal mark would not survive.
+ * - `commands-unavailable`: the server does not advertise both UIDPLUS and
+ *   CONDSTORE.
+ * - `changed-since-preview`: the draft's size, internal date or MODSEQ
+ *   differs from its preview, it is gone, it lost the draft flag, or it gained
+ *   the removal mark (D-06).
+ */
+export type DraftDeleteOutcome =
+  | { applied: true; result: MessageMoveResult }
+  | {
+      applied: false;
+      refusal:
+        | "mailbox-read-only"
+        | "removal-not-kept"
+        | "commands-unavailable"
+        | "changed-since-preview";
+    };
+
+/** Whether a flag list holds `flag`, compared without case. */
+function carriesFlag(flags: readonly string[], flag: string): boolean {
+  const wanted = flag.toLowerCase();
+  return flags.some((one) => one.toLowerCase() === wanted);
+}
+
+/**
+ * Move one draft to Trash, inside an open mutating session on the drafts folder.
+ *
+ * `moveListWithin`'s shape for one entry, plus the two flag checks a list move
+ * does not make. The whole-session checks, then the fingerprint re-read, then
+ * the move step with the sealed MODSEQ and this call's deadline. Answers in the
+ * list move's own outcome type, so `settleMove` can turn a lost connection into
+ * a per-message result exactly as it does for a list.
+ */
+async function deleteDraftWithin(
+  session: MutatingMailSession,
+  target: DraftDeleteTarget,
+  options: MailSessionOptions,
+  ledger: MoveLedger,
+): Promise<MoveOutcome> {
+  const startedAt = Date.now();
+  const deadlineAt = startedAt + (options.callDeadlineMs ?? CALL_DEADLINE_MS);
+
+  // Whole-session refusals, with zero writes.
+  if (!hasMoveCommands(session.capability)) {
+    return { applied: false, refusal: "commands-unavailable" };
+  }
+  if (!keepsFlag(session.permanentFlags, "\\Deleted")) {
+    return { applied: false, refusal: "removal-not-kept" };
+  }
+
+  // The draft re-read before the first write. Any difference is one refusal,
+  // and nothing else is sent (D-06). It is never looked for elsewhere: a UID
+  // with no reply is refused, not searched for by subject or header (D-14).
+  const { entry } = target;
+  const reread = await sendCommand(
+    session.channel,
+    session.channel.nextTag(),
+    `UID FETCH ${entry.uid} ${FINGERPRINT_ITEMS}`,
+  );
+  if (reread.status !== "OK") throw refusalOf(reread);
+  const now = parseFingerprint(reread.untagged, entry.uid);
+  if (
+    now === null ||
+    now.size !== entry.size ||
+    now.internalDate !== entry.internalDate ||
+    now.modSeq !== entry.modSeq ||
+    !carriesFlag(now.flags, "\\Draft") ||
+    carriesFlag(now.flags, "\\Deleted")
+  ) {
+    return { applied: false, refusal: "changed-since-preview", changedUids: [entry.uid] };
+  }
+
+  ledger.inFlight = entry.uid;
+  ledger.started = true;
+  const result = await moveMessageWithin(
+    session,
+    { mailbox: session.mailbox, uidValidity: session.uidValidity, uid: entry.uid },
+    target.trashMailbox,
+    entry.modSeq,
+    deadlineAt,
+  );
+  ledger.results.push(result);
+  ledger.inFlight = null;
+  return { applied: true, results: [result] };
+}
+
+/** Turn the list move's answer for one draft into the draft verb's. */
+function draftOutcomeOf(outcome: MoveOutcome): DraftDeleteOutcome {
+  if (!outcome.applied) return { applied: false, refusal: outcome.refusal };
+  const result = outcome.results[0];
+  // One entry in, one result out. `settleMove` builds exactly one per entry.
+  if (result === undefined) throw new ImapConnectError();
+  return { applied: true, result };
+}
+
+/** Move one draft to Trash, over an already-open stream pair. */
+export async function deleteDraftOver(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  target: DraftDeleteTarget,
+  options: MailSessionOptions = {},
+): Promise<DraftDeleteOutcome> {
+  const ledger: MoveLedger = { results: [], inFlight: null, started: false };
+  return draftOutcomeOf(
+    await settleMove([target.entry], ledger, () =>
+      withMutatingMailboxOver(
+        duplex,
+        principal,
+        gate,
+        target.draftsMailbox,
+        target.uidValidity,
+        (session) => deleteDraftWithin(session, target, options, ledger),
+        options,
+      ),
+    ),
+  );
+}
+
+/** Move one draft from the drafts folder to Trash. */
+export async function deleteDraft(
+  principal: Principal,
+  gate: SessionGate,
+  target: DraftDeleteTarget,
+  options: MailSessionOptions = {},
+): Promise<DraftDeleteOutcome> {
+  const ledger: MoveLedger = { results: [], inFlight: null, started: false };
+  return draftOutcomeOf(
+    await settleMove([target.entry], ledger, () =>
+      withMutatingMailbox(
+        principal,
+        gate,
+        target.draftsMailbox,
+        target.uidValidity,
+        (session) => deleteDraftWithin(session, target, options, ledger),
+        options,
+      ),
     ),
   );
 }

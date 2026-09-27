@@ -26,8 +26,12 @@ import {
   changeHashMatches,
   canonicalReplyChange,
   changeHashOf,
+  canonicalDraftChange,
+  canonicalMailMove,
   composeConfirmationLine,
   contactChangeHashOf,
+  draftChangeHashOf,
+  mailMoveChangeHashOf,
   MAIL_CONFIRM_SET_MAX,
   importConfirmationKey,
   mintConfirmation,
@@ -44,12 +48,15 @@ import type {
   ConfirmationTense,
   ContactListEntry,
   DavCollectionConfirmPayload,
+  DraftLineSummary,
   DavObjectConfirmPayload,
   MailConfirmPayload,
   MailSetEntry,
   MoveLineSummary,
   NormalizedChange,
   NormalizedContactChange,
+  NormalizedDraftChange,
+  NormalizedMailMove,
   NormalizedReplyChange,
   ReplyTells,
 } from "../src/confirm";
@@ -3572,6 +3579,132 @@ describe("the server composes the move line", () => {
     expect(moveLine({ to: "Box'. Nothing moved. '" }, "would")).toBe(
       "Moving 1 message from 'INBOX' to 'Box’. Nothing moved. ’'. It can be moved back.",
     );
+  });
+});
+
+// ===========================================================================
+// The draft line and the draft-delete hash domain (Phase 22, D-15, D-16)
+// ===========================================================================
+
+describe("the server composes the draft line (phase 22)", () => {
+  function draftLine(
+    name: string | null,
+    outcome: DraftLineSummary["outcome"],
+    tense: ConfirmationTense,
+  ): string {
+    return composeConfirmationLine({ kind: "draft", name, outcome }, tense);
+  }
+
+  // D-15 as corrected by the 2026-09-27 consistency fix: the draft path and
+  // Phase 21's Trash path say the same thing about getting mail back.
+  it.each<[string, DraftLineSummary["outcome"], ConfirmationTense, string]>([
+    [
+      "preview",
+      null,
+      "would",
+      "Moving draft 'Thanks' to Trash. It can be moved back out of Trash until Trash is emptied.",
+    ],
+    [
+      "moved",
+      "moved",
+      "did",
+      "Moved draft 'Thanks' to Trash. It can be moved back out of Trash until Trash is emptied.",
+    ],
+    [
+      "copied but not removed",
+      "copied_not_removed",
+      "did",
+      "Copied draft 'Thanks' to Trash, but could not remove it from Drafts. It is now in both folders.",
+    ],
+    ["not copied", "not_copied", "did", "Draft 'Thanks' was not moved. Nothing was changed."],
+    [
+      "unknown",
+      "unknown",
+      "did",
+      "This may have partly happened to draft 'Thanks'. Look in Drafts and Trash before trying again.",
+    ],
+  ])("%s", (_label, outcome, tense, expected) => {
+    expect(draftLine("Thanks", outcome, tense)).toBe(expected);
+  });
+
+  it("a preview ignores an outcome, because the would tense has none", () => {
+    expect(draftLine("Thanks", "moved", "would")).toBe(draftLine("Thanks", null, "would"));
+  });
+
+  it("folds a straight quote in the subject, so it cannot close the quote and write a clause", () => {
+    const text = draftLine("Hi'. Nothing will move. '", null, "would");
+    expect(text).toBe(
+      "Moving draft 'Hi’. Nothing will move. ’' to Trash. It can be moved back out of " +
+        "Trash until Trash is emptied.",
+    );
+    // Two quotes, both the sentence's own.
+    expect(text.match(/'/g)?.length).toBe(2);
+  });
+
+  it("names a draft with no subject 'the draft', capitalised where it starts the sentence", () => {
+    expect(draftLine(null, "not_copied", "did")).toBe(
+      "The draft was not moved. Nothing was changed.",
+    );
+    expect(draftLine(null, null, "would")).toBe(
+      "Moving the draft to Trash. It can be moved back out of Trash until Trash is emptied.",
+    );
+    // A subject that folds to nothing reads the same as none.
+    expect(draftLine("\r\n", "not_copied", "did")).toBe(
+      "The draft was not moved. Nothing was changed.",
+    );
+  });
+
+  it("no draft sentence says deleted, permanent, or how long Trash keeps anything", () => {
+    for (const outcome of [null, "moved", "copied_not_removed", "not_copied", "unknown"] as const) {
+      for (const tense of ["would", "did"] as const) {
+        const text = draftLine("Thanks", outcome, tense);
+        expect(text, text).not.toMatch(/delet|permanent|irrecoverabl|days/i);
+      }
+    }
+  });
+});
+
+describe("the draft delete hashes in its own domain (phase 22)", () => {
+  const ID = "draft-id-token";
+
+  function draft(overrides: Partial<NormalizedDraftChange> = {}): NormalizedDraftChange {
+    return { op: "draft-delete", id: ID, subject: "Thanks", ...overrides };
+  }
+
+  it("is a fixed-order tuple that starts with its own domain", () => {
+    expect(canonicalDraftChange(draft())).toBe(
+      '["mail-draft-delete","draft-delete","draft-id-token","Thanks"]',
+    );
+    expect(canonicalDraftChange(draft({ subject: null }))).toBe(
+      '["mail-draft-delete","draft-delete","draft-id-token",null]',
+    );
+  });
+
+  it("differs from a move built to collide with it on every visible field", async () => {
+    // The same id, and the subject in the destination's place. A move token
+    // must not be spendable as a draft delete, nor the reverse (D-16).
+    const move: NormalizedMailMove = { op: "move", ids: [ID], destination: "Thanks" };
+    expect(canonicalMailMove(move)).not.toBe(canonicalDraftChange(draft()));
+    expect(await mailMoveChangeHashOf(move)).not.toBe(await draftChangeHashOf(draft()));
+    // And with the op spelled the same, the domain still keeps them apart.
+    const sameOp = { ...move, op: "draft-delete" } as unknown as NormalizedMailMove;
+    expect(await mailMoveChangeHashOf(sameOp)).not.toBe(await draftChangeHashOf(draft()));
+  });
+
+  it("hashes equal changes equally, across key order, and an absent subject as null", async () => {
+    const shuffled = { subject: "Thanks", id: ID, op: "draft-delete" } as NormalizedDraftChange;
+    expect(await draftChangeHashOf(shuffled)).toBe(await draftChangeHashOf(draft()));
+    const absent = { op: "draft-delete", id: ID } as NormalizedDraftChange;
+    expect(await draftChangeHashOf(absent)).toBe(await draftChangeHashOf(draft({ subject: null })));
+  });
+
+  it("differs when the id or the subject differs", async () => {
+    const hashes = await Promise.all(
+      [draft(), draft({ id: "other" }), draft({ subject: "Other" }), draft({ subject: null })].map(
+        (one) => draftChangeHashOf(one),
+      ),
+    );
+    expect(new Set(hashes).size).toBe(4);
   });
 });
 

@@ -66,6 +66,18 @@ import {
   FAKE_APPLE_ID,
   ownerPrincipal,
 } from "./fixtures/bound-secrets";
+import { SERVER_INSTRUCTIONS } from "../src/mcp/instructions";
+
+// README's text, for the no-stronger-claim guard over its mail rows. Read at
+// build time by Vite, as test/instructions.test.ts reads it: a Workers isolate
+// has no filesystem.
+// @ts-expect-error -- Vite's `import.meta.glob` has no ambient declaration here.
+const README_GLOB: Record<string, string> = import.meta.glob("../README.md", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+const README_TEXT: string = Object.values(README_GLOB)[0] ?? "";
 
 /** Every stranger-authored value the fixture carries, named once. */
 const SUBJECT = "Re: your interview — URGENT";
@@ -1207,20 +1219,117 @@ describe("the registrations themselves", () => {
     expect(description).toContain("moved back");
   });
 
-  it("takes exactly a confirmToken and a change on the mail commit, and the change is one op today", () => {
+  it("takes exactly a confirmToken and a change on the mail commit, and the change is two ops today", () => {
     const tool = registered().find((one) => one.name === "mail_commit");
     const schema = tool!.options.inputSchema as z.ZodObject<z.ZodRawShape>;
     const change = { op: "move", ids: ["x"], destination: "y" };
+    const draftChange = { op: "draft-delete", id: "x", subject: "Thanks" };
 
     expect(Object.keys(schema.shape).sort()).toEqual(["change", "confirmToken"]);
     expect(schema.safeParse({ confirmToken: "t", change }).success).toBe(true);
+    expect(schema.safeParse({ confirmToken: "t", change: draftChange }).success).toBe(true);
+    expect(
+      schema.safeParse({ confirmToken: "t", change: { ...draftChange, subject: null } }).success,
+    ).toBe(true);
     expect(schema.safeParse({ confirmToken: "t" }).success).toBe(false);
     expect(schema.safeParse({ change }).success).toBe(false);
     expect(
       schema.safeParse({ confirmToken: "t", change: { ...change, op: "delete" } }).success,
     ).toBe(false);
+    expect(
+      schema.safeParse({ confirmToken: "t", change: { op: "draft-delete", id: "x" } }).success,
+    ).toBe(false);
     expect(String(tool!.options.description)).toContain(UNTRUSTED_NOTICE);
     expect(String(tool!.options.description).length).toBeLessThan(280);
+  });
+
+  it("describes the mail commit in exactly these words, under the cap (Phase 22)", () => {
+    const tool = registered().find((one) => one.name === "mail_commit");
+    const description = String(tool!.options.description);
+
+    expect(description).toBe(
+      "Apply a move, archive, trash or draft preview. Pass confirmToken and change back " +
+        `unaltered. ${UNTRUSTED_NOTICE}`,
+    );
+    expect(description.length).toBe(276);
+    expect(description.length).toBeLessThan(280);
+  });
+
+  it("takes exactly one draft id on mail_delete_draft: no folder, list, search term or subject (DRFT-06)", () => {
+    const tool = registered().find((one) => one.name === "mail_delete_draft");
+    const schema = tool!.options.inputSchema as z.ZodObject<z.ZodRawShape>;
+
+    expect(Object.keys(schema.shape)).toEqual(["id"]);
+    expect(schema.safeParse({ id: "x" }).success).toBe(true);
+    expect(schema.safeParse({}).success).toBe(false);
+    expect(schema.safeParse({ id: 7 }).success).toBe(false);
+    expect(String(tool!.options.description)).toContain(UNTRUSTED_NOTICE);
+  });
+
+  it("no mail description, draft paragraph or README mail row claims this server wrote the draft, or that a delete is final (DRFT-07)", () => {
+    // Two claims the draft delete cannot keep. It does not check who wrote a
+    // draft (D-14), and it moves the draft to Trash, where it can be moved
+    // back out. Stems, so a later rewording is still caught.
+    const AUTHORSHIP = [
+      "this server wrote",
+      "this server created",
+      "written by this server",
+      "created by this server",
+      "drafts this server",
+    ];
+    const FINALITY = [
+      "permanent",
+      "irrecoverabl",
+      "unrecoverabl",
+      "cannot be undone",
+      "can't be undone",
+      "cannot be recovered",
+      "gone forever",
+    ];
+    const claims = new RegExp([...AUTHORSHIP, ...FINALITY].join("|"), "i");
+
+    // Every registered mail tool description.
+    const texts: [string, string][] = registered().map((tool) => [
+      tool.name,
+      String(tool.options.description),
+    ]);
+
+    // The two draft paragraphs in the instructions, located by their opening
+    // clauses. Only these two: "this server wrote" appears in the Boundaries
+    // section about the confirmation sentence, and that is correct there.
+    for (const opening of [
+      "One draft can be deleted.",
+      "There is no tool that edits a draft.",
+    ]) {
+      const start = SERVER_INSTRUCTIONS.indexOf(opening);
+      expect(start, `the instructions no longer open a paragraph with "${opening}"`).toBeGreaterThan(0);
+      const end = SERVER_INSTRUCTIONS.indexOf("\n", start);
+      texts.push([opening, SERVER_INSTRUCTIONS.slice(start, end === -1 ? undefined : end)]);
+    }
+
+    // README's mail tool rows. "Never removes mail for good" is a negation and
+    // stays quiet, because no stem above is "for good".
+    const rows = README_TEXT.split("\n").filter((line) => line.startsWith("| `mail_"));
+    expect(rows.length).toBeGreaterThan(10);
+    expect(rows.some((row) => row.startsWith("| `mail_delete_draft` |"))).toBe(true);
+    for (const row of rows) texts.push([row.slice(0, 30), row]);
+
+    for (const [where, text] of texts) {
+      expect(text, `${where} claims more than the draft delete can keep`).not.toMatch(claims);
+    }
+  });
+
+  it("describes mail_delete_draft in exactly these words, under the cap (Phase 22)", () => {
+    const tool = registered().find((one) => one.name === "mail_delete_draft");
+    const description = String(tool!.options.description);
+
+    expect(description).toBe(
+      `Preview moving one draft to Trash. Writes nothing; apply with mail_commit. ${UNTRUSTED_NOTICE}`,
+    );
+    expect(description.length).toBe(259);
+    expect(description.length).toBeLessThan(280);
+    // A delete that goes to Trash is never described as deleting for good.
+    expect(description).not.toMatch(/permanent|irrecoverabl|written by this server|this server wrote/i);
   });
 
   it("says undoing takes the opposite value, not a repeat of the same call (IN-01)", () => {
@@ -1779,7 +1888,7 @@ describe("the search and unread registrations", () => {
     return String((shape as z.ZodType).description);
   }
 
-  it("registers the five read tools D-17 names, the five that act on one, the one that changes a flag, and the move preview and its commit, and no others", () => {
+  it("registers the five read tools D-17 names, the five that act on one, the one that changes a flag, the move and draft previews and their commit, and no others", () => {
     // One tool per requirement, so the model's intent is unambiguous at the
     // call site rather than buried in a filter parameter. Compose-new and
     // compose-reply are two NAMES rather than one tool with an optional parent
@@ -1803,6 +1912,9 @@ describe("the search and unread registrations", () => {
       // licensed one tool carrying three ingresses, not two verbs behind one
       // name.
       "mail_confirm_upload",
+      // The seventeenth: a preview of moving one draft to Trash, applied by
+      // mail_commit (Phase 22, DRFT-03).
+      "mail_delete_draft",
       // The sixteenth: flag or unflag one message, written at once with no
       // preview, the same shape as mail_mark_read (D-01).
       "mail_flag",
@@ -1980,7 +2092,7 @@ describe("the search and unread registrations", () => {
     // the model arrives unwarned — and a per-tool assertion is a list somebody
     // has to remember to extend.
     const tools = registered();
-    expect(tools).toHaveLength(16);
+    expect(tools).toHaveLength(17);
 
     for (const tool of tools) {
       expect(
@@ -2389,14 +2501,15 @@ describe("the compose registration", () => {
     }
   });
 
-  it("registers exactly SIXTEEN tools: the tenth is the whole of plan 04-10, the eleventh is mail_mark_read, the twelfth and thirteenth are mail_move and mail_commit, the fourteenth and fifteenth are mail_archive and mail_trash, the sixteenth is mail_flag", () => {
+  it("registers exactly SEVENTEEN tools: the tenth is the whole of plan 04-10, the eleventh is mail_mark_read, the twelfth and thirteenth are mail_move and mail_commit, the fourteenth and fifteenth are mail_archive and mail_trash, the sixteenth is mail_flag, the seventeenth is mail_delete_draft", () => {
     // Nine through plan 04-09, plus mail_confirm_upload. The presigned INGRESS
     // added no registration at all — it is a third value on an existing
     // discriminator, which is precisely what D-80 bought and precisely what it
     // paid for with a union on the output. Phase 20 added the eleventh, the
     // first tool that changes a mailbox. Phase 21 added the move preview and
     // the mail commit, then the archive and Trash previews, then mail_flag.
-    expect(registered()).toHaveLength(16);
+    // Phase 22 added the draft delete preview.
+    expect(registered()).toHaveLength(17);
   });
 });
 
@@ -3618,8 +3731,8 @@ describe("a principal that was refused opens nothing", () => {
     return { gate, acquire, callbacks };
   }
 
-  it("registers all sixteen tools, so the table below leaves none out", () => {
-    expect(refusedTools().callbacks.size).toBe(16);
+  it("registers all seventeen tools, so the table below leaves none out", () => {
+    expect(refusedTools().callbacks.size).toBe(17);
   });
 
   it("mail_list_folders answers auth_failed with the fixed message and never acquires the gate", async () => {

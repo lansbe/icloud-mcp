@@ -120,7 +120,7 @@ person's derived id.
 | `server.ts` | Per-request server factory; session gate + DAV fetch; all tool registrations. |
 | `untrusted.ts` | The untrusted-content fence (notice + nonce + trusted/untrusted split). |
 | `tools/diagnose.ts` | `mail_imap_diagnose`. |
-| `tools/mail.ts` | The 16 mail tools and their response shapers. |
+| `tools/mail.ts` | The 17 mail tools and their response shapers. |
 | `tools/dav-diagnose.ts` | `dav_diagnose`. |
 | `tools/calendar.ts` | The 9 calendar tools; preview/commit logic. |
 | `tools/contacts.ts` | The 2 contact tools. |
@@ -131,7 +131,7 @@ person's derived id.
 |------|------|
 | `socket.ts` | **The only module that may open a TCP socket.** `connectImap()` takes no parameters. |
 | `service.ts` | **The two session orchestrators** over one private core: read (`withMailSession`, `withMailSessionOver`) and mutating (`withMutatingMailbox`, `withMutatingMailboxOver`), plus `createSessionGate`. The sole draft-write (`APPEND`) site, and the one place a mailbox is opened in the mutating form. |
-| `triage.ts` | **The only user of the mutating orchestrator.** Hands out verbs, never a session. Marks one message read or unread, flags or unflags one message, and moves a list of messages to another folder: a copy, then the removal of that one original. Fetches no message body. |
+| `triage.ts` | **The only user of the mutating orchestrator.** Hands out verbs, never a session. Marks one message read or unread, flags or unflags one message, and moves a list of messages to another folder: a copy, then the removal of that one original. Also moves one draft from the drafts folder to Trash, through the same move step. Fetches no message body. |
 | `imap-session.ts` | The IMAP wire conversation over a `DuplexLike` (socket-free, no logging). |
 | `imap-parser.ts` | Pure IMAP line parsing, no I/O. |
 | `mime.ts` | Raw RFC822 → decoded message (`postal-mime`, `HTMLRewriter`). |
@@ -311,7 +311,8 @@ this is the summary.
    is opened read-only (`EXAMINE`), and every fetch uses the peeking form.
    Non-peeking fetch items are banned. One separate path, used only by
    `src/mail/triage.ts`, opens a mailbox in the mutating form when the user
-   asks: to mark one message read or unread, to flag it, or to move messages.
+   asks: to mark one message read or unread, to flag it, to move messages, or
+   to move one draft to Trash.
    It is counted, kept apart by type, and fetches no body. A move copies first,
    and removes only the one original whose copy iCloud proved. Nothing removes
    mail in place or empties Trash.
