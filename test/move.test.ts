@@ -29,8 +29,11 @@ import {
   encodeFolderId,
   encodeMessageId,
 } from "../src/mail/ids";
+import { ImapConnectError } from "../src/errors";
 import { createSessionGate } from "../src/mail/service";
 import { connectImap } from "../src/mail/socket";
+import { moveMessagesOver } from "../src/mail/triage";
+import type { MoveEntry, MoveOutcome } from "../src/mail/triage";
 import { registerMailTools } from "../src/mcp/tools/mail";
 import {
   GREETING,
@@ -44,7 +47,7 @@ import {
   taggedOk,
   wire,
 } from "./fixtures/icloud-bytes";
-import { createFakeDuplex } from "./fixtures/fake-duplex";
+import { createFakeDuplex, createStallingDuplex } from "./fixtures/fake-duplex";
 import type { FakeDuplex } from "./fixtures/fake-duplex";
 import { ownerPrincipal } from "./fixtures/bound-secrets";
 
@@ -486,3 +489,556 @@ describe("the verdict comes from the re-read, not from an OK (TRIA-06)", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// Every way a move can end (21-02 Task 1)
+//
+// These drive the verb directly over a fake duplex, so each case can script a
+// reply the tool path never would. Every case asserts the WHOLE recorded line
+// array and the outcome together: an outcome alone cannot tell a removal that
+// was skipped from one that was sent and ignored.
+// ---------------------------------------------------------------------------
+
+/** Short bounds, so no ordinary case here costs wall time. */
+const VERB_BOUNDS = {
+  readTimeoutMs: 40,
+  drainTimeoutMs: 20,
+  closeTimeoutMs: 20,
+  callDeadlineMs: 5_000,
+};
+
+/** `INTERNAL_DATE` as whole seconds since the epoch, as a preview seals it. */
+const INTERNAL_SECONDS = Date.UTC(2026, 7, 13, 16, 14, 2) / 1000;
+
+const INBOX_SOURCE = { mailbox: "INBOX", uidValidity: INBOX_UIDVALIDITY };
+
+const ONE: Fixture = { uid: 4242, size: 18_431, modSeq: "742", subject: "One" };
+const TWO: Fixture = { uid: 4250, size: 2_048, modSeq: "760", subject: "Two" };
+const THREE: Fixture = { uid: 4260, size: 512, modSeq: "771", subject: "Three" };
+
+/** The entry a preview of `message` would have sealed. */
+function entryOf(message: Fixture): MoveEntry {
+  return {
+    uid: message.uid,
+    size: message.size,
+    internalDate: INTERNAL_SECONDS,
+    modSeq: message.modSeq,
+  };
+}
+
+/** Run the verb over `duplex` and hand back its answer. */
+async function runMove(
+  duplex: FakeDuplex,
+  messages: Fixture[],
+  options: Record<string, number> = VERB_BOUNDS,
+): Promise<MoveOutcome> {
+  return moveMessagesOver(
+    duplex,
+    await ownerPrincipal(),
+    createSessionGate(),
+    INBOX_SOURCE,
+    messages.map(entryOf),
+    RECEIPTS,
+    options,
+  );
+}
+
+/** A read-write open with the default permanent flags. */
+function writableOpen(tag = "a4"): Uint8Array {
+  return selectResponse(tag, "[READ-WRITE]");
+}
+
+/** The lines of one message's full four-step move, from tag `a<n>`. */
+function fullMoveLines(n: number, message: Fixture): string[] {
+  return [
+    `a${n} UID COPY ${message.uid} "${RECEIPTS}"`,
+    `a${n + 1} UID STORE ${message.uid} (UNCHANGEDSINCE ${message.modSeq}) +FLAGS (\\Deleted)`,
+    `a${n + 2} UID EXPUNGE ${message.uid}`,
+    `a${n + 3} UID SEARCH UID ${message.uid}`,
+  ];
+}
+
+/** The replies of one message's clean move, from tag `a<n>`. */
+function fullMoveReplies(n: number, message: Fixture, newUid: number): Uint8Array[] {
+  return [
+    copyReply(`a${n}`, message.uid, newUid),
+    markEcho(`a${n + 1}`, message.uid, "9001"),
+    wire(`a${n + 2} OK EXPUNGE completed`),
+    searchReply(`a${n + 3}`, []),
+  ];
+}
+
+/** The commit's opening lines for `messages`: the open, then the whole-list check. */
+function openAndCheckLines(messages: Fixture[]): string[] {
+  return [
+    ...SIGN_IN,
+    'a4 SELECT "INBOX"',
+    `a5 UID FETCH ${messages.map((m) => m.uid).join(",")} ` +
+      "(UID FLAGS RFC822.SIZE INTERNALDATE MODSEQ)",
+  ];
+}
+
+/**
+ * The command word of a recorded line, past its tag and any `UID` prefix, with
+ * the first argument: `"STORE 4242"`, `"COPY 4242"`, `"LOGOUT "`.
+ */
+function commandOf(line: string): { word: string; uid: string } {
+  const tokens = line.split(" ");
+  const rest = (tokens[1] ?? "").toUpperCase() === "UID" ? tokens.slice(2) : tokens.slice(1);
+  const word = (rest[0] ?? "").toUpperCase();
+  // SEARCH names its UID after the `UID` search key.
+  const uid = word === "SEARCH" ? (rest[2] ?? "") : (rest[1] ?? "");
+  return { word, uid };
+}
+
+/** Assert that no recorded line sends `word` for `uid` (any UID when omitted). */
+function expectNoLine(lines: string[], word: string, uid?: number): void {
+  const hits = lines.filter((line) => {
+    const command = commandOf(line);
+    return command.word === word && (uid === undefined || command.uid === String(uid));
+  });
+  expect(hits, `a ${word}${uid === undefined ? "" : ` for ${uid}`} was sent`).toEqual([]);
+}
+
+/** The three commands that change mail, after the copy. */
+const CHANGING = ["COPY", "STORE", "EXPUNGE"] as const;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * A duplex whose every chunk waits `delayMs` before it is handed over.
+ *
+ * Models a slow server: each reply takes a while, so a list's time runs out
+ * part-way through. Built over `createFakeDuplex` so the recording is the same.
+ */
+function slowDuplex(script: Uint8Array[], delayMs: number): FakeDuplex {
+  const fake = createFakeDuplex(script);
+  const inner = fake.readable.getReader();
+  const readable = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        await sleep(delayMs);
+        const { value, done } = await inner.read();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  return { ...fake, readable };
+}
+
+describe("every way a move can end", () => {
+  it("copy answered NO: not_copied, copy-refused, nothing more for it, and the next message still moves", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      writableOpen(),
+      fingerprintReply("a5", [ONE, TWO]),
+      wire("a6 NO [OVERQUOTA] COPY failed"),
+      ...fullMoveReplies(7, TWO, 89),
+      logoutExchange("a11"),
+    ]);
+
+    const outcome = await runMove(duplex, [ONE, TWO]);
+
+    const lines = wireOf(duplex);
+    expect(lines).toEqual([
+      ...openAndCheckLines([ONE, TWO]),
+      `a6 UID COPY 4242 "${RECEIPTS}"`,
+      ...fullMoveLines(7, TWO),
+      "a11 LOGOUT",
+    ]);
+    for (const word of ["STORE", "EXPUNGE", "SEARCH"]) expectNoLine(lines, word, ONE.uid);
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "not_copied", reason: "copy-refused", newUid: null, destinationUidValidity: null },
+        { uid: 4250, outcome: "moved", reason: "verified-gone", newUid: 89, destinationUidValidity: RECEIPTS_UIDVALIDITY },
+      ],
+    });
+  });
+
+  it.each([
+    ["no COPYUID at all", "a6 OK COPY completed"],
+    ["a COPYUID naming a different source UID", `a6 OK [COPYUID ${RECEIPTS_UIDVALIDITY} 4243 88] COPY completed`],
+    ["a COPYUID with two destination UIDs", `a6 OK [COPYUID ${RECEIPTS_UIDVALIDITY} 4242,4243 88,89] COPY completed`],
+  ])("copy OK with %s: copied_not_removed, copy-unproven, and nothing more for it", async (_label, reply) => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      writableOpen(),
+      fingerprintReply("a5", [ONE]),
+      wire(reply),
+      logoutExchange("a7"),
+    ]);
+
+    const outcome = await runMove(duplex, [ONE]);
+
+    const lines = wireOf(duplex);
+    expect(lines).toEqual([
+      ...openAndCheckLines([ONE]),
+      `a6 UID COPY 4242 "${RECEIPTS}"`,
+      "a7 LOGOUT",
+    ]);
+    for (const word of ["STORE", "EXPUNGE", "SEARCH"]) expectNoLine(lines, word, ONE.uid);
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "copied_not_removed", reason: "copy-unproven", newUid: null, destinationUidValidity: null },
+      ],
+    });
+  });
+
+  it.each([
+    ["OK", "a7 OK [MODIFIED 4242] Conditional STORE failed"],
+    ["NO", "a7 NO [MODIFIED 4242] Conditional STORE failed"],
+  ])("removal mark answered %s [MODIFIED]: no removal, the search runs, changed-since-preview", async (_label, reply) => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      writableOpen(),
+      fingerprintReply("a5", [ONE]),
+      copyReply("a6", ONE.uid, 88),
+      wire(reply),
+      searchReply("a8", [ONE.uid]),
+      logoutExchange("a9"),
+    ]);
+
+    const outcome = await runMove(duplex, [ONE]);
+
+    const lines = wireOf(duplex);
+    expect(lines).toEqual([
+      ...openAndCheckLines([ONE]),
+      `a6 UID COPY 4242 "${RECEIPTS}"`,
+      "a7 UID STORE 4242 (UNCHANGEDSINCE 742) +FLAGS (\\Deleted)",
+      "a8 UID SEARCH UID 4242",
+      "a9 LOGOUT",
+    ]);
+    expectNoLine(lines, "EXPUNGE");
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "copied_not_removed", reason: "changed-since-preview", newUid: 88, destinationUidValidity: RECEIPTS_UIDVALIDITY },
+      ],
+    });
+  });
+
+  it("removal mark answered NO with no code: copied_not_removed, mark-refused, no removal", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      writableOpen(),
+      fingerprintReply("a5", [ONE]),
+      copyReply("a6", ONE.uid, 88),
+      wire("a7 NO STORE failed"),
+      searchReply("a8", [ONE.uid]),
+      logoutExchange("a9"),
+    ]);
+
+    const outcome = await runMove(duplex, [ONE]);
+
+    const lines = wireOf(duplex);
+    expect(lines).toEqual([
+      ...openAndCheckLines([ONE]),
+      `a6 UID COPY 4242 "${RECEIPTS}"`,
+      "a7 UID STORE 4242 (UNCHANGEDSINCE 742) +FLAGS (\\Deleted)",
+      "a8 UID SEARCH UID 4242",
+      "a9 LOGOUT",
+    ]);
+    expectNoLine(lines, "EXPUNGE");
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "copied_not_removed", reason: "mark-refused", newUid: 88, destinationUidValidity: RECEIPTS_UIDVALIDITY },
+      ],
+    });
+  });
+
+  it("removal answered NO and the search still lists the UID: copied_not_removed, removal-refused", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      writableOpen(),
+      fingerprintReply("a5", [ONE]),
+      copyReply("a6", ONE.uid, 88),
+      markEcho("a7", ONE.uid, "743"),
+      wire("a8 NO EXPUNGE failed"),
+      searchReply("a9", [ONE.uid]),
+      logoutExchange("a10"),
+    ]);
+
+    const outcome = await runMove(duplex, [ONE]);
+
+    expect(wireOf(duplex)).toEqual([
+      ...openAndCheckLines([ONE]),
+      ...fullMoveLines(6, ONE),
+      "a10 LOGOUT",
+    ]);
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "copied_not_removed", reason: "removal-refused", newUid: 88, destinationUidValidity: RECEIPTS_UIDVALIDITY },
+      ],
+    });
+  });
+
+  it("removal mark refused but the search no longer lists the UID: moved, verified-gone", async () => {
+    // Someone else removed the original in the meantime. The copy is proven in
+    // the destination and the source no longer holds it, which is a move.
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      writableOpen(),
+      fingerprintReply("a5", [ONE]),
+      copyReply("a6", ONE.uid, 88),
+      wire("a7 NO STORE failed"),
+      searchReply("a8", []),
+      logoutExchange("a9"),
+    ]);
+
+    const outcome = await runMove(duplex, [ONE]);
+
+    const lines = wireOf(duplex);
+    expect(lines).toEqual([
+      ...openAndCheckLines([ONE]),
+      `a6 UID COPY 4242 "${RECEIPTS}"`,
+      "a7 UID STORE 4242 (UNCHANGEDSINCE 742) +FLAGS (\\Deleted)",
+      "a8 UID SEARCH UID 4242",
+      "a9 LOGOUT",
+    ]);
+    expectNoLine(lines, "EXPUNGE");
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "moved", reason: "verified-gone", newUid: 88, destinationUidValidity: RECEIPTS_UIDVALIDITY },
+      ],
+    });
+  });
+
+  it("search answered NO: unknown, verify-refused, with the proven copy", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      writableOpen(),
+      fingerprintReply("a5", [ONE]),
+      copyReply("a6", ONE.uid, 88),
+      markEcho("a7", ONE.uid, "743"),
+      wire("a8 OK EXPUNGE completed"),
+      wire("a9 NO SEARCH failed"),
+      logoutExchange("a10"),
+    ]);
+
+    const outcome = await runMove(duplex, [ONE]);
+
+    expect(wireOf(duplex)).toEqual([
+      ...openAndCheckLines([ONE]),
+      ...fullMoveLines(6, ONE),
+      "a10 LOGOUT",
+    ]);
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "unknown", reason: "verify-refused", newUid: 88, destinationUidValidity: RECEIPTS_UIDVALIDITY },
+      ],
+    });
+  });
+
+  const STALE: [string, (message: Fixture) => string][] = [
+    ["its MODSEQ", (m) => `* 1 FETCH (UID ${m.uid} FLAGS (\\Seen) RFC822.SIZE ${m.size} INTERNALDATE "${INTERNAL_DATE}" MODSEQ (999))`],
+    ["its size", (m) => `* 1 FETCH (UID ${m.uid} FLAGS (\\Seen) RFC822.SIZE ${m.size + 1} INTERNALDATE "${INTERNAL_DATE}" MODSEQ (${m.modSeq}))`],
+    ["its internal date", (m) => `* 1 FETCH (UID ${m.uid} FLAGS (\\Seen) RFC822.SIZE ${m.size} INTERNALDATE "13-Aug-2026 09:14:03 -0700" MODSEQ (${m.modSeq}))`],
+    ["no reply for it at all", () => "* 1 FETCH (UID 1 FLAGS (\\Seen))"],
+  ];
+
+  it.each(STALE)("whole-list check where one message differs in %s: changed-since-preview naming it, and no copy anywhere", async (_label, staleLine) => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      writableOpen(),
+      wire(
+        `* 2 FETCH (${fingerprintItems(ONE)})`,
+        staleLine(TWO),
+        `* 3 FETCH (${fingerprintItems(THREE)})`,
+        "a5 OK FETCH completed",
+      ),
+      logoutExchange("a6"),
+    ]);
+
+    const outcome = await runMove(duplex, [ONE, TWO, THREE]);
+
+    const lines = wireOf(duplex);
+    expect(lines).toEqual([...openAndCheckLines([ONE, TWO, THREE]), "a6 LOGOUT"]);
+    for (const word of CHANGING) expectNoLine(lines, word);
+    expect(outcome).toEqual({
+      applied: false,
+      refusal: "changed-since-preview",
+      changedUids: [TWO.uid],
+    });
+  });
+
+  it("an open that completes read-only: mailbox-read-only, nothing after the open", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-ONLY]"),
+      logoutExchange("a5"),
+    ]);
+
+    const outcome = await runMove(duplex, [ONE]);
+
+    expect(wireOf(duplex)).toEqual([...SIGN_IN, 'a4 SELECT "INBOX"', "a5 LOGOUT"]);
+    expect(outcome).toEqual({ applied: false, refusal: "mailbox-read-only" });
+  });
+
+  it("a permanent-flags list with the seen flag but not the removal mark: removal-not-kept, nothing after the open", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]", 172, INBOX_UIDVALIDITY, "\\Answered \\Seen \\*"),
+      logoutExchange("a5"),
+    ]);
+
+    const outcome = await runMove(duplex, [ONE]);
+
+    expect(wireOf(duplex)).toEqual([...SIGN_IN, 'a4 SELECT "INBOX"', "a5 LOGOUT"]);
+    expect(outcome).toEqual({ applied: false, refusal: "removal-not-kept" });
+  });
+
+  it.each([
+    ["UIDPLUS", POST_AUTH_CAPABILITY.replace(" UIDPLUS", "")],
+    ["CONDSTORE", POST_AUTH_CAPABILITY.replace(" CONDSTORE", "")],
+  ])("a post-login capability without %s: commands-unavailable, nothing after the open", async (missing, capability) => {
+    expect(capability.split(" ")).not.toContain(missing);
+    const duplex = createFakeDuplex([
+      GREETING,
+      capabilityResponse("a1", PRE_AUTH_CAPABILITY),
+      taggedOk("a2", "LOGIN completed"),
+      capabilityResponse("a3", capability),
+      writableOpen(),
+      logoutExchange("a5"),
+    ]);
+
+    const outcome = await runMove(duplex, [ONE]);
+
+    expect(wireOf(duplex)).toEqual([...SIGN_IN, 'a4 SELECT "INBOX"', "a5 LOGOUT"]);
+    expect(outcome).toEqual({ applied: false, refusal: "commands-unavailable" });
+  });
+
+  it("a connection lost right after the first copy: that one unknown, the rest not attempted, and results rather than an error", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      writableOpen(),
+      fingerprintReply("a5", [ONE, TWO, THREE]),
+      // The script ends here, so the copy's reply never comes.
+    ]);
+
+    const outcome = await runMove(duplex, [ONE, TWO, THREE]);
+
+    const lines = wireOf(duplex);
+    expect(lines).toEqual([
+      ...openAndCheckLines([ONE, TWO, THREE]),
+      `a6 UID COPY 4242 "${RECEIPTS}"`,
+      "a7 LOGOUT",
+    ]);
+    expectNoLine(lines, "COPY", TWO.uid);
+    expectNoLine(lines, "COPY", THREE.uid);
+    expectNoLine(lines, "STORE");
+    expectNoLine(lines, "EXPUNGE");
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "unknown", reason: "connection-lost", newUid: null, destinationUidValidity: null },
+        { uid: 4250, outcome: "not_copied", reason: "not-attempted", newUid: null, destinationUidValidity: null },
+        { uid: 4260, outcome: "not_copied", reason: "not-attempted", newUid: null, destinationUidValidity: null },
+      ],
+    });
+  });
+
+  it("a connection lost during the whole-list check: a connection failure, and no copy", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      writableOpen(),
+      // The script ends before the fingerprint reply.
+    ]);
+
+    await expect(runMove(duplex, [ONE, TWO])).rejects.toBeInstanceOf(ImapConnectError);
+
+    const lines = wireOf(duplex);
+    expect(lines).toEqual([...openAndCheckLines([ONE, TWO]), "a6 LOGOUT"]);
+    for (const word of CHANGING) expectNoLine(lines, word);
+  });
+
+  it("the call deadline firing while the second copy waits: first moved, second unknown, third not copied, and nothing changing after it", async () => {
+    const duplex = createStallingDuplex([
+      ...authPrefix(),
+      writableOpen(),
+      fingerprintReply("a5", [ONE, TWO, THREE]),
+      ...fullMoveReplies(6, ONE, 88),
+      // The second copy's reply never comes, and the stream never ends.
+    ]);
+
+    const outcome = await runMove(duplex, [ONE, TWO, THREE], {
+      readTimeoutMs: 400,
+      drainTimeoutMs: 20,
+      closeTimeoutMs: 20,
+      callDeadlineMs: 120,
+    });
+
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "moved", reason: "verified-gone", newUid: 88, destinationUidValidity: RECEIPTS_UIDVALIDITY },
+        { uid: 4250, outcome: "unknown", reason: "connection-lost", newUid: null, destinationUidValidity: null },
+        { uid: 4260, outcome: "not_copied", reason: "not-attempted", newUid: null, destinationUidValidity: null },
+      ],
+    });
+
+    // Give any late continuation of the abandoned step time to act.
+    await sleep(500);
+    const lines = wireOf(duplex);
+    expect(lines).toEqual([
+      ...openAndCheckLines([ONE, TWO, THREE]),
+      ...fullMoveLines(6, ONE),
+      `a10 UID COPY 4250 "${RECEIPTS}"`,
+      "a11 LOGOUT",
+    ]);
+    for (const uid of [TWO.uid, THREE.uid]) {
+      expectNoLine(lines, "STORE", uid);
+      expectNoLine(lines, "EXPUNGE", uid);
+    }
+    expectNoLine(lines, "COPY", THREE.uid);
+  });
+
+  it("replies slow enough that half the call deadline passes during the first message: the rest not attempted, with no line", async () => {
+    const duplex = slowDuplex(
+      [
+        ...authPrefix(),
+        writableOpen(),
+        fingerprintReply("a5", [ONE, TWO, THREE]),
+        ...fullMoveReplies(6, ONE, 88),
+        logoutExchange("a10"),
+      ],
+      80,
+    );
+
+    const outcome = await runMove(duplex, [ONE, TWO, THREE], {
+      readTimeoutMs: 1_000,
+      drainTimeoutMs: 20,
+      closeTimeoutMs: 20,
+      // Half is 320ms. The check and the first message take about 400.
+      callDeadlineMs: 640,
+    });
+
+    const lines = wireOf(duplex);
+    expect(lines).toEqual([
+      ...openAndCheckLines([ONE, TWO, THREE]),
+      ...fullMoveLines(6, ONE),
+      "a10 LOGOUT",
+    ]);
+    for (const uid of [TWO.uid, THREE.uid]) {
+      for (const word of [...CHANGING, "SEARCH"]) expectNoLine(lines, word, uid);
+    }
+    expect(outcome).toEqual({
+      applied: true,
+      results: [
+        { uid: 4242, outcome: "moved", reason: "verified-gone", newUid: 88, destinationUidValidity: RECEIPTS_UIDVALIDITY },
+        { uid: 4250, outcome: "not_copied", reason: "not-attempted", newUid: null, destinationUidValidity: null },
+        { uid: 4260, outcome: "not_copied", reason: "not-attempted", newUid: null, destinationUidValidity: null },
+      ],
+    });
+  });
+});
+
