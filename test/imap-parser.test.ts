@@ -28,13 +28,19 @@ import {
   parseAccessCode,
   parseCapabilityLine,
   parseCompletionCode,
+  parseCopyUid,
+  parseFingerprint,
   parseListLine,
+  parseEsearchCount,
+  parseModifiedUids,
   parsePermanentFlags,
   parseSearchLine,
   parseStatusLine,
   parseTaggedResponse,
   resolveFolderRole,
   seenStateOf,
+  flagStateOf,
+  keepsFlag,
 } from "../src/mail/imap-parser";
 import { ImapChannel, readUntilTag } from "../src/mail/imap-session";
 import { createFakeDuplex } from "./fixtures/fake-duplex";
@@ -47,6 +53,8 @@ import {
   AUTH_UNCLASSIFIED_TEXT,
   CONNECTION_LIMIT_TEXT,
   GREETING_LINE,
+  MEASURED_ESEARCH_GONE_LINE,
+  MEASURED_ESEARCH_PRESENT_LINE,
   POST_AUTH_CAPABILITY,
   PRE_AUTH_CAPABILITY,
   UNTIDY_CAPABILITY_LINE,
@@ -987,6 +995,44 @@ describe("parseSearchLine", () => {
   });
 });
 
+describe("parseEsearchCount", () => {
+  // iCloud sends no untagged search line when a plain search matches nothing
+  // (21-UAT.md, "Probe, 2026-09-27"), so a move's re-read asks for a count
+  // instead. These are the two lines the probe recorded, then every way a line
+  // can fail to be the answer to THIS command.
+  async function countOf(line: string, tag: string): Promise<number | null> {
+    const [first] = await untaggedFrom(line);
+    return parseEsearchCount(first!, tag);
+  }
+
+  it.each<[string, string, string, number | null]>([
+    ["iCloud's measured reply for a UID that is gone", MEASURED_ESEARCH_GONE_LINE, "a6", 0],
+    ["iCloud's measured reply for a UID that is there", MEASURED_ESEARCH_PRESENT_LINE, "a7", 1],
+    ["the gone reply read for another command's tag", MEASURED_ESEARCH_GONE_LINE, "a7", null],
+    ["a tag that only starts the same", '* ESEARCH (TAG "a60") UID COUNT 0', "a6", null],
+    ["no correlator at all", "* ESEARCH UID COUNT 0", "a6", null],
+    ["a correlator with no tag value", "* ESEARCH (TAG) UID COUNT 0", "a6", null],
+    ["no COUNT item", '* ESEARCH (TAG "a6") UID MIN 3', "a6", null],
+    ["no return data at all", '* ESEARCH (TAG "a6") UID', "a6", null],
+    ["COUNT with no number", '* ESEARCH (TAG "a6") UID COUNT', "a6", null],
+    ["COUNT with a word for a number", '* ESEARCH (TAG "a6") UID COUNT none', "a6", null],
+    ["COUNT with a negative number", '* ESEARCH (TAG "a6") UID COUNT -1', "a6", null],
+    ["COUNT with a leading zero", '* ESEARCH (TAG "a6") UID COUNT 01', "a6", null],
+    ["COUNT past the 32-bit range", '* ESEARCH (TAG "a6") UID COUNT 4294967296', "a6", null],
+    ["COUNT twice", '* ESEARCH (TAG "a6") UID COUNT 0 COUNT 1', "a6", null],
+    ["other items before COUNT", '* ESEARCH (TAG "a6") UID MIN 3 COUNT 1', "a6", 1],
+    ["other items after COUNT", '* ESEARCH (TAG "a6") UID COUNT 2 MIN 3 MAX 9', "a6", 2],
+    ["a set-valued item before COUNT", '* ESEARCH (TAG "a6") UID ALL 3:5,9 COUNT 4', "a6", 4],
+    ["no UID marker", '* ESEARCH (TAG "a6") COUNT 0', "a6", 0],
+    ["lowercase throughout", '* esearch (tag "a6") uid count 0', "a6", 0],
+    ["a plain search line", "* SEARCH 4242", "a6", null],
+    ["iCloud's empty plain search, were it ever sent", "* SEARCH", "a6", null],
+    ["another untagged line", "* 3 EXISTS", "a6", null],
+  ])("%s", async (_label, line, tag, expected) => {
+    expect(await countOf(line, tag)).toBe(expected);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // The mutating path's two parsers (phase 20, plan 20-03)
 // ---------------------------------------------------------------------------
@@ -1169,5 +1215,216 @@ describe("seenStateOf", () => {
     const untagged = await untaggedFrom("* 4 FETCH (UID 11 FLAGS (\\Flagged \\Answered))");
 
     expect(seenStateOf(untagged, 11)).toBe(false);
+  });
+});
+
+// ===========================================================================
+// The move path's parsers (Phase 21)
+// ===========================================================================
+
+/**
+ * The destination's validity in every COPYUID row below.
+ *
+ * Different from every source validity in this file, and from the source UID,
+ * so a parser that read the fields in the wrong order cannot pass (RFC 4315 §3
+ * puts the DESTINATION's validity first; PITFALLS #35).
+ */
+const COPY_DESTINATION_VALIDITY = 1_700_000_001;
+
+describe("parseCopyUid", () => {
+  it("reads the destination's validity first, then the source set, then the destination set", () => {
+    expect(parseCopyUid(`a6 OK [COPYUID ${COPY_DESTINATION_VALIDITY} 4242 91] Done`)).toEqual({
+      uidValidity: COPY_DESTINATION_VALIDITY,
+      source: [4242],
+      destination: [91],
+    });
+  });
+
+  it.each<[string, string, { uidValidity: number; source: number[]; destination: number[] }]>([
+    ["a range written high to low equals low to high", "4:2 91:93", { uidValidity: COPY_DESTINATION_VALIDITY, source: [2, 3, 4], destination: [91, 92, 93] }],
+    ["a range written low to high", "2:4 91:93", { uidValidity: COPY_DESTINATION_VALIDITY, source: [2, 3, 4], destination: [91, 92, 93] }],
+    ["a list with a range expands in order", "1,3:4 91,92,93", { uidValidity: COPY_DESTINATION_VALIDITY, source: [1, 3, 4], destination: [91, 92, 93] }],
+    ["exactly 100 UIDs", "1:100 201:300", { uidValidity: COPY_DESTINATION_VALIDITY, source: Array.from({ length: 100 }, (_u, i) => i + 1), destination: Array.from({ length: 100 }, (_u, i) => i + 201) }],
+  ])("%s", (_label, sets, expected) => {
+    expect(parseCopyUid(`a6 OK [COPYUID ${COPY_DESTINATION_VALIDITY} ${sets}] Done`)).toEqual(expected);
+  });
+
+  it.each<[string, string]>([
+    ["unequal set lengths", `a6 OK [COPYUID ${COPY_DESTINATION_VALIDITY} 4242,4243 91] Done`],
+    ["more than 100 UIDs", `a6 OK [COPYUID ${COPY_DESTINATION_VALIDITY} 1:101 201:301] Done`],
+    ["a zero source UID", `a6 OK [COPYUID ${COPY_DESTINATION_VALIDITY} 0 91] Done`],
+    ["a zero destination UID", `a6 OK [COPYUID ${COPY_DESTINATION_VALIDITY} 4242 0] Done`],
+    ["a zero validity", "a6 OK [COPYUID 0 4242 91] Done"],
+    ["a NO line", `a6 NO [COPYUID ${COPY_DESTINATION_VALIDITY} 4242 91] Done`],
+    ["an untagged line", `* OK [COPYUID ${COPY_DESTINATION_VALIDITY} 4242 91] Done`],
+    ["another code", `a6 OK [APPENDUID ${COPY_DESTINATION_VALIDITY} 91] Done`],
+    ["the code later in the text", `a6 OK Done [COPYUID ${COPY_DESTINATION_VALIDITY} 4242 91]`],
+  ])("%s is null", (_label, text) => {
+    expect(parseCopyUid(text)).toBeNull();
+  });
+});
+
+describe("parseModifiedUids", () => {
+  it.each<[string, string, number[] | null]>([
+    ["on OK", "a7 OK [MODIFIED 4242] Conditional STORE failed", [4242]],
+    ["on NO", "a7 NO [MODIFIED 4242] Conditional STORE failed", [4242]],
+    ["a range and a list", "a7 OK [MODIFIED 7,9:11] Conditional STORE failed", [7, 9, 10, 11]],
+    ["absent", "a7 OK STORE completed", null],
+    ["absent on NO", "a7 NO STORE failed", null],
+  ])("%s", (_label, text, expected) => {
+    expect(parseModifiedUids(text)).toEqual(expected);
+  });
+});
+
+describe("parseFingerprint", () => {
+  const DATE = '"13-Aug-2026 09:14:02 -0700"';
+  const SECONDS = Date.UTC(2026, 7, 13, 16, 14, 2) / 1000;
+
+  function reply(seq: number, uid: number, size: string, date: string, modSeq: string | null): string {
+    const modSeqItem = modSeq === null ? "" : ` MODSEQ (${modSeq})`;
+    return `* ${seq} FETCH (UID ${uid} FLAGS (\\Seen) RFC822.SIZE ${size} INTERNALDATE ${date}${modSeqItem})`;
+  }
+
+  it("finds the reply whose own UID matches, among several", async () => {
+    const untagged = await untaggedFrom(
+      reply(1, 4241, "10", DATE, "1"),
+      reply(2, 4242, "18431", DATE, "742"),
+      reply(3, 4243, "30", DATE, "3"),
+    );
+
+    expect(parseFingerprint(untagged, 4242)).toEqual({
+      uid: 4242,
+      flags: ["\\Seen"],
+      size: 18_431,
+      internalDate: SECONDS,
+      modSeq: "742",
+    });
+  });
+
+  it("takes the last of two replies for one UID", async () => {
+    const untagged = await untaggedFrom(
+      reply(2, 4242, "18431", DATE, "742"),
+      reply(2, 4242, "18431", DATE, "743"),
+    );
+
+    expect(parseFingerprint(untagged, 4242)?.modSeq).toBe("743");
+  });
+
+  it("ignores the sequence number", async () => {
+    // Sequence number 4242 names a different message; only the UID item counts.
+    const untagged = await untaggedFrom(reply(4242, 7, "10", DATE, "1"));
+
+    expect(parseFingerprint(untagged, 4242)).toBeNull();
+    expect(parseFingerprint(untagged, 7)?.uid).toBe(7);
+  });
+
+  it.each<[string, string | null]>([
+    ["no MODSEQ", null],
+    ["a MODSEQ of 0", "0"],
+    ["a MODSEQ with a leading zero", "07"],
+    ["a 20-digit MODSEQ", "12345678901234567890"],
+  ])("%s is null", async (_label, modSeq) => {
+    const untagged = await untaggedFrom(reply(1, 4242, "18431", DATE, modSeq));
+
+    expect(parseFingerprint(untagged, 4242)).toBeNull();
+  });
+
+  it("keeps a 19-digit MODSEQ exactly, as digits", async () => {
+    const untagged = await untaggedFrom(reply(1, 4242, "18431", DATE, "9223372036854775807"));
+
+    expect(parseFingerprint(untagged, 4242)?.modSeq).toBe("9223372036854775807");
+  });
+
+  it("reads a day padded with a space", async () => {
+    const untagged = await untaggedFrom(reply(1, 4242, "18431", '" 3-Aug-2026 09:14:02 -0700"', "742"));
+
+    expect(parseFingerprint(untagged, 4242)?.internalDate).toBe(
+      Date.UTC(2026, 7, 3, 16, 14, 2) / 1000,
+    );
+  });
+
+  it.each<[string, string, string]>([
+    ["a day that does not exist", "18431", '"31-Feb-2026 09:14:02 -0700"'],
+    ["an unknown month", "18431", '"13-Foo-2026 09:14:02 -0700"'],
+    ["a size above the wire bound", "4294967296", DATE],
+  ])("%s is null", async (_label, size, date) => {
+    const untagged = await untaggedFrom(reply(1, 4242, size, date, "742"));
+
+    expect(parseFingerprint(untagged, 4242)).toBeNull();
+  });
+});
+
+
+describe("keepsFlag (D-08)", () => {
+  const FLAGS = ["\\Seen", "\\Flagged", "\\Deleted"] as const;
+
+  it("is true for every flag when the open sent no list (RFC 3501 §6.3.1)", () => {
+    for (const flag of FLAGS) expect(keepsFlag(null, flag), flag).toBe(true);
+  });
+
+  it("is false for every flag on an empty list", () => {
+    for (const flag of FLAGS) expect(keepsFlag([], flag), flag).toBe(false);
+  });
+
+  it.each(FLAGS)("finds %s when present, in any case, and not when absent", (flag) => {
+    const others = FLAGS.filter((one) => one !== flag);
+    expect(keepsFlag([flag], flag)).toBe(true);
+    expect(keepsFlag(["\\Answered", flag.toUpperCase()], flag)).toBe(true);
+    expect(keepsFlag([flag.toLowerCase()], flag)).toBe(true);
+    expect(keepsFlag(others, flag)).toBe(false);
+  });
+
+  it.each(FLAGS)("does not count \\* alone for %s: it is about keywords", (flag) => {
+    expect(keepsFlag(["\\*"], flag)).toBe(false);
+  });
+});
+
+describe("flagStateOf", () => {
+  it("finds the reply whose own UID matches, among several", async () => {
+    const untagged = await untaggedFrom(
+      "* 3 FETCH (UID 10 FLAGS (\\Seen))",
+      "* 4 FETCH (UID 11 FLAGS (\\Flagged))",
+      "* 5 FETCH (UID 12 FLAGS ())",
+    );
+
+    expect(flagStateOf(untagged, 11, "\\Flagged")).toBe(true);
+    expect(flagStateOf(untagged, 10, "\\Flagged")).toBe(false);
+    expect(flagStateOf(untagged, 12, "\\Flagged")).toBe(false);
+    expect(flagStateOf(untagged, 10, "\\Seen")).toBe(true);
+  });
+
+  it("lets the last reply for the UID win", async () => {
+    const flaggedLast = await untaggedFrom(
+      "* 4 FETCH (UID 11 FLAGS ())",
+      "* 4 FETCH (UID 11 FLAGS (\\flagged))",
+    );
+    const clearedLast = await untaggedFrom(
+      "* 4 FETCH (UID 11 FLAGS (\\Flagged))",
+      "* 4 FETCH (UID 11 FLAGS ())",
+    );
+
+    expect(flagStateOf(flaggedLast, 11, "\\Flagged")).toBe(true);
+    expect(flagStateOf(clearedLast, 11, "\\Flagged")).toBe(false);
+  });
+
+  it("keys on the UID item, never on the sequence-number prefix", async () => {
+    const untagged = await untaggedFrom("* 11 FETCH (UID 40 FLAGS (\\Flagged))");
+
+    expect(flagStateOf(untagged, 11, "\\Flagged")).toBeNull();
+    expect(flagStateOf(untagged, 40, "\\Flagged")).toBe(true);
+  });
+
+  it("is null when no reply for the UID carries a flag list", async () => {
+    const untagged = await untaggedFrom("* 4 FETCH (UID 11 RFC822.SIZE 100)");
+
+    expect(flagStateOf(untagged, 11, "\\Flagged")).toBeNull();
+    expect(flagStateOf([], 11, "\\Flagged")).toBeNull();
+  });
+
+  it("does not read the other flag as this one", async () => {
+    const untagged = await untaggedFrom("* 4 FETCH (UID 11 FLAGS (\\Seen))");
+
+    expect(flagStateOf(untagged, 11, "\\Flagged")).toBe(false);
+    expect(flagStateOf(untagged, 11, "\\Seen")).toBe(true);
   });
 });

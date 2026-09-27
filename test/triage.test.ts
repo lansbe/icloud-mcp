@@ -43,6 +43,8 @@ import { createFakeDuplex } from "./fixtures/fake-duplex";
 import type { FakeDuplex } from "./fixtures/fake-duplex";
 import type { Principal } from "../src/principal";
 import { ownerPrincipal } from "./fixtures/bound-secrets";
+import { flagMessageOver, unflagMessageOver } from "../src/mail/triage";
+import { flagStateToolResult } from "../src/mcp/tools/mail";
 
 // The verbs module's own source, for the no-body guard. Read at build time by
 // Vite, as test/service.test.ts reads the service module: a Workers isolate has
@@ -737,5 +739,328 @@ describe("one mark-read per request (D-08, MUTA-05)", () => {
     });
     expect(wroteFlagChange(firstDuplex)).toBe(true);
     expect(gate.held).toBe(false);
+  });
+});
+
+describe("flag and unflag, end to end", () => {
+  it("flags one message, and reports the flag state from the echo", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      flagEcho("a5", 17, UID, "\\Seen \\Flagged"),
+      logoutExchange("a6"),
+    ]);
+
+    const outcome = await flagMessageOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      REF,
+      FAST_BOUNDS,
+    );
+
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      `a5 UID STORE ${UID} +FLAGS (\\Flagged)`,
+      "a6 LOGOUT",
+    ]);
+    expect(outcome).toEqual({ applied: true, flagged: true, source: "store-echo" });
+
+    const id = encodeMessageId(REF);
+    const answer = JSON.parse(
+      flagStateToolResult(id, true, outcome).content[0]!.text,
+    ) as Record<string, unknown>;
+    expect(answer).toEqual({
+      id,
+      requested: "flagged",
+      state: "flagged",
+      stateSource: "store-echo",
+    });
+    expect(flagStateToolResult(id, true, outcome).isError).toBeUndefined();
+  });
+
+  it("unflags one message, and reports the flag state from the echo", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      flagEcho("a5", 17, UID, "\\Seen"),
+      logoutExchange("a6"),
+    ]);
+
+    const outcome = await unflagMessageOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      REF,
+      FAST_BOUNDS,
+    );
+
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      `a5 UID STORE ${UID} -FLAGS (\\Flagged)`,
+      "a6 LOGOUT",
+    ]);
+    expect(outcome).toEqual({ applied: true, flagged: false, source: "store-echo" });
+
+    const id = encodeMessageId(REF);
+    const answer = JSON.parse(
+      flagStateToolResult(id, false, outcome).content[0]!.text,
+    ) as Record<string, unknown>;
+    expect(answer).toEqual({
+      id,
+      requested: "unflagged",
+      state: "unflagged",
+      stateSource: "store-echo",
+    });
+  });
+});
+
+describe("flagging refuses and reports honestly, and each verb checks its own flag (D-08)", () => {
+  /** A read-write open with `permanent` as its permanent-flags list. */
+  function openWith(permanent: string | null): Uint8Array {
+    return selectResponse("a4", "[READ-WRITE]", 172, INBOX_UIDVALIDITY, permanent);
+  }
+
+  it("refuses a folder that opened read-only, and writes no flag change", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-ONLY]"),
+      logoutExchange("a5"),
+    ]);
+
+    const outcome = await flagMessageOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS);
+
+    expect(outcome).toEqual({ applied: false, refusal: "mailbox-read-only" });
+    expect(wireOf(duplex)).toEqual([...SIGN_IN, 'a4 SELECT "INBOX"', "a5 LOGOUT"]);
+    expect(wroteFlagChange(duplex)).toBe(false);
+    expectClosedAfterRead(duplex);
+  });
+
+  it("refuses a folder whose permanent flags leave out the flagged flag, as flag-not-kept", async () => {
+    // `\*` is about new keywords and does not count for a system flag.
+    for (const permanent of ["\\Seen \\Deleted", "", "\\Seen \\*"]) {
+      const duplex = createFakeDuplex([
+        ...authPrefix(),
+        openWith(permanent),
+        logoutExchange("a5"),
+      ]);
+
+      const outcome = await unflagMessageOver(
+        duplex,
+        principal,
+        createSessionGate(),
+        REF,
+        FAST_BOUNDS,
+      );
+
+      expect(outcome, `list (${permanent})`).toEqual({
+        applied: false,
+        refusal: "flag-not-kept",
+      });
+      expect(wireOf(duplex), `list (${permanent})`).toEqual([
+        ...SIGN_IN,
+        'a4 SELECT "INBOX"',
+        "a5 LOGOUT",
+      ]);
+      expect(wroteFlagChange(duplex)).toBe(false);
+      expectClosedAfterRead(duplex);
+    }
+
+    // The answer names the refusal and says retrying will not help. Not isError.
+    const refused = flagStateToolResult("x", true, {
+      applied: false,
+      refusal: "flag-not-kept",
+    });
+    const answer = JSON.parse(refused.content[0]!.text) as Record<string, unknown>;
+    expect(Object.keys(answer).sort()).toEqual(["id", "reason", "refusal", "requested"]);
+    expect(answer.refusal).toBe("flag-not-kept");
+    expect(String(answer.reason)).toContain("does not keep the flag");
+    expect(String(answer.reason)).toContain("nothing was changed");
+    expect(String(answer.reason)).toContain("Retrying will not help");
+    expect(refused.isError).toBeUndefined();
+  });
+
+  it("goes on when the list is absent, names the flagged flag in any case, or leaves out the seen flag", async () => {
+    // The last row is the intended change in this plan: before it, the
+    // orchestrator refused any folder that did not keep the seen flag, which
+    // was right for mark read and wrong for flag.
+    for (const permanent of [null, "\\Seen \\Flagged", "\\flagged", "\\Flagged"]) {
+      const duplex = createFakeDuplex([
+        ...authPrefix(),
+        openWith(permanent),
+        flagEcho("a5", 17, UID, "\\Flagged"),
+        logoutExchange("a6"),
+      ]);
+
+      const outcome = await flagMessageOver(
+        duplex,
+        principal,
+        createSessionGate(),
+        REF,
+        FAST_BOUNDS,
+      );
+
+      expect(outcome, `list ${String(permanent)}`).toEqual({
+        applied: true,
+        flagged: true,
+        source: "store-echo",
+      });
+      expect(wireOf(duplex), `list ${String(permanent)}`).toEqual([
+        ...SIGN_IN,
+        'a4 SELECT "INBOX"',
+        `a5 UID STORE ${UID} +FLAGS (\\Flagged)`,
+        "a6 LOGOUT",
+      ]);
+    }
+  });
+
+  it("still refuses mark read on a list without the seen flag, now decided inside the verb", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      openWith("\\Flagged \\Deleted"),
+      logoutExchange("a5"),
+    ]);
+
+    const outcome = await markReadOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS);
+
+    expect(outcome).toEqual({ applied: false, refusal: "mailbox-read-only" });
+    expect(wireOf(duplex)).toEqual([...SIGN_IN, 'a4 SELECT "INBOX"', "a5 LOGOUT"]);
+    expect(wroteFlagChange(duplex)).toBe(false);
+  });
+
+  it("chooses the error for a refused flag change by its code", async () => {
+    const cases: [string, Uint8Array, new () => Error][] = [
+      ["NO [NONEXISTENT]", taggedNo("a5", "[NONEXISTENT] No such message"), ImapNotFoundError],
+      ["NO [INUSE]", taggedNo("a5", "[INUSE] Mailbox in use"), ImapThrottleError],
+      ["bare NO", taggedNo("a5", "STORE failed"), ImapConnectError],
+    ];
+    for (const [label, reply, expected] of cases) {
+      const duplex = createFakeDuplex([
+        ...authPrefix(),
+        selectResponse("a4", "[READ-WRITE]"),
+        reply,
+        logoutExchange("a6"),
+      ]);
+
+      const call = flagMessageOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS);
+      await expect(call, label).rejects.toBeInstanceOf(expected);
+      if (expected !== ImapNotFoundError) {
+        await expect(call, label).rejects.not.toBeInstanceOf(ImapNotFoundError);
+      }
+
+      expect(wireOf(duplex), label).toEqual([
+        ...SIGN_IN,
+        'a4 SELECT "INBOX"',
+        `a5 UID STORE ${UID} +FLAGS (\\Flagged)`,
+        "a6 LOGOUT",
+      ]);
+      expectClosedAfterRead(duplex);
+    }
+  });
+
+  it("treats an echo for another message only as no echo, and lets the re-read decide", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      flagEcho("a5", 17, 9999, "\\Flagged"),
+      wire(`* 17 FETCH (UID ${UID} FLAGS ())`, "a6 OK FETCH completed"),
+      logoutExchange("a7"),
+    ]);
+
+    const outcome = await flagMessageOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS);
+
+    // The other message's echo said flagged; this message's re-read says not.
+    expect(outcome).toEqual({ applied: true, flagged: false, source: "read-back" });
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      `a5 UID STORE ${UID} +FLAGS (\\Flagged)`,
+      `a6 UID FETCH ${UID} (UID FLAGS)`,
+      "a7 LOGOUT",
+    ]);
+  });
+
+  it("reports iCloud's word when the echo disagrees with the request", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      flagEcho("a5", 17, UID, "\\Seen"),
+      logoutExchange("a6"),
+    ]);
+
+    const outcome = await flagMessageOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS);
+
+    expect(outcome).toEqual({ applied: true, flagged: false, source: "store-echo" });
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      `a5 UID STORE ${UID} +FLAGS (\\Flagged)`,
+      "a6 LOGOUT",
+    ]);
+    const answer = JSON.parse(
+      flagStateToolResult("x", true, outcome).content[0]!.text,
+    ) as Record<string, unknown>;
+    expect(answer.requested).toBe("flagged");
+    expect(answer.state).toBe("unflagged");
+  });
+
+  it("reports an accepted change as unconfirmed when the re-read is refused", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      taggedOk("a5", "STORE completed"),
+      taggedNo("a6", "FETCH failed"),
+      logoutExchange("a7"),
+    ]);
+
+    const outcome = await unflagMessageOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      REF,
+      FAST_BOUNDS,
+    );
+
+    expect(outcome).toEqual({ applied: true, source: "unconfirmed" });
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      `a5 UID STORE ${UID} -FLAGS (\\Flagged)`,
+      `a6 UID FETCH ${UID} (UID FLAGS)`,
+      "a7 LOGOUT",
+    ]);
+    const answer = JSON.parse(
+      flagStateToolResult("x", false, outcome).content[0]!.text,
+    ) as Record<string, unknown>;
+    expect(answer).toMatchObject({
+      requested: "unflagged",
+      state: "unflagged",
+      stateSource: "unconfirmed",
+    });
+    expect(String(answer.note)).toContain("did not report the flag");
+  });
+
+  it("is not_found when the re-read has nothing for the message", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      selectResponse("a4", "[READ-WRITE]"),
+      taggedOk("a5", "STORE completed"),
+      taggedOk("a6", "FETCH completed"),
+      logoutExchange("a7"),
+    ]);
+
+    await expect(
+      flagMessageOver(duplex, principal, createSessionGate(), REF, FAST_BOUNDS),
+    ).rejects.toBeInstanceOf(ImapNotFoundError);
+
+    expect(wireOf(duplex)).toEqual([
+      ...SIGN_IN,
+      'a4 SELECT "INBOX"',
+      `a5 UID STORE ${UID} +FLAGS (\\Flagged)`,
+      `a6 UID FETCH ${UID} (UID FLAGS)`,
+      "a7 LOGOUT",
+    ]);
   });
 });

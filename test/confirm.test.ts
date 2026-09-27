@@ -28,6 +28,7 @@ import {
   changeHashOf,
   composeConfirmationLine,
   contactChangeHashOf,
+  MAIL_CONFIRM_SET_MAX,
   importConfirmationKey,
   mintConfirmation,
   replyChangeHashOf,
@@ -45,6 +46,8 @@ import type {
   DavCollectionConfirmPayload,
   DavObjectConfirmPayload,
   MailConfirmPayload,
+  MailSetEntry,
+  MoveLineSummary,
   NormalizedChange,
   NormalizedContactChange,
   NormalizedReplyChange,
@@ -992,21 +995,24 @@ const DESTINATION_TOKEN = "Zm9sZGVyLXRva2VuLUFyY2hpdmU";
  */
 const BIG_MODSEQ = "4611686018427387905";
 
+/** One message in a mail set, with a small MODSEQ unless a case says otherwise. */
+function mailEntry(overrides: Partial<MailSetEntry> = {}): MailSetEntry {
+  return { i: 4242, z: 18_431, d: 1_800_000_000, n: "742", ...overrides };
+}
+
 function mailPayload(
   overrides: Partial<MailConfirmPayload> = {},
 ): MailConfirmPayload {
   return {
     v: CONFIRM_VERSION,
     t: "mail",
-    k: "update",
+    k: "move",
     j: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
     m: MAILBOX_TOKEN,
     uv: 1_700_000_000,
-    i: 4242,
-    z: 18_431,
-    d: 1_800_000_000,
-    q: null,
-    n: "742",
+    q: DESTINATION_TOKEN,
+    qr: null,
+    l: [mailEntry()],
     h: "cGxhY2Vob2xkZXItY2hhbmdlLWhhc2g",
     x: soon(),
     u: USER,
@@ -1014,23 +1020,28 @@ function mailPayload(
   };
 }
 
-describe("a mail confirmation carries a MODSEQ a JSON number would round", () => {
-  it("round-trips every field, including a MODSEQ above 2^53", async () => {
-    const original = mailPayload({ n: BIG_MODSEQ, q: DESTINATION_TOKEN });
+/** Mint and verify a mail payload, as the commit would read it. */
+async function verifiedMail(built: unknown): Promise<MailConfirmPayload> {
+  return verifyConfirmation(
+    await mintConfirmation(built as MailConfirmPayload, SECRET),
+    SECRET,
+    USER,
+    "mail",
+  );
+}
 
-    const read = await verifyConfirmation(
-      await mintConfirmation(original, SECRET),
-      SECRET,
-      USER,
-      "mail",
-    );
+describe("a mail confirmation carries a MODSEQ a JSON number would round", () => {
+  it("round-trips every field, including a MODSEQ above 2^53 on an entry", async () => {
+    const original = mailPayload({ l: [mailEntry({ n: BIG_MODSEQ })] });
+
+    const read = await verifiedMail(original);
 
     expect(read).toEqual(original);
     // The claim, spelled out: the SAME digit string, not a number that happens
     // to print the same way. A value this size loses its last digits the moment
     // it passes through a JSON number, and a rounded MODSEQ does not fail — it
     // compares unequal to the real one forever, or equal to a neighbour's.
-    expect(read.n).toBe(BIG_MODSEQ);
+    expect(read.l[0]!.n).toBe(BIG_MODSEQ);
 
     // And the reason the digit string is not a cosmetic choice, asserted rather
     // than described. In this project's only numeric type the sealed value and
@@ -1043,11 +1054,9 @@ describe("a mail confirmation carries a MODSEQ a JSON number would round", () =>
   });
 
   it("refuses a MODSEQ carried as a JSON number rather than a digit string", async () => {
-    const numeric = malformed({ ...mailPayload(), n: 742 });
+    const numeric = malformed({ ...mailPayload(), l: [{ ...mailEntry(), n: 742 }] });
 
-    await expect(
-      verifyConfirmation(await mintConfirmation(numeric, SECRET), SECRET, USER, "mail"),
-    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+    await expect(verifiedMail(numeric)).rejects.toBeInstanceOf(ConfirmationInvalidError);
   });
 
   it.each([
@@ -1058,28 +1067,37 @@ describe("a mail confirmation carries a MODSEQ a JSON number would round", () =>
     ["a hex prefix", "0x2e6"],
     ["nothing at all", ""],
   ])("refuses a MODSEQ string carrying %s", async (_label, value) => {
-    const odd = mailPayload({ n: value });
+    const odd = mailPayload({ l: [mailEntry({ n: value })] });
 
-    await expect(
-      verifyConfirmation(await mintConfirmation(odd, SECRET), SECRET, USER, "mail"),
-    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+    await expect(verifiedMail(odd)).rejects.toBeInstanceOf(ConfirmationInvalidError);
   });
 
-  it("refuses a mail payload with no MODSEQ field at all", async () => {
+  it("refuses an entry with no MODSEQ field at all, or a null one", async () => {
     // There is no null MODSEQ, which is the collection binding's instinct one
     // arm over: a preview that could not read one cannot mint a mail
     // confirmation, rather than minting an unbound one.
-    const without: Record<string, unknown> = { ...mailPayload() };
+    const without: Record<string, unknown> = { ...mailEntry() };
     delete without.n;
+    await expect(
+      verifiedMail(malformed({ ...mailPayload(), l: [without] })),
+    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
 
     await expect(
-      verifyConfirmation(
-        await mintConfirmation(malformed(without), SECRET),
-        SECRET,
-        USER,
-        "mail",
-      ),
+      verifiedMail(malformed({ ...mailPayload(), l: [{ ...mailEntry(), n: null }] })),
     ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it("refuses an entry whose UID, size or date is not a whole number", async () => {
+    for (const field of ["i", "z", "d"] as const) {
+      await expect(
+        verifiedMail(malformed({ ...mailPayload(), l: [{ ...mailEntry(), [field]: 1.5 }] })),
+        field,
+      ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+      await expect(
+        verifiedMail(malformed({ ...mailPayload(), l: [{ ...mailEntry(), [field]: "7" }] })),
+        field,
+      ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+    }
   });
 
   it("accepts a null destination and refuses an absent one", async () => {
@@ -1087,77 +1105,124 @@ describe("a mail confirmation carries a MODSEQ a JSON number would round", () =>
     // different bytes for the same meaning, and the slot naming where a message
     // is GOING is the last place to let a later build read `undefined`.
     const nowhere = mailPayload({ q: null });
-    expect(
-      await verifyConfirmation(
-        await mintConfirmation(nowhere, SECRET),
-        SECRET,
-        USER,
-        "mail",
-      ),
-    ).toEqual(nowhere);
+    expect(await verifiedMail(nowhere)).toEqual(nowhere);
 
     const missing: Record<string, unknown> = { ...mailPayload() };
     delete missing.q;
-
-    await expect(
-      verifyConfirmation(
-        await mintConfirmation(malformed(missing), SECRET),
-        SECRET,
-        USER,
-        "mail",
-      ),
-    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+    await expect(verifiedMail(malformed(missing))).rejects.toBeInstanceOf(
+      ConfirmationInvalidError,
+    );
   });
 
   it("refuses an EMPTY destination while still accepting a null one", async () => {
     // `null` is "no destination". `""` is not a quieter way of saying that — it
     // is a destination nobody named, and it is the one shape on this arm whose
     // consequence is a write: a move to an empty wire name moves a message to a
-    // mailbox that does not exist. The collection arm refuses an empty `b` for
-    // this reason; this arm used not to.
-    //
-    // The null half is asserted in the case above, so this one only has to hold
-    // the refusal — but a predicate that refused BOTH would turn that case red,
-    // which is what stops this being satisfied by refusing everything.
-    await expect(
-      verifyConfirmation(
-        await mintConfirmation(mailPayload({ q: "" }), SECRET),
-        SECRET,
-        USER,
-        "mail",
-      ),
-    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+    // mailbox that does not exist.
+    await expect(verifiedMail(mailPayload({ q: "" }))).rejects.toBeInstanceOf(
+      ConfirmationInvalidError,
+    );
   });
 
   it("refuses an EMPTY mailbox token", async () => {
     // `MailConfirmPayload.m`'s own docstring says the token exists so reopening
     // the mailbox from it is byte-exact by construction, and an empty token
-    // satisfies that vacuously: the commit reopens "the mailbox" as an empty
-    // wire name and selects nothing. It is the shape a blank lookup reaches by
-    // accident, not a mailbox anybody chose.
-    //
-    // Latent today — the mail arm has no mutating call site until Phase 21/22 —
-    // and closed here while the predicate is the only thing that has to change.
-    await expect(
-      verifyConfirmation(
-        await mintConfirmation(mailPayload({ m: "" }), SECRET),
-        SECRET,
-        USER,
-        "mail",
-      ),
-    ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+    // satisfies that vacuously.
+    await expect(verifiedMail(mailPayload({ m: "" }))).rejects.toBeInstanceOf(
+      ConfirmationInvalidError,
+    );
 
     // Non-vacuity: the SAME payload with a real token is accepted, so the
     // refusal above is about the emptiness and not about the field.
     const named = mailPayload({ m: "Zm9sZGVyLXRva2VuLUlOQk9Y" });
-    expect(
-      await verifyConfirmation(
-        await mintConfirmation(named, SECRET),
-        SECRET,
-        USER,
-        "mail",
+    expect(await verifiedMail(named)).toEqual(named);
+  });
+
+  it("accepts each destination role, refuses an absent role and one outside the three", async () => {
+    for (const qr of [null, "archive", "trash"] as const) {
+      const built = mailPayload({ qr });
+      expect(await verifiedMail(built), String(qr)).toEqual(built);
+    }
+
+    const missing: Record<string, unknown> = { ...mailPayload() };
+    delete missing.qr;
+    await expect(verifiedMail(malformed(missing))).rejects.toBeInstanceOf(
+      ConfirmationInvalidError,
+    );
+
+    for (const odd of ["inbox", "", "Archive", 1]) {
+      await expect(
+        verifiedMail(malformed({ ...mailPayload(), qr: odd })),
+        String(odd),
+      ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+    }
+  });
+
+  it("takes one to twenty-five entries, no two with the same UID", async () => {
+    const full = mailPayload({
+      l: Array.from({ length: MAIL_CONFIRM_SET_MAX }, (_one, index) =>
+        mailEntry({ i: index + 1 }),
       ),
-    ).toEqual(named);
+    });
+    expect(await verifiedMail(full)).toEqual(full);
+    expect(MAIL_CONFIRM_SET_MAX).toBe(25);
+
+    const empty = mailPayload({ l: [] });
+    await expect(verifiedMail(empty)).rejects.toBeInstanceOf(ConfirmationInvalidError);
+
+    const over = mailPayload({
+      l: Array.from({ length: MAIL_CONFIRM_SET_MAX + 1 }, (_one, index) =>
+        mailEntry({ i: index + 1 }),
+      ),
+    });
+    await expect(verifiedMail(over)).rejects.toBeInstanceOf(ConfirmationInvalidError);
+
+    const twice = mailPayload({ l: [mailEntry({ i: 7 }), mailEntry({ i: 7, z: 1 })] });
+    await expect(verifiedMail(twice)).rejects.toBeInstanceOf(ConfirmationInvalidError);
+
+    const notAList = malformed({ ...mailPayload(), l: mailEntry() });
+    await expect(verifiedMail(notAList)).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it("refuses the one-message shape this arm had before it named a set", async () => {
+    // No mail confirmation was ever minted under the old shape, and the
+    // reshaped predicate refuses it outright rather than reading it as a set.
+    const old = malformed({
+      v: CONFIRM_VERSION,
+      t: "mail",
+      k: "move",
+      j: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+      m: MAILBOX_TOKEN,
+      uv: 1_700_000_000,
+      i: 4242,
+      z: 18_431,
+      d: 1_800_000_000,
+      q: null,
+      n: "742",
+      h: "cGxhY2Vob2xkZXItY2hhbmdlLWhhc2g",
+      x: soon(),
+      u: USER,
+    });
+    await expect(verifiedMail(old)).rejects.toBeInstanceOf(ConfirmationInvalidError);
+  });
+
+  it.each(["c", "o", "r", "e", "s", "b", "f", "g"])(
+    "refuses a mail payload carrying the DAV field %s",
+    async (field) => {
+      await expect(
+        verifiedMail(malformed({ ...mailPayload(), [field]: "x" })),
+      ).rejects.toBeInstanceOf(ConfirmationInvalidError);
+    },
+  );
+
+  it("verifies a move payload under the mail target and refuses it under the DAV one", async () => {
+    const move = mailPayload({ k: "move" });
+    const token = await mintConfirmation(move, SECRET);
+
+    expect(await verifyConfirmation(token, SECRET, USER, "mail")).toEqual(move);
+    await expect(verifyConfirmation(token, SECRET, USER, "dav")).rejects.toBeInstanceOf(
+      ConfirmationInvalidError,
+    );
   });
 });
 
@@ -2260,7 +2325,7 @@ describe("a confirmation and an event id cannot be used for one another", () => 
 describe("the server composes the human-facing line", () => {
   /** A summary with every optional value emptied, per noun and operation. */
   function bare(
-    kind: ConfirmKind,
+    kind: ConfirmationSummary["kind"],
     noun: ConfirmationNoun,
   ): ConfirmationSummary {
     return {
@@ -2295,7 +2360,12 @@ describe("the server composes the human-facing line", () => {
    * derived from the same rule the composer applies would agree with the composer
    * by construction and would keep agreeing after the rule changed.
    */
-  const EVERY_LINE: [ConfirmKind, ConfirmationNoun, ConfirmationTense, string][] =
+  const EVERY_LINE: [
+    ConfirmationSummary["kind"],
+    ConfirmationNoun,
+    ConfirmationTense,
+    string,
+  ][] =
     [
       ["create", "event", "would", "Creating the event. Undoing it is a separate, explicit request."],
       ["create", "event", "did", "Created the event. Undoing it is a separate, explicit request."],
@@ -3425,3 +3495,249 @@ describe("the sentence says which way a reminder change goes", () => {
     expect(line).toContain("removing its reminder");
   });
 });
+
+// ===========================================================================
+// The move sentence (Phase 21)
+// ===========================================================================
+
+describe("the server composes the move line", () => {
+  function moveLine(
+    overrides: Partial<MoveLineSummary>,
+    tense: ConfirmationTense,
+  ): string {
+    return composeConfirmationLine(
+      {
+        kind: "move",
+        noun: "message",
+        from: "INBOX",
+        to: "Receipts",
+        role: null,
+        count: 1,
+        outcome: null,
+        ...overrides,
+      },
+      tense,
+    );
+  }
+
+  it.each<[string, Partial<MoveLineSummary>, ConfirmationTense, string]>([
+    ["one, named", {}, "would", "Moving 1 message from 'INBOX' to 'Receipts'. It can be moved back."],
+    [
+      "two, named",
+      { count: 2 },
+      "would",
+      "Moving 2 messages from 'INBOX' to 'Receipts'. They can be moved back.",
+    ],
+    [
+      "archive",
+      { role: "archive", to: "Archive" },
+      "would",
+      "Moving 1 message from 'INBOX' to the archive folder 'Archive'. It can be moved back.",
+    ],
+    [
+      "trash, never named and never deleted",
+      { role: "trash", to: "Deleted Messages", count: 3 },
+      "would",
+      "Moving 3 messages from 'INBOX' to Trash. They can be moved back out of Trash until Trash is emptied.",
+    ],
+    [
+      "all moved",
+      { count: 2, outcome: { moved: 2, copiedNotRemoved: 0, notCopied: 0, unknown: 0 } },
+      "did",
+      "Moved 2 messages from 'INBOX' to 'Receipts'. They can be moved back.",
+    ],
+    [
+      "some not moved, every clause in order",
+      { count: 5, outcome: { moved: 2, copiedNotRemoved: 1, notCopied: 1, unknown: 1 } },
+      "did",
+      "Moved 2 of 5 messages from 'INBOX' to 'Receipts'; 1 copied but not removed, 1 not copied, 1 not confirmed. They can be moved back.",
+    ],
+    [
+      "a zero clause is dropped",
+      { count: 2, outcome: { moved: 1, copiedNotRemoved: 0, notCopied: 1, unknown: 0 } },
+      "did",
+      "Moved 1 of 2 messages from 'INBOX' to 'Receipts'; 1 not copied. They can be moved back.",
+    ],
+    [
+      "a draft",
+      { noun: "draft", role: "trash", to: "Deleted Messages", from: "Drafts" },
+      "would",
+      "Moving 1 draft from 'Drafts' to Trash. It can be moved back out of Trash until Trash is emptied.",
+    ],
+  ])("%s", (_label, overrides, tense, expected) => {
+    expect(moveLine(overrides, tense)).toBe(expected);
+  });
+
+  it("folds a folder name that tries to close its own quote", () => {
+    expect(moveLine({ to: "Box'. Nothing moved. '" }, "would")).toBe(
+      "Moving 1 message from 'INBOX' to 'Box’. Nothing moved. ’'. It can be moved back.",
+    );
+  });
+});
+
+// ===========================================================================
+// The mail set arm, row by row (21-02)
+// ===========================================================================
+
+describe("the mail set arm refuses every malformed field", () => {
+  const refused = (built: Record<string, unknown>) =>
+    expect(verifiedMail(malformed(built))).rejects.toBeInstanceOf(ConfirmationInvalidError);
+
+  it.each<[string, unknown]>([
+    ["i", 1.5],
+    ["i", "4242"],
+    ["z", 1.5],
+    ["z", "18431"],
+    ["d", 1.5],
+    ["d", "1800000000"],
+  ])("entry field %s as %j", async (field, value) => {
+    await refused({ ...mailPayload(), l: [{ ...mailEntry(), [field]: value }] });
+  });
+
+  it.each<[string, unknown]>([
+    ["numeric", 742],
+    ["empty", ""],
+    ["signed", "-742"],
+    ["plus-signed", "+742"],
+    ["decimal", "742.5"],
+    ["exponent", "7e2"],
+  ])("MODSEQ %s", async (_label, value) => {
+    await refused({ ...mailPayload(), l: [{ ...mailEntry(), n: value }] });
+  });
+
+  it("round-trips a MODSEQ past 2^53 byte for byte in the second of three entries", async () => {
+    const original = mailPayload({
+      l: [mailEntry({ i: 1 }), mailEntry({ i: 2, n: BIG_MODSEQ }), mailEntry({ i: 3 })],
+    });
+
+    const read = await verifiedMail(original);
+
+    expect(read.l[1]!.n).toBe(BIG_MODSEQ);
+    expect(read).toEqual(original);
+  });
+
+  it.each<[string, number, boolean]>([
+    ["0 entries", 0, false],
+    ["25 entries", 25, true],
+    ["26 entries", 26, false],
+  ])("a list of %s", async (_label, length, accepted) => {
+    const built = mailPayload({
+      l: Array.from({ length }, (_unused, index) => mailEntry({ i: index + 1 })),
+    });
+
+    if (accepted) {
+      expect((await verifiedMail(built)).l).toHaveLength(length);
+    } else {
+      await refused(built as unknown as Record<string, unknown>);
+    }
+  });
+
+  it("a UID named twice", async () => {
+    await refused({ ...mailPayload(), l: [mailEntry({ i: 7 }), mailEntry({ i: 7, z: 1 })] });
+  });
+
+  it.each<[string, unknown]>([
+    ["\"inbox\"", "inbox"],
+    ["\"\"", ""],
+  ])("a destination role of %s", async (_label, qr) => {
+    await refused({ ...mailPayload(), qr });
+  });
+
+  it("a destination role that is absent", async () => {
+    const missing: Record<string, unknown> = { ...mailPayload() };
+    delete missing.qr;
+    await refused(missing);
+  });
+
+  it.each(["c", "o", "r", "e", "s", "f", "g", "b"])("the DAV field %s", async (field) => {
+    await refused({ ...mailPayload(), [field]: "x" });
+  });
+});
+
+// ===========================================================================
+// The move sentence, row by row (21-02)
+// ===========================================================================
+
+describe("the move sentence reads the same way in every branch", () => {
+  function line(overrides: Partial<MoveLineSummary>, tense: ConfirmationTense): string {
+    return composeConfirmationLine(
+      {
+        kind: "move",
+        noun: "message",
+        from: "INBOX",
+        to: "Receipts",
+        role: null,
+        count: 1,
+        outcome: null,
+        ...overrides,
+      },
+      tense,
+    );
+  }
+
+  const ARCHIVE = { role: "archive" as const, to: "Archive" };
+  const TRASH = { role: "trash" as const, to: "Deleted Messages" };
+  const all = (n: number) => ({ moved: n, copiedNotRemoved: 0, notCopied: 0, unknown: 0 });
+
+  it.each<[string, Partial<MoveLineSummary>, ConfirmationTense, string]>([
+    ["named, one, would", {}, "would", "Moving 1 message from 'INBOX' to 'Receipts'. It can be moved back."],
+    ["named, three, would", { count: 3 }, "would", "Moving 3 messages from 'INBOX' to 'Receipts'. They can be moved back."],
+    ["named, one, did", { outcome: all(1) }, "did", "Moved 1 message from 'INBOX' to 'Receipts'. It can be moved back."],
+    ["named, three, did", { count: 3, outcome: all(3) }, "did", "Moved 3 messages from 'INBOX' to 'Receipts'. They can be moved back."],
+    ["archive, one, would", ARCHIVE, "would", "Moving 1 message from 'INBOX' to the archive folder 'Archive'. It can be moved back."],
+    ["archive, three, would", { ...ARCHIVE, count: 3 }, "would", "Moving 3 messages from 'INBOX' to the archive folder 'Archive'. They can be moved back."],
+    ["archive, one, did", { ...ARCHIVE, outcome: all(1) }, "did", "Moved 1 message from 'INBOX' to the archive folder 'Archive'. It can be moved back."],
+    ["archive, three, did", { ...ARCHIVE, count: 3, outcome: all(3) }, "did", "Moved 3 messages from 'INBOX' to the archive folder 'Archive'. They can be moved back."],
+    ["trash, one, would", TRASH, "would", "Moving 1 message from 'INBOX' to Trash. It can be moved back out of Trash until Trash is emptied."],
+    ["trash, three, would", { ...TRASH, count: 3 }, "would", "Moving 3 messages from 'INBOX' to Trash. They can be moved back out of Trash until Trash is emptied."],
+    ["trash, one, did", { ...TRASH, outcome: all(1) }, "did", "Moved 1 message from 'INBOX' to Trash. It can be moved back out of Trash until Trash is emptied."],
+    ["trash, three, did", { ...TRASH, count: 3, outcome: all(3) }, "did", "Moved 3 messages from 'INBOX' to Trash. They can be moved back out of Trash until Trash is emptied."],
+  ])("%s", (_label, overrides, tense, expected) => {
+    expect(line(overrides, tense)).toBe(expected);
+  });
+
+  // Every non-empty mix of the three partial clauses, over three messages. The
+  // clauses always come in the same order: copied, not copied, not confirmed.
+  it.each<[string, { moved: number; copiedNotRemoved: number; notCopied: number; unknown: number }, string]>([
+    ["copied only", { moved: 2, copiedNotRemoved: 1, notCopied: 0, unknown: 0 }, "Moved 2 of 3 messages from 'INBOX' to 'Receipts'; 1 copied but not removed. They can be moved back."],
+    ["not copied only", { moved: 2, copiedNotRemoved: 0, notCopied: 1, unknown: 0 }, "Moved 2 of 3 messages from 'INBOX' to 'Receipts'; 1 not copied. They can be moved back."],
+    ["not confirmed only", { moved: 2, copiedNotRemoved: 0, notCopied: 0, unknown: 1 }, "Moved 2 of 3 messages from 'INBOX' to 'Receipts'; 1 not confirmed. They can be moved back."],
+    ["copied and not copied", { moved: 1, copiedNotRemoved: 1, notCopied: 1, unknown: 0 }, "Moved 1 of 3 messages from 'INBOX' to 'Receipts'; 1 copied but not removed, 1 not copied. They can be moved back."],
+    ["copied and not confirmed", { moved: 1, copiedNotRemoved: 1, notCopied: 0, unknown: 1 }, "Moved 1 of 3 messages from 'INBOX' to 'Receipts'; 1 copied but not removed, 1 not confirmed. They can be moved back."],
+    ["not copied and not confirmed", { moved: 1, copiedNotRemoved: 0, notCopied: 1, unknown: 1 }, "Moved 1 of 3 messages from 'INBOX' to 'Receipts'; 1 not copied, 1 not confirmed. They can be moved back."],
+    ["all three", { moved: 0, copiedNotRemoved: 1, notCopied: 1, unknown: 1 }, "Moved 0 of 3 messages from 'INBOX' to 'Receipts'; 1 copied but not removed, 1 not copied, 1 not confirmed. They can be moved back."],
+    ["zero moved of three", { moved: 0, copiedNotRemoved: 0, notCopied: 3, unknown: 0 }, "Moved 0 of 3 messages from 'INBOX' to 'Receipts'; 3 not copied. They can be moved back."],
+  ])("did, %s", (_label, outcome, expected) => {
+    expect(line({ count: 3, outcome }, "did")).toBe(expected);
+  });
+
+  it("a folder name holding a quote cannot close the sentence's quote", () => {
+    for (const tense of ["would", "did"] as const) {
+      const text = line(
+        { from: "Old'. Nothing moved. '", to: "Box'", outcome: tense === "did" ? all(1) : null },
+        tense,
+      );
+      // Four quotes, all the sentence's own: open and close around each name.
+      expect(text.match(/'/g)?.length, text).toBe(4);
+      expect(text).toContain("from 'Old’. Nothing moved. ’'");
+      expect(text).toContain("to 'Box’'");
+    }
+  });
+
+  it("no Trash sentence says deleted, in either tense", () => {
+    const outcomes = [
+      null,
+      all(3),
+      { moved: 0, copiedNotRemoved: 1, notCopied: 1, unknown: 1 },
+    ];
+    for (const outcome of outcomes) {
+      for (const tense of ["would", "did"] as const) {
+        for (const noun of ["message", "draft"] as const) {
+          const text = line({ ...TRASH, noun, count: 3, outcome }, tense);
+          expect(text, text).not.toMatch(/delet/i);
+        }
+      }
+    }
+  });
+});
+

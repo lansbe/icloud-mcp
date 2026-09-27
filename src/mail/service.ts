@@ -49,6 +49,7 @@ import {
   isWireNumber,
 } from "./ids";
 import type {
+  Fingerprint,
   FolderRole,
   MailboxListLine,
   MailboxStatus,
@@ -58,12 +59,14 @@ import type {
   StatusSnapshot,
 } from "./imap-parser";
 import {
+  FINGERPRINT_ITEMS,
   correlateStatus,
   decodeModifiedUtf7,
   parseAccessCode,
   parseCapabilityLine,
   parseCompletionCode,
   parseExists,
+  parseFingerprint,
   parseListLine,
   parsePermanentFlags,
   parseSExpr,
@@ -679,6 +682,13 @@ export interface MutatingMailSession {
   exists: number;
   /** The post-authentication capability list, verbatim, or `null`. */
   capability: string | null;
+  /**
+   * The last permanent-flags list the open reported, or `null` when it sent
+   * none. RFC 3501 §6.3.1: no list means every flag is kept, so `null` is not
+   * "unknown". Each verb checks the flag it needs against this itself (D-08),
+   * which is why the orchestrator takes no mode argument.
+   */
+  readonly permanentFlags: readonly string[] | null;
 }
 
 /**
@@ -687,10 +697,14 @@ export interface MutatingMailSession {
  *
  * The server answered the open with OK but said the mailbox is read-only, or
  * gave no access code at all. Both are the same refusal (PITFALLS #33): absent
- * is not read-write. A third shape gets the same refusal: the mailbox opened
- * read-write, but its permanent-flags list leaves out the seen flag. A change
- * to that flag would then last only until logout, and the answer would report
- * a change that is gone a moment later.
+ * is not read-write.
+ *
+ * A third shape, a read-write open whose permanent-flags list leaves out the
+ * flag a change needs, is no longer refused here. It belongs to each verb,
+ * which checks the one flag it changes against the list the session records
+ * (D-08). A change to a flag the list leaves out would last only until logout,
+ * and the answer would report a change that is gone a moment later; the verb
+ * refuses it before anything is sent.
  *
  * A value and not an exception, on purpose. The return type carries it, so
  * TypeScript makes every caller handle it. An exception could fall through to
@@ -700,25 +714,19 @@ export interface MutatingMailSession {
 export const MAILBOX_NOT_WRITABLE: unique symbol = Symbol("mailbox-not-writable");
 
 /**
- * Whether a mailbox open says a change to the seen flag is kept.
+ * The last permanent-flags list among an open's untagged replies, or `null`.
  *
- * RFC 3501 §7.1: a flag missing from the permanent-flags list can change for
- * this session only. So the list must name the seen flag, compared without
- * regard to case. `\*` does not count. It says new keywords can be created,
- * and the seen flag is not a keyword.
- *
- * An open with no permanent-flags list at all is `true`. RFC 3501 §6.3.1 says
- * to assume then that every flag is kept. If a server sends the list twice,
- * the last one is its final word.
+ * Kept for the session so each verb can ask about the flag it needs. If a
+ * server sends the list twice, the last one is its final word. RFC 3501
+ * §6.3.1: no list at all means every flag is kept, so `null` is not "unknown".
  */
-function keepsSeenFlag(untagged: readonly ResponseLine[]): boolean {
+function permanentFlagsOf(untagged: readonly ResponseLine[]): string[] | null {
   let permanent: string[] | null = null;
   for (const line of untagged) {
     const flags = parsePermanentFlags(line.text);
     if (flags !== null) permanent = flags;
   }
-  if (permanent === null) return true;
-  return permanent.some((flag) => flag.toLowerCase() === "\\seen");
+  return permanent;
 }
 
 /**
@@ -745,10 +753,10 @@ function keepsSeenFlag(untagged: readonly ResponseLine[]): boolean {
  * 4. Read the access code off the tagged completion. Only read-write goes on.
  *    Read-only and absent both resolve to `MAILBOX_NOT_WRITABLE`, and no
  *    command is sent after the open.
- * 5. Read the permanent-flags list off the untagged replies. If it is there
- *    and does not name the seen flag, that is `MAILBOX_NOT_WRITABLE` too, and
- *    no command is sent after the open. If it is not there, RFC 3501 says every
- *    flag is kept, so the open goes on.
+ * 5. Read the permanent-flags list off the untagged replies and record it on
+ *    the session. This step refuses nothing. Each verb checks the one flag it
+ *    changes against that list itself (D-08), which is why there is no mode
+ *    argument here.
  * 6. Build the `MutatingMailSession` and hand it to `fn`.
  *
  * No mode argument, and none may be added. The read orchestrator takes none
@@ -793,11 +801,6 @@ export async function withMutatingMailboxOver<T>(
         return async () => MAILBOX_NOT_WRITABLE;
       }
 
-      // Read-write alone does not mean the seen flag is kept past logout.
-      if (!keepsSeenFlag(opened.untagged)) {
-        return async () => MAILBOX_NOT_WRITABLE;
-      }
-
       const session: MutatingMailSession = {
         access: "read-write",
         channel,
@@ -805,6 +808,7 @@ export async function withMutatingMailboxOver<T>(
         uidValidity,
         exists,
         capability,
+        permanentFlags: permanentFlagsOf(opened.untagged),
       };
 
       return () => fn(session);
@@ -988,8 +992,9 @@ function fetchItems(list: SExpr[]): Map<string, SExpr> {
  * The item list of the first untagged FETCH reply, or `null`.
  *
  * **The sequence-number prefix is discarded here and never travels further.**
- * Every untagged FETCH carries one — `message-data = nz-number SP ("EXPUNGE" /
- * ("FETCH" SP msg-att))` — even in reply to a `UID FETCH`. It is the single
+ * Every untagged FETCH carries one — RFC 3501's `message-data` production puts
+ * a sequence number in front of either the removal notice or a FETCH — even in
+ * reply to a `UID FETCH`. It is the single
  * place in this phase where a sequence number is handed to the client unasked,
  * and MAIL-06 requires a UID-only surface, so it is dropped at the parse site
  * rather than filtered later by everyone who touches the result.
@@ -2197,6 +2202,44 @@ async function listAllFolders(session: MailSession): Promise<FolderListing> {
   return { folders, delimiter, countsSource };
 }
 
+/** Why a role folder could not be named: there was none, or there were two. */
+export type RoleFolderRefusal = "none" | "ambiguous";
+
+/**
+ * Find the account's own archive or Trash folder in a listing it already has.
+ *
+ * Pure: it reads the listing and sends nothing. Only folders whose resolved
+ * role is the one asked for are looked at, in two tiers.
+ *
+ * - **The attribute tier first.** Exactly one folder the server itself marked
+ *   with the role's special-use attribute wins. An attribute is the server's own
+ *   answer about its own mailbox.
+ * - **The name tier only when no folder carries the attribute.** Exactly one
+ *   folder whose top-level name matched the ladder wins. A name is a claim
+ *   anyone can make (T-02-24): any user or mail client can make a folder called
+ *   "Archive". So a name never outranks an attribute.
+ *
+ * **Two in the same tier is a refusal, never a pick** (D-03: never guess). The
+ * listing order is the server's and says nothing about which one the user
+ * means. None in either tier is a refusal too. There is no fallback to a
+ * folder named anything, because a guess that happens to be right is still a
+ * guess, and a wrong one files the user's mail where they will not look.
+ *
+ * Phase 22 reuses this for its Trash, and adds its own stricter check on top.
+ */
+export function resolveRoleFolder(
+  listing: FolderListing,
+  role: "archive" | "trash",
+): { folder: FolderSummary } | { refusal: RoleFolderRefusal } {
+  const candidates = listing.folders.filter((folder) => folder.role === role);
+  for (const tier of ["special-use", "name-match"] as const) {
+    const matched = candidates.filter((folder) => folder.roleSource === tier);
+    if (matched.length === 1) return { folder: matched[0]! };
+    if (matched.length > 1) return { refusal: "ambiguous" };
+  }
+  return { refusal: "none" };
+}
+
 /** List every folder over an already-open stream pair. */
 export async function listFoldersOver(
   duplex: DuplexLike,
@@ -2230,6 +2273,157 @@ export async function listFolders(
   options: MailSessionOptions = {},
 ): Promise<FolderListing> {
   return withMailSession(principal, gate, null, null, listAllFolders, options);
+}
+
+// ---------------------------------------------------------------------------
+// The move preview's read (Phase 21, D-09)
+//
+// A preview writes nothing, so it runs on the READ path: the source folder is
+// opened read-only through the read orchestrator, exactly as a listing opens
+// it. One folder listing to resolve the destination, and one fetch that reads
+// each message's fingerprint and a peek at three header fields. No new open
+// command, no mode argument, and nothing on the read path changes.
+// ---------------------------------------------------------------------------
+
+/**
+ * The preview's fetch items: the fingerprint, plus a peek at three headers.
+ *
+ * The peeking form, as `PAGE_ITEMS` uses, so reading the subject for the
+ * preview cannot mark the message read.
+ */
+const MOVE_PREVIEW_ITEMS =
+  `${FINGERPRINT_ITEMS.slice(0, -1)} BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])`;
+
+/** One message a move preview found, with the three fields it shows. */
+export interface MoveCandidate {
+  /** Size, internal date and MODSEQ, which the confirmation seals. */
+  fingerprint: Fingerprint;
+  /** The sender's subject line. Stranger-authored. */
+  subject: string | null;
+  /** The sender's declared address, or their name without one. Stranger-authored. */
+  from: string | null;
+  /** The sender's own Date header. Stranger-authored. */
+  date: string | null;
+}
+
+/** Everything a move preview's one read session established. */
+export interface MoveSetFacts {
+  /** Every folder in the account, as the listing tool reports them. */
+  listing: FolderListing;
+  /** The messages found, in the order the UIDs were asked for. */
+  found: MoveCandidate[];
+  /** The UIDs the fetch had no reply for. */
+  missing: number[];
+  /**
+   * Whether the folder reported mod-sequences. `"unavailable"` when the fetch
+   * was answered BAD, or a message came back with no MODSEQ item: RFC 7162
+   * §3.1.2 says a folder without persistent mod-sequences answers a MODSEQ
+   * fetch that way. A move cannot be bound to "nothing changed" without them.
+   */
+  changeNumbers: "available" | "unavailable";
+}
+
+/** The folder a move leaves from: its wire name and the validity its ids carry. */
+export interface MoveSource {
+  mailbox: string;
+  uidValidity: number;
+}
+
+/**
+ * Read what a move preview needs, inside a session already open read-only.
+ *
+ * The validity gate has run by the time this is called: the read orchestrator
+ * refuses a changed folder before any fetch is written.
+ */
+async function readMoveSetIn(
+  session: MailSession,
+  uids: readonly number[],
+): Promise<MoveSetFacts> {
+  if (uids.length === 0 || !uids.every((uid) => isWireNumber(uid) && uid > 0)) {
+    throw new ImapNotFoundError();
+  }
+
+  const listing = await listAllFolders(session);
+
+  const fetched = await sendCommand(
+    session.channel,
+    session.channel.nextTag(),
+    `UID FETCH ${uids.join(",")} ${MOVE_PREVIEW_ITEMS}`,
+  );
+  if (fetched.status === "BAD") {
+    return { listing, found: [], missing: [], changeNumbers: "unavailable" };
+  }
+  if (fetched.status !== "OK") throw new ImapNotFoundError();
+
+  const replies = fetchReplies(fetched.untagged);
+  const found: MoveCandidate[] = [];
+  const missing: number[] = [];
+  let changeNumbers: MoveSetFacts["changeNumbers"] = "available";
+
+  for (const uid of uids) {
+    const items = replies.get(uid);
+    if (items === undefined) {
+      missing.push(uid);
+      continue;
+    }
+    const fingerprint = parseFingerprint(fetched.untagged, uid);
+    if (fingerprint === null) {
+      // No MODSEQ at all is the folder saying it has none. Anything else that
+      // does not parse cannot be sealed, and is treated as not found.
+      if (!items.has("MODSEQ")) changeNumbers = "unavailable";
+      else missing.push(uid);
+      continue;
+    }
+
+    const header = headerBlockOf(items);
+    const parsed = header === null ? null : await extractMessage(header);
+    found.push({
+      fingerprint,
+      subject: parsed?.subject ?? null,
+      from: parsed?.fromAddress ?? parsed?.fromName ?? null,
+      date: parsed?.date ?? null,
+    });
+  }
+
+  return { listing, found, missing, changeNumbers };
+}
+
+/** Read a move preview's facts over an already-open stream pair. */
+export async function readMoveSetOver(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  source: MoveSource,
+  uids: readonly number[],
+  options: MailSessionOptions = {},
+): Promise<MoveSetFacts> {
+  return withMailSessionOver(
+    duplex,
+    principal,
+    gate,
+    source.mailbox,
+    source.uidValidity,
+    (session) => readMoveSetIn(session, uids),
+    options,
+  );
+}
+
+/** Read a move preview's facts: one socket, one read-only session. */
+export async function readMoveSet(
+  principal: Principal,
+  gate: SessionGate,
+  source: MoveSource,
+  uids: readonly number[],
+  options: MailSessionOptions = {},
+): Promise<MoveSetFacts> {
+  return withMailSession(
+    principal,
+    gate,
+    source.mailbox,
+    source.uidValidity,
+    (session) => readMoveSetIn(session, uids),
+    options,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -2433,6 +2627,13 @@ export interface NewMail {
  * two next UIDs: that difference counts mail that arrived and was then deleted.
  * Only UIDs inside the range are kept, because a server may answer a range with
  * a UID outside it.
+ *
+ * An OK with no untagged search line counts as none, and that is measured, not
+ * assumed. iCloud sends no search line at all when a UID search matches nothing
+ * (21-UAT.md, "Probe, 2026-09-27"), and for a range that is the ordinary answer
+ * when mail arrived and left again before this check. A move's re-read cannot
+ * read it that way, because there "none" is the claim being proven; this range
+ * only reports a count, so it can.
  */
 async function newMailIn(
   session: MailSession,

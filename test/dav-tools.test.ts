@@ -3356,11 +3356,9 @@ describe("the calendar_commit delete", () => {
         // unreachable, and it is why the refusal has to happen inside the gate.
         m: "Zm9sZGVyLXRva2VuLUlOQk9Y",
         uv: 1_700_000_000,
-        i: 4242,
-        z: 18_431,
-        d: 1_800_000_000,
         q: null,
-        n: "742",
+        qr: null,
+        l: [{ i: 4242, z: 18_431, d: 1_800_000_000, n: "742" }],
         h: await changeHashOf(change),
         x: expiry,
         // The OWNER, so the refusal is genuinely about the target. A different
@@ -9663,11 +9661,9 @@ describe("the calendar_commit collection arm (CALM-06, D-09, D-12, D-14)", () =>
         j: crypto.randomUUID(),
         m: "Zm9sZGVyLXRva2VuLUlOQk9Y",
         uv: 1_700_000_000,
-        i: 4242,
-        z: 18_431,
-        d: 1_800_000_000,
         q: null,
-        n: "742",
+        qr: null,
+        l: [{ i: 4242, z: 18_431, d: 1_800_000_000, n: "742" }],
         h: await changeHashOf(change as NormalizedChange),
         x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
         // The OWNER, so the refusal is genuinely about the target rather than
