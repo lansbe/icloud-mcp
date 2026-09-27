@@ -17,6 +17,7 @@
 // before every comparison, as in test/triage.test.ts.
 
 import type { McpServer } from "@modelcontextprotocol/server";
+import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/mail/socket", async (importOriginal) => ({
@@ -29,6 +30,12 @@ import {
   encodeFolderId,
   encodeMessageId,
 } from "../src/mail/ids";
+import {
+  CONFIRM_TTL_SECONDS,
+  CONFIRM_VERSION,
+  mailMoveChangeHashOf,
+  mintConfirmation,
+} from "../src/confirm";
 import { ImapConnectError } from "../src/errors";
 import { createSessionGate } from "../src/mail/service";
 import { connectImap } from "../src/mail/socket";
@@ -1038,6 +1045,321 @@ describe("every way a move can end", () => {
         { uid: 4250, outcome: "not_copied", reason: "not-attempted", newUid: null, destinationUidValidity: null },
         { uid: 4260, outcome: "not_copied", reason: "not-attempted", newUid: null, destinationUidValidity: null },
       ],
+    });
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// The move tools refuse by name (21-02 Task 2)
+//
+// Through the registered callbacks, with `connectImap` counted. A refusal that
+// can be decided from the input alone must not cost a connection, and a commit
+// that does not match what was previewed must not reach one.
+// ---------------------------------------------------------------------------
+
+/** The four whole-mailbox wire lines a stale-free preview listing carries. */
+function listingWith(tag: string, receiptsAttributes = "\\HasNoChildren"): Uint8Array {
+  return wire(
+    '* LIST (\\HasNoChildren) "/" "INBOX"',
+    '* STATUS "INBOX" (MESSAGES 172 UNSEEN 3)',
+    `* LIST (${receiptsAttributes}) "/" "${RECEIPTS}"`,
+    `* STATUS "${RECEIPTS}" (MESSAGES 10 UNSEEN 0)`,
+    `${tag} OK LIST completed`,
+  );
+}
+
+/** A preview conversation whose listing and fetch reply the case chooses. */
+function previewServerWith(listing: Uint8Array, fetched: Uint8Array): FakeDuplex {
+  return createFakeDuplex([
+    ...authPrefix(),
+    examineResponse("a4"),
+    listing,
+    fetched,
+    logoutExchange("a7"),
+  ]);
+}
+
+/** Assert a named refusal: plain JSON, no token, never `isError`. */
+function expectRefusal(answer: ToolAnswer, refusal: string): Record<string, unknown> {
+  expect(answer.isError, "a refusal is not an error").toBeUndefined();
+  const parsed = body(answer);
+  expect(parsed.refusal).toBe(refusal);
+  expect(typeof parsed.reason).toBe("string");
+  expect(parsed).not.toHaveProperty("confirmToken");
+  return parsed;
+}
+
+/** Assert a tool error of `category`. */
+function expectCategory(answer: ToolAnswer, category: string): void {
+  expect(answer.isError).toBe(true);
+  expect(body(answer).category).toBe(category);
+}
+
+describe("the move tools refuse by name", () => {
+  describe("before any socket", () => {
+    it("26 ids: too-many, naming the cap", async () => {
+      const { move } = tools();
+      const ids = Array.from({ length: 26 }, (_unused, index) => idOf(4000 + index));
+
+      const parsed = expectRefusal(await move({ ids, destination: RECEIPTS_ID }), "too-many");
+
+      expect(parsed.cap).toBe(25);
+      expect(parsed.reason).toContain("25");
+      expect(connectImap).not.toHaveBeenCalled();
+    });
+
+    it("the same id twice: duplicate-ids", async () => {
+      const { move } = tools();
+
+      const parsed = expectRefusal(
+        await move({ ids: [idOf(4242), idOf(4250), idOf(4242)], destination: RECEIPTS_ID }),
+        "duplicate-ids",
+      );
+
+      expect(parsed.ids).toEqual([idOf(4242)]);
+      expect(connectImap).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      [
+        "two folders",
+        encodeMessageId({ mailbox: RECEIPTS, uidValidity: INBOX_UIDVALIDITY, uid: 7 }),
+      ],
+      [
+        "one folder under two validities",
+        encodeMessageId({ mailbox: "INBOX", uidValidity: INBOX_UIDVALIDITY + 1, uid: 7 }),
+      ],
+    ])("ids from %s: mixed-folders", async (_label, other) => {
+      const { move } = tools();
+
+      expectRefusal(
+        await move({ ids: [idOf(4242), other], destination: RECEIPTS_ID }),
+        "mixed-folders",
+      );
+      expect(connectImap).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["an undecodable id", { ids: [idOf(4242), "not-an-id"], destination: RECEIPTS_ID }],
+      ["an undecodable destination", { ids: [idOf(4242)], destination: "not-a-folder" }],
+    ])("%s: not_found", async (_label, args) => {
+      const { move } = tools();
+
+      expectCategory(await move(args), "not_found");
+      expect(connectImap).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("after the one read session", () => {
+    const ONE_P: Fixture = { uid: 4242, size: 18_431, modSeq: "742", subject: "One" };
+    const TWO_P: Fixture = { uid: 4250, size: 2_048, modSeq: "760", subject: "Two" };
+
+    async function refusedPreview(
+      duplex: FakeDuplex,
+      ids: string[],
+      destination: string,
+      refusal: string,
+    ): Promise<Record<string, unknown>> {
+      const { move } = tools();
+      vi.mocked(connectImap).mockReturnValueOnce(duplex as never);
+      const parsed = expectRefusal(await move({ ids, destination }), refusal);
+      expect(connectImap).toHaveBeenCalledTimes(1);
+      const lines = wireOf(duplex);
+      // Read path only: the open is the read-only one, and nothing changes mail.
+      expectNoLine(lines, "SELECT");
+      for (const word of CHANGING) expectNoLine(lines, word);
+      return parsed;
+    }
+
+    it("a UID the fetch does not answer: messages-not-found naming that id", async () => {
+      const duplex = previewServerWith(listingWith("a5"), previewFetchReply("a6", [ONE_P]));
+
+      const parsed = await refusedPreview(
+        duplex,
+        [idOf(ONE_P.uid), idOf(TWO_P.uid)],
+        RECEIPTS_ID,
+        "messages-not-found",
+      );
+
+      expect(parsed.ids).toEqual([idOf(TWO_P.uid)]);
+      expect(wireOf(duplex)).toEqual(previewLines([ONE_P.uid, TWO_P.uid]));
+    });
+
+    it("a message already carrying the removal mark: already-marked-for-removal naming it", async () => {
+      const duplex = previewServerWith(
+        listingWith("a5"),
+        wire(
+          `* 1 FETCH (${fingerprintItems(ONE_P)})`,
+          `* 2 FETCH (${fingerprintItems(TWO_P).replace("FLAGS (\\Seen)", "FLAGS (\\Seen \\Deleted)")})`,
+          "a6 OK FETCH completed",
+        ),
+      );
+
+      const parsed = await refusedPreview(
+        duplex,
+        [idOf(ONE_P.uid), idOf(TWO_P.uid)],
+        RECEIPTS_ID,
+        "already-marked-for-removal",
+      );
+
+      expect(parsed.ids).toEqual([idOf(TWO_P.uid)]);
+    });
+
+    it("the fetch answered BAD: no-change-numbers", async () => {
+      const duplex = previewServerWith(listingWith("a5"), wire("a6 BAD MODSEQ not supported"));
+
+      const parsed = await refusedPreview(
+        duplex,
+        [idOf(ONE_P.uid)],
+        RECEIPTS_ID,
+        "no-change-numbers",
+      );
+
+      expect(parsed.ids).toEqual([idOf(ONE_P.uid)]);
+    });
+
+    it("a destination no listed folder has: destination-not-found", async () => {
+      await refusedPreview(
+        previewServerWith(listingWith("a5"), previewFetchReply("a6", [ONE_P])),
+        [idOf(ONE_P.uid)],
+        encodeFolderId({ mailbox: "Archive" }),
+        "destination-not-found",
+      );
+    });
+
+    it("the source folder as the destination: destination-is-source", async () => {
+      await refusedPreview(
+        previewServerWith(listingWith("a5"), previewFetchReply("a6", [ONE_P])),
+        [idOf(ONE_P.uid)],
+        encodeFolderId({ mailbox: "INBOX" }),
+        "destination-is-source",
+      );
+    });
+
+    it("a destination listed as unselectable: destination-not-selectable", async () => {
+      await refusedPreview(
+        previewServerWith(
+          listingWith("a5", "\\Noselect \\HasChildren"),
+          previewFetchReply("a6", [ONE_P]),
+        ),
+        [idOf(ONE_P.uid)],
+        RECEIPTS_ID,
+        "destination-not-selectable",
+      );
+    });
+  });
+
+  describe("the commit gate", () => {
+    const FIRST: Fixture = { uid: 4242, size: 18_431, modSeq: "742", subject: "One" };
+    const SECOND: Fixture = { uid: 4250, size: 2_048, modSeq: "760", subject: "Two" };
+
+    /** Preview FIRST and SECOND, and hand back the token and change. */
+    async function previewed(move: Callback): Promise<{
+      confirmToken: string;
+      change: { op: string; ids: string[]; destination: string };
+    }> {
+      vi.mocked(connectImap).mockReturnValueOnce(previewServer([FIRST, SECOND]) as never);
+      const trusted = body(
+        await move({ ids: [idOf(FIRST.uid), idOf(SECOND.uid)], destination: RECEIPTS_ID }),
+      );
+      expect(typeof trusted.confirmToken).toBe("string");
+      return trusted as never;
+    }
+
+    it.each([
+      ["the destination swapped", (c: { ids: string[]; destination: string }) => ({ op: "move", ids: c.ids, destination: encodeFolderId({ mailbox: "Archive" }) })],
+      ["the ids reordered", (c: { ids: string[]; destination: string }) => ({ op: "move", ids: [...c.ids].reverse(), destination: c.destination })],
+      ["one id dropped", (c: { ids: string[]; destination: string }) => ({ op: "move", ids: c.ids.slice(0, 1), destination: c.destination })],
+      ["an op that is not move", (c: { ids: string[]; destination: string }) => ({ op: "delete", ids: c.ids, destination: c.destination })],
+    ])("a commit with %s: confirmation_invalid, and no socket", async (_label, alter) => {
+      const { move, commit } = tools();
+      const { confirmToken, change } = await previewed(move);
+      expect(connectImap).toHaveBeenCalledTimes(1);
+
+      const answer = await commit({ confirmToken, change: alter(change) });
+
+      expectCategory(answer, "confirmation_invalid");
+      expect(connectImap).toHaveBeenCalledTimes(1);
+    });
+
+    it("the same token committed twice: the second is confirmation_invalid, and the commit opened one socket", async () => {
+      const { move, commit } = tools();
+      const { confirmToken, change } = await previewed(move);
+      vi.mocked(connectImap).mockReturnValueOnce(
+        createFakeDuplex([
+          ...authPrefix(),
+          selectResponse("a4", "[READ-WRITE]"),
+          fingerprintReply("a5", [FIRST, SECOND]),
+          ...fullMoveReplies(6, FIRST, 88),
+          ...fullMoveReplies(10, SECOND, 89),
+          logoutExchange("a14"),
+        ]) as never,
+      );
+
+      const first = await commit({ confirmToken, change });
+      const again = await commit({ confirmToken, change });
+
+      expect(first.isError).toBeUndefined();
+      expectCategory(again, "confirmation_invalid");
+      // One for the preview, one for the first commit, none for the second.
+      expect(connectImap).toHaveBeenCalledTimes(2);
+    });
+
+    it("a mail token whose kind is not move: confirmation_invalid, and no socket", async () => {
+      const { commit } = tools();
+      const actor = await ownerPrincipal();
+      const change = {
+        op: "move" as const,
+        ids: [idOf(FIRST.uid)],
+        destination: RECEIPTS_ID,
+      };
+      // Everything a real move token carries, with the one field wrong.
+      const token = await mintConfirmation(
+        {
+          v: CONFIRM_VERSION,
+          t: "mail",
+          k: "delete",
+          j: crypto.randomUUID(),
+          m: encodeFolderId({ mailbox: "INBOX" }),
+          uv: INBOX_UIDVALIDITY,
+          q: RECEIPTS_ID,
+          qr: null,
+          l: [{ i: FIRST.uid, z: FIRST.size, d: INTERNAL_SECONDS, n: FIRST.modSeq }],
+          h: await mailMoveChangeHashOf(change),
+          x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+          u: actor.userId,
+        },
+        env.CONFIRM_SECRET,
+      );
+
+      expectCategory(await commit({ confirmToken: token, change }), "confirmation_invalid");
+      expect(connectImap).not.toHaveBeenCalled();
+    });
+
+    it("a commit that finds a message changed: changed-since-preview with the caller's ids, not an error", async () => {
+      const { move, commit } = tools();
+      const { confirmToken, change } = await previewed(move);
+      const committed = createFakeDuplex([
+        ...authPrefix(),
+        selectResponse("a4", "[READ-WRITE]"),
+        fingerprintReply("a5", [FIRST, { ...SECOND, modSeq: "999" }]),
+        logoutExchange("a6"),
+      ]);
+      vi.mocked(connectImap).mockReturnValueOnce(committed as never);
+
+      const answer = await commit({ confirmToken, change });
+
+      expect(answer.isError).toBeUndefined();
+      expect(body(answer)).toEqual({
+        refusal: "changed-since-preview",
+        reason:
+          "These messages changed after the preview, so nothing was moved. Preview the move again.",
+        changedIds: [idOf(SECOND.uid)],
+      });
+      const lines = wireOf(committed);
+      expect(lines).toEqual([...openAndCheckLines([FIRST, SECOND]), "a6 LOGOUT"]);
+      for (const word of CHANGING) expectNoLine(lines, word);
     });
   });
 });
