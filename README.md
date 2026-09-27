@@ -474,7 +474,7 @@ which runs both from the test suite and from a pre-commit hook:
 2. No mail sending — no SMTP, one draft-write path, enforced as a count.
 3. One and only one module may open a TCP socket.
 4. No credential ever reaches a log or an error (there is no logging in `src/`).
-5. Reading mail never marks it read (mailboxes opened read-only, peeking fetches).
+5. Reading mail never marks it read (read paths open mailboxes read-only, fetches peek). One separate path marks a single message read or unread, only when you ask.
 
 Changing any of these is a change to the project's safety boundary. The rules,
 their reasons, and how they are enforced are documented in

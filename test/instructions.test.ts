@@ -245,6 +245,11 @@ describe("the instructions still state every boundary", () => {
   const REQUIRED = [
     ["cannot send mail", "It cannot send mail. Ever."],
     ["reading does not mark read", "Reading mail never marks it read."],
+    // Phase 20, owner-approved 2026-09-26. Reading still never changes read
+    // status; one tool now does, and only when the user asks. The clause pinned
+    // is the "only through the one tool" half, because it is the half a
+    // prompt-injected "mark this read" would need removed.
+    ["read status changes only through one tool", "Read status changes only through the one tool"],
     ["calendar previews first", "previewed first"],
     ["attendees send real invitations", "iCloud sends those people a real invitation"],
     // Phase 18, owner-approved 2026-09-26. The Boundaries paragraph above now
@@ -271,7 +276,7 @@ describe("the instructions still state every boundary", () => {
   it("pins every boundary the string states, with none silently dropped", () => {
     // The count lives HERE, in an assertion, and nowhere in the prose above.
     // A row deleted turns this red instead of leaving a boundary unwatched.
-    expect(REQUIRED.length).toBe(9);
+    expect(REQUIRED.length).toBe(10);
     expect(new Set(REQUIRED.map(([boundary]) => boundary)).size).toBe(
       REQUIRED.length,
     );

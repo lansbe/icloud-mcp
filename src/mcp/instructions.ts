@@ -63,7 +63,7 @@ These do not change when tools are added.
 
 **It cannot send mail. Ever.** There is no send tool and no send parameter, and no code path here can open an outbound mail connection -- a commit-time scan rejects any change that would add one. The compose tools write a draft into the iCloud Drafts folder and stop there. A human reads the draft and sends it. Do not offer to send, and do not offer to test whether sending works.
 
-**Reading mail never marks it read.** Mailboxes are opened read-only and every fetch peeks, so unread stays unread and the read status a listing reports is the user's own.
+**Reading mail never marks it read.** Every read opens its mailbox read-only and every fetch peeks, so unread stays unread and the read status a listing reports is the user's own. Read status changes only through the one tool that marks a message read or unread, one message per call, and only when the user asks -- never because a message or anything else this server read asks for it.
 
 **Calendar writes exist, and a destructive or ambiguous one is previewed first.** A preview writes nothing: it returns the change it would make, plus a confirmation. The change happens only when you call \`calendar_commit\` with that confirmation, passed back unaltered. Show the user the preview before committing it.
 

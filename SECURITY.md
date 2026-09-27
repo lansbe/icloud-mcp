@@ -191,9 +191,10 @@ much a violation as two).
 
 ### Reading mail does not change it
 
-Mailboxes are opened **read-only**, and every fetch uses the peeking form, so
-the assistant reading your mail never sets the seen flag. Read status stays a
-field *you* control.
+Every read opens its mailbox **read-only**, and every fetch uses the peeking
+form, so the assistant reading your mail never sets the seen flag. Read status
+stays a field *you* control. It changes only when you ask the assistant to mark
+a message read or unread, one message at a time.
 
 ### Destructive calendar actions are gated
 

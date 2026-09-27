@@ -222,8 +222,11 @@ strangers all day, and the only thing standing between that and a message sent
 under the user's name is a person looking at it first. Removing the step would
 be a safety regression dressed up as a feature.
 
-A draft reaches the iCloud Drafts folder via IMAP `APPEND`. That is the entire
-write path, and it is deliberately the entire write path.
+A draft reaches the iCloud Drafts folder via IMAP `APPEND`. One other mail write
+exists. It places nothing and sends nothing: it changes one flag on one message,
+when the user asks, through the separate path in §5 under "One path may change a
+mailbox, and it is not a read path". The drafts write is the only write that
+places a message, and deliberately so.
 
 **That write is constructed in exactly one module, `src/mail/service.ts`, and
 the constraint is a count rather than a prohibition.** Zero constructors is as
@@ -246,9 +249,10 @@ the command word held in a variable and handed to the generic sender — and bot
 are named in the rule's own docstring, because a rule believed to prove more than
 it does is worse than one whose limits are written down.
 
-Nothing is given up here either. There is no point on this project's roadmap
-where a second write path is the answer, and a second one would be a second
-thing this project can do to the user's account, arriving without a decision.
+Nothing is given up here either. A second path that places a message would be a
+second thing this project can do to the user's account. So one arrives only with
+a decision, never as a refactor. The flag change in §5 arrived that way, in
+Phase 20, and places no message.
 
 One consequence lands on every module added under `src/` from now on. The rule's
 scope is the whole source tree and it walks that tree on every commit, so
@@ -274,9 +278,10 @@ re-derived.
    what the content *is*. It is not a claim that no byte may leave this Worker.
 
 2. **This server still sends no mail.** No submission port is opened, no
-   mail-sending library is linked, and no second write construction site appears
-   in `src/mail/`. The scan verifies all three mechanically, in both directions,
-   and this phase adds nothing at all to `src/mail/`.
+   mail-sending library is linked, and no second construction site for the
+   drafts write appears in `src/mail/`. The scan verifies all three
+   mechanically, in both directions, and this phase adds nothing at all to
+   `src/mail/`.
 
 3. **The send is iCloud's.** RFC 6638 defines a scheduling object resource as
    one the server sends scheduling messages for on behalf of the owner of the
@@ -388,10 +393,14 @@ violation too. A choke-point that was quietly moved, renamed, or emptied guards
 nothing, and that failure is far easier to miss than a duplicate.
 
 **The same one-connection-per-request property is defended one layer up as
-well.** `src/mail/service.ts` holds exactly one session orchestrator —
-`withMailSession`, plus `withMailSessionOver` for an already-open stream — and
-there is no raw escape hatch past it. A concurrent combinator wrapped around
-either is rejected by the scan, exactly as one wrapped around the socket open is.
+well.** `src/mail/service.ts` holds two session orchestrators over one private
+core. The read one is `withMailSession`, plus `withMailSessionOver` for an
+already-open stream. The mutating one is `withMutatingMailbox`, plus
+`withMutatingMailboxOver`. The core is not exported, and there is no raw escape
+hatch past either orchestrator. Both take the same request gate, so one request
+gets one session, whichever kind it is. A concurrent combinator wrapped around
+any of them is rejected by the scan, exactly as one wrapped around the socket
+open is.
 
 That rule exists because a fan-out here is genuinely tempting rather than
 hypothetical. An account-wide unread sweep and an account-wide search are both
@@ -516,11 +525,13 @@ for.
 
 There are two halves to this, and it is worth knowing which is which.
 
-The **structural** half is that every mailbox is opened read-only. RFC 3501 is
-explicit that no change to the permanent state of a mailbox opened that way is
-permitted, per-user state included, so the server refuses the mutation for the
-whole session no matter what an individual command asks for. Opening a mailbox
-in the mutating form instead is a decision, not a refactor.
+The **structural** half is that every mailbox opened on a read path is opened
+read-only. RFC 3501 says no change to the permanent state of a mailbox opened
+that way is allowed, per-user state included. So on a read path, iCloud refuses
+the change for the whole session, whatever a single command asks for. One
+separate path may open a mailbox in the mutating form. Only explicit triage
+tools use it, and the subsection below says how it is fenced. Opening a mailbox
+in the mutating form anywhere else is a decision, not a refactor.
 
 The **convention** half is that every fetch item uses the peeking form — and
 this is the half the scan enforces, because a convention is otherwise something
@@ -536,6 +547,50 @@ on the fetch item rather than on the spelling alone: a peeking fetch comes back
 under a key spelled *without* the peek, so `src/mail/service.ts` has to look that
 key up. A rule keyed on the spelling would ban reading the answer to the very
 command it protects.
+
+#### One path may change a mailbox, and it is not a read path
+
+Phase 20 adds a tool that marks one message read or unread. To do that, it has
+to open a mailbox in the form that allows changes. This is the one place that
+happens.
+
+1. **Which paths are read-only.** Every other mail tool goes through the read
+   orchestrator. When it opens a mailbox, it opens it read-only. The sign-in
+   check goes through the same orchestrator and opens no mailbox. The diagnostic
+   opens the inbox read-only, with the same command.
+
+2. **The one path that is not.** A second orchestrator in `src/mail/service.ts`:
+   `withMutatingMailbox`, plus `withMutatingMailboxOver`. It runs over the same
+   private core and the same one-per-request gate as the read one. Only
+   `src/mail/triage.ts` may use it. That module hands out verbs, never a
+   session. Today its only verbs mark one message read or unread, and only when
+   the user asks.
+
+3. **What this gives up.** Before Phase 20, iCloud itself refused a read-status
+   change in every session this server opened. Now that is true only on read
+   paths. This trades an absolute for a bounded one, on purpose. Triage cannot
+   exist any other way.
+
+4. **What fences the other path.**
+   - One place in the code opens a mailbox in the mutating form, and one module
+     may use that path. The scan counts both, and refuses zero as well as two.
+   - The mutating session is its own type. The compiler will not let a read
+     session stand in for it, or the other way round.
+   - The verbs fetch no message body.
+   - If a mailbox opens read-only anyway, the verb refuses and says so by name.
+   - The answer reports what iCloud sent back, not what was asked for.
+
+5. **How the read side is proved.** `test/read-path-wire.test.ts` holds the
+   exact commands every read sends. They were recorded before the split. Editing
+   that file is a decision, not a fix.
+
+6. **What is a decision on this boundary, not a refactor.**
+   - A mode argument on either orchestrator.
+   - A second place that opens a mailbox in the mutating form.
+   - A second module that uses the mutating path.
+   - A verb that fetches a message body.
+   - Any new verb. Phase 21's flag and move will each be decided in their own
+     phase.
 
 ### Enforcement
 
