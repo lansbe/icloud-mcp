@@ -1610,6 +1610,54 @@ export async function mailMoveChangeHashOf(
 }
 
 /**
+ * The change a draft delete reduces to, before it is hashed (Phase 22, D-16).
+ *
+ * Exactly what the caller hands back to the mail commit: the op, the caller's
+ * draft id, and the subject the preview read. Its own shape and its own hash
+ * domain, on `NormalizedMailMove`'s reasoning, so a move token cannot be spent
+ * as a draft delete and a draft-delete token cannot be spent as a move.
+ *
+ * **Adding it did NOT bump `CONFIRM_VERSION`.** No field of any token in flight
+ * changes meaning, and the draft delete adds no field to the mail arm: it signs
+ * `k: "delete"`, already a member of `ConfirmKind`, over the same set shape a
+ * move signs, with exactly one entry in `l`.
+ */
+export interface NormalizedDraftChange {
+  op: "draft-delete";
+  id: string;
+  subject: string | null;
+}
+
+/** The domain string a draft delete's tuple starts with. Used by no other change. */
+const MAIL_DRAFT_DELETE_DOMAIN = "mail-draft-delete";
+
+/**
+ * The bytes a draft delete hashes to, as a fixed-order tuple.
+ *
+ * Every field read by name, so key order in what a caller passed back cannot
+ * reach the output. A missing subject is an explicit null, never absent.
+ */
+export function canonicalDraftChange(change: NormalizedDraftChange): string {
+  return JSON.stringify([
+    MAIL_DRAFT_DELETE_DOMAIN,
+    change.op,
+    change.id,
+    change.subject ?? null,
+  ]);
+}
+
+/** The canonical draft delete, digested and carried as base64url. */
+export async function draftChangeHashOf(
+  change: NormalizedDraftChange,
+): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    TOKEN_ENCODER.encode(canonicalDraftChange(change)),
+  );
+  return toBase64Url(new Uint8Array(digest));
+}
+
+/**
  * The resource words this server will ever name in a composed line.
  *
  * A CLOSED vocabulary rather than a caller-supplied string, on `changedFields`'
@@ -1799,6 +1847,25 @@ export interface MoveLineSummary {
     notCopied: number;
     unknown: number;
   } | null;
+}
+
+/**
+ * What the composer takes for one draft moved to Trash (Phase 22, D-15).
+ *
+ * A third member of the composer's input, on `MoveLineSummary`'s precedent: the
+ * draft delete names one draft by its subject and says what happened to it,
+ * and nothing about folders or counts applies. Every field is present and null
+ * when it has no value, never absent.
+ */
+export interface DraftLineSummary {
+  kind: "draft";
+  /** The draft's subject, or `null`. Folded before it is embedded. */
+  name: string | null;
+  /**
+   * What happened to the draft on a commit, or `null` on a preview. The move
+   * step's own outcome word, which came from a re-read, never from the request.
+   */
+  outcome: "moved" | "copied_not_removed" | "not_copied" | "unknown" | null;
 }
 
 /**
@@ -2134,9 +2201,37 @@ function quotedName(name: string): string {
  * a failed preview.
  */
 export function composeConfirmationLine(
-  summary: ConfirmationSummary | MoveLineSummary,
+  summary: ConfirmationSummary | MoveLineSummary | DraftLineSummary,
   tense: ConfirmationTense,
 ): string {
+  // A draft moved to Trash has its own five sentences, still this function's:
+  // one composer, one tense table, one quoting rule. It returns early because
+  // none of the clauses below can apply. The subject goes through `quotedName`
+  // and nowhere else. No sentence says how long Trash keeps anything, because
+  // nobody measured it (D-15), and none says the draft is gone for good,
+  // because it is not.
+  if (summary.kind === "draft") {
+    const safe = summary.name === null ? "" : quotedName(summary.name);
+    const named = safe.length > 0;
+    const draft = named ? `draft '${safe}'` : "the draft";
+    const Draft = named ? `Draft '${safe}'` : "The draft";
+    const back = "It can be moved back out of Trash until Trash is emptied.";
+    const outcome = tense === "would" ? null : summary.outcome;
+    if (outcome === null) return `Moving ${draft} to Trash. ${back}`;
+    if (outcome === "moved") return `Moved ${draft} to Trash. ${back}`;
+    if (outcome === "copied_not_removed") {
+      return (
+        `Copied ${draft} to Trash, but could not remove it from Drafts. ` +
+        "It is now in both folders."
+      );
+    }
+    if (outcome === "not_copied") return `${Draft} was not moved. Nothing was changed.`;
+    return (
+      `This may have partly happened to ${draft}. ` +
+      "Look in Drafts and Trash before trying again."
+    );
+  }
+
   // A mail move has its own sentence, still this function's: one composer, one
   // tense table, one quoting rule. It returns early because none of the clauses
   // below can apply to a move. Both folder names are folded, because a folder

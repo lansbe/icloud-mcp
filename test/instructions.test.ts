@@ -87,6 +87,7 @@ const EXPECTED_TOOLS: readonly string[] = [
   "mail_compose_new",
   "mail_compose_reply",
   "mail_confirm_upload",
+  "mail_delete_draft",
   "mail_flag",
   "mail_get_attachment",
   "mail_get_message",

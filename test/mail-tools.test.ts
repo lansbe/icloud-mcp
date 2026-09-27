@@ -1779,7 +1779,7 @@ describe("the search and unread registrations", () => {
     return String((shape as z.ZodType).description);
   }
 
-  it("registers the five read tools D-17 names, the five that act on one, the one that changes a flag, and the move preview and its commit, and no others", () => {
+  it("registers the five read tools D-17 names, the five that act on one, the one that changes a flag, the move and draft previews and their commit, and no others", () => {
     // One tool per requirement, so the model's intent is unambiguous at the
     // call site rather than buried in a filter parameter. Compose-new and
     // compose-reply are two NAMES rather than one tool with an optional parent
@@ -1803,6 +1803,9 @@ describe("the search and unread registrations", () => {
       // licensed one tool carrying three ingresses, not two verbs behind one
       // name.
       "mail_confirm_upload",
+      // The seventeenth: a preview of moving one draft to Trash, applied by
+      // mail_commit (Phase 22, DRFT-03).
+      "mail_delete_draft",
       // The sixteenth: flag or unflag one message, written at once with no
       // preview, the same shape as mail_mark_read (D-01).
       "mail_flag",
@@ -1980,7 +1983,7 @@ describe("the search and unread registrations", () => {
     // the model arrives unwarned — and a per-tool assertion is a list somebody
     // has to remember to extend.
     const tools = registered();
-    expect(tools).toHaveLength(16);
+    expect(tools).toHaveLength(17);
 
     for (const tool of tools) {
       expect(
@@ -2389,14 +2392,15 @@ describe("the compose registration", () => {
     }
   });
 
-  it("registers exactly SIXTEEN tools: the tenth is the whole of plan 04-10, the eleventh is mail_mark_read, the twelfth and thirteenth are mail_move and mail_commit, the fourteenth and fifteenth are mail_archive and mail_trash, the sixteenth is mail_flag", () => {
+  it("registers exactly SEVENTEEN tools: the tenth is the whole of plan 04-10, the eleventh is mail_mark_read, the twelfth and thirteenth are mail_move and mail_commit, the fourteenth and fifteenth are mail_archive and mail_trash, the sixteenth is mail_flag, the seventeenth is mail_delete_draft", () => {
     // Nine through plan 04-09, plus mail_confirm_upload. The presigned INGRESS
     // added no registration at all — it is a third value on an existing
     // discriminator, which is precisely what D-80 bought and precisely what it
     // paid for with a union on the output. Phase 20 added the eleventh, the
     // first tool that changes a mailbox. Phase 21 added the move preview and
     // the mail commit, then the archive and Trash previews, then mail_flag.
-    expect(registered()).toHaveLength(16);
+    // Phase 22 added the draft delete preview.
+    expect(registered()).toHaveLength(17);
   });
 });
 
@@ -3618,8 +3622,8 @@ describe("a principal that was refused opens nothing", () => {
     return { gate, acquire, callbacks };
   }
 
-  it("registers all sixteen tools, so the table below leaves none out", () => {
-    expect(refusedTools().callbacks.size).toBe(16);
+  it("registers all seventeen tools, so the table below leaves none out", () => {
+    expect(refusedTools().callbacks.size).toBe(17);
   });
 
   it("mail_list_folders answers auth_failed with the fixed message and never acquires the gate", async () => {

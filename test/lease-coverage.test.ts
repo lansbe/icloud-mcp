@@ -141,6 +141,7 @@ function heldByAnotherRequest(): StoredLease {
 // ---------------------------------------------------------------------------
 
 const MESSAGE_ID = encodeMessageId({ mailbox: "INBOX", uidValidity: 7, uid: 42 });
+const DRAFT_ID = encodeMessageId({ mailbox: "Drafts", uidValidity: 7, uid: 42 });
 const FOLDER_ID = encodeFolderId({ mailbox: "Receipts" });
 const ATTACHMENT_ID = encodeAttachmentId({
   mailbox: "INBOX",
@@ -222,6 +223,7 @@ const LEASED: ReadonlyArray<{ name: string; args: Args }> = [
   { name: "mail_move", args: { ids: [MESSAGE_ID], destination: FOLDER_ID } },
   { name: "mail_archive", args: { ids: [MESSAGE_ID] } },
   { name: "mail_trash", args: { ids: [MESSAGE_ID] } },
+  { name: "mail_delete_draft", args: { id: DRAFT_ID } },
   {
     name: "mail_commit",
     args: async () => ({ confirmToken: (await mintedMove()).confirmToken, change: MOVE_CHANGE }),
