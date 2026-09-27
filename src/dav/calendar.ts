@@ -695,12 +695,20 @@ export type CalendarChangeState =
   | "not_checked"
   | "gone";
 
-/** Why a calendar could not be checked. A subset of D-05's closed list. */
+/**
+ * Why a calendar could not be checked. D-05's closed list, plus one.
+ *
+ * `marker_full` is the one this list adds. The marker has no room left for
+ * this calendar, so it is not checked and no state is kept for it. Unlike
+ * every other reason, the fresh marker does NOT keep an old starting point
+ * for it, and the tool's sentence says so rather than promising a gap covered.
+ */
 export type CalendarNotCheckedReason =
   | "throttled"
   | "connection"
   | "unavailable"
-  | "no_usable_answer";
+  | "no_usable_answer"
+  | "marker_full";
 
 /**
  * Which path answered, so the first live check settles assumption A2.
@@ -1176,12 +1184,8 @@ export async function calendarChangesSince(
         notCovered.push({ calendarId, displayName: collection.displayName });
         continue;
       }
-      // More calendars than one marker may hold: the rest are named, not checked.
-      if (seenKeys.size >= MAX_CHANGE_CALENDARS) {
-        notCovered.push({ calendarId, displayName: collection.displayName });
-        continue;
-      }
-
+      // The key first, before any cap: a calendar that exists is never counted
+      // as gone, whether or not this call checks it.
       const key = await calendarKeyOf(collection.url);
       seenKeys.add(key);
       const old = priorByKey.get(key) ?? null;
@@ -1195,6 +1199,13 @@ export async function calendarChangesSince(
         more: false,
         events: [] as ChangedEventRow[],
       };
+
+      // More calendars than one marker may hold: the rest are not checked, cost
+      // no request, and keep no state, because there is no room to keep one.
+      if (freshStates.length >= MAX_CHANGE_CALENDARS) {
+        calendars.push({ ...base, state: "not_checked", mechanism: null, reason: "marker_full" });
+        continue;
+      }
       const notChecked = (
         reason: CalendarNotCheckedReason,
         mechanism: CalendarSyncMechanism | null,

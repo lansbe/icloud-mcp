@@ -93,12 +93,19 @@ export type SourceState =
   | "not_checked"
   | "gone";
 
-/** Why a source could not be checked. A closed list (D-05). */
+/**
+ * Why a source could not be checked. A closed list (D-05), plus one.
+ *
+ * `marker_full` is calendar-only: the marker has no room for that calendar, so
+ * it keeps no state for it, and the sentence says it is not tracked rather than
+ * promising the next check covers the gap.
+ */
 export type NotCheckedReason =
   | "throttled"
   | "connection"
   | "unavailable"
-  | "no_usable_answer";
+  | "no_usable_answer"
+  | "marker_full";
 
 /**
  * Which mail mechanism answered, so the live check can settle whether iCloud
@@ -468,6 +475,8 @@ function sources(count: number): string {
 function overallSentence(
   states: readonly SourceState[],
   carried: number,
+  /** How many of the `not_checked` states are calendars with no room in the marker. */
+  untracked = 0,
 ): string {
   const count = (state: SourceState) =>
     states.filter((one) => one === state).length;
@@ -484,12 +493,21 @@ function overallSentence(
   if (changes > 0) {
     parts.push(`Changes were found in ${sources(changes)}.`);
   }
-  const notCheckedCount = count("not_checked");
+  // A calendar the marker has no room for keeps no old starting point, so it
+  // is never promised one.
+  const notCheckedCount = count("not_checked") - untracked;
   if (notCheckedCount > 0) {
     parts.push(
       `${sources(notCheckedCount)} could not be checked; the marker keeps ` +
         `the old starting point for ${one(notCheckedCount, "it", "them")}, so ` +
         "the next check covers the gap.",
+    );
+  }
+  if (untracked > 0) {
+    parts.push(
+      untracked === 1
+        ? "1 calendar was not checked because the marker has no room for it; it is not tracked."
+        : `${untracked} calendars were not checked because the marker has no room for them; they are not tracked.`,
     );
   }
   const restarted = count("restarted");
@@ -594,7 +612,13 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
     carried: answer.carried,
     notCovered: answer.calendar.notCovered.map((one) => one.calendarId),
     goneCalendars: answer.calendar.gone,
-    overall: overallSentence(states, answer.carried.length),
+    overall: overallSentence(
+      states,
+      answer.carried.length,
+      answer.calendar.calendars.filter(
+        (one) => one.state === "not_checked" && one.reason === "marker_full",
+      ).length,
+    ),
     since:
       answer.since === null
         ? null

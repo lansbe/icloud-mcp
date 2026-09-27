@@ -1054,3 +1054,35 @@ describe("calendarChangesSince: a calendar with no token property (D-23 fallback
     expect(multigets(stub)).toEqual([]);
   });
 });
+
+describe("calendarChangesSince: calendars past what one marker holds (WR-06)", () => {
+  const url = (n: number) => `${HOME}c${String(n).padStart(2, "0")}/`;
+
+  it("a calendar pushed past the cap is not_checked with marker_full, never gone, and costs no request", async () => {
+    // Sixty-five calendars now; the marker held the last sixty-four. The new
+    // first one pushes the last one past the cap.
+    const cals: Cal[] = Array.from({ length: 65 }, (_, n) => ({
+      url: url(n),
+      name: `Cal ${n}`,
+      token: `t-${n}`,
+    }));
+    const stub = davStub(cals);
+    const prior = await block(
+      Array.from({ length: 64 }, (_, n): [string, string] => [url(n + 1), `t-${n + 1}`]),
+    );
+    const result = await run(stub, prior);
+
+    expect(stub.log.map((one) => one.method)).toEqual(["PROPFIND"]);
+    expect(result.gone).toBe(0);
+    expect(result.notCovered).toEqual([]);
+    const last = result.calendars.find((one) => one.calendarId === idOf(url(64)))!;
+    expect(last).toMatchObject({
+      state: "not_checked",
+      reason: "marker_full",
+      addedOrChanged: null,
+    });
+    expect(result.calendars[0]).toMatchObject({ calendarId: idOf(url(0)), state: "started" });
+    expect(result.fresh.calendars).toHaveLength(64);
+    expect(result.fresh.calendars.map((one) => one.syncToken)).not.toContain("t-64");
+  });
+});

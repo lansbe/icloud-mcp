@@ -1408,6 +1408,45 @@ describe("changes_since with calendars (CHNG-01, CHNG-06, D-32)", () => {
     expect(overall).not.toMatch(/nothing has changed/i);
     expect(overall).toMatch(/1 source could not be checked/);
   });
+
+  it("changesResult: a calendar the marker has no room for is not promised a covered gap (WR-06)", () => {
+    const full = {
+      calendarId: encodeCalendarId({ collectionUrl: WORK_CAL }),
+      displayName: "Work",
+      state: "not_checked" as const,
+      added: null,
+      changed: null,
+      addedOrChanged: null,
+      removed: null,
+      events: [],
+      more: false,
+      mechanism: null,
+      reason: "marker_full" as const,
+    };
+    const result = changesResult({
+      mail: [
+        {
+          folder: "INBOX",
+          state: "no_changes",
+          newMessages: 0,
+          otherActivity: false,
+          mechanism: "status-uidnext",
+          rows: [],
+        },
+      ],
+      carried: [],
+      calendar: { ...NO_CALENDARS, calendars: [full] },
+      since: 1790000000,
+      marker: "m",
+    });
+    const trusted = JSON.parse(result.content[0]!.text);
+    expect(trusted.counts[1]).toMatchObject({ state: "not_checked", reason: "marker_full" });
+    expect(trusted.overall).not.toMatch(/nothing has changed/i);
+    expect(trusted.overall).not.toMatch(/keeps the old starting point/);
+    expect(trusted.overall).toMatch(
+      /1 calendar was not checked because the marker has no room for it; it is not tracked\./,
+    );
+  });
 });
 
 describe("changes_since names the changed events, inside the fence (CHNG-01, CHNG-09, T-23-26)", () => {
