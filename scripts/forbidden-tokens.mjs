@@ -1144,6 +1144,19 @@ export const APPEND_SCOPE = "src/";
  *      because a case-insensitive one would fire on ordinary strings that begin
  *      with the English word "Select" followed by a space.
  *
+ * COMMENTS. The collector matches against the file with its comment LINES
+ * blanked (`withoutCommentLines`), so a commented-out open does not satisfy the
+ * count. Without that, deleting the real open and leaving a comment that quotes
+ * it would keep the count at one and the missing arm quiet, which is the exact
+ * quiet loss that arm exists to catch. Only whole-line comments are blanked: a
+ * line whose first non-space characters are `//`, and a block comment that
+ * starts a line, up to its close. One shape is left, and it still counts: a
+ * comment trailing code on the same line (`foo(); // was ...`). Telling that
+ * `//` from one inside a string or a regex literal needs a real tokenizer, and
+ * a tokenizer that misreads one would hide real code, which is worse than the
+ * gap. A block comment opened after code on a line is not tracked either, so
+ * its following lines count as code.
+ *
  * The one legitimate site is held one layer up instead, by the byte-exact
  * assertion on the recorded open line in `test/triage.test.ts`, which reads
  * what was actually sent rather than the shape of the source that sent it. A
@@ -1153,8 +1166,9 @@ export const APPEND_SCOPE = "src/";
  * PROSE DISCIPLINE. The scope is the whole source tree and the walk runs on
  * every commit, so describe this command BY ROLE in `src/` -- "opened in the
  * mutating form", "the mutating open" -- and never by name followed by an
- * argument. A source comment spelling it out would fail the very check it was
- * trying to explain, in the middle of an unrelated plan.
+ * argument. A whole-line comment no longer counts here (see COMMENTS), but a
+ * trailing one still does, and the write's count one constant up still reads
+ * comments. Describing it by role keeps every one of those quiet.
  *
  * THE SHAPE. The same anchoring as `APPEND_COMMAND`: after an interpolated tag,
  * or at the head of a quoted string, case-sensitive, with a trailing space.
@@ -1179,6 +1193,32 @@ export const MUTATING_OPEN_OWNER = "src/mail/service.ts";
 /** The tree `MUTATING_OPEN_COMMAND` is collected from. Tests and fixtures spell
  *  the command on purpose. */
 export const MUTATING_OPEN_SCOPE = "src/";
+
+/**
+ * The mutating-open construction sites one file contributes, as `scan()`
+ * collects them.
+ *
+ * EVERY match, not the first, with a fresh global copy per call: two sites in
+ * the owner file are two sites. Matched against the file with its comment
+ * lines blanked, so a commented-out open is not a site; the positions are
+ * unchanged by the blanking. See the `MUTATING_OPEN_COMMAND` docstring,
+ * COMMENTS, for what is and is not blanked. An empty list for a file outside
+ * `MUTATING_OPEN_SCOPE`.
+ *
+ * Exported so the tests can feed the checker a real source sample through the
+ * collector `scan()` itself uses.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectMutatingOpens(relativePath, contents) {
+  if (!relativePath.startsWith(MUTATING_OPEN_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  return [...code.matchAll(new RegExp(MUTATING_OPEN_COMMAND, "g"))].map(
+    (match) => ({ file: relativePath, ...positionOf(code, match.index) }),
+  );
+}
 
 /**
  * An import of the mutating orchestrator, permitted in exactly one file of the
@@ -1211,6 +1251,12 @@ export const MUTATING_OPEN_SCOPE = "src/";
  *
  * A renamed binding in the braces (`withMutatingMailbox as open`) IS seen,
  * because the orchestrator's own name is still spelled inside them.
+ *
+ * COMMENTS. As for the mutating open: the collector matches against the file
+ * with its comment LINES blanked, so an import that was deleted and left
+ * quoted in a comment does not satisfy the count. A comment trailing code on
+ * the same line still counts; see `MUTATING_OPEN_COMMAND`, COMMENTS, for why
+ * that one is left.
  *
  * A named re-export (`export { withMutatingMailbox } from "./service"`) IS
  * seen too. It is the cheapest way round an import-only count: one barrel line
@@ -1248,7 +1294,9 @@ export const MUTATING_SESSION_SCOPE = "src/";
  * Exported so the tests can feed the checker a real source sample, through
  * the collector `scan()` itself uses, rather than a hand-made position. At most
  * one entry per file: the first match, as `String.prototype.search` finds it.
- * An empty list for a file outside `MUTATING_SESSION_SCOPE`.
+ * Matched against the file with its comment lines blanked, so a commented-out
+ * import is not an importer. An empty list for a file outside
+ * `MUTATING_SESSION_SCOPE`.
  *
  * @param {string} relativePath
  * @param {string} contents
@@ -1256,9 +1304,10 @@ export const MUTATING_SESSION_SCOPE = "src/";
  */
 export function collectMutatingSessionImports(relativePath, contents) {
   if (!relativePath.startsWith(MUTATING_SESSION_SCOPE)) return [];
-  const index = contents.search(MUTATING_SESSION_IMPORT);
+  const code = withoutCommentLines(contents);
+  const index = code.search(MUTATING_SESSION_IMPORT);
   if (index === -1) return [];
-  return [{ file: relativePath, ...positionOf(contents, index) }];
+  return [{ file: relativePath, ...positionOf(code, index) }];
 }
 
 /**
@@ -2097,6 +2146,54 @@ function walk(absoluteDir, collected = []) {
   return collected;
 }
 
+/**
+ * `text` with every whole-line comment blanked to spaces.
+ *
+ * Blanked: a line whose first non-space characters are `//`, and a block
+ * comment that starts a line, through its closing `*` + `/` (the rest of that
+ * closing line is kept). Every newline and every other character stays where
+ * it was, so a match position in the result is the same line and column in
+ * `text`.
+ *
+ * Deliberately line-anchored rather than a tokenizer. A `//` or an opener in
+ * the middle of a line may sit inside a string or a regex literal, and reading
+ * one of those as a comment would blank real code. So a comment trailing code
+ * is kept, and so is a block comment opened after code. Used by the two
+ * mutating-path counts only.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function withoutCommentLines(text) {
+  const blank = (part) => part.replace(/[^\n]/g, " ");
+  const lines = text.split("\n");
+  let inBlock = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    // Where to look for the block's close on this line.
+    let searchFrom = 0;
+    if (!inBlock) {
+      const trimmed = line.trimStart();
+      if (trimmed.startsWith("//")) {
+        lines[i] = blank(line);
+        continue;
+      }
+      if (!trimmed.startsWith("/*")) continue;
+      // Past the opener, so the opener's own star cannot close it.
+      searchFrom = line.indexOf("/*") + 2;
+    }
+    const close = line.indexOf("*/", searchFrom);
+    if (close === -1) {
+      inBlock = true;
+      lines[i] = blank(line);
+      continue;
+    }
+    inBlock = false;
+    lines[i] = blank(line.slice(0, close + 2)) + line.slice(close + 2);
+  }
+  return lines.join("\n");
+}
+
 /** Line and 1-based column of a character offset within `text`. */
 function positionOf(text, index) {
   const before = text.slice(0, index);
@@ -2304,16 +2401,7 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
     // confirm-line collector gives: `search()` cannot tell one site in the
     // owner file from two. A fresh global copy per file, so no `lastIndex`
     // travels between files.
-    if (relativePath.startsWith(MUTATING_OPEN_SCOPE)) {
-      for (const match of contents.matchAll(
-        new RegExp(MUTATING_OPEN_COMMAND, "g"),
-      )) {
-        mutatingOpens.push({
-          file: relativePath,
-          ...positionOf(contents, match.index),
-        });
-      }
-    }
+    mutatingOpens.push(...collectMutatingOpens(relativePath, contents));
     // The service module defines the orchestrator and imports nothing from
     // itself, so the pattern cannot match there.
     mutatingSessionImporters.push(

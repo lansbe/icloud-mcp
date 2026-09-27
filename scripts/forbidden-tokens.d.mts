@@ -162,6 +162,12 @@ export declare function checkMutatingOpenOwnership(
 export declare function checkMutatingSessionImportOwnership(
   importers: ReadonlyArray<OwnershipMatch>,
 ): Violation[];
+export declare function collectMutatingOpens(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+/** `text` with every whole-line comment blanked, positions unchanged. */
+export declare function withoutCommentLines(text: string): string;
 export declare function collectMutatingSessionImports(
   relativePath: string,
   contents: string,

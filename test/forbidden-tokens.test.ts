@@ -36,7 +36,9 @@ import {
   MUTATING_SESSION_IMPORT,
   MUTATING_SESSION_OWNER,
   MUTATING_SESSION_SCOPE,
+  collectMutatingOpens,
   collectMutatingSessionImports,
+  withoutCommentLines,
   OWNERSHIP_VIOLATION_IDS,
   PASSWORD_READER_IMPORT,
   PASSWORD_READER_OWNERS,
@@ -4346,9 +4348,78 @@ describe("the mutating open is a count constraint too (Phase 20, D-06)", () => {
   });
 
   it("does fire on prose that spells the command with a quoted argument", () => {
-    // The executable form of "describe it by role" in src/. A comment written
-    // like this would fail the very check it was explaining.
+    // The pattern alone still sees it. The collector blanks whole-line
+    // comments before matching (WR-06), so this line would not be counted, but
+    // a trailing comment would, and the write's count still reads comments.
+    // Describing it by role keeps all of those quiet.
     expect(fires(' * a `SELECT "INBOX"` here would open the mailbox for changing.')).toBe(true);
+  });
+
+  it("does not count a commented-out open, so a deleted site cannot hide behind a comment (WR-06)", () => {
+    // The real open deleted, and a comment quoting it left behind in the
+    // owner. Before WR-06 that comment kept the count at one.
+    for (const sample of [
+      "// the old open was `SELECT ${quoted}`\n",
+      "    // `SELECT ${quoted}`,\n",
+      "/**\n * The old open, `SELECT ${quoted}`, lived here.\n */\n",
+      "  /* was: `SELECT ${quoted}` */\n",
+    ]) {
+      const collected = collectMutatingOpens(MUTATING_OPEN_OWNER, sample);
+      expect(collected, JSON.stringify(sample)).toEqual([]);
+      expect(checkMutatingOpenOwnership(collected).map((v) => v.pattern)).toEqual([
+        "mutating-open-missing",
+      ]);
+    }
+  });
+
+  it("still counts real code beside comments, at the right position (WR-06)", () => {
+    const sample = [
+      "/**",
+      " * was `SELECT ${old}`",
+      " */",
+      "// and `SELECT ${older}`",
+      "const opened = await send(",
+      "        `SELECT ${quoted}`,",
+      ");",
+    ].join("\n");
+    expect(collectMutatingOpens(MUTATING_OPEN_OWNER, sample)).toEqual([
+      { file: MUTATING_OPEN_OWNER, line: 6, column: 9 },
+    ]);
+    // Outside the scope it is nobody's business: fixtures spell it on purpose.
+    expect(collectMutatingOpens("test/fixtures/x.ts", sample)).toEqual([]);
+  });
+
+  it("pins the one comment shape still counted: a comment trailing code (WR-06)", () => {
+    // Telling this `//` from one inside a string or a regex literal needs a
+    // tokenizer, and a tokenizer that misread one would hide real code. The
+    // docstring lists this. If the collector later blanks it, move this row out
+    // and update the docstring.
+    expect(
+      collectMutatingOpens(MUTATING_OPEN_OWNER, "done(); // was `SELECT ${quoted}`\n"),
+    ).toHaveLength(1);
+  });
+
+  it("blanks only whole-line comments, and keeps every position", () => {
+    const text = [
+      "a(); // tail",
+      "  // whole",
+      "/* one-line */ b();",
+      "/**",
+      " * body",
+      " */ c();",
+      'const url = "https://example.invalid/*";',
+    ].join("\n");
+    const out = withoutCommentLines(text);
+    expect(out.length).toBe(text.length);
+    expect(out.split("\n")).toEqual([
+      "a(); // tail",
+      " ".repeat("  // whole".length),
+      `${" ".repeat("/* one-line */".length)} b();`,
+      "   ",
+      " ".repeat(" * body".length),
+      `${" ".repeat(" */".length)} c();`,
+      'const url = "https://example.invalid/*";',
+    ]);
   });
 
   it("carries no global flag, and the collector stays safe across files", () => {
@@ -4493,6 +4564,25 @@ describe("the mutating session has one importer (Phase 20, D-05, D-06)", () => {
     }
   });
 
+  it("does not count a commented-out import, so a deleted importer cannot hide behind a comment (WR-06)", () => {
+    for (const sample of [
+      '// was: import { withMutatingMailbox } from "./service";\n',
+      '/**\n * import { withMutatingMailboxOver } from "./service";\n */\n',
+      '// import {\n//   withMutatingMailbox,\n// } from "./service";\n',
+    ]) {
+      const collected = collectMutatingSessionImports(MUTATING_SESSION_OWNER, sample);
+      expect(collected, JSON.stringify(sample)).toEqual([]);
+      expect(
+        checkMutatingSessionImportOwnership(collected).map((v) => v.pattern),
+      ).toEqual(["mutating-session-importer-missing"]);
+    }
+    // The real import after a comment block is still counted, on its own line.
+    const real = '// header\nimport { withMutatingMailbox } from "./service";\n';
+    expect(collectMutatingSessionImports(MUTATING_SESSION_OWNER, real)).toEqual([
+      { file: MUTATING_SESSION_OWNER, line: 2, column: 1 },
+    ]);
+  });
+
   it("collects a file that imports it twice once, at its first import", () => {
     const first = 'import { withMutatingMailbox } from "./service";';
     const twice = `// header\n${first}\nimport { withMutatingMailboxOver } from "./service";\n`;
@@ -4517,6 +4607,10 @@ describe("the mutating session has one importer (Phase 20, D-05, D-06)", () => {
 describe("the count constraints as a set", () => {
   /** A barrel's named re-export of the mutating orchestrator (WR-05). */
   const BARREL_REEXPORT = 'export { withMutatingMailbox } from "./service";\n';
+
+  /** The owners with the real site deleted and only a comment left (WR-06). */
+  const COMMENTED_OPEN = "// the old open was `SELECT ${quoted}`\n";
+  const COMMENTED_IMPORT = '// was: import { withMutatingMailbox } from "./service";\n';
 
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
@@ -4560,16 +4654,22 @@ describe("the count constraints as a set", () => {
       // One owner, so the same two lists once more.
       ...checkConfirmLineOwnership([nonOwner]).map((v) => v.pattern),
       ...checkConfirmLineOwnership([]).map((v) => v.pattern),
-      // The two phase 20 counts, one owner each, so the same pair of lists.
+      // The two phase 20 counts, one owner each. Both are fed real source
+      // samples through scan()'s own collectors. The missing arms get an owner
+      // whose only match is inside a comment (WR-06), which must not count.
       ...checkMutatingOpenOwnership([nonOwner]).map((v) => v.pattern),
-      ...checkMutatingOpenOwnership([]).map((v) => v.pattern),
+      ...checkMutatingOpenOwnership(
+        collectMutatingOpens(MUTATING_OPEN_OWNER, COMMENTED_OPEN),
+      ).map((v) => v.pattern),
       // The outside arm is fed a real source sample through scan()'s own
       // collector: a barrel's named re-export, the cheapest way round an
       // import-only count (WR-05).
       ...checkMutatingSessionImportOwnership(
         collectMutatingSessionImports("src/mail/index.ts", BARREL_REEXPORT),
       ).map((v) => v.pattern),
-      ...checkMutatingSessionImportOwnership([]).map((v) => v.pattern),
+      ...checkMutatingSessionImportOwnership(
+        collectMutatingSessionImports(MUTATING_SESSION_OWNER, COMMENTED_IMPORT),
+      ).map((v) => v.pattern),
       // The second two-owner count, fed the same pair of lists the password
       // count is fed and for the same reason.
       ...checkPrincipalConstructorOwnership([
@@ -4630,11 +4730,15 @@ describe("the count constraints as a set", () => {
       // One owner each again: a lone non-owner and an empty list give one of
       // each id.
       ...checkMutatingOpenOwnership([nonOwner]),
-      ...checkMutatingOpenOwnership([]),
+      ...checkMutatingOpenOwnership(
+        collectMutatingOpens(MUTATING_OPEN_OWNER, COMMENTED_OPEN),
+      ),
       ...checkMutatingSessionImportOwnership(
         collectMutatingSessionImports("src/mail/index.ts", BARREL_REEXPORT),
       ),
-      ...checkMutatingSessionImportOwnership([]),
+      ...checkMutatingSessionImportOwnership(
+        collectMutatingSessionImports(MUTATING_SESSION_OWNER, COMMENTED_IMPORT),
+      ),
       // TWO owners again, so the same asymmetric pair the password count needs:
       // both owners plus a non-owner is exactly one outside, and one owner
       // alone is exactly one missing.
