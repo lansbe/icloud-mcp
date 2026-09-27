@@ -36,11 +36,14 @@ import {
   mintConfirmation,
 } from "../src/confirm";
 import { ImapAuthError } from "../src/errors";
+import { decodeFolderId, encodeFolderId } from "../src/mail/ids";
 import { TOKEN_ENCODER, toBase64Url } from "../src/tokens";
 import {
   AUTH_REJECTED_LEGACY_TEXT,
   AUTH_REJECTED_TEXT,
   GREETING_AT_CONNECTION_LIMIT,
+  MUTF7_DISPLAY_NAME,
+  MUTF7_WIRE_NAME,
   taggedNo,
   GREETING,
   INBOX_UIDVALIDITY,
@@ -185,7 +188,14 @@ describe("changes_since for the inbox (CHNG-01, CHNG-03, CHNG-07)", () => {
     const text = answer.content[0]!.text;
     expect(text.startsWith('{"counts":')).toBe(true);
     const trusted = trustedOf(answer);
-    expect(Object.keys(trusted)).toEqual(["counts", "overall", "since", "marker"]);
+    expect(Object.keys(trusted)).toEqual([
+      "counts",
+      "carried",
+      "overall",
+      "since",
+      "marker",
+    ]);
+    expect(trusted.carried).toEqual([]);
     expect(trusted.counts).toEqual([
       {
         source: "mail",
@@ -390,8 +400,9 @@ describe("stranger-authored text stays inside the fence (CHNG-06, CHNG-09)", () 
     const body = fenced.split("\n")[2]!;
     const untrusted = JSON.parse(body);
     expect(Object.keys(untrusted)).toEqual(["INBOX"]);
-    expect(untrusted.INBOX).toHaveLength(1);
-    expect(untrusted.INBOX[0].subject).toBe(HOSTILE_SUBJECT);
+    expect(untrusted.INBOX.name).toBe("INBOX");
+    expect(untrusted.INBOX.rows).toHaveLength(1);
+    expect(untrusted.INBOX.rows[0].subject).toBe(HOSTILE_SUBJECT);
   });
 
   it("no recorded line opens a mailbox for changing or fetches content", async () => {
@@ -779,5 +790,291 @@ describe("the nothing-changed sentence only when every source is no_changes (D-0
       }
     }
     expect(seen).toBe(36);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 23-03 Task 2: folders by id, one after another, and carry-forward
+// (D-04, D-16, D-18, D-21, CHNG-08)
+// ---------------------------------------------------------------------------
+
+interface ScriptedStatus {
+  mailbox: string;
+  uidValidity: number;
+  uidNext: number;
+  modseq?: string | null;
+}
+
+/** One status session answering each folder in turn, tags from a4. */
+function statusSessionFor(folders: readonly ScriptedStatus[]): FakeDuplex {
+  return createFakeDuplex([
+    ...authPrefix(),
+    ...folders.map((folder, index) =>
+      statusResponse(
+        `a${4 + index}`,
+        folder.mailbox,
+        folder.uidValidity,
+        folder.uidNext,
+        10,
+        folder.modseq ?? null,
+      ),
+    ),
+    logoutExchange(`a${4 + folders.length}`),
+  ]);
+}
+
+function statusLine(tag: string, mailbox: string): string {
+  return `${tag} STATUS "${mailbox}" (UIDVALIDITY UIDNEXT MESSAGES HIGHESTMODSEQ)`;
+}
+
+/** The inputSchema the tool registers, for the validation cases. */
+function changesSchema(): { safeParse(input: unknown): any } {
+  let schema: { safeParse(input: unknown): any } | undefined;
+  const server = {
+    registerTool(name: string, options: { inputSchema: any }) {
+      if (name === CHANGES_TOOL_NAME) schema = options.inputSchema;
+    },
+  };
+  registerChangesTool(
+    server as unknown as McpServer,
+    createSessionGate(),
+    ownerPrincipal(),
+  );
+  return schema!;
+}
+
+const RECEIPTS = encodeFolderId({ mailbox: "Receipts" });
+const ARCHIVE = encodeFolderId({ mailbox: "Archive" });
+
+describe("changes_since with a folder list (CHNG-08)", () => {
+  it("two ids: two status lines in the given order, one session, no inbox", async () => {
+    const session = statusSessionFor([
+      { mailbox: "Receipts", uidValidity: 7, uidNext: 40 },
+      { mailbox: "Archive", uidValidity: 8, uidNext: 900 },
+    ]);
+    vi.mocked(connectImap).mockReturnValueOnce(session as never);
+
+    const answer = await changesCallback()({ folders: [RECEIPTS, ARCHIVE] });
+
+    expect(connectImap).toHaveBeenCalledTimes(1);
+    expect(wireOf(session)).toEqual([
+      "a1 CAPABILITY",
+      "a2 LOGIN [redacted]",
+      "a3 CAPABILITY",
+      statusLine("a4", "Receipts"),
+      statusLine("a5", "Archive"),
+      "a6 LOGOUT",
+    ]);
+    const trusted = trustedOf(answer);
+    expect(trusted.counts.map((one: any) => [one.folder, one.state])).toEqual([
+      [RECEIPTS, "started"],
+      [ARCHIVE, "started"],
+    ]);
+  });
+
+  it("a duplicate id is asked once", async () => {
+    const session = statusSessionFor([
+      { mailbox: "Receipts", uidValidity: 7, uidNext: 40 },
+    ]);
+    vi.mocked(connectImap).mockReturnValueOnce(session as never);
+
+    const answer = await changesCallback()({ folders: [RECEIPTS, RECEIPTS] });
+
+    expect(wireOf(session).filter((line) => line.includes("STATUS"))).toEqual([
+      statusLine("a4", "Receipts"),
+    ]);
+    expect(trustedOf(answer).counts).toHaveLength(1);
+  });
+
+  it("six ids are refused by the input schema, with a plain sentence", () => {
+    const schema = changesSchema();
+    const six = ["a", "b", "c", "d", "e", "f"].map((mailbox) =>
+      encodeFolderId({ mailbox }),
+    );
+    const refused = schema.safeParse({ folders: six });
+    expect(refused.success).toBe(false);
+    expect(refused.error.issues[0].message).toMatch(/^At most five folders/);
+    expect(schema.safeParse({ folders: six.slice(0, 5) }).success).toBe(true);
+    expect(schema.safeParse({ folders: [] }).success).toBe(false);
+    expect(schema.safeParse({}).success).toBe(true);
+    expect(connectImap).not.toHaveBeenCalled();
+  });
+
+  it("a bad id is answered as the mail tools answer one, and no socket is opened", async () => {
+    let expected: unknown;
+    try {
+      decodeFolderId("not-a-folder-id");
+    } catch (err) {
+      expected = mailErrorResult(err);
+    }
+    expect(expected).toBeDefined();
+
+    const answer = await changesCallback()({
+      folders: [RECEIPTS, "not-a-folder-id"],
+    });
+
+    expect(answer).toEqual(expected);
+    expect(connectImap).not.toHaveBeenCalled();
+  });
+
+  it("two folders with new mail: one status session, then two read-only sessions one after another", async () => {
+    const marker = await markerFor({
+      folders: [
+        { mailbox: "Receipts", uidValidity: 7, uidNext: 40, highestModseq: null },
+        { mailbox: "Archive", uidValidity: 8, uidNext: 900, highestModseq: null },
+      ],
+      calendar: null,
+      mintedAt: 1790000000,
+    });
+    const status = statusSessionFor([
+      { mailbox: "Receipts", uidValidity: 7, uidNext: 42 },
+      { mailbox: "Archive", uidValidity: 8, uidNext: 901 },
+    ]);
+    const receipts = createFakeDuplex([
+      ...authPrefix(),
+      examineResponse("a4", 10, 7),
+      wire("* SEARCH 40 41", "a5 OK SEARCH completed"),
+      headerFetchReply("a6", [
+        { uid: 41, subject: "Two", from: "b@example.invalid" },
+        { uid: 40, subject: "One", from: "a@example.invalid" },
+      ]),
+      logoutExchange("a7"),
+    ]);
+    const archive = createFakeDuplex([
+      ...authPrefix(),
+      examineResponse("a4", 10, 8),
+      wire("* SEARCH 900", "a5 OK SEARCH completed"),
+      headerFetchReply("a6", [
+        { uid: 900, subject: "Old", from: "c@example.invalid" },
+      ]),
+      logoutExchange("a7"),
+    ]);
+
+    // Each connect checks that every earlier session has already logged out
+    // and closed, so two sessions never overlap.
+    const sessions = [status, receipts, archive];
+    const overlaps: string[] = [];
+    let next = 0;
+    vi.mocked(connectImap).mockImplementation((() => {
+      for (const earlier of sessions.slice(0, next)) {
+        const lines = wireOf(earlier);
+        if (!lines.at(-1)?.endsWith("LOGOUT") || earlier.firstIndexOf("close") < 0) {
+          overlaps.push(`session ${next} opened before an earlier one closed`);
+        }
+      }
+      return sessions[next++] as never;
+    }) as never);
+
+    const answer = await changesCallback()({ marker, folders: [RECEIPTS, ARCHIVE] });
+
+    expect(overlaps).toEqual([]);
+    expect(connectImap).toHaveBeenCalledTimes(3);
+    expect(wireOf(status)).toEqual([
+      "a1 CAPABILITY",
+      "a2 LOGIN [redacted]",
+      "a3 CAPABILITY",
+      statusLine("a4", "Receipts"),
+      statusLine("a5", "Archive"),
+      "a6 LOGOUT",
+    ]);
+    expect(wireOf(receipts)).toEqual([
+      "a1 CAPABILITY",
+      "a2 LOGIN [redacted]",
+      "a3 CAPABILITY",
+      'a4 EXAMINE "Receipts"',
+      "a5 UID SEARCH UID 40:41",
+      "a6 UID FETCH 41,40 (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])",
+      "a7 LOGOUT",
+    ]);
+    expect(wireOf(archive)).toEqual([
+      "a1 CAPABILITY",
+      "a2 LOGIN [redacted]",
+      "a3 CAPABILITY",
+      'a4 EXAMINE "Archive"',
+      "a5 UID SEARCH UID 900:900",
+      "a6 UID FETCH 900 (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])",
+      "a7 LOGOUT",
+    ]);
+    const trusted = trustedOf(answer);
+    expect(trusted.counts.map((one: any) => [one.folder, one.state, one.newMessages])).toEqual([
+      [RECEIPTS, "changes", 2],
+      [ARCHIVE, "changes", 1],
+    ]);
+  });
+
+  it("a marker folder not asked about is carried unchanged and named by id", async () => {
+    const receiptsState = {
+      mailbox: "Receipts",
+      uidValidity: 7,
+      uidNext: 40,
+      highestModseq: "55",
+    };
+    const marker = await markerFor({
+      folders: [{ ...INBOX_STATE }, receiptsState],
+      calendar: null,
+      mintedAt: 1790000000,
+    });
+    const session = statusSession(4392, "118");
+    vi.mocked(connectImap).mockReturnValueOnce(session as never);
+
+    const answer = await changesCallback()({ marker });
+
+    expect(wireOf(session).filter((line) => line.includes("STATUS"))).toEqual([
+      STATUS_LINE,
+    ]);
+    const trusted = trustedOf(answer);
+    expect(trusted.counts.map((one: any) => one.folder)).toEqual(["INBOX"]);
+    expect(trusted.carried).toEqual([RECEIPTS]);
+    expect(trusted.overall).not.toMatch(/nothing has changed/i);
+    expect(trusted.overall).toMatch(/not asked about this time/);
+
+    const { userId } = await ownerPrincipal();
+    const reading = await readMarker(trusted.marker, userId, env.CONFIRM_SECRET);
+    if (reading.kind !== "current") throw new Error("expected a current marker");
+    expect(reading.content.folders).toEqual([{ ...INBOX_STATE }, receiptsState]);
+  });
+
+  it("checked plus carried over five is refused before any socket", async () => {
+    const marker = await markerFor({
+      folders: ["INBOX", "A", "B", "C", "D"].map((mailbox) => ({
+        mailbox,
+        uidValidity: 1,
+        uidNext: 2,
+        highestModseq: null,
+      })),
+      calendar: null,
+      mintedAt: 1790000000,
+    });
+
+    const answer = await changesCallback()({
+      marker,
+      folders: [encodeFolderId({ mailbox: "E" })],
+    });
+
+    expect(connectImap).not.toHaveBeenCalled();
+    const body = trustedOf(answer);
+    expect(body.refusal).toBe("too-many-folders");
+    expect(body.overall).toMatch(/^At most five folders/);
+    expect(body.marker).toBeUndefined();
+  });
+
+  it("a non-inbox folder is named by id in the trusted block; its name is only in the fence", async () => {
+    const id = encodeFolderId({ mailbox: MUTF7_WIRE_NAME });
+    const session = statusSessionFor([
+      { mailbox: MUTF7_WIRE_NAME, uidValidity: 9, uidNext: 12 },
+    ]);
+    vi.mocked(connectImap).mockReturnValueOnce(session as never);
+
+    const answer = await changesCallback()({ folders: [id] });
+
+    const trustedText = answer.content[0]!.text;
+    expect(trustedText).not.toContain(MUTF7_WIRE_NAME);
+    expect(trustedText).not.toContain(MUTF7_DISPLAY_NAME);
+    expect(JSON.parse(trustedText).counts[0].folder).toBe(id);
+
+    const fenced = answer.content[1]!.text;
+    const untrusted = JSON.parse(fenced.split("\n")[2]!);
+    expect(Object.keys(untrusted)).toEqual([id]);
+    expect(untrusted[id]).toEqual({ name: MUTF7_DISPLAY_NAME, rows: [] });
   });
 });
