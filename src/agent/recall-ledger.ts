@@ -41,7 +41,7 @@
 // at the source, never in the pattern.
 
 /** The reasons a record can be refused. Plan 25-03 appends to this list and nowhere else. */
-export const RECORD_REFUSALS = ["invalid", "unnamed", "full"] as const;
+export const RECORD_REFUSALS = ["invalid", "unnamed", "full", "destroying"] as const;
 
 /** One reason a record was refused. */
 export type RecordRefusal = (typeof RECORD_REFUSALS)[number];
@@ -51,7 +51,7 @@ export type RecordRefusal = (typeof RECORD_REFUSALS)[number];
  * Plan 25-03 appends to this list and nowhere else. The build engine derives its
  * status type from it, so a reason added here needs no change there.
  */
-export const PAGE_REFUSALS = ["busy", "paused", "quota", "full"] as const;
+export const PAGE_REFUSALS = ["busy", "paused", "quota", "full", "destroying"] as const;
 
 /** One reason a page was refused. */
 export type PageRefusal = (typeof PAGE_REFUSALS)[number];
@@ -80,6 +80,9 @@ const LAST_PAGE_ROW = "last_page_at";
 /** The `recall_state` keys of the current UTC day and its page count. */
 const DAY_ROW = "pages_day";
 const DAY_COUNT_ROW = "pages_count";
+
+/** The `recall_state` key of the pending-destroy flag. */
+const PENDING_DESTROY_ROW = "destroy_pending";
 
 /** The `recall_state` key of one mailbox's build cursor is this plus the mailbox. */
 const CURSOR_ROW = "cursor:";
@@ -322,4 +325,28 @@ export function earliestExpiry(sql: SqlStorage): number | null {
     .exec<{ m: number | null }>(`select min(expires_at) as m from recall_vectors`)
     .one();
   return typeof row.m === "number" ? row.m : null;
+}
+
+/** Whether a destroy has started and not finished. */
+export function destroyPending(sql: SqlStorage): boolean {
+  return readState(sql, PENDING_DESTROY_ROW) !== null;
+}
+
+/** Mark a destroy as started. Set BEFORE the first delete. */
+export function markDestroyPending(sql: SqlStorage): void {
+  writeState(sql, PENDING_DESTROY_ROW, "1");
+}
+
+/** Mark the destroy as finished. */
+export function clearDestroyPending(sql: SqlStorage): void {
+  clearState(sql, PENDING_DESTROY_ROW);
+}
+
+/**
+ * Clear every recall state row except the pending-destroy flag: every cursor,
+ * the page token, the last page time and the day's page count. The object's
+ * own name is not a recall state row, so it survives.
+ */
+export function clearRecallStateExceptPending(sql: SqlStorage): void {
+  sql.exec(`delete from recall_state where k != ?`, PENDING_DESTROY_ROW);
 }

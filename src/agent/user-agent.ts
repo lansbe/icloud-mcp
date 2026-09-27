@@ -49,7 +49,8 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { type RecallStore, recallStore } from "../recall/index";
-import { type LedgerHandle, sweepExpired } from "../recall/lifecycle";
+import { grantsRemainFor } from "../recall/grant-check";
+import { destroyAll, type LedgerHandle, sweepExpired } from "../recall/lifecycle";
 import {
   RECALL_MAX_PAGES_PER_DAY,
   RECALL_MAX_VECTORS,
@@ -58,7 +59,10 @@ import {
 } from "../recall/retention";
 import {
   clearCursor,
+  clearDestroyPending,
   clearPageSlot,
+  clearRecallStateExceptPending,
+  destroyPending,
   countNewIds,
   countPageOn,
   countVectors,
@@ -68,6 +72,7 @@ import {
   anyIds,
   forgetVectors,
   idsForMailbox,
+  markDestroyPending,
   type LedgerRowInput,
   type MailboxRow,
   type PageRefusal,
@@ -282,12 +287,13 @@ export class UserAgent extends DurableObject<Env> {
    * a ledger row exists. A later phase with a job on this alarm adds its job
    * here, in this function, and nowhere else (Phases 27 and 28 will). A second
    * condition written beside this one would let one job remove the alarm
-   * another job still needs.
+   * another job still needs. Recall's jobs: a ledger row exists, or a destroy
+   * has started and not finished.
    */
   anyJobPending = (): boolean => {
     const sql = this.ctx.storage.sql;
     ensureRecallSchema(sql);
-    return countVectors(sql) > 0;
+    return countVectors(sql) > 0 || destroyPending(sql);
   };
 
   /**
@@ -310,6 +316,59 @@ export class UserAgent extends DurableObject<Env> {
     const target = Math.min(Math.max(wantedAt, now), now + RECALL_SWEEP_MAX_INTERVAL_MS);
     const current = await storage.getAlarm();
     if (current === null || current <= now || current > target) await storage.setAlarm(target);
+  };
+
+  /**
+   * Whether this person still holds any grant. A seam, so tests can answer for
+   * the library; production never overrides it.
+   */
+  grantsRemain = (userId: string): Promise<"some" | "none" | "unknown"> =>
+    grantsRemainFor(this.env.OAUTH_KV, userId);
+
+  /**
+   * The object's stored own name, when it is a 64-hex user id, else null.
+   *
+   * Reads only the key-value storage. It never reads the platform's id, which
+   * is not documented as present inside an alarm (D-22). The alarm and later
+   * phases ask this, never the platform.
+   */
+  storedOwnName = (): string | null => {
+    const stored = this.ctx.storage.kv.get<unknown>(OWN_NAME_KEY);
+    return typeof stored === "string" && HEX_64.test(stored) ? stored : null;
+  };
+
+  /**
+   * Destroy this person's recall index: every vector, every ledger row, every
+   * cursor and the page state (D-10). The object's own name is kept.
+   *
+   * NOT an RPC method, and no prototype method destroys. Recall is inherent and
+   * there is no opt-out, so nothing outside the object may start a destroy. In
+   * production the alarm is its only caller: when the person's last grant is
+   * gone, or to finish a destroy that failed part-way.
+   *
+   * The pending flag is set FIRST, before any delete. While it is set, a record
+   * and a page start are refused as `destroying`, so nothing lands in the
+   * ledger while it is being emptied. Store first, then ledger, batch by batch.
+   * On success every recall state row goes, the flag last, and the helper
+   * removes the alarm when no job is left. On failure the flag stays, the alarm
+   * is set about an hour out, and the next alarm finishes the job. The caught
+   * value is never read.
+   */
+  destroyRecall = async (): Promise<{ ok: boolean }> => {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    markDestroyPending(sql);
+    clearPageSlot(sql);
+    try {
+      await destroyAll(this.ledgerHandle(), this.vectorStore());
+    } catch {
+      await this.scheduleAlarm(Date.now() + RECALL_ALARM_RETRY_MS);
+      return { ok: false };
+    }
+    clearRecallStateExceptPending(sql);
+    clearDestroyPending(sql);
+    await this.scheduleAlarm(Date.now() + RECALL_SWEEP_MAX_INTERVAL_MS);
+    return { ok: true };
   };
 
   /** Reads and removals over this object's own ledger, for the sweep and the destroy. */
@@ -343,8 +402,9 @@ export class UserAgent extends DurableObject<Env> {
    * this module that reads the platform's id.
    */
   rememberOwnName = (): string | null => {
-    const stored = this.ctx.storage.kv.get<unknown>(OWN_NAME_KEY);
-    if (typeof stored === "string") return stored;
+    const stored = this.storedOwnName();
+    if (stored !== null) return stored;
+    if (this.ctx.storage.kv.get<unknown>(OWN_NAME_KEY) !== undefined) return null;
     const name: unknown = this.ctx.id.name;
     if (typeof name !== "string" || !HEX_64.test(name)) return null;
     this.ctx.storage.kv.put(OWN_NAME_KEY, name);
@@ -370,6 +430,7 @@ export class UserAgent extends DurableObject<Env> {
     if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
     const valid = validRows(rows);
     if (valid === null) return { ok: false, reason: "invalid" };
+    if (destroyPending(sql)) return { ok: false, reason: "destroying" };
     const fresh = countNewIds(
       sql,
       valid.map((row) => row.vectorId),
@@ -383,10 +444,12 @@ export class UserAgent extends DurableObject<Env> {
   }
 
   /**
-   * The object's one alarm (Phase 25, D-13).
+   * The object's one alarm (Phase 25, D-09, D-13, D-22).
    *
-   * Sweeps expired vectors, store first, then sets the alarm again through the
-   * helper: one minute out when expired rows remain, else at the next expiry
+   * Its jobs, in order: finish a pending destroy; destroy everything when the
+   * person holds no grant any more, asked about the object's stored own name;
+   * then sweep expired vectors. The sweep deletes store first, then the alarm
+   * is set again through the helper: one minute out when expired rows remain, else at the next expiry
    * (the helper lowers that to one day). It never throws: on any failure it
    * reschedules one hour out through the same helper, which keeps an earlier
    * alarm and removes the alarm when no job is left. The caught value is never
@@ -394,6 +457,19 @@ export class UserAgent extends DurableObject<Env> {
    */
   async alarm(): Promise<void> {
     try {
+      // 1. A destroy that started and did not finish is finished first.
+      if (destroyPending(this.ctx.storage.sql)) {
+        await this.destroyRecall();
+        return;
+      }
+      // 2. Revocation: asked about the name this object stored for itself,
+      //    never the platform's. Only a definite "none" destroys.
+      const name = this.storedOwnName();
+      if (name !== null && (await this.grantsRemain(name)) === "none") {
+        await this.destroyRecall();
+        return;
+      }
+      // 3. Expiry.
       const more = await sweepExpired(this.ledgerHandle(), this.vectorStore(), Date.now());
       const next = more
         ? Date.now() + RECALL_SWEEP_AGAIN_MS
@@ -430,6 +506,7 @@ export class UserAgent extends DurableObject<Env> {
     if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
     if (!isMailbox(mailbox)) return { ok: false, reason: "invalid" };
     if (kind !== "build" && kind !== "reconcile") return { ok: false, reason: "invalid" };
+    if (destroyPending(sql)) return { ok: false, reason: "destroying" };
 
     const now = Date.now();
     const slot = readPageSlot(sql);
