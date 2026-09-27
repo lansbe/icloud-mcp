@@ -128,6 +128,38 @@ describe("the change marker", () => {
     expect(key).toMatch(/^[A-Za-z0-9_-]{12}$/);
     expect(await calendarKeyOf("https://p01-caldav.icloud.com/123/calendars/work/")).not.toBe(key);
   });
+
+  it("carries a calendar's own takenAt when it has one, and reads it back (D-16, 23-04)", async () => {
+    const { userId } = await ownerPrincipal();
+    const content: MarkerContent = {
+      folders: [],
+      calendar: {
+        takenAt: 1790000500,
+        calendars: [
+          { key: "AAAAAAAAAAAA", syncToken: "t-new" },
+          { key: "BBBBBBBBBBBB", syncToken: "t-old", takenAt: 1790000000 },
+        ],
+      },
+      mintedAt: 1790000500,
+    };
+    const sealed = await sealMarker(content, userId, env.CONFIRM_SECRET);
+    const reading = await readMarker(sealed, userId, env.CONFIRM_SECRET);
+    expect(reading).toEqual({ kind: "current", content });
+  });
+
+  it("refuses a calendar entry whose own takenAt is not whole seconds", async () => {
+    const { userId } = await ownerPrincipal();
+    const bad: MarkerContent = {
+      folders: [],
+      calendar: {
+        takenAt: 1790000500,
+        calendars: [{ key: "AAAAAAAAAAAA", syncToken: "t", takenAt: 1.5 }],
+      },
+      mintedAt: 1790000500,
+    };
+    const err = await refusal(sealMarker(bad, userId, env.CONFIRM_SECRET));
+    expect(err).toBeInstanceOf(MarkerRefusedError);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -61,7 +61,7 @@ import {
 } from "vitest";
 import { getEvent } from "../src/dav/calendar";
 import { clearDavCache, resolveDavAccount } from "../src/dav/discovery";
-import { DavNotFoundError } from "../src/dav/errors";
+import { DavNotFoundError, DavThrottleError } from "../src/dav/errors";
 import { decodeCalendarId, decodeEventId } from "../src/dav/ids";
 import { createDavFetch } from "../src/dav/transport";
 import {
@@ -1800,7 +1800,14 @@ function changesFor(user: TestUser): ChangesCall {
   } as unknown as McpServer;
   const who = testPrincipal(user);
   who.catch(() => {});
-  registerChangesTool(server, createSessionGate(), who);
+  // The calendar side never reaches the network here: every DAV request is
+  // answered with a throttle, so a call that gets past the marker reports the
+  // calendars as not checked and still returns a marker. The cases below are
+  // about the marker, not the calendars.
+  const noCalendars = (async () => {
+    throw new DavThrottleError();
+  }) as typeof globalThis.fetch;
+  registerChangesTool(server, createSessionGate(), who, noCalendars);
   if (callback === undefined) throw new Error("the change tool is not registered");
   return callback;
 }

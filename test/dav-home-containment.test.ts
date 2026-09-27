@@ -341,6 +341,11 @@ const DAV_REQUEST_FUNCTIONS = Object.freeze([
   // replaces whatever it addressed. Both are declared below rather than exempt.
   "createVCard",
   "updateVCard",
+  // Phase 23's one: tsdav's raw sync REPORT helper, which the change check's
+  // per-calendar step ends in. It sends the credential to whatever collection
+  // URL it is handed, like every other name here, so it is in the vocabulary
+  // and its one site is declared below rather than left invisible.
+  "syncCollection",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -825,6 +830,31 @@ export const HOME_EXEMPT_REQUEST_SITES: readonly ExemptSite[] = Object.freeze([
     request: "davRequest",
     reason:
       "FOUR requests share this entry because they share this key and this loop exactly -- one depth-0 DAV:propname PROPFIND per target. Two targets ARE the discovery triple resolveDavAccount just produced for THIS principal, the account's principalUrl and its homeUrl, so there is nothing above either of them to be contained by; the other two are hrefs read off the depth-1 home listing by advertised resource type, the scheduling inbox and the first calendar collection, and both are passed through assertUnderHome against resolved.homeUrl before the request because they arrived from the SERVER rather than from a caller and transport.ts attaches the credential to whatever URL it is handed. That check is recorded here rather than claimed as the containment this gate verified, on createCalendarCollection's and resolveDefaultCalendarUrl's own precedent. NO check is asserted on the principal and that is deliberate rather than missing: the principal sits on the unsharded discovery entry host while every collection sits on the account's pXX- shard, so assertUnderHome against the home would refuse a URL the account genuinely owns on an origin mismatch every time -- it is the same URL resolveDefaultCalendarUrl's first request addresses with no check. The probe's whole input is one boolean saying whether to run: no host, no path and no identifier crosses the tool boundary, which is why this is exempt rather than checked -- there is no caller-supplied URL for assertUnderHome to be checking. The request is READ-ONLY in the strongest form here: RFC 4918 section 9.1 makes the server answer with property NAMES and no values, and since plan 17-05 the safety no longer rests on the server behaving -- the answer is read off the RAW body for element NAMES only, with no text content and no attribute value read anywhere, so nothing the server could put in that body reaches the report. The request itself is unchanged by that fix: the same library helper still assembles the same propname body, which is why this declaration's key and its argument are both untouched",
+  },
+  // Phase 23 (CHNG-01). The change check's two requests. Neither target can be
+  // aimed by a caller: the marker holds a twelve-character DIGEST of each
+  // collection URL, never the URL, so there is nothing in a token to decode
+  // into a request target. The home listing addresses resolved.homeUrl itself,
+  // and every REPORT addresses a collection that listing produced.
+  {
+    file: CALENDAR,
+    fn: "fetchCollectionStates",
+    request: "propfind",
+    reason:
+      "the target IS resolved.homeUrl, the same enumeration fetchCollections sends with DAV:sync-token added, so there is nothing above it to be contained by",
+  },
+  // Exempt, and checked anyway one level up, on the `runPropertyNameProbe`
+  // shape above: `calendarChangesSince` asserts each enumerated collection is
+  // under the home before handing it here, because the enumeration resolves a
+  // relative href against the home without comparing origin. That check is
+  // defence against the remote ANSWER; the exemption is the claim that no
+  // CALLER can aim this request.
+  {
+    file: CALENDAR,
+    fn: "syncOneCalendar",
+    request: "syncCollection",
+    reason:
+      "the target is a collection URL fetchCollectionStates enumerated from resolved.homeUrl in the same call; the change marker carries only a digest of each collection URL, never the URL, so no token can name the target, and calendarChangesSince asserts the enumerated URL is under the home before calling here"
   },
 ]);
 
