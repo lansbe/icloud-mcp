@@ -379,10 +379,43 @@ describe("folderSnapshotsOver opens no mailbox (CHNG-07)", () => {
       'a5 STATUS "INBOX" (UIDVALIDITY UIDNEXT MESSAGES HIGHESTMODSEQ)',
       "a6 LOGOUT",
     ]);
-    expect(outcomes[0]).toEqual({ mailbox: "Gone", answered: false });
+    // NONEXISTENT is the one refusal that says the folder is gone (D-21).
+    expect(outcomes[0]).toEqual({ mailbox: "Gone", answered: false, gone: true });
     expect(outcomes[1]).toMatchObject({ mailbox: MAILBOX, answered: true });
     // Absent is null, never zero.
     expect(outcomes[1]).toMatchObject({ snapshot: { highestModseq: null } });
+  });
+});
+
+describe("a refused status that does not say the folder is gone (D-21)", () => {
+  it.each([
+    ["no response code", "Mailbox is busy"],
+    ["a busy code", "[UNAVAILABLE] Try again later"],
+    ["a code that is not NONEXISTENT", "[CANNOT] Not permitted"],
+  ])("%s: not answered, and not gone", async (_label, text) => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      taggedNo("a4", text),
+      logoutExchange("a5"),
+    ]);
+
+    const outcomes = await folderSnapshotsOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      ["Receipts"],
+    );
+
+    expect(wireOf(duplex)).toEqual([
+      "a1 CAPABILITY",
+      "a2 LOGIN [redacted]",
+      "a3 CAPABILITY",
+      'a4 STATUS "Receipts" (UIDVALIDITY UIDNEXT MESSAGES HIGHESTMODSEQ)',
+      "a5 LOGOUT",
+    ]);
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.answered).toBe(false);
+    expect("gone" in outcomes[0]! && outcomes[0]!.gone === true).toBe(false);
   });
 });
 
