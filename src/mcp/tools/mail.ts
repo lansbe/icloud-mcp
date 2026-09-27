@@ -2707,7 +2707,9 @@ export function registerMailTools(
    * other write in this milestone is previewed first. This one is not, because
    * it changes one flag on one message, it harms nothing, and the same tool
    * puts it back. A reply cannot be unsent and a delete cannot be undone, so
-   * those are previewed. This can be undone in one call.
+   * those are previewed. This can be undone in one call, with the opposite
+   * value. Calling again with the same value changes nothing, so the
+   * description says which value undoes it.
    *
    * The input is exactly an id and a boolean. No folder, no search term, no
    * list and no address: one message per call, named by an id this server
@@ -2724,8 +2726,8 @@ export function registerMailTools(
       // the state is iCloud's, and the server instructions say that reading
       // never marks mail read.
       description:
-        "Mark one email read or unread by its id. Writes at once, no " +
-        `preview; call again to undo. ${UNTRUSTED_NOTICE}`,
+        "Mark one email read or unread by id. Writes at once, no preview; " +
+        `undo with the opposite read. ${UNTRUSTED_NOTICE}`,
       inputSchema: z.object({
         id: z.string().describe("The opaque message id from a listing."),
         read: z

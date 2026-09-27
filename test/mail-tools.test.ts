@@ -1121,6 +1121,18 @@ describe("the registrations themselves", () => {
     expect(schema.safeParse({ read: true }).success).toBe(false);
   });
 
+  it("says undoing takes the opposite value, not a repeat of the same call (IN-01)", () => {
+    // Calling again with the same value changes nothing. A model reading
+    // "call again to undo" could do exactly that.
+    const tool = registered().find((one) => one.name === "mail_mark_read");
+    const description = String(tool!.options.description);
+
+    expect(description).toContain("undo with the opposite read.");
+    expect(description).not.toContain("call again to undo");
+    expect(description).toContain(UNTRUSTED_NOTICE);
+    expect(description.length).toBeLessThan(280);
+  });
+
   it("keeps every description terse, because it is a tax paid on every call", () => {
     for (const tool of registered()) {
       expect(String(tool.options.description).length).toBeLessThan(280);
