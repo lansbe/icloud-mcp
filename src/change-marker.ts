@@ -121,6 +121,13 @@ export interface FolderState {
    * two different values compare equal.
    */
   highestModseq: string | null;
+  /**
+   * When THIS folder's state was taken, in seconds, when that is older than
+   * the marker's own time. Set only on a folder carried forward unchecked
+   * (D-16), so a later check counts, and says it counts, from the time the
+   * state was really taken (WR-05). Absent everywhere else.
+   */
+  takenAt?: number;
 }
 
 /** What the change check knows about one calendar. Plain data. */
@@ -212,7 +219,10 @@ export class MarkerRefusedError extends Error {
 interface WirePayload {
   v: number;
   t: number;
-  f: [string, number, number, string | null][];
+  f: (
+    | [string, number, number, string | null]
+    | [string, number, number, string | null, number]
+  )[];
   c: { t: number; s: ([string, string] | [string, string, number])[] } | null;
 }
 
@@ -274,14 +284,20 @@ function contentOf(wire: unknown): MarkerContent | null {
   const folders: FolderState[] = [];
   const seenMailboxes = new Set<string>();
   for (const entry of wire.f) {
-    if (!Array.isArray(entry) || entry.length !== 4) return null;
-    const [mailbox, uidValidity, uidNext, highestModseq] = entry;
+    if (!Array.isArray(entry)) return null;
+    if (entry.length !== 4 && entry.length !== 5) return null;
+    const [mailbox, uidValidity, uidNext, highestModseq, takenAt] = entry;
     if (!isMailboxName(mailbox)) return null;
     if (!isUint32(uidValidity) || !isUint32(uidNext)) return null;
     if (!isModseq(highestModseq)) return null;
+    if (entry.length === 5 && !isSeconds(takenAt)) return null;
     if (seenMailboxes.has(mailbox)) return null;
     seenMailboxes.add(mailbox);
-    folders.push({ mailbox, uidValidity, uidNext, highestModseq });
+    folders.push(
+      entry.length === 5
+        ? { mailbox, uidValidity, uidNext, highestModseq, takenAt: takenAt as number }
+        : { mailbox, uidValidity, uidNext, highestModseq },
+    );
   }
 
   let calendar: CalendarBlock | null = null;
@@ -317,12 +333,20 @@ function wireOf(content: MarkerContent): WirePayload {
   return {
     v: MARKER_VERSION,
     t: content.mintedAt,
-    f: content.folders.map((folder) => [
-      folder.mailbox,
-      folder.uidValidity,
-      folder.uidNext,
-      folder.highestModseq,
-    ]),
+    f: content.folders.map(
+      (folder):
+        | [string, number, number, string | null]
+        | [string, number, number, string | null, number] =>
+        folder.takenAt === undefined
+          ? [folder.mailbox, folder.uidValidity, folder.uidNext, folder.highestModseq]
+          : [
+              folder.mailbox,
+              folder.uidValidity,
+              folder.uidNext,
+              folder.highestModseq,
+              folder.takenAt,
+            ],
+    ),
     c:
       content.calendar === null
         ? null

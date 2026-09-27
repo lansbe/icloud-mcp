@@ -658,7 +658,8 @@ describe("a failed check is not_checked and keeps the old state (CHNG-04, T-23-1
     const { userId } = await ownerPrincipal();
     const reading = await readMarker(trusted.marker, userId, env.CONFIRM_SECRET);
     if (reading.kind !== "current") throw new Error("expected a current marker");
-    expect(reading.content.folders).toEqual([{ ...INBOX_STATE }]);
+    // The old state, with the time it was really taken (WR-05).
+    expect(reading.content.folders).toEqual([{ ...INBOX_STATE, takenAt: 1790000000 }]);
   }
 
   it("the greeting at the connection limit: throttled", async () => {
@@ -1059,7 +1060,12 @@ describe("changes_since with a folder list (CHNG-08)", () => {
     const { userId } = await ownerPrincipal();
     const reading = await readMarker(trusted.marker, userId, env.CONFIRM_SECRET);
     if (reading.kind !== "current") throw new Error("expected a current marker");
-    expect(reading.content.folders).toEqual([{ ...INBOX_STATE }, receiptsState]);
+    // Carried with the time its state was really taken, so a later check does
+    // not vouch for a newer one (WR-05).
+    expect(reading.content.folders).toEqual([
+      { ...INBOX_STATE },
+      { ...receiptsState, takenAt: 1790000000 },
+    ]);
   });
 
   it("checked plus carried over five is refused before any socket", async () => {
@@ -1363,7 +1369,11 @@ describe("changes_since with calendars (CHNG-01, CHNG-06, D-32)", () => {
     const { userId } = await ownerPrincipal();
     const reading = await readMarker(trusted.marker, userId, env.CONFIRM_SECRET);
     if (reading.kind !== "current") throw new Error("marker not current");
-    expect(reading.content.calendar).toEqual(priorCalendar);
+    // Every carried calendar keeps the time its token was really taken (WR-05).
+    expect(reading.content.calendar).toEqual({
+      takenAt: priorCalendar.takenAt,
+      calendars: [{ ...priorCalendar.calendars[0]!, takenAt: 1790000000 }],
+    });
   });
 
   it("a calendar gone since the marker is counted in goneCalendars and in the sentence", async () => {
@@ -1668,5 +1678,52 @@ describe("an unusable signing key is refused before any socket, apart from a bad
     expect(body.refusal).toBe("markers-unavailable");
     expect(body.overall).toMatch(/keep the marker/i);
     expect(body.overall).not.toMatch(/no marker/i);
+  });
+});
+
+describe("since is per source when a source was carried (WR-05)", () => {
+  it("a folder carried from an older marker is compared, and counted, since its own time", async () => {
+    vi.mocked(connectImap).mockReturnValueOnce(statusSession(4392, "118") as never);
+    const marker = await markerFor({
+      folders: [{ ...INBOX_STATE, takenAt: 1780000000 }],
+      calendar: null,
+      mintedAt: 1790000000,
+    });
+    const trusted = trustedOf(await changesCallback()({ marker }));
+    expect(trusted.since).toBe(new Date(1790000000 * 1000).toISOString());
+    expect(trusted.counts[0]).toMatchObject({
+      folder: "INBOX",
+      state: "no_changes",
+      since: new Date(1780000000 * 1000).toISOString(),
+    });
+  });
+
+  it("a folder checked from the marker's own time carries no since of its own", async () => {
+    vi.mocked(connectImap).mockReturnValueOnce(statusSession(4392, "118") as never);
+    const marker = await markerFor(inboxMarkerContent());
+    const trusted = trustedOf(await changesCallback()({ marker }));
+    expect(trusted.counts[0].since).toBeUndefined();
+  });
+
+  it("a calendar carried from an older marker is counted since its own time", async () => {
+    vi.mocked(connectImap).mockReturnValueOnce(statusSession(4392, "118") as never);
+    vi.stubGlobal("fetch", davStub([{ url: WORK_CAL, name: "Work", token: "w-1" }]).fetch);
+    const marker = await markerFor({
+      folders: [{ ...INBOX_STATE }],
+      calendar: {
+        takenAt: 1790000000,
+        calendars: [
+          { key: await calendarKeyOf(WORK_CAL), syncToken: "w-1", takenAt: 1780000000 },
+        ],
+      },
+      mintedAt: 1790000000,
+    });
+    const trusted = trustedOf(await changesCallback()({ marker }));
+    expect(trusted.counts[1]).toMatchObject({
+      source: "calendar",
+      state: "no_changes",
+      since: new Date(1780000000 * 1000).toISOString(),
+    });
+    expect(trusted.counts[0].since).toBeUndefined();
   });
 });

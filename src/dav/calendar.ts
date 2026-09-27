@@ -791,6 +791,13 @@ export interface CalendarChange {
   mechanism: CalendarSyncMechanism | null;
   why?: CalendarRestartWhy;
   reason?: CalendarNotCheckedReason;
+  /**
+   * When the token this calendar was compared against was taken, in seconds.
+   * Only on `changes` and `no_changes`, and only when that differs from the
+   * block's own time: a calendar carried forward unchecked from an older call
+   * (WR-05). The counts are since then, not since the marker's time.
+   */
+  since?: number;
 }
 
 /** Everything `calendarChangesSince` answers. */
@@ -1256,6 +1263,8 @@ export async function calendarChangesSince(
         markFull();
         continue;
       }
+      // A carried calendar was compared against its own, older token time.
+      const since = old?.takenAt !== undefined ? { since: old.takenAt } : {};
       const notChecked = (
         reason: CalendarNotCheckedReason,
         mechanism: CalendarSyncMechanism | null,
@@ -1289,6 +1298,7 @@ export async function calendarChangesSince(
             addedOrChanged: 0,
             removed: 0,
             mechanism: "propfind-token",
+            ...since,
           },
           { key, syncToken: property },
         );
@@ -1407,6 +1417,7 @@ export async function calendarChangesSince(
         more: answer.truncated,
         mechanism,
         events: detail.rows,
+        ...since,
       });
       freshStates.push(freshState);
       // A throttle or a lost connection on the detail read stops the calendar

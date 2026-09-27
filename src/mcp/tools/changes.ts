@@ -142,6 +142,13 @@ export interface MailFolderAnswer {
   mechanism: MailMechanism | null;
   /** Only for `not_checked`. */
   reason?: NotCheckedReason;
+  /**
+   * When the state this folder was compared against was taken, in seconds.
+   * Only on `changes` and `no_changes`, and only for a folder carried forward
+   * unchecked from an older call: its counts are since then, not since the
+   * marker's own time (WR-05).
+   */
+  since?: number;
   /** New-mail rows, newest first. Stranger-authored: fenced, never trusted. */
   rows: NewMailRow[];
 }
@@ -569,7 +576,13 @@ function calendarCount(one: CalendarChange) {
     ...(one.state === "not_checked" && one.reason !== undefined
       ? { reason: one.reason }
       : {}),
+    ...(one.since !== undefined ? { since: isoOf(one.since) } : {}),
   };
+}
+
+/** Seconds since the epoch, as the ISO time the trusted block states. */
+function isoOf(seconds: number): string {
+  return new Date(seconds * 1000).toISOString();
 }
 
 /**
@@ -592,6 +605,7 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
     ...(folder.state === "not_checked" && folder.reason !== undefined
       ? { reason: folder.reason }
       : {}),
+    ...(folder.since !== undefined ? { since: isoOf(folder.since) } : {}),
   }));
 
   // A calendar side that could not be checked at all is one source, named by
@@ -632,10 +646,9 @@ export function changesResult(answer: ChangesAnswer): ToolResult {
         (one) => one.state === "not_checked" && one.reason === "marker_full",
       ).length + (answer.calendar.dropped ?? 0),
     ),
-    since:
-      answer.since === null
-        ? null
-        : new Date(answer.since * 1000).toISOString(),
+    // The marker's own time. A source carried from an older call states its
+    // own `since` in its counts entry, and that one is what its counts cover.
+    since: answer.since === null ? null : isoOf(answer.since),
     marker: answer.marker,
   };
 
@@ -865,13 +878,20 @@ export function registerChangesTool(
           }
         }
 
+        // A state kept without being checked keeps the time it was really
+        // taken, so a later call never vouches for a newer one (WR-05).
+        const stamped = (old: FolderState): FolderState => ({
+          ...old,
+          takenAt: old.takenAt ?? (prior as MarkerContent).mintedAt,
+        });
+
         // Marker folders this call does not ask about are carried forward
-        // unchanged (D-16). Checked and carried together may not pass five,
-        // refused before any socket.
+        // unchanged but for that time (D-16). Checked and carried together may
+        // not pass five, refused before any socket.
         const asked = new Set(mailboxes);
-        const carried = (prior?.folders ?? []).filter(
-          (one) => !asked.has(one.mailbox),
-        );
+        const carried = (prior?.folders ?? [])
+          .filter((one) => !asked.has(one.mailbox))
+          .map(stamped);
         if (mailboxes.length + carried.length > MAX_CHANGE_FOLDERS) {
           return tooManyFoldersResult();
         }
@@ -886,6 +906,7 @@ export function registerChangesTool(
                 uidValidity: LARGEST_UID,
                 uidNext: LARGEST_UID,
                 highestModseq: LARGEST_MODSEQ,
+                takenAt: now,
               })),
               ...carried,
             ],
@@ -908,6 +929,19 @@ export function registerChangesTool(
           options,
         );
 
+        // A folder that could not be checked keeps its old state, stamped. A
+        // folder compared against a carried state says since when (WR-05).
+        for (const check of checks) {
+          const old = priorFolders.get(check.mailbox);
+          if (old === undefined || check.state === null) continue;
+          if (check.answer.state === "not_checked") check.state = stamped(old);
+          else if (
+            (check.answer.state === "changes" || check.answer.state === "no_changes") &&
+            old.takenAt !== undefined
+          ) {
+            check.answer.since = old.takenAt;
+          }
+        }
         const freshFolders: FolderState[] = [
           ...checks.flatMap((check) => (check.state === null ? [] : [check.state])),
           ...carried,
@@ -948,7 +982,11 @@ export function registerChangesTool(
           }
           // The old block, carried whole where it fits beside this call's
           // mail states. What does not fit is dropped from the end and said.
-          const kept = [...(prior?.calendar?.calendars ?? [])];
+          // Each carried calendar keeps the time its token was really taken.
+          const kept = (prior?.calendar?.calendars ?? []).map((one) => ({
+            ...one,
+            takenAt: one.takenAt ?? (prior?.calendar as CalendarBlock).takenAt,
+          }));
           while (kept.length > 0 && !fits(kept)) kept.pop();
           const dropped = (prior?.calendar?.calendars.length ?? 0) - kept.length;
           calendar = {
