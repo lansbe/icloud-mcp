@@ -1207,20 +1207,64 @@ describe("the registrations themselves", () => {
     expect(description).toContain("moved back");
   });
 
-  it("takes exactly a confirmToken and a change on the mail commit, and the change is one op today", () => {
+  it("takes exactly a confirmToken and a change on the mail commit, and the change is two ops today", () => {
     const tool = registered().find((one) => one.name === "mail_commit");
     const schema = tool!.options.inputSchema as z.ZodObject<z.ZodRawShape>;
     const change = { op: "move", ids: ["x"], destination: "y" };
+    const draftChange = { op: "draft-delete", id: "x", subject: "Thanks" };
 
     expect(Object.keys(schema.shape).sort()).toEqual(["change", "confirmToken"]);
     expect(schema.safeParse({ confirmToken: "t", change }).success).toBe(true);
+    expect(schema.safeParse({ confirmToken: "t", change: draftChange }).success).toBe(true);
+    expect(
+      schema.safeParse({ confirmToken: "t", change: { ...draftChange, subject: null } }).success,
+    ).toBe(true);
     expect(schema.safeParse({ confirmToken: "t" }).success).toBe(false);
     expect(schema.safeParse({ change }).success).toBe(false);
     expect(
       schema.safeParse({ confirmToken: "t", change: { ...change, op: "delete" } }).success,
     ).toBe(false);
+    expect(
+      schema.safeParse({ confirmToken: "t", change: { op: "draft-delete", id: "x" } }).success,
+    ).toBe(false);
     expect(String(tool!.options.description)).toContain(UNTRUSTED_NOTICE);
     expect(String(tool!.options.description).length).toBeLessThan(280);
+  });
+
+  it("describes the mail commit in exactly these words, under the cap (Phase 22)", () => {
+    const tool = registered().find((one) => one.name === "mail_commit");
+    const description = String(tool!.options.description);
+
+    expect(description).toBe(
+      "Apply a move, archive, trash or draft preview. Pass confirmToken and change back " +
+        `unaltered. ${UNTRUSTED_NOTICE}`,
+    );
+    expect(description.length).toBe(276);
+    expect(description.length).toBeLessThan(280);
+  });
+
+  it("takes exactly one draft id on mail_delete_draft: no folder, list, search term or subject (DRFT-06)", () => {
+    const tool = registered().find((one) => one.name === "mail_delete_draft");
+    const schema = tool!.options.inputSchema as z.ZodObject<z.ZodRawShape>;
+
+    expect(Object.keys(schema.shape)).toEqual(["id"]);
+    expect(schema.safeParse({ id: "x" }).success).toBe(true);
+    expect(schema.safeParse({}).success).toBe(false);
+    expect(schema.safeParse({ id: 7 }).success).toBe(false);
+    expect(String(tool!.options.description)).toContain(UNTRUSTED_NOTICE);
+  });
+
+  it("describes mail_delete_draft in exactly these words, under the cap (Phase 22)", () => {
+    const tool = registered().find((one) => one.name === "mail_delete_draft");
+    const description = String(tool!.options.description);
+
+    expect(description).toBe(
+      `Preview moving one draft to Trash. Writes nothing; apply with mail_commit. ${UNTRUSTED_NOTICE}`,
+    );
+    expect(description.length).toBe(259);
+    expect(description.length).toBeLessThan(280);
+    // A delete that goes to Trash is never described as deleting for good.
+    expect(description).not.toMatch(/permanent|irrecoverabl|written by this server|this server wrote/i);
   });
 
   it("says undoing takes the opposite value, not a repeat of the same call (IN-01)", () => {

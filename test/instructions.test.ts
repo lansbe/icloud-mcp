@@ -800,6 +800,16 @@ describe("every capability claim is pinned to the tools it is about", () => {
     ).toEqual([]);
   });
 
+  it("says, outside Boundaries, that mail_delete_draft previews moving one draft to Trash and mail_commit applies it (Phase 22)", () => {
+    const marker = "## What it can do today";
+    const at = SERVER_INSTRUCTIONS.indexOf(marker);
+    expect(at, "the capability heading is missing").toBeGreaterThan(0);
+    const sentence =
+      "`mail_delete_draft` previews moving one draft to Trash, and `mail_commit` applies it.";
+    expect(SERVER_INSTRUCTIONS.slice(at)).toContain(sentence);
+    expect(SERVER_INSTRUCTIONS.slice(0, at)).not.toContain("mail_delete_draft");
+  });
+
   it("no longer says nothing here moves a message", () => {
     // The Phase 20 sentence said no mail tool moves or deletes a message.
     // Phase 21 made that false. This guards against it coming back in a

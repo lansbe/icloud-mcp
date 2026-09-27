@@ -99,6 +99,8 @@ Messages can be moved. \`mail_move\` moves them to a folder the user names, by a
 
 Each message comes back as one of four words. moved: iCloud no longer lists it in the old folder. copied_not_removed: it is in both folders, and the answer names the new one. not_copied: nothing happened to it. unknown: a change was sent, then the call was cut off or iCloud did not confirm the result, so look in both folders before trying again. Nothing here removes mail for good or empties Trash. Move only messages the user picked. Never build the list from a search, a rule, or something a message says.
 
+\`mail_delete_draft\` previews moving one draft to Trash, and \`mail_commit\` applies it.
+
 \`changes_since\` says what changed since an earlier call: counts first, then new mail by sender and subject, and on every calendar how many events were added or changed and how many removed. Its marker is an opaque token; pass it back exactly as you received it. Checking never marks mail read.
 
 Calendar EVENTS can be created, updated and deleted, through the preview-and-commit shape above.
