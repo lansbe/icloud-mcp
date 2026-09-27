@@ -266,6 +266,71 @@ describe("the mutating path refuses and reports honestly", () => {
     expectClosedAfterRead(duplex);
   });
 
+  it("refuses a read-write mailbox whose permanent flags leave out the seen flag (WR-01)", async () => {
+    // RFC 3501 §7.1: a flag missing from the permanent-flags list changes for
+    // this session only. The change would be echoed back as done and then be
+    // gone at logout, which is PITFALLS #33's shape exactly.
+    for (const permanent of ["", "\\Answered \\Flagged", "\\Answered \\*"]) {
+      const duplex = createFakeDuplex([
+        ...authPrefix(),
+        selectResponse("a4", "[READ-WRITE]", 172, INBOX_UIDVALIDITY, permanent),
+        logoutExchange("a5"),
+      ]);
+
+      const outcome = await markReadOver(
+        duplex,
+        principal,
+        createSessionGate(),
+        REF,
+        FAST_BOUNDS,
+      );
+
+      expect(outcome, `list (${permanent})`).toEqual({
+        applied: false,
+        refusal: "mailbox-read-only",
+      });
+      expect(wireOf(duplex)).toEqual([
+        ...SIGN_IN,
+        'a4 SELECT "INBOX"',
+        "a5 LOGOUT",
+      ]);
+      expect(wroteFlagChange(duplex)).toBe(false);
+      expectClosedAfterRead(duplex);
+    }
+  });
+
+  it("goes on when the permanent-flags list is absent, or names the seen flag in any case", async () => {
+    // Absent: RFC 3501 §6.3.1 says to assume every flag is kept.
+    for (const permanent of [null, "\\seen", "\\Answered \\SEEN"]) {
+      const duplex = createFakeDuplex([
+        ...authPrefix(),
+        selectResponse("a4", "[READ-WRITE]", 172, INBOX_UIDVALIDITY, permanent),
+        flagEcho("a5", 17, UID, "\\Seen"),
+        logoutExchange("a6"),
+      ]);
+
+      const outcome = await markReadOver(
+        duplex,
+        principal,
+        createSessionGate(),
+        REF,
+        FAST_BOUNDS,
+      );
+
+      expect(outcome, `list ${String(permanent)}`).toEqual({
+        applied: true,
+        seen: true,
+        source: "store-echo",
+      });
+      expect(wireOf(duplex)).toEqual([
+        ...SIGN_IN,
+        'a4 SELECT "INBOX"',
+        `a5 UID STORE ${UID} +FLAGS (\\Seen)`,
+        "a6 LOGOUT",
+      ]);
+    }
+  });
+
   it("is not_found when the open is answered NO, and writes no flag change", async () => {
     const duplex = createFakeDuplex([
       ...authPrefix(),

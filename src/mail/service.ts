@@ -62,6 +62,7 @@ import {
   parseCapabilityLine,
   parseExists,
   parseListLine,
+  parsePermanentFlags,
   parseSExpr,
   parseSearchLine,
   parseStatusLine,
@@ -682,7 +683,10 @@ export interface MutatingMailSession {
  *
  * The server answered the open with OK but said the mailbox is read-only, or
  * gave no access code at all. Both are the same refusal (PITFALLS #33): absent
- * is not read-write.
+ * is not read-write. A third shape gets the same refusal: the mailbox opened
+ * read-write, but its permanent-flags list leaves out the seen flag. A change
+ * to that flag would then last only until logout, and the answer would report
+ * a change that is gone a moment later.
  *
  * A value and not an exception, on purpose. The return type carries it, so
  * TypeScript makes every caller handle it. An exception could fall through to
@@ -690,6 +694,28 @@ export interface MutatingMailSession {
  * model to retry something that will fail the same way every time.
  */
 export const MAILBOX_NOT_WRITABLE: unique symbol = Symbol("mailbox-not-writable");
+
+/**
+ * Whether a mailbox open says a change to the seen flag is kept.
+ *
+ * RFC 3501 §7.1: a flag missing from the permanent-flags list can change for
+ * this session only. So the list must name the seen flag, compared without
+ * regard to case. `\*` does not count. It says new keywords can be created,
+ * and the seen flag is not a keyword.
+ *
+ * An open with no permanent-flags list at all is `true`. RFC 3501 §6.3.1 says
+ * to assume then that every flag is kept. If a server sends the list twice,
+ * the last one is its final word.
+ */
+function keepsSeenFlag(untagged: readonly ResponseLine[]): boolean {
+  let permanent: string[] | null = null;
+  for (const line of untagged) {
+    const flags = parsePermanentFlags(line.text);
+    if (flags !== null) permanent = flags;
+  }
+  if (permanent === null) return true;
+  return permanent.some((flag) => flag.toLowerCase() === "\\seen");
+}
 
 /**
  * Hold a session over an already-open stream pair, with one mailbox opened in
@@ -715,7 +741,11 @@ export const MAILBOX_NOT_WRITABLE: unique symbol = Symbol("mailbox-not-writable"
  * 4. Read the access code off the tagged completion. Only read-write goes on.
  *    Read-only and absent both resolve to `MAILBOX_NOT_WRITABLE`, and no
  *    command is sent after the open.
- * 5. Build the `MutatingMailSession` and hand it to `fn`.
+ * 5. Read the permanent-flags list off the untagged replies. If it is there
+ *    and does not name the seen flag, that is `MAILBOX_NOT_WRITABLE` too, and
+ *    no command is sent after the open. If it is not there, RFC 3501 says every
+ *    flag is kept, so the open goes on.
+ * 6. Build the `MutatingMailSession` and hand it to `fn`.
  *
  * No mode argument, and none may be added. The read orchestrator takes none
  * either. Only `./triage.ts` imports this, and it exports verbs, never a session.
@@ -756,6 +786,11 @@ export async function withMutatingMailboxOver<T>(
 
       // OK alone does not mean writable. Only an explicit read-write code does.
       if (parseAccessCode(opened.tagged.text) !== "read-write") {
+        return async () => MAILBOX_NOT_WRITABLE;
+      }
+
+      // Read-write alone does not mean the seen flag is kept past logout.
+      if (!keepsSeenFlag(opened.untagged)) {
         return async () => MAILBOX_NOT_WRITABLE;
       }
 

@@ -28,6 +28,7 @@ import {
   parseAccessCode,
   parseCapabilityLine,
   parseListLine,
+  parsePermanentFlags,
   parseSearchLine,
   parseStatusLine,
   parseTaggedResponse,
@@ -1033,6 +1034,37 @@ describe("parseAccessCode", () => {
 
   it("is null on an untagged line", () => {
     expect(parseAccessCode("* OK [READ-WRITE] mailbox open")).toBeNull();
+  });
+});
+
+describe("parsePermanentFlags", () => {
+  it("reads the list off the untagged OK, verbatim and in order", () => {
+    expect(
+      parsePermanentFlags(
+        "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)] Flags permitted",
+      ),
+    ).toEqual(["\\Answered", "\\Flagged", "\\Deleted", "\\Seen", "\\Draft", "\\*"]);
+  });
+
+  it("reads an empty list as an empty array, not as absent", () => {
+    // Empty means no flag is kept. Absent means every flag is. Mixing the two
+    // up is the whole hazard.
+    expect(parsePermanentFlags("* OK [PERMANENTFLAGS ()] No permanent flags")).toEqual([]);
+  });
+
+  it("matches the code in any case, and keeps the flags' own case", () => {
+    expect(parsePermanentFlags("* ok [permanentflags (\\seen)] ok")).toEqual(["\\seen"]);
+  });
+
+  it("is null when the line carries no such code", () => {
+    expect(parsePermanentFlags("* OK [UIDVALIDITY 5] UIDs valid")).toBeNull();
+    expect(parsePermanentFlags("* FLAGS (\\Seen \\Draft)")).toBeNull();
+    expect(parsePermanentFlags("* 172 EXISTS")).toBeNull();
+  });
+
+  it("is null on a tagged line or a NO, even one carrying the code", () => {
+    expect(parsePermanentFlags("a4 OK [PERMANENTFLAGS (\\Seen)] done")).toBeNull();
+    expect(parsePermanentFlags("* NO [PERMANENTFLAGS (\\Seen)] odd")).toBeNull();
   });
 });
 

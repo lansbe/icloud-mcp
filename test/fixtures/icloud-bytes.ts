@@ -267,6 +267,10 @@ export function examineResponse(
  * mutating orchestrator must turn away. `uidValidity` may be `null`, which
  * leaves the validity line out entirely: the absent case, which fails closed.
  *
+ * `permanentFlags` is the inside of the permanent-flags list, verbatim. `null`
+ * leaves that line out entirely, which RFC 3501 says means every flag is kept.
+ * The default is the list every other case has always been scripted with.
+ *
  * Test fixtures may spell the command; the scan count on it covers `src/` only.
  */
 export function selectResponse(
@@ -274,6 +278,7 @@ export function selectResponse(
   accessCode: "[READ-WRITE]" | "[READ-ONLY]" | "",
   exists = INBOX_EXISTS,
   uidValidity: number | null = INBOX_UIDVALIDITY,
+  permanentFlags: string | null = "\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*",
 ): Uint8Array {
   const completion =
     accessCode === ""
@@ -283,7 +288,9 @@ export function selectResponse(
     `* ${exists} EXISTS`,
     "* 0 RECENT",
     "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)",
-    "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)] Flags permitted",
+    ...(permanentFlags === null
+      ? []
+      : [`* OK [PERMANENTFLAGS (${permanentFlags})] Flags permitted`]),
     ...(uidValidity === null ? [] : [`* OK [UIDVALIDITY ${uidValidity}] UIDs valid`]),
     completion,
   );

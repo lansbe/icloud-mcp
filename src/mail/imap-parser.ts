@@ -252,6 +252,34 @@ export function parseUidValidity(line: string): number | null {
 }
 
 /**
+ * The flag list carried by an untagged `PERMANENTFLAGS` response code, or
+ * `null`.
+ *
+ * It arrives on an untagged `OK` when a mailbox opens:
+ * `* OK [PERMANENTFLAGS (\Answered \Seen \*)] Limited`. RFC 3501 §7.1 says a
+ * flag missing from this list can be changed, but only for this session. The
+ * change is gone when the session ends. So a mailbox can open read-write and
+ * still not keep a read-state change.
+ *
+ * `null` means the code was ABSENT. RFC 3501 §6.3.1 says what that means: the
+ * client should assume all flags can be changed permanently. That is the
+ * opposite of `parseUidValidity`'s absent case, and it is the RFC's rule, not a
+ * default picked here.
+ *
+ * The flags come back verbatim, in order, split on spaces. Flags are atoms,
+ * which cannot hold a space or a parenthesis. Comparing them is the caller's
+ * job, and it must ignore case. `\*` is returned like any other entry. It says
+ * new keywords can be created. It does not say `\Seen` is kept, so a caller
+ * must not read it as covering `\Seen`.
+ */
+export function parsePermanentFlags(line: string): string[] | null {
+  if (!/^\* +OK\b/i.test(line)) return null;
+  const match = /\[PERMANENTFLAGS +\(([^()]*)\)\]/i.exec(line);
+  if (match === null) return null;
+  return match[1].split(" ").filter((flag) => flag !== "");
+}
+
+/**
  * The message count carried by an untagged `EXISTS` response, or `null`.
  *
  * Not a response code but a counted untagged response — `* 172 EXISTS` — which
