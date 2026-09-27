@@ -109,6 +109,7 @@ import type { Principal } from "../src/principal";
 import { ownerPrincipal } from "./fixtures/bound-secrets";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { connectImap } from "../src/mail/socket";
+import { createLeasedMail } from "../src/agent/lease";
 import { createSessionGate } from "../src/mail/service";
 import {
   CHANGES_TOOL_NAME,
@@ -1807,7 +1808,7 @@ function changesFor(user: TestUser): ChangesCall {
   const noCalendars = (async () => {
     throw new DavThrottleError();
   }) as typeof globalThis.fetch;
-  registerChangesTool(server, createSessionGate(), who, noCalendars);
+  registerChangesTool(server, createLeasedMail(createSessionGate()), who, noCalendars);
   if (callback === undefined) throw new Error("the change tool is not registered");
   return callback;
 }

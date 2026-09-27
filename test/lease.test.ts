@@ -57,7 +57,7 @@ function listFoldersCallback(principal: Promise<Principal>): NoArgCallback {
       if (name === "mail_list_folders") callback = handler;
     },
   };
-  registerMailTools(server as unknown as McpServer, createSessionGate(), principal);
+  registerMailTools(server as unknown as McpServer, createLeasedMail(createSessionGate()), principal);
   expect(callback, "mail_list_folders is not registered").toBeDefined();
   return callback!;
 }

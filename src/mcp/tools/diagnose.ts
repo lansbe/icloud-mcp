@@ -7,6 +7,7 @@
 // would NOT be equivalent — is recorded in 01-02-SUMMARY.md rather than here.
 
 import type { McpServer } from "@modelcontextprotocol/server";
+import type { LeasedMail } from "../../agent/lease";
 import {
   ImapAuthError,
   ImapThrottleError,
@@ -177,9 +178,18 @@ function refusedHereResult(err: unknown): ToolResult {
  * await out is what lets the answer say which side refused, without changing
  * one byte of what goes on the wire or weakening the refusal. See
  * `refusedHereResult` above.
+ *
+ * `mail` is the per-person connection lease (Phase 24, D-07). The diagnostic
+ * opens a real iCloud mail connection, so it takes the lease like every mail
+ * tool, AFTER the principal is awaited: a refused principal answers above and
+ * never reaches the object. Another request holding the lease answers
+ * `connection_busy` through the same `toErrorCategory` backstop below, and no
+ * socket opens. The pause exemption is untouched: `principal` here is still
+ * the unpaused one.
  */
 export function registerDiagnoseTool(
   server: McpServer,
+  mail: LeasedMail,
   principal: Promise<Principal>,
 ): void {
   server.registerTool(
@@ -199,7 +209,9 @@ export function registerDiagnoseTool(
       }
 
       try {
-        return diagnosticResult(await runDiagnosticOutcome(actor));
+        return diagnosticResult(
+          await mail.withConnectionLease(actor, () => runDiagnosticOutcome(actor)),
+        );
       } catch (err) {
         // A backstop for anything the diagnostic did not already fold into an
         // outcome. Same boundary, same fixed vocabulary.

@@ -45,7 +45,9 @@ import {
   readMarker,
   sealMarker,
 } from "../../change-marker";
+import type { LeasedMail } from "../../agent/lease";
 import {
+  ConnectionBusyError,
   ImapAuthError,
   ImapNotFoundError,
   ImapThrottleError,
@@ -65,7 +67,6 @@ import type {
   FolderSnapshotOutcome,
   MailSessionOptions,
   NewMailRow,
-  SessionGate,
 } from "../../mail/service";
 import {
   DEFAULT_MAILBOX,
@@ -102,18 +103,24 @@ export type SourceState =
   | "gone";
 
 /**
- * Why a source could not be checked. A closed list (D-05), plus one.
+ * Why a source could not be checked. A closed list (D-05), plus two.
  *
  * `marker_full` is calendar-only: the marker has no room for that calendar, so
  * it keeps no state for it, and the sentence says it is not tracked rather than
  * promising the next check covers the gap.
+ *
+ * `busy` is mail-only (Phase 24): another request on this account took the
+ * mail connection lease between two of this call's sessions, so the folders
+ * left were not asked. Neither `throttled` nor `connection` would be true:
+ * iCloud refused nothing and nothing failed to connect.
  */
 export type NotCheckedReason =
   | "throttled"
   | "connection"
   | "unavailable"
   | "no_usable_answer"
-  | "marker_full";
+  | "marker_full"
+  | "busy";
 
 /**
  * Which mail mechanism answered, so the live check can settle whether iCloud
@@ -267,6 +274,7 @@ export function mailOutcome(
 
 /** Dispatch on the failure's type. The caught value is never read. */
 function reasonOf(err: unknown): NotCheckedReason {
+  if (err instanceof ConnectionBusyError) return "busy";
   if (err instanceof ImapThrottleError) return "throttled";
   if (err instanceof ImapNotFoundError) return "unavailable";
   return "connection";
@@ -336,10 +344,23 @@ interface PendingSearch {
  * and nothing is retried. A refusal that is not NONEXISTENT is `unavailable`.
  * Every `not_checked` folder keeps its OLD state, so the next call covers the
  * gap. A NONEXISTENT folder is `gone` and leaves the marker.
+ *
+ * Each session takes the connection lease on its own, and gives it back when
+ * it closes (Phase 24). One lease is never held across two sessions, because
+ * its expiry is sized to one: held across the status session plus up to five
+ * searches it could lapse while a socket is still open, and a second request
+ * could then open a second connection. So the lease can be refused at either
+ * point:
+ * - on the status session, nothing was checked, and the refusal is rethrown
+ *   like a sign-in refusal: the whole call answers `connection_busy` and
+ *   issues no marker;
+ * - on a later search, another request took the lease between two sessions.
+ *   That stops the mail source like a throttle (D-29): every folder not yet
+ *   answered is `not_checked` with reason `busy` and keeps its old state.
  */
 async function checkMail(
   actor: Principal,
-  gate: SessionGate,
+  mail: LeasedMail,
   mailboxes: readonly string[],
   prior: ReadonlyMap<string, FolderState>,
   restartAll: boolean,
@@ -355,9 +376,13 @@ async function checkMail(
 
   let outcomes: FolderSnapshotOutcome[];
   try {
-    outcomes = await folderSnapshots(actor, gate, mailboxes, options);
+    outcomes = await mail.withConnectionLease(actor, (leased) =>
+      folderSnapshots(actor, leased, mailboxes, options),
+    );
   } catch (err) {
-    if (err instanceof ImapAuthError) throw err;
+    if (err instanceof ImapAuthError || err instanceof ConnectionBusyError) {
+      throw err;
+    }
     return notCheckedAll(reasonOf(err));
   }
 
@@ -430,20 +455,24 @@ async function checkMail(
 
     let found: { count: number; rows: NewMailRow[] };
     try {
-      found = await newMail(
-        actor,
-        gate,
-        check.mailbox,
-        search.fresh.uidValidity,
-        search.from,
-        search.fresh.uidNext,
-        options,
+      found = await mail.withConnectionLease(actor, (leased) =>
+        newMail(
+          actor,
+          leased,
+          check.mailbox,
+          search.fresh.uidValidity,
+          search.from,
+          search.fresh.uidNext,
+          options,
+        ),
       );
     } catch (err) {
       if (err instanceof ImapAuthError) throw err;
       const reason = reasonOf(err);
       check.answer = notChecked(key, reason);
-      if (reason === "throttled" || reason === "connection") stopped = reason;
+      if (reason === "throttled" || reason === "connection" || reason === "busy") {
+        stopped = reason;
+      }
       continue;
     }
 
@@ -792,12 +821,14 @@ export function refusedMarkerResult(): ToolResult {
  *
  * The signing key is imported first and the marker is read next, both BEFORE
  * any socket, so an unusable key or a refused marker costs no iCloud contact. The mail source runs in sessions awaited one after another on the
- * request-scoped gate. The calendar source runs only after the last mail
- * session has closed, through the one request-scoped DAV fetch.
+ * request-scoped gate, which it reaches only through `mail`, the per-person
+ * connection lease (Phase 24); each session takes the lease on its own. The
+ * calendar source runs only after the last mail session has closed, through
+ * the one request-scoped DAV fetch, and takes no lease (D-07).
  */
 export function registerChangesTool(
   server: McpServer,
-  gate: SessionGate,
+  mail: LeasedMail,
   principal: Promise<Principal>,
   /** The same request-scoped DAV fetch the calendar tools get. */
   davFetch: DavFetch,
@@ -922,7 +953,7 @@ export function registerChangesTool(
         );
         const checks = await checkMail(
           actor,
-          gate,
+          mail,
           mailboxes,
           priorFolders,
           restartAll,

@@ -24,6 +24,7 @@ vi.mock("../src/mail/socket", async (importOriginal) => ({
 
 import { encodeMessageId } from "../src/mail/ids";
 import type { MessageRef } from "../src/mail/ids";
+import { createLeasedMail } from "../src/agent/lease";
 import { createSessionGate } from "../src/mail/service";
 import { connectImap } from "../src/mail/socket";
 import { registerMailTools } from "../src/mcp/tools/mail";
@@ -57,7 +58,7 @@ function markReadCallback(): MarkReadCallback {
       if (name === "mail_mark_read") callback = handler;
     },
   };
-  registerMailTools(server as unknown as McpServer, createSessionGate(), ownerPrincipal());
+  registerMailTools(server as unknown as McpServer, createLeasedMail(createSessionGate()), ownerPrincipal());
   expect(callback, "mail_mark_read is not registered").toBeDefined();
   return callback!;
 }
