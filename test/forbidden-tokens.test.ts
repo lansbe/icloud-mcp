@@ -45,6 +45,11 @@ import {
   collectRemovalMarks,
   collectRemovalSites,
   withoutCommentLines,
+  AGENT_NAMESPACE_OWNER,
+  AGENT_NAMESPACE_READ,
+  AGENT_NAMESPACE_SCOPE,
+  collectAgentNamespaceReads,
+  checkAgentNamespaceReadOwnership,
   OWNERSHIP_VIOLATION_IDS,
   PASSWORD_READER_IMPORT,
   PASSWORD_READER_OWNERS,
@@ -749,6 +754,10 @@ const RAW_SOURCES: Record<string, string> = import.meta.glob(
     "../src/dav/*.ts",
     "../src/mail/service.ts",
     "../src/mail/triage.ts",
+    "../src/agent/*.ts",
+    "../src/env.ts",
+    "../src/index.ts",
+    "../src/mcp/server.ts",
     "../scripts/forbidden-tokens.mjs",
   ],
   { query: "?raw", import: "default", eager: true },
@@ -1052,6 +1061,18 @@ describe("the patterns have teeth", () => {
     // Phase 21. The RFC 6851 command, UID-scoped, as a "try it first" branch
     // would write it.
     "move-command": "await sendCommand(channel, tag, `UID MOVE ${uid} ${quoted}`);",
+    // Phase 24, DOBJ-01. The per-person object named from a request field: the
+    // shortest way to "look up the caller's object" from inside a handler, and
+    // the one that reaches whoever the request names.
+    "agent-name-not-from-principal":
+      "const stub = env.USER_AGENT.getByName(request.userName);",
+    // The string-to-id helper handed a user id. It typechecks, because both are
+    // 64-hex strings, and it names a raw object id nobody was hashed to.
+    "durable-object-id-helper":
+      "const stub = env.USER_AGENT.get(env.USER_AGENT.idFromString(principal.userId));",
+    // The object module reaching for the mail service, the first line of any
+    // edit that tries to hold the session inside the object.
+    "agent-object-reaches-mail": 'import { withMailSession } from "../mail/service";',
   };
 
   it("covers every rule with a known-violating sample", () => {
@@ -5037,6 +5058,283 @@ for (const count of MOVE_STEP_COUNTS) {
   });
 }
 
+// Phase 24, D-10 (a). The per-person object's namespace binding is read in
+// exactly one file under src/: the lease module, whose agentFor is the one stub
+// construction. Its type declaration in src/env.ts is not a read.
+describe("the per-person object namespace has one reader (Phase 24, D-10 a)", () => {
+  const owner = { file: AGENT_NAMESPACE_OWNER, line: 51, column: 14 };
+  // The realistic second reader: the server factory, which holds the request
+  // and could name an object from it.
+  const outsider = { file: "src/mcp/server.ts", line: 90, column: 20 };
+
+  /** A fresh copy per probe, so no state can carry between samples. */
+  const fires = (sample: string): boolean =>
+    new RegExp(AGENT_NAMESPACE_READ.source, AGENT_NAMESPACE_READ.flags).test(sample);
+
+  it("names the lease module as the owner, and collects from the source tree only", () => {
+    expect(AGENT_NAMESPACE_OWNER).toBe("src/agent/lease.ts");
+    expect(AGENT_NAMESPACE_SCOPE).toBe("src/");
+  });
+
+  it("finds the lease module in the real tree and nothing else, and not src/env.ts's declaration", () => {
+    const collected = [
+      "src/agent/lease.ts",
+      "src/agent/user-agent.ts",
+      "src/env.ts",
+      "src/mcp/server.ts",
+      "src/index.ts",
+    ].flatMap((file) => collectAgentNamespaceReads(file, rawSourceOf(file)));
+    expect(collected.map((reader) => reader.file)).toEqual([AGENT_NAMESPACE_OWNER]);
+    // src/env.ts mentions the binding in a doc comment AND declares it. Neither
+    // is a read.
+    expect(rawSourceOf("src/env.ts")).toMatch(/\bUSER_AGENT\b/);
+    expect(collectAgentNamespaceReads("src/env.ts", rawSourceOf("src/env.ts"))).toEqual([]);
+  });
+
+  it("passes when only the lease module reads the binding", () => {
+    expect(checkAgentNamespaceReadOwnership([owner])).toEqual([]);
+  });
+
+  it("reports a second reader, naming its file", () => {
+    const violations = checkAgentNamespaceReadOwnership([owner, outsider]);
+    expect(violations.map((v) => v.pattern)).toEqual(["agent-namespace-read-outside-owner"]);
+    expect(violations[0]!.file).toBe(outsider.file);
+    expect(violations[0]!.line).toBe(outsider.line);
+  });
+
+  it("reports the owner as missing when nothing reads the binding", () => {
+    const violations = checkAgentNamespaceReadOwnership([]);
+    expect(violations.map((v) => v.pattern)).toEqual(["agent-namespace-read-missing"]);
+    expect(violations[0]!.file).toBe(AGENT_NAMESPACE_OWNER);
+  });
+
+  it("is wired into scan(): scripts/ alone reports it missing, the real tree reports neither", () => {
+    expect(scan("scripts").map((v) => v.pattern)).toContain("agent-namespace-read-missing");
+    const patterns = scan().map((v) => v.pattern);
+    expect(patterns).not.toContain("agent-namespace-read-missing");
+    expect(patterns).not.toContain("agent-namespace-read-outside-owner");
+  });
+
+  it("counts member access, destructuring, bracket access and an object-literal line", () => {
+    for (const sample of [
+      // The owner's read, byte for byte.
+      "  return env.USER_AGENT.getByName(principal.userId);",
+      "const { USER_AGENT } = env;",
+      'const ns = env["USER_AGENT"];',
+      "const ns = this.env.USER_AGENT;",
+      // An object literal line starts with the name and a colon, but it is not
+      // the declaration: the value is a read.
+      "  USER_AGENT: env.USER_AGENT,",
+      "  USER_AGENT: ns,",
+    ]) {
+      expect(fires(sample), `missed ${JSON.stringify(sample)}`).toBe(true);
+    }
+  });
+
+  it("does not count the interface member that declares it, or a longer name", () => {
+    for (const sample of [
+      "      USER_AGENT: DurableObjectNamespace<UserAgent>;",
+      "  readonly USER_AGENT: DurableObjectNamespace<UserAgent>;",
+      "  USER_AGENT?: DurableObjectNamespace;",
+      "const header = request.headers.get(USER_AGENT_HEADER);",
+      "const ua = request.headers.get('User-Agent');",
+    ]) {
+      expect(fires(sample), `false-positived on ${JSON.stringify(sample)}`).toBe(false);
+    }
+  });
+
+  it("does not count a commented-out read, so a deleted reader cannot hide behind a comment", () => {
+    for (const sample of [
+      "// was: return env.USER_AGENT.getByName(principal.userId);\n",
+      "/**\n * env.USER_AGENT.getByName(principal.userId)\n */\n",
+    ]) {
+      const collected = collectAgentNamespaceReads(AGENT_NAMESPACE_OWNER, sample);
+      expect(collected, JSON.stringify(sample)).toEqual([]);
+      expect(checkAgentNamespaceReadOwnership(collected).map((v) => v.pattern)).toEqual([
+        "agent-namespace-read-missing",
+      ]);
+    }
+    // The real read after a comment block is still counted, on its own line,
+    // at the column of the name.
+    const real = "// header\n  return env.USER_AGENT.getByName(principal.userId);\n";
+    expect(collectAgentNamespaceReads(AGENT_NAMESPACE_OWNER, real)).toEqual([
+      { file: AGENT_NAMESPACE_OWNER, line: 2, column: 14 },
+    ]);
+  });
+
+  it("collects outside src/ nothing, because tests reach an object on purpose", () => {
+    expect(
+      collectAgentNamespaceReads("test/lease.test.ts", "env.USER_AGENT.getByName(name);"),
+    ).toEqual([]);
+  });
+
+  it("collects a file that reads it twice once, at its first read", () => {
+    expect(AGENT_NAMESPACE_READ.flags).toBe("m");
+    const twice = "const a = env.USER_AGENT;\nconst b = env.USER_AGENT;\n";
+    expect(collectAgentNamespaceReads("src/mcp/server.ts", twice)).toEqual([
+      { file: "src/mcp/server.ts", line: 1, column: 15 },
+    ]);
+  });
+
+  it("gives the two ids distinct sort keys, straight after the removal site's", () => {
+    const violations = [
+      ...checkAgentNamespaceReadOwnership([owner, outsider]),
+      ...checkAgentNamespaceReadOwnership([]),
+    ];
+    const outside = violations.find((v) => v.pattern === "agent-namespace-read-outside-owner")!;
+    const missing = violations.find((v) => v.pattern === "agent-namespace-read-missing")!;
+    expect(outside.patternIndex).toBe(FORBIDDEN.length + 33);
+    expect(missing.patternIndex).toBe(FORBIDDEN.length + 34);
+  });
+});
+
+// Phase 24, D-10 (b) to (e). The object's name, the other id helpers, the
+// object module's imports, and a fan-out over the lease runner.
+describe("the per-person object rules (Phase 24, D-10 b to e)", () => {
+  const rule = (id: string) => FORBIDDEN.find((r) => r.id === id)!;
+  /** Through the real scope mechanism, at a given path. */
+  const hits = (id: string, path: string, text: string): number =>
+    matchRule(rule(id), FORBIDDEN.indexOf(rule(id)), path, text).length;
+
+  it("fires the name rule on a request field, a string literal and a bare identifier", () => {
+    for (const sample of [
+      "env.USER_AGENT.getByName(request.userName);",
+      'env.USER_AGENT.getByName("a".repeat(64));',
+      "env.USER_AGENT.getByName('owner');",
+      "env.USER_AGENT.getByName(userId);",
+      "env.USER_AGENT.getByName(args.userId + suffix);",
+      "env.USER_AGENT.getByName(`${principal.userId}`);",
+    ]) {
+      expect(hits("agent-name-not-from-principal", "src/agent/lease.ts", sample), sample).toBe(1);
+    }
+  });
+
+  it("does not fire the name rule on a Principal's userId member", () => {
+    for (const sample of [
+      "  return env.USER_AGENT.getByName(principal.userId);",
+      "env.USER_AGENT.getByName(actor.userId);",
+      "env.USER_AGENT.getByName(ctx.actor.userId);",
+      "env.USER_AGENT.getByName(\n    principal.userId,\n  );",
+      "env.USER_AGENT.getByName( principal.userId );",
+      "env.USER_AGENT.getByName(principal.userId, { locationHint: 'wnam' });",
+    ]) {
+      expect(hits("agent-name-not-from-principal", "src/agent/lease.ts", sample), sample).toBe(0);
+    }
+  });
+
+  it("scopes the name rule to src/, so tests may name an object directly", () => {
+    const sample = "env.USER_AGENT.getByName(name);";
+    expect(hits("agent-name-not-from-principal", "src/mcp/server.ts", sample)).toBe(1);
+    expect(hits("agent-name-not-from-principal", "test/lease-cost.test.ts", sample)).toBe(0);
+  });
+
+  it("fires the id-helper ban on each of the three helpers under src/, and not under test/", () => {
+    for (const helper of ["idFromName", "idFromString", "newUniqueId"]) {
+      const sample = `const id = env.USER_AGENT.${helper}(value);`;
+      expect(hits("durable-object-id-helper", "src/agent/lease.ts", sample), helper).toBe(1);
+      expect(hits("durable-object-id-helper", "test/lease.test.ts", sample), helper).toBe(0);
+    }
+  });
+
+  it("does not fire the id-helper ban on the project's own uid helpers", () => {
+    for (const sample of [
+      "const uid = uidFromObjectUrl(payload.o);",
+      "const uid = contactUidFromObjectUrl(payload.o);",
+      "const id = await idFromListing((one) => one.allDay);",
+    ]) {
+      expect(hits("durable-object-id-helper", "src/mcp/tools/calendar.ts", sample), sample).toBe(0);
+    }
+  });
+
+  it("fires the object-imports rule on a static, a dynamic and a re-export of each forbidden tree", () => {
+    for (const tree of ["mail", "dav", "mcp", "auth", "staging", "feed"]) {
+      for (const sample of [
+        `import { thing } from "../${tree}/module";`,
+        `import type { Thing } from '../${tree}/module.ts';`,
+        `const { thing } = await import("../${tree}/module");`,
+        `export { thing } from "../${tree}/module";`,
+        `import "../${tree}/module";`,
+      ]) {
+        expect(hits("agent-object-reaches-mail", "src/agent/user-agent.ts", sample), sample).toBe(1);
+      }
+    }
+  });
+
+  it("scopes the object-imports rule to the object module, so the lease module may import the gate's type", () => {
+    const sample = 'import type { SessionGate } from "../mail/service";';
+    expect(hits("agent-object-reaches-mail", "src/agent/user-agent.ts", sample)).toBe(1);
+    expect(hits("agent-object-reaches-mail", "src/agent/lease.ts", sample)).toBe(0);
+    expect(rawSourceOf("src/agent/lease.ts")).toContain('from "../mail/service"');
+  });
+
+  it("does not fire the object-imports rule on the object module's own imports", () => {
+    for (const sample of [
+      'import { DurableObject } from "cloudflare:workers";',
+      'import type { Env } from "../env";',
+      'import { ConnectionBusyError } from "../errors";',
+      'import { thing } from "../mailbox-helpers";',
+    ]) {
+      expect(hits("agent-object-reaches-mail", "src/agent/user-agent.ts", sample), sample).toBe(0);
+    }
+  });
+
+  /** `concurrent-session` exactly as it shipped before plan 24-03, typed out so
+   *  the widening has something to be measured against. */
+  const CONCURRENT_SESSION_BEFORE_24_03 =
+    /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|markRead|markUnread|flagMessage|unflagMessage|moveMessages|readMoveSet|buildMovePreview|applyMailCommit)/g;
+
+  /** The realistic shape: a combinator over an array mapped to leased calls. */
+  const LEASED_FAN_OUT =
+    "const pages = await Promise.all(folders.map((folder) => mail.withConnectionLease(actor, (gate) => listMessagesPage(actor, gate, folder, 1))));";
+
+  it("fires concurrent-session on a combinator over leased calls", () => {
+    expect(hits("concurrent-session", "src/mcp/tools/mail.ts", LEASED_FAN_OUT)).toBe(1);
+    for (const combinator of ["all", "allSettled", "any", "race"]) {
+      const sample = `await Promise.${combinator}(ids.map((id) => leased.withConnectionLease(actor, work)));`;
+      expect(hits("concurrent-session", "src/mcp/tools/changes.ts", sample), combinator).toBe(1);
+    }
+  });
+
+  it("the rule as it shipped before 24-03 misses the leased fan-out, so the widening has teeth", () => {
+    const old = new RegExp(
+      CONCURRENT_SESSION_BEFORE_24_03.source,
+      CONCURRENT_SESSION_BEFORE_24_03.flags,
+    );
+    expect(old.test(LEASED_FAN_OUT)).toBe(false);
+    // And the typed-out text really was the rule: it fires on the standing
+    // sample, which the widened rule still fires on too.
+    const standing = violatingSamples_concurrentSession;
+    expect(new RegExp(old.source, old.flags).test(standing)).toBe(true);
+    expect(hits("concurrent-session", "src/mcp/tools/mail.ts", standing)).toBe(1);
+  });
+
+  it("does not fire concurrent-session on one awaited leased call", () => {
+    for (const permitted of [
+      "return mail.withConnectionLease(actor, (gate) => listFolders(actor, gate));",
+      "const folders = await leasedMail.withConnectionLease(principal, work);",
+    ]) {
+      expect(hits("concurrent-session", "src/mcp/tools/mail.ts", permitted), permitted).toBe(0);
+    }
+  });
+
+  it("finds none of the four in the real tree", () => {
+    const ids = scan().map((violation) => violation.pattern);
+    for (const id of [
+      "agent-name-not-from-principal",
+      "durable-object-id-helper",
+      "agent-object-reaches-mail",
+      "concurrent-session",
+    ]) {
+      expect(ids).not.toContain(id);
+    }
+  });
+});
+
+/** The standing `concurrent-session` sample, restated for the phase 24 block,
+ *  which sits outside the describe that owns the samples table. */
+const violatingSamples_concurrentSession =
+  "await Promise.all(refs.map((ref) => withMailSession(env, gate, ref.mailbox, ref.uidValidity, one)));";
+
 describe("the count constraints as a set", () => {
   /** A barrel's named re-export of the mutating orchestrator (WR-05). */
   const BARREL_REEXPORT = 'export { withMutatingMailbox } from "./service";\n';
@@ -5054,6 +5352,10 @@ describe("the count constraints as a set", () => {
   const TOOL_MARK = "await sendCommand(channel, tag, `UID STORE ${uid} +FLAGS (\\\\Deleted)`);\n";
   const TOOL_REMOVAL = "await sendCommand(channel, tag, `UID EXPUNGE ${uid}`);\n";
   const TOOL_LAYER = "src/mcp/tools/mail.ts";
+  /** Phase 24: a second read of the per-person object's namespace in the
+   *  server factory, and an owner whose only read is inside a comment. */
+  const FACTORY_NAMESPACE_READ = "const ns = env.USER_AGENT;\n";
+  const COMMENTED_NAMESPACE_READ = "// return env.USER_AGENT.getByName(principal.userId);\n";
 
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
@@ -5128,6 +5430,16 @@ describe("the count constraints as a set", () => {
       ...checkRemovalSiteOwnership(collectRemovalSites(REMOVAL_OWNER, COMMENTED_REMOVAL)).map(
         (v) => v.pattern,
       ),
+      // The phase 24 namespace-read count, one owner, both arms through
+      // scan()'s own collector: a read in the server factory, and an owner
+      // whose only read is inside a comment.
+      ...checkAgentNamespaceReadOwnership([
+        ...collectAgentNamespaceReads(AGENT_NAMESPACE_OWNER, "  return env.USER_AGENT.getByName(principal.userId);\n"),
+        ...collectAgentNamespaceReads("src/mcp/server.ts", FACTORY_NAMESPACE_READ),
+      ]).map((v) => v.pattern),
+      ...checkAgentNamespaceReadOwnership(
+        collectAgentNamespaceReads(AGENT_NAMESPACE_OWNER, COMMENTED_NAMESPACE_READ),
+      ).map((v) => v.pattern),
       // The second two-owner count, fed the same pair of lists the password
       // count is fed and for the same reason.
       ...checkPrincipalConstructorOwnership([
@@ -5207,6 +5519,14 @@ describe("the count constraints as a set", () => {
       ),
       ...checkRemovalSiteOwnership(collectRemovalSites(TOOL_LAYER, TOOL_REMOVAL)),
       ...checkRemovalSiteOwnership(collectRemovalSites(REMOVAL_OWNER, COMMENTED_REMOVAL)),
+      // The namespace-read count: a lone non-owner reader, and an owner whose
+      // only read is commented out, give one of each id.
+      ...checkAgentNamespaceReadOwnership(
+        collectAgentNamespaceReads("src/mcp/server.ts", FACTORY_NAMESPACE_READ),
+      ),
+      ...checkAgentNamespaceReadOwnership(
+        collectAgentNamespaceReads(AGENT_NAMESPACE_OWNER, COMMENTED_NAMESPACE_READ),
+      ),
       // TWO owners again, so the same asymmetric pair the password count needs:
       // both owners plus a non-owner is exactly one outside, and one owner
       // alone is exactly one missing.
@@ -5261,6 +5581,10 @@ describe("the count constraints as a set", () => {
     expect(REMOVAL_MARK_OWNER).toBe(COPY_OWNER);
     expect(REMOVAL_OWNER).toBe(COPY_OWNER);
     expect(EXCLUDED.has(COPY_OWNER)).toBe(false);
+    // And for the one stub construction. The lease module is the one place an
+    // object is named, so it must stay inside the name rule and the id-helper
+    // ban, which a path exclusion would drop along with the count's exemption.
+    expect(EXCLUDED.has(AGENT_NAMESPACE_OWNER)).toBe(false);
     // And for both minting sites. These two are the files that hold a live
     // credential longest — the door holds a decrypted grant, the login page
     // holds a value somebody just typed — so they are the two that most need

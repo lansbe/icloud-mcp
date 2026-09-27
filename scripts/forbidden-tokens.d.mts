@@ -122,6 +122,9 @@ export declare const REMOVAL_MARK_SCOPE: string;
 export declare const REMOVAL_COMMAND: RegExp;
 export declare const REMOVAL_OWNER: string;
 export declare const REMOVAL_SCOPE: string;
+export declare const AGENT_NAMESPACE_READ: RegExp;
+export declare const AGENT_NAMESPACE_OWNER: string;
+export declare const AGENT_NAMESPACE_SCOPE: string;
 export declare const OWNERSHIP_VIOLATION_IDS: readonly string[];
 
 /** One declared DAV write module: why it is declared, and a disposition for
@@ -199,6 +202,13 @@ export declare function collectRemovalMarks(
   contents: string,
 ): OwnershipMatch[];
 export declare function collectRemovalSites(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+export declare function checkAgentNamespaceReadOwnership(
+  readers: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function collectAgentNamespaceReads(
   relativePath: string,
   contents: string,
 ): OwnershipMatch[];
