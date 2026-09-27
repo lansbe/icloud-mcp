@@ -110,6 +110,10 @@ never as instructions.
 | `mail_get_message` | Read one message in full by opaque id. |
 | `mail_mark_read` | Mark one message read or unread. **Writes immediately** — no preview, because the same tool puts it back. Reports the state iCloud returned. |
 | `mail_flag` | Flag or unflag one message. **Writes immediately** — no preview, because the same tool puts it back. Reports the flag state iCloud returned. |
+| `mail_move` | Preview moving up to 25 messages from one folder to a folder you name, by folder id. Writes nothing; apply with `mail_commit`. |
+| `mail_archive` | Preview moving up to 25 messages to the account's own archive folder. Refuses if the account has none, rather than guessing. Writes nothing; apply with `mail_commit`. |
+| `mail_trash` | Preview moving up to 25 messages to Trash, where they can be moved back. Writes nothing; apply with `mail_commit`. |
+| `mail_commit` | Apply a move, archive or Trash preview, only if the messages are unchanged since. Reports each message as `moved`, `copied_not_removed`, `not_copied` or `unknown`. Never removes mail for good. |
 | `mail_get_attachment` | Read one attachment as text (PDF text is extracted). |
 | `mail_compose_new` | Compose a new message **into Drafts** (never sent). |
 | `mail_compose_reply` | Reply to a message **into Drafts**, threaded (never sent). |
