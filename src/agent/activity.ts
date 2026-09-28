@@ -29,8 +29,14 @@ export interface ActivityEntry {
   readonly ruleId: string | null;
   /** The message's opaque id, for an action; null for a run entry. */
   readonly messageId: string | null;
-  /** A run outcome or an action outcome, from their closed lists. */
+  /**
+   * A run outcome or an action outcome, from their closed lists. One more
+   * word, for a run entry only: `not_seen`, when the change check counted new
+   * messages it did not list, which are never acted on.
+   */
   readonly outcome: string;
+  /** How many messages, for a `not_seen` entry only. */
+  readonly count?: number;
 }
 
 /** The part of the object's storage the ring uses. */
@@ -49,7 +55,8 @@ function isEntry(value: unknown): value is ActivityEntry {
     (e.kind === "run" || e.kind === "flag" || e.kind === "draft") &&
     (e.ruleId === null || typeof e.ruleId === "string") &&
     (e.messageId === null || typeof e.messageId === "string") &&
-    typeof e.outcome === "string"
+    typeof e.outcome === "string" &&
+    (e.count === undefined || (typeof e.count === "number" && Number.isSafeInteger(e.count)))
   );
 }
 

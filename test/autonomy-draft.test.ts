@@ -302,6 +302,7 @@ async function armedWithRule(
     expect(queued).toHaveLength(0);
     calls.splice(0);
     handedOut.length = 0;
+    vi.mocked(connectImap).mockClear();
     await makeJobDue(armed.stub);
     return { armed, calls, ruleId: added.ok ? added.id : "" };
   } catch (error) {

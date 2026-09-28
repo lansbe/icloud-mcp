@@ -98,6 +98,9 @@ export type ActionOutcome =
  * The session: `not_allowed`, `off`, `revoked`, `session_failed`.
  * The change check: `call_failed`, `unreadable`, `marker_refused`,
  * `markers_unavailable`, `inbox_not_checked`.
+ * The sign-in check: `own_address_unreadable` (its answer could not be read,
+ * so no reply's recipient could be checked against the account's own address;
+ * nothing was acted on and the marker was kept).
  * The end: `started` (a starting point: the marker was stored and nothing was
  * acted on), `done` (every verdict handled and the fresh marker stored),
  * `stopped` (an action failed, so the run stopped and kept the old marker).
@@ -117,6 +120,7 @@ export type RunOutcome =
   | "marker_refused"
   | "markers_unavailable"
   | "inbox_not_checked"
+  | "own_address_unreadable"
   | "started"
   | "done"
   | "stopped"
