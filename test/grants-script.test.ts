@@ -62,6 +62,7 @@ import {
 import type { Env } from "../src/env";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 import { maskAppleId, userIdOf } from "../src/principal";
+import { AUTONOMY_STATUS_KEY_PREFIX } from "../src/agent/status";
 import { getOAuthApi } from "@cloudflare/workers-oauth-provider";
 import {
   AUTONOMY_SECRET_NAMES,
@@ -69,6 +70,7 @@ import {
   NOTHING_REVOKED,
   REPLACE_ENDS_KEYS,
   USAGE,
+  autonomyStatusText,
   createWranglerKv,
   createWranglerSecrets,
   installAutonomyClientRecord,
@@ -2413,5 +2415,283 @@ describe("AUTO-03: the owner's autonomy setup creates the client and sets both s
   it("names autonomy-setup in the usage text", () => {
     expect(USAGE).toContain("autonomy-setup [--replace] [--yes]");
     expect(USAGE).toContain(REPLACE_ENDS_KEYS);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The rules job in the owner's listing (Phase 28, AUTO-15, D-17 as revised).
+//
+// Each run of a person's rules job writes one small record to the sign-in
+// store: next wake, refused sign-ins in a row, last run. The listing shows it
+// on a line under each autonomy grant, so the grant row itself stays
+// byte-identical to Phase 27's. Every signed-in person holds an autonomy grant
+// and most have no rules, so most say "no run recorded".
+//
+// Every case runs over a store it OWNS, for the reason the section above gives.
+// ---------------------------------------------------------------------------
+
+/** 06:00 UTC on 2026-09-28, the clock every case below reads. */
+const STATUS_NOW = Date.UTC(2026, 8, 28, 6, 0, 0);
+
+/** A status record in the shape `src/agent/status.ts` writes, as stored text. */
+function statusRecord(fields: Record<string, unknown>): string {
+  return JSON.stringify({
+    v: 1,
+    nextAt: null,
+    authFailures: 0,
+    lastRunAt: null,
+    lastOutcome: "no_new_mail",
+    rules: 1,
+    ...fields,
+  });
+}
+
+/** A store we own that counts reads by prefix and records how many overlap. */
+function countingStore(records: Record<string, unknown>) {
+  const base = ownStore(records);
+  const seen = { lists: [] as string[], gets: [] as string[], inFlight: 0, maxInFlight: 0 };
+  const store: GrantStore = {
+    async list(options?: { prefix?: string }) {
+      seen.lists.push(options?.prefix ?? "");
+      return base.list(options);
+    },
+    async get(name: string, options?: { type?: string }) {
+      seen.gets.push(name);
+      seen.inFlight += 1;
+      seen.maxInFlight = Math.max(seen.maxInFlight, seen.inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      seen.inFlight -= 1;
+      return base.get(name, options);
+    },
+    async delete(name: string) {
+      await base.delete(name);
+    },
+  };
+  return { store, seen };
+}
+
+/** `list` over a store, at the fixed clock, returning the printed text. */
+async function listAt(kv: GrantStore): Promise<string> {
+  const out = sink();
+  const code = await runGrants(["list"], {
+    kv,
+    async knownAddresses() {
+      return [LISTED_APPLE_ID];
+    },
+    write: out.write,
+    writeError: out.write,
+    now: () => STATUS_NOW,
+  });
+  expect(code).toBe(0);
+  return out.text();
+}
+
+/** The line printed straight after the row carrying a grant id. */
+function lineAfter(text: string, grantId: string): string {
+  const lines = text.split("\n");
+  const at = lines.findIndex((candidate) => candidate.includes(grantId));
+  expect(at, `no line for ${grantId}`).toBeGreaterThanOrEqual(0);
+  return lines[at + 1] ?? "";
+}
+
+describe("AUTO-15: the owner's listing shows each person's rules job", () => {
+  async function storeWith(status: unknown, extra: Record<string, unknown> = {}) {
+    const userKey = await listedUserId();
+    const records: Record<string, unknown> = {
+      [`grant:${userKey}:auto-status-1`]: namedGrantRecord(
+        userKey,
+        "auto-status-1",
+        AUTONOMY_CLIENT_ID,
+        AUTONOMY_CLIENT_NAME,
+      ),
+      [`grant:${userKey}:plain-status-1`]: namedGrantRecord(userKey, "plain-status-1", "a-client-id", "Claude"),
+      [`client:${AUTONOMY_CLIENT_ID}`]: { clientId: AUTONOMY_CLIENT_ID },
+      "client:a-client-id": { clientId: "a-client-id" },
+      ...extra,
+    };
+    if (status !== undefined) records[`${AUTONOMY_STATUS_KEY_PREFIX}${userKey}`] = status;
+    return { userKey, kv: ownStore(records) };
+  }
+
+  it("shows the next wake as a UTC time, and the failure count, while the wake is ahead", async () => {
+    const { kv } = await storeWith(
+      statusRecord({ nextAt: STATUS_NOW + 15 * 60_000, authFailures: 1, lastRunAt: STATUS_NOW - 60_000 }),
+    );
+    const text = await listAt(kv);
+    expect(lineAfter(text, "auto-status-1")).toBe("    rules job  next wake 2026-09-28 06:15 UTC  auth failures 1  last no_new_mail");
+    // The grant row itself is byte-identical to Phase 27's.
+    expect(lineFor(text, "auto-status-1")).toMatch(/ {2}autonomy$/);
+  });
+
+  it("says idle since the last run once the next wake has passed", async () => {
+    const { kv } = await storeWith(
+      statusRecord({ nextAt: STATUS_NOW - 60_000, authFailures: 0, lastRunAt: STATUS_NOW - 16 * 60_000 }),
+    );
+    expect(lineAfter(await listAt(kv), "auto-status-1")).toBe(
+      "    rules job  idle since 2026-09-28 05:44 UTC  auth failures 0  last no_new_mail",
+    );
+  });
+
+  // 28-REVIEW-2 WR-03. A job stuck at the sign-in for weeks looked exactly
+  // like a working one. The last outcome is one word from the job's closed
+  // list, so it is printed; anything else is left off.
+  it("shows the last run's outcome word, so a job that cannot sign in stands out", async () => {
+    const { kv } = await storeWith(
+      statusRecord({ nextAt: STATUS_NOW + 30 * 60_000, lastRunAt: STATUS_NOW - 60_000, lastOutcome: "sign_in_unavailable" }),
+    );
+    expect(lineAfter(await listAt(kv), "auto-status-1")).toBe(
+      "    rules job  next wake 2026-09-28 06:30 UTC  auth failures 0  last sign_in_unavailable",
+    );
+    for (const word of ["Not A Word", "done\u001b[31m", "x".repeat(41), 7, null]) {
+      expect(
+        autonomyStatusText(statusRecord({ nextAt: STATUS_NOW + 60_000, lastOutcome: word }), STATUS_NOW),
+        String(word),
+      ).toBe("next wake 2026-09-28 06:01 UTC  auth failures 0");
+    }
+  });
+
+  it("says no run recorded for an autonomy grant with no record, as most people have", async () => {
+    const { kv } = await storeWith(undefined);
+    expect(lineAfter(await listAt(kv), "auto-status-1")).toBe("    rules job  no run recorded");
+  });
+
+  it("says unreadable for a record that will not parse, and the listing carries on", async () => {
+    const otherKey = "9".repeat(64);
+    const { kv } = await storeWith("{not json", {
+      [`grant:${otherKey}:auto-status-2`]: namedGrantRecord(
+        otherKey,
+        "auto-status-2",
+        AUTONOMY_CLIENT_ID,
+        AUTONOMY_CLIENT_NAME,
+      ),
+      [`${AUTONOMY_STATUS_KEY_PREFIX}${otherKey}`]: statusRecord({ nextAt: STATUS_NOW + 60_000 }),
+    });
+    const text = await listAt(kv);
+    expect(lineAfter(text, "auto-status-1")).toBe("    rules job  status unreadable");
+    expect(lineAfter(text, "auto-status-2")).toBe("    rules job  next wake 2026-09-28 06:01 UTC  auth failures 0  last no_new_mail");
+  });
+
+  it("a failed listing of the status records never costs the grant listing: each person's line says status unreadable (28-REVIEW IN-05)", async () => {
+    const otherKey = "9".repeat(64);
+    const { kv } = await storeWith(statusRecord({ nextAt: STATUS_NOW + 60_000 }), {
+      [`grant:${otherKey}:auto-status-2`]: namedGrantRecord(
+        otherKey,
+        "auto-status-2",
+        AUTONOMY_CLIENT_ID,
+        AUTONOMY_CLIENT_NAME,
+      ),
+    });
+    const failing: GrantStore = {
+      ...kv,
+      async list(options?: { prefix?: string }) {
+        if (options?.prefix === AUTONOMY_STATUS_KEY_PREFIX) throw new Error("the listing failed");
+        return kv.list(options);
+      },
+    };
+    // listAt asserts the command still exits 0.
+    const text = await listAt(failing);
+    expect(lineFor(text, "auto-status-1")).toMatch(/ {2}autonomy$/);
+    expect(lineFor(text, "plain-status-1")).toContain("plain-status-1");
+    expect(lineAfter(text, "auto-status-1")).toBe("    rules job  status unreadable");
+    expect(lineAfter(text, "auto-status-2")).toBe("    rules job  status unreadable");
+  });
+
+  it("prints no rules job line and reads no status for a person with no autonomy grant", async () => {
+    const userKey = await listedUserId();
+    const { store, seen } = countingStore({
+      [`grant:${userKey}:plain-status-2`]: namedGrantRecord(userKey, "plain-status-2", "a-client-id", "Claude"),
+      "client:a-client-id": { clientId: "a-client-id" },
+      // A record with no autonomy grant beside it: never read.
+      [`${AUTONOMY_STATUS_KEY_PREFIX}${userKey}`]: statusRecord({ nextAt: STATUS_NOW + 60_000 }),
+    });
+    const text = await listAt(store);
+    expect(text).not.toContain("rules job");
+    expect(seen.lists).not.toContain(AUTONOMY_STATUS_KEY_PREFIX);
+    expect(seen.gets.filter((name) => name.startsWith(AUTONOMY_STATUS_KEY_PREFIX))).toEqual([]);
+  });
+
+  it("never prints a rule value, an unmasked address, or any field but the listed ones", async () => {
+    const { kv } = await storeWith(
+      statusRecord({
+        nextAt: STATUS_NOW + 60_000,
+        authFailures: 2,
+        lastRunAt: STATUS_NOW - 60_000,
+        lastOutcome: "auth_failed",
+        rules: 7,
+        // Fields a record must never hold. If one ever did, the listing still
+        // would not print it: only the listed fields are read.
+        subjectContains: "Offer letter",
+        fromAddresses: [LISTED_APPLE_ID],
+        text: "Thanks, I will reply soon.",
+      }),
+    );
+    const text = await listAt(kv);
+    // The outcome word is printed since 28-REVIEW-2 WR-03; it is a word from
+    // the job's closed list, never a value from mail or a rule.
+    for (const leak of ["Offer letter", "Thanks, I will reply soon.", LISTED_APPLE_ID, "rules 7"]) {
+      expect(text, leak).not.toContain(leak);
+    }
+    expect(text).toContain(maskAppleId(LISTED_APPLE_ID));
+    expect(lineAfter(text, "auto-status-1")).toBe("    rules job  next wake 2026-09-28 06:01 UTC  auth failures 2  last auth_failed");
+  });
+
+  it("reads statuses one at a time: one listing, then one read per person with a record", async () => {
+    const userKey = await listedUserId();
+    const otherKey = "8".repeat(64);
+    const thirdKey = "7".repeat(64);
+    const { store, seen } = countingStore({
+      [`grant:${userKey}:auto-serial-1`]: namedGrantRecord(userKey, "auto-serial-1", AUTONOMY_CLIENT_ID, AUTONOMY_CLIENT_NAME),
+      [`grant:${otherKey}:auto-serial-2`]: namedGrantRecord(otherKey, "auto-serial-2", AUTONOMY_CLIENT_ID, AUTONOMY_CLIENT_NAME),
+      [`grant:${thirdKey}:auto-serial-3`]: namedGrantRecord(thirdKey, "auto-serial-3", AUTONOMY_CLIENT_ID, AUTONOMY_CLIENT_NAME),
+      [`client:${AUTONOMY_CLIENT_ID}`]: { clientId: AUTONOMY_CLIENT_ID },
+      [`${AUTONOMY_STATUS_KEY_PREFIX}${userKey}`]: statusRecord({ nextAt: STATUS_NOW + 60_000 }),
+      [`${AUTONOMY_STATUS_KEY_PREFIX}${otherKey}`]: statusRecord({ nextAt: STATUS_NOW + 120_000 }),
+    });
+    const text = await listAt(store);
+    expect(seen.lists.filter((prefix) => prefix === AUTONOMY_STATUS_KEY_PREFIX)).toHaveLength(1);
+    const statusGets = seen.gets.filter((name) => name.startsWith(AUTONOMY_STATUS_KEY_PREFIX));
+    expect([...statusGets].sort()).toEqual(
+      [`${AUTONOMY_STATUS_KEY_PREFIX}${userKey}`, `${AUTONOMY_STATUS_KEY_PREFIX}${otherKey}`].sort(),
+    );
+    expect(seen.maxInFlight).toBe(1);
+    expect(lineAfter(text, "auto-serial-3")).toBe("    rules job  no run recorded");
+  });
+
+  it("the revoke preview shows no rules job line", async () => {
+    const { kv } = await storeWith(statusRecord({ nextAt: STATUS_NOW + 60_000 }));
+    const out = sink();
+    await runGrants(["revoke", "auto-status-1"], {
+      kv,
+      async knownAddresses() {
+        return [LISTED_APPLE_ID];
+      },
+      write: out.write,
+      writeError: out.write,
+      now: () => STATUS_NOW,
+    });
+    expect(out.text()).toContain("auto-status-1");
+    expect(out.text()).not.toContain("rules job");
+  });
+
+  it("reads a record strictly: a wrong version, a bad count or an unusable time is unreadable", () => {
+    const unreadable = "status unreadable";
+    for (const value of [
+      statusRecord({ v: 2, nextAt: STATUS_NOW + 60_000 }),
+      statusRecord({ authFailures: -1, nextAt: STATUS_NOW + 60_000 }),
+      statusRecord({ authFailures: 1.5, nextAt: STATUS_NOW + 60_000 }),
+      statusRecord({ authFailures: "0", nextAt: STATUS_NOW + 60_000 }),
+      statusRecord({ nextAt: 1e20 }),
+      statusRecord({ nextAt: null, lastRunAt: null }),
+      "[]",
+      "null",
+      42,
+    ]) {
+      expect(autonomyStatusText(value, STATUS_NOW), String(value)).toBe(unreadable);
+    }
+    expect(autonomyStatusText(null, STATUS_NOW)).toBe("no run recorded");
+    // A stored object (as the pool's store hands back) reads like its text.
+    expect(autonomyStatusText({ v: 1, nextAt: STATUS_NOW + 60_000, authFailures: 3 }, STATUS_NOW)).toBe(
+      "next wake 2026-09-28 06:01 UTC  auth failures 3",
+    );
   });
 });

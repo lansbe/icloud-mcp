@@ -81,6 +81,7 @@ import {
   AUTONOMY_CLIENT_NAME,
   AUTONOMY_REDIRECT_PATH,
 } from "../src/agent/autonomy-client";
+import { AUTONOMY_STATUS_KEY_PREFIX } from "../src/agent/status";
 import { maskAppleId, userIdOf } from "../src/principal";
 
 /** The store's user segment for a grant made before this milestone. */
@@ -1061,6 +1062,162 @@ async function pruneClients(kv, orphans, claimed, writeError) {
   return left;
 }
 
+// ---------------------------------------------------------------------------
+// The rules job's status (Phase 28, AUTO-15, D-17 as revised 2026-09-27).
+//
+// Each run of a person's rules job writes one small record to this store, under
+// `autonomy-status:v1:` and the person's user id: when the job next wakes, how
+// many sign-ins in a row iCloud refused, and when it last ran. `list` shows it on
+// a line under each autonomy grant. Every signed-in person holds an autonomy
+// grant and most write no rules, so most people have no record and the line says
+// so. The record expires three days after the last run.
+//
+// WHAT IS READ, AND WHAT NEVER IS. Only three fields: the next wake, the failure
+// count and the last run's time, each a number. Nothing else in the record is
+// read, so nothing else can be printed. The record holds no address, rule value
+// or mail by construction (src/agent/status.ts); this reader does not rely on it.
+//
+// HOW MANY READS. The status prefix is listed once, and only when somebody holds
+// an autonomy grant. Then each such person with a record costs one read, one at
+// a time. A person with no record costs no read: through wrangler, a read of a
+// missing key fails, and a failed read is reported as an incomplete listing,
+// which would be wrong for the common case. Decided by Claude, owner may revise.
+// ---------------------------------------------------------------------------
+
+/** What the line says when a person with an autonomy grant has no record. */
+export const NO_RUN_RECORDED = "no run recorded";
+
+/** What the line says when a record is there but cannot be read. */
+export const STATUS_UNREADABLE = "status unreadable";
+
+/**
+ * The shape of a word on the job's closed list of run outcomes: the same shape
+ * the job checks before it writes one (`src/agent/status.ts`). Only such a word
+ * is printed, so nothing else in a record can reach the owner's terminal.
+ */
+const STATUS_OUTCOME_WORD = /^[a-z_]{1,40}$/;
+
+/** The shape of a user id, the only kind of segment a record is written for. */
+const STATUS_USER_ID = /^[0-9a-f]{64}$/;
+
+/**
+ * A time in ms since the epoch as `YYYY-MM-DD HH:MM UTC`, or null when it is not
+ * a usable time.
+ *
+ * @param {unknown} ms
+ * @returns {string | null}
+ */
+function utcMinute(ms) {
+  if (typeof ms !== "number" || !Number.isFinite(ms)) return null;
+  const when = new Date(ms);
+  if (Number.isNaN(when.getTime())) return null;
+  const iso = when.toISOString();
+  if (!/^\d{4}-/.test(iso)) return null;
+  return `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
+}
+
+/**
+ * One status record as the words `list` prints after "rules job". PURE.
+ *
+ * `null` or `undefined` is no record. Text is parsed as JSON; an object (as a
+ * store may hand back) is read as is. A record must be version 1, with a failure
+ * count that is a whole number at least 0. Then: the next wake when it is still
+ * ahead of `now`; otherwise "idle since" the last run; otherwise unreadable.
+ * Then the last run's outcome word, when it is one (28-REVIEW-2 WR-03): a job
+ * whose every run stops at the sign-in looked exactly like a working one. Only
+ * those four fields are read. Never throws.
+ *
+ * @param {unknown} value
+ * @param {number} now  ms since the epoch
+ * @returns {string}
+ */
+export function autonomyStatusText(value, now) {
+  try {
+    if (value === null || value === undefined) return NO_RUN_RECORDED;
+    let record = value;
+    if (typeof value === "string") {
+      try {
+        record = JSON.parse(value);
+      } catch {
+        return STATUS_UNREADABLE;
+      }
+    }
+    if (typeof record !== "object" || record === null || Array.isArray(record)) {
+      return STATUS_UNREADABLE;
+    }
+    if (record.v !== 1) return STATUS_UNREADABLE;
+    const failures = record.authFailures;
+    if (typeof failures !== "number" || !Number.isSafeInteger(failures) || failures < 0) {
+      return STATUS_UNREADABLE;
+    }
+    const outcome =
+      typeof record.lastOutcome === "string" && STATUS_OUTCOME_WORD.test(record.lastOutcome)
+        ? `  last ${record.lastOutcome}`
+        : "";
+    const next = typeof record.nextAt === "number" ? record.nextAt : null;
+    if (next !== null && next > now) {
+      const at = utcMinute(next);
+      return at === null ? STATUS_UNREADABLE : `next wake ${at}  auth failures ${failures}${outcome}`;
+    }
+    const last = utcMinute(record.lastRunAt);
+    if (last === null) return STATUS_UNREADABLE;
+    return `idle since ${last}  auth failures ${failures}${outcome}`;
+  } catch {
+    return STATUS_UNREADABLE;
+  }
+}
+
+/**
+ * The status line's words for each person who holds an autonomy grant, keyed by
+ * user segment. Nobody with an autonomy grant: no read of any kind. Otherwise
+ * one listing of the status prefix, then one read per person with a record, in
+ * order, one at a time. A listing that fails marks every person's status
+ * unreadable and never throws (28-REVIEW IN-05).
+ *
+ * @param {import("./grants-core.d.mts").GrantStore} kv
+ * @param {readonly import("./grants-core.d.mts").GrantGroup[]} groups
+ * @param {number} now
+ * @returns {Promise<Map<string, string>>}
+ */
+export async function readAutonomyStatuses(kv, groups, now) {
+  const statuses = new Map();
+  const people = groups
+    .filter((group) => group.grants.some((grant) => grant.autonomy === true))
+    .map((group) => group.userKey);
+  if (people.length === 0) return statuses;
+  // The status line is secondary. The grant listing above it is the owner's
+  // revocation tool, so a failed listing of the status records must never cost
+  // it (28-REVIEW IN-05): every person's line then says the status could not
+  // be read. The caught value is never read, for the adapter's reason: it
+  // could carry wrangler's stderr.
+  let recorded;
+  try {
+    recorded = new Set(await allKeysUnder(kv, AUTONOMY_STATUS_KEY_PREFIX));
+  } catch {
+    for (const userKey of people) statuses.set(userKey, STATUS_UNREADABLE);
+    return statuses;
+  }
+  for (const userKey of people) {
+    const key = `${AUTONOMY_STATUS_KEY_PREFIX}${userKey}`;
+    if (!STATUS_USER_ID.test(userKey) || !recorded.has(key)) {
+      statuses.set(userKey, NO_RUN_RECORDED);
+      continue;
+    }
+    let value;
+    try {
+      value = await kv.get(key);
+    } catch {
+      // The caught value is never read, for the reason the adapter's own read
+      // gives: it could carry wrangler's stderr.
+      statuses.set(userKey, STATUS_UNREADABLE);
+      continue;
+    }
+    // Listed, then gone or unreadable by the time it was read.
+    statuses.set(userKey, value === null ? STATUS_UNREADABLE : autonomyStatusText(value, now));
+  }
+  return statuses;
+}
+
 /**
  * The groups as text. It returns lines and prints nothing.
  *
@@ -1068,13 +1225,19 @@ async function pruneClients(kv, orphans, claimed, writeError) {
  * client name, the day it was made, the day it expires (`never` when it does
  * not), and whether its client record still exists.
  *
+ * With `statuses` (the listing passes it; the revoke preview does not), each
+ * autonomy grant row is followed by one line saying how that person's rules job
+ * stands. The grant row itself is unchanged.
+ *
  * Every field that came from the store goes through `printable` here, which is
- * the one place that happens.
+ * the one place that happens. The status words are built by
+ * `autonomyStatusText` from numbers and fixed words only.
  *
  * @param {readonly import("./grants-core.d.mts").GrantGroup[]} groups
+ * @param {ReadonlyMap<string, string>} [statuses]
  * @returns {string}
  */
-export function renderGrants(groups) {
+export function renderGrants(groups, statuses) {
   if (groups.length === 0) return `${NOTHING_FOUND}\n`;
 
   const lines = ["Grants in the REMOTE store, by person.", ""];
@@ -1097,6 +1260,9 @@ export function renderGrants(groups) {
           // ordinary connection, so only this word tells it apart.
           `${grant.autonomy === true ? "  autonomy" : ""}`,
       );
+      if (grant.autonomy === true && statuses?.has(group.userKey)) {
+        lines.push(`    rules job  ${printable(statuses.get(group.userKey), 80)}`);
+      }
     }
     lines.push("");
   }
@@ -1485,7 +1651,8 @@ export async function runGrants(argv, deps) {
   };
 
   if (asked.command === "list") {
-    write(renderGrants(groups));
+    const now = typeof deps.now === "function" ? deps.now() : Date.now();
+    write(renderGrants(groups, await readAutonomyStatuses(deps.kv, groups, now)));
     // The growth is stated rather than left silent. Nothing in this repository
     // deleted a client record before this command existed, so an owner who never
     // sees the count has no way to know the namespace is filling up.

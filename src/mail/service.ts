@@ -35,6 +35,7 @@ import { reportRefusal } from "../password-pause";
 import {
   ImapAuthError,
   ImapConnectError,
+  ImapCredentialRefusedError,
   ImapGoneError,
   ImapNotFoundError,
   ImapValidityChangedError,
@@ -424,7 +425,12 @@ async function withMailSessionCore<T>(
       // The need is RECORDED here and the store write happens after teardown
       // (WR-03). See the `finally` below for why.
       credentialRefused = auth.credentialRefused;
-      throw new ImapAuthError();
+      // A narrower distinction, carried to the answer (28-REVIEW CR-01, and
+      // 28-REVIEW-2 WR-01): only a refusal Apple NAMED with a response code
+      // raises the narrower class, so the rules job counts that and nothing
+      // else toward ending a key. A bare `NO` still pauses, above, and still
+      // raises the plain class. Every category stays as it was.
+      throw auth.credentialNamed ? new ImapCredentialRefusedError() : new ImapAuthError();
     }
 
     const postLogin = await sendCommand(channel, channel.nextTag(), "CAPABILITY");
@@ -2785,7 +2791,7 @@ export async function folderSnapshots(
 export const MAX_NEW_MAIL_ROWS = 25;
 
 /**
- * The row fetch's items: UID, flags, receipt time, and a peek of two header
+ * The row fetch's items: UID, flags, receipt time, and a peek of four header
  * fields. Nothing else.
  *
  * **A narrower row than `MessageSummary`, on purpose (CHNG-09).** The change
@@ -2794,9 +2800,38 @@ export const MAX_NEW_MAIL_ROWS = 25;
  * attachment flag. A snippet is the start of a body, and the change check does
  * not read bodies. The header item is the peeking form, so nothing is marked
  * read even on a server that ignored the read-only open.
+ *
+ * **The two list fields are asked for only to see whether they are there
+ * (Phase 28 D-31).** Mail sent through a mailing list carries a list id or an
+ * unsubscribe field. The row says whether either one came back, and that is
+ * all. Their values are never read into the row. This is how the autonomous
+ * job knows not to draft a reply to list mail.
  */
 const NEW_MAIL_ROW_ITEMS =
-  "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])";
+  "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM LIST-ID LIST-UNSUBSCRIBE)])";
+
+/**
+ * A header line that starts one of the two list fields. Only the name and its
+ * colon are matched. The value after the colon is never captured.
+ *
+ * Anchored at the start of a line, so a subject that mentions a list field
+ * does not count. A folded continuation line starts with a space or a tab, so
+ * it cannot match either. Space before the colon is allowed because the old
+ * header syntax permits it, and reading such a field as a list only means
+ * fewer automatic replies.
+ */
+const LIST_FIELD_LINE = /^(?:list-id|list-unsubscribe)[ \t]*:/i;
+
+/**
+ * Whether a fetched header block holds a list id or an unsubscribe field.
+ *
+ * Decoded only to find where lines start. Field names are plain ASCII, so a
+ * value in some other encoding cannot change the answer.
+ */
+function hasListField(header: Uint8Array): boolean {
+  const text = new TextDecoder().decode(header);
+  return text.split(/\r?\n/).some((line) => LIST_FIELD_LINE.test(line));
+}
 
 /**
  * One new message: who it is from and what it is about, and nothing more.
@@ -2814,6 +2849,15 @@ export interface NewMailRow {
   fromName: string | null;
   fromAddress: string | null;
   subject: string | null;
+  /**
+   * True when the message had a list id or an unsubscribe field, or both.
+   * Only whether one was there; the values are never kept.
+   *
+   * The sender decides whether these fields are present, so a sender can
+   * leave both off. False means neither came back, not that the message is
+   * surely personal mail.
+   */
+  mailingList: boolean;
 }
 
 /** The new mail in one folder's UID range. */
@@ -2891,6 +2935,7 @@ async function newMailIn(
       fromName: parsed?.fromName ?? null,
       fromAddress: parsed?.fromAddress ?? null,
       subject: parsed?.subject ?? null,
+      mailingList: header === null ? false : hasListField(header),
     });
   }
 

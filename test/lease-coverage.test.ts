@@ -226,6 +226,9 @@ async function argsOf(args: Args): Promise<Record<string, unknown>> {
   return typeof args === "function" ? args() : args;
 }
 
+/** A valid rule, for the rules tools' rows. */
+const LEASE_RULE = { when: { fromAddresses: ["lease@example.invalid"] }, then: { flag: true } };
+
 /**
  * Every tool that can open an iCloud mail connection. Each must take the lease
  * before any socket, so with the lease held it answers connection_busy.
@@ -258,7 +261,12 @@ const LEASED: ReadonlyArray<{ name: string; args: Args }> = [
   },
   { name: "mail_imap_diagnose", args: {} },
   { name: "changes_since", args: {} },
+  // Phase 28: the one rules tool that reads mail.
+  { name: "rules_test", args: { rule: LEASE_RULE } },
 ];
+
+/** Why a rules tool other than the test takes no lease. */
+const RULES_REASON = "reaches the person's own object only; opens no mail session (Phase 28, D-25)";
 
 /** Why a calendar or contacts tool takes no lease. */
 const DAV_REASON =
@@ -366,6 +374,14 @@ const NOT_LEASED: ReadonlyArray<{ name: string; reason: string; args: Args }> = 
     reason: DAV_REASON,
     args: { confirmToken: "not-a-confirmation", change: { op: "update", id: CONTACT_ID } },
   },
+  { name: "rules_list", reason: RULES_REASON, args: {} },
+  { name: "rules_add", reason: "a preview: it parses the rule and signs a confirmation; no mail", args: { rule: LEASE_RULE } },
+  {
+    name: "rules_commit",
+    reason: RULES_REASON,
+    args: { confirmToken: "not-a-confirmation", rule: LEASE_RULE },
+  },
+  { name: "rules_remove", reason: RULES_REASON, args: { ruleId: "no-such-rule" } },
 ];
 
 /** The fixed answer every leased tool gives while another request holds the lease. */

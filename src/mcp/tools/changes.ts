@@ -2,8 +2,9 @@
 //
 // One tool, `changes_since`. The caller hands back the marker an earlier call
 // gave it, and the answer says, per source, whether anything changed since
-// then: counts first, then who new mail is from and what it is about. Every
-// answer that reached iCloud carries a fresh marker to pass back next time.
+// then: counts first, then who new mail is from, what it is about, and whether
+// it came from a mailing list. Every answer that reached iCloud carries a
+// fresh marker to pass back next time.
 // Called with no marker, it answers with a starting point and a marker, and
 // says so in words that cannot be read as "nothing changed".
 //
@@ -156,7 +157,11 @@ export interface MailFolderAnswer {
    * marker's own time (WR-05).
    */
   since?: number;
-  /** New-mail rows, newest first. Stranger-authored: fenced, never trusted. */
+  /**
+   * New-mail rows, newest first. Stranger-authored: fenced, never trusted.
+   * That includes `mailingList`, because the sender decides whether the list
+   * fields are there. Only that boolean leaves; no list field value does.
+   */
   rows: NewMailRow[];
 }
 
@@ -846,8 +851,8 @@ export function registerChangesTool(
     {
       description:
         "What changed since a marker from an earlier call, in mail and on " +
-        "every calendar. Counts first, then new mail: sender and subject " +
-        "only, never a body. Events are counted as added or changed, and " +
+        "every calendar. Counts first, then new mail: sender, subject and " +
+        "whether it came from a mailing list, never a body. Events are counted as added or changed, and " +
         "removed. The inbox by default, or up to five folder ids. Call with " +
         "no marker for a starting point. Every answer returns a fresh " +
         "marker; pass it back exactly. Never marks mail read. " +

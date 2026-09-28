@@ -841,8 +841,11 @@ describe("every error class this repository exports is named in a dispatcher bra
     // LOUDLY, which is the opposite of one written in prose.
     expect(
       EXPORTED_ERROR_CLASSES.size,
-      "six Imap* classes, one Mail* class, ConnectionBusyError and ten Dav* classes ship today",
-    ).toBe(18);
+      "seven Imap* classes, one Mail* class, ConnectionBusyError and ten Dav* classes ship today",
+    ).toBe(19);
+    // 28-REVIEW CR-01: Apple refusing the saved password has its own auth
+    // subclass, so the rules job can count that and nothing else.
+    expect([...EXPORTED_ERROR_CLASSES.keys()]).toContain("ImapCredentialRefusedError");
     // 26-REVIEW WR-02: the open's validity gate has its own not-found subclass.
     expect([...EXPORTED_ERROR_CLASSES.keys()]).toContain("ImapValidityChangedError");
     // 26-REVIEW WR-03: a not-found that is certain has its own subclass.

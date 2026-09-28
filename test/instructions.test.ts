@@ -101,6 +101,11 @@ const EXPECTED_TOOLS: readonly string[] = [
   "mail_recall",
   "mail_stage_attachment",
   "mail_trash",
+  "rules_add",
+  "rules_commit",
+  "rules_list",
+  "rules_remove",
+  "rules_test",
 ];
 
 /** The sentence every failure below ends with. */
@@ -428,6 +433,16 @@ describe("the tool set is pinned against the instructions", () => {
  * account and not decided here.
  */
 const CAPABILITY_CLAIMS = [
+  // Phase 28. The one capability sentence about the rules tools. The
+  // Boundaries line about the job is the owner's, in plan 28-07.
+  {
+    claim: "rules run on their own, do only two things, and adding one is previewed",
+    clause:
+      "manage the user's own rules, which run on their own every 15 minutes with nobody present. " +
+      "With no rules nothing runs. A rule can only flag a message or place a draft reply to its sender, " +
+      "and adding one is previewed by `rules_add` and happens only through `rules_commit`.",
+    tools: ["rules_list", "rules_add", "rules_commit", "rules_remove", "rules_test"],
+  },
   {
     claim: "reminders are a whole list, and an empty one clears them",
     clause: "supplying an EMPTY list removes every one",
@@ -723,6 +738,14 @@ const TRIAGE_TOOL_SHAPE = /^mail_(flag|move|archive|trash|commit)$/;
  */
 const DRAFT_TOOL_SHAPE = /^mail_[a-z]+_draft$/;
 
+/**
+ * The rules surface, by name shape, on the same model (Phase 28).
+ *
+ * The five rules tools. A rules tool arriving with no sentence about it is
+ * caught here the moment it is registered.
+ */
+const RULES_TOOL_SHAPE = /^rules_[a-z]+$/;
+
 /** The parameter name the two reminder rows are a claim about. */
 const REMINDERS_PARAMETER = "alarms";
 
@@ -748,7 +771,7 @@ describe("every capability claim is pinned to the tools it is about", () => {
   it("has a claim per row, each named once", () => {
     // The count lives in an assertion and nowhere in the prose above, for the
     // reason the boundary table's own docstring records.
-    expect(CAPABILITY_CLAIMS.length).toBe(32);
+    expect(CAPABILITY_CLAIMS.length).toBe(33);
     expect(new Set(CAPABILITY_CLAIMS.map((row) => row.claim)).size).toBe(
       CAPABILITY_CLAIMS.length,
     );
@@ -907,6 +930,30 @@ describe("every capability claim is pinned to the tools it is about", () => {
     expect(
       drafts.filter((name) => !claimed.has(name)),
       "a draft tool is registered with no sentence about it in " +
+        "SERVER_INSTRUCTIONS. " +
+        ALSO_EDIT_THE_STRING,
+    ).toEqual([]);
+  });
+
+  it("leaves no rules tool without a claim", async () => {
+    const live = await liveToolParameters();
+    const claimed = new Set<string>(
+      CAPABILITY_CLAIMS.flatMap((row) => [...row.tools]),
+    );
+    const rules = [...live.keys()].filter((name) => RULES_TOOL_SHAPE.test(name)).sort();
+
+    // Non-vacuity, for the collection direction's reason. Five match today.
+    expect(
+      rules.length,
+      "no tool matches the rules name shape. Either the tools were renamed, in " +
+        "which case RULES_TOOL_SHAPE must follow them, or the surface this " +
+        "direction watches no longer exists and the rules sentence in " +
+        "SERVER_INSTRUCTIONS must go with it.",
+    ).toBeGreaterThan(0);
+
+    expect(
+      rules.filter((name) => !claimed.has(name)),
+      "a rules tool is registered with no sentence about it in " +
         "SERVER_INSTRUCTIONS. " +
         ALSO_EDIT_THE_STRING,
     ).toEqual([]);

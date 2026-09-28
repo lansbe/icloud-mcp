@@ -110,6 +110,8 @@ There is no tool that edits a draft. To revise one, write the new version first,
 
 \`changes_since\` says what changed since an earlier call: counts first, then new mail by sender and subject, and on every calendar how many events were added or changed and how many removed. Its marker is an opaque token; pass it back exactly as you received it. Checking never marks mail read.
 
+\`rules_list\`, \`rules_add\`, \`rules_commit\`, \`rules_remove\` and \`rules_test\` manage the user's own rules, which run on their own every 15 minutes with nobody present. With no rules nothing runs. A rule can only flag a message or place a draft reply to its sender, and adding one is previewed by \`rules_add\` and happens only through \`rules_commit\`.
+
 Two tools find mail, and their empty answers mean different things. \`mail_find\` is exhaustive in the one folder it searches, so an empty answer means no such mail is there. \`mail_recall\` finds recent mail by meaning. It is ranked and best-effort, so an empty answer means nothing scored high enough, never that no such mail exists. It returns message ids and subjects only; open results with \`mail_get_message\`.
 
 Calendar EVENTS can be created, updated and deleted, through the preview-and-commit shape above.

@@ -403,7 +403,13 @@ core. The read one is `withMailSession`, plus `withMailSessionOver` for an
 already-open stream. The mutating one is `withMutatingMailbox`, plus
 `withMutatingMailboxOver`. The core is not exported, and there is no raw escape
 hatch past either orchestrator. Both take the same request gate, so one request
-gets one session, whichever kind it is. A concurrent combinator wrapped around
+has at most one session open at a time, whichever kind it is. A request can hold
+several sessions one after another, never together: a mail tool's own, and then
+the sessions of the one recall build step that may follow it. The gate refuses a
+second session while the first is open, and allows one after the first has
+closed. Making the gate refuse every second session, open or not, would silently
+stop the recall build, because a step's refusals are silent. That is a decision,
+not a refactor. A concurrent combinator wrapped around
 any of them is rejected by the scan, exactly as one wrapped around the socket
 open is. The scan also refuses one wrapped around a triage verb, because a list
 of moves is worked through one message at a time, in one session.
@@ -433,8 +439,24 @@ cannot hold it forever.
 
 The lease is added to the gate. It does not replace it. Do not remove the per-request gate because
 the object serializes too: a bug in the object would then remove the only runtime check, and
-nothing would fail. The object holds a lease and nothing else. It never opens a socket and never
-imports mail code. Changing either of those is a decision, not a refactor.
+nothing would fail. The object holds a lease, its own stored name, the person's recall ledger,
+one sealed autonomy record, the person's rules with their activity and job state, and one alarm.
+The alarm's jobs run in a fixed order: autonomy first (does the key still stand?), then the rules
+job, then recall's revocation, then recall's expiry. One predicate, `anyJobPending()`, keeps the
+alarm, and one helper, `scheduleAlarm`, is the only code that sets or removes it. The alarm never
+uses the autonomy key: it reads the grant id and the arming time, and asks the sign-in store. A new
+job adds a clause to that predicate; a second condition or a second set is a decision, not a
+refactor. It never opens a socket and never imports mail code. Changing either of those is a
+decision, not a refactor.
+
+A mail tool call can be followed by one recall build step, in the same request. The step
+runs only after the tool's own session has closed and its answer is built, and only when
+that answer is not an error. It takes the person's lease itself, once, the same way a tool
+does. Under that lease it usually opens one session, and in two rare cases up to three, one
+after another. It never runs inside a tool's lease, and never after the answer has
+been sent. One seam in `src/mcp/server.ts` applies it, to the mail, recall and change
+registrars only. The IMAP diagnostic never runs one. Widening that set, or running a step
+anywhere else, is a decision, not a refactor.
 
 ### 4. Credentials never reach a log or an error
 
@@ -533,6 +555,56 @@ requirement the developer decided on 2026-09-21 and settled on 2026-09-23 rather
 than fixing a breach. A session reading the reversal alone would read it as
 permission to put an address into any response, and it is permission for exactly
 one answer to exactly one question.
+
+#### The autonomy key is a credential the server holds, and that is a decision
+
+Phase 27 makes autonomy inherent: part of every sign-in. When a person signs in, this server keeps a
+key that can sign in to their mail with nobody present. That looks like the thing this rule forbids.
+It is a decision the owner made on 2026-09-23, and made inherent on 2026-09-27. The argument is
+written down here so nobody has to work it out again.
+
+1. **What the key is.** It is the refresh token of a second sign-in, made only for autonomy. The
+   ordinary sign-in page makes it, from the Apple ID and app password the person just typed, after
+   Apple has accepted them. The server keeps the token in that person's own Durable Object. Before
+   this, only the person's own apps held a key like this. That is the weakening, and it is real.
+2. **Everyone who signs in has one.** There is no opt-in and no switch. The sign-in page says so,
+   above the fields, before the person signs in. A person who has not signed in since this shipped
+   has no key. They get one at their next sign-in, and never by any other path.
+3. **The cost, stated plainly.** Every signed-in person has a sealed key stored here. So a compromise
+   of this server reaches every signed-in account at once, not only the people who chose it. Someone
+   who can only read this server's storage still gets nothing, because the key is sealed. Someone who
+   can run code in this Worker can open every key. What the server does with a key on its own is
+   bounded to flag and draft by Phase 28. That bound holds for this server's own code. It does not
+   hold for an attacker's code, which could use a key for anything this server's tools can do. Before
+   this phase, the same attacker got each person only when that person next signed in or used the
+   server. The owner accepted this on 2026-09-27.
+4. **The password is stored nowhere new.** It sits inside the autonomy sign-in's locked props, like
+   every other sign-in's. No new code reads it. The door is still the one place props are read, and
+   the two places a principal is made are still the only two.
+5. **What opens it.** The token is sealed with a Worker secret before it is stored, and the seal is
+   tied to that person. Reading every store this server has opens nothing, because the secret is in
+   no store. What opens a key is the secret, the person's object and the sign-in store, together.
+   Only code running in this Worker can read a Worker secret.
+6. **How it starts.** Only at the sign-in page, after Apple has accepted the password and the
+   ordinary sign-in has succeeded. Never through a tool. One file in `src/` arms it, and the scan
+   counts that file: zero is a violation, and so is two. If arming fails, the sign-in still succeeds
+   and the person has no key.
+7. **How it ends.** It has no timer. It lives exactly as long as the person's ordinary connection.
+   When the person holds no ordinary sign-in any more, the object revokes the autonomy sign-in and
+   deletes its copy, within a day, and at its next use at the latest. The next sign-in makes a new
+   key and revokes the old. The owner's grants script ends it by revoking the person's grants, or the
+   autonomy grant alone; the object notices within a day, or at its next use, and deletes its copy
+   without retrying. Taking someone off the allow list stops every use before the key is read, but
+   does not delete it: a store error looks the same as a removal, and deleting on an error would end
+   everyone's key at once. A person can also stop it by deleting their app-specific password at Apple.
+   There is no switch on this server.
+8. **It never reaches a log, an error or a response.** Its names are in the logging scan that covers
+   `test/` and `scripts/` as well as `src/`. No method on the object hands the token or a bearer back
+   out.
+9. **Widening it is a decision, not a refactor.** Each of these is one: a second way to arm it, a tool
+   that can arm it, minting one without an interactive sign-in, letting it outlive the person's
+   ordinary connection, storing the token unsealed, handing the token or a bearer out of the object, and letting the key call any tool
+   beyond the one check that it works. Phase 28 adds the rule set under its own decision.
 
 ### 5. Reading mail does not mark it read
 
@@ -724,6 +796,27 @@ plan, with no obvious cause and a tempting one-character "fix" to the pattern.
 Take neither that fix nor an exclusion: the answer is always at the source.
 
 **The recall index fails open, so there is one way to it.** A query to the vector index with no namespace searches everyone's vectors. So one module, `src/recall/index.ts`, may name the index binding. Its read and write paths take the signed-in principal and nothing else. It sets the namespace and a metadata filter from `principal.userId`, and it drops any match that belongs to someone else. The store's two by-id read verbs skip the namespace and are banned under `src/`. Its keep-first write verb is banned in `src/recall/`. Describe all three by role in source comments, never by name. The per-person list of vector ids lives in that person's Durable Object. It is written before a vector is stored and cleared after a vector is deleted, so it always holds every id the index holds. Recall is inherent: every signed-in person's recent mail is indexed, with no switch. Their vectors are destroyed within a day of their access ending. The object checks that on its own alarm, asking about the name it stored for itself, so no caller can choose whose index is destroyed or kept. Changing any of this is a change to the safety boundary, not a refactor.
+
+Recall has one driver and one model. Exactly one call of the recall build step exists under
+`src/`, in `src/recall/drive.ts`, so neither the object's alarm nor the autonomy key can
+start building an index without a decision. Exactly one model id exists under `src/`, in
+`src/recall/embed.ts`, so no model can join the retrieval loop without a decision. The
+exhaustive search's old name is refused anywhere under `src/`, comments included, so an
+alias cannot come back. Describe the old name and any other model by role in comments,
+never by name. Changing any of this is a decision, not a refactor.
+
+**Phase 27 added four checks and six names for the autonomy key.** The key's
+names joined the unscoped logging rule, so they are refused in `src/`,
+`scripts/` and `test/`. The arm call is a count with one owner, the sign-in
+handler; zero is a violation too. The object's imports are walked to the
+bottom at commit time, not only in a test: nothing the object loads at run
+time may reach mail, DAV, tool, staging or feed code, the login handler, the
+OAuth wiring module or the socket module. Type-only imports the compiler
+erases are not followed, the same as the Phase 26 closure test. The library's
+helper that decrypts a token's props is banned by name under `src/`, comments
+included, so **describe it by role** ("the library's token-unwrapping helper")
+in any `src/` comment, exactly as §2 and the Phase 17 paragraph say for the
+other banned names. Both Worker configs must bind `SELF` to their own name.
 
 Changing any of these five is a change to the project's safety boundary, not a
 refactor. If one of them is genuinely in the way, say so and get a decision —

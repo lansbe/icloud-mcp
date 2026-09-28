@@ -41,7 +41,11 @@ import {
   unseal,
   withAutonomySession,
 } from "../src/agent/autonomy";
-import { AUTONOMY_CLIENT_ID, AUTONOMY_CLIENT_NAME } from "../src/agent/autonomy-client";
+import {
+  AUTONOMY_CLIENT_ID,
+  AUTONOMY_CLIENT_NAME,
+  AUTONOMY_TOOLS,
+} from "../src/agent/autonomy-client";
 import type { UserAgent } from "../src/agent/user-agent";
 import { ALLOW_LIST_KEY } from "../src/auth/allow-list";
 import { autonomyConfigured, createLoginHandler, signInNotices } from "../src/auth/login-handler";
@@ -711,7 +715,22 @@ describe("autonomy credential: no expiry, seal, order, not configured (AUTO-02, 
     expect(fetcher.paths).toEqual([]);
   });
 
-  it("refuses every tool but the one the key may call, with no request, and stops once the session ends", async () => {
+  it("refuses every tool outside AUTONOMY_TOOLS, with no request, and stops once the session ends", async () => {
+    // Phase 28 widened the list to four names (28-01, D-09). The allowed names
+    // are read from the list itself, so this case cannot pass by naming a tool
+    // the key may call, and it fails if `call` stops checking the list.
+    const allowed: readonly string[] = AUTONOMY_TOOLS;
+    expect(allowed).toContain("account_whoami");
+    const outside = [
+      "mail_move",
+      "mail_compose_new",
+      "mail_find",
+      "mail_list_messages",
+      "calendar_commit",
+      "ACCOUNT_WHOAMI",
+      "",
+    ];
+    for (const tool of outside) expect(allowed).not.toContain(tool);
     const armed = await signInArmed(LISTED_APPLE_ID, "autonomy tool list");
     try {
       const fetcher = recordingFetch();
@@ -724,7 +743,7 @@ describe("autonomy credential: no expiry, seal, order, not configured (AUTO-02, 
             async (call) => {
               kept = call;
               const refused: unknown[] = [];
-              for (const tool of ["mail_find", "mail_list_messages", "calendar_commit", "ACCOUNT_WHOAMI", ""]) {
+              for (const tool of outside) {
                 refused.push(await call(tool, {}));
               }
               return refused;
@@ -736,7 +755,7 @@ describe("autonomy credential: no expiry, seal, order, not configured (AUTO-02, 
       );
       expect(outcome.session.kind).toBe("ok");
       const refused = (outcome.session as { value: unknown[] }).value;
-      expect(refused).toHaveLength(5);
+      expect(refused).toHaveLength(outside.length);
       for (const answer of refused) expect(answer).toEqual({ kind: "failed" });
       expect(outcome.late).toEqual({ kind: "failed" });
       // The refresh and the bearer revoked (IN-04), and no tool call at all.

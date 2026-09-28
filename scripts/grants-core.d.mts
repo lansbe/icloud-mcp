@@ -126,6 +126,8 @@ export interface GrantDeps {
   writeError?(text: string): void;
   /** Only `autonomy-setup` reads this. */
   readonly autonomy?: AutonomySetupDeps;
+  /** The clock `list` reads the rules job's next wake against. Defaults to `Date.now`. */
+  now?(): number;
 }
 
 /** The library helpers `installAutonomyClientRecord` calls. */
@@ -243,7 +245,22 @@ export declare function orphanClientIds(
 ): string[];
 
 /** The groups as text. Returns lines; prints nothing. */
-export declare function renderGrants(groups: readonly GrantGroup[]): string;
+export declare function renderGrants(
+  groups: readonly GrantGroup[],
+  statuses?: ReadonlyMap<string, string>,
+): string;
+/** What the rules job line says for a person with no status record. */
+export declare const NO_RUN_RECORDED: string;
+/** What it says for a record that is there but cannot be read. */
+export declare const STATUS_UNREADABLE: string;
+/** One status record as the words printed after "rules job". Pure. */
+export declare function autonomyStatusText(value: unknown, now: number): string;
+/** The status line's words for each person holding an autonomy grant. */
+export declare function readAutonomyStatuses(
+  kv: GrantStore,
+  groups: readonly GrantGroup[],
+  now: number,
+): Promise<Map<string, string>>;
 
 /**
  * The whole closing report of a `prune-clients --yes` run.

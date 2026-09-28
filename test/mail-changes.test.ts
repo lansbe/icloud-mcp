@@ -61,7 +61,7 @@ const ENCODER = new TextEncoder();
 const MAILBOX = "INBOX";
 const UIDVALIDITY = 3857529045;
 const ROW_FETCH_ITEMS =
-  "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])";
+  "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM LIST-ID LIST-UNSUBSCRIBE)])";
 
 // ---------------------------------------------------------------------------
 // The redactor, copied from test/read-path-wire.test.ts
@@ -129,6 +129,11 @@ interface HeaderRow {
   flags: string;
   subject: string;
   from: string;
+  /**
+   * The whole header block as served, when a case needs exact bytes. Absent,
+   * the block is the subject line and the from line.
+   */
+  header?: string;
 }
 
 /** One header-only FETCH reply per row, then the tagged completion. */
@@ -136,13 +141,13 @@ function headerFetchReply(tag: string, rows: readonly HeaderRow[]): Uint8Array {
   const parts: Uint8Array[] = [];
   rows.forEach((row, index) => {
     const header = ENCODER.encode(
-      `Subject: ${row.subject}\r\nFrom: ${row.from}\r\n\r\n`,
+      row.header ?? `Subject: ${row.subject}\r\nFrom: ${row.from}\r\n\r\n`,
     );
     parts.push(
       ENCODER.encode(
         `* ${index + 1} FETCH (UID ${row.uid} FLAGS (${row.flags}) ` +
           `INTERNALDATE "13-Aug-2026 09:14:02 -0700" ` +
-          `BODY[HEADER.FIELDS (SUBJECT FROM)] {${header.length}}\r\n`,
+          `BODY[HEADER.FIELDS (SUBJECT FROM LIST-ID LIST-UNSUBSCRIBE)] {${header.length}}\r\n`,
       ),
       header,
       ENCODER.encode(")\r\n"),
@@ -191,7 +196,7 @@ describe("newMailOver records exactly the header-only reads (CHNG-09)", () => {
       "a3 CAPABILITY",
       'a4 EXAMINE "INBOX"',
       "a5 UID SEARCH UID 4392:4394",
-      "a6 UID FETCH 4394,4393,4392 (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])",
+      "a6 UID FETCH 4394,4393,4392 (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM LIST-ID LIST-UNSUBSCRIBE)])",
       "a7 LOGOUT",
     ]);
     expect(found.count).toBe(3);
@@ -290,7 +295,7 @@ describe("newMailOver records exactly the header-only reads (CHNG-09)", () => {
     expect(found.rows.map((one) => one.uid)).toEqual([4393]);
   });
 
-  it("a row carries exactly id, uid, unread, receivedAt, sender and subject", async () => {
+  it("a row carries exactly id, uid, unread, receivedAt, sender, subject and mailingList", async () => {
     const duplex = createFakeDuplex([
       ...authPrefix(),
       examineReply("a4"),
@@ -311,7 +316,16 @@ describe("newMailOver records exactly the header-only reads (CHNG-09)", () => {
 
     const [only] = found.rows;
     expect(Object.keys(only!).sort()).toEqual(
-      ["fromAddress", "fromName", "id", "receivedAt", "subject", "uid", "unread"],
+      [
+        "fromAddress",
+        "fromName",
+        "id",
+        "mailingList",
+        "receivedAt",
+        "subject",
+        "uid",
+        "unread",
+      ],
     );
     expect(only).toEqual({
       id: only!.id,
@@ -321,11 +335,166 @@ describe("newMailOver records exactly the header-only reads (CHNG-09)", () => {
       fromName: "Sender 4392",
       fromAddress: "sender4392@example.invalid",
       subject: "Message 4392",
+      mailingList: false,
     });
     expect(decodeMessageId(only!.id)).toEqual({
       mailbox: MAILBOX,
       uidValidity: UIDVALIDITY,
       uid: 4392,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Whether a new message came from a mailing list (Phase 28 D-31)
+//
+// The fetch asks for the two list header fields only so the row can say
+// whether either is there. Their values never reach the row.
+// ---------------------------------------------------------------------------
+
+/** One new message served with exactly `header`, read back as its one row. */
+async function onlyRowFor(header: string | null) {
+  const uid = 4392;
+  let fetchReply: Uint8Array;
+  if (header === null) {
+    // The server answered the fetch without the header item at all.
+    fetchReply = ENCODER.encode(
+      `* 1 FETCH (UID ${uid} FLAGS () ` +
+        `INTERNALDATE "13-Aug-2026 09:14:02 -0700")\r\n` +
+        `a6 OK UID FETCH completed\r\n`,
+    );
+  } else {
+    fetchReply = headerFetchReply("a6", [{ ...row(uid), header }]);
+  }
+  const duplex = createFakeDuplex([
+    ...authPrefix(),
+    examineReply("a4"),
+    searchReply("a5", [uid]),
+    fetchReply,
+    logoutExchange("a7"),
+  ]);
+  const found = await newMailOver(
+    duplex,
+    principal,
+    createSessionGate(),
+    MAILBOX,
+    UIDVALIDITY,
+    uid,
+    uid + 1,
+  );
+  expect(found.rows).toHaveLength(1);
+  return { only: found.rows[0]!, wire: wireOf(duplex) };
+}
+
+const PLAIN_SUBJECT = "Subject: Lunch on Friday\r\n";
+const PLAIN_FROM = 'From: "Dana Example" <dana@example.invalid>\r\n';
+
+describe("each new-mail row says whether it came from a mailing list (D-31)", () => {
+  it.each([
+    [
+      "a List-Id line: true",
+      `${PLAIN_SUBJECT}${PLAIN_FROM}List-Id: Weekly <weekly.example.invalid>\r\n\r\n`,
+      true,
+    ],
+    [
+      "only a List-Unsubscribe line: true",
+      `${PLAIN_SUBJECT}${PLAIN_FROM}List-Unsubscribe: <mailto:off@example.invalid>\r\n\r\n`,
+      true,
+    ],
+    [
+      "both lines: true",
+      `${PLAIN_SUBJECT}${PLAIN_FROM}List-Id: <a.example.invalid>\r\n` +
+        `List-Unsubscribe: <https://example.invalid/off>\r\n\r\n`,
+      true,
+    ],
+    ["neither line: false", `${PLAIN_SUBJECT}${PLAIN_FROM}\r\n`, false],
+    [
+      "a lower-case field name: true",
+      `${PLAIN_SUBJECT}${PLAIN_FROM}list-id: <a.example.invalid>\r\n\r\n`,
+      true,
+    ],
+    [
+      "an upper-case field name: true",
+      `${PLAIN_SUBJECT}${PLAIN_FROM}LIST-UNSUBSCRIBE: <mailto:off@example.invalid>\r\n\r\n`,
+      true,
+    ],
+    [
+      "a list line first in the block: true",
+      `List-Id: <a.example.invalid>\r\n${PLAIN_SUBJECT}${PLAIN_FROM}\r\n`,
+      true,
+    ],
+    [
+      "a subject whose text holds the field name: false",
+      `Subject: List-Id: x\r\n${PLAIN_FROM}\r\n`,
+      false,
+    ],
+    [
+      "a folded subject line that begins with a space and then the field name: false",
+      `Subject: Weekly notes\r\n List-Id: x\r\n${PLAIN_FROM}\r\n`,
+      false,
+    ],
+    [
+      "a folded subject line that begins with a tab and then the field name: false",
+      `Subject: Weekly notes\r\n\tList-Unsubscribe: <mailto:x@example.invalid>\r\n${PLAIN_FROM}\r\n`,
+      false,
+    ],
+    [
+      "a field whose name only starts with the list name: false",
+      `${PLAIN_SUBJECT}${PLAIN_FROM}List-Id-Extra: x\r\nList-Unsubscribe-Post: x\r\n\r\n`,
+      false,
+    ],
+  ])("%s", async (_label, header, expected) => {
+    const { only } = await onlyRowFor(header);
+    expect(only.mailingList).toBe(expected);
+  });
+
+  it("a row whose header block never arrived: false, and its sender is null as before", async () => {
+    const { only } = await onlyRowFor(null);
+    expect(only.mailingList).toBe(false);
+    expect(only.fromAddress).toBeNull();
+    expect(only.fromName).toBeNull();
+    expect(only.subject).toBeNull();
+  });
+
+  it("the recorded fetch asks for exactly the subject, the sender and the two list fields, peeking", async () => {
+    const { wire: lines } = await onlyRowFor(`${PLAIN_SUBJECT}${PLAIN_FROM}\r\n`);
+    const fetch = lines.find((line) => line.includes(" UID FETCH "));
+    expect(fetch).toBe(
+      "a6 UID FETCH 4392 (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM LIST-ID LIST-UNSUBSCRIBE)])",
+    );
+    expect(
+      fetch!.endsWith(
+        "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM LIST-ID LIST-UNSUBSCRIBE)])",
+      ),
+    ).toBe(true);
+  });
+
+  it("neither list value reaches any field of the row", async () => {
+    const idMarker = "listid-marker-7f3a91c2";
+    const unsubscribeMarker = "unsubscribe-marker-b04e6d58";
+    const { only } = await onlyRowFor(
+      `${PLAIN_SUBJECT}${PLAIN_FROM}List-Id: <${idMarker}.example.invalid>\r\n` +
+        `List-Unsubscribe: <mailto:${unsubscribeMarker}@example.invalid>\r\n\r\n`,
+    );
+    expect(only.mailingList).toBe(true);
+    const everything = JSON.stringify(only);
+    expect(everything).not.toContain(idMarker);
+    expect(everything).not.toContain(unsubscribeMarker);
+  });
+
+  it("every other field is what it was before, for the same served bytes", async () => {
+    const { only } = await onlyRowFor(
+      `${PLAIN_SUBJECT}${PLAIN_FROM}List-Id: <a.example.invalid>\r\n\r\n`,
+    );
+    expect(only).toEqual({
+      id: only.id,
+      uid: 4392,
+      unread: true,
+      receivedAt: "13-Aug-2026 09:14:02 -0700",
+      fromName: "Dana Example",
+      fromAddress: "dana@example.invalid",
+      subject: "Lunch on Friday",
+      mailingList: true,
     });
   });
 });

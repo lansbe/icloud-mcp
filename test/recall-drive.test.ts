@@ -381,6 +381,18 @@ const NOT_DRIVEN: ReadonlyArray<{ name: string; reason: string }> = [
   { name: "contacts_create", reason: NOT_MAIL },
   { name: "contacts_update", reason: NOT_MAIL },
   { name: "contacts_commit", reason: NOT_MAIL },
+  // Phase 28, decided by Claude (owner may revise): the rules tools manage the
+  // person's own rules in their own object. Four open no mail session at all.
+  // `rules_test` reads the newest 25 inbox headers once to try a rule, and a
+  // recall step after it would be a second iCloud session nobody asked for.
+  { name: "rules_list", reason: "not mail: it reads the person's own rules and the job's record only" },
+  { name: "rules_add", reason: "not mail: a preview that reads and writes nothing" },
+  { name: "rules_commit", reason: "not mail: it adds a rule to the person's own object" },
+  { name: "rules_remove", reason: "not mail: it removes a rule from the person's own object" },
+  {
+    name: "rules_test",
+    reason: "tries a rule on 25 inbox headers and writes nothing; a recall step would add a second session",
+  },
 ];
 
 function isDriven(callback: Callback): boolean {

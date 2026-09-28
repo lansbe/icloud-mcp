@@ -45,6 +45,7 @@ import type {
 import type { Env } from "../../env";
 import {
   ImapAuthError,
+  ImapCredentialRefusedError,
   ImapGoneError,
   ImapNotFoundError,
   MailConfirmationError,
@@ -173,6 +174,14 @@ export function mailErrorResult(
 ): ToolResult {
   const { category, message } = toErrorCategory(err);
   const authDetail = err instanceof ImapAuthError ? detail : null;
+  // One more fact, set only when Apple refused the saved password and named
+  // the refusal with a response code (28-REVIEW CR-01, 28-REVIEW-2 WR-01). The
+  // category is the same `auth_failed` either way, so nothing an interactive
+  // caller reads changes. The rules job reads this field and counts only these
+  // toward ending a key: a bare NO at the sign-in, a server fault there, the
+  // dead-password pause and a calendar refusal answer `auth_failed` without
+  // it. Dispatched on the error's type, like everything else here.
+  const refused = err instanceof ImapCredentialRefusedError ? { credentialRefused: true } : {};
 
   return {
     isError: true,
@@ -181,8 +190,8 @@ export function mailErrorResult(
         type: "text",
         text: JSON.stringify(
           authDetail === null
-            ? { category, message }
-            : { category, message, authFailureDetail: authDetail },
+            ? { category, message, ...refused }
+            : { category, message, authFailureDetail: authDetail, ...refused },
         ),
       },
     ],

@@ -25,6 +25,7 @@ import {
   LITERAL_SUFFIX,
   indicatesConnectionLimit,
   indicatesCredentialRefusal,
+  namesCredentialRefusal,
   isUntagged,
   literalPlaceholder,
   parseTaggedResponse,
@@ -809,6 +810,15 @@ export interface AuthOutcome {
    * user can act on.
    */
   credentialRefused: boolean;
+  /**
+   * Whether the refusal was NAMED as a refusal of the credential, with a
+   * response code the protocol specifies for it (28-REVIEW-2 WR-01). Narrower
+   * than `credentialRefused`: a bare `NO` sets that one and not this one. The
+   * pause reads `credentialRefused`; the rules job's count toward ending a key
+   * reads only this, through the narrower error class the session raises. See
+   * `namesCredentialRefusal` for why the two differ.
+   */
+  credentialNamed: boolean;
   /** Which mechanism the server accepted, or `null` if none did. */
   mechanism: AuthMechanism | null;
   /**
@@ -876,6 +886,7 @@ export async function authenticate(
     return {
       authenticated: true,
       credentialRefused: false,
+      credentialNamed: false,
       mechanism: "LOGIN",
       failureDetail: null,
     };
@@ -900,6 +911,7 @@ export async function authenticate(
       // The one attempt is the only reply there is, so it is the only one to
       // read. Same parsed source the classification above reads.
       credentialRefused: indicatesCredentialRefusal(login.tagged.text),
+      credentialNamed: namesCredentialRefusal(login.tagged.text),
       mechanism: null,
       failureDetail: `LOGIN: ${replyText(login)}`.slice(0, MAX_FAILURE_DETAIL),
     };
@@ -915,6 +927,7 @@ export async function authenticate(
     return {
       authenticated: true,
       credentialRefused: false,
+      credentialNamed: false,
       mechanism: "AUTHENTICATE PLAIN",
       failureDetail: null,
     };
@@ -945,6 +958,10 @@ export async function authenticate(
     credentialRefused:
       indicatesCredentialRefusal(login.tagged.text) ||
       indicatesCredentialRefusal(sasl.tagged.text),
+    // The same either-attempt rule, over the narrower question.
+    credentialNamed:
+      namesCredentialRefusal(login.tagged.text) ||
+      namesCredentialRefusal(sasl.tagged.text),
     mechanism: null,
     failureDetail: detail,
   };
