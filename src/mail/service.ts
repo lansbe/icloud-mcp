@@ -2846,22 +2846,7 @@ async function newMailIn(
   // row with no validity would mint an id no later call could gate.
   if (mailbox === null || uidValidity === null) throw new ImapNotFoundError();
 
-  const last = toUidExclusive - 1;
-  const result = await sendCommand(
-    session.channel,
-    session.channel.nextTag(),
-    `UID SEARCH UID ${fromUid}:${last}`,
-  );
-  if (result.status !== "OK") throw new ImapNotFoundError();
-
-  const found = new Set<number>();
-  for (const line of result.untagged) {
-    const identifiers = parseSearchLine(line);
-    if (identifiers === null) continue;
-    for (const uid of identifiers) {
-      if (uid >= fromUid && uid <= last) found.add(uid);
-    }
-  }
+  const found = await uidsInRange(session, fromUid, toUidExclusive);
 
   const page = [...found].sort((a, b) => b - a).slice(0, MAX_NEW_MAIL_ROWS);
   if (page.length === 0) return { count: 0, rows: [] };
@@ -2898,6 +2883,40 @@ async function newMailIn(
   }
 
   return { count: found.size, rows };
+}
+
+/**
+ * The UIDs still present in `[fromUid, toUidExclusive)`, inside an open
+ * session. The caller has checked the range is not empty.
+ *
+ * THE ONE BOUNDED RANGE SEARCH (Phase 23 D-18). The range is closed at both
+ * ends: the upper end is `toUidExclusive - 1`, never the open-ended form, which
+ * would always take in the newest message and anything that arrived after the
+ * status reply. Only UIDs inside the range are kept, because a server may
+ * answer a range with a UID outside it. An OK with no search line is none.
+ */
+async function uidsInRange(
+  session: MailSession,
+  fromUid: number,
+  toUidExclusive: number,
+): Promise<Set<number>> {
+  const last = toUidExclusive - 1;
+  const result = await sendCommand(
+    session.channel,
+    session.channel.nextTag(),
+    `UID SEARCH UID ${fromUid}:${last}`,
+  );
+  if (result.status !== "OK") throw new ImapNotFoundError();
+
+  const found = new Set<number>();
+  for (const line of result.untagged) {
+    const identifiers = parseSearchLine(line);
+    if (identifiers === null) continue;
+    for (const uid of identifiers) {
+      if (uid >= fromUid && uid <= last) found.add(uid);
+    }
+  }
+  return found;
 }
 
 /** New mail in one folder's range, over an already-open stream pair. */
@@ -3638,6 +3657,34 @@ async function fetchPage(
   // vanished identifier would be re-requested forever.
   const lastUid = page[page.length - 1]!;
 
+  const messages = await summaryRows(session, mailbox, uidValidity, page);
+
+  return {
+    messages,
+    hasMore,
+    nextCursor: hasMore
+      ? encodeCursor({ mailbox, uidValidity, lastUid })
+      : null,
+    unsupportedCharset: false,
+  };
+}
+
+/**
+ * The listing's rows for `page`, a list of UIDs already chosen and ordered by
+ * the caller, inside an open session.
+ *
+ * THE ONE ROW BUILDER. One batched metadata fetch of `PAGE_ITEMS`, then the
+ * preview fetches, then the assembly, all in the peeking form. The listing, the
+ * search, the unread listing and the recall new-mail read all build their rows
+ * here, so the fields and the fetch items cannot drift between them. Rows come
+ * back in `page`'s order; a UID the fetch did not answer for is left out.
+ */
+async function summaryRows(
+  session: MailSession,
+  mailbox: string,
+  uidValidity: number,
+  page: readonly number[],
+): Promise<MessageSummary[]> {
   const metadata = await sendCommand(
     session.channel,
     session.channel.nextTag(),
@@ -3696,15 +3743,7 @@ async function fetchPage(
       hasAttachments: row.hasAttachments,
     });
   }
-
-  return {
-    messages,
-    hasMore,
-    nextCursor: hasMore
-      ? encodeCursor({ mailbox, uidValidity, lastUid })
-      : null,
-    unsupportedCharset: false,
-  };
+  return messages;
 }
 
 /**
