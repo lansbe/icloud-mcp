@@ -1055,6 +1055,64 @@ describe("each seam made to fail, through the real alarm: it resolves, the other
   }
 });
 
+describe("when the person's access has ended, their rules go with it (28-REVIEW IN-07)", () => {
+  /** Every key of the rules job's own in the object: rules, activity, acted records, job state. */
+  function rulesJobKeys(stub: Stub): Promise<string[]> {
+    return runInDurableObject(stub, (_i, state) =>
+      [...state.storage.kv.list()]
+        .map(([key]) => key)
+        .filter((key) => key === RULES_KEY || key === ACTIVITY_KEY || key.startsWith("acted:") || key.startsWith("job:")),
+    );
+  }
+
+  /** Seed the object, let the job run once, and add one acted record. */
+  async function withJobState(): Promise<Awaited<ReturnType<typeof seededObject>>> {
+    const seeded = await seededObject();
+    await runInDurableObject(seeded.stub, (instance: UserAgent, state) => {
+      instance.autonomySelfFetch = async () => new Response(null, { status: 500 });
+      state.storage.kv.put("acted:r1:flag:0000", { state: "flagged", at: Date.now() });
+      state.storage.kv.put(JOB_MARKER_KEY, { marker: "m", at: Date.now() });
+    });
+    return seeded;
+  }
+
+  it("no grant of any kind remains: the rules, the activity, the acted records and the job's state are deleted", async () => {
+    const seeded = await withJobState();
+    try {
+      await runInDurableObject(seeded.stub, (instance: UserAgent) => {
+        instance.grantsRemain = async () => {
+          seeded.ran.grants += 1;
+          return "none";
+        };
+      });
+      await runAlarm(seeded.stub);
+      expect(seeded.ran.grants).toBe(1);
+      expect(await rulesJobKeys(seeded.stub)).toEqual([]);
+    } finally {
+      await seeded.cleanup();
+    }
+  });
+
+  for (const answer of ["some", "unknown"] as const) {
+    it(`grants ${answer === "some" ? "remain" : "cannot be listed"}: nothing of the rules job is deleted`, async () => {
+      const seeded = await withJobState();
+      try {
+        await runInDurableObject(seeded.stub, (instance: UserAgent) => {
+          instance.grantsRemain = async () => answer;
+        });
+        await runAlarm(seeded.stub);
+        const kept = await rulesJobKeys(seeded.stub);
+        expect(kept).toContain(RULES_KEY);
+        expect(kept).toContain(ACTIVITY_KEY);
+        expect(kept).toContain("acted:r1:flag:0000");
+        expect(kept).toContain(JOB_MARKER_KEY);
+      } finally {
+        await seeded.cleanup();
+      }
+    });
+  }
+});
+
 describe("the call through the key keeps a tool error's category (27 notes §4)", () => {
   it("an auth_failed tool answer through the real call arrives intact, with its category", async () => {
     const { armed, calls } = await armedWithRule();

@@ -100,7 +100,7 @@
 // job asks the one scheduling helper again, so the alarm goes when no job is
 // left (Phase 27's contract).
 
-import { appendActivity, type ActivityKind } from "./activity";
+import { ACTIVITY_KEY, appendActivity, type ActivityKind } from "./activity";
 import { placeDraft, setFlag } from "./actions";
 import { autonomyArmed, type AutonomySessionOutcome } from "./autonomy";
 import { JOB_CADENCE_MS, nextWakeAfter } from "./cadence";
@@ -251,6 +251,33 @@ export function readRules(storage: Pick<JobStorage, "get">): Rule[] {
     if (rule !== null) rules.push(rule);
   }
   return rules;
+}
+
+/** The start of every key the job keeps state under. */
+const JOB_STATE_PREFIX = "job:";
+
+/**
+ * Delete everything the rules job keeps for this person: the rules, the
+ * activity ring, every "already acted" record and every `job:` key (the stored
+ * marker copy, the next wake, the last run, the day's reply count, the failure
+ * count and the stopped state). Synchronous: the keys are collected first and
+ * removed after, with no await.
+ *
+ * Its one caller is the object's alarm, when the person holds no grant of any
+ * kind any more, the same definite answer that destroys their recall vectors
+ * (28-REVIEW IN-07). Their rules hold sender addresses and reply words, and
+ * nothing else would ever remove them. It is not called when only the
+ * autonomy key ends (the owner revoked that key, or iCloud refused the sign-in
+ * twice): the person still signs in, the next sign-in makes a new key, and
+ * their rules run again (D-16). It is not called on an unreadable listing or a
+ * config fault. Decided by Claude, owner may revise.
+ */
+export function forgetRulesJob(storage: JobStorage): void {
+  const keys: string[] = [RULES_KEY, ACTIVITY_KEY];
+  for (const prefix of [ACTED, JOB_STATE_PREFIX]) {
+    for (const [key] of storage.list<unknown>({ prefix })) keys.push(key);
+  }
+  for (const key of keys) storage.delete(key);
 }
 
 /** The stored marker, or null. */

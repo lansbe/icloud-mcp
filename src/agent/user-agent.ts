@@ -87,6 +87,7 @@ import {
   JOB_MARKER_KEY,
   JOB_NEXT_AT_KEY,
   RULES_KEY,
+  forgetRulesJob,
   readRules,
   runAutonomyJob,
 } from "./job";
@@ -753,9 +754,13 @@ export class UserAgent extends DurableObject<Env> {
         return;
       }
       // 2. Revocation: asked about the name this object stored for itself,
-      //    never the platform's. Only a definite "none" destroys.
+      //    never the platform's. Only a definite "none" destroys. The rules
+      //    job's state goes on the same answer, first and synchronously: the
+      //    rules hold sender addresses and reply words, and nothing else would
+      //    ever remove them (28-REVIEW IN-07).
       const name = this.storedOwnName();
       if (name !== null && (await this.grantsRemain(name)) === "none") {
+        forgetRulesJob(this.ctx.storage.kv);
         await this.destroyRecall();
         return;
       }
