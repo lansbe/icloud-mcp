@@ -382,7 +382,10 @@ async function testRule(
       messageId: row.id,
       from: source.fromAddress,
       subject: source.subject,
-      replyTo: recipient?.kind === "reply" ? recipient.to : null,
+      // Named for what it is, and never after the redirect header this phase
+      // refuses to read, so a model reading the answer cannot tell the user
+      // that replies go there (28-REVIEW IN-01).
+      recipient: recipient?.kind === "reply" ? recipient.to : null,
     });
   }
 

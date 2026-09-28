@@ -1035,7 +1035,7 @@ describe("rules_test tries a rule on recent mail and writes nothing", () => {
       { messageId: idOf(4830), wouldFlag: true, wouldDraft: true, draftSkip: null },
     ]);
     expect(parsed.untrusted?.results).toEqual([
-      { messageId: idOf(4830), from: "hr@example.com", subject: "Your interview", replyTo: "hr@example.com" },
+      { messageId: idOf(4830), from: "hr@example.com", subject: "Your interview", recipient: "hr@example.com" },
     ]);
     // Senders and subjects are fenced, never trusted.
     expect(result.content[0]!.text).not.toContain("@");
@@ -1055,7 +1055,10 @@ describe("rules_test tries a rule on recent mail and writes nothing", () => {
       { messageId: idOf(4827), wouldFlag: false, wouldDraft: true, draftSkip: "no-address" },
     ]);
     const fenced = parsed.untrusted?.results as Array<Record<string, unknown>>;
-    expect(fenced.map((row) => row.replyTo)).toEqual(["hr@example.com", "attacker@evil.example", null, null]);
+    expect(fenced.map((row) => row.recipient)).toEqual(["hr@example.com", "attacker@evil.example", null, null]);
+    // Named for what it is, never after the redirect header this phase refuses
+    // to read (28-REVIEW IN-01): a model must not tell the user replies go there.
+    for (const row of fenced) expect(Object.keys(row)).not.toContain("replyTo");
     expect(parsed.trusted?.sentences).toContain(NO_LIST_CHECK);
   });
 
@@ -1064,7 +1067,7 @@ describe("rules_test tries a rule on recent mail and writes nothing", () => {
     const result = await call(USER_A, "rules_test", { rule: INTERVIEW_RULE });
     const fenced = readToolResult(result).untrusted?.results as Array<Record<string, unknown>>;
 
-    expect(fenced.find((row) => row.messageId === idOf(4829))?.replyTo).toBe("attacker@evil.example");
+    expect(fenced.find((row) => row.messageId === idOf(4829))?.recipient).toBe("attacker@evil.example");
     expect(textOf(result)).not.toContain(LOOKALIKE_NAME);
   });
 

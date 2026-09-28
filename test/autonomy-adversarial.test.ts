@@ -1408,8 +1408,8 @@ describe("rules_test over the fixture mailbox reports level A's verdicts and wri
     expect(fenced.map((row) => row.messageId)).toEqual(expected.map((row) => row.messageId));
     for (const [index, row] of expected.entries()) {
       const one = HOSTILE_MAILBOX.find((m) => m.row.id === row.messageId) as HostileMessage;
-      const replyTo = row.wouldDraft && row.draftSkip === null ? one.row.fromAddress : null;
-      expect(fenced[index]?.replyTo, one.name).toBe(replyTo);
+      const recipient = row.wouldDraft && row.draftSkip === null ? one.row.fromAddress : null;
+      expect(fenced[index]?.recipient, one.name).toBe(recipient);
     }
 
     // Never a display name in any result, trusted or fenced. (The answer also
