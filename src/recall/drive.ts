@@ -32,9 +32,22 @@
 // belong to some other client. An unknown client (no header, a missing record,
 // a store error) runs no step either. Failing that way only delays the build.
 //
-// ONE SESSION PER STEP (D-27). A step opens at most one iCloud session, and
-// holds the lease for that session only. What the step does in that session is
-// `recallStep`'s business, in ./sync.ts.
+// ONE LEASE PER STEP, AND ALMOST ALWAYS ONE SESSION (D-27). A step takes the
+// person's lease at most once, and holds it only for the reads under it. What
+// the step does there is `recallStep`'s business, in ./sync.ts. Almost every
+// step opens at most one iCloud session. A build page can open up to three,
+// one after another under that one lease, in two rare cases in the page source
+// (./mail-source.ts):
+//   - the build cursor's mailbox changed its validity, so the page is read
+//     again from the top: a second session;
+//   - a page came back with no rows and no cursor to take the validity from,
+//     for example an empty archive folder's first page, so the validity is
+//     read on its own: one more session.
+// The sessions never overlap: the request's session gate refuses a second one
+// while the first is open. So no two connections to iCloud are ever open at
+// once for a step. Getting to strictly one session in those two cases would
+// change the listing's answer shape, which is the owner's decision
+// (26-VERIFICATION, the one gap).
 //
 // NOTHING THE STEP DOES REACHES THE ANSWER. A step that is refused, finds the
 // lease busy, or fails, is silent. The caught value is never read, nothing here
@@ -42,7 +55,9 @@
 //
 // WHAT THE BACKFILL COSTS PER PERSON (D-31). Recall is inherent, so this runs
 // for everyone who signs in, and this is what each of them costs. One step per
-// successful mail call, and at most one iCloud session per step. Pages (build,
+// successful mail call. A step takes the lease at most once, and almost always
+// opens at most one iCloud session; the two rare cases above open up to three,
+// one after another. Pages (build,
 // new mail, deletion sync) run at most one a minute and
 // `RECALL_MAX_PAGES_PER_DAY` (200) a day, and a person holds at most
 // `RECALL_MAX_VECTORS` (10,000) vectors. Both ceilings are Phase 25's, and this

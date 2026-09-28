@@ -20,9 +20,10 @@
 // page is passed over, and a build page is refused as `full` by the object
 // before any lease is taken.
 //
-// ONE SESSION PER STEP (D-27). Otherwise the step does exactly one of these,
-// each one IMAP session under the person's connection lease, and holds the
-// lease for that session only:
+// ONE LEASE PER STEP (D-27). Otherwise the step does exactly one of these,
+// each under the person's connection lease taken once, and holds the lease
+// only for that. Each is one IMAP session, except that a build page can take
+// up to three, one after another, in two rare cases (./drive.ts says which):
 //
 //   1. no folder list yet, or it is a day old, or a folder was just dropped as
 //      gone: list the folders and store INBOX plus the account's archive
