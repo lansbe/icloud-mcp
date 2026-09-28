@@ -1150,11 +1150,15 @@ export function refuseUnlistedRedirects(
 
     // THE AUTONOMY CLIENT'S NAME IS NOT FOR REGISTRANTS (Phase 27, D-23). The
     // owner's grant listing shows a grant's client name, and only the fixed
-    // autonomy id may carry this one. A registration naming itself the same,
-    // in any letter case and with any surrounding spaces, is refused.
+    // autonomy id may carry this one. A registration whose name reads the
+    // same is refused. Both sides go through `foldClientName` first (review
+    // IN-02), so doubled or unusual spaces, full-width letters, and invisible
+    // characters cannot make a name that looks identical but compares
+    // different. Look-alike letters from other scripts are NOT caught: that
+    // needs a confusables table, and the listing labels autonomy by id anyway.
     const posingAsAutonomy =
       typeof name === "string" &&
-      name.trim().toLowerCase() === AUTONOMY_CLIENT_NAME.toLowerCase();
+      foldClientName(name) === foldClientName(AUTONOMY_CLIENT_NAME);
 
     return allowed && namedSafely && boundedUris && boundedWhole && !posingAsAutonomy
       ? undefined
@@ -1164,6 +1168,32 @@ export function refuseUnlistedRedirects(
     // one to store, so it is answered exactly as every other refusal is.
     return { description: REGISTRATION_REFUSED_DESCRIPTION };
   }
+}
+
+/**
+ * A client name reduced to what a person reading it would see (review IN-02),
+ * for the autonomy-name refusal above and nothing else.
+ *
+ * In order: NFKC, which turns full-width and other compatibility letters and
+ * spaces into their plain forms; every format character removed (`\p{Cf}`:
+ * zero-width spaces and joiners, the soft hyphen, the byte-order mark); every
+ * run of white space collapsed to one space; the ends trimmed; letter case
+ * folded to lower case.
+ *
+ * WHAT IT DOES NOT CATCH. Look-alike letters from other scripts, such as a
+ * Cyrillic letter that looks like a Latin one. NFKC leaves those alone, and
+ * catching them needs a confusables table this project does not carry. It is a
+ * residual, not a hole: the owner's listing labels a grant as autonomy by its
+ * client id, never by its name, so a look-alike name fools only a person
+ * reading the consent page.
+ */
+function foldClientName(value: string): string {
+  return value
+    .normalize("NFKC")
+    .replace(/\p{Cf}/gu, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 }
 
 /**

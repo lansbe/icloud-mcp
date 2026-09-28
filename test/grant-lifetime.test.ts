@@ -758,6 +758,40 @@ describe("LIFE-02: a registration off the allowlist is refused at the door", () 
     expect(nameOf("a client")).toBeUndefined();
   });
 
+  it("refuses the autonomy client's name however it is spaced, width-shifted or padded with invisible characters (review IN-02)", () => {
+    // Each of these looks like the autonomy client's name on a consent page.
+    // The name is normalised before it is compared: NFKC, format characters
+    // removed, runs of white space collapsed, case folded.
+    const good = "https://claude.ai/api/mcp/auth_callback";
+    const nameOf = (client_name: unknown) =>
+      refuseUnlistedRedirects(
+        registrationOptions({
+          client_name,
+          redirect_uris: [good],
+          token_endpoint_auth_method: "none",
+        }),
+      );
+
+    for (const posing of [
+      "iCloud  MCP autonomy",
+      "iCloud MCP \t autonomy",
+      "iCloud MCP autonomy",
+      "iCloud MCP　autonomy",
+      "iCloud​ MCP autonomy",
+      "iCloud MCP‍ autonomy⁠",
+      "﻿iCloud MCP auto­nomy",
+      "ｉＣｌｏｕｄ ＭＣＰ autonomy",
+      "iCloud MCP autonomy",
+    ]) {
+      expect(nameOf(posing), JSON.stringify(posing)).toEqual(REGISTRATION_REFUSAL);
+    }
+
+    // Near names are still ordinary names after normalising.
+    expect(nameOf("iCloudMCP autonomy")).toBeUndefined();
+    expect(nameOf("iCloud MCP autonomy two")).toBeUndefined();
+    expect(nameOf("iCloud MCP autonomous")).toBeUndefined();
+  });
+
   it("refuses the autonomy client's name at the real registration endpoint, and stores nothing", async () => {
     const puts: string[] = [];
     const env = allowAllEnv({ OAUTH_KV: recordingKv(puts) });
