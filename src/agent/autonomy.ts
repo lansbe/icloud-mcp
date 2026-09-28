@@ -254,7 +254,16 @@ export function oneAtATime(): AutonomyQueue {
   };
 }
 
-/** What one tool call through the key answers. Never the bearer. */
+/**
+ * What one tool call through the key answers. Never the bearer.
+ *
+ * `ok` carries the tool's MCP result exactly as the door sent it. That includes
+ * a tool's error answer, with `isError` set and its category in the first text
+ * part (Phase 28, plan 28-03): a caller that treats `ok` as success must check
+ * `isError` first. `failed` is everything else: a name outside the list, a
+ * session that has ended, any HTTP failure (a 401 included), and a body with no
+ * readable answer. It carries nothing.
+ */
 export type AutonomyCallOutcome = { kind: "ok"; result: unknown } | { kind: "failed" };
 
 /** The one function a session hands its caller. */
@@ -898,11 +907,12 @@ async function sessionOnTicket<T>(
         if (!response.ok) return { kind: "failed" };
         const message = rpcMessageWithId(text, id);
         if (message === null || !("result" in message)) return { kind: "failed" };
-        const result = message.result;
-        if (typeof result === "object" && result !== null && (result as { isError?: unknown }).isError === true) {
-          return { kind: "failed" };
-        }
-        return { kind: "ok", result };
+        // A tool's error answer is handed back as it came, `isError` and all,
+        // so the caller can read its category (Phase 28, plan 28-03). The rules
+        // job must tell iCloud refusing the sign-in (`auth_failed`) apart from
+        // every other failure: only that one counts toward ending the key.
+        // Everything that is not a tool's own answer is still `failed`.
+        return { kind: "ok", result: message.result };
       } catch {
         return { kind: "failed" };
       }
@@ -934,6 +944,9 @@ async function sessionOnTicket<T>(
  */
 async function answersAs(result: unknown, name: string): Promise<boolean> {
   try {
+    // A tool's error answer now reaches here intact (plan 28-03). It is never
+    // a proof, whatever its text holds.
+    if ((result as { isError?: unknown }).isError === true) return false;
     const content = (result as { content?: unknown }).content;
     if (!Array.isArray(content)) return false;
     const text = (content[0] as { text?: unknown } | undefined)?.text;

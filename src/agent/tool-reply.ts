@@ -98,6 +98,18 @@ export function readFirstJson(result: unknown): Record<string, unknown> | null {
   return jsonObject(texts[0] as string);
 }
 
+/**
+ * Whether the result is a tool's error answer: `isError` is exactly true. Its
+ * category may still be unreadable; `readToolError` answers that.
+ */
+export function isErrorAnswer(result: unknown): boolean {
+  try {
+    return isPlainObject(result) && result.isError === true;
+  } catch {
+    return false;
+  }
+}
+
 /** The category of a tool error answer, or null when the result is not one. */
 export function readToolError(result: unknown): string | null {
   try {

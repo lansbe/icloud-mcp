@@ -805,6 +805,7 @@ async function runJobTwice(user: TestUser): Promise<void> {
           kind: "ok",
           value: await use(async (tool, args) => answer(tool, args)),
         }),
+        disarm: async () => {},
       };
       await runAutonomyJob(deps);
     });

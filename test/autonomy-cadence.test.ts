@@ -131,6 +131,9 @@ function directDeps(
       recorded.events.push("session");
       return { kind: "failed" };
     },
+    disarm: async () => {
+      recorded.events.push("disarm");
+    },
     ...over,
   };
   return { deps, recorded };

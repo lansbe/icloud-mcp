@@ -628,6 +628,7 @@ async function runOnce(
         return answer(tool, args);
       }),
     }),
+    disarm: async () => {},
   };
   return { outcome: await runAutonomyJob(deps), calls };
 }
@@ -671,27 +672,43 @@ describe("the sign-in check: once, and only in a run with a reply to place (D-30
     expect(calls.map((call) => call.tool)).toEqual(["changes_since", "mail_flag"]);
   });
 
-  const unreadable: Array<[string, () => CallAnswer]> = [
-    ["a failed call", () => ({ kind: "failed" })],
+  // An auth_failed answer is no longer unreadable: plan 28-03 counts it as the
+  // auth failure it is (D-16 as revised), and test/autonomy-failures.test.ts
+  // pins the count. The run still stops before any action.
+  const unreadable: Array<[string, () => CallAnswer, string]> = [
+    ["a failed call", () => ({ kind: "failed" }), "own_address_unreadable"],
     [
-      "an error answer",
+      "an auth error answer",
       () => ({
         kind: "ok",
         result: { isError: true, content: [{ type: "text", text: '{"category":"auth_failed","message":"x"}' }] },
       }),
+      "auth_failed",
     ],
-    ["an answer with no signedInAs", () => ({ kind: "ok", result: { content: [{ type: "text", text: "{}" }] } })],
+    [
+      "another error answer",
+      () => ({
+        kind: "ok",
+        result: { isError: true, content: [{ type: "text", text: '{"category":"connection_failed","message":"x"}' }] },
+      }),
+      "own_address_unreadable",
+    ],
+    [
+      "an answer with no signedInAs",
+      () => ({ kind: "ok", result: { content: [{ type: "text", text: "{}" }] } }),
+      "own_address_unreadable",
+    ],
   ];
-  for (const [name, whoami] of unreadable) {
-    it(`${name}: the run stops before any action, keeps the marker, and records one entry`, async () => {
+  for (const [name, whoami, expected] of unreadable) {
+    it(`${name}: the run stops before any action as ${expected}, keeps the marker, and records one entry`, async () => {
       const storage = armedStorage([rule("r1", { flag: true, draft: { text: RULE_TEXT } })]);
       const before = storage.get(JOB_MARKER_KEY);
       const { outcome, calls } = await runOnce(storage, { rows: [newRow(1)], whoami });
-      expect(outcome).toBe("own_address_unreadable");
+      expect(outcome).toBe(expected);
       expect(actions(calls)).toEqual([]);
       expect(storage.get(JOB_MARKER_KEY)).toEqual(before);
       expect(actedStates(storage)).toEqual([]);
-      expect(ring(storage)).toEqual([expect.objectContaining({ kind: "run", outcome: "own_address_unreadable" })]);
+      expect(ring(storage)).toEqual([expect.objectContaining({ kind: "run", outcome: expected })]);
     });
   }
 });

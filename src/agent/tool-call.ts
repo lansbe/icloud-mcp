@@ -26,8 +26,9 @@ export interface ToolCall {
 
 /**
  * What one call answers. The same shape as Phase 27's `call`: `ok` carries the
- * tool's MCP result (`content`, and `isError` when it is set), and `failed`
- * carries nothing, whatever went wrong.
+ * tool's MCP result (`content`, and `isError` when it is set, so a tool error's
+ * category can be read; plan 28-03), and `failed` carries nothing, whatever
+ * went wrong.
  */
 export type CallAnswer = { kind: "ok"; result: unknown } | { kind: "failed" };
 
@@ -72,6 +73,9 @@ export interface EnvelopeRow {
  * `skipped_own_address`, `skipped_mailing_list`, and `skipped_duplicate` (a
  * second reply to the same message in one run).
  * `skipped_cap`: past a per-run or per-day cap (plan 28-02), no call.
+ * `unknown`: a record an earlier run left `reserved`. Its call went out and
+ * what happened was never written down, so the job cannot say. It is never
+ * tried again (D-15, plan 28-03).
  */
 export type ActionOutcome =
   | "flagged"
@@ -87,7 +91,8 @@ export type ActionOutcome =
   | "skipped_own_address"
   | "skipped_mailing_list"
   | "skipped_duplicate"
-  | "skipped_cap";
+  | "skipped_cap"
+  | "unknown";
 
 /**
  * What one run came to. A closed list.
@@ -104,6 +109,11 @@ export type ActionOutcome =
  * The end: `started` (a starting point: the marker was stored and nothing was
  * acted on), `done` (every verdict handled and the fresh marker stored),
  * `stopped` (an action failed, so the run stopped and kept the old marker).
+ * Failures of any call (plan 28-03, D-16): `auth_failed` (iCloud refused the
+ * sign-in, or the dead-password pause answered for it; counted), `busy` (the
+ * person's own request held the connection), `tool_error` (any other tool
+ * error). Each stopped the run after that one call and kept the old marker.
+ * `off_auth`: the second auth failure in a row, which ended the key.
  * `failed`: something threw inside the job. It is caught and never read.
  */
 export type RunOutcome =
@@ -124,4 +134,8 @@ export type RunOutcome =
   | "started"
   | "done"
   | "stopped"
+  | "auth_failed"
+  | "busy"
+  | "tool_error"
+  | "off_auth"
   | "failed";

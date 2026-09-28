@@ -74,6 +74,7 @@ import {
   armWith,
   autonomyAlarmJob,
   autonomyArmed,
+  disarmWith,
   oneAtATime,
   withAutonomySession,
 } from "./autonomy";
@@ -706,10 +707,23 @@ export class UserAgent extends DurableObject<Env> {
     //     recall's early returns cannot skip it. The name is the stored one;
     //     with none, the job is skipped for this alarm. It opens at most one
     //     session, with this run's ticket.
+    //
+    //     The second auth failure in a row ends the key through Phase 27's
+    //     `disarmWith`, bound here over this object's own storage, stored name
+    //     and seam, and called by the job inside this same queue run, after its
+    //     session. It is never an RPC. The job then asks the scheduling helper
+    //     again, so the alarm goes when no job is left (plan 28-03).
     try {
       const ownName = this.storedOwnName();
       if (ownName !== null) {
         const storage = this.ctx.storage.kv;
+        const autonomyDeps = {
+          storage,
+          name: ownName,
+          env: this.env,
+          selfFetch: (request: Request) => this.autonomySelfFetch(request),
+          now: () => Date.now(),
+        };
         await this.autonomyQueue.run((ticket) =>
           runAutonomyJob({
             storage,
@@ -717,18 +731,8 @@ export class UserAgent extends DurableObject<Env> {
             now: () => Date.now(),
             isRetry: alarmInfo?.isRetry === true,
             requestWake: (wantedAt) => this.scheduleAlarm(wantedAt),
-            withSession: (use) =>
-              withAutonomySession(
-                {
-                  storage,
-                  name: ownName,
-                  env: this.env,
-                  selfFetch: (request) => this.autonomySelfFetch(request),
-                  now: () => Date.now(),
-                  ticket,
-                },
-                use,
-              ),
+            withSession: (use) => withAutonomySession({ ...autonomyDeps, ticket }, use),
+            disarm: () => disarmWith(autonomyDeps),
           }),
         );
       }

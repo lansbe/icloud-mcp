@@ -62,7 +62,32 @@
 // person's user id (`./cadence.ts`). Nothing here, and nothing a caller hands
 // in, can change either.
 //
-// Plan 28-03 adds the failure counter and the owner's status.
+// FAILURES (D-16 as revised, plan 28-03). Every call in a run goes through one
+// guard. The first answer that is not a tool's plain answer (a failed call, or
+// a tool error of any category) ends the run's calls: the guard refuses every
+// later one without sending it, so nothing is retried inside a run.
+//   - A tool error whose category is `auth_failed` means iCloud refused the
+//     sign-in, or the dead-password pause answered for it. It is the one
+//     failure that costs an Apple login (PITFALLS #43), and the only one
+//     counted, under `job:authFailures`. A change answer the job could read
+//     sets the count back to 0: the sign-in worked.
+//   - The second in a row ends the key through Phase 27's `disarmWith`, the one
+//     thing in the object that ends a key, called after the session and never
+//     as an RPC. The count goes back to 0 and `job:state` says `off_auth`. The
+//     rules and the activity stay. Nothing here arms: the person's next sign-in
+//     makes a new key, and the job starts again on its own.
+//   - Anything else (a busy lease, another tool error, a failed call, the
+//     markers-unavailable refusal, an answer the job cannot read) stops the run
+//     and keeps the marker. The count is left as it was. A failed call is never
+//     counted: Phase 27 folds every HTTP failure into it, a 401 included, and a
+//     config fault (an unusable seal key, `invalid_client`) or a refused second
+//     session answers `failed` too. Counting those would end every person's key
+//     at once for a fault that is not theirs.
+//   - A busy answer is never waited on: the run ends, and the next wake is the
+//     normal one.
+// After the key ends, and after a session that answered `off` or `revoked`, the
+// job asks the one scheduling helper again, so the alarm goes when no job is
+// left (Phase 27's contract).
 
 import { appendActivity, type ActivityKind } from "./activity";
 import { placeDraft, setFlag } from "./actions";
@@ -70,8 +95,8 @@ import { autonomyArmed, type AutonomySessionOutcome } from "./autonomy";
 import { JOB_CADENCE_MS, nextWakeAfter } from "./cadence";
 import { evaluate } from "./evaluate";
 import { type Rule, storedRuleOf } from "./rules";
-import type { ActionOutcome, CallFn, EnvelopeRow, RunOutcome } from "./tool-call";
-import { readChangesAnswer, readSignedInAs } from "./tool-reply";
+import type { ActionOutcome, CallAnswer, CallFn, EnvelopeRow, RunOutcome } from "./tool-call";
+import { isErrorAnswer, readChangesAnswer, readSignedInAs, readToolError } from "./tool-reply";
 
 /** The storage key of the person's rules. */
 export const RULES_KEY = "rules";
@@ -100,6 +125,18 @@ export const JOB_AUTH_FAILURES_KEY = "job:authFailures";
  * failure handling (plan 28-03) writes it; the rules view reads it.
  */
 export const JOB_STATE_KEY = "job:state";
+
+/** The job's stopped state after the key was ended for refused sign-ins. */
+export const JOB_OFF_AUTH = "off_auth";
+
+/**
+ * How many auth failures in a row end the key (D-16 as revised): two.
+ *
+ * Two, not one: a single refusal can be a blip on Apple's side, and the pause
+ * already stops the second from reaching Apple. Not more: each one that does
+ * reach Apple is a failed login against an unpublished lockout threshold.
+ */
+export const AUTH_FAILURES_TO_DISARM = 2;
 
 /** The start of every "already acted" record's key. */
 const ACTED = "acted:";
@@ -144,7 +181,10 @@ export interface JobStorage {
  * `name` is the object's own stored name, from `storedOwnName()`, never the
  * platform's id. `requestWake` is bound to the object's one scheduling helper.
  * `withSession` is bound to Phase 27's `withAutonomySession`, inside the
- * object's autonomy queue; tests replace it with a recording one.
+ * object's autonomy queue; tests replace it with a recording one. `disarm` is
+ * bound to Phase 27's `disarmWith`, over the same storage, name and seam, and
+ * is called only by the second-failure rule, inside the same queue run, after
+ * the session has settled.
  */
 export interface JobDeps {
   readonly storage: JobStorage;
@@ -155,6 +195,7 @@ export interface JobDeps {
   readonly withSession: <T>(
     use: (call: CallFn) => Promise<T>,
   ) => Promise<AutonomySessionOutcome<T>>;
+  readonly disarm: () => Promise<unknown>;
 }
 
 /** What the "already acted" record holds: its state and when it was written. */
@@ -215,6 +256,36 @@ const REPLY_SKIPS: readonly ActionOutcome[] = [
   "skipped_own_address",
   "skipped_mailing_list",
 ];
+
+/** The stored count of consecutive auth failures; 0 for anything else. */
+export function authFailuresOf(storage: Pick<JobStorage, "get">): number {
+  const value = storage.get<unknown>(JOB_AUTH_FAILURES_KEY);
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+/**
+ * Why a call's answer stopped the run, as a run outcome: a failed call, or a
+ * tool error by its category. Only for an answer that is one of those.
+ */
+function stopOfAnswer(answer: CallAnswer): RunOutcome {
+  if (answer.kind !== "ok") return "call_failed";
+  const category = readToolError(answer.result);
+  if (category === "auth_failed") return "auth_failed";
+  if (category === "connection_busy") return "busy";
+  return "tool_error";
+}
+
+/** Whether an answer is a failed call or a tool error: it stops the run. */
+function stops(answer: CallAnswer): boolean {
+  return answer.kind !== "ok" || isErrorAnswer(answer.result);
+}
+
+/** Why an action's outcome stopped the run, as a run outcome. */
+function stopOfAction(outcome: ActionOutcome): RunOutcome {
+  if (outcome === "auth_failed") return "auth_failed";
+  if (outcome === "busy") return "busy";
+  return "stopped";
+}
 
 /** The session's answer as a run outcome, when it did not reach `use`'s value. */
 function sessionOutcome(kind: "not_allowed" | "off" | "revoked" | "failed"): RunOutcome {
@@ -312,10 +383,28 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
     const sendable = previous !== null && now - previous.at <= JOB_MARKER_MAX_AGE_MS ? previous : null;
 
     // 3. One session; every call inside it, one after another.
-    const session = await deps.withSession(async (call): Promise<RunOutcome> => {
+    let authFailed = false;
+    const session = await deps.withSession(async (sessionCall): Promise<RunOutcome> => {
+      // The one guard every call goes through (D-16). After an answer that
+      // stops the run, it sends nothing more. An auth failure is counted here,
+      // once, at the moment it arrives.
+      let halted = false;
+      const call: CallFn = async (tool, args) => {
+        if (halted) return { kind: "failed" };
+        const answer = await sessionCall(tool, args);
+        if (stops(answer)) {
+          halted = true;
+          if (stopOfAnswer(answer) === "auth_failed") {
+            authFailed = true;
+            deps.storage.put(JOB_AUTH_FAILURES_KEY, authFailuresOf(deps.storage) + 1);
+          }
+        }
+        return answer;
+      };
+
       // 4. The change check. INBOX only: no folders argument (D-02).
       const answer = await call("changes_since", sendable === null ? {} : { marker: sendable.marker });
-      if (answer.kind !== "ok") return "call_failed";
+      if (answer.kind !== "ok" || isErrorAnswer(answer.result)) return stopOfAnswer(answer);
       const reading = readChangesAnswer(answer.result);
       if (reading.kind === "unreadable") return "unreadable";
       if (reading.kind === "markers-unavailable") return "markers_unavailable";
@@ -325,6 +414,11 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
         return "marker_refused";
       }
       if (reading.state === "not_checked" || reading.state === "gone") return "inbox_not_checked";
+      // The inbox was checked, so the sign-in worked. The count of refused
+      // sign-ins starts again, and a job stopped after refused sign-ins is
+      // running again (a new sign-in made a new key).
+      if (authFailuresOf(deps.storage) !== 0) deps.storage.put(JOB_AUTH_FAILURES_KEY, 0);
+      if (deps.storage.get<unknown>(JOB_STATE_KEY) !== undefined) deps.storage.delete(JOB_STATE_KEY);
       if (reading.state === "started" || reading.state === "restarted") {
         // A starting point: store the marker, act on nothing.
         deps.storage.put<StoredMarker>(JOB_MARKER_KEY, { marker: reading.marker, at: now });
@@ -352,6 +446,11 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
       let self = "";
       if (verdicts.some((v) => v.action === "draft" && deps.storage.get<unknown>(v.key) === undefined)) {
         const who = await call("account_whoami", {});
+        // An auth failure or a busy lease here is what it is anywhere else.
+        if (stops(who) && who.kind === "ok") {
+          const stop = stopOfAnswer(who);
+          if (stop === "auth_failed" || stop === "busy") return stop;
+        }
         const address = who.kind === "ok" ? readSignedInAs(who.result) : null;
         if (address === null) return "own_address_unreadable";
         self = address;
@@ -382,7 +481,7 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
           flagsThisRun += 1;
           const outcome = await setFlag(call, v.row);
           settle(v, outcome);
-          if (STOPS_THE_RUN.includes(outcome)) return "stopped";
+          if (STOPS_THE_RUN.includes(outcome)) return stopOfAction(outcome);
           continue;
         }
 
@@ -412,7 +511,7 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
           deps.storage.put(JOB_DRAFT_DAY_KEY, { day, count: draftsToday });
         }
         settle(v, outcome);
-        if (STOPS_THE_RUN.includes(outcome)) return "stopped";
+        if (STOPS_THE_RUN.includes(outcome)) return stopOfAction(outcome);
       }
 
       // 6. Only a run that reached the end stores the fresh marker.
@@ -420,7 +519,25 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
       return "done";
     });
 
-    const outcome: RunOutcome = session.kind === "ok" ? session.value : sessionOutcome(session.kind);
+    let outcome: RunOutcome = session.kind === "ok" ? session.value : sessionOutcome(session.kind);
+
+    // The second auth failure in a row ends the key (D-16 as revised). After
+    // the session, never inside it, and inside the same queue run, so no other
+    // autonomy operation is between the failure and the disarm. Only this
+    // run's own auth failure can trigger it: a stored count alone never does.
+    if (authFailed && authFailuresOf(deps.storage) >= AUTH_FAILURES_TO_DISARM) {
+      await deps.disarm();
+      deps.storage.put(JOB_AUTH_FAILURES_KEY, 0);
+      deps.storage.put(JOB_STATE_KEY, JOB_OFF_AUTH);
+      outcome = "off_auth";
+    }
+    // The key is gone (ended here, or found gone by the session): ask the one
+    // scheduling helper again, so the alarm goes when no job is left. It asks
+    // for the same time as before, never an earlier one.
+    if (outcome === "off_auth" || session.kind === "off" || session.kind === "revoked") {
+      await deps.requestWake(nextAt);
+    }
+
     record("run", null, null, outcome);
     deps.storage.put(JOB_LAST_RUN_KEY, { at: now, outcome });
     // 7. Bounded records: old "already acted" records go, a few hundred a run.
