@@ -174,6 +174,8 @@ export interface DirectRun {
   /** `call <tool>`, `put <key>`, `delete <key>`, `wake`, `disarm`, `session`, `status`, in order. */
   readonly events: string[];
   readonly disarms: number;
+  /** Every write to the owner's status store, in order. */
+  readonly statuses: { key: string; value: string; options: { expirationTtl: number } }[];
 }
 
 /** How one direct run behaves. Every field is optional. */
@@ -214,6 +216,7 @@ export async function directRun(storage: Memory, options: DirectOptions = {}): P
   const wakes: number[] = [];
   const events: string[] = [];
   let disarms = 0;
+  const statuses: DirectRun["statuses"] = [];
 
   const fallback = (tool: string, args: Record<string, unknown>): CallAnswer => {
     if (tool === "changes_since") {
@@ -253,6 +256,12 @@ export async function directRun(storage: Memory, options: DirectOptions = {}): P
       storage.delete(AUTONOMY_KEY);
       return { kind: "off" };
     },
+    statusStore: {
+      put: async (key: string, value: string, putOptions: { expirationTtl: number }) => {
+        events.push("status");
+        statuses.push({ key, value, options: putOptions });
+      },
+    },
     withSession: async (use) => {
       events.push("session");
       if (options.session !== undefined) return { kind: options.session };
@@ -268,7 +277,7 @@ export async function directRun(storage: Memory, options: DirectOptions = {}): P
     ...options.over,
   } as JobDeps;
   const outcome = await runAutonomyJob(deps);
-  return { outcome, calls, wakes, events, disarms };
+  return { outcome, calls, wakes, events, disarms, statuses };
 }
 
 /** The action calls only. */
