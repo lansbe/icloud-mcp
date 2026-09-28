@@ -10,7 +10,14 @@
 // logged, and the tests can see it.
 //
 // A change to `StepDeps` is made here, once, for every step test.
+//
+// Each scripted folder also has a LIVE side for keeping a built folder current
+// (plan 26-04): its validity, its messages and its mod-sequence as the status
+// check and the new-mail read see them. A test adds new mail, moves the
+// mod-sequence or changes the validity there. The page source's own messages
+// are the ones the first build reads, and do not change.
 
+import { ImapNotFoundError } from "../../src/errors";
 import { createLeasedMail } from "../../src/agent/lease";
 import type { FolderSnapshotOutcome } from "../../src/mail/service";
 import { createSessionGate } from "../../src/mail/service";
@@ -32,15 +39,32 @@ export interface FakeFolder {
   readonly messages: FakeMessage[];
 }
 
+/** One recorded new-mail read. */
+export interface NewMailCall {
+  readonly mailbox: string;
+  readonly uidValidity: number;
+  readonly fromUid: number;
+  readonly toUidExclusive: number;
+}
+
 /** The harness a step test drives. */
 export interface StepHarness {
   readonly deps: StepDeps;
   /**
    * Everything in call order: `lease` when the lease runner is called, `enter`
    * and `exit` around the leased work, and `<read>:start` / `<read>:end` for
-   * `folders`, `snapshot:<mailbox>`, `page:<mailbox>` and `uids:<mailbox>`.
+   * `folders`, `snapshot:<mailbox>`, `page:<mailbox>`, `uids:<mailbox>` and
+   * `newMail:<mailbox>`.
    */
   readonly log: string[];
+  /** Every new-mail read, with the range it was asked for. */
+  readonly newMailCalls: NewMailCall[];
+  /** New mail arrives in `mailbox`: the status check and the new-mail read see it. */
+  addMessages(mailbox: string, messages: FakeMessage[]): void;
+  /** The mod-sequence the status check reports for `mailbox`, as digits or null. */
+  setModseq(mailbox: string, modseq: string | null): void;
+  /** Change `mailbox`'s validity everywhere: the status check, the reads, the source. */
+  setValidity(mailbox: string, uidValidity: number): void;
   readonly sources: Record<string, FakeRecallSource>;
   readonly index: FakeVectorize;
   readonly ai: FakeAi;
@@ -57,8 +81,15 @@ function tick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-/** A status check that answered, from a scripted folder. */
-function answered(mailbox: string, folder: FakeFolder): FolderSnapshotOutcome {
+/** One folder as the status check and the new-mail read see it now. */
+interface LiveFolder {
+  uidValidity: number;
+  messages: FakeMessage[];
+  modseq: string | null;
+}
+
+/** A status check that answered, from a live folder. */
+function answered(mailbox: string, folder: LiveFolder): FolderSnapshotOutcome {
   const top = folder.messages.reduce((max, m) => Math.max(max, m.uid), 0);
   return {
     mailbox,
@@ -68,10 +99,13 @@ function answered(mailbox: string, folder: FakeFolder): FolderSnapshotOutcome {
       uidValidity: folder.uidValidity,
       uidNext: top + 1,
       messages: folder.messages.length,
-      highestModseq: "7",
+      highestModseq: folder.modseq,
     },
   };
 }
+
+/** The most rows one new-mail page carries, as the real read. */
+const NEW_MAIL_PAGE = 25;
 
 /** Build a harness over these scripted folders. */
 export function fakeStepDeps(options: {
@@ -83,13 +117,26 @@ export function fakeStepDeps(options: {
   const overrides = new Map<string, FolderSnapshotOutcome>();
   let clock: number | null = null;
 
+  const newMailCalls: NewMailCall[] = [];
+
   const sources: Record<string, FakeRecallSource> = {};
+  const live: Record<string, LiveFolder> = {};
   for (const [mailbox, folder] of Object.entries(options.mailboxes)) {
     sources[mailbox] = createFakeRecallSource({
       mailbox,
       uidValidity: folder.uidValidity,
       messages: folder.messages,
     });
+    live[mailbox] = {
+      uidValidity: folder.uidValidity,
+      messages: [...folder.messages],
+      modseq: "7",
+    };
+  }
+  function liveFor(mailbox: string): LiveFolder {
+    const folder = live[mailbox];
+    if (folder === undefined) throw new Error(`fake-step-deps: no scripted mailbox ${mailbox}`);
+    return folder;
   }
   function sourceFor(mailbox: string): FakeRecallSource {
     const source = sources[mailbox];
@@ -148,8 +195,33 @@ export function fakeStepDeps(options: {
         log.push(`snapshot:${mailbox}:end`);
         const override = overrides.get(mailbox);
         if (override !== undefined) return override;
-        const folder = options.mailboxes[mailbox];
+        const folder = live[mailbox];
         return folder === undefined ? { mailbox, answered: false } : answered(mailbox, folder);
+      },
+      async newMail(_gate, _principal, mailbox, uidValidity, fromUid, toUidExclusive) {
+        log.push(`newMail:${mailbox}:start`);
+        newMailCalls.push({ mailbox, uidValidity, fromUid, toUidExclusive });
+        await tick();
+        log.push(`newMail:${mailbox}:end`);
+        const folder = liveFor(mailbox);
+        // The real read opens with the stored validity as the expected one.
+        if (folder.uidValidity !== uidValidity) throw new ImapNotFoundError();
+        if (toUidExclusive <= fromUid) return { items: [], nextFrom: fromUid };
+        const inRange = folder.messages
+          .filter((m) => m.uid >= fromUid && m.uid < toUidExclusive)
+          .sort((x, y) => x.uid - y.uid);
+        const chosen = inRange.slice(0, NEW_MAIL_PAGE);
+        const nextFrom =
+          inRange.length > chosen.length ? chosen[chosen.length - 1]!.uid + 1 : toUidExclusive;
+        return {
+          items: chosen.map((m) => ({
+            ref: { mailbox, uidValidity, uid: m.uid },
+            text: m.text,
+            snippet: m.snippet,
+            messageDate: m.date,
+          })),
+          nextFrom,
+        };
       },
     },
     now: () => clock ?? Date.now(),
@@ -158,6 +230,17 @@ export function fakeStepDeps(options: {
   return {
     deps,
     log,
+    newMailCalls,
+    addMessages(mailbox, messages) {
+      liveFor(mailbox).messages.push(...messages);
+    },
+    setModseq(mailbox, modseq) {
+      liveFor(mailbox).modseq = modseq;
+    },
+    setValidity(mailbox, uidValidity) {
+      liveFor(mailbox).uidValidity = uidValidity;
+      sources[mailbox]?.setValidity(uidValidity);
+    },
     sources,
     index,
     ai,
