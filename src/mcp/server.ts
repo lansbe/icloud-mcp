@@ -21,6 +21,7 @@ import { registerDavDiagnoseTool } from "./tools/dav-diagnose";
 import { registerDiagnoseTool } from "./tools/diagnose";
 import { registerMailTools } from "./tools/mail";
 import { registerRecallTools } from "./tools/recall";
+import { registerRulesTools } from "./tools/rules";
 
 /**
  * Build the per-request server factory.
@@ -188,6 +189,12 @@ export function createServerFactory(
     // Phase 3's tool surface: one diagnostic, four calendar tools and two
     // contacts tools, alongside Phase 2's mail tools.
     registerContactsTools(server, davFetch, principal);
+    // The person's autonomy rules (Phase 28, D-10). On the plain server, not
+    // the driven one: four of the five tools open no mail session at all, and
+    // `rules_test` reads the newest inbox headers once to try a rule, where a
+    // recall step after it would be a second iCloud session nobody asked for.
+    // The leased mail, never the gate, so that one read takes the lease.
+    registerRulesTools(server, leasedMail, principal);
     for (const register of extraTools) register(server);
     return server;
   };

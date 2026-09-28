@@ -87,7 +87,7 @@ enforcement, and the module map — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ## Tools
 
-40 tools in five groups. Every tool description carries an untrusted-content
+45 tools in six groups. Every tool description carries an untrusted-content
 notice; event titles, message bodies, and contact fields are treated as data,
 never as instructions.
 
@@ -152,6 +152,21 @@ never as instructions.
 | Tool | What it does |
 |------|--------------|
 | `changes_since` | Say what changed since a marker from an earlier call: counts first, then new mail by sender and subject only, then each calendar's count of events added or changed and removed. Returns a fresh marker every time. Never marks mail read. |
+
+### Rules
+
+These are this server's own autonomy rules, not iCloud Mail's rules. A rule
+runs on its own every 15 minutes, with nobody present, and can only flag a
+matching message or place a draft reply to its sender. With no rules, nothing
+runs.
+
+| Tool | What it does |
+|------|--------------|
+| `rules_list` | List your rules, whether the rules job is running for you, and what it did recently. Reads no mail. |
+| `rules_add` | **Preview** adding a rule. Writes nothing; the preview's sentence names every condition and the action. Apply with `rules_commit`. |
+| `rules_commit` | Add the rule `rules_add` previewed, using its confirmation token. |
+| `rules_remove` | Remove one of your rules at once. |
+| `rules_test` | Try a rule on your newest 25 inbox messages and say what it would do. Writes nothing. |
 
 Full input parameters for each tool are in the tool descriptions themselves and
 in [ARCHITECTURE.md](ARCHITECTURE.md).
