@@ -3,10 +3,15 @@
 // on the vector index entry, a remote key on the AI object, and a vector index
 // block with no marker line beside it. Never deployed; read only by
 // test/forbidden-tokens.test.ts through scanWranglerConfig.
+//
+// The SELF binding below is CORRECT on purpose (Phase 27, D-22). It names this
+// file's own Worker, so the SELF check stays quiet and this sample fires only
+// the recall checks it exists for.
 {
   "name": "recall-config-sample",
   "vectorize": [
     { "binding": "RECALL_INDEX", "index_name": "sample", "remote": true }
   ],
-  "ai": { "binding": "AI", "remote": true }
+  "ai": { "binding": "AI", "remote": true },
+  "services": [{ "binding": "SELF", "service": "recall-config-sample" }]
 }

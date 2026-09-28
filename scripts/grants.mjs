@@ -6,6 +6,7 @@
 //   node scripts/grants.mjs revoke --address <a> [--yes]
 //   node scripts/grants.mjs revoke --legacy-owner [--yes]
 //   node scripts/grants.mjs prune-clients [--yes]
+//   node scripts/grants.mjs autonomy-setup [--replace] [--yes]
 //   node scripts/grants.mjs --help
 //
 // **It runs as YOU, through wrangler's own login, and there is no web endpoint
@@ -40,6 +41,29 @@
 // It never touches the allow list, which is step 1 of removing somebody and is a
 // separate decision.
 //
+// **What it can create (Phase 27, D-18).** One thing, and it also sets two
+// secrets. `autonomy-setup` creates the autonomy client, the one client record
+// this project ever writes, under its fixed id. Then it sets two Worker
+// secrets, `AUTONOMY_CLIENT_SECRET` and `AUTONOMY_SEAL_KEY`, both 32 random
+// bytes as base64url, made here with Node's own `randomBytes`. Each value goes
+// to `wrangler secret put` on STANDARD INPUT only. Neither is printed, written
+// to a file, or put on a command line, where the process list and the shell
+// history would keep it. It runs only after --yes, and without --yes it says
+// what it would do.
+//
+// Three consequences worth knowing before running it:
+//
+//   - `wrangler secret put` deploys a new version of the Worker. Each of the
+//     two puts does.
+//   - From the moment both secrets are set, every sign-in also arms that
+//     person's autonomy key. Autonomy is inherent: there is no switch, and no
+//     turn-off. The listing marks each person's key with `autonomy`, and a
+//     revoke by id or by address ends it along with everything else.
+//   - It refuses if the client already exists. `--replace` makes a new one, and
+//     that ends everyone's key until their next sign-in, because the old
+//     client's secret and the old seal key both stop working. Rotating the seal
+//     key by any other road has the same effect.
+//
 // **IT NEEDS NODE 22.18 OR LATER**, and the requirement is not cosmetic. Two
 // things below exist only from that version. `module.registerHooks` — the
 // synchronous resolve hook in step 1 — landed in 22.15, and unflagged TypeScript
@@ -65,6 +89,8 @@
 //   5. the call, and the exit status.
 
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
@@ -186,7 +212,10 @@ registerHooks({
 //    goes to the error stream, so it never mixes into anything captured here.
 // ---------------------------------------------------------------------------
 
-const { USAGE, createWranglerKv, runGrants } = await import("./grants-core.mjs");
+const { USAGE, createWranglerKv, createWranglerSecrets, runGrants } = await import(
+  "./grants-core.mjs"
+);
+const { getHostname } = await import("./hostname.mjs");
 const { ALLOW_LIST_KEY, parseAllowList } = await import(
   "../src/auth/allow-list"
 );
@@ -268,6 +297,50 @@ function run(args) {
   } catch {
     throw new Error(WRANGLER_FAILED);
   }
+}
+
+/**
+ * Run one wrangler command with `input` as its standard input.
+ *
+ * The ONE way a secret value leaves this process. It goes to the child's
+ * standard input and nowhere else: not into the argument list, which any user
+ * on the machine can read in the process list, and not into the terminal.
+ * wrangler reads a secret from standard input whenever that is not a terminal.
+ *
+ * Every output stream is captured and dropped, as `run` does, and a failure
+ * throws the same one fixed sentence, which carries neither the value nor
+ * anything wrangler said.
+ *
+ * @param {readonly string[]} args
+ * @param {string} input
+ * @returns {string}
+ */
+function runWithInput(args, input) {
+  try {
+    return execFileSync(WRANGLER, [...args], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      input,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch {
+    throw new Error(WRANGLER_FAILED);
+  }
+}
+
+/**
+ * The deployed hostname, for the autonomy client's one redirect URI.
+ *
+ * Read by the one reader, `getHostname()`. That falls back to the tracked
+ * template when the local config is missing, and the template's hostname is
+ * not this deployment's, so the setup refuses instead. The core turns the throw
+ * into one fixed sentence.
+ *
+ * @returns {string}
+ */
+function deployedHostname() {
+  if (!existsSync(CONFIG_PATH)) throw new Error("no local wrangler.jsonc");
+  return getHostname();
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +459,12 @@ try {
       knownAddresses,
       write: (text) => process.stdout.write(text),
       writeError: (text) => process.stderr.write(text),
+      // Read by `autonomy-setup` only. Nothing here runs for any other command.
+      autonomy: {
+        hostname: deployedHostname,
+        randomBytes: (length) => new Uint8Array(randomBytes(length)),
+        secrets: createWranglerSecrets(runWithInput),
+      },
     });
   }
 } catch {

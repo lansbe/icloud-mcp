@@ -159,11 +159,22 @@ export const FORBIDDEN = [
   // dot, in every rule that opens with these two words, so the five cannot
   // disagree with each other about it. The two new shapes only refuse more,
   // and each rule carries its own sample of both in the test file.
+  //
+  // Phase 27 (AUTO-07, D-21 as revised). SIX MORE NAMES, all for the autonomy
+  // key. Autonomy is inherent: the server holds, for every signed-in person, a
+  // token that signs in as them with nobody present. Its plaintext name, the
+  // bearer made from it, its sealed field, its wire name and the two secrets
+  // that guard it must never reach a log in any directory, so they join this
+  // rule, which has no scope, and never a scoped copy of it.
+  //
+  // The wire name is also everyday OAuth vocabulary. A script or a test that
+  // talks about token exchange may reach for it inside a log line. If this rule
+  // fires on a line that looks innocent, reword the line. Never reword the rule.
   {
     id: "secret-binding-in-log-call",
     pattern:
-      /\b(?:console|logger)\s*\??\.\s*[A-Za-z_$][\w$]*\s*\([^)]*\b(?:APPLE_APP_PASSWORD|APPLE_ID|AUTH_SECRET|appPassword|appleId)\b/g,
-    why: "A logging call whose arguments mention a secret binding name, or one of the two credential field names the grant's props carry. A log line naming either field leaks the Apple ID or the app-specific password. Credentials must never reach a log, an error, or a tool response. THREE OF THE FIVE NAMES ARE DEAD BINDINGS and they stay on purpose: phase 13 deleted the account bindings and the login gate's secret from the platform, so nothing supplies those three now, but the rule only refuses MORE by keeping them -- and what it catches is a future session re-introducing a binding under one of those exact names, which is the singular-owner assumption coming back. Do not tidy them out. The two live names are the grant-props fields, and they are why this rule still has work to do.",
+      /\b(?:console|logger)\s*\??\.\s*[A-Za-z_$][\w$]*\s*\([^)]*\b(?:APPLE_APP_PASSWORD|APPLE_ID|AUTH_SECRET|appPassword|appleId|autonomyRefreshToken|autonomyAccessToken|sealedRefreshToken|refresh_token|AUTONOMY_CLIENT_SECRET|AUTONOMY_SEAL_KEY)\b/g,
+    why: "A logging call whose arguments mention a secret binding name, one of the two credential field names the grant's props carry, or one of the six names the autonomy key travels under. A log line naming either props field leaks the Apple ID or the app-specific password. Credentials must never reach a log, an error, or a tool response. THREE OF THE ELEVEN NAMES ARE DEAD BINDINGS and they stay on purpose: phase 13 deleted the account bindings and the login gate's secret from the platform, so nothing supplies those three now, but the rule only refuses MORE by keeping them -- and what it catches is a future session re-introducing a binding under one of those exact names, which is the singular-owner assumption coming back. Do not tidy them out. THE SIX AUTONOMY NAMES (phase 27, AUTO-07): autonomy is inherent, so this server holds, for every signed-in person, a token that signs in to their mail with nobody present. Its plaintext name, the bearer made from it, its sealed field, its OAuth wire name, and the two Worker secrets that seal it and prove the client must never reach a log in src/, scripts/ or test/: a retained log line holding one of them is a working key to somebody's mail, or the means to open every key at once. The wire name is also ordinary OAuth vocabulary; if it fires on an innocent line, reword the line, never this rule.",
   },
   // Phase 9 (D-02). Widened together with the blanket src/ rule below, so the
   // two cannot drift: both listed the same six method names, and both now
@@ -1213,6 +1224,38 @@ export const FORBIDDEN = [
     pattern: /\bmail_search/g,
     why: "The old name of the exhaustive mail search, under src/, in code or in a comment. That tool was renamed so its name carries its promise: it searches every message in the folder, so an empty answer means none there, while the ranked recall tool only finds what scored high enough. The rename shipped with no alias (RCLL-09). An alias would leave two names answering the same way, and the model would keep drawing the old conclusion from the old name. Use the current name. In a comment, describe the old one by role. Bringing an alias back is a decision on the tool contract, not a refactor: get the decision, never loosen this rule.",
   },
+
+  // ------------------------------------------------------------ autonomy key
+  // Phase 27, D-21 (e) (AUTO-02). The OAuth library ships a helper that takes
+  // a token string and hands back that grant's props, decrypted. Those props
+  // hold the Apple ID and the app-specific password. The props-reader count
+  // above sees only the two reads it was written for: the request context's
+  // props and the auth-context reader. It cannot see this helper, so this helper
+  // would be a second props read nobody counts, reachable from any module that
+  // holds a token string. The per-person object holds one: the autonomy key.
+  //
+  // Nothing under `src/` names it today (measured 2026-09-28). Scoped to `src/`:
+  // a test may name it, to prove it is refused. Comments count, like the rule
+  // above, so src/ describes it by role ("the library's token-unwrapping
+  // helper").
+  //
+  // WIDER THAN A MEMBER CALL, ON PURPOSE. The plan asked for the member call.
+  // This rule refuses the name as a whole word, which covers the member call,
+  // a destructured copy called bare, and the helper passed around as a value.
+  // It only refuses more.
+  //
+  // WHAT IT DOES NOT SEE. A name assembled from fragments and indexed. That is
+  // a deliberate evasion, not a mistake.
+  //
+  // NOT ADDED, deliberately: a ban on the sign-in store's binding name under
+  // src/agent/. Phase 25's grant check names that binding there, through the
+  // library's grant listing, with no props (27-RESEARCH §9).
+  {
+    id: "token-unwrap-helper",
+    scope: "src/",
+    pattern: /\bunwrapToken\b/g,
+    why: "The OAuth library's token-unwrapping helper, named under src/. It takes a token string and returns that grant's props, decrypted, and those props hold the person's Apple ID and app-specific password. The door in src/mcp/api-handler.ts is the one place props are read, and the props-reader count holds that, but the count matches only the request context's props and the auth-context reader, so it cannot see this helper. Named here, it is a second props read, reachable from any module holding a token string -- the per-person object holds one, the autonomy key, for every signed-in person (AUTO-02). Take the principal the door built instead. If this fired on a comment, describe the helper by role. Do not narrow the pattern: a second props read is a decision on the credential boundary, not a refactor.",
+  },
 ];
 
 /**
@@ -2145,6 +2188,281 @@ export function collectRecallStepCalls(relativePath, contents) {
 }
 
 /**
+ * A call of the per-person object's arm method, permitted exactly once, in the
+ * sign-in handler (Phase 27, D-21 (b), AUTO-01).
+ *
+ * THE RULE. Exactly one member call of the arm method exists under `src/`, and
+ * it is in `src/auth/login-handler.ts`, in the function the sign-in POST hands
+ * to the request's background work after Apple has accepted the password and
+ * the ordinary sign-in has succeeded. The method's own definition in
+ * `src/agent/user-agent.ts` is not a call: nothing sits before its name but the
+ * word that marks it async, so the leading dot the pattern needs is absent.
+ *
+ * WHY A COUNT. Arming makes a key that signs in to a person's mail with nobody
+ * present, and autonomy is inherent, so it happens for everyone who signs in.
+ * It must happen only at the sign-in page, after the page showed the autonomy
+ * notice and after Apple accepted the password (AUTO-01, D-26, D-30). A second
+ * call site is a second way to make that key, possibly without an interactive
+ * sign-in at all -- a tool, an alarm, a refresh. A second call inside the
+ * handler counts the same. Zero is a violation too, and it is the quieter one:
+ * the sign-in's arming was deleted or moved, every person silently stops
+ * getting a key, and nothing fails on the way out.
+ *
+ * THE SHAPE. A dot, optional white space, the method's name, optional white
+ * space, an optional `?.` with optional white space after it, an opening
+ * parenthesis. So `agentFor(principal).armAutonomy(code)`, a call split over
+ * lines after the dot, and the optional-call form `stub.armAutonomy?.(code)`
+ * are all seen. The optional-call form was missed until review IN-01 of
+ * 2026-09-28; it is an ordinary spelling, not an evasion, so the pattern was
+ * widened for it. An optional chain on the receiver (`stub?.armAutonomy(`)
+ * already ends in the dot the pattern needs.
+ *
+ * COMMENTS. Matched with comment lines blanked, so a commented-out call cannot
+ * keep the missing arm quiet, and prose naming the method is not a call.
+ *
+ * WHAT IT DOES NOT SEE. A bracket access with the name as a string, the method
+ * pulled off a stub by destructuring and called bare, and `.call` or `.apply`
+ * on it. All three are deliberate evasions, not mistakes. A stub method reached
+ * through Workers RPC cannot be destructured usefully anyway, since the call
+ * must go through the stub.
+ *
+ * Collected from `src/` only. Tests call the method on a stub directly, and a
+ * test is not a code path. No `g` flag; the collector builds its own global
+ * copy per file.
+ */
+export const AUTONOMY_ARM_CALL = /\.\s*armAutonomy\s*(?:\?\.\s*)?\(/;
+
+/** The one file under `AUTONOMY_ARM_SCOPE` permitted to match
+ *  `AUTONOMY_ARM_CALL`, and only once. */
+export const AUTONOMY_ARM_OWNER = "src/auth/login-handler.ts";
+
+/** The tree `AUTONOMY_ARM_CALL` is collected from. */
+export const AUTONOMY_ARM_SCOPE = "src/";
+
+/**
+ * The arm calls one file contributes, as `scan()` collects them. EVERY match,
+ * with a fresh global copy per call: two calls in the owner are two calls.
+ * Comment lines blanked, positions unchanged. An empty list outside
+ * `AUTONOMY_ARM_SCOPE`.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectAutonomyArmCalls(relativePath, contents) {
+  if (!relativePath.startsWith(AUTONOMY_ARM_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  return [...code.matchAll(new RegExp(AUTONOMY_ARM_CALL, "g"))].map((match) => ({
+    file: relativePath,
+    ...positionOf(code, match.index),
+  }));
+}
+
+/**
+ * The per-person object's module, where the import-closure walk starts
+ * (Phase 27, D-21 (c), D-14).
+ */
+export const AGENT_OBJECT_MODULE = "src/agent/user-agent.ts";
+
+/** Directories the object's import closure must never reach. */
+export const AGENT_CLOSURE_FORBIDDEN_DIRS = Object.freeze([
+  "src/mail/",
+  "src/dav/",
+  "src/mcp/",
+  "src/staging/",
+  "src/feed/",
+]);
+
+/** Single files the object's import closure must never reach. The OAuth
+ *  wiring module is here because it reaches the handler and the mail tree. */
+export const AGENT_CLOSURE_FORBIDDEN_FILES = Object.freeze([
+  "src/auth/login-handler.ts",
+  "src/auth/oauth.ts",
+]);
+
+/** The socket module's specifier, refused as an import anywhere in the
+ *  closure. The same literal `SOCKET_IMPORT` matches. */
+const AGENT_CLOSURE_SOCKET_SPECIFIER = "cloudflare:sockets";
+
+/**
+ * Blank block and line comments with spaces, keeping every newline and every
+ * offset, so an import quoted in prose is not an edge and a reported position
+ * still points at the real line. The same two expressions the Phase 26 closure
+ * test uses, with the replacement made length-preserving.
+ */
+function withoutCommentsKeepingOffsets(text) {
+  const blank = (part) => part.replace(/[^\n]/g, " ");
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, blank)
+    .replace(/(^|[^:"'`])\/\/[^\n]*/g, (match, lead) => lead + blank(match.slice(lead.length)));
+}
+
+/**
+ * The specifiers one file loads at run time, with the offset of each.
+ *
+ * Every specifier in a static import, a side-effect import, a static re-export
+ * and a dynamic import. The two statement forms the compiler erases are
+ * skipped: `import type ... from` and `export type ... from`. An import whose
+ * braces hold only `type` members is NOT skipped: tsconfig sets
+ * `verbatimModuleSyntax`, and under it that statement is kept as a bare import
+ * and the module is loaded at run time. This is the Phase 26 closure test's
+ * rule exactly, so the two cannot disagree on what an edge is.
+ *
+ * WHY THE ERASED FORMS ARE SKIPPED. A type-only import loads nothing, and the
+ * real object already takes types from modules whose code must never run in
+ * it: following them would put the mail tree in the closure today, and the
+ * check could never pass. The cost is written down rather than hidden: a
+ * type-only import of a forbidden module is one edit from a value import. The
+ * edit that widens it is the one this check refuses.
+ *
+ * @param {string} contents
+ * @returns {Array<{specifier: string, index: number}>}
+ */
+function runtimeSpecifiersOf(contents) {
+  const code = withoutCommentsKeepingOffsets(contents);
+  const found = [];
+  const at = (match, specifier) => ({
+    specifier,
+    index: match.index + match[0].lastIndexOf(specifier),
+  });
+  for (const match of code.matchAll(
+    /\b(import|export)\s+(type\s+)?[\w$\s{},*]*?\bfrom\s*["']([^"']+)["']/g,
+  )) {
+    if (match[2] !== undefined) continue;
+    found.push(at(match, match[3]));
+  }
+  for (const match of code.matchAll(/\bimport\s*["']([^"']+)["']/g)) {
+    found.push(at(match, match[1]));
+  }
+  for (const match of code.matchAll(/\bimport\s*\(\s*["']([^"']+)["']\s*\)/g)) {
+    found.push(at(match, match[1]));
+  }
+  return found.sort((a, b) => a.index - b.index);
+}
+
+/**
+ * Where a relative specifier points, as repo-relative candidate paths: the
+ * resolved file when one exists in `sources`, otherwise every path it could
+ * have meant. The candidates are `<stem>.ts` and `<path>/index.ts`, as the
+ * Phase 26 closure test resolves them.
+ *
+ * @returns {{resolved: string | null, candidates: string[]}}
+ */
+function resolveRelativeSpecifier(fromFile, specifier, sources) {
+  const parts = fromFile.split("/").slice(0, -1);
+  for (const segment of specifier.split("/")) {
+    if (segment === "." || segment === "") continue;
+    if (segment === "..") parts.pop();
+    else parts.push(segment);
+  }
+  const base = parts.join("/");
+  const stem = base.replace(/\.(?:[cm]?js|ts)$/, "");
+  const candidates = [`${stem}.ts`, `${base}/index.ts`];
+  const resolved = candidates.find((candidate) => Object.hasOwn(sources, candidate)) ?? null;
+  return { resolved, candidates };
+}
+
+/** Whether a repo-relative path is one the object's closure must not reach. */
+function forbiddenInAgentClosure(path) {
+  return (
+    AGENT_CLOSURE_FORBIDDEN_DIRS.some((dir) => path.startsWith(dir)) ||
+    AGENT_CLOSURE_FORBIDDEN_FILES.includes(path)
+  );
+}
+
+/**
+ * The object's import closure check, as a pure function over a map of
+ * repo-relative path to file contents (Phase 27, D-21 (c), D-14).
+ *
+ * THE RULE. Walk every runtime import from `src/agent/user-agent.ts`, one hop
+ * after another. Refuse any file reached under `src/mail/`, `src/dav/`,
+ * `src/mcp/`, `src/staging/` or `src/feed/`, the login handler, the OAuth
+ * wiring module, and any import of the socket module.
+ *
+ * WHY. 24-03's rule on the object module refuses those trees as DIRECT
+ * imports. This refuses the same thing one or more hops away. The object
+ * reaches the allow-list reader through the autonomy module, and the OAuth
+ * library through `src/agent/autonomy-grants.ts`, on purpose (D-14, D-28), and
+ * nothing else may ride in behind them. It strengthens 24-03's rule; it does
+ * not replace it. The Phase 26 closure test in `test/recall-import-closure.test.ts`
+ * walks the same closure with the same edge rule, as a test. This is the
+ * commit-time gate. If the two ever disagree on the real tree, fix the code,
+ * never either check.
+ *
+ * UNRESOLVED EDGES. A relative specifier that names no file in `sources` is
+ * still checked, against every path it could have meant, so an edge cannot
+ * leave the closure by pointing at a file that is absent from this checkout.
+ * It is not followed, because there is nothing to read. The deployment's
+ * generated hostname module is the one such file on a fresh checkout, and it
+ * imports nothing. Package specifiers are not followed; the socket module's is
+ * the one refused.
+ *
+ * A MISSING START. When `sources` holds no object module, the check reports
+ * that rather than passing: a walk that starts nowhere guards nothing, and the
+ * object moved or renamed would otherwise take this check with it silently.
+ *
+ * WHAT IT DOES NOT SEE. A specifier built at run time and handed to a dynamic
+ * import, and a module path alias that does not start with a dot. Both are
+ * deliberate evasions, not mistakes.
+ *
+ * @param {Record<string, string>} sources  repo-relative path to contents
+ * @returns {Array<{file: string, line: number, column: number, pattern: string, patternIndex: number, why: string}>}
+ */
+export function checkAgentObjectClosure(sources) {
+  const pattern = "agent-object-closure-reaches-mail";
+  const patternIndex = FORBIDDEN.length + 45;
+  if (!Object.hasOwn(sources, AGENT_OBJECT_MODULE)) {
+    return [
+      {
+        file: AGENT_OBJECT_MODULE,
+        line: 0,
+        column: 0,
+        pattern,
+        patternIndex,
+        why: `The per-person object module ${AGENT_OBJECT_MODULE} was not found, so the walk over its import closure started nowhere and guarded nothing. The check refuses the object's imports reaching mail, DAV, tool, staging or feed code, the login handler, the OAuth wiring module or the socket module, one or more hops away. If the object really moved, that is a decision: move the start of this walk with it, never delete the walk.`,
+      },
+    ];
+  }
+  const violations = [];
+  const parentOf = new Map([[AGENT_OBJECT_MODULE, null]]);
+  const chainTo = (file) => {
+    const chain = [];
+    for (let at = file; at !== null; at = parentOf.get(at) ?? null) chain.unshift(at);
+    return chain.join(" -> ");
+  };
+  const queue = [AGENT_OBJECT_MODULE];
+  while (queue.length > 0) {
+    const file = queue.shift();
+    const contents = sources[file];
+    for (const { specifier, index } of runtimeSpecifiersOf(contents)) {
+      const where = { file, ...positionOf(contents, index), pattern, patternIndex };
+      if (specifier === AGENT_CLOSURE_SOCKET_SPECIFIER) {
+        violations.push({
+          ...where,
+          why: `The per-person object's import closure imports the socket module, in ${file}, reached as ${chainTo(file)}. The object holds a connection lease and never a session: an open socket keeps a Durable Object resident and billed for up to 15 minutes per connection and escapes the call deadline that bounds every mail conversation in the Worker request. The object reaches mail only through its own /mcp, with the autonomy key. Remove the import; a socket in the object is a decision on the boundary, not a refactor.`,
+        });
+        continue;
+      }
+      if (!specifier.startsWith("./") && !specifier.startsWith("../")) continue;
+      const { resolved, candidates } = resolveRelativeSpecifier(file, specifier, sources);
+      const reached = resolved !== null ? [resolved] : candidates;
+      const bad = reached.find(forbiddenInAgentClosure);
+      if (bad !== undefined) {
+        violations.push({
+          ...where,
+          why: `The per-person object's import closure reaches ${bad}, through ${chainTo(file)} -> ${bad}. The object may reach the allow-list reader through the autonomy module and the OAuth library through src/agent/autonomy-grants.ts, on purpose (D-14, D-28), and nothing else may ride in behind them: no mail, DAV, tool, staging or feed code, not the login handler, not the OAuth wiring module (it reaches the handler and the mail tree), and not the socket module. 24-03's rule refuses these as direct imports; this refuses them any number of hops away. The object reaches mail only through its own /mcp, with the autonomy key. Cut the edge at the module that added it. If this and test/recall-import-closure.test.ts ever disagree, fix the code, never either check.`,
+        });
+        continue;
+      }
+      if (resolved === null || parentOf.has(resolved)) continue;
+      parentOf.set(resolved, file);
+      queue.push(resolved);
+    }
+  }
+  return violations;
+}
+
+/**
  * A bare network call, permitted in exactly one module of the subscription-feed
  * tree.
  *
@@ -2895,6 +3213,8 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "model-id-missing",
   "recall-step-call-duplicated",
   "recall-step-call-missing",
+  "autonomy-arm-outside-sign-in",
+  "autonomy-arm-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -3150,6 +3470,8 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const aiBindingReaders = [];
   const modelIdLiterals = [];
   const recallStepCalls = [];
+  const autonomyArmCalls = [];
+  const sourceTree = {};
   const davWriteExports = {};
 
   for (const absolute of files) {
@@ -3294,6 +3616,15 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
     // is not a call, so it is not collected.
     modelIdLiterals.push(...collectModelIdLiterals(relativePath, contents));
     recallStepCalls.push(...collectRecallStepCalls(relativePath, contents));
+    // The phase 27 arm count. The sign-in handler is not skipped: it holds the
+    // one call. Every match, comment lines blanked. The method's definition in
+    // the object module has no leading dot, so it is not collected.
+    autonomyArmCalls.push(...collectAutonomyArmCalls(relativePath, contents));
+    // The phase 27 closure check reads every TypeScript file under src/ once,
+    // after the walk, from this map.
+    if (relativePath.startsWith("src/") && relativePath.endsWith(".ts")) {
+      sourceTree[relativePath] = contents;
+    }
     // The write-module manifest collects NAMES rather than a match position, so
     // it is the one collector that keys by module instead of appending to a list.
     // A declared module that is never walked therefore has no key at all, which
@@ -3327,6 +3658,12 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   violations.push(...checkAiBindingOwnership(aiBindingReaders));
   violations.push(...checkModelIdOwnership(modelIdLiterals));
   violations.push(...checkRecallStepCallOwnership(recallStepCalls));
+  violations.push(...checkAutonomyArmOwnership(autonomyArmCalls));
+  // Only when this scan walked src/ at all. A scan of scripts/ or test/ alone
+  // has no object to start from, and that is not the object going missing.
+  if (Object.keys(sourceTree).length > 0) {
+    violations.push(...checkAgentObjectClosure(sourceTree));
+  }
   violations.push(...checkDavWriteCoverage(davWriteExports));
 
   return violations.sort(
@@ -4093,6 +4430,45 @@ export function checkRecallStepCallOwnership(calls) {
 }
 
 /**
+ * The arm-site count constraint (Phase 27, D-21 (b), AUTO-01), as a pure
+ * function over the calls `collectAutonomyArmCalls` found. The first call in
+ * the owner passes; every other call, in the owner or anywhere else under
+ * `src/`, is `autonomy-arm-outside-sign-in`. No call at all is
+ * `autonomy-arm-missing`.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} calls
+ */
+export function checkAutonomyArmOwnership(calls) {
+  const violations = [];
+  let ownerCalls = 0;
+  for (const call of calls) {
+    if (call.file === AUTONOMY_ARM_OWNER) {
+      ownerCalls += 1;
+      if (ownerCalls === 1) continue;
+    }
+    violations.push({
+      file: call.file,
+      line: call.line,
+      column: call.column,
+      pattern: "autonomy-arm-outside-sign-in",
+      patternIndex: FORBIDDEN.length + 43,
+      why: `A second call of the per-person object's arm method under ${AUTONOMY_ARM_SCOPE} -- either in another module or a second one inside ${AUTONOMY_ARM_OWNER} itself, which counts the same. Arming makes a key that signs in to a person's mail with nobody present, for everyone who signs in, because autonomy is inherent. It happens only at the sign-in page, after the page showed the autonomy notice and after Apple accepted the password (AUTO-01, D-26, D-30). A second arming site is a second way to make that key, possibly with no interactive sign-in behind it: a tool, an alarm or a token refresh. Arm only from the sign-in handler's one call. A second way to arm is a decision on the credential boundary, not a refactor: get it, then change the owner, never the pattern.`,
+    });
+  }
+  if (calls.length === 0) {
+    violations.push({
+      file: AUTONOMY_ARM_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "autonomy-arm-missing",
+      patternIndex: FORBIDDEN.length + 44,
+      why: `No call of the per-person object's arm method under ${AUTONOMY_ARM_SCOPE}, which means the sign-in's arming in ${AUTONOMY_ARM_OWNER} was deleted, emptied, or moved. Zero is as much a violation as two, and it is the quieter of the pair: every person silently stops getting an autonomy key at sign-in, the sign-in itself still works, and nothing fails on the way out, because arming runs after the answer is sent. A call that survives only in a comment counts as zero. Restore the call in the sign-in handler. If arming really moved, that is a decision, not a refactor: get it, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
  * The names in the trailing alternation group of the shipped
  * `dav-concurrent-request` rule.
  *
@@ -4538,6 +4914,78 @@ export function checkRecallPoolConfig(poolFile, poolText, bindingDeclared) {
 }
 
 /**
+ * The value of the top-level `name` key in a Worker config's code (comment
+ * lines blanked), or null. Top-level means depth one of the outermost object:
+ * binding entries carry `name` keys of their own, deeper down.
+ */
+function topLevelWorkerName(code) {
+  let depth = 0;
+  let inString = false;
+  for (let i = 0; i < code.length; i += 1) {
+    const ch = code[i];
+    if (inString) {
+      if (ch === "\\") i += 1;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === "{" || ch === "[") depth += 1;
+    else if (ch === "}" || ch === "]") depth -= 1;
+    else if (ch === '"') {
+      if (depth === 1) {
+        const match = /^"name"\s*:\s*"([^"\n]*)"/.exec(code.slice(i));
+        if (match) return match[1];
+      }
+      inString = true;
+    }
+  }
+  return null;
+}
+
+/**
+ * The `SELF` service binding check over one Worker config file's text
+ * (Phase 27, D-21 (d), D-22).
+ *
+ * THE RULE. The config declares a `services` entry whose binding is `SELF`,
+ * and that entry's `service` equals the config's own top-level `name`. The
+ * object redeems the autonomy key at `SELF /oauth/token` with the client
+ * secret, then calls `SELF /mcp` with the bearer it got back. A binding that
+ * names any other Worker hands that Worker a person's refresh token and the
+ * client secret on every redemption. A missing binding is refused too: the
+ * config is the one place that says where those requests go, and a config
+ * that no longer says so has lost the reason beside it.
+ *
+ * Read with comment lines blanked, so the prose beside the binding fires
+ * nothing. Pure and exported so the tests can drive it from inline text.
+ *
+ * WHAT IT DOES NOT SEE. An environment-specific override block that re-binds
+ * `SELF` under `env`. This project deploys no named environments. The first
+ * `SELF` entry found is the one checked.
+ *
+ * @param {string} file  repo-relative path, reported in the violation
+ * @param {string} text  the config file's contents
+ */
+export function checkSelfBindingConfig(file, text) {
+  const code = withoutCommentLines(text);
+  const name = topLevelWorkerName(code);
+  const entry = /\{[^{}]*"binding"\s*:\s*"SELF"[^{}]*\}/.exec(code);
+  const service = entry ? /"service"\s*:\s*"([^"\n]*)"/.exec(entry[0])?.[1] : undefined;
+  if (entry && name !== null && service === name) return [];
+  const where = entry ? positionOf(code, entry.index) : { line: 0, column: 0 };
+  const found = entry
+    ? `binds SELF to ${service === undefined ? "no named service" : `"${service}"`}, and the Worker's own name is ${name === null ? "missing" : `"${name}"`}`
+    : "declares no SELF service binding";
+  return [
+    {
+      file,
+      ...where,
+      pattern: "self-binding-not-self",
+      patternIndex: 6,
+      why: `The Worker config ${found}. SELF must be a service binding to this same Worker: the per-person object redeems each person's autonomy key at SELF /oauth/token with the autonomy client's secret, then calls SELF /mcp with the bearer it gets back (D-22). A binding to any other Worker hands that Worker a person's refresh token and the client secret on every redemption, and nothing else in the code would notice. Restore { "binding": "SELF", "service": <this file's top-level name> } in the services list, with the reason beside it. Pointing SELF anywhere else is a decision on the credential boundary, not a config tweak.`,
+    },
+  ];
+}
+
+/**
  * Configuration checks the deploy tooling cannot make for us.
  *
  * Wave 1 established that `wrangler deploy --dry-run` does not validate inside a
@@ -4583,6 +5031,8 @@ export function scanWranglerConfig(
     violations.push(...checkDurableObjectConfig(path, config));
     // The recall binding checks (phase 25, D-16, D-17), over both files.
     violations.push(...checkRecallConfig(path, config));
+    // The SELF binding check (phase 27, D-22), over both files.
+    violations.push(...checkSelfBindingConfig(path, config));
     if (declaresRecallBinding(withoutCommentLines(config))) {
       recallBindingDeclared = true;
     }

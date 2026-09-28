@@ -29,25 +29,46 @@
 // know whose grants to ask about, and the platform's name is not documented as
 // present inside an alarm.
 //
+// Since Phase 27 it also holds, because autonomy is inherent, one sealed
+// autonomy record for every person who has signed in since autonomy was set up
+// and is still connected: the refresh token of their autonomy grant, sealed
+// under a Worker secret and tied to their user id (./autonomy.ts says how). So
+// what the object holds is: a lease record, its own stored name, Phase 25's
+// recall tables (Phase 26 keeps its folder state there too), its one alarm, and
+// that one sealed record. Still no address and no password.
+//
 // It still never opens a socket and never imports mail, DAV, tool or auth code.
+// It reaches this Worker only through `autonomySelfFetch`, its one seam to the
+// Worker's own endpoints.
 //
 // Recall is inherent (owner, 2026-09-27), so there is no switch here: no method
 // that turns recall on or off, and no enabled flag. The first record for a
 // person needs no earlier call.
 //
-// ONE ALARM SLOT, SHARED. An object has one alarm, and recall is its first
-// user. Its jobs today, in the order `alarm()` runs them: a pending destroy,
-// then revocation, then expiry. Every set and every removal goes through one
-// helper, `scheduleAlarm`, which removes the alarm only when `anyJobPending()`
-// says no job is left and otherwise never moves a set alarm later. Phases 27
-// and 28 fold their jobs into the same handler, the same helper and the same
-// predicate. A second call that sets the alarm, or a second condition for
-// removing it, would silently drop another job's schedule.
+// ONE ALARM SLOT, SHARED. An object has one alarm, and recall was its first
+// user. Its jobs today, in the order `alarm()` runs them: autonomy first (Phase
+// 27: does the key still stand?), then recall's revocation (a pending destroy,
+// or no grant left), then recall's expiry. All three keep the alarm through
+// `anyJobPending()`. Every set and every removal goes through one helper,
+// `scheduleAlarm`, which removes the alarm only when `anyJobPending()` says no
+// job is left and otherwise never moves a set alarm later. Phase 28 folds its
+// job into the same handler, the same helper and the same predicate. A second
+// call that sets the alarm, or a second condition for removing it, would
+// silently drop another job's schedule.
 //
 // This module logs nothing (./.claude/CLAUDE.md §4).
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
+import {
+  AUTONOMY_KEY,
+  type ArmOutcome,
+  type AutonomyQueue,
+  armWith,
+  autonomyAlarmJob,
+  oneAtATime,
+} from "./autonomy";
+import { type KeyStanding, keyStandingFor, sweepAutonomyGrants } from "./autonomy-grants";
 import { type RecallStore, recallStore } from "../recall/index";
 import { grantsRemainFor } from "../recall/grant-check";
 import { destroyAll, type LedgerHandle, sweepExpired } from "../recall/lifecycle";
@@ -318,17 +339,26 @@ export class UserAgent extends DurableObject<Env> {
   /**
    * Whether the object has any job for its one alarm.
    *
-   * THIS IS THE ONE CONDITION FOR KEEPING THE ALARM. Today the job is recall's:
-   * a ledger row exists. A later phase with a job on this alarm adds its job
-   * here, in this function, and nowhere else (Phases 27 and 28 will). A second
+   * THIS IS THE ONE CONDITION FOR KEEPING THE ALARM. A phase with a job on this
+   * alarm adds its clause here, in this function, and nowhere else. A second
    * condition written beside this one would let one job remove the alarm
-   * another job still needs. Recall's jobs: a ledger row exists, or a destroy
-   * has started and not finished.
+   * another job still needs. The clauses today:
+   *   - recall's ledger holds a row (Phase 25);
+   *   - recall's destroy has started and not finished (Phase 25);
+   *   - an autonomy record is stored (Phase 27). Presence only: the record is
+   *     never parsed or unsealed here. So an empty recall ledger on its own
+   *     does not remove the alarm while a key is held, and the key's standing
+   *     is asked at least once a day.
+   * Phase 28's job adds its clause here too.
    */
   anyJobPending = (): boolean => {
     const sql = this.ctx.storage.sql;
     ensureRecallSchema(sql);
-    return countVectors(sql) > 0 || destroyPending(sql);
+    return (
+      countVectors(sql) > 0 ||
+      destroyPending(sql) ||
+      this.ctx.storage.kv.get<unknown>(AUTONOMY_KEY) !== undefined
+    );
   };
 
   /**
@@ -359,6 +389,81 @@ export class UserAgent extends DurableObject<Env> {
    */
   grantsRemain = (userId: string): Promise<"some" | "none" | "unknown"> =>
     grantsRemainFor(this.env.OAUTH_KV, userId);
+
+  /**
+   * The one thing this object uses to reach this Worker (Phase 27, D-22).
+   *
+   * Every autonomy request goes through it: the code exchange, the refresh, the
+   * revocation and the one tool call. `./autonomy.ts` builds each URL from the
+   * deployed hostname and an exact path, and the binding adds no identity.
+   * Tests replace this property through `runInDurableObject`, to record what
+   * the object sent; production never overrides it.
+   */
+  autonomySelfFetch = (request: Request): Promise<Response> => this.env.SELF.fetch(request);
+
+  /**
+   * Whether the key whose grant is `grantId` still stands, for the person whose
+   * user id is `name` (27-05, D-33). The alarm job asks it. A seam, so tests
+   * can answer for the listing; production never overrides it. An instance
+   * property, so RPC does not expose it.
+   */
+  keyStanding = (name: string, grantId: string): Promise<KeyStanding> =>
+    keyStandingFor(this.env.OAUTH_KV, name, grantId);
+
+  /**
+   * Revoke every autonomy grant the person whose user id is `name` holds,
+   * except `keepGrantId` and the grants whose arm is waiting in the queue:
+   * those are sign-ins still in flight (D-27). The alarm job calls it keeping
+   * none when the key has ended, and keeping the record's grant while the key
+   * stands (review R2-WR-02). A seam, like the one above.
+   */
+  sweepAutonomy = (name: string, keepGrantId: string | null = null): Promise<unknown> =>
+    sweepAutonomyGrants(
+      this.env.OAUTH_KV,
+      name,
+      keepGrantId,
+      new Set(this.pendingArmGrants.keys()),
+      Math.floor(Date.now() / 1000),
+    );
+
+  /**
+   * The one autonomy queue (Phase 27, D-27). Every autonomy entry point runs
+   * through it, one operation at a time: `armAutonomy` today, plan 27-05's
+   * alarm job and Phase 28's job later. Those two take the object's name from
+   * `storedOwnName()`. Inner calls never re-enter it: the arm's proof calls
+   * the session function directly. The lease and every other method never
+   * wait on it.
+   *
+   * Each run hands its operation a ticket, live only while that operation
+   * runs, and a session refuses without one (review WR-04). So opening a
+   * session from outside this queue is refused at run time, not merely
+   * discouraged: Phase 28's job opens its session inside
+   * `autonomyQueue.run((ticket) => ...)` and passes that ticket. A ticket
+   * opens one session, ever, and the run does not end until that session has
+   * settled, even when the operation did not await it (review R2-WR-01). So
+   * two sessions in one run are refused too, and a session cannot outlive
+   * its run.
+   *
+   * WHY. The Claude client submits the sign-in form twice, about 1.4 seconds
+   * apart (measured 2026-09-21), so every sign-in arms twice. Without one at a
+   * time, the two arms interleave at every `await`, sweep each other's grants,
+   * and the person ends with no key. It is also what meets D-15's "one
+   * redemption at a time": a second caller waits and then runs its own
+   * operation, so no two refreshes of one token are ever out at once.
+   *
+   * An instance property, not a method, so no Worker holding a stub can reach
+   * it (the seam above follows the same rule). If the object is evicted, the
+   * queue is lost with everything in it. That is safe: the stored token is
+   * still the current one or the previous one, and the library accepts both.
+   */
+  autonomyQueue: AutonomyQueue = oneAtATime();
+
+  /**
+   * How many arms are waiting in the queue for each grant id. The sweeps leave
+   * these grants alone, because each belongs to a sign-in whose arm has not
+   * run yet (D-27). An instance property, for the same reason as the queue.
+   */
+  pendingArmGrants = new Map<string, number>();
 
   /**
    * The object's stored own name, when it is a 64-hex user id, else null.
@@ -479,11 +584,23 @@ export class UserAgent extends DurableObject<Env> {
   }
 
   /**
-   * The object's one alarm (Phase 25, D-09, D-13, D-22).
+   * The object's one alarm (Phase 25, D-09, D-13, D-22; Phase 27, D-25).
    *
-   * Its jobs, in order: finish a pending destroy; destroy everything when the
-   * person holds no grant any more, asked about the object's stored own name;
-   * then sweep expired vectors. The sweep deletes store first, then the alarm
+   * Its jobs, in order: the autonomy job (Phase 27); finish a pending destroy;
+   * destroy everything when the person holds no grant any more, asked about the
+   * object's stored own name; then sweep expired vectors.
+   *
+   * The autonomy job runs FIRST, in its own `try`, through the one autonomy
+   * queue (D-27). First, so recall's early returns cannot skip it, and so that
+   * when it ends the key, recall's grant check in the same run already sees
+   * the person as gone. Its own `try`, so a fault in it cannot starve recall's
+   * jobs. It is asked about the name from `storedOwnName()`, exactly as
+   * recall's grant check is: the platform's name is not documented as present
+   * inside an alarm, and this module reads the platform's name in one place
+   * only. With no stored name the job is skipped. The record then stays, and
+   * `anyJobPending()` keeps the alarm at most a day away.
+   *
+   * Recall's jobs then run as before. The sweep deletes store first, then the alarm
    * is set again through the helper: one minute out when expired rows remain, else at the next expiry
    * (the helper lowers that to one day). It never throws: on any failure it
    * reschedules one hour out through the same helper, which keeps an earlier
@@ -491,7 +608,31 @@ export class UserAgent extends DurableObject<Env> {
    * read.
    */
   async alarm(): Promise<void> {
+    // 0. Autonomy: does the key still stand? Never skipped by what follows.
     try {
+      const ownName = this.storedOwnName();
+      if (ownName !== null) {
+        const outcome = await this.autonomyQueue.run(() =>
+          autonomyAlarmJob({
+            storage: this.ctx.storage.kv,
+            name: ownName,
+            keyStanding: (name, grantId) => this.keyStanding(name, grantId),
+            sweep: (name, keepGrantId) => this.sweepAutonomy(name, keepGrantId),
+            now: () => Date.now(),
+          }),
+        );
+        if (outcome.kind !== "none") {
+          await this.scheduleAlarm(outcome.wantedAt ?? Date.now() + RECALL_SWEEP_MAX_INTERVAL_MS);
+        }
+      }
+    } catch {
+      // Recall's jobs below still run, and each ends through the helper.
+    }
+    try {
+      // Recall's tables may not exist yet: since Phase 27 an object can hold an
+      // alarm for its autonomy record before any recall call. Creating them is
+      // idempotent, and without them the read below throws.
+      ensureRecallSchema(this.ctx.storage.sql);
       // 1. A destroy that started and did not finish is finished first.
       if (destroyPending(this.ctx.storage.sql)) {
         await this.destroyRecall();
@@ -742,6 +883,73 @@ export class UserAgent extends DurableObject<Env> {
       .slice(0, MAX_SCOPE_ROWS)
       .filter((id): id is string => typeof id === "string" && HEX_64.test(id));
     return heldIds(sql, valid);
+  }
+
+  /**
+   * Arm the autonomy key from a one-time code (Phase 27, D-09, D-16, D-26).
+   *
+   * The one RPC method autonomy adds. The sign-in calls it after its answer has
+   * gone, through the request's `waitUntil`, with the code of the autonomy grant
+   * it just minted. Answers `{ kind: "armed", grantId }` or
+   * `{ kind: "not_armed" }`, and nothing else: no token and no bearer ever
+   * crosses back out.
+   *
+   * The name comes from Phase 25's `rememberOwnName()`, called FIRST (25 D-22).
+   * An autonomy record can exist before this object ever had a recall call, so
+   * arming must store the name itself: the alarm (plan 27-05) reads the stored
+   * copy to know whose grants to ask about, and a record in an object with no
+   * stored name could never be ended by it. With no name, nothing is armed.
+   * This method never reads the platform's name itself; the one reader of it in
+   * this module stays inside `rememberOwnName`.
+   *
+   * The whole arm runs inside `autonomyQueue.run`, after the name is known, so
+   * two sign-ins arming at once run one after the other (D-27). While it
+   * waits, its grant id is listed in `pendingArmGrants`, so an arm ahead of it
+   * does not sweep the grant it is about to arm.
+   *
+   * Never throws: an error's class does not survive RPC, and the caller must be
+   * able to tell "not armed" from nothing at all.
+   */
+  async armAutonomy(code: unknown): Promise<ArmOutcome> {
+    if (typeof code !== "string") return { kind: "not_armed" };
+    const name = this.rememberOwnName();
+    if (name === null) return { kind: "not_armed" };
+    const grantId = code.split(":")[1] ?? "";
+    const pending = this.pendingArmGrants;
+    pending.set(grantId, (pending.get(grantId) ?? 0) + 1);
+    try {
+      return await this.autonomyQueue.run(async (ticket) => {
+        const outcome = await armWith(
+          {
+            storage: this.ctx.storage.kv,
+            name,
+            env: this.env,
+            selfFetch: (request) => this.autonomySelfFetch(request),
+            now: () => Date.now(),
+            pendingArms: () => new Set(pending.keys()),
+            // The arm's proof is a session, and a session opens only with the
+            // queue's live ticket (review WR-04).
+            ticket,
+          },
+          code,
+        );
+        // The record was stored, replaced or deleted. The helper keeps an
+        // earlier alarm, sets one a day out while a record exists, and removes
+        // the alarm when no job is left (27-05, 25 D-23).
+        try {
+          await this.scheduleAlarm(Date.now() + RECALL_SWEEP_MAX_INTERVAL_MS);
+        } catch {
+          // The arm's answer stands. The next alarm or arm schedules again.
+        }
+        return outcome;
+      });
+    } catch {
+      return { kind: "not_armed" };
+    } finally {
+      const left = (pending.get(grantId) ?? 1) - 1;
+      if (left > 0) pending.set(grantId, left);
+      else pending.delete(grantId);
+    }
   }
 
   /**

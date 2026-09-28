@@ -110,6 +110,11 @@ to anyone, and that value is the literal `["*"]`.
    read fresh at every sign-in, so the next one they attempt is refused.
 2. Revoke their grants — `node scripts/grants.mjs revoke --address … --yes`.
 
+   Revoking their grants also ends autonomy: the autonomy sign-in is one of
+   their grants, and it also ends on its own, within a day, once they hold no
+   ordinary sign-in. Taking them off the list alone stops autonomy from
+   running, but the key stays until their grants are revoked.
+
 Here is why step 1 alone is not enough, stated rather than left to be
 discovered.
 
@@ -146,6 +151,11 @@ the one property that keeps the door cheap and testable.
 - Errors are mapped to a fixed, small vocabulary by dispatching on the error
   *type*. No error message echoes a caught value's text, and no diagnostic
   field repeats the last command sent.
+- For every person who has signed in since autonomy was set up, one more thing:
+  a sealed refresh token in their own Durable Object. It opens that person's
+  autonomy sign-in and nothing else. It is sealed with a Worker secret, so
+  reading every store opens nothing. It lasts as long as that person's ordinary
+  connection. See "Autonomy (inherent)" below.
 
 ### Per-user scoping
 
@@ -196,6 +206,53 @@ it costs.
 
 These numbers are the constants in `src/recall/retention.ts`, and a check keeps
 this section equal to them.
+
+<!-- DRAFT: awaiting owner approval in 27-06 -->
+### Autonomy (inherent)
+
+Autonomy is inherent. Every sign-in also makes a second sign-in, just for
+autonomy. There is no opt-in and no switch. The sign-in page says so, above the
+sign-in fields, before the person signs in.
+
+**What is kept.** The refresh token of that second sign-in, sealed, in the
+person's own Durable Object. It is sealed with a Worker secret, and the seal is
+tied to that person, so it opens only in their own object. The Apple password is
+stored nowhere new: it sits inside the autonomy sign-in's locked props, the same
+as every other sign-in's.
+
+**What it does.** Today, one check right after sign-in that the key works. That
+check asks only which account the key belongs to, and reads no mail. Later, only
+what the person's own rules say, and only flag a message or put a draft in the
+Drafts folder. It never sends mail. With no rules, it does nothing.
+
+**How long.** Exactly as long as the person's ordinary connection. There is no
+timer. The next interactive sign-in makes a new key and revokes the old one. A
+Claude app refreshing its own token makes nothing.
+
+**How it ends.**
+
+- The person's last ordinary sign-in is revoked or removed. The key ends within
+  a day, and at its next use at the latest.
+- The owner revokes the autonomy grant.
+- Taking the person off the allow list stops every use before the key is read.
+  It does not delete the key: a store error looks the same as a removal, and
+  deleting on an error would end everyone's key at once.
+- The person deletes their app-specific password at account.apple.com.
+
+**What the seal protects, and what it does not.** Someone who can only read this
+server's storage gets nothing, because the secret that opens the seal is in no
+store. Someone who can run code in this Worker gets every signed-in person's key
+at once, and can use it for anything this server's tools can do. The limit to
+flag and draft holds for this server's own code, not for an attacker's.
+
+That is the blast radius: **every signed-in account**, not only people who chose
+it. Before autonomy, the same attacker reached each person only when that person
+next signed in or used the server. The owner accepted this on 2026-09-27.
+
+**If you think the server was compromised, every signed-in person should delete
+their app-specific password at account.apple.com.** Nothing on a timer protects
+the password: the key has no expiry, and an app-specific password opens the
+whole mail account.
 
 ### The dead-password pause
 
