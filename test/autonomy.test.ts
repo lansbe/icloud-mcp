@@ -510,7 +510,9 @@ async function sealedRecordFor(sealedFor: string, generation = 1): Promise<Recor
     grantId: "fakegrant",
     sealedRefreshToken: sealed?.sealedRefreshToken,
     iv: sealed?.iv,
-    armedAt: 1,
+    // Armed now, so plan 27-02's standing check is inside its grace and these
+    // cases still reach the step they are about.
+    armedAt: Math.floor(Date.now() / 1000),
     generation,
   };
 }

@@ -56,6 +56,7 @@ import {
   AUTONOMY_REDIRECT_PATH,
   AUTONOMY_TOOLS,
 } from "./autonomy-client";
+import { type KeyStanding, keyStandingFor, sweepAutonomyGrants } from "./autonomy-grants";
 
 /** The object's key-value key for the one autonomy record. */
 export const AUTONOMY_KEY = "autonomy";
@@ -80,6 +81,18 @@ const AUTONOMY_REDIRECT_URI = `https://${DEPLOYED_HOSTNAME}${AUTONOMY_REDIRECT_P
 
 /** The MCP protocol version the tool call is made under, as the door expects. */
 const MCP_PROTOCOL_VERSION = "2026-07-28";
+
+/**
+ * For this long after a key is armed, in seconds, the standing check is
+ * skipped (D-33).
+ *
+ * The sign-in that armed the key had just made the person's ordinary grant, and
+ * the sign-in store's listing can lag behind a fresh write by about a minute. A
+ * check made in that window could read "no ordinary grant" and end a key that
+ * is fine. Ten minutes is well past the lag, and a key this new was proved to
+ * work at arming.
+ */
+export const STANDING_GRACE_SECONDS = 600;
 
 /**
  * The one stored record (D-10, as revised 2026-09-27).
@@ -108,7 +121,11 @@ export interface AutonomyStorage {
 /** The bindings this module reads. Nothing holding them is ever returned. */
 export type AutonomyEnv = Pick<
   Env,
-  "ALLOWED_APPLE_IDS_SEED" | "ALLOW_LIST_KV" | "AUTONOMY_CLIENT_SECRET" | "AUTONOMY_SEAL_KEY"
+  | "ALLOWED_APPLE_IDS_SEED"
+  | "ALLOW_LIST_KV"
+  | "AUTONOMY_CLIENT_SECRET"
+  | "AUTONOMY_SEAL_KEY"
+  | "OAUTH_KV"
 >;
 
 /**
@@ -118,6 +135,10 @@ export type AutonomyEnv = Pick<
  * `rememberOwnName()` in an RPC method, `storedOwnName()` in the alarm.
  * `selfFetch` is the object's one seam to this Worker. `now` answers
  * milliseconds since the epoch.
+ *
+ * `keyStanding` asks whether the key whose grant is `grantId` still stands
+ * (D-33). Left out, it asks the library through `keyStandingFor` over
+ * `env.OAUTH_KV`. It exists so tests can answer for the listing.
  */
 export interface AutonomyDeps {
   readonly storage: AutonomyStorage;
@@ -125,6 +146,7 @@ export interface AutonomyDeps {
   readonly env: AutonomyEnv;
   readonly selfFetch: (request: Request) => Promise<Response>;
   readonly now: () => number;
+  readonly keyStanding?: (grantId: string) => Promise<KeyStanding>;
 }
 
 /** What one tool call through the key answers. Never the bearer. */
@@ -371,6 +393,27 @@ async function admitted(deps: AutonomyDeps): Promise<boolean> {
   return listAdmits(await readStoredAllowList(deps.env.ALLOW_LIST_KV), deps.name);
 }
 
+// ------------------------------------------------------- the standing check
+
+/**
+ * Whether the key whose grant is `grantId` still stands, through the seam when
+ * one was handed in. Anything thrown is `unknown`, which ends nothing.
+ */
+async function standingOf(deps: AutonomyDeps, grantId: string): Promise<KeyStanding> {
+  try {
+    if (deps.keyStanding !== undefined) return await deps.keyStanding(grantId);
+    return await keyStandingFor(deps.env.OAUTH_KV, deps.name, grantId);
+  } catch {
+    return "unknown";
+  }
+}
+
+/** Whether a record armed at `armedAt` (seconds) is still inside the grace. */
+function insideGrace(deps: AutonomyDeps, armedAt: number): boolean {
+  const age = Math.floor(deps.now() / 1000) - armedAt;
+  return age >= 0 && age < STANDING_GRACE_SECONDS;
+}
+
 // -------------------------------------------------------------- the session
 
 /** The JSON-RPC message with id `id` in an MCP answer, on either lane, or null. */
@@ -409,6 +452,10 @@ function rpcMessageWithId(bodyText: string, id: number): Record<string, unknown>
  *   2. Both autonomy secrets must be set. Not set answers `failed` and keeps
  *      the record: an unset secret is a server fault, not a revocation.
  *   3. The record. Absent answers `off`. Malformed is deleted, `off`.
+ *   3a. The standing check (D-33), unless the key was armed less than
+ *      `STANDING_GRACE_SECONDS` ago. `revoked` or `connection_ended` sweeps
+ *      every autonomy grant, deletes the record and answers `revoked`, with no
+ *      token-endpoint call. `unknown` answers `failed` and keeps the record.
  *   4. Unseal. Any failure deletes the record, `off`.
  *   5. One refresh at the token endpoint. `invalid_grant` or `invalid_client`
  *      deletes the record, `revoked`, with no retry. Anything else that is not
@@ -445,7 +492,25 @@ export async function withAutonomySession<T>(
       return { kind: "off" };
     }
 
-    // 27-02: D-33's standing check goes here, after the record is read and before it is unsealed.
+    // THE STANDING CHECK (D-33). The owner's answer is that the key lives
+    // exactly as long as the person's ordinary connection. Nothing tells this
+    // object when that connection ends: grants are revoked from the owner's
+    // terminal or by the person's Claude app, and neither can reach it. So the
+    // key asks, here, before it is unsealed, and this is what makes it end at
+    // the next use at the latest. Plan 27-05's alarm job asks the same question
+    // so that a key nobody uses ends within a day.
+    //
+    // `unknown` ends nothing: a listing error must not end every person's key
+    // at once. It answers `failed`, and the record is kept.
+    if (!insideGrace(deps, record.armedAt)) {
+      const standing = await standingOf(deps, record.grantId);
+      if (standing === "unknown") return { kind: "failed" };
+      if (standing !== "standing") {
+        await sweepAutonomyGrants(deps.env.OAUTH_KV, deps.name, null);
+        deps.storage.delete(AUTONOMY_KEY);
+        return { kind: "revoked" };
+      }
+    }
 
     const autonomyRefreshToken = await unseal(sealKey, deps.name, record);
     if (autonomyRefreshToken === null) {
@@ -567,19 +632,23 @@ async function answersAs(result: unknown, name: string): Promise<boolean> {
 }
 
 /**
- * Arm the key from a one-time code (D-09, D-10, D-11).
+ * Arm the key from a one-time code (D-09, D-10, D-11, D-13, D-28).
  *
- * Refuses (`not_armed`) unless both autonomy secrets are set and the code's
- * user segment is the object's own name, so a wiring mistake refuses rather
- * than arming the wrong person's object. Then: exchange the code at this
- * Worker's token endpoint; take the grant id from the refresh token; seal it;
- * write the record, with `generation` one more than any record it replaces;
- * and prove it, with one session that calls `account_whoami` and checks the
- * answer is this person.
+ * Refuses (`not_armed`), and changes nothing, unless both autonomy secrets are
+ * set and the code's user segment is the object's own name, so a wiring
+ * mistake refuses rather than arming the wrong person's object. Then: exchange
+ * the code at this Worker's token endpoint; take the grant id from the refresh
+ * token; seal it; write the record, with `generation` one more than any record
+ * it replaces; prove it, with one session that calls `account_whoami` and
+ * checks the answer is this person; and sweep every other autonomy grant this
+ * person holds.
  *
- * Fails toward off (D-11): on any failure after the exchange, the new token is
- * revoked at the endpoint and the record is deleted, including a record an
- * earlier sign-in left. Plan 27-02 adds the sweep of other autonomy grants.
+ * FAILS TOWARD OFF (D-11). Once the input checks have passed, any failure,
+ * before or after the exchange, revokes the new token if one exists, deletes
+ * the record, and sweeps EVERY autonomy grant, and answers `not_armed`. That
+ * ends the key the person already had, too. A key that could not be re-armed
+ * at this sign-in is not one to keep trusting, and the person's next sign-in
+ * arms again.
  */
 export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutcome> {
   const clientSecret = deps.env.AUTONOMY_CLIENT_SECRET;
@@ -592,39 +661,46 @@ export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutc
     return { kind: "not_armed" };
   }
 
-  let answer: Awaited<ReturnType<typeof readTokenAnswer>>;
-  try {
-    const response = await deps.selfFetch(
-      tokenRequest(clientSecret, {
-        grant_type: "authorization_code",
-        code,
-        redirect_uri: AUTONOMY_REDIRECT_URI,
-      }),
-    );
-    answer = await readTokenAnswer(response);
-  } catch {
-    return { kind: "not_armed" };
-  }
-  if (answer.kind !== "ok") return { kind: "not_armed" };
-  const autonomyRefreshToken = answer.body.refresh_token;
-  if (typeof autonomyRefreshToken !== "string") return { kind: "not_armed" };
+  // Set once the exchange has handed back a token. Every failure after that
+  // revokes it.
+  let autonomyRefreshToken: string | null = null;
 
-  // From here on a token exists, so every failure revokes it and deletes the record.
   const fail = async (): Promise<ArmOutcome> => {
+    if (autonomyRefreshToken !== null) {
+      await revokeAtEndpoint(deps, clientSecret, autonomyRefreshToken);
+    }
     deps.storage.delete(AUTONOMY_KEY);
-    await revokeAtEndpoint(deps, clientSecret, autonomyRefreshToken);
+    await sweepAutonomyGrants(deps.env.OAUTH_KV, deps.name, null);
     return { kind: "not_armed" };
   };
 
   try {
-    const tokenParts = autonomyRefreshToken.split(":");
+    let answer: Awaited<ReturnType<typeof readTokenAnswer>>;
+    try {
+      const response = await deps.selfFetch(
+        tokenRequest(clientSecret, {
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: AUTONOMY_REDIRECT_URI,
+        }),
+      );
+      answer = await readTokenAnswer(response);
+    } catch {
+      return await fail();
+    }
+    if (answer.kind !== "ok") return await fail();
+    const exchanged = answer.body.refresh_token;
+    if (typeof exchanged !== "string") return await fail();
+    autonomyRefreshToken = exchanged;
+
+    const tokenParts = exchanged.split(":");
     const grantId = tokenParts[1];
     if (tokenParts.length !== 3 || tokenParts[0] !== deps.name || grantId !== codeParts[1]) {
       return await fail();
     }
     if (grantId === undefined || grantId.length === 0) return await fail();
 
-    const sealed = await seal(sealKey, deps.name, autonomyRefreshToken);
+    const sealed = await seal(sealKey, deps.name, exchanged);
     if (sealed === null) return await fail();
 
     const previous = recordOf(deps.storage.get<unknown>(AUTONOMY_KEY));
@@ -641,9 +717,48 @@ export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutc
     if (proof.kind !== "ok" || proof.value.kind !== "ok") return await fail();
     if (!(await answersAs(proof.value.result, deps.name))) return await fail();
 
-    // 27-02: the sweep of this person's other autonomy grants goes here (D-13, D-28).
+    // The sweep (D-13, D-28): every other autonomy grant this person holds is
+    // revoked, so at most one survives any sign-in. It lists rather than
+    // trusting the record it replaced, so a grant minted and never armed is
+    // caught too. An incomplete sweep does not fail the arm.
+    await sweepAutonomyGrants(deps.env.OAUTH_KV, deps.name, grantId);
     return { kind: "armed", grantId };
   } catch {
     return await fail();
   }
+}
+
+// ---------------------------------------------------------------- disarming
+
+/**
+ * End the key from inside the object (D-16 as revised).
+ *
+ * If a record exists and unseals, its token is revoked at the token endpoint,
+ * which revokes the whole grant (best effort: the endpoint answers 200 either
+ * way). Then the record is deleted. A record that does not unseal is only
+ * deleted. Always answers `off`.
+ *
+ * A module function and never an RPC method: nothing outside the object turns
+ * autonomy off, because there is no user switch (owner, 2026-09-27). Its
+ * callers are plan 27-05's alarm job and Phase 28's second-failure rule.
+ */
+export async function disarmWith(deps: AutonomyDeps): Promise<{ kind: "off" }> {
+  try {
+    const stored = deps.storage.get<unknown>(AUTONOMY_KEY);
+    if (stored === undefined) return { kind: "off" };
+    const record = recordOf(stored);
+    if (record === null) {
+      deps.storage.delete(AUTONOMY_KEY);
+      return { kind: "off" };
+    }
+    const clientSecret = deps.env.AUTONOMY_CLIENT_SECRET;
+    const autonomyRefreshToken = await unseal(deps.env.AUTONOMY_SEAL_KEY, deps.name, record);
+    if (autonomyRefreshToken !== null && isConfiguredSecret(clientSecret)) {
+      await revokeAtEndpoint(deps, clientSecret, autonomyRefreshToken);
+    }
+    deps.storage.delete(AUTONOMY_KEY);
+  } catch {
+    // Nothing to read. The answer is the same.
+  }
+  return { kind: "off" };
 }
