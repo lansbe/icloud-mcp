@@ -29,6 +29,7 @@ import { defineConfig } from "vitest/config";
 const FILESYSTEM_TESTS = [
   "test/forbidden-tokens.test.ts",
   "test/vectorize-shape.test.ts",
+  "test/recall-import-closure.test.ts",
 ];
 
 const IGNORED = ["**/node_modules/**", "**/dist/**", "**/.wrangler/**"];
