@@ -22,9 +22,14 @@ import { encodeMessageId, type MessageRef } from "../src/mail/ids";
 import type { Principal } from "../src/principal";
 import { createEmbedder } from "../src/recall/embed";
 import { vectorIdOf } from "../src/recall/ids";
-import { createRecallStore, type RecallQueryOptions, RecallStoreError } from "../src/recall/index";
+import {
+  createRecallStore,
+  RECALL_MIN_SCORE,
+  type RecallQueryOptions,
+  RecallStoreError,
+} from "../src/recall/index";
 import { indexItems, type RecallDeps, type RecallItem, recallFor } from "../src/recall/pipeline";
-import { createFakeAi } from "./fixtures/fake-embedder";
+import { createFakeAi, fakeVectorOf } from "./fixtures/fake-embedder";
 import { createFakeVectorize, type FakeVectorize } from "./fixtures/fake-vectorize";
 import { USER_A, USER_B, testPrincipal } from "./fixtures/two-users";
 
@@ -136,13 +141,24 @@ describe("recall isolation (RCLL-01)", () => {
     await indexBoth();
     fake.ignoreScopes = true;
 
-    const forCanary = await recallFor(a, CANARY, deps, 50);
+    // Since Phase 26 the store drops a match below RECALL_MIN_SCORE (D-07), so
+    // this query shares words with BOTH A's first message and B's canary, and
+    // each scores above the floor. Then it is layer 3, not the floor, that has
+    // to keep B's canary out, and A's own result set is still not empty.
+    const query = `secret note ${CANARY} staff engineer interview tuesday`;
+    const forCanary = await recallFor(a, query, deps, 50);
     const bRef = encodeMessageId(B_REF);
     expect(forCanary.length, "A's own result set must not be empty").toBeGreaterThan(0);
     for (const match of forCanary) {
       expect(match.ref).not.toBe(bRef);
       expect(match.snippet).not.toContain(CANARY);
     }
+
+    // B's canary did reach the store's answer, above the floor.
+    const raw = await fake.query(fakeVectorOf(query), { topK: 50, returnMetadata: "all" });
+    const bMatch = raw.matches.find((m) => m.metadata?.u === b.userId);
+    expect(bMatch, "B's canary never reached the store's answer").toBeDefined();
+    expect(bMatch!.score).toBeGreaterThanOrEqual(RECALL_MIN_SCORE);
   });
 
   it("canary: with both people indexed, A's recall for B's canary returns nothing of B's, while A's own search is non-empty", async () => {
@@ -172,7 +188,9 @@ describe("recall isolation (RCLL-01)", () => {
 
   it("drops a returned match with no u, or with a u of another length", async () => {
     await indexItems(a, [item(A_REF, "Staff engineer interview", "Staff interview")], deps);
-    const values = new Array<number>(1024).fill(0).map((_, i) => (i === 0 ? 1 : 0));
+    // A's own message's vector, so all three matches score 1 and clear the floor
+    // the store applies since Phase 26 (D-07). Only the u check can drop two.
+    const values = fakeVectorOf("Staff engineer interview");
     fake.vectors.set("1".repeat(64), {
       id: "1".repeat(64),
       values,
