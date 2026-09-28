@@ -723,6 +723,8 @@ the failure arrives as a pre-commit rejection in the middle of an unrelated
 plan, with no obvious cause and a tempting one-character "fix" to the pattern.
 Take neither that fix nor an exclusion: the answer is always at the source.
 
+**The recall index fails open, so there is one way to it.** A query to the vector index with no namespace searches everyone's vectors. So one module, `src/recall/index.ts`, may name the index binding. Its read and write paths take the signed-in principal and nothing else. It sets the namespace and a metadata filter from `principal.userId`, and it drops any match that belongs to someone else. The store's two by-id read verbs skip the namespace and are banned under `src/`. Its keep-first write verb is banned in `src/recall/`. Describe all three by role in source comments, never by name. The per-person list of vector ids lives in that person's Durable Object. It is written before a vector is stored and cleared after a vector is deleted, so it always holds every id the index holds. Recall is inherent: every signed-in person's recent mail is indexed, with no switch. Their vectors are destroyed within a day of their access ending. The object checks that on its own alarm, asking about the name it stored for itself, so no caller can choose whose index is destroyed or kept. Changing any of this is a change to the safety boundary, not a refactor.
+
 Changing any of these five is a change to the project's safety boundary, not a
 refactor. If one of them is genuinely in the way, say so and get a decision —
 do not loosen the pattern list to make a commit go through. Exclusion is by
