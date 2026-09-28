@@ -330,13 +330,16 @@ describe("recallStep does one session of work, in the fixed order (D-13, D-27)",
     ).toEqual({ ok: true });
 
     h.setSnapshot(ARCHIVE, { mailbox: ARCHIVE, answered: false, gone: true });
+    h.setFolders([INBOX]);
     expect((await step(a, h)).outcome).toBe("gone");
     expect((await syncState(USER_A.userId)).folders).toEqual([INBOX]);
+    // The drop asks for another listing (26-REVIEW-2 WR-02). The archive's
+    // removal took the page slot, so the pause is waited out first.
+    await passPause(USER_A.userId);
+    expect((await step(a, h)).outcome).toBe("folders");
 
     // INBOX reported gone: nothing is dropped. The check is recorded as a
-    // failure (CR-01), so INBOX is not asked again on the very next call. The
-    // archive's removal took the page slot, so the pause is waited out first.
-    await passPause(USER_A.userId);
+    // failure (CR-01), so INBOX is not asked again on the very next call.
     expect(await stub.recallSetSync(INBOX, SEED_ROW)).toEqual({ ok: true });
     h.setSnapshot(INBOX, { mailbox: INBOX, answered: false, gone: true });
     const now = Date.now();
@@ -619,6 +622,29 @@ describe("recallSetFolders and recallSetSync refuse what they must not store", (
     }
     expect(await stub.recallSetFolders([INBOX, "a", "b", "c"])).toEqual({ ok: true });
     expect((await stub.recallSyncState()).folders).toEqual([INBOX, "a", "b", "c"]);
+  });
+
+  it("recallSetFolders stores when the list was listed: a time, null for list again, or now when absent (26-REVIEW-2 WR-02)", async () => {
+    const stub = objectFor(USER_A.userId);
+
+    expect(await stub.recallSetFolders([INBOX], 1234)).toEqual({ ok: true });
+    expect((await stub.recallSyncState()).listedAt).toBe(1234);
+    for (const bad of ["1234", Number.NaN, Number.POSITIVE_INFINITY, true, {}]) {
+      expect(await stub.recallSetFolders([INBOX, ARCHIVE], bad)).toEqual({
+        ok: false,
+        reason: "invalid",
+      });
+    }
+    const unchanged = await stub.recallSyncState();
+    expect(unchanged.folders).toEqual([INBOX]);
+    expect(unchanged.listedAt).toBe(1234);
+
+    expect(await stub.recallSetFolders([INBOX, ARCHIVE], null)).toEqual({ ok: true });
+    expect((await stub.recallSyncState()).listedAt).toBeNull();
+
+    const before = Date.now();
+    expect(await stub.recallSetFolders([INBOX])).toEqual({ ok: true });
+    expect((await stub.recallSyncState()).listedAt).toBeGreaterThanOrEqual(before);
   });
 
   it("both refuse destroying while the pending-destroy flag is set, and write nothing", async () => {

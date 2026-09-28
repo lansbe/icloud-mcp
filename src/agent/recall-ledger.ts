@@ -110,10 +110,18 @@ const CURSOR_ROW = "cursor:";
 const FOLDERS_ROW = "folders";
 
 /**
- * The `recall_state` key of the folder listing's failures, while there is no
- * folder list yet (26-REVIEW CR-01). Cleared when a list is stored.
+ * The `recall_state` key of the folder listing's failures (26-REVIEW CR-01).
+ * Cleared when a list is stored.
  */
 const LISTING_FAILED_ROW = "folders_failed";
+
+/**
+ * The `recall_state` key of when the stored folder list was listed, in ms
+ * since the epoch (26-REVIEW-2 WR-02). Absent means the list is due to be
+ * listed again: after a folder was dropped as gone, and for a list stored
+ * before this key existed.
+ */
+const LISTED_AT_ROW = "folders_listed_at";
 
 /** The `recall_state` key of one mailbox's sync row is this plus the mailbox (D-15). */
 export const SYNC_ROW = "sync:";
@@ -310,14 +318,23 @@ export function folderListOf(value: unknown): string[] | null {
 }
 
 /**
- * Store the folder list. The caller has checked it with `folderListOf`.
+ * Store the folder list, and when it was listed. The caller has checked the
+ * list with `folderListOf`.
  *
- * A stored list ends the listing's failure record: the listing worked. And a
- * folder that is not on it any more leaves nothing behind (26-REVIEW CR-03):
- * the sync row and the build cursor of every mailbox outside the list go.
+ * `listedAt` null stores no listing time, so the next step lists the folders
+ * again (26-REVIEW-2 WR-02). A stored list ends the listing's failure record:
+ * the listing worked. And a folder that is not on it any more leaves nothing
+ * behind (26-REVIEW CR-03): the sync row and the build cursor of every mailbox
+ * outside the list go. The caller removes that folder's vectors first.
  */
-export function writeFolders(sql: SqlStorage, folders: readonly string[]): void {
+export function writeFolders(
+  sql: SqlStorage,
+  folders: readonly string[],
+  listedAt: number | null,
+): void {
   writeState(sql, FOLDERS_ROW, JSON.stringify(folders));
+  if (listedAt === null) clearState(sql, LISTED_AT_ROW);
+  else writeState(sql, LISTED_AT_ROW, String(listedAt));
   clearState(sql, LISTING_FAILED_ROW);
   const keep = new Set(folders);
   for (const prefix of [SYNC_ROW, CURSOR_ROW]) {
@@ -333,6 +350,14 @@ export function writeFolders(sql: SqlStorage, folders: readonly string[]): void 
       if (!keep.has(k.slice(prefix.length))) clearState(sql, k);
     }
   }
+}
+
+/** When the stored folder list was listed, or null when it is due to be listed again. */
+export function readListedAt(sql: SqlStorage): number | null {
+  const raw = readState(sql, LISTED_AT_ROW);
+  if (raw === null) return null;
+  const at = Number(raw);
+  return Number.isFinite(at) ? at : null;
 }
 
 /** The folder listing's failure record, or null when there is none or it is malformed. */

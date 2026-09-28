@@ -23,8 +23,10 @@
 // each one IMAP session under the person's connection lease, and holds the
 // lease for that session only:
 //
-//   1. no folder list yet: list the folders and store INBOX plus the account's
-//      archive folder (D-12);
+//   1. no folder list yet, or it is a day old, or a folder was just dropped as
+//      gone: list the folders and store INBOX plus the account's archive
+//      folder (D-12; 26-REVIEW-2 WR-02). An archive folder that was replaced
+//      loses its vectors first. See `listFoldersStep`;
 //   2. the first folder not built is at seed: run the status check for that
 //      folder alone and store what it said (D-14, D-15);
 //   3. that folder is at build: read and index one page of it through Phase
@@ -130,6 +132,14 @@ export const RECALL_CHECK_INTERVAL_MS = 5 * 60 * 1000;
  * deletion sync reads the window's whole UID list.
  */
 export const RECALL_RECONCILE_INTERVAL_MS = 60 * 60 * 1000;
+
+/**
+ * How old the stored folder list may get before the step lists the folders
+ * again: a day (26-REVIEW-2 WR-02). So an archive folder the account renames,
+ * or replaces with another, is found within a day, at the cost of one session
+ * a day per person.
+ */
+export const RECALL_RELIST_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * How many failed build pages in a row send a folder back to seed, so its
@@ -374,25 +384,17 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
   const full = state.full;
   const now = deps.now();
 
-  // 2. No folder list yet: list them, store them, stop. A listing that failed
-  //    is left alone until its wait has passed (CR-01).
-  if (state.folders === null) {
-    if (waiting(state.listing, now)) return "idle";
-    try {
-      const folders = await underLease(principal, deps, (gate) =>
-        deps.reads.folders(gate, principal),
-      );
-      if (folders === LEASE_BUSY) return "lease_busy";
-      return afterSet(await stub.recallSetFolders(folders)) ?? "folders";
-    } catch {
-      try {
-        await stub.recallListingFailed(deps.now());
-      } catch {
-        // The next step lists again. Not read.
-      }
-      throw new RecallBuildError();
-    }
+  // 2. No folder list yet, or it is due to be listed again (WR-02): list them,
+  //    store them, stop. A listing that failed is left alone until its wait
+  //    has passed (CR-01); meanwhile a stored list is worked on as it is.
+  const relistDue =
+    state.folders === null ||
+    state.listedAt === null ||
+    now - state.listedAt >= RECALL_RELIST_INTERVAL_MS;
+  if (relistDue && !waiting(state.listing, now)) {
+    return listFoldersStep(principal, state.folders, deps);
   }
+  if (state.folders === null) return "idle";
 
   const folders = state.folders;
   // A folder name is the account's own, so it is only ever an own key (WR-06).
@@ -466,6 +468,61 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
 }
 
 /**
+ * The folder listing, as one step (D-12; 26-REVIEW-2 WR-02): list the folders
+ * in one session, and store what the build should cover.
+ *
+ * `stored` is the list stored now, or null before the first listing. The new
+ * list is what the listing gives, with two rules for the archive folder:
+ *   - The listing names a different archive folder than the stored one (it was
+ *     renamed, or the account marks another folder as its archive). The old
+ *     one's vectors go first, under the page slot as a removal, the same way a
+ *     folder dropped as gone loses them (CR-03). Then the new list is stored,
+ *     and the old folder's sync row and cursor go with it. A refused slot
+ *     stores nothing, so the next step lists again.
+ *   - The listing names no archive folder, or two, while one is stored. The
+ *     stored one is kept. A listing that names none is no evidence the folder
+ *     changed, and dropping it would throw its index away. If the folder was
+ *     deleted, its own status check finds it gone, and the drop then asks for
+ *     another listing.
+ *
+ * The time stored is this step's, so the next listing is a day later. A
+ * failure is recorded on the object, so the next listing waits (CR-01).
+ */
+async function listFoldersStep(
+  principal: Principal,
+  stored: readonly string[] | null,
+  deps: StepDeps,
+): Promise<StepOutcome> {
+  const stub = agentFor(principal);
+  try {
+    const listed = await underLease(principal, deps, (gate) =>
+      deps.reads.folders(gate, principal),
+    );
+    if (listed === LEASE_BUSY) return "lease_busy";
+    const keepStored = stored !== null && stored.length > 1 && listed.length < 2;
+    const next = keepStored ? stored : listed;
+    // One replaced folder per step: each removal takes the page slot, and the
+    // slot's pause refuses a second in the same step. Any other stays listed,
+    // and the next step lists again for it.
+    const replaced = (stored ?? []).filter((one) => !next.includes(one));
+    if (replaced.length > 0) {
+      const removed = await forgetMailbox(principal, replaced[0]!, deps);
+      if (removed !== "removed") return removed;
+    }
+    const pending = replaced.slice(1);
+    const listedAt = pending.length > 0 ? null : deps.now();
+    return afterSet(await stub.recallSetFolders([...next, ...pending], listedAt)) ?? "folders";
+  } catch {
+    try {
+      await stub.recallListingFailed(deps.now());
+    } catch {
+      // The next step lists again. Not read.
+    }
+    throw new RecallBuildError();
+  }
+}
+
+/**
  * One step of a folder that is not built yet: its status check at seed, or one
  * page through Phase 25's engine at build.
  */
@@ -531,6 +588,11 @@ async function advanceUnbuilt(
  * list is changed. A refusal of that slot answers the refusal and drops
  * nothing, so the next status check tries again. Storing the shorter list also
  * clears the folder's sync row and build cursor.
+ *
+ * The shorter list is stored with no listing time, so the next step lists the
+ * folders again (26-REVIEW-2 WR-02). A folder that was deleted and recreated,
+ * or replaced by another the account marks as its archive, is then found and
+ * built, instead of being left out of recall for as long as the grant lives.
  */
 async function dropIfGone(
   principal: Principal,
@@ -545,7 +607,7 @@ async function dropIfGone(
   const removed = await forgetMailbox(principal, mailbox, deps);
   if (removed !== "removed") return removed;
   const kept = folders.filter((one) => one !== mailbox);
-  return afterSet(await agentFor(principal).recallSetFolders(kept)) ?? "gone";
+  return afterSet(await agentFor(principal).recallSetFolders(kept, null)) ?? "gone";
 }
 
 /** Whether two mod-sequences are the same, compared as the digit strings they are. */

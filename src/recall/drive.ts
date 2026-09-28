@@ -51,7 +51,8 @@
 // over about 60 of the person's mail calls. A person at the ceiling costs about
 // $0.12 once and $0.11 a month. The daily cap bounds a runaway at about $0.06
 // of embedding per person per day. Status checks run at most once per folder
-// per five minutes, and the folder listing once. The numbers and their
+// per five minutes. The folder listing runs at most once a day, plus once
+// after a folder is dropped as gone (26-REVIEW-2 WR-02). The numbers and their
 // assumptions are in 26-CONTEXT D-31 and 25-CONTEXT D-24.
 
 import type { McpServer } from "@modelcontextprotocol/server";

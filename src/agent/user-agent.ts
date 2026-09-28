@@ -76,6 +76,7 @@ import {
   pageRefusal,
   RECALL_PAGE_PAUSE_MS,
   readFolders,
+  readListedAt,
   readListingFailure,
   readSyncRows,
   type RetryState,
@@ -182,14 +183,16 @@ export type BeginPageAnswer =
  * never `full`: a removal is never refused at the vector ceiling. `full` says
  * whether a page that adds vectors would be refused at that ceiling now
  * (26-REVIEW-2 WR-04). `folders` is the stored folder list, or null before the
- * first listing. `listing` is the folder listing's failure record while there
- * is no list, or null. `sync` is every mailbox's sync row that parses, keyed
- * by mailbox.
+ * first listing. `listedAt` is when that list was listed, or null when it is
+ * due to be listed again (26-REVIEW-2 WR-02). `listing` is the folder
+ * listing's failure record, or null. `sync` is every mailbox's sync row that
+ * parses, keyed by mailbox.
  */
 export interface RecallSyncState {
   readonly slot: PageRefusal | "free";
   readonly full: boolean;
   readonly folders: string[] | null;
+  readonly listedAt: number | null;
   readonly listing: RetryState | null;
   readonly sync: Record<string, SyncRow>;
 }
@@ -575,6 +578,7 @@ export class UserAgent extends DurableObject<Env> {
       slot: pageRefusal(sql, "reconcile", now) ?? "free",
       full: pageRefusal(sql, "build", now) === "full",
       folders: readFolders(sql),
+      listedAt: readListedAt(sql),
       listing: readListingFailure(sql),
       sync: readSyncRows(sql),
     };
@@ -602,21 +606,30 @@ export class UserAgent extends DurableObject<Env> {
   /**
    * Store the folder list the build covers (Phase 26, D-12, D-15).
    *
+   * `listedAt` is when the list was listed, in ms since the epoch: the step
+   * lists again once it is a day old (26-REVIEW-2 WR-02). Null stores no time,
+   * so the next step lists again, which the step asks for after it dropped a
+   * folder as gone. Absent means now, by this object's clock.
+   *
    * Refuses, in this order: `unnamed`; `invalid` unless the list is 1 to 4
    * distinct non-empty names of at most 1024 characters, the first exactly
-   * `INBOX`; `destroying` while a destroy is running, so a step racing a destroy
-   * cannot put the list back. No `await`, so the check and the write are one
-   * atomic step. The destroy already clears this row: it lives in the recall
-   * state table.
+   * `INBOX`, and `listedAt` is absent, null or a finite number; `destroying`
+   * while a destroy is running, so a step racing a destroy cannot put the list
+   * back. No `await`, so the check and the write are one atomic step. The
+   * destroy already clears these rows: they live in the recall state table.
    */
-  recallSetFolders(list: unknown): SetAnswer {
+  recallSetFolders(list: unknown, listedAt?: unknown): SetAnswer {
     const sql = this.ctx.storage.sql;
     ensureRecallSchema(sql);
     if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
     const folders = folderListOf(list);
     if (folders === null) return { ok: false, reason: "invalid" };
+    const at = listedAt === undefined ? Date.now() : listedAt;
+    if (at !== null && (typeof at !== "number" || !Number.isFinite(at))) {
+      return { ok: false, reason: "invalid" };
+    }
     if (destroyPending(sql)) return { ok: false, reason: "destroying" };
-    writeFolders(sql, folders);
+    writeFolders(sql, folders, at);
     return { ok: true };
   }
 

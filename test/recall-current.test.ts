@@ -37,6 +37,7 @@ import {
   indexNewMail,
   RECALL_CHECK_INTERVAL_MS,
   RECALL_RECONCILE_INTERVAL_MS,
+  RECALL_RELIST_INTERVAL_MS,
   recallStep,
   type StepOutcome,
 } from "../src/recall/sync";
@@ -301,11 +302,14 @@ describe("a built folder's status check runs alone, at most once in five minutes
     });
 
     h.setSnapshot(ARCHIVE, { mailbox: ARCHIVE, answered: false, gone: true });
+    h.setFolders([INBOX]);
     expect((await step(a, h)).outcome).toBe("gone");
     expect((await objectFor(USER_A.userId).recallSyncState()).folders).toEqual([INBOX]);
-
-    // The drop's removal took the page slot, so wait out the pause first.
+    // The drop asks for another listing (26-REVIEW-2 WR-02). The drop's
+    // removal took the page slot, so the pause is waited out first.
     await passPause(USER_A.userId);
+    expect((await step(a, h)).outcome).toBe("folders");
+
     h.setSnapshot(INBOX, { mailbox: INBOX, answered: false, gone: true });
     expect((await step(a, h)).outcome).toBe("unanswered");
     expect((await objectFor(USER_A.userId).recallSyncState()).folders).toEqual([INBOX]);
@@ -879,12 +883,15 @@ describe("removals reach the index on the folder's next sync", () => {
     expect(h.index.vectors.size).toBe(7);
     await passPause(USER_A.userId);
 
-    // Still full. The archive's check finds it gone, and its vectors go.
+    // Still full. The archive's check finds it gone, and its vectors go. The
+    // listing that follows the drop runs at the ceiling too.
     expect((await objectFor(USER_A.userId).recallSyncState()).full).toBe(true);
+    h.setFolders([INBOX]);
     expect((await step(a, h)).outcome).toBe("gone");
     expect(h.index.vectors.size).toBe(3);
     expect((await objectFor(USER_A.userId).recallSyncState()).folders).toEqual([INBOX]);
     await passPause(USER_A.userId);
+    expect((await step(a, h)).outcome).toBe("folders");
 
     // Still full. New mail is found by the check, then waits: no read, no
     // lease, and the step says the index is full.
@@ -1243,5 +1250,163 @@ describe("a failure is recorded and waited out, and never stops the other folder
     const state = await objectFor(USER_A.userId).recallSyncState();
     expect(state.folders).toEqual([INBOX]);
     expect(state.listing).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The folder list is listed again (26-REVIEW-2 WR-02, 26-REVIEW IN-04)
+// ---------------------------------------------------------------------------
+
+describe("the folder list is listed again, so a replaced archive folder is found (26-REVIEW-2 WR-02)", () => {
+  const ARCHIVE_2 = "Archive 2";
+
+  /** INBOX (3), the archive (4) and a second folder (6) the listing may name later. */
+  function threeFolders(): StepHarness {
+    return fakeStepDeps({
+      folders: [INBOX, ARCHIVE],
+      mailboxes: {
+        [INBOX]: { uidValidity: 100, messages: scriptedMessages(3) },
+        [ARCHIVE]: { uidValidity: 300, messages: scriptedMessages(4) },
+        [ARCHIVE_2]: { uidValidity: 500, messages: scriptedMessages(6) },
+      },
+    });
+  }
+
+  /** Drive INBOX and the archive to built through real steps. */
+  async function buildBoth(a: Principal, h: StepHarness): Promise<void> {
+    expect((await step(a, h)).outcome).toBe("folders");
+    expect((await step(a, h)).outcome).toBe("seeded");
+    expect((await step(a, h)).outcome).toBe("done");
+    await passPause(USER_A.userId);
+    expect((await step(a, h)).outcome).toBe("seeded");
+    expect((await step(a, h)).outcome).toBe("done");
+    await passPause(USER_A.userId);
+    expect(await ledgerCount(USER_A.userId)).toBe(7);
+  }
+
+  it("a folder dropped as gone is followed by a listing, and the folder the account now marks as its archive is built", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = threeFolders();
+    const now = Date.now();
+    h.setNow(now);
+    await buildBoth(a, h);
+
+    // The archive is deleted, and another folder is marked as the archive.
+    h.setGone(ARCHIVE, true);
+    h.setFolders([INBOX, ARCHIVE_2]);
+    const t = now + 6 * MINUTE;
+    h.setNow(t);
+    expect((await step(a, h)).outcome).toBe("checked");
+    expect((await step(a, h)).outcome).toBe("gone");
+    expect(await ledgerCount(USER_A.userId)).toBe(3);
+    expect((await objectFor(USER_A.userId).recallSyncState()).listedAt).toBeNull();
+
+    await passPause(USER_A.userId);
+    expect((await step(a, h)).outcome).toBe("folders");
+    const state = await objectFor(USER_A.userId).recallSyncState();
+    expect(state.folders).toEqual([INBOX, ARCHIVE_2]);
+    expect(state.listedAt).toBe(t);
+
+    expect((await step(a, h)).outcome).toBe("seeded");
+    expect((await step(a, h)).outcome).toBe("done");
+    expect(await ledgerCount(USER_A.userId)).toBe(3 + 6);
+    expect((await rowOf(USER_A.userId, ARCHIVE_2))!.stage).toBe("built");
+  });
+
+  it("a day after the last listing the folders are listed again; a renamed archive loses its old vectors first, and the new name is built", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = threeFolders();
+    const now = Date.now();
+    h.setNow(now);
+    await buildBoth(a, h);
+
+    // A minute short of a day: no listing, INBOX's check instead.
+    h.setFolders([INBOX, ARCHIVE_2]);
+    h.setNow(now + RECALL_RELIST_INTERVAL_MS - MINUTE);
+    expect((await step(a, h)).outcome).toBe("checked");
+    expect(h.log.filter((entry) => entry === "folders:start")).toHaveLength(1);
+    await passPause(USER_A.userId);
+
+    // A day: the listing comes before any check.
+    const t = now + RECALL_RELIST_INTERVAL_MS;
+    h.setNow(t);
+    const run = await step(a, h);
+    expect(run.outcome).toBe("folders");
+    expect(run.log).toEqual(["lease", "enter", "folders:start", "folders:end", "exit"]);
+    const state = await objectFor(USER_A.userId).recallSyncState();
+    expect(state.folders).toEqual([INBOX, ARCHIVE_2]);
+    expect(state.listedAt).toBe(t);
+    // The old archive's vectors, sync row and cursor are gone; INBOX's stay.
+    expect(await ledgerCount(USER_A.userId)).toBe(3);
+    expect(h.index.vectors.size).toBe(3);
+    const keys = (await recallTables(USER_A.userId)).state.map((row) => row.split("=")[0]);
+    expect(keys).not.toContain(`sync:${ARCHIVE}`);
+    expect(keys).not.toContain(`cursor:${ARCHIVE}`);
+    expect(keys).toContain(`sync:${INBOX}`);
+
+    // Then the new name is seeded and built, with no second listing.
+    await passPause(USER_A.userId);
+    const outcomes: StepOutcome[] = [];
+    for (let n = 0; n < 4; n += 1) {
+      await passPause(USER_A.userId);
+      outcomes.push((await step(a, h)).outcome);
+    }
+    expect(outcomes).toContain("seeded");
+    expect(outcomes).not.toContain("folders");
+    expect((await rowOf(USER_A.userId, ARCHIVE_2))!.stage).toBe("built");
+    expect(await ledgerCount(USER_A.userId)).toBe(3 + 6);
+  });
+
+  it("a listing that names no archive folder keeps the stored one and its index", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = threeFolders();
+    const now = Date.now();
+    h.setNow(now);
+    await buildBoth(a, h);
+
+    h.setFolders([INBOX]);
+    const t = now + RECALL_RELIST_INTERVAL_MS;
+    h.setNow(t);
+    expect((await step(a, h)).outcome).toBe("folders");
+    const state = await objectFor(USER_A.userId).recallSyncState();
+    expect(state.folders).toEqual([INBOX, ARCHIVE]);
+    expect(state.listedAt).toBe(t);
+    expect(await ledgerCount(USER_A.userId)).toBe(7);
+    expect((await rowOf(USER_A.userId, ARCHIVE))!.stage).toBe("built");
+    // Listed: the next step is a check, not another listing.
+    expect((await step(a, h)).outcome).toBe("checked");
+  });
+
+  it("a listing again that fails is waited out, and the stored list is worked on meanwhile", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX],
+      mailboxes: { [INBOX]: { uidValidity: 100, messages: scriptedMessages(5) } },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    await buildInbox(a, h);
+
+    h.setListingFails(true);
+    const t = now + RECALL_RELIST_INTERVAL_MS;
+    h.setNow(t);
+    await expect(recallStep(a, h.deps)).rejects.toBeInstanceOf(RecallBuildError);
+    expect((await objectFor(USER_A.userId).recallSyncState()).listing).toEqual({
+      failedAt: t,
+      failures: 1,
+    });
+
+    // Inside the listing's wait: INBOX is still checked, then nothing.
+    expect((await step(a, h)).outcome).toBe("checked");
+    expect((await step(a, h)).outcome).toBe("idle");
+    expect(h.log.filter((entry) => entry === "folders:start")).toHaveLength(2);
+
+    // After it: listed again.
+    h.setListingFails(false);
+    h.setNow(t + RECALL_CHECK_INTERVAL_MS);
+    expect((await step(a, h)).outcome).toBe("folders");
+    const state = await objectFor(USER_A.userId).recallSyncState();
+    expect(state.listing).toBeNull();
+    expect(state.listedAt).toBe(t + RECALL_CHECK_INTERVAL_MS);
   });
 });
