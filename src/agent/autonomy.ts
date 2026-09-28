@@ -152,8 +152,10 @@ export type AutonomyEnv = Pick<
  * them (D-27). Left out, nothing is pending.
  *
  * `ticket` is the one the object's queue handed the operation this runs in
- * (review WR-04). `withAutonomySession` refuses without a live one. `armWith`
- * passes it through to its proof. Other functions here ignore it.
+ * (review WR-04). `withAutonomySession` refuses without a live one, and
+ * refuses a ticket that has already opened a session (review R2-WR-01).
+ * `armWith` passes it through to its proof, which is that ticket's one
+ * session. Other functions here ignore it.
  */
 export interface AutonomyDeps {
   readonly storage: AutonomyStorage;
@@ -189,6 +191,15 @@ function ticketIsLive(ticket: unknown): boolean {
 }
 
 /**
+ * The one session each ticket has opened (review R2-WR-01). A ticket opens at
+ * most one session, ever: a second one on the same ticket is refused, whether
+ * the first is still open or has settled. The queue's `run` reads this before
+ * it lets its ticket die, and waits for the session it finds. Weak, like the
+ * set above.
+ */
+const sessionOn = new WeakMap<object, Promise<unknown>>();
+
+/**
  * Runs one autonomy operation at a time (D-27).
  *
  * Each `run` waits for the one before it to settle, then runs. A rejection in
@@ -198,6 +209,13 @@ function ticketIsLive(ticket: unknown): boolean {
  * Each operation is handed a ticket, live only while that operation runs
  * (review WR-04). A session needs one, so the only way to open a session is
  * from inside a `run`.
+ *
+ * A RUN ENDS WHEN ITS SESSION DOES (review R2-WR-01). A ticket opens at most
+ * one session. When the operation settles, the run waits for that session to
+ * settle too, and only then ends the ticket and lets the next run start. So a
+ * session the operation started and did not await (a `void` call, a `.then`
+ * chain that was not returned) still finishes inside its own run, and the
+ * next run's refresh cannot overlap it.
  */
 export interface AutonomyQueue {
   run<T>(operation: (ticket: AutonomyTicket) => Promise<T>): Promise<T>;
@@ -214,6 +232,16 @@ export function oneAtATime(): AutonomyQueue {
         try {
           return await operation(ticket);
         } finally {
+          // A session opened on this ticket that the operation did not await
+          // still ends inside this run (review R2-WR-01). A session never
+          // rejects, and a rejection here would be ignored anyway.
+          const open = sessionOn.get(ticket);
+          if (open !== undefined) {
+            await open.then(
+              () => undefined,
+              () => undefined,
+            );
+          }
           liveTickets.delete(ticket);
         }
       });
@@ -608,8 +636,9 @@ function rpcMessageWithId(bodyText: string, id: number): Record<string, unknown>
  *
  * In this order and no other:
  *   0. The caller must hold a live ticket from the object's queue
- *      (`deps.ticket`, review WR-04). Without one it answers `failed`, and
- *      reads, writes and sends nothing. See "ONE AT A TIME" below.
+ *      (`deps.ticket`, review WR-04) that has not opened a session before
+ *      (review R2-WR-01). Otherwise it answers `failed`, and reads, writes and
+ *      sends nothing. See "ONE AT A TIME" below.
  *   1. The allow list, seed then store, by the object's own user id. Not
  *      admitted answers `not_allowed`: the record is not read and not touched.
  *   2. Both autonomy secrets must be set, and the seal key must be the shape
@@ -663,14 +692,55 @@ function rpcMessageWithId(bodyText: string, id: number): Record<string, unknown>
  * inside `autonomyQueue.run((ticket) => ...)`, and passes that ticket.
  * Creating a second queue just to get a ticket defeats this on purpose, and
  * is a decision on the safety boundary, not a refactor.
+ *
+ * ONE SESSION PER TICKET, AND THE RUN WAITS FOR IT (review R2-WR-01). A
+ * ticket checked once, at entry, proves only that the session STARTED inside
+ * a run. Two ordinary slips got past that: two sessions on one ticket
+ * (`Promise.all` of two), which refresh the same token at once; and a session
+ * the operation did not await, which kept refreshing after its run ended and
+ * the next run began. So a ticket now opens one session, ever: the claim is
+ * made synchronously, before this function's first `await`, and a second
+ * session on the same ticket answers `failed` with nothing read or sent. And
+ * the queue's `run` waits for that session before it ends the ticket, so the
+ * session always finishes inside its own run. As a second guard, the ticket
+ * is checked again before every write to the record, before the refresh, and
+ * before every tool call. While the queue waits as it does, those checks
+ * never fire; they make a later change to the queue fail closed rather than
+ * open.
  */
 export async function withAutonomySession<T>(
   deps: AutonomyDeps,
   use: (call: AutonomyCall) => Promise<T>,
 ): Promise<AutonomySessionOutcome<T>> {
+  let ticket: object;
   try {
-    if (!ticketIsLive(deps.ticket)) return { kind: "failed" };
+    const held: unknown = deps.ticket;
+    if (!ticketIsLive(held) || sessionOn.has(held as object)) return { kind: "failed" };
+    ticket = held as object;
+  } catch {
+    return { kind: "failed" };
+  }
+  // Claimed before the first `await`, so the run sees this session however
+  // its operation treats the promise (review R2-WR-01).
+  const session = sessionOnTicket(deps, ticket, use);
+  sessionOn.set(ticket, session);
+  return session;
+}
+
+/**
+ * The body of one session, on a ticket it has already claimed. Only
+ * `withAutonomySession` calls it. `live()` is asked again after every `await`
+ * that comes before a write or a request (review R2-WR-01).
+ */
+async function sessionOnTicket<T>(
+  deps: AutonomyDeps,
+  ticket: object,
+  use: (call: AutonomyCall) => Promise<T>,
+): Promise<AutonomySessionOutcome<T>> {
+  const live = (): boolean => ticketIsLive(ticket);
+  try {
     if (!(await admitted(deps))) return { kind: "not_allowed" };
+    if (!live()) return { kind: "failed" };
 
     const clientSecret = deps.env.AUTONOMY_CLIENT_SECRET;
     const sealKey = deps.env.AUTONOMY_SEAL_KEY;
@@ -701,22 +771,25 @@ export async function withAutonomySession<T>(
     // at once. It answers `failed`, and the record is kept.
     if (!insideGrace(deps, record.armedAt)) {
       const standing = await standingOf(deps, record.grantId);
-      if (standing === "unknown") return { kind: "failed" };
+      if (standing === "unknown" || !live()) return { kind: "failed" };
       if (standing !== "standing") {
         await sweepAutonomyGrants(deps.env.OAUTH_KV, deps.name, null, pendingOf(deps));
-        deleteIfStill(deps.storage, record);
+        if (live()) deleteIfStill(deps.storage, record);
         return { kind: "revoked" };
       }
     }
 
     const autonomyRefreshToken = await unseal(sealKey, deps.name, record);
+    if (!live()) return { kind: "failed" };
     if (autonomyRefreshToken === null) {
       deleteIfStill(deps.storage, record);
       return { kind: "off" };
     }
 
-    // One at a time (D-27). The ticket checked at the top is what holds this:
-    // this code runs only inside a run of the object's queue. The generation
+    // One at a time (D-27). The ticket claimed in `withAutonomySession` is what
+    // holds this: this code runs only inside a run of the object's queue, it
+    // is the only session on its ticket, and the run waits for it before the
+    // next run starts (review R2-WR-01). The generation
     // checks below DO NOT make a caller outside the queue safe. They catch a
     // record replaced or deleted while the refresh was out. They cannot catch
     // two sessions refreshing the same token at once, which leaves a dead
@@ -735,7 +808,7 @@ export async function withAutonomySession<T>(
       return { kind: "failed" };
     }
     if (answer.kind === "final") {
-      deleteIfStill(deps.storage, record);
+      if (live()) deleteIfStill(deps.storage, record);
       return { kind: "revoked" };
     }
     // `config` (invalid_client) falls through to here with every other
@@ -750,7 +823,10 @@ export async function withAutonomySession<T>(
     }
 
     const resealed = await seal(sealKey, deps.name, rotated);
-    if (resealed === null) {
+    // A ticket that died while the seal ran must not write (review R2-WR-01).
+    // The rotated token is dropped and NOT revoked: revoking it would end the
+    // whole grant, and the stored token is still accepted as the previous one.
+    if (resealed === null || !live()) {
       await revokeAtEndpoint(deps, clientSecret, autonomyAccessToken, "access_token");
       return { kind: "failed" };
     }
@@ -773,7 +849,7 @@ export async function withAutonomySession<T>(
     let open = true;
     let nextId = 1;
     const call: AutonomyCall = async (tool, args) => {
-      if (!open || !AUTONOMY_TOOLS.includes(tool)) return { kind: "failed" };
+      if (!open || !live() || !AUTONOMY_TOOLS.includes(tool)) return { kind: "failed" };
       const id = nextId;
       nextId += 1;
       try {

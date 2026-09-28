@@ -431,7 +431,11 @@ export class UserAgent extends DurableObject<Env> {
    * runs, and a session refuses without one (review WR-04). So opening a
    * session from outside this queue is refused at run time, not merely
    * discouraged: Phase 28's job opens its session inside
-   * `autonomyQueue.run((ticket) => ...)` and passes that ticket.
+   * `autonomyQueue.run((ticket) => ...)` and passes that ticket. A ticket
+   * opens one session, ever, and the run does not end until that session has
+   * settled, even when the operation did not await it (review R2-WR-01). So
+   * two sessions in one run are refused too, and a session cannot outlive
+   * its run.
    *
    * WHY. The Claude client submits the sign-in form twice, about 1.4 seconds
    * apart (measured 2026-09-21), so every sign-in arms twice. Without one at a

@@ -30,6 +30,7 @@ import { describe, expect, it } from "vitest";
 import {
   AUTONOMY_KEY,
   type AutonomyCall,
+  type AutonomyCallOutcome,
   type AutonomyDeps,
   type AutonomySessionOutcome,
   type AutonomyEnv,
@@ -936,6 +937,116 @@ describe("autonomy credential: a session needs a live ticket from the queue (rev
           ),
       );
       expect(inside.kind).toBe("ok");
+    } finally {
+      await armed.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review fix R2-WR-01: a ticket holds one session, and its run waits for it.
+
+describe("autonomy credential: a ticket holds one session, and its run waits for it (review R2-WR-01)", () => {
+  const whoami = (call: AutonomyCall) => call("account_whoami", {});
+
+  it("a second session on one ticket, at once or after the first: failed, nothing sent, and the key still works", async () => {
+    const armed = await signInArmed(LISTED_APPLE_ID, "autonomy one session per ticket");
+    try {
+      const result = await runInDurableObject(
+        entryEnv().USER_AGENT.getByName(armed.userId),
+        async (_i, state) => {
+          // Two sessions on one ticket at the same time: the combinator slip.
+          const atOnce = recordingFetch();
+          const together = await oneAtATime().run((ticket) => {
+            const deps = { ...depsOver(state.storage.kv, armed.userId, atOnce.selfFetch), ticket };
+            return Promise.all([withAutonomySession(deps, whoami), withAutonomySession(deps, whoami)]);
+          });
+          // Two sessions on one ticket, one after the other: a spent ticket.
+          const inTurn = recordingFetch();
+          const serial = await oneAtATime().run(async (ticket) => {
+            const deps = { ...depsOver(state.storage.kv, armed.userId, inTurn.selfFetch), ticket };
+            const first = await withAutonomySession(deps, whoami);
+            const second = await withAutonomySession(deps, whoami);
+            return [first, second] as const;
+          });
+          const later = await sessionInQueue(
+            depsOver(state.storage.kv, armed.userId, recordingFetch().selfFetch),
+            whoami,
+          );
+          return { together, atOnce: atOnce.paths, serial, inTurn: inTurn.paths, later };
+        },
+      );
+      // One session is: the refresh, the one tool call, the bearer's revoke.
+      const oneSession = ["/oauth/token", "/mcp", "/oauth/token"];
+      expect(result.together[0].kind).toBe("ok");
+      expect(result.together[1]).toEqual({ kind: "failed" });
+      expect(result.atOnce).toEqual(oneSession);
+      expect(result.serial[0].kind).toBe("ok");
+      expect(result.serial[1]).toEqual({ kind: "failed" });
+      expect(result.inTurn).toEqual(oneSession);
+      expect(result.later.kind).toBe("ok");
+    } finally {
+      await armed.cleanup();
+    }
+  });
+
+  it("a session its run did not wait for still ends inside that run: the next run starts only after it settles", async () => {
+    const armed = await signInArmed(LISTED_APPLE_ID, "autonomy detached session");
+    try {
+      const result = await runInDurableObject(
+        entryEnv().USER_AGENT.getByName(armed.userId),
+        async (_i, state) => {
+          const events: string[] = [];
+          // The first request any session sends is held until the case lets
+          // it go. The hold is released from inside the object, so the
+          // forwarded call continues in the object's own context.
+          let release = (): void => {};
+          const released = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          let held = false;
+          const selfFetch = async (request: Request): Promise<Response> => {
+            if (!held) {
+              held = true;
+              events.push("first request out");
+              await released;
+              events.push("first request back");
+            }
+            return entryEnv().SELF.fetch(request);
+          };
+          const deps = depsOver(state.storage.kv, armed.userId, selfFetch);
+          const queue = oneAtATime();
+          const detached: { session?: Promise<AutonomySessionOutcome<AutonomyCallOutcome>> } = {};
+
+          // The slip: the session is started and neither awaited nor returned.
+          const first = queue.run(async (ticket) => {
+            detached.session = withAutonomySession({ ...deps, ticket }, whoami);
+            events.push("first operation returned");
+          });
+          const second = queue.run(async (ticket) => {
+            events.push("second run started");
+            return withAutonomySession({ ...deps, ticket }, whoami);
+          });
+
+          for (let i = 0; i < 200 && !held; i += 1) await new Promise((r) => setTimeout(r, 5));
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          events.push("hold released");
+          release();
+          await first;
+          events.push("first run settled");
+          const secondOutcome = await second;
+          const detachedOutcome = await detached.session;
+          return { events, secondOutcome, detachedOutcome };
+        },
+      );
+
+      const at = (event: string) => result.events.indexOf(event);
+      expect(at("first request out")).toBeGreaterThanOrEqual(0);
+      expect(at("second run started")).toBeGreaterThan(at("hold released"));
+      expect(at("second run started")).toBeGreaterThan(at("first request back"));
+      expect(at("first run settled")).toBeGreaterThan(at("first request back"));
+      expect(result.detachedOutcome?.kind).toBe("ok");
+      expect(result.secondOutcome.kind).toBe("ok");
     } finally {
       await armed.cleanup();
     }
