@@ -17,7 +17,7 @@
 
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ensureRecallSchema,
   type SyncRow,
@@ -300,6 +300,8 @@ describe("a built folder's status check runs alone, at most once in five minutes
     expect((await step(a, h)).outcome).toBe("gone");
     expect((await objectFor(USER_A.userId).recallSyncState()).folders).toEqual([INBOX]);
 
+    // The drop's removal took the page slot, so wait out the pause first.
+    await passPause(USER_A.userId);
     h.setSnapshot(INBOX, { mailbox: INBOX, answered: false, gone: true });
     expect((await step(a, h)).outcome).toBe("unanswered");
     expect((await objectFor(USER_A.userId).recallSyncState()).folders).toEqual([INBOX]);
@@ -589,6 +591,89 @@ describe("removals reach the index on the folder's next sync", () => {
     expect(pages[pages.length - 1]).toEqual({ kind: "page", mailbox: INBOX, cursor: null });
     expect(await ledgerCount(USER_A.userId)).toBe(5);
     expect((await rowOf(USER_A.userId, INBOX))!.stage).toBe("built");
+  });
+
+  it("a folder dropped as gone takes its vectors, its sync row and its cursor with it (26-REVIEW CR-03)", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX, ARCHIVE],
+      mailboxes: {
+        [INBOX]: { uidValidity: 100, messages: scriptedMessages(3) },
+        [ARCHIVE]: { uidValidity: 300, messages: scriptedMessages(4) },
+      },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    expect((await step(a, h)).outcome).toBe("folders");
+    expect((await step(a, h)).outcome).toBe("seeded");
+    expect((await step(a, h)).outcome).toBe("done");
+    await passPause(USER_A.userId);
+    expect((await step(a, h)).outcome).toBe("seeded");
+    expect((await step(a, h)).outcome).toBe("done");
+    expect(await ledgerCount(USER_A.userId)).toBe(7);
+    await passPause(USER_A.userId);
+
+    // The archive folder is deleted in iCloud. INBOX's check comes first (same
+    // check time, listed first), then the archive's finds it gone.
+    h.setGone(ARCHIVE, true);
+    h.setNow(now + 6 * MINUTE);
+    expect((await step(a, h)).outcome).toBe("checked");
+    expect((await step(a, h)).outcome).toBe("gone");
+
+    expect((await objectFor(USER_A.userId).recallSyncState()).folders).toEqual([INBOX]);
+    expect(await ledgerCount(USER_A.userId)).toBe(3);
+    expect(h.index.vectors.size).toBe(3);
+    const keys = (await recallTables(USER_A.userId)).state.map((row) => row.split("=")[0]);
+    expect(keys).not.toContain(`sync:${ARCHIVE}`);
+    expect(keys).not.toContain(`cursor:${ARCHIVE}`);
+    expect(keys).toContain(`sync:${INBOX}`);
+    expect(keys).toContain(`cursor:${INBOX}`);
+  });
+
+  it("a gone folder whose removal is refused by the slot stays listed, and the next check drops it", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX, ARCHIVE],
+      mailboxes: {
+        [INBOX]: { uidValidity: 100, messages: scriptedMessages(3) },
+        [ARCHIVE]: { uidValidity: 300, messages: scriptedMessages(4) },
+      },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    await seedRows(USER_A.userId, [INBOX, ARCHIVE], {
+      [INBOX]: builtRow(stateOf(INBOX, 100, 4), { checkedAt: now + MINUTE }),
+      [ARCHIVE]: builtRow(stateOf(ARCHIVE, 300, 5), { checkedAt: now - 10 * MINUTE }),
+    });
+    h.setGone(ARCHIVE, true);
+    // Another page starts between the slot read and the removal's slot.
+    const stub = objectFor(USER_A.userId);
+    await runInDurableObject(stub, (instance: UserAgent) => {
+      const prototype = Object.getPrototypeOf(instance) as UserAgent;
+      const real = prototype.recallBeginPage;
+      let first = true;
+      vi.spyOn(prototype, "recallBeginPage").mockImplementation(function (
+        this: UserAgent,
+        mailbox: unknown,
+        kind: unknown,
+      ) {
+        if (first) {
+          first = false;
+          return { ok: false, reason: "busy" };
+        }
+        return real.call(this, mailbox, kind);
+      });
+    });
+
+    try {
+      expect((await step(a, h)).outcome).toBe("busy");
+      expect((await stub.recallSyncState()).folders).toEqual([INBOX, ARCHIVE]);
+
+      expect((await step(a, h)).outcome).toBe("gone");
+      expect((await stub.recallSyncState()).folders).toEqual([INBOX]);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 
   it("the mod-sequence moved and the last sync was two hours ago: the deletion sync removes what iCloud no longer has, and counts", async () => {

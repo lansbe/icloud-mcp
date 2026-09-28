@@ -360,6 +360,43 @@ export async function reconcileMailbox(
 }
 
 /**
+ * Remove every vector of `mailbox` from the store and the ledger, because the
+ * folder itself is gone (26-REVIEW CR-03).
+ *
+ * The step calls this before it drops a folder its status check reported gone.
+ * A dropped folder gets no further sync, so without this its subject lines
+ * would stay recallable until they expired. It takes the page slot as a
+ * reconcile, so it is paced, exclusive and counted like any other removal,
+ * and it is never refused as full. It reads no mail, so it takes no lease.
+ * Store first, then ledger, batch by batch, so the ledger stays a superset of
+ * the store. The slot ends with the mailbox's build cursor reset.
+ *
+ * Answers `removed`, or the object's refusal with nothing removed. Throws
+ * `RecallBuildError` on any other failure.
+ */
+export async function forgetMailbox(
+  principal: Principal,
+  mailbox: string,
+  deps: RecallDeps,
+): Promise<"removed" | PageRefusal> {
+  const slot = await beginSlot(principal, mailbox, "reconcile");
+  if (!slot.ok) return slot.reason;
+  try {
+    const rows = await mailboxRows(principal, mailbox);
+    await removeIds(
+      principal,
+      rows.map((row) => row.vectorId),
+      deps,
+    );
+    await slot.end(RESET);
+    return "removed";
+  } catch {
+    await slot.end(KEEP);
+    throw new RecallBuildError();
+  }
+}
+
+/**
  * Remove named refs from the store and the ledger, without finding them first.
  *
  * Phase 26 calls this when a recall hit fails to open, so a dead ref is removed

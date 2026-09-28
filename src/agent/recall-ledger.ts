@@ -312,11 +312,27 @@ export function folderListOf(value: unknown): string[] | null {
 /**
  * Store the folder list. The caller has checked it with `folderListOf`.
  *
- * A stored list ends the listing's failure record: the listing worked.
+ * A stored list ends the listing's failure record: the listing worked. And a
+ * folder that is not on it any more leaves nothing behind (26-REVIEW CR-03):
+ * the sync row and the build cursor of every mailbox outside the list go.
  */
 export function writeFolders(sql: SqlStorage, folders: readonly string[]): void {
   writeState(sql, FOLDERS_ROW, JSON.stringify(folders));
   clearState(sql, LISTING_FAILED_ROW);
+  const keep = new Set(folders);
+  for (const prefix of [SYNC_ROW, CURSOR_ROW]) {
+    const keys = sql
+      .exec<{ k: string }>(
+        `select k from recall_state where substr(k, 1, ?) = ?`,
+        prefix.length,
+        prefix,
+      )
+      .toArray()
+      .map((row) => row.k);
+    for (const k of keys) {
+      if (!keep.has(k.slice(prefix.length))) clearState(sql, k);
+    }
+  }
 }
 
 /** The folder listing's failure record, or null when there is none or it is malformed. */

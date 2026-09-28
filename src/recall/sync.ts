@@ -92,6 +92,7 @@ import type { Principal } from "../principal";
 import {
   type BuildDeps,
   type BuildStatus,
+  forgetMailbox,
   indexNextPage,
   RECALL_PAGE_SIZE,
   RecallBuildError,
@@ -490,6 +491,13 @@ async function advanceUnbuilt(
  * and answer `gone`. INBOX is never dropped: it answers `unanswered`, recorded
  * as a failure like any check with no answer. Answers null when the check did
  * not say gone.
+ *
+ * Its vectors go first (26-REVIEW CR-03): a dropped folder gets no further
+ * sync, so anything it left in the index would stay recallable until it
+ * expired. They are removed under the page slot, as a reconcile, before the
+ * list is changed. A refusal of that slot answers the refusal and drops
+ * nothing, so the next status check tries again. Storing the shorter list also
+ * clears the folder's sync row and build cursor.
  */
 async function dropIfGone(
   principal: Principal,
@@ -501,6 +509,8 @@ async function dropIfGone(
 ): Promise<StepOutcome | null> {
   if (outcome.answered || outcome.gone !== true) return null;
   if (mailbox === DEFAULT_MAILBOX) return unanswered(principal, mailbox, row, deps);
+  const removed = await forgetMailbox(principal, mailbox, deps);
+  if (removed !== "removed") return removed;
   const kept = folders.filter((one) => one !== mailbox);
   return afterSet(await agentFor(principal).recallSetFolders(kept)) ?? "gone";
 }

@@ -317,7 +317,9 @@ describe("recallStep does one session of work, in the fixed order (D-13, D-27)",
     expect((await syncState(USER_A.userId)).folders).toEqual([INBOX]);
 
     // INBOX reported gone: nothing is dropped. The check is recorded as a
-    // failure (CR-01), so INBOX is not asked again on the very next call.
+    // failure (CR-01), so INBOX is not asked again on the very next call. The
+    // archive's removal took the page slot, so the pause is waited out first.
+    await passPause(USER_A.userId);
     expect(await stub.recallSetSync(INBOX, SEED_ROW)).toEqual({ ok: true });
     h.setSnapshot(INBOX, { mailbox: INBOX, answered: false, gone: true });
     const now = Date.now();
