@@ -41,6 +41,7 @@ vi.mock("../src/mail/socket", async (importOriginal) => ({
 import { createLeasedMail } from "../src/agent/lease";
 import {
   AUTONOMY_KEY,
+  armWith,
   type AutonomyDeps,
   type AutonomyQueue,
   type AutonomyRecord,
@@ -393,6 +394,11 @@ function expectOrdinaryAnswer(result: { status: number; location: string }, user
 
 /** Mint an autonomy grant through the library, never armed. Answers its id. */
 async function mintStrayAutonomyGrant(env: Env, userId: string): Promise<string> {
+  return (await mintAutonomyCode(env, userId)).split(":")[1] as string;
+}
+
+/** Mint an autonomy grant through the library, never armed. Answers its one-time code. */
+async function mintAutonomyCode(env: Env, userId: string): Promise<string> {
   const minted = await getOAuthApi(oauthProviderOptions, env).completeAuthorization({
     request: {
       responseType: "code",
@@ -407,7 +413,27 @@ async function mintStrayAutonomyGrant(env: Env, userId: string): Promise<string>
     props: { v: 1, appleId: LISTED_APPLE_ID, appPassword: FAKE_APP_PASSWORD },
     revokeExistingGrants: false,
   });
-  return new URL(minted.redirectTo).searchParams.get("code")?.split(":")[1] as string;
+  return new URL(minted.redirectTo).searchParams.get("code") as string;
+}
+
+/**
+ * A store whose listing does not show `hidden` yet, the way a KV listing can
+ * lag a fresh write by up to a minute. Reads, writes and deletes are the real
+ * store's.
+ */
+function listingWithout(real: KVNamespace, hidden: string): KVNamespace {
+  return new Proxy(real, {
+    get(target, prop) {
+      if (prop === "list") {
+        return async (options: KVNamespaceListOptions = {}) => {
+          const page = await target.list(options);
+          return { ...page, keys: page.keys.filter((key) => key.name !== hidden) };
+        };
+      }
+      const value = Reflect.get(target, prop, target) as unknown;
+      return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +473,39 @@ describe("autonomy credential: re-arm, sweep and failure isolation (D-11, D-13, 
       expect(after).toHaveLength(1);
       expect(after).not.toContain(stray);
       expect(after[0]).toBe((await storedRecord(world.userId))?.grantId);
+    } finally {
+      await world.cleanup();
+    }
+  });
+
+  it("a re-arm revokes the grant it replaced by id, even when the listing does not show that grant yet (review WR-02)", async () => {
+    const world = await setUp("lifecycle replaced by id");
+    try {
+      await world.signIn();
+      const replaced = (await storedRecord(world.userId)) as AutonomyRecord;
+      const code = await mintAutonomyCode(world.env, world.userId);
+      const newGrantId = code.split(":")[1] as string;
+      const lagging = listingWithout(entryEnv().OAUTH_KV, `grant:${world.userId}:${replaced.grantId}`);
+
+      const outcome = await runInDurableObject(objectOf(world.userId), async (instance: UserAgent, state) =>
+        instance.autonomyQueue.run(async () =>
+          armWith(
+            {
+              storage: state.storage.kv,
+              name: world.userId,
+              env: { ...entryEnv(), OAUTH_KV: lagging },
+              selfFetch: (request) => entryEnv().SELF.fetch(request),
+              now: () => Date.now(),
+            },
+            code,
+          ),
+        ),
+      );
+
+      expect(outcome).toEqual({ kind: "armed", grantId: newGrantId });
+      expect((await storedRecord(world.userId))?.generation).toBe(replaced.generation + 1);
+      expect(await autonomyGrantIds(world.userId)).toEqual([newGrantId]);
+      expect(await keysUnder(`token:${world.userId}:${replaced.grantId}:`)).toEqual([]);
     } finally {
       await world.cleanup();
     }

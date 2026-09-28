@@ -152,6 +152,36 @@ export async function sweepAutonomyGrants(
 }
 
 /**
+ * Revoke one autonomy grant by its id, through the library's own revoke, which
+ * deletes the grant and every token under it (review WR-02).
+ *
+ * A direct key operation, not a listing. The sweep above finds grants through
+ * the store's listing, and a listing can lag a fresh write by about a minute.
+ * So a re-arm that relied on the sweep alone could miss the grant it had just
+ * replaced, when that grant was armed a moment earlier by a second submission
+ * of the same sign-in form. That grant would then stay live, with its refresh
+ * token thrown away and never revoked. The caller passes only an id it read
+ * from its own record, which only ever names an autonomy grant.
+ *
+ * Answers `done`, or `incomplete` when the user id is malformed, the id is
+ * empty, or the revoke rejected. Never throws.
+ */
+export async function revokeAutonomyGrant(
+  kv: KVNamespace,
+  userId: string,
+  grantId: string,
+): Promise<SweepOutcome> {
+  if (typeof userId !== "string" || !USER_ID.test(userId)) return "incomplete";
+  if (typeof grantId !== "string" || grantId.length === 0) return "incomplete";
+  try {
+    await helpersOver(kv).revokeGrant(grantId, userId);
+    return "done";
+  } catch {
+    return "incomplete";
+  }
+}
+
+/**
  * Whether the key whose grant is `grantId` still stands (D-33). One pass over
  * every page of the person's grants. See `KeyStanding`.
  */

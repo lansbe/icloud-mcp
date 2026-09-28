@@ -58,7 +58,12 @@ import {
   AUTONOMY_REDIRECT_PATH,
   AUTONOMY_TOOLS,
 } from "./autonomy-client";
-import { type KeyStanding, keyStandingFor, sweepAutonomyGrants } from "./autonomy-grants";
+import {
+  type KeyStanding,
+  keyStandingFor,
+  revokeAutonomyGrant,
+  sweepAutonomyGrants,
+} from "./autonomy-grants";
 
 /** The object's key-value key for the one autonomy record. */
 export const AUTONOMY_KEY = "autonomy";
@@ -835,10 +840,24 @@ export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutc
     if (proof.kind !== "ok" || proof.value.kind !== "ok") return await fail();
     if (!(await answersAs(proof.value.result, deps.name))) return await fail();
 
+    // The replaced grant, revoked BY ID (review WR-02). The record this arm
+    // replaced names it, so no listing is needed to find it, and the listing
+    // can lag: under a double-submitted sign-in form, that grant was written
+    // about 1.4 seconds ago and is often not listed yet. A grant whose arm is
+    // still waiting in the queue is left alone, as the sweep leaves it.
+    if (
+      previous !== null &&
+      previous.grantId !== grantId &&
+      !othersPending().has(previous.grantId)
+    ) {
+      await revokeAutonomyGrant(deps.env.OAUTH_KV, deps.name, previous.grantId);
+    }
+
     // The sweep (D-13, D-28): every other autonomy grant this person holds is
     // revoked, so at most one survives any sign-in. It lists rather than
     // trusting the record it replaced, so a grant minted and never armed is
-    // caught too. An incomplete sweep does not fail the arm.
+    // caught too. It is the backstop to the revoke above, not the only way the
+    // replaced grant ends. An incomplete sweep does not fail the arm.
     await sweepAutonomyGrants(deps.env.OAUTH_KV, deps.name, grantId, othersPending());
     return { kind: "armed", grantId };
   } catch {
