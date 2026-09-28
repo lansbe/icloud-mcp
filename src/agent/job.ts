@@ -13,9 +13,11 @@
 //   1. Due check, cheapest first: at least one rule (a local read), then an
 //      autonomy record (presence only, through `autonomyArmed`), then not a
 //      platform retry. Any "no" returns at once, having written nothing and
-//      asked for nothing (D-25). Then its own time: a run the shared alarm
-//      woke early for another job asks for its own time again and returns,
-//      having written nothing.
+//      asked for nothing (D-25). Then the sign-in backoff: while it is in
+//      force the run asks for the backoff's time and returns, having written
+//      nothing and opened no session (28-REVIEW-2 CR-01). Then its own time: a
+//      run the shared alarm woke early for another job asks for its own time
+//      again and returns, having written nothing.
 //   2. Ask for the next wake through the object's one scheduling helper, before
 //      any I/O, so a run that dies still leaves the alarm set.
 //   3. One session, through the `withSession` it is handed. The object binds
@@ -81,7 +83,10 @@
 //     `[CONTACTADMIN]`, a `BAD`), the dead-password pause, a calendar refusal
 //     inside the change check (the job reads only its mail half, D-02), or a
 //     password this server will not send. Counting them would let an iCloud
-//     outage end every person's key at once.
+//     outage end every person's key at once. Not counting them left a streak
+//     of them with no end, so each one doubles the wait before the next
+//     sign-in attempt, up to a day, and no session opens while it waits
+//     (28-REVIEW-2 CR-01, `backoffGapMs`).
 //   - The second in a row ends the key through Phase 27's `disarmWith`, the one
 //     thing in the object that ends a key, called after the session and never
 //     as an RPC. The count goes back to 0 and `job:state` says `off_auth`. The
@@ -166,6 +171,58 @@ export const JOB_OFF_AUTH = "off_auth";
  * lockout threshold.
  */
 export const AUTH_FAILURES_TO_DISARM = 2;
+
+/**
+ * The storage key of the sign-in backoff (28-REVIEW-2 CR-01): how many runs in
+ * a row ended `sign_in_unavailable`, and the time before which the job makes no
+ * sign-in attempt at all.
+ */
+export const JOB_BACKOFF_KEY = "job:backoff";
+
+/**
+ * The longest the backoff waits: 24 hours, 24 × 60 × 60 × 1000.
+ *
+ * Also the longest a stored backoff time is trusted: one further ahead was not
+ * written by this module, so it is ignored and the run goes ahead. It matches
+ * the one scheduling helper's own limit of one day.
+ */
+export const JOB_BACKOFF_MAX_MS = 86400000;
+
+/**
+ * How long the job waits after the `streak`-th run in a row that ended
+ * `sign_in_unavailable` (28-REVIEW-2 CR-01): the cadence doubled once per run,
+ * so 30 minutes, then 60, then 120, and so on, never more than a day.
+ *
+ * WHY. That outcome is never counted toward ending the key (28-REVIEW CR-01),
+ * so without this nothing ended a streak of them. The case that made it
+ * matter: the change check's calendar half answers 401 while mail works. The
+ * 401 starts the 15-minute password pause, the next run meets the pause, the
+ * one after reaches Apple and is refused again. That was one refused sign-in
+ * at Apple every 30 minutes, 48 a day, against Apple's unpublished lockout
+ * threshold, and the person's own tools paused half of every hour. With the
+ * backoff it is six in the first day and one a day after. Decided by Claude,
+ * owner may revise.
+ */
+export function backoffGapMs(streak: number): number {
+  const doublings = Math.min(Math.max(Math.floor(streak), 1), 32);
+  return Math.min(JOB_CADENCE_MS * 2 ** doublings, JOB_BACKOFF_MAX_MS);
+}
+
+/** The stored backoff. */
+interface Backoff {
+  readonly streak: number;
+  readonly until: number;
+}
+
+/** The stored backoff, or null when none is stored or it is not this module's shape. */
+function backoffOf(storage: Pick<JobStorage, "get">): Backoff | null {
+  const value = storage.get<unknown>(JOB_BACKOFF_KEY);
+  if (typeof value !== "object" || value === null) return null;
+  const b = value as { streak?: unknown; until?: unknown };
+  if (typeof b.streak !== "number" || !Number.isSafeInteger(b.streak) || b.streak < 1) return null;
+  if (typeof b.until !== "number" || !Number.isFinite(b.until)) return null;
+  return { streak: b.streak, until: b.until };
+}
 
 /** The start of every "already acted" record's key. */
 const ACTED = "acted:";
@@ -471,10 +528,21 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
     if (deps.isRetry) return "retry";
 
     now = deps.now();
+    // The sign-in backoff (28-REVIEW-2 CR-01): after a run that ended
+    // `sign_in_unavailable`, no session is opened, so no sign-in reaches Apple,
+    // until the stored time. The job asks for that time and writes nothing. A
+    // stored time more than a day ahead was not written here, and is ignored.
+    const backoff = backoffOf(deps.storage);
+    if (backoff !== null && now < backoff.until && backoff.until <= now + JOB_BACKOFF_MAX_MS) {
+      await deps.requestWake(backoff.until);
+      return "backed_off";
+    }
+
     // Its own time: the alarm is shared, so it may have fired for another
     // job. Then the job asks for its own time again and writes nothing. A
     // stored time more than one cadence ahead was not written by this code
-    // path, so it is not trusted and the run goes ahead.
+    // path (the backoff's later time is held by the check above), so it is
+    // not trusted and the run goes ahead.
     const storedNextAt = deps.storage.get<unknown>(JOB_NEXT_AT_KEY);
     if (
       typeof storedNextAt === "number" &&
@@ -502,6 +570,7 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
 
     // 3. One session; every call inside it, one after another.
     let authFailed = false;
+    let inboxChecked = false;
     const session = await deps.withSession(async (sessionCall): Promise<RunOutcome> => {
       // The one guard every call goes through (D-16). After an answer that
       // stops the run, it sends nothing more. An auth failure is counted here,
@@ -535,6 +604,7 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
       // The inbox was checked, so the sign-in worked. The count of refused
       // sign-ins starts again, and a job stopped after refused sign-ins is
       // running again (a new sign-in made a new key).
+      inboxChecked = true;
       if (authFailuresOf(deps.storage) !== 0) deps.storage.put(JOB_AUTH_FAILURES_KEY, 0);
       if (deps.storage.get<unknown>(JOB_STATE_KEY) !== undefined) deps.storage.delete(JOB_STATE_KEY);
       if (reading.state === "started" || reading.state === "restarted") {
@@ -678,6 +748,25 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
       deps.storage.put(JOB_STATE_KEY, JOB_OFF_AUTH);
       outcome = "off_auth";
     }
+
+    // The sign-in backoff (28-REVIEW-2 CR-01). A run that ended
+    // `sign_in_unavailable` doubles the wait before the next sign-in attempt,
+    // up to a day. The wait is stored as the next wake too, so the person and
+    // the owner are shown when the job will try again. A run that checked the
+    // inbox and did not end that way starts the streak again; so does a key
+    // ended here, because the next sign-in makes a new key and should not
+    // inherit a wait. Any other run leaves the streak as it was.
+    if (outcome === "sign_in_unavailable") {
+      const streak = Math.min((backoff?.streak ?? 0) + 1, 64);
+      const until = now + backoffGapMs(streak);
+      deps.storage.put<Backoff>(JOB_BACKOFF_KEY, { streak, until });
+      deps.storage.put(JOB_NEXT_AT_KEY, until);
+      nextAtForStatus = until;
+      await deps.requestWake(until);
+    } else if ((inboxChecked || outcome === "off_auth") && backoff !== null) {
+      deps.storage.delete(JOB_BACKOFF_KEY);
+    }
+
     // The key is gone (ended here, or found gone by the session): ask the one
     // scheduling helper again, so the alarm goes when no job is left. It asks
     // for the same time as before, never an earlier one.

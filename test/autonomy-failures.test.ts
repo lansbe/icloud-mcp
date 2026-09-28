@@ -36,6 +36,7 @@ import { AUTONOMY_CLIENT_ID } from "../src/agent/autonomy-client";
 import { JOB_CADENCE_MS, nextWakeAfter } from "../src/agent/cadence";
 import {
   JOB_AUTH_FAILURES_KEY,
+  JOB_BACKOFF_KEY,
   JOB_LAST_RUN_KEY,
   JOB_MARKER_KEY,
   JOB_NEXT_AT_KEY,
@@ -272,9 +273,12 @@ describe("only iCloud refusing the password counts toward ending the key (28-REV
     it(`a plain auth_failed from ${tool}, three runs in a row: the run stops each time, nothing is counted, the key stays`, async () => {
       const storage = armedStorage([rule("r1", { flag: true, draft: { text: "Thanks." } })]);
       const marker = storage.get(JOB_MARKER_KEY);
+      // Spaced past the sign-in backoff each run sets (28-REVIEW-2 CR-01):
+      // 30 minutes after the first, 60 after the second.
+      const at = [0, 30, 90];
       for (let i = 0; i < 3; i += 1) {
         const run = await directRun(storage, {
-          now: T0 + i * 15 * MIN,
+          now: T0 + (at[i] as number) * MIN,
           rows: [newRow(1 + i)],
           answer: (called) => (called === tool ? PLAIN() : undefined),
         });
@@ -310,8 +314,9 @@ describe("one refusal is never enough to end the key (28-REVIEW WR-01)", () => {
     expect(failures(storage)).toBe(1);
     expect(storage.get(AUTONOMY_KEY)).toBeDefined();
 
-    // The pause has expired: the next run reaches iCloud, and iCloud refuses again.
-    const again = await directRun(storage, { now: T0 + 30 * MIN, rows: [newRow(1)], answer: on(REFUSED) });
+    // The pause has expired and so has the 30-minute backoff the paused run
+    // set (28-REVIEW-2 CR-01): the next run reaches iCloud, and iCloud refuses again.
+    const again = await directRun(storage, { now: T0 + 45 * MIN, rows: [newRow(1)], answer: on(REFUSED) });
     expect(again.outcome).toBe("off_auth");
     expect(again.disarms).toBe(1);
     expect(storage.get(AUTONOMY_KEY)).toBeUndefined();
@@ -321,12 +326,76 @@ describe("one refusal is never enough to end the key (28-REVIEW WR-01)", () => {
     const storage = armedStorage([rule("r1", FLAG)]);
     const on = (answer: () => CallAnswer) => (tool: string) => (tool === "changes_since" ? answer() : undefined);
     await directRun(storage, { rows: [newRow(1)], answer: on(REFUSED) });
-    for (const step of [1, 2, 3]) {
-      const run = await directRun(storage, { now: T0 + step * 15 * MIN, rows: [newRow(1)], answer: on(PAUSED) });
+    // Each paused run backs off for twice as long as the one before
+    // (28-REVIEW-2 CR-01), so they are spaced past it.
+    for (const [step, at] of [[1, 15], [2, 45], [3, 105]] as const) {
+      const run = await directRun(storage, { now: T0 + at * MIN, rows: [newRow(1)], answer: on(PAUSED) });
+      expect(run.outcome, `step ${step}`).toBe("sign_in_unavailable");
       expect(run.disarms, `step ${step}`).toBe(0);
     }
     expect(failures(storage)).toBe(1);
     expect(storage.get(AUTONOMY_KEY)).toBeDefined();
+  });
+});
+
+describe("a sign-in that keeps not going through backs off, and Apple is not asked while it does (28-REVIEW-2 CR-01)", () => {
+  // The calendar half of the change check answers 401 while the mail half
+  // works. The 401 starts the 15-minute password pause, the pause answers the
+  // next call, then it runs out and the calendar is refused again. Neither
+  // answer is counted (CR-01), so before the backoff nothing ended this: one
+  // refused sign-in at Apple every 30 minutes, 48 a day, forever.
+  const PLAIN = () => toolError(new ImapAuthError());
+
+  /** A calendar that refuses the saved password, and the pause it starts. */
+  function calendarRefusing() {
+    let pausedUntil = -Infinity;
+    let attempts = 0;
+    const answer = (now: number) => (tool: string) => {
+      if (tool !== "changes_since") return undefined;
+      // The pause answers before any request leaves: no attempt at Apple.
+      if (now < pausedUntil) return PLAIN();
+      attempts += 1;
+      // The pause is written after the refused request, a moment after the
+      // wake, so the wake 15 minutes on still meets it.
+      pausedUntil = now + 15 * MIN + 1000;
+      return PLAIN();
+    };
+    return { answer, attempts: () => attempts };
+  }
+
+  it("over 24 simulated hours of wakes every 15 minutes, the job's sign-in attempts at Apple stay bounded", async () => {
+    const storage = armedStorage([rule("r1", FLAG)]);
+    const icloud = calendarRefusing();
+    let sessions = 0;
+    let checks = 0;
+    for (let wake = 0; wake < 96; wake += 1) {
+      const now = T0 + wake * 15 * MIN;
+      const run = await directRun(storage, { now, rows: [newRow(1)], keepNextAt: true, answer: icloud.answer(now) });
+      if (run.events.includes("session")) sessions += 1;
+      checks += run.calls.filter((call) => call.tool === "changes_since").length;
+      expect(run.disarms, `wake ${wake}`).toBe(0);
+    }
+    // Without the backoff this is 48: every other wake reaches Apple.
+    expect(icloud.attempts()).toBeGreaterThanOrEqual(1);
+    expect(icloud.attempts()).toBeLessThanOrEqual(8);
+    expect(checks).toBeLessThanOrEqual(8);
+    expect(sessions).toBeLessThanOrEqual(8);
+    expect(storage.get(AUTONOMY_KEY)).toBeDefined();
+  });
+
+  it("the wake after a sign-in that did not go through opens no session and asks for a later wake", async () => {
+    const storage = armedStorage([rule("r1", FLAG)]);
+    const first = await directRun(storage, {
+      rows: [newRow(1)],
+      answer: (tool) => (tool === "changes_since" ? PLAIN() : undefined),
+    });
+    expect(first.outcome).toBe("sign_in_unavailable");
+
+    const early = await directRun(storage, { now: T0 + 15 * MIN, rows: [newRow(1)] });
+    expect(early.events).not.toContain("session");
+    expect(early.calls).toEqual([]);
+    expect(early.statuses).toEqual([]);
+    expect(early.wakes).toEqual([T0 + 30 * MIN]);
   });
 });
 
@@ -650,6 +719,19 @@ function jobState(stub: Stub) {
   }));
 }
 
+/**
+ * Let the backoff run out now, as waiting would (28-REVIEW-2 CR-01): the stored
+ * time is moved into the past and the job is made due. The streak is kept, so
+ * the next sign-in that does not go through backs off for longer.
+ */
+function endBackoff(stub: Stub): Promise<void> {
+  return runInDurableObject(stub, (_i, state) => {
+    const stored = state.storage.kv.get<{ streak: number; until: number }>(JOB_BACKOFF_KEY);
+    if (stored !== undefined) state.storage.kv.put(JOB_BACKOFF_KEY, { ...stored, until: Date.now() - 1 });
+    state.storage.kv.delete(JOB_NEXT_AT_KEY);
+  });
+}
+
 describe("through the real alarm and the real door (AUTO-10, AUTO-13)", () => {
   it("a refused iCloud sign-in, then the pause (not counted), then a second refusal after it: the key ends; the rules stay; a new sign-in makes a key the job then uses", async () => {
     const { armed, calls } = await armedWithRule();
@@ -685,8 +767,9 @@ describe("through the real alarm and the real door (AUTO-10, AUTO-13)", () => {
 
       // ---- Run four: the pause has run out (its marker is removed here, as
       //      its expiry would), the run reaches iCloud, and iCloud refuses again.
+      //      The backoff the paused run set is let run out too (28-REVIEW-2 CR-01).
       await armed.env.OAUTH_KV.delete(`password-pause:v1:${armed.userId}`);
-      await makeJobDue(armed.stub);
+      await endBackoff(armed.stub);
       queued.push(() => refusedSession());
       await runAlarm(armed.stub);
       expect(queued).toHaveLength(0);
@@ -745,7 +828,8 @@ describe("through the real alarm and the real door (AUTO-10, AUTO-13)", () => {
       for (let run = 1; run <= 2; run += 1) {
         // A server fault starts no pause, so each run reaches iCloud again.
         queued.push(() => serverFaultSession());
-        await makeJobDue(armed.stub);
+        // The backoff the first run set is let run out (28-REVIEW-2 CR-01).
+        await endBackoff(armed.stub);
         await runAlarm(armed.stub);
         expect(queued, `run ${run}`).toHaveLength(0);
         expect(mcpCalls(calls.splice(0)).map((call) => call.tool), `run ${run}`).toEqual(["changes_since"]);
@@ -761,23 +845,50 @@ describe("through the real alarm and the real door (AUTO-10, AUTO-13)", () => {
     }
   });
 
-  it("the calendar half refuses the sign-in while mail works, two runs in a row: nothing counted, the key stays (28-REVIEW CR-01)", async () => {
+  it("the calendar half refuses the sign-in while mail works, four alarms: one change check, the next three reach nothing, and the backoff doubles (28-REVIEW-2 CR-01)", async () => {
     const { armed, calls } = await armedWithRule();
     try {
       // Every calendar request answers 401. The mail half's status read works.
-      vi.stubGlobal("fetch", async () => new Response(null, { status: 401 }));
-      for (let run = 1; run <= 2; run += 1) {
-        // The calendar refusal may start the pause, and then the second run
-        // never reaches iCloud; so a session is offered and not required.
-        queued = [() => statusSession(4393, "118")];
+      let davRequests = 0;
+      vi.stubGlobal("fetch", async () => {
+        davRequests += 1;
+        return new Response(null, { status: 401 });
+      });
+
+      // ---- Alarm one: the change check runs, the calendar refuses, nothing counted.
+      queued = [() => statusSession(4393, "118")];
+      await makeJobDue(armed.stub);
+      await runAlarm(armed.stub);
+      expect(mcpCalls(calls.splice(0)).map((call) => call.tool)).toEqual(["changes_since"]);
+      expect(davRequests).toBeGreaterThan(0);
+      const one = await jobState(armed.stub);
+      expect(one.view.job.authFailures).toBe(0);
+      expect(one.view.activity[0]).toMatchObject({ kind: "run", outcome: "sign_in_unavailable" });
+      const firstGap = (one.nextAt as number) - Date.now();
+      expect(firstGap).toBeGreaterThan(JOB_CADENCE_MS);
+
+      // ---- Alarms two to four, while backed off: no /mcp call, no CalDAV request, no socket.
+      const davBefore = davRequests;
+      vi.mocked(connectImap).mockClear();
+      for (let alarm = 2; alarm <= 4; alarm += 1) {
         await makeJobDue(armed.stub);
         await runAlarm(armed.stub);
-        expect(mcpCalls(calls.splice(0)).map((call) => call.tool), `run ${run}`).toEqual(["changes_since"]);
-        const after = await jobState(armed.stub);
-        expect(after.view.job.authFailures, `run ${run}`).toBe(0);
-        expect(after.record, `run ${run}`).toBeDefined();
-        expect(after.view.job.offAuth, `run ${run}`).toBe(false);
+        expect(mcpCalls(calls.splice(0)), `alarm ${alarm}`).toEqual([]);
       }
+      expect(davRequests).toBe(davBefore);
+      expect(vi.mocked(connectImap)).not.toHaveBeenCalled();
+
+      // ---- The backoff runs out: one more change check, and the next gap doubles.
+      await armed.env.OAUTH_KV.delete(`password-pause:v1:${armed.userId}`);
+      await endBackoff(armed.stub);
+      queued = [() => statusSession(4393, "118")];
+      await runAlarm(armed.stub);
+      expect(mcpCalls(calls.splice(0)).map((call) => call.tool)).toEqual(["changes_since"]);
+      const five = await jobState(armed.stub);
+      expect(five.view.job.authFailures).toBe(0);
+      expect(five.record).toBeDefined();
+      expect(five.view.job.offAuth).toBe(false);
+      expect((five.nextAt as number) - Date.now()).toBeGreaterThan(firstGap + JOB_CADENCE_MS / 2);
     } finally {
       await armed.cleanup();
     }

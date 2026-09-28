@@ -168,7 +168,9 @@ describe("a busy or refused sign-in is tried again on the next run (28-REVIEW WR
         expect(acted(storage)).toEqual([]);
         expect(ring(storage).filter((entry) => entry.kind !== "run")).toHaveLength(1);
 
-        const second = await directRun(storage, { rows: [newRow(1)], now: T0 + 15 * MIN });
+        // 30 minutes on: past the sign-in backoff an uncounted auth failure
+        // sets (28-REVIEW-2 CR-01).
+        const second = await directRun(storage, { rows: [newRow(1)], now: T0 + 30 * MIN });
         expect(actions(second.calls).map((call) => call.tool)).toEqual([tool]);
         expect(second.outcome).toBe("done");
         expect(acted(storage).map(([, value]) => value.state)).toEqual([tool === "mail_flag" ? "flagged" : "placed"]);
