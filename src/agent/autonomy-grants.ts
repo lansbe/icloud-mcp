@@ -53,6 +53,12 @@ const MAX_PAGES = 1000;
 export type SweepOutcome = "done" | "incomplete";
 
 /**
+ * What a revoke by id answers: the sweep's two answers, and `refused` when the
+ * id names a grant of another client (review R2-IN-01).
+ */
+export type RevokeOutcome = SweepOutcome | "refused";
+
+/**
  * Whether the key the record names still stands (D-33).
  *
  * `standing`: its grant is listed and the person holds another grant.
@@ -268,24 +274,38 @@ export async function sweepAutonomyGrants(
  * So a re-arm that relied on the sweep alone could miss the grant it had just
  * replaced, when that grant was armed a moment earlier by a second submission
  * of the same sign-in form. That grant would then stay live, with its refresh
- * token thrown away and never revoked. The caller passes only an id it read
- * from its own record, which only ever names an autonomy grant.
+ * token thrown away and never revoked.
+ *
+ * AN AUTONOMY GRANT ONLY (review R2-IN-01). The grant's stored record is read
+ * first, by its key (`storedGrantOf`), and the revoke goes ahead only when its
+ * client id is exactly `AUTONOMY_CLIENT_ID`. Today's one caller passes an id
+ * from its own record, which only ever names an autonomy grant. But the record
+ * reader accepts any non-empty id, and an ordinary grant revoked here would
+ * sign the person out and, through recall's grant check (RCLL-06), destroy
+ * their recall index. So the name of this function is checked, not trusted.
  *
  * Best effort (review R2-WR-02). The caller does not act on `incomplete`: the
  * arm's sweep that follows revokes the grant anyway, because an exchanged
  * grant is never spared for being young, and when the listing does not show
  * it yet, the alarm's sweep finds it later.
  *
- * Answers `done`, or `incomplete` when the user id is malformed, the id is
- * empty, or the revoke rejected. Never throws.
+ * Answers:
+ * - `done`: the autonomy grant was revoked, or no grant has that id, so
+ *   nothing is left to end and nothing was asked of the library.
+ * - `refused`: the grant belongs to another client. Nothing was revoked.
+ * - `incomplete`: an id is malformed, the record could not be read, or the
+ *   revoke rejected.
+ * Never throws.
  */
 export async function revokeAutonomyGrant(
   kv: KVNamespace,
   userId: string,
   grantId: string,
-): Promise<SweepOutcome> {
-  if (typeof userId !== "string" || !USER_ID.test(userId)) return "incomplete";
-  if (typeof grantId !== "string" || grantId.length === 0) return "incomplete";
+): Promise<RevokeOutcome> {
+  const stored = await storedGrantOf(kv, userId, grantId);
+  if (stored.kind === "unreadable") return "incomplete";
+  if (stored.kind === "absent") return "done";
+  if (stored.clientId !== AUTONOMY_CLIENT_ID) return "refused";
   try {
     await helpersOver(kv).revokeGrant(grantId, userId);
     return "done";

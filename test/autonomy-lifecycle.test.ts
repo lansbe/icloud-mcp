@@ -60,6 +60,7 @@ import { AUTONOMY_CLIENT_ID, AUTONOMY_CLIENT_NAME } from "../src/agent/autonomy-
 import {
   type KeyStanding,
   keyStandingFor,
+  revokeAutonomyGrant,
   sweepAutonomyGrants,
 } from "../src/agent/autonomy-grants";
 import { UserAgent as UserAgentClass } from "../src/agent/user-agent";
@@ -1077,6 +1078,39 @@ describe("autonomy credential: the library, asked once (autonomy-grants)", () =>
       expect(await sweepAutonomyGrants(kv, minted.userId, null)).toBe("done");
       expect(await autonomyGrantIds(minted.userId)).toEqual([]);
       expect(await ordinaryGrantIds(minted.userId)).toHaveLength(2);
+    } finally {
+      await minted.cleanup();
+    }
+  });
+
+  it("revokeAutonomyGrant refuses an ordinary grant id and revokes nothing; it revokes an autonomy grant (review R2-IN-01)", async () => {
+    const minted = await mintFor(1, 1);
+    try {
+      const kv = entryEnv().OAUTH_KV;
+      const ordinary = minted.ordinaryIds[0] as string;
+      const autonomy = minted.autonomyIds[0] as string;
+
+      expect(await revokeAutonomyGrant(kv, minted.userId, ordinary)).toBe("refused");
+      expect(await ordinaryGrantIds(minted.userId)).toEqual([ordinary]);
+      expect(await keysUnder(`grant:${minted.userId}:${ordinary}`)).toHaveLength(1);
+
+      expect(await revokeAutonomyGrant(kv, minted.userId, autonomy)).toBe("done");
+      expect(await autonomyGrantIds(minted.userId)).toEqual([]);
+      // Nothing left to end is done, with no revoke.
+      expect(await revokeAutonomyGrant(kv, minted.userId, autonomy)).toBe("done");
+      // Ids that are not a user's or a grant's, and a store that cannot be read.
+      expect(await revokeAutonomyGrant(kv, "not-a-user-id", ordinary)).toBe("incomplete");
+      expect(await revokeAutonomyGrant(kv, minted.userId, "")).toBe("incomplete");
+      expect(await revokeAutonomyGrant(kv, minted.userId, `${ordinary}:x`)).toBe("incomplete");
+      const unreadable = new Proxy(kv, {
+        get(target, prop) {
+          if (prop === "get") return () => Promise.reject(new Error("the store could not read"));
+          const value = Reflect.get(target, prop, target) as unknown;
+          return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+        },
+      });
+      expect(await revokeAutonomyGrant(unreadable, minted.userId, ordinary)).toBe("incomplete");
+      expect(await ordinaryGrantIds(minted.userId)).toEqual([ordinary]);
     } finally {
       await minted.cleanup();
     }
