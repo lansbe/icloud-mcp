@@ -60,6 +60,16 @@ import {
   AI_BINDING_SCOPE,
   collectAiBindingReads,
   checkAiBindingOwnership,
+  MODEL_ID_LITERAL,
+  MODEL_ID_OWNER,
+  MODEL_ID_SCOPE,
+  collectModelIdLiterals,
+  checkModelIdOwnership,
+  RECALL_STEP_CALL,
+  RECALL_STEP_OWNER,
+  RECALL_STEP_SCOPE,
+  collectRecallStepCalls,
+  checkRecallStepCallOwnership,
   OWNERSHIP_VIOLATION_IDS,
   PASSWORD_READER_IMPORT,
   PASSWORD_READER_OWNERS,
@@ -774,6 +784,7 @@ const RAW_SOURCES: Record<string, string> = import.meta.glob(
     "../src/env.ts",
     "../src/index.ts",
     "../src/mcp/server.ts",
+    "../src/mcp/tools/recall.ts",
     "../scripts/forbidden-tokens.mjs",
     "../wrangler.jsonc.example",
   ],
@@ -1124,6 +1135,9 @@ describe("the patterns have teeth", () => {
     "recall-keep-first-write": "await index.insert(vectors.slice(i, i + BATCH));",
     // The partition taken from a tool argument after it was assigned.
     "recall-namespace-not-from-principal": "        namespace: ns,",
+    // Phase 26 (RCLL-09). The alias a "keep old clients working" edit would
+    // register: the old name of the exhaustive search, beside the new one.
+    "old-search-tool-name": 'server.registerTool("mail_search", findConfig, findHandler);',
   };
 
   it("covers every rule with a known-violating sample", () => {
@@ -5573,6 +5587,15 @@ describe("the count constraints as a set", () => {
   const TOOL_AI_READ = "const model = env.AI;\n";
   const COMMENTED_AI_READ = "// return createEmbedder(env.AI);\n";
   const RECALL_TOOL = "src/mcp/tools/recall.ts";
+  /** Phase 26: a second model id in a would-be summariser, and an embedder
+   *  whose only id is inside a comment. */
+  const TOOL_MODEL_ID = 'const SUMMARY_MODEL = "@cf/meta/llama-3.1-8b-instruct";\n';
+  const COMMENTED_MODEL_ID = '// export const RECALL_MODEL = "@cf/baai/bge-m3";\n';
+  /** Phase 26: a step called from the object's alarm, and a driver whose only
+   *  call is inside a comment. */
+  const ALARM_STEP_CALL = "    await recallStep(principal, deps);\n";
+  const COMMENTED_STEP_CALL = "    // await recallStep(actor, productionStepDeps(mail));\n";
+  const OBJECT_MODULE = "src/agent/user-agent.ts";
 
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
@@ -5674,6 +5697,23 @@ describe("the count constraints as a set", () => {
       ...checkAiBindingOwnership(
         collectAiBindingReads(AI_BINDING_OWNER, COMMENTED_AI_READ),
       ).map((v) => v.pattern),
+      // The two phase 26 counts, one owner each, both arms through scan()'s
+      // own collectors: an occurrence outside the owner, and an owner whose
+      // only occurrence is inside a comment.
+      ...checkModelIdOwnership([
+        ...collectModelIdLiterals(MODEL_ID_OWNER, 'export const RECALL_MODEL = "@cf/baai/bge-m3";\n'),
+        ...collectModelIdLiterals(RECALL_TOOL, TOOL_MODEL_ID),
+      ]).map((v) => v.pattern),
+      ...checkModelIdOwnership(
+        collectModelIdLiterals(MODEL_ID_OWNER, COMMENTED_MODEL_ID),
+      ).map((v) => v.pattern),
+      ...checkRecallStepCallOwnership([
+        ...collectRecallStepCalls(RECALL_STEP_OWNER, "    await recallStep(actor, deps);\n"),
+        ...collectRecallStepCalls(OBJECT_MODULE, ALARM_STEP_CALL),
+      ]).map((v) => v.pattern),
+      ...checkRecallStepCallOwnership(
+        collectRecallStepCalls(RECALL_STEP_OWNER, COMMENTED_STEP_CALL),
+      ).map((v) => v.pattern),
       // The second two-owner count, fed the same pair of lists the password
       // count is fed and for the same reason.
       ...checkPrincipalConstructorOwnership([
@@ -5769,6 +5809,14 @@ describe("the count constraints as a set", () => {
       ),
       ...checkAiBindingOwnership(collectAiBindingReads(RECALL_TOOL, TOOL_AI_READ)),
       ...checkAiBindingOwnership(collectAiBindingReads(AI_BINDING_OWNER, COMMENTED_AI_READ)),
+      // The two phase 26 counts: a lone occurrence outside the owner, and an
+      // owner whose only occurrence is commented out, one of each id.
+      ...checkModelIdOwnership(collectModelIdLiterals(RECALL_TOOL, TOOL_MODEL_ID)),
+      ...checkModelIdOwnership(collectModelIdLiterals(MODEL_ID_OWNER, COMMENTED_MODEL_ID)),
+      ...checkRecallStepCallOwnership(collectRecallStepCalls(OBJECT_MODULE, ALARM_STEP_CALL)),
+      ...checkRecallStepCallOwnership(
+        collectRecallStepCalls(RECALL_STEP_OWNER, COMMENTED_STEP_CALL),
+      ),
       // TWO owners again, so the same asymmetric pair the password count needs:
       // both owners plus a non-owner is exactly one outside, and one owner
       // alone is exactly one missing.
@@ -6221,5 +6269,329 @@ describe("the recall config checks (Phase 25, D-16, D-17)", () => {
 
   it("passes both real configs and the real pool", () => {
     expect(scanWranglerConfig().map(formatViolation)).toEqual([]);
+  });
+});
+
+// Phase 26, D-20 (RCLL-09, RCLL-12). Four additions, each measured on the real
+// tree before it was armed: the old search name refused under src/; one model
+// id literal, in the embedder; one call of the recall step, in the driver; and
+// the fan-out rule widened to the step and the reads it opens a session for.
+describe("the recall answer's scan rules (Phase 26, D-20)", () => {
+  const rule = (id: string) => FORBIDDEN.find((r) => r.id === id)!;
+  /** Through the real scope mechanism, at a given path. */
+  const hits = (id: string, path: string, text: string): number =>
+    matchRule(rule(id), FORBIDDEN.indexOf(rule(id)), path, text).length;
+  const RECALL_TOOL = "src/mcp/tools/recall.ts";
+  const OBJECT_MODULE = "src/agent/user-agent.ts";
+
+  describe("the old search name is gone for good (a)", () => {
+    const OLD = "mail_search";
+
+    it("fires under src/ in code, in a string, and in a comment", () => {
+      for (const sample of [
+        `server.registerTool("${OLD}", config, handler);`,
+        `const ALIAS = '${OLD}';`,
+        `// ${OLD} is kept as an alias for old clients`,
+        ` * The ${OLD}_v2 name answers the same way.`,
+      ]) {
+        for (const path of ["src/mcp/tools/mail.ts", "src/mcp/instructions.ts", "src/index.ts"]) {
+          expect(hits("old-search-tool-name", path, sample), `${path}: ${sample}`).toBe(1);
+        }
+      }
+    });
+
+    it("does not fire under test/ or scripts/, where the name is asserted absent", () => {
+      const sample = `expect(names).not.toContain("${OLD}");`;
+      expect(hits("old-search-tool-name", "test/instructions.test.ts", sample)).toBe(0);
+      expect(hits("old-search-tool-name", "scripts/probe.mjs", sample)).toBe(0);
+    });
+
+    it("does not fire on the current name or on the recall tool", () => {
+      for (const sample of [
+        'server.registerTool("mail_find", config, handler);',
+        'server.registerTool("mail_recall", config, handler);',
+        "const searchPage = await searchMessages(principal, gate, query);",
+      ]) {
+        expect(hits("old-search-tool-name", "src/mcp/tools/mail.ts", sample), sample).toBe(0);
+      }
+    });
+
+    it("finds nothing in the real tree", () => {
+      expect(scan().map((v) => v.pattern)).not.toContain("old-search-tool-name");
+    });
+  });
+
+  describe("one model id, in the embedder (b)", () => {
+    it("names the embedder as the owner, over src/", () => {
+      expect(MODEL_ID_OWNER).toBe("src/recall/embed.ts");
+      expect(MODEL_ID_SCOPE).toBe("src/");
+    });
+
+    it("finds exactly one literal in the real tree, in the embedder", () => {
+      const collected = [
+        "src/recall/embed.ts",
+        "src/recall/index.ts",
+        "src/recall/pipeline.ts",
+        "src/recall/sync.ts",
+        "src/mcp/tools/recall.ts",
+        "src/env.ts",
+      ].flatMap((file) => collectModelIdLiterals(file, rawSourceOf(file)));
+      expect(collected.map((literal) => literal.file)).toEqual([MODEL_ID_OWNER]);
+      expect(checkModelIdOwnership(collected)).toEqual([]);
+    });
+
+    it("reports a second literal in another module as the duplicate", () => {
+      const owner = collectModelIdLiterals(MODEL_ID_OWNER, rawSourceOf(MODEL_ID_OWNER));
+      const second = collectModelIdLiterals(
+        "src/recall/summarise.ts",
+        "const MODEL = '@cf/meta/llama-3.1-8b-instruct';\n",
+      );
+      const violations = checkModelIdOwnership([...owner, ...second]);
+      expect(violations.map((v) => v.pattern)).toEqual(["model-id-duplicated"]);
+      expect(violations[0]!.file).toBe("src/recall/summarise.ts");
+    });
+
+    it("reports a second literal inside the embedder itself as the duplicate", () => {
+      const twice = `${rawSourceOf(MODEL_ID_OWNER)}\nconst RERANK = \`@cf/baai/bge-reranker-base\`;\n`;
+      const violations = checkModelIdOwnership(collectModelIdLiterals(MODEL_ID_OWNER, twice));
+      expect(violations.map((v) => v.pattern)).toEqual(["model-id-duplicated"]);
+      expect(violations[0]!.file).toBe(MODEL_ID_OWNER);
+    });
+
+    it("reports the embedder missing when it holds none, or only a commented one", () => {
+      for (const contents of [
+        "export const RECALL_MODEL = readModel();\n",
+        '// export const RECALL_MODEL = "@cf/baai/bge-m3";\n',
+      ]) {
+        const violations = checkModelIdOwnership(collectModelIdLiterals(MODEL_ID_OWNER, contents));
+        expect(violations.map((v) => v.pattern), contents).toEqual(["model-id-missing"]);
+        expect(violations[0]!.file).toBe(MODEL_ID_OWNER);
+      }
+    });
+
+    it("counts both catalogue prefixes and every quote, and not prose or a scoped package", () => {
+      const fires = (sample: string): boolean =>
+        new RegExp(MODEL_ID_LITERAL.source, MODEL_ID_LITERAL.flags).test(sample);
+      for (const sample of [
+        'const m = "@cf/baai/bge-m3";',
+        "const m = '@hf/thebloke/some-model';",
+        "const m = `@cf/${family}/${name}`;",
+      ]) {
+        expect(fires(sample), `missed ${JSON.stringify(sample)}`).toBe(true);
+      }
+      for (const sample of [
+        'import { McpServer } from "@modelcontextprotocol/server";',
+        'import { env } from "cloudflare:workers";',
+        "const note = 'the model under @cf/ is the embedder';",
+      ]) {
+        expect(fires(sample), `false-positived on ${JSON.stringify(sample)}`).toBe(false);
+      }
+    });
+
+    it("collects nothing outside src/", () => {
+      expect(
+        collectModelIdLiterals("test/recall-embed.test.ts", 'expect(model).toBe("@cf/baai/bge-m3");'),
+      ).toEqual([]);
+    });
+
+    it("is wired into scan(): scripts/ alone reports it missing, the real tree reports neither", () => {
+      expect(scan("scripts").map((v) => v.pattern)).toContain("model-id-missing");
+      const patterns = scan().map((v) => v.pattern);
+      expect(patterns).not.toContain("model-id-missing");
+      expect(patterns).not.toContain("model-id-duplicated");
+    });
+  });
+
+  describe("one caller of the recall step, in the driver (d)", () => {
+    it("names the driver as the owner, over src/", () => {
+      expect(RECALL_STEP_OWNER).toBe("src/recall/drive.ts");
+      expect(RECALL_STEP_SCOPE).toBe("src/");
+    });
+
+    it("finds exactly one call in the real tree, in the driver, and not the step's definition", () => {
+      const collected = [
+        "src/recall/drive.ts",
+        "src/recall/sync.ts",
+        "src/agent/user-agent.ts",
+        "src/mcp/server.ts",
+      ].flatMap((file) => collectRecallStepCalls(file, rawSourceOf(file)));
+      expect(collected.map((call) => call.file)).toEqual([RECALL_STEP_OWNER]);
+      expect(checkRecallStepCallOwnership(collected)).toEqual([]);
+      expect(rawSourceOf("src/recall/sync.ts")).toMatch(/export async function recallStep\(/);
+    });
+
+    it("reports a call from the object module as the duplicate", () => {
+      const owner = collectRecallStepCalls(RECALL_STEP_OWNER, rawSourceOf(RECALL_STEP_OWNER));
+      const alarm = collectRecallStepCalls(
+        OBJECT_MODULE,
+        "  async alarm(): Promise<void> {\n    await recallStep(this.principal, deps);\n  }\n",
+      );
+      const violations = checkRecallStepCallOwnership([...owner, ...alarm]);
+      expect(violations.map((v) => v.pattern)).toEqual(["recall-step-call-duplicated"]);
+      expect(violations[0]!.file).toBe(OBJECT_MODULE);
+    });
+
+    it("reports a second driver anywhere else under src/, through a namespace import too", () => {
+      const owner = collectRecallStepCalls(RECALL_STEP_OWNER, rawSourceOf(RECALL_STEP_OWNER));
+      for (const [file, text] of [
+        ["src/recall/second-driver.ts", "void recallStep(actor, deps);\n"],
+        ["src/mcp/tools/recall.ts", "await sync.recallStep (actor, deps);\n"],
+      ] as const) {
+        const violations = checkRecallStepCallOwnership([
+          ...owner,
+          ...collectRecallStepCalls(file, text),
+        ]);
+        expect(violations.map((v) => v.pattern), file).toEqual(["recall-step-call-duplicated"]);
+      }
+    });
+
+    it("reports a second call inside the driver itself as the duplicate", () => {
+      const twice = `${rawSourceOf(RECALL_STEP_OWNER)}\nexport async function again(a: Principal, d: StepDeps) {\n  await recallStep(a, d);\n}\n`;
+      const violations = checkRecallStepCallOwnership(collectRecallStepCalls(RECALL_STEP_OWNER, twice));
+      expect(violations.map((v) => v.pattern)).toEqual(["recall-step-call-duplicated"]);
+      expect(violations[0]!.file).toBe(RECALL_STEP_OWNER);
+    });
+
+    it("reports the driver missing when it holds no call, or only a commented one", () => {
+      for (const contents of [
+        "export async function runRecallStep(): Promise<void> {}\n",
+        "    // await recallStep(actor, productionStepDeps(mail));\n",
+      ]) {
+        const violations = checkRecallStepCallOwnership(
+          collectRecallStepCalls(RECALL_STEP_OWNER, contents),
+        );
+        expect(violations.map((v) => v.pattern), contents).toEqual(["recall-step-call-missing"]);
+        expect(violations[0]!.file).toBe(RECALL_STEP_OWNER);
+      }
+    });
+
+    it("does not count the definition, the runner, or the name without a call", () => {
+      const fires = (sample: string): boolean =>
+        new RegExp(RECALL_STEP_CALL.source, RECALL_STEP_CALL.flags).test(sample);
+      for (const sample of [
+        "export async function recallStep(principal: Principal, deps: StepDeps) {",
+        "async function recallStep (p, d) {",
+        "await runRecallStep(principal, mail, grantClient);",
+        'import { productionStepDeps, recallStep } from "./sync";',
+        "const outcome: typeof recallStep = fake;",
+      ]) {
+        expect(fires(sample), `false-positived on ${JSON.stringify(sample)}`).toBe(false);
+      }
+      for (const sample of [
+        "await recallStep(actor, deps);",
+        "void recallStep (actor, deps);",
+        "return sync.recallStep(actor, deps);",
+      ]) {
+        expect(fires(sample), `missed ${JSON.stringify(sample)}`).toBe(true);
+      }
+    });
+
+    it("collects nothing outside src/", () => {
+      expect(
+        collectRecallStepCalls("test/recall-sync.test.ts", "await recallStep(actor, deps);"),
+      ).toEqual([]);
+    });
+
+    it("is wired into scan(): scripts/ alone reports it missing, the real tree reports neither", () => {
+      expect(scan("scripts").map((v) => v.pattern)).toContain("recall-step-call-missing");
+      const patterns = scan().map((v) => v.pattern);
+      expect(patterns).not.toContain("recall-step-call-missing");
+      expect(patterns).not.toContain("recall-step-call-duplicated");
+    });
+
+    it("gives the four phase 26 count ids distinct sort keys after the recall binding counts'", () => {
+      const index = [
+        ...checkModelIdOwnership([{ file: RECALL_TOOL, line: 1, column: 1 }]),
+        ...checkModelIdOwnership([]),
+        ...checkRecallStepCallOwnership([{ file: RECALL_TOOL, line: 1, column: 1 }]),
+        ...checkRecallStepCallOwnership([]),
+      ].map((v) => v.patternIndex - FORBIDDEN.length);
+      expect(index).toEqual([39, 40, 41, 42]);
+    });
+  });
+
+  describe("the fan-out rule reaches the step and its reads (c)", () => {
+    /** `concurrent-session` exactly as it shipped before plan 26-05, typed out
+     *  so the widening has something to be measured against. */
+    const CONCURRENT_SESSION_BEFORE_26_05 =
+      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit|indexNextPage|reconcileMailbox)/g;
+
+    const ADDED = [
+      "recallStep",
+      "runRecallStep",
+      "indexNewMail",
+      "windowUids",
+      "windowUidsOver",
+      "summariesInRange",
+      "summariesInRangeOver",
+      "newMailPage",
+    ];
+    const fanOut = (name: string, combinator = "all"): string =>
+      `await Promise.${combinator}(mailboxes.map((m) => ${name}(principal, deps, m)));`;
+
+    it("fires on a combinator around each added name", () => {
+      for (const name of ADDED) {
+        for (const combinator of ["all", "allSettled", "any", "race"]) {
+          expect(hits("concurrent-session", RECALL_TOOL, fanOut(name, combinator)), `${name} ${combinator}`)
+            .toBe(1);
+        }
+      }
+    });
+
+    it("the rule as it shipped before 26-05 misses every added name, so the widening has teeth", () => {
+      for (const name of ADDED) {
+        const old = new RegExp(
+          CONCURRENT_SESSION_BEFORE_26_05.source,
+          CONCURRENT_SESSION_BEFORE_26_05.flags,
+        );
+        expect(old.test(fanOut(name)), `the old pattern already saw ${name}`).toBe(false);
+      }
+      // And the typed-out text really was the rule: it fires on the standing
+      // sample, which the widened rule still fires on too.
+      const standing = violatingSamples_concurrentSession;
+      expect(
+        new RegExp(CONCURRENT_SESSION_BEFORE_26_05.source, CONCURRENT_SESSION_BEFORE_26_05.flags)
+          .test(standing),
+      ).toBe(true);
+      expect(hits("concurrent-session", RECALL_TOOL, standing)).toBe(1);
+    });
+
+    it("covers every session-opening export of the step and page-source modules, read from the source", () => {
+      // Measured, not listed: every exported async function in these modules
+      // opens, or runs something that opens, the person's one connection.
+      for (const [file, expected] of [
+        ["src/recall/sync.ts", ["recallStep", "indexNewMail"]],
+        ["src/recall/drive.ts", ["runRecallStep"]],
+        ["src/recall/mail-source.ts", ["newMailPage"]],
+      ] as const) {
+        const source = rawSourceOf(file);
+        const names = [...source.matchAll(/^export\s+async\s+function\s+(\w+)/gm)].map((m) => m[1]!);
+        expect([...names].sort(), file).toEqual([...expected].sort());
+        for (const name of names) {
+          expect(hits("concurrent-session", RECALL_TOOL, fanOut(name)), `${file} ${name}`).toBe(1);
+        }
+      }
+      const service = exportedFunctionNames(rawSourceOf("src/mail/service.ts"));
+      for (const name of ["windowUids", "windowUidsOver", "summariesInRange", "summariesInRangeOver"]) {
+        expect(service, `${name} was not read from the service module`).toContain(name);
+      }
+    });
+
+    it("does not fire on one awaited call to each", () => {
+      for (const permitted of [
+        "const outcome = await recallStep(actor, productionStepDeps(mail));",
+        "await runRecallStep(principal, mail, grantClient);",
+        "const page = await indexNewMail(principal, deps, mailbox, state, next);",
+        "const uids = await windowUids(principal, gate, mailbox, since);",
+        "const rows = await summariesInRange(principal, gate, mailbox, from, to);",
+        "const page = await newMailPage(leased, principal, mailbox, from, to);",
+      ]) {
+        expect(hits("concurrent-session", RECALL_TOOL, permitted), permitted).toBe(0);
+      }
+    });
+
+    it("finds no fan-out in the real tree", () => {
+      expect(scan().map((v) => v.pattern)).not.toContain("concurrent-session");
+    });
   });
 });

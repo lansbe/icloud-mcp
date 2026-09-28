@@ -144,6 +144,12 @@ export declare const RECALL_INDEX_SCOPE: string;
 export declare const AI_BINDING_READ: RegExp;
 export declare const AI_BINDING_OWNER: string;
 export declare const AI_BINDING_SCOPE: string;
+export declare const MODEL_ID_LITERAL: RegExp;
+export declare const MODEL_ID_OWNER: string;
+export declare const MODEL_ID_SCOPE: string;
+export declare const RECALL_STEP_CALL: RegExp;
+export declare const RECALL_STEP_OWNER: string;
+export declare const RECALL_STEP_SCOPE: string;
 export declare const OWNERSHIP_VIOLATION_IDS: readonly string[];
 
 /** One declared DAV write module: why it is declared, and a disposition for
@@ -242,6 +248,20 @@ export declare function checkAiBindingOwnership(
   readers: ReadonlyArray<OwnershipMatch>,
 ): Violation[];
 export declare function collectAiBindingReads(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+export declare function checkModelIdOwnership(
+  literals: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function collectModelIdLiterals(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+export declare function checkRecallStepCallOwnership(
+  calls: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function collectRecallStepCalls(
   relativePath: string,
   contents: string,
 ): OwnershipMatch[];
