@@ -86,10 +86,11 @@ import {
   JOB_STATE_KEY,
   JOB_MARKER_KEY,
   JOB_NEXT_AT_KEY,
+  RULES_FORGET_SEEN_KEY,
   RULES_KEY,
-  forgetRulesJob,
   readRules,
   runAutonomyJob,
+  settleRulesOnGrants,
 } from "./job";
 import { MAX_RULES, parseRule, type Rule, RULE_VERSION, type RuleRefusal } from "./rules";
 import { type KeyStanding, keyStandingFor, sweepAutonomyGrants } from "./autonomy-grants";
@@ -418,6 +419,10 @@ export class UserAgent extends DurableObject<Env> {
    *     person with rules but no key has nothing the job could do. Today the
    *     clause above already holds whenever this one does; it is written out
    *     so the rules job's reason for the alarm does not rest on another job's.
+   *   - a first "no grant left" answer is noted and waiting for the second
+   *     (28-REVIEW-2 WR-02). Without this clause the alarm would go with the
+   *     key and the vectors, the second question would never be asked, and
+   *     the rules would stay for good.
    */
   anyJobPending = (): boolean => {
     const sql = this.ctx.storage.sql;
@@ -426,7 +431,8 @@ export class UserAgent extends DurableObject<Env> {
       countVectors(sql) > 0 ||
       destroyPending(sql) ||
       this.ctx.storage.kv.get<unknown>(AUTONOMY_KEY) !== undefined ||
-      (readRules(this.ctx.storage.kv).length > 0 && autonomyArmed(this.ctx.storage.kv))
+      (readRules(this.ctx.storage.kv).length > 0 && autonomyArmed(this.ctx.storage.kv)) ||
+      this.ctx.storage.kv.get<unknown>(RULES_FORGET_SEEN_KEY) !== undefined
     );
   };
 
@@ -755,12 +761,15 @@ export class UserAgent extends DurableObject<Env> {
       }
       // 2. Revocation: asked about the name this object stored for itself,
       //    never the platform's. Only a definite "none" destroys. The rules
-      //    job's state goes on the same answer, first and synchronously: the
-      //    rules hold sender addresses and reply words, and nothing else would
-      //    ever remove them (28-REVIEW IN-07).
+      //    job's state is settled on the same answer, first and synchronously:
+      //    the rules hold sender addresses and reply words, and nothing else
+      //    would ever remove them (28-REVIEW IN-07). They go only when a
+      //    second "none", a day or more after the first, agrees (28-REVIEW-2
+      //    WR-02); the noted first answer keeps the alarm until then.
       const name = this.storedOwnName();
-      if (name !== null && (await this.grantsRemain(name)) === "none") {
-        forgetRulesJob(this.ctx.storage.kv);
+      const grants = name === null ? null : await this.grantsRemain(name);
+      if (grants !== null) settleRulesOnGrants(this.ctx.storage.kv, grants, Date.now());
+      if (grants === "none") {
         await this.destroyRecall();
         return;
       }

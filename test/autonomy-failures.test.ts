@@ -41,6 +41,8 @@ import {
   JOB_MARKER_KEY,
   JOB_NEXT_AT_KEY,
   JOB_STATE_KEY,
+  RULES_FORGET_GRACE_MS,
+  RULES_FORGET_SEEN_KEY,
   RULES_KEY,
 } from "../src/agent/job";
 import type { CallAnswer } from "../src/agent/tool-call";
@@ -1228,18 +1230,95 @@ describe("when the person's access has ended, their rules go with it (28-REVIEW 
     return seeded;
   }
 
-  it("no grant of any kind remains: the rules, the activity, the acted records and the job's state are deleted", async () => {
+  /** Answer the grant check with `answer` from now on, counting each question. */
+  function grantsAnswer(seeded: Awaited<ReturnType<typeof seededObject>>, answer: "some" | "none" | "unknown") {
+    return runInDurableObject(seeded.stub, (instance: UserAgent) => {
+      instance.grantsRemain = async () => {
+        seeded.ran.grants += 1;
+        return answer;
+      };
+    });
+  }
+
+  /** Move the stored first "no grant" sighting back by `ms`, as waiting would. */
+  function ageSighting(stub: Stub, ms: number): Promise<void> {
+    return runInDurableObject(stub, (_i, state) => {
+      const seen = state.storage.kv.get<number>(RULES_FORGET_SEEN_KEY);
+      if (typeof seen === "number") state.storage.kv.put(RULES_FORGET_SEEN_KEY, seen - ms);
+    });
+  }
+
+  // 28-REVIEW-2 WR-02. The rules are the person's own words, and they cannot be
+  // rebuilt from mail as recall's vectors can. The grant listing is eventually
+  // consistent, and a reconnect has a real window with no grant. So one "none"
+  // only notes the time; the rules go when a second "none", on a later alarm
+  // at least a day on, agrees.
+  it("the first 'no grant' answer deletes nothing, notes the time, and keeps the alarm set", async () => {
     const seeded = await withJobState();
     try {
-      await runInDurableObject(seeded.stub, (instance: UserAgent) => {
-        instance.grantsRemain = async () => {
-          seeded.ran.grants += 1;
-          return "none";
-        };
+      // No key and no vectors: nothing else keeps this object's alarm.
+      await runInDurableObject(seeded.stub, (_i, state) => {
+        state.storage.kv.delete(AUTONOMY_KEY);
       });
+      await grantsAnswer(seeded, "none");
       await runAlarm(seeded.stub);
       expect(seeded.ran.grants).toBe(1);
+      // With no key the job does not run, so it writes no activity here.
+      const kept = await rulesJobKeys(seeded.stub);
+      expect(kept).toContain(RULES_KEY);
+      expect(kept).toContain("acted:r1:flag:0000");
+      expect(kept).toContain(JOB_MARKER_KEY);
+      const noted = await runInDurableObject(seeded.stub, (_i, state) => state.storage.kv.get(RULES_FORGET_SEEN_KEY));
+      expect(typeof noted).toBe("number");
+      const alarm = await runInDurableObject(seeded.stub, (_i, state) => state.storage.getAlarm());
+      expect(alarm).not.toBeNull();
+    } finally {
+      await seeded.cleanup();
+    }
+  });
+
+  it("a second 'no grant' answer a day or more after the first: the rules, the activity, the acted records and the job's state are deleted", async () => {
+    const seeded = await withJobState();
+    try {
+      await grantsAnswer(seeded, "none");
+      await runAlarm(seeded.stub);
+      expect(await rulesJobKeys(seeded.stub)).toContain(RULES_KEY);
+      await ageSighting(seeded.stub, RULES_FORGET_GRACE_MS);
+      await runAlarm(seeded.stub);
+      expect(seeded.ran.grants).toBe(2);
       expect(await rulesJobKeys(seeded.stub)).toEqual([]);
+      expect(await runInDurableObject(seeded.stub, (_i, state) => state.storage.kv.get(RULES_FORGET_SEEN_KEY))).toBeUndefined();
+    } finally {
+      await seeded.cleanup();
+    }
+  });
+
+  it("a second 'no grant' answer less than a day after the first deletes nothing", async () => {
+    const seeded = await withJobState();
+    try {
+      await grantsAnswer(seeded, "none");
+      await runAlarm(seeded.stub);
+      await ageSighting(seeded.stub, 12 * 60 * 60 * 1000);
+      await runAlarm(seeded.stub);
+      expect(await rulesJobKeys(seeded.stub)).toContain(RULES_KEY);
+    } finally {
+      await seeded.cleanup();
+    }
+  });
+
+  it("a grant seen again between the two clears the first sighting: the next 'no grant' starts the wait over", async () => {
+    const seeded = await withJobState();
+    try {
+      await grantsAnswer(seeded, "none");
+      await runAlarm(seeded.stub);
+      await grantsAnswer(seeded, "some");
+      await runAlarm(seeded.stub);
+      expect(await runInDurableObject(seeded.stub, (_i, state) => state.storage.kv.get(RULES_FORGET_SEEN_KEY))).toBeUndefined();
+      await grantsAnswer(seeded, "none");
+      await runAlarm(seeded.stub);
+      await ageSighting(seeded.stub, 60 * 1000);
+      await runAlarm(seeded.stub);
+      expect(await rulesJobKeys(seeded.stub)).toContain(RULES_KEY);
     } finally {
       await seeded.cleanup();
     }

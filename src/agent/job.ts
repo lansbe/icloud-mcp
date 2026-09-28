@@ -334,9 +334,10 @@ const JOB_STATE_PREFIX = "job:";
  * count and the stopped state). Synchronous: the keys are collected first and
  * removed after, with no await.
  *
- * Its one caller is the object's alarm, when the person holds no grant of any
- * kind any more, the same definite answer that destroys their recall vectors
- * (28-REVIEW IN-07). Their rules hold sender addresses and reply words, and
+ * Its one caller is `settleRulesOnGrants` below, when the person has held no
+ * grant of any kind on two alarms at least a day apart (28-REVIEW IN-07, with
+ * the wait from 28-REVIEW-2 WR-02). Recall's vectors go on the first such
+ * answer; the rules wait for the second. Their rules hold sender addresses and reply words, and
  * nothing else would ever remove them. It is not called when only the
  * autonomy key ends (the owner revoked that key, or iCloud refused the sign-in
  * twice): the person still signs in, the next sign-in makes a new key, and
@@ -349,6 +350,79 @@ export function forgetRulesJob(storage: JobStorage): void {
     for (const [key] of storage.list<unknown>({ prefix })) keys.push(key);
   }
   for (const key of keys) storage.delete(key);
+}
+
+/**
+ * The storage key of the first definite "no grant left" answer, as a time
+ * (28-REVIEW-2 WR-02). Outside the `job:` prefix, so it is its own key and not
+ * part of the job's state.
+ */
+export const RULES_FORGET_SEEN_KEY = "rules-forget:noGrantSince";
+
+/**
+ * How long after the first "no grant left" answer a second one must come before
+ * the rules go: 24 hours, 24 × 60 × 60 × 1000 (28-REVIEW-2 WR-02).
+ */
+export const RULES_FORGET_GRACE_MS = 86400000;
+
+/** Whether this object holds anything of the rules job's to forget. */
+function holdsRulesJobState(storage: JobStorage): boolean {
+  if (storage.get<unknown>(RULES_KEY) !== undefined) return true;
+  if (storage.get<unknown>(ACTIVITY_KEY) !== undefined) return true;
+  for (const prefix of [ACTED, JOB_STATE_PREFIX]) {
+    if (storage.list<unknown>({ prefix })[Symbol.iterator]().next().done !== true) return true;
+  }
+  return false;
+}
+
+/**
+ * What the grant check's answer means for the rules job's state (28-REVIEW-2
+ * WR-02). Synchronous. The object's alarm calls it with the same answer that
+ * decides recall's destroy.
+ *
+ * WHY TWO ANSWERS, A DAY APART. Recall destroys its vectors on the first
+ * "none", because vectors can be rebuilt from mail. Rules cannot: they are the
+ * person's own words, previewed and confirmed. And one "none" is weaker than
+ * it looks. The grant listing is eventually consistent, so a grant just written
+ * can be missing from it for a while; and a person who reconnects their Claude
+ * app, or whose one grant is replaced, has a real window with no grant at all.
+ * So:
+ *   - "none", with nothing stored: note the time. Nothing is deleted.
+ *   - "none", at least `RULES_FORGET_GRACE_MS` after the noted time: delete
+ *     everything through `forgetRulesJob`, and the noted time.
+ *   - "none", sooner than that: nothing changes.
+ *   - "some": the noted time goes, so a later "none" starts the wait over.
+ *   - "unknown": nothing changes.
+ * With nothing of the job's held, nothing is noted. The noted time keeps the
+ * object's alarm (`anyJobPending`), so the second question is always asked,
+ * about a day later. The rules therefore go within about two days of access
+ * ending. Decided by Claude, owner may revise.
+ */
+export function settleRulesOnGrants(
+  storage: JobStorage,
+  answer: "some" | "none" | "unknown",
+  now: number,
+): "forgotten" | "waiting" | "kept" {
+  const seen = storage.get<unknown>(RULES_FORGET_SEEN_KEY);
+  if (answer === "some") {
+    if (seen !== undefined) storage.delete(RULES_FORGET_SEEN_KEY);
+    return "kept";
+  }
+  if (answer !== "none") return "kept";
+  if (!holdsRulesJobState(storage)) {
+    if (seen !== undefined) storage.delete(RULES_FORGET_SEEN_KEY);
+    return "kept";
+  }
+  // A noted time this module did not write (not a number, or in the future)
+  // is not trusted: the wait starts now.
+  if (typeof seen !== "number" || !Number.isFinite(seen) || seen > now) {
+    storage.put(RULES_FORGET_SEEN_KEY, now);
+    return "waiting";
+  }
+  if (now - seen < RULES_FORGET_GRACE_MS) return "waiting";
+  forgetRulesJob(storage);
+  storage.delete(RULES_FORGET_SEEN_KEY);
+  return "forgotten";
 }
 
 /** The stored marker, or null. */
