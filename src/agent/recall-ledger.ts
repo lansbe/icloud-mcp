@@ -246,6 +246,57 @@ export function readFolders(sql: SqlStorage): string[] | null {
   return parsed;
 }
 
+/** The most folders the build covers: INBOX, the archive folder, and room to spare. */
+export const MAX_RECALL_FOLDERS = 4;
+
+/** The most characters of one folder name in the folder list. */
+const MAX_FOLDER_CHARS = 1024;
+
+/**
+ * `value` as a folder list the object stores, or null (Phase 26, D-12).
+ *
+ * 1 to MAX_RECALL_FOLDERS non-empty names of at most 1024 characters each, no
+ * name twice, and the first exactly `INBOX`, so the one folder every account
+ * has is always built first and can never be left out.
+ */
+export function folderListOf(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  if (value.length < 1 || value.length > MAX_RECALL_FOLDERS) return null;
+  if (value[0] !== "INBOX") return null;
+  const out: string[] = [];
+  for (const one of value) {
+    if (typeof one !== "string" || one.length < 1 || one.length > MAX_FOLDER_CHARS) return null;
+    if (out.includes(one)) return null;
+    out.push(one);
+  }
+  return out;
+}
+
+/** Store the folder list. The caller has checked it with `folderListOf`. */
+export function writeFolders(sql: SqlStorage, folders: readonly string[]): void {
+  writeState(sql, FOLDERS_ROW, JSON.stringify(folders));
+}
+
+/**
+ * `value` as `mailbox`'s sync row, or null (Phase 26, D-15).
+ *
+ * The row must be one `parseSyncRow` accepts, and its `state` and `seen`, when
+ * present, must name `mailbox` itself, so one folder's numbers can never be
+ * stored as another's.
+ */
+export function syncRowFor(mailbox: string, value: unknown): SyncRow | null {
+  const row = parseSyncRow(value);
+  if (row === null) return null;
+  if (row.state !== null && row.state.mailbox !== mailbox) return null;
+  if (row.seen !== null && row.seen.mailbox !== mailbox) return null;
+  return row;
+}
+
+/** Store `mailbox`'s sync row. The caller has checked it with `syncRowFor`. */
+export function writeSyncRow(sql: SqlStorage, mailbox: string, row: SyncRow): void {
+  writeState(sql, SYNC_ROW + mailbox, JSON.stringify(row));
+}
+
 /** Every sync row that parses, keyed by mailbox. A row that does not parse is left out. */
 export function readSyncRows(sql: SqlStorage): Record<string, SyncRow> {
   const out: Record<string, SyncRow> = {};

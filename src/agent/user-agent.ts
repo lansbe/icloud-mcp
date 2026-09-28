@@ -65,6 +65,7 @@ import {
   ensureRecallSchema,
   expiredIds,
   anyIds,
+  folderListOf,
   forgetVectors,
   heldIds,
   idsForMailbox,
@@ -81,10 +82,13 @@ import {
   readPageSlot,
   recordVectors,
   type RecordRefusal,
+  syncRowFor,
   utcDay,
   writeCursor,
+  writeFolders,
   writeLastPageAt,
   writePageSlot,
+  writeSyncRow,
 } from "./recall-ledger";
 
 /**
@@ -180,6 +184,14 @@ export interface RecallSyncState {
   readonly folders: string[] | null;
   readonly sync: Record<string, SyncRow>;
 }
+
+/**
+ * The answer to a build-state write (Phase 26, D-15). Shapes, never throws.
+ *
+ * `unnamed` when the object does not know whose it is, `invalid` for a value
+ * the object will not store, `destroying` while a destroy is running.
+ */
+export type SetAnswer = { ok: true } | { ok: false; reason: "unnamed" | "invalid" | "destroying" };
 
 /** What to do with a mailbox's cursor when a page ends. */
 export type CursorUpdate =
@@ -551,6 +563,47 @@ export class UserAgent extends DurableObject<Env> {
       folders: readFolders(sql),
       sync: readSyncRows(sql),
     };
+  }
+
+  /**
+   * Store the folder list the build covers (Phase 26, D-12, D-15).
+   *
+   * Refuses, in this order: `unnamed`; `invalid` unless the list is 1 to 4
+   * distinct non-empty names of at most 1024 characters, the first exactly
+   * `INBOX`; `destroying` while a destroy is running, so a step racing a destroy
+   * cannot put the list back. No `await`, so the check and the write are one
+   * atomic step. The destroy already clears this row: it lives in the recall
+   * state table.
+   */
+  recallSetFolders(list: unknown): SetAnswer {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
+    const folders = folderListOf(list);
+    if (folders === null) return { ok: false, reason: "invalid" };
+    if (destroyPending(sql)) return { ok: false, reason: "destroying" };
+    writeFolders(sql, folders);
+    return { ok: true };
+  }
+
+  /**
+   * Store one mailbox's sync row (Phase 26, D-15).
+   *
+   * Refuses, in this order: `unnamed`; `invalid` for a bad mailbox, a row
+   * `parseSyncRow` rejects, or a row whose `state` or `seen` names another
+   * mailbox; `destroying` while a destroy is running. No `await`, so the check
+   * and the write are one atomic step. The destroy already clears these rows.
+   */
+  recallSetSync(mailbox: unknown, row: unknown): SetAnswer {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
+    if (!isMailbox(mailbox)) return { ok: false, reason: "invalid" };
+    const parsed = syncRowFor(mailbox, row);
+    if (parsed === null) return { ok: false, reason: "invalid" };
+    if (destroyPending(sql)) return { ok: false, reason: "destroying" };
+    writeSyncRow(sql, mailbox, parsed);
+    return { ok: true };
   }
 
   /**
