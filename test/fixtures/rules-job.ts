@@ -86,6 +86,8 @@ export interface Armed {
   readonly env: Env;
   readonly userId: string;
   readonly stub: Stub;
+  /** The ordinary connection's access token, for a direct tool call. */
+  readonly accessToken: string;
   cleanup(): Promise<void>;
 }
 
@@ -176,13 +178,14 @@ export async function signInArmed(): Promise<Armed> {
       env,
     );
     expect(exchanged.status).toBe(200);
+    const accessToken = ((await exchanged.json()) as { access_token: string }).access_token;
     const grants = (await getOAuthApi(oauthProviderOptions, env).listUserGrants(userId)).items;
     expect(grants.filter((grant) => grant.clientId === AUTONOMY_CLIENT_ID)).toHaveLength(1);
     const armed = await runInDurableObject(stub, (_i, state) =>
       state.storage.kv.get(AUTONOMY_KEY) !== undefined,
     );
     expect(armed).toBe(true);
-    return { env, userId, stub, cleanup };
+    return { env, userId, stub, accessToken, cleanup };
   } catch (error) {
     await cleanup();
     throw error;
@@ -328,4 +331,42 @@ export function headerFetchReply(tag: string, at: number, rows: readonly NewMess
   });
   parts.push(ENCODER.encode(`${tag} OK UID FETCH completed\r\n`));
   return concatBytes(...parts);
+}
+
+/**
+ * One tool call on the person's ORDINARY connection, straight into this Worker,
+ * the way a Claude client makes it. Answers the HTTP response.
+ */
+export function directToolCall(
+  armed: Armed,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<Response> {
+  return callWorker(
+    new Request(`${ORIGIN}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        host: DEPLOYED_HOSTNAME,
+        "Mcp-Method": "tools/call",
+        "Mcp-Name": name,
+        authorization: `Bearer ${armed.accessToken}`,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name,
+          arguments: args,
+          _meta: {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+          },
+        },
+      }),
+    }),
+    armed.env,
+  );
 }

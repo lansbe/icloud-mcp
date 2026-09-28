@@ -67,6 +67,9 @@ export const JOB_NEXT_AT_KEY = "job:nextAt";
 /** The storage key of the last run's time and outcome. */
 export const JOB_LAST_RUN_KEY = "job:lastRun";
 
+/** The storage key of the day's reply count: the UTC date and a count. */
+export const JOB_DRAFT_DAY_KEY = "job:draftDay";
+
 /** The start of every "already acted" record's key. */
 const ACTED = "acted:";
 
