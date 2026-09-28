@@ -113,11 +113,12 @@ export type ActionOutcome =
  * acted on), `done` (every verdict handled and the fresh marker stored),
  * `stopped` (an action failed, so the run stopped and kept the old marker).
  * Failures of any call (plan 28-03, D-16): `auth_failed` (Apple itself refused
- * the saved password; counted), `sign_in_unavailable` (the sign-in did not go
- * through, but nothing says the password is wrong: a server fault at the
- * sign-in, the dead-password pause, or the change check's calendar half; never
- * counted, 28-REVIEW CR-01 and WR-01), `busy` (the person's own request held
- * the connection), `tool_error` (any other tool error). Each stopped the run
+ * the saved password and named the refusal; counted), `sign_in_unavailable`
+ * (the sign-in did not go through, but nothing names the password as wrong: a
+ * bare NO at the sign-in, a server fault there, the dead-password pause, or the
+ * change check's calendar half; never counted, 28-REVIEW CR-01 and WR-01,
+ * 28-REVIEW-2 WR-01; it starts the sign-in backoff, 28-REVIEW-2 CR-01),
+ * `busy` (the person's own request held the connection), `tool_error` (any other tool error). Each stopped the run
  * after that one call and kept the old marker.
  * `off_auth`: the second auth failure in a row, which ended the key.
  * `failed`: something threw inside the job. It is caught and never read.

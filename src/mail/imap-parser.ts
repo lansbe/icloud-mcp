@@ -1325,6 +1325,38 @@ export function indicatesCredentialRefusal(line: string): boolean {
   return !indicatesConnectionLimit(line);
 }
 
+/**
+ * The two response codes that NAME a refusal of the credential. Lowercase and
+ * bracketed, for `AUTH_RESPONSE_CODES`' reason. `[PRIVACYREQUIRED]` is left out:
+ * it asks for a secure channel and says nothing about the password.
+ */
+const CREDENTIAL_NAMED_CODES = ["[authenticationfailed]", "[authorizationfailed]"];
+
+/**
+ * Whether a tagged reply NAMES a refusal of the credential: a tagged `NO`
+ * carrying `[AUTHENTICATIONFAILED]` or `[AUTHORIZATIONFAILED]`, and no server
+ * fault code (28-REVIEW-2 WR-01).
+ *
+ * NARROWER THAN `indicatesCredentialRefusal`, ON PURPOSE. That one decides the
+ * password pause, and it counts by exclusion, so a bare `NO` pauses: a missed
+ * pause is the costly error there, and a spurious one costs fifteen minutes and
+ * undoes itself. This one decides whether the rules job may count the refusal
+ * toward ending a person's autonomy key. Ending a key costs a human sign-in and
+ * does not undo itself, and what iCloud sends during a sign-in outage has never
+ * been measured. If it is a bare `NO`, counting by exclusion would end every
+ * armed key in the deployment within about 30 minutes. So here only a code the
+ * protocol specifies for exactly this counts. The cost, written down: if iCloud
+ * answers a wrong password with a bare `NO`, the job never ends that key. It
+ * then backs off instead (`backoffGapMs` in `src/agent/job.ts`), so its attempts
+ * at Apple stay at about one a day. Decided by Claude, owner may revise.
+ */
+export function namesCredentialRefusal(line: string): boolean {
+  if (parseTaggedResponse(line)?.status !== "NO") return false;
+  const lowered = line.toLowerCase();
+  if (SERVER_FAULT_RESPONSE_CODES.some((code) => lowered.includes(code))) return false;
+  return CREDENTIAL_NAMED_CODES.some((code) => lowered.includes(code));
+}
+
 // ---------------------------------------------------------------------------
 // Moving a message (Phase 21)
 //

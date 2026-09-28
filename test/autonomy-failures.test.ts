@@ -653,6 +653,21 @@ function serverFaultSession(): FakeDuplex {
   ]);
 }
 
+/**
+ * A session whose sign-in iCloud refuses with a bare NO: no response code
+ * names the refusal (28-REVIEW-2 WR-01). What iCloud sends during a sign-in
+ * outage has never been measured, and this is one shape it could take.
+ */
+function bareRefusalSession(): FakeDuplex {
+  return createFakeDuplex([
+    GREETING,
+    capabilityResponse("a1", PRE_AUTH_CAPABILITY),
+    taggedNo("a2", "Authentication failed."),
+    taggedNo("a3", "Authentication failed."),
+    logoutExchange("a4"),
+  ]);
+}
+
 /** The change check's new-mail read: open, search, header fetch. */
 function newMailSession(uid: number): FakeDuplex {
   return createFakeDuplex([
@@ -840,6 +855,32 @@ describe("through the real alarm and the real door (AUTO-10, AUTO-13)", () => {
       }
       const grants = (await getOAuthApi(oauthProviderOptions, armed.env).listUserGrants(armed.userId)).items;
       expect(grants.filter((grant) => grant.clientId === AUTONOMY_CLIENT_ID)).toHaveLength(1);
+    } finally {
+      await armed.cleanup();
+    }
+  });
+
+  it("a bare NO at the sign-in, two runs past the pause and the backoff: nothing counted, the key stays (28-REVIEW-2 WR-01)", async () => {
+    const { armed, calls } = await armedWithRule();
+    try {
+      for (let run = 1; run <= 2; run += 1) {
+        // A bare NO still starts the pause, so it is let run out before each run.
+        await armed.env.OAUTH_KV.delete(`password-pause:v1:${armed.userId}`);
+        await endBackoff(armed.stub);
+        queued.push(() => bareRefusalSession());
+        await runAlarm(armed.stub);
+        expect(queued, `run ${run}`).toHaveLength(0);
+        expect(mcpCalls(calls.splice(0)).map((call) => call.tool), `run ${run}`).toEqual(["changes_since"]);
+        const after = await jobState(armed.stub);
+        expect(after.view.job.authFailures, `run ${run}`).toBe(0);
+        expect(after.record, `run ${run}`).toBeDefined();
+        expect(after.view.job.offAuth, `run ${run}`).toBe(false);
+        expect(after.view.activity[0], `run ${run}`).toMatchObject({ kind: "run", outcome: "sign_in_unavailable" });
+      }
+      const grants = (await getOAuthApi(oauthProviderOptions, armed.env).listUserGrants(armed.userId)).items;
+      expect(grants.filter((grant) => grant.clientId === AUTONOMY_CLIENT_ID)).toHaveLength(1);
+      // The pause still started: the sign-in page's own rule is unchanged.
+      expect(await armed.env.OAUTH_KV.get(`password-pause:v1:${armed.userId}`)).not.toBeNull();
     } finally {
       await armed.cleanup();
     }

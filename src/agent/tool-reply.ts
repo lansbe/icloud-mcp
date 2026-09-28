@@ -128,9 +128,11 @@ export function readToolError(result: unknown): string | null {
 /**
  * Whether a tool error answer says Apple itself refused the saved password
  * (28-REVIEW CR-01): its category is `auth_failed` AND its `credentialRefused`
- * field is exactly true. Every other answer is false, including an
- * `auth_failed` without the field: a server fault at the sign-in, the
- * dead-password pause, or the change check's calendar half.
+ * field is exactly true. The mail tools set it only when the refusal was named
+ * with a response code (28-REVIEW-2 WR-01). Every other answer is false,
+ * including an `auth_failed` without the field: a bare NO at the sign-in, a
+ * server fault there, the dead-password pause, or the change check's calendar
+ * half.
  */
 export function readCredentialRefused(result: unknown): boolean {
   try {

@@ -958,6 +958,44 @@ describe("a failed check is not_checked and keeps the old state (CHNG-04, T-23-1
       expect("credentialRefused" in fault, text).toBe(false);
     }
   });
+
+  // 28-REVIEW-2 WR-01. What iCloud sends during a sign-in outage has never been
+  // measured. If it is a bare NO, and a bare NO carried the field, every person
+  // with rules would be refused, meet the pause and be refused again, and every
+  // key would end within about 30 minutes. So the field needs Apple to NAME the
+  // refusal with a response code. The pause still starts on a bare NO.
+  it("the field needs a response code that names the refusal; a bare NO, or any other code, does not carry it (28 R2-WR-01)", async () => {
+    const marker = await markerFor(inboxMarkerContent());
+    const refusedWith = (login: string, sasl: string) =>
+      createFakeDuplex([
+        GREETING,
+        capabilityResponse("a1", PRE_AUTH_CAPABILITY),
+        taggedNo("a2", login),
+        taggedNo("a3", sasl),
+        logoutExchange("a4"),
+      ]);
+    const fieldFor = async (login: string, sasl: string) => {
+      vi.mocked(connectImap).mockReturnValueOnce(refusedWith(login, sasl) as never);
+      const body = JSON.parse((await changesCallback()({ marker })).content[0]!.text);
+      expect(body.category, `${login} | ${sasl}`).toBe("auth_failed");
+      return "credentialRefused" in body;
+    };
+
+    for (const text of [
+      "Authentication failed.",
+      "LOGIN failed",
+      "[ALERT] Your account is not available right now",
+      "[PRIVACYREQUIRED] Use TLS",
+    ]) {
+      expect(await fieldFor(text, text), text).toBe(false);
+    }
+    // Either attempt naming the refusal is enough, as for the pause.
+    expect(await fieldFor("Authentication failed.", AUTH_REJECTED_TEXT)).toBe(true);
+    expect(await fieldFor(AUTH_REJECTED_TEXT, "Authentication failed.")).toBe(true);
+    expect(await fieldFor("[AUTHORIZATIONFAILED] Not allowed", "[AUTHORIZATIONFAILED] Not allowed")).toBe(true);
+    // A server fault code beside the refusal code is still a server fault.
+    expect(await fieldFor("[SERVERBUG] [AUTHENTICATIONFAILED] x", "[SERVERBUG] [AUTHENTICATIONFAILED] x")).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

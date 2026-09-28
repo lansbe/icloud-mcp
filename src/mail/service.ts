@@ -425,10 +425,12 @@ async function withMailSessionCore<T>(
       // The need is RECORDED here and the store write happens after teardown
       // (WR-03). See the `finally` below for why.
       credentialRefused = auth.credentialRefused;
-      // The same distinction, carried to the answer (28-REVIEW CR-01): only a
-      // refusal of the password raises the narrower class, so the rules job
-      // can count that and nothing else. Every category stays as it was.
-      throw credentialRefused ? new ImapCredentialRefusedError() : new ImapAuthError();
+      // A narrower distinction, carried to the answer (28-REVIEW CR-01, and
+      // 28-REVIEW-2 WR-01): only a refusal Apple NAMED with a response code
+      // raises the narrower class, so the rules job counts that and nothing
+      // else toward ending a key. A bare `NO` still pauses, above, and still
+      // raises the plain class. Every category stays as it was.
+      throw auth.credentialNamed ? new ImapCredentialRefusedError() : new ImapAuthError();
     }
 
     const postLogin = await sendCommand(channel, channel.nextTag(), "CAPABILITY");

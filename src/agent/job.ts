@@ -74,12 +74,14 @@
 // a tool error of any category) ends the run's calls: the guard refuses every
 // later one without sending it, so nothing is retried inside a run.
 //   - A tool error whose category is `auth_failed` AND whose answer says Apple
-//     itself refused the saved password (`credentialRefused`, 28-REVIEW CR-01)
-//     is the one failure counted, under `job:authFailures`. It costs an Apple
+//     itself refused the saved password, naming the refusal with a response
+//     code (`credentialRefused`, 28-REVIEW CR-01 and 28-REVIEW-2 WR-01), is the
+//     one failure counted, under `job:authFailures`. It costs an Apple
 //     login (PITFALLS #43), and it is the person's own. A change answer the
 //     job could read sets the count back to 0: the sign-in worked.
 //   - Any other `auth_failed` is `sign_in_unavailable`: it stops the run and is
-//     never counted. That is a server fault at the sign-in (`[SERVERBUG]`,
+//     never counted. That is a bare `NO` at the sign-in (no response code
+//     names the refusal), a server fault there (`[SERVERBUG]`,
 //     `[CONTACTADMIN]`, a `BAD`), the dead-password pause, a calendar refusal
 //     inside the change check (the job reads only its mail half, D-02), or a
 //     password this server will not send. Counting them would let an iCloud
@@ -169,6 +171,18 @@ export const JOB_OFF_AUTH = "off_auth";
  *
  * Not more: each counted refusal is a failed login against Apple's unpublished
  * lockout threshold.
+ *
+ * WHAT COUNTS (28-REVIEW-2 WR-01). Only a refusal Apple NAMES, with
+ * `[AUTHENTICATIONFAILED]` or `[AUTHORIZATIONFAILED]` on the sign-in reply. A
+ * bare `NO` is not counted. It still starts the password pause, which counts by
+ * exclusion (owner decision 2026-09-22), but ending a key costs a human sign-in
+ * and does not undo itself. What iCloud sends during a sign-in outage has never
+ * been measured: if it were a bare `NO` and it counted, every armed key in the
+ * deployment would end within about 30 minutes. The residual, the other way: if
+ * iCloud answers a wrong password with a bare `NO`, this count never ends that
+ * key. The job then backs off (`backoffGapMs`), so a dead password costs about
+ * one attempt at Apple a day, and the person is told the job cannot sign in.
+ * Decided by Claude, owner may revise.
  */
 export const AUTH_FAILURES_TO_DISARM = 2;
 
