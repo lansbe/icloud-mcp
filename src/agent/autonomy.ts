@@ -449,14 +449,23 @@ function tokenRequest(clientSecret: string, fields: Record<string, string>): Req
 /**
  * What the token endpoint answered, read once.
  *
- * `final` is `invalid_grant` or `invalid_client`: the grant, the token or the
- * client is gone, and no retry can bring it back. `failed` is everything else
- * that is not a success. `ok` carries the parsed body, which holds tokens, so
- * a caller takes what it needs out of it at once and keeps nothing else.
+ * `final` is `invalid_grant`: this person's grant or token is gone, and no
+ * retry can bring it back. `config` is `invalid_client`: the endpoint refused
+ * THIS SERVER, because the client secret does not match or the client record
+ * is missing (review IN-03). That is a fault in this server's setup, the same
+ * for every person at once, and never a reason to end one person's key.
+ * `failed` is everything else that is not a success. `ok` carries the parsed
+ * body, which holds tokens, so a caller takes what it needs out of it at once
+ * and keeps nothing else.
  */
 async function readTokenAnswer(
   response: Response,
-): Promise<{ kind: "ok"; body: Record<string, unknown> } | { kind: "final" } | { kind: "failed" }> {
+): Promise<
+  | { kind: "ok"; body: Record<string, unknown> }
+  | { kind: "final" }
+  | { kind: "config" }
+  | { kind: "failed" }
+> {
   let body: unknown;
   try {
     body = await response.json();
@@ -466,7 +475,8 @@ async function readTokenAnswer(
   if (typeof body !== "object" || body === null || Array.isArray(body)) return { kind: "failed" };
   const parsed = body as Record<string, unknown>;
   if (response.ok) return { kind: "ok", body: parsed };
-  if (parsed.error === "invalid_grant" || parsed.error === "invalid_client") return { kind: "final" };
+  if (parsed.error === "invalid_grant") return { kind: "final" };
+  if (parsed.error === "invalid_client") return { kind: "config" };
   return { kind: "failed" };
 }
 
@@ -581,17 +591,22 @@ function rpcMessageWithId(bodyText: string, id: number): Record<string, unknown>
  *      reads, writes and sends nothing. See "ONE AT A TIME" below.
  *   1. The allow list, seed then store, by the object's own user id. Not
  *      admitted answers `not_allowed`: the record is not read and not touched.
- *   2. Both autonomy secrets must be set. Not set answers `failed` and keeps
- *      the record: an unset secret is a server fault, not a revocation.
+ *   2. Both autonomy secrets must be set, and the seal key must be the shape
+ *      the seal accepts (`sealKeyUsable`). Otherwise `failed`, and the record
+ *      is kept: an unset or unusable secret is a server fault, not a
+ *      revocation (review IN-03). So "the key is unusable" is told apart from
+ *      "the record does not open" (step 4) before either can end anything.
  *   3. The record. Absent answers `off`. Malformed is deleted, `off`.
  *   3a. The standing check (D-33), unless the key was armed less than
  *      `STANDING_GRACE_SECONDS` ago. `revoked` or `connection_ended` sweeps
  *      every autonomy grant, deletes the record and answers `revoked`, with no
  *      token-endpoint call. `unknown` answers `failed` and keeps the record.
  *   4. Unseal. Any failure deletes the record, `off`.
- *   5. One refresh at the token endpoint. `invalid_grant` or `invalid_client`
- *      deletes the record, `revoked`, with no retry. Anything else that is not
- *      a success answers `failed` and keeps the record.
+ *   5. One refresh at the token endpoint. `invalid_grant` deletes the record,
+ *      `revoked`, with no retry. `invalid_client` answers `failed` and KEEPS
+ *      the record, with no retry: it refuses this server, not this person
+ *      (review IN-03, which changes D-15 step 5 as first written). Anything
+ *      else that is not a success answers `failed` and keeps the record.
  *   6. The rotated token is sealed and written at once, before the access
  *      token is used for anything, and only if the record is still the one
  *      read in step 3 (same generation, same grant). Otherwise the fresh
@@ -635,7 +650,10 @@ export async function withAutonomySession<T>(
 
     const clientSecret = deps.env.AUTONOMY_CLIENT_SECRET;
     const sealKey = deps.env.AUTONOMY_SEAL_KEY;
-    if (!isConfiguredSecret(clientSecret) || !isConfiguredSecret(sealKey)) {
+    // A seal key the seal would refuse is a server fault, told apart here from
+    // a record that does not open (review IN-03). Without this, the unseal
+    // below would fail for every person and delete every record.
+    if (!isConfiguredSecret(clientSecret) || !sealKeyUsable(sealKey)) {
       return { kind: "failed" };
     }
 
@@ -696,6 +714,8 @@ export async function withAutonomySession<T>(
       deleteIfStill(deps.storage, record);
       return { kind: "revoked" };
     }
+    // `config` (invalid_client) falls through to here with every other
+    // non-success: failed, and the record is kept (review IN-03).
     if (answer.kind !== "ok") return { kind: "failed" };
 
     const autonomyAccessToken = answer.body.access_token;
@@ -820,6 +840,10 @@ async function answersAs(result: unknown, name: string): Promise<boolean> {
  * ends the key the person already had, too. A key that could not be re-armed
  * at this sign-in is not one to keep trusting, and the person's next sign-in
  * arms again.
+ *
+ * ONE EXCEPTION (review IN-03). An exchange refused as `invalid_client` is a
+ * fault in this server's setup, not in the person's key, so it answers
+ * `not_armed` and changes nothing, the same as an input check.
  */
 export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutcome> {
   const clientSecret = deps.env.AUTONOMY_CLIENT_SECRET;
@@ -879,6 +903,12 @@ export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutc
     } catch {
       return await fail();
     }
+    // The endpoint refused THIS SERVER (`invalid_client`): a fault in this
+    // server's setup, not a reason to end the key the person already had
+    // (review IN-03). Nothing was exchanged, so there is no token to revoke,
+    // and the record and grants are left exactly as they were. The sign-in
+    // revokes the grant it minted, because this answer is not `armed`.
+    if (answer.kind === "config") return { kind: "not_armed" };
     if (answer.kind !== "ok") return await fail();
     const exchanged = answer.body.refresh_token;
     if (typeof exchanged !== "string") return await fail();

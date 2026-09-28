@@ -103,6 +103,9 @@ const CLAUDE_WEB_REDIRECT = "https://claude.ai/api/mcp/auth_callback";
 /** Eleven minutes, in seconds: past the standing check's grace. */
 const PAST_GRACE_SECONDS = 11 * 60;
 
+/** 16 zero bytes, base64url: set, but not the 32 bytes the seal needs. */
+const SHORT_SEAL_KEY = "AAAAAAAAAAAAAAAAAAAAAA";
+
 beforeEach(() => {
   resetLoginProof();
   vi.mocked(connectImap).mockReset();
@@ -657,16 +660,102 @@ describe("autonomy credential: revocation and the standing check (AUTO-04, D-33)
     }
   });
 
-  it("treats a deleted autonomy client as final: one call, revoked, record deleted", async () => {
+  it("treats a deleted autonomy client as a server fault: one call, failed, record kept (review IN-03)", async () => {
+    // The token endpoint answers `invalid_client`. That is this server's
+    // configuration, not the person's grant, so it ends nobody's key. Once
+    // Phase 28 redeems every key, deleting on it would end them all at once.
     const world = await setUp("lifecycle client gone");
     try {
       await world.signIn();
+      const before = JSON.stringify(await storedRecord(world.userId));
       await entryEnv().OAUTH_KV.delete(`client:${AUTONOMY_CLIENT_ID}`);
       const fetcher = recordingFetch();
-      expect(await world.session(fetcher.selfFetch)).toEqual({ kind: "revoked" });
+      expect(await world.session(fetcher.selfFetch)).toEqual({ kind: "failed" });
       expect(fetcher.seen).toHaveLength(1);
       expect(fetcher.seen[0]?.path).toBe("/oauth/token");
-      expect(await storedRecord(world.userId)).toBeUndefined();
+      expect(JSON.stringify(await storedRecord(world.userId))).toBe(before);
+    } finally {
+      await world.cleanup();
+    }
+  });
+
+  /** One session inside the object, with these env overrides. */
+  async function sessionWithEnv(
+    userId: string,
+    fetcher: (request: Request) => Promise<Response>,
+    env: Partial<AutonomyDeps["env"]>,
+  ): Promise<unknown> {
+    return runInDurableObject(objectOf(userId), async (_i, state) =>
+      sessionInQueue(
+        { ...depsOver(state.storage.kv, userId, fetcher), env: { ...entryEnv(), ...env } },
+        (call) => call("account_whoami", {}),
+      ),
+    );
+  }
+
+  it("a seal key the seal would refuse keeps the key and answers failed, with no request (review IN-03)", async () => {
+    const world = await setUp("lifecycle seal key unusable");
+    try {
+      await world.signIn();
+      const before = JSON.stringify(await storedRecord(world.userId));
+      const fetcher = recordingFetch();
+      for (const sealKey of [SHORT_SEAL_KEY, `${entryEnv().AUTONOMY_SEAL_KEY}=`]) {
+        const outcome = await sessionWithEnv(world.userId, fetcher.selfFetch, { AUTONOMY_SEAL_KEY: sealKey });
+        expect(outcome).toEqual({ kind: "failed" });
+      }
+      expect(fetcher.seen).toEqual([]);
+      expect(JSON.stringify(await storedRecord(world.userId))).toBe(before);
+      expect(await autonomyGrantIds(world.userId)).toHaveLength(1);
+    } finally {
+      await world.cleanup();
+    }
+  });
+
+  it("a client secret the token endpoint refuses keeps the key and answers failed, with no retry (review IN-03)", async () => {
+    const world = await setUp("lifecycle client secret refused");
+    try {
+      await world.signIn();
+      const before = JSON.stringify(await storedRecord(world.userId));
+      const fetcher = recordingFetch();
+      const outcome = await sessionWithEnv(world.userId, fetcher.selfFetch, {
+        AUTONOMY_CLIENT_SECRET: "a-different-secret-set-by-hand-not-real",
+      });
+      expect(outcome).toEqual({ kind: "failed" });
+      expect(fetcher.seen).toEqual([{ path: "/oauth/token", grantType: "refresh_token", revokes: false }]);
+      expect(JSON.stringify(await storedRecord(world.userId))).toBe(before);
+
+      // The right secret again: the kept key still works.
+      const again = (await world.session(recordingFetch().selfFetch)) as { kind: string };
+      expect(again.kind).toBe("ok");
+    } finally {
+      await world.cleanup();
+    }
+  });
+
+  it("an arm whose code exchange is refused as invalid_client changes nothing: the key the person had stays (review IN-03)", async () => {
+    const world = await setUp("lifecycle arm client refused");
+    try {
+      await world.signIn();
+      const before = JSON.stringify(await storedRecord(world.userId));
+      const kept = (await storedRecord(world.userId))?.grantId as string;
+      const code = await mintAutonomyCode(world.env, world.userId);
+      const fetcher = recordingFetch();
+      const outcome = await runInDurableObject(objectOf(world.userId), async (instance: UserAgent, state) =>
+        instance.autonomyQueue.run(async (ticket) =>
+          armWith(
+            {
+              ...depsOver(state.storage.kv, world.userId, fetcher.selfFetch),
+              env: { ...entryEnv(), AUTONOMY_CLIENT_SECRET: "a-different-secret-set-by-hand-not-real" },
+              ticket,
+            },
+            code,
+          ),
+        ),
+      );
+      expect(outcome).toEqual({ kind: "not_armed" });
+      expect(fetcher.seen).toEqual([{ path: "/oauth/token", grantType: "authorization_code", revokes: false }]);
+      expect(JSON.stringify(await storedRecord(world.userId))).toBe(before);
+      expect(await autonomyGrantIds(world.userId)).toContain(kept);
     } finally {
       await world.cleanup();
     }
