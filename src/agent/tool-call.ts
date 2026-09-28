@@ -109,10 +109,13 @@ export type ActionOutcome =
  * The end: `started` (a starting point: the marker was stored and nothing was
  * acted on), `done` (every verdict handled and the fresh marker stored),
  * `stopped` (an action failed, so the run stopped and kept the old marker).
- * Failures of any call (plan 28-03, D-16): `auth_failed` (iCloud refused the
- * sign-in, or the dead-password pause answered for it; counted), `busy` (the
- * person's own request held the connection), `tool_error` (any other tool
- * error). Each stopped the run after that one call and kept the old marker.
+ * Failures of any call (plan 28-03, D-16): `auth_failed` (Apple itself refused
+ * the saved password; counted), `sign_in_unavailable` (the sign-in did not go
+ * through, but nothing says the password is wrong: a server fault at the
+ * sign-in, the dead-password pause, or the change check's calendar half; never
+ * counted, 28-REVIEW CR-01 and WR-01), `busy` (the person's own request held
+ * the connection), `tool_error` (any other tool error). Each stopped the run
+ * after that one call and kept the old marker.
  * `off_auth`: the second auth failure in a row, which ended the key.
  * `failed`: something threw inside the job. It is caught and never read.
  */
@@ -135,6 +138,7 @@ export type RunOutcome =
   | "done"
   | "stopped"
   | "auth_failed"
+  | "sign_in_unavailable"
   | "busy"
   | "tool_error"
   | "off_auth"

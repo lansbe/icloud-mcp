@@ -47,12 +47,14 @@ import {
   mintConfirmation,
 } from "../src/confirm";
 import type { UserAgent } from "../src/agent/user-agent";
-import { ConnectionBusyError, ImapAuthError, SAFE_MESSAGES } from "../src/errors";
+import { ConnectionBusyError, ImapCredentialRefusedError, SAFE_MESSAGES } from "../src/errors";
 import { decodeFolderId, encodeFolderId } from "../src/mail/ids";
 import { TOKEN_ENCODER, toBase64Url } from "../src/tokens";
 import {
+  AUTH_CONTACTADMIN_TEXT,
   AUTH_REJECTED_LEGACY_TEXT,
   AUTH_REJECTED_TEXT,
+  AUTH_SERVER_FAULT_TEXT,
   GREETING_AT_CONNECTION_LIMIT,
   MUTF7_DISPLAY_NAME,
   MUTF7_WIRE_NAME,
@@ -925,8 +927,36 @@ describe("a failed check is not_checked and keeps the old state (CHNG-04, T-23-1
 
     const answer = await changesCallback()({ marker });
 
-    expect(answer).toEqual(mailErrorResult(new ImapAuthError()));
+    // A refusal of the password: the auth category, with the field that says
+    // so (28-REVIEW CR-01).
+    expect(answer).toEqual(mailErrorResult(new ImapCredentialRefusedError()));
     expect(answer.content[0]!.text).not.toContain("marker");
+  });
+
+  // 28-REVIEW CR-01. The rules job counts only a refusal Apple made of this
+  // person's password. A server fault at the sign-in lands in the same
+  // category, so the refusal needs a field of its own the job can read.
+  it("a refused sign-in says so in its own field; a server fault at the sign-in does not (28 CR-01)", async () => {
+    const marker = await markerFor(inboxMarkerContent());
+    const refusedWith = (text: string) =>
+      createFakeDuplex([
+        GREETING,
+        capabilityResponse("a1", PRE_AUTH_CAPABILITY),
+        taggedNo("a2", text),
+        taggedNo("a3", text),
+        logoutExchange("a4"),
+      ]);
+
+    vi.mocked(connectImap).mockReturnValueOnce(refusedWith(AUTH_REJECTED_TEXT) as never);
+    const refused = JSON.parse((await changesCallback()({ marker })).content[0]!.text);
+    expect(refused).toMatchObject({ category: "auth_failed", credentialRefused: true });
+
+    for (const text of [AUTH_SERVER_FAULT_TEXT, AUTH_CONTACTADMIN_TEXT]) {
+      vi.mocked(connectImap).mockReturnValueOnce(refusedWith(text) as never);
+      const fault = JSON.parse((await changesCallback()({ marker })).content[0]!.text);
+      expect(fault.category, text).toBe("auth_failed");
+      expect("credentialRefused" in fault, text).toBe(false);
+    }
   });
 });
 

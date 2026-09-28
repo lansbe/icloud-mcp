@@ -126,6 +126,27 @@ export function readToolError(result: unknown): string | null {
 }
 
 /**
+ * Whether a tool error answer says Apple itself refused the saved password
+ * (28-REVIEW CR-01): its category is `auth_failed` AND its `credentialRefused`
+ * field is exactly true. Every other answer is false, including an
+ * `auth_failed` without the field: a server fault at the sign-in, the
+ * dead-password pause, or the change check's calendar half.
+ */
+export function readCredentialRefused(result: unknown): boolean {
+  try {
+    if (!isPlainObject(result) || result.isError !== true) return false;
+    const content = result.content;
+    if (!Array.isArray(content) || content.length < 1) return false;
+    const first = content[0];
+    if (!isPlainObject(first) || typeof first.text !== "string") return false;
+    const body = jsonObject(first.text);
+    return body !== null && body.category === "auth_failed" && body.credentialRefused === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The address the sign-in check answered, or null (C-11). Exactly one text
  * part, holding a JSON object with a non-empty `signedInAs` string.
  */

@@ -68,11 +68,17 @@
 // guard. The first answer that is not a tool's plain answer (a failed call, or
 // a tool error of any category) ends the run's calls: the guard refuses every
 // later one without sending it, so nothing is retried inside a run.
-//   - A tool error whose category is `auth_failed` means iCloud refused the
-//     sign-in, or the dead-password pause answered for it. It is the one
-//     failure that costs an Apple login (PITFALLS #43), and the only one
-//     counted, under `job:authFailures`. A change answer the job could read
-//     sets the count back to 0: the sign-in worked.
+//   - A tool error whose category is `auth_failed` AND whose answer says Apple
+//     itself refused the saved password (`credentialRefused`, 28-REVIEW CR-01)
+//     is the one failure counted, under `job:authFailures`. It costs an Apple
+//     login (PITFALLS #43), and it is the person's own. A change answer the
+//     job could read sets the count back to 0: the sign-in worked.
+//   - Any other `auth_failed` is `sign_in_unavailable`: it stops the run and is
+//     never counted. That is a server fault at the sign-in (`[SERVERBUG]`,
+//     `[CONTACTADMIN]`, a `BAD`), the dead-password pause, a calendar refusal
+//     inside the change check (the job reads only its mail half, D-02), or a
+//     password this server will not send. Counting them would let an iCloud
+//     outage end every person's key at once.
 //   - The second in a row ends the key through Phase 27's `disarmWith`, the one
 //     thing in the object that ends a key, called after the session and never
 //     as an RPC. The count goes back to 0 and `job:state` says `off_auth`. The
@@ -99,7 +105,13 @@ import { evaluate } from "./evaluate";
 import { type Rule, storedRuleOf } from "./rules";
 import { type StatusStore, writeAutonomyStatus } from "./status";
 import type { ActionOutcome, CallAnswer, CallFn, EnvelopeRow, RunOutcome } from "./tool-call";
-import { isErrorAnswer, readChangesAnswer, readSignedInAs, readToolError } from "./tool-reply";
+import {
+  isErrorAnswer,
+  readChangesAnswer,
+  readCredentialRefused,
+  readSignedInAs,
+  readToolError,
+} from "./tool-reply";
 
 /** The storage key of the person's rules. */
 export const RULES_KEY = "rules";
@@ -280,7 +292,10 @@ export function authFailuresOf(storage: Pick<JobStorage, "get">): number {
 function stopOfAnswer(answer: CallAnswer): RunOutcome {
   if (answer.kind !== "ok") return "call_failed";
   const category = readToolError(answer.result);
-  if (category === "auth_failed") return "auth_failed";
+  // Only Apple refusing the saved password is counted (28-REVIEW CR-01).
+  if (category === "auth_failed") {
+    return readCredentialRefused(answer.result) ? "auth_failed" : "sign_in_unavailable";
+  }
   if (category === "connection_busy") return "busy";
   return "tool_error";
 }
@@ -290,9 +305,13 @@ function stops(answer: CallAnswer): boolean {
   return answer.kind !== "ok" || isErrorAnswer(answer.result);
 }
 
-/** Why an action's outcome stopped the run, as a run outcome. */
-function stopOfAction(outcome: ActionOutcome): RunOutcome {
-  if (outcome === "auth_failed") return "auth_failed";
+/**
+ * Why an action's outcome stopped the run, as a run outcome. `counted` says
+ * whether the guard counted this run's auth failure: an `auth_failed` it did
+ * not count was not Apple refusing the password (28-REVIEW CR-01).
+ */
+function stopOfAction(outcome: ActionOutcome, counted: boolean): RunOutcome {
+  if (outcome === "auth_failed") return counted ? "auth_failed" : "sign_in_unavailable";
   if (outcome === "busy") return "busy";
   return "stopped";
 }
@@ -481,7 +500,7 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
         // An auth failure or a busy lease here is what it is anywhere else.
         if (stops(who) && who.kind === "ok") {
           const stop = stopOfAnswer(who);
-          if (stop === "auth_failed" || stop === "busy") return stop;
+          if (stop === "auth_failed" || stop === "sign_in_unavailable" || stop === "busy") return stop;
         }
         const address = who.kind === "ok" ? readSignedInAs(who.result) : null;
         if (address === null) return "own_address_unreadable";
@@ -519,7 +538,7 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
           flagsThisRun += 1;
           const outcome = await setFlag(call, v.row);
           settle(v, outcome);
-          if (STOPS_THE_RUN.includes(outcome)) return stopOfAction(outcome);
+          if (STOPS_THE_RUN.includes(outcome)) return stopOfAction(outcome, authFailed);
           continue;
         }
 
@@ -549,7 +568,7 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
           deps.storage.put(JOB_DRAFT_DAY_KEY, { day, count: draftsToday });
         }
         settle(v, outcome);
-        if (STOPS_THE_RUN.includes(outcome)) return stopOfAction(outcome);
+        if (STOPS_THE_RUN.includes(outcome)) return stopOfAction(outcome, authFailed);
       }
 
       // 6. Only a run that reached the end stores the fresh marker.

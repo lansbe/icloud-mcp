@@ -35,6 +35,7 @@ import { reportRefusal } from "../password-pause";
 import {
   ImapAuthError,
   ImapConnectError,
+  ImapCredentialRefusedError,
   ImapGoneError,
   ImapNotFoundError,
   ImapValidityChangedError,
@@ -424,7 +425,10 @@ async function withMailSessionCore<T>(
       // The need is RECORDED here and the store write happens after teardown
       // (WR-03). See the `finally` below for why.
       credentialRefused = auth.credentialRefused;
-      throw new ImapAuthError();
+      // The same distinction, carried to the answer (28-REVIEW CR-01): only a
+      // refusal of the password raises the narrower class, so the rules job
+      // can count that and nothing else. Every category stays as it was.
+      throw credentialRefused ? new ImapCredentialRefusedError() : new ImapAuthError();
     }
 
     const postLogin = await sendCommand(channel, channel.nextTag(), "CAPABILITY");

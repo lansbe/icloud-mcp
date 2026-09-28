@@ -673,9 +673,13 @@ describe("the sign-in check: once, and only in a run with a reply to place (D-30
     expect(calls.map((call) => call.tool)).toEqual(["changes_since", "mail_flag"]);
   });
 
-  // An auth_failed answer is no longer unreadable: plan 28-03 counts it as the
-  // auth failure it is (D-16 as revised), and test/autonomy-failures.test.ts
-  // pins the count. The run still stops before any action.
+  // An auth_failed answer is no longer unreadable: plan 28-03 stops the run on
+  // it (D-16 as revised), and test/autonomy-failures.test.ts pins the count.
+  // The sign-in check makes no iCloud connection, so its auth_failed is the
+  // dead-password pause, never Apple refusing the password: it stops the run
+  // uncounted as sign_in_unavailable (28-REVIEW CR-01). Only a refusal the
+  // answer marks as the password's is auth_failed. The run still stops before
+  // any action.
   const unreadable: Array<[string, () => CallAnswer, string]> = [
     ["a failed call", () => ({ kind: "failed" }), "own_address_unreadable"],
     [
@@ -683,6 +687,17 @@ describe("the sign-in check: once, and only in a run with a reply to place (D-30
       () => ({
         kind: "ok",
         result: { isError: true, content: [{ type: "text", text: '{"category":"auth_failed","message":"x"}' }] },
+      }),
+      "sign_in_unavailable",
+    ],
+    [
+      "an auth error answer marked as a refused password",
+      () => ({
+        kind: "ok",
+        result: {
+          isError: true,
+          content: [{ type: "text", text: '{"category":"auth_failed","message":"x","credentialRefused":true}' }],
+        },
       }),
       "auth_failed",
     ],

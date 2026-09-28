@@ -48,7 +48,9 @@ import {
   ConnectionBusyError,
   ImapAuthError,
   ImapConnectError,
+  ImapCredentialRefusedError,
   ImapThrottleError,
+  SAFE_MESSAGES,
 } from "../src/errors";
 import { connectImap } from "../src/mail/socket";
 import { markersUnavailableResult, refusedMarkerResult } from "../src/mcp/tools/changes";
@@ -58,6 +60,7 @@ import { entryEnv } from "./fixtures/bound-secrets";
 import { createFakeDuplex, type FakeDuplex } from "./fixtures/fake-duplex";
 import {
   AUTH_REJECTED_TEXT,
+  AUTH_SERVER_FAULT_TEXT,
   GREETING,
   PRE_AUTH_CAPABILITY,
   capabilityResponse,
@@ -101,8 +104,29 @@ const SENDER = "recruiter@example.invalid";
 
 // ===================================================== the job, driven directly
 
-/** The auth error answer, as the real tool builds it. */
-const AUTH = () => toolError(new ImapAuthError());
+/**
+ * iCloud refusing this person's password, as the real tool builds it: the one
+ * auth answer the job counts (28-REVIEW CR-01).
+ */
+const AUTH = () => toolError(new ImapCredentialRefusedError());
+
+/**
+ * iCloud refusing this person's password, as the mail tools answer it: the
+ * auth category with the one field that says the refusal was Apple's verdict
+ * on the password (28-REVIEW CR-01). Built by hand, byte for byte.
+ */
+const REFUSED = (): CallAnswer => ({
+  kind: "ok",
+  result: {
+    isError: true,
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({ category: "auth_failed", message: SAFE_MESSAGES.auth_failed, credentialRefused: true }),
+      },
+    ],
+  },
+});
 
 /** The run entries in the ring, oldest first. */
 function runEntries(storage: ReturnType<typeof memoryStorage>): ActivityEntry[] {
@@ -223,6 +247,42 @@ describe("an auth failure (AUTO-10, D-16 as revised)", () => {
     expect(run.outcome).toBe("done");
     expect(storage.get(JOB_STATE_KEY)).toBeUndefined();
   });
+});
+
+describe("only iCloud refusing the password counts toward ending the key (28-REVIEW CR-01)", () => {
+  // The plain auth answer is what every auth_failed that is NOT Apple refusing
+  // this person's password looks like: a server fault at the sign-in
+  // (`[SERVERBUG]`, `[CONTACTADMIN]`, a `BAD`), the dead-password pause, a
+  // calendar-side refusal inside the change check, a password this server will
+  // not send. None of them is the person's fault, and during an iCloud outage
+  // every person with rules would get one each run.
+  const PLAIN = () => toolError(new ImapAuthError());
+
+  it("the answer the job counts is the real mail tools' refusal answer, byte for byte", () => {
+    expect(AUTH()).toEqual(REFUSED());
+    expect(PLAIN()).not.toEqual(REFUSED());
+  });
+
+  for (const tool of ["changes_since", "mail_flag", "account_whoami"] as const) {
+    it(`a plain auth_failed from ${tool}, three runs in a row: the run stops each time, nothing is counted, the key stays`, async () => {
+      const storage = armedStorage([rule("r1", { flag: true, draft: { text: "Thanks." } })]);
+      const marker = storage.get(JOB_MARKER_KEY);
+      for (let i = 0; i < 3; i += 1) {
+        const run = await directRun(storage, {
+          now: T0 + i * 15 * MIN,
+          rows: [newRow(1 + i)],
+          answer: (called) => (called === tool ? PLAIN() : undefined),
+        });
+        expect(run.outcome, `run ${i + 1}`).toBe("sign_in_unavailable");
+        expect(run.disarms, `run ${i + 1}`).toBe(0);
+        expect(run.calls.at(-1)?.tool, `run ${i + 1}`).toBe(tool);
+      }
+      expect(failures(storage)).toBe(0);
+      expect(storage.get(AUTONOMY_KEY)).toBeDefined();
+      expect(storage.get(JOB_STATE_KEY)).toBeUndefined();
+      expect(storage.get(JOB_MARKER_KEY)).toEqual(marker);
+    });
+  }
 });
 
 describe("every other failure stops the run, keeps the marker and leaves the counter alone (AUTO-13, D-16)", () => {
@@ -468,6 +528,17 @@ function refusedSession(): FakeDuplex {
   ]);
 }
 
+/** A session whose sign-in iCloud answers with a server fault, not a verdict on the password. */
+function serverFaultSession(): FakeDuplex {
+  return createFakeDuplex([
+    GREETING,
+    capabilityResponse("a1", PRE_AUTH_CAPABILITY),
+    taggedNo("a2", AUTH_SERVER_FAULT_TEXT),
+    taggedNo("a3", AUTH_SERVER_FAULT_TEXT),
+    logoutExchange("a4"),
+  ]);
+}
+
 /** The change check's new-mail read: open, search, header fetch. */
 function newMailSession(uid: number): FakeDuplex {
   return createFakeDuplex([
@@ -535,7 +606,7 @@ function jobState(stub: Stub) {
 }
 
 describe("through the real alarm and the real door (AUTO-10, AUTO-13)", () => {
-  it("a refused iCloud sign-in, then the pause: counted, then the key ends; the rules stay; a new sign-in makes a key the job then uses", async () => {
+  it("a refused iCloud sign-in, then the pause (not counted), then a second refusal after it: the key ends; the rules stay; a new sign-in makes a key the job then uses", async () => {
     const { armed, calls } = await armedWithRule();
     try {
       const before = await jobState(armed.stub);
@@ -555,11 +626,25 @@ describe("through the real alarm and the real door (AUTO-10, AUTO-13)", () => {
       expect(afterTwo.view.activity[0]).toMatchObject({ kind: "run", outcome: "auth_failed" });
       expect(afterTwo.view.job.offAuth).toBe(false);
 
-      // ---- Run three: the dead-password pause answers before iCloud.
+      // ---- Run three: the dead-password pause answers before iCloud. That is
+      //      not a second refusal, so it is not counted (28-REVIEW CR-01, WR-01).
       await makeJobDue(armed.stub);
       vi.mocked(connectImap).mockClear();
       await runAlarm(armed.stub);
       expect(vi.mocked(connectImap)).not.toHaveBeenCalled();
+      expect(mcpCalls(calls.splice(0)).map((call) => call.tool)).toEqual(["changes_since"]);
+      const afterPause = await jobState(armed.stub);
+      expect(afterPause.view.job.authFailures).toBe(1);
+      expect(afterPause.record).toBeDefined();
+      expect(afterPause.view.activity[0]).toMatchObject({ kind: "run", outcome: "sign_in_unavailable" });
+
+      // ---- Run four: the pause has run out (its marker is removed here, as
+      //      its expiry would), the run reaches iCloud, and iCloud refuses again.
+      await armed.env.OAUTH_KV.delete(`password-pause:v1:${armed.userId}`);
+      await makeJobDue(armed.stub);
+      queued.push(() => refusedSession());
+      await runAlarm(armed.stub);
+      expect(queued).toHaveLength(0);
       const three = calls.splice(0);
       expect(mcpCalls(three).map((call) => call.tool)).toEqual(["changes_since"]);
       // One revocation at the token endpoint: a request with no grant type.
@@ -576,7 +661,7 @@ describe("through the real alarm and the real door (AUTO-10, AUTO-13)", () => {
       expect(afterThree.view.armed).toBe(false);
       expect(afterThree.view.rules).toHaveLength(1);
       expect(afterThree.view.activity[0]).toMatchObject({ kind: "run", outcome: "off_auth" });
-      expect(afterThree.view.activity.length).toBeGreaterThanOrEqual(3);
+      expect(afterThree.view.activity.length).toBeGreaterThanOrEqual(4);
 
       // ---- The next alarm makes no outbound call.
       await runAlarm(armed.stub);
@@ -604,6 +689,50 @@ describe("through the real alarm and the real door (AUTO-10, AUTO-13)", () => {
       expect(afterFour.state).toBeUndefined();
       expect(afterFour.view.job.lastRun?.outcome).toBe("done");
       expect(afterFour.view.activity[0]).toMatchObject({ kind: "run", outcome: "done" });
+    } finally {
+      await armed.cleanup();
+    }
+  });
+
+  it("an iCloud server fault at the sign-in, two runs in a row: nothing counted, the key stays (28-REVIEW CR-01)", async () => {
+    const { armed, calls } = await armedWithRule();
+    try {
+      for (let run = 1; run <= 2; run += 1) {
+        // A server fault starts no pause, so each run reaches iCloud again.
+        queued.push(() => serverFaultSession());
+        await makeJobDue(armed.stub);
+        await runAlarm(armed.stub);
+        expect(queued, `run ${run}`).toHaveLength(0);
+        expect(mcpCalls(calls.splice(0)).map((call) => call.tool), `run ${run}`).toEqual(["changes_since"]);
+        const after = await jobState(armed.stub);
+        expect(after.view.job.authFailures, `run ${run}`).toBe(0);
+        expect(after.record, `run ${run}`).toBeDefined();
+        expect(after.view.activity[0], `run ${run}`).toMatchObject({ kind: "run", outcome: "sign_in_unavailable" });
+      }
+      const grants = (await getOAuthApi(oauthProviderOptions, armed.env).listUserGrants(armed.userId)).items;
+      expect(grants.filter((grant) => grant.clientId === AUTONOMY_CLIENT_ID)).toHaveLength(1);
+    } finally {
+      await armed.cleanup();
+    }
+  });
+
+  it("the calendar half refuses the sign-in while mail works, two runs in a row: nothing counted, the key stays (28-REVIEW CR-01)", async () => {
+    const { armed, calls } = await armedWithRule();
+    try {
+      // Every calendar request answers 401. The mail half's status read works.
+      vi.stubGlobal("fetch", async () => new Response(null, { status: 401 }));
+      for (let run = 1; run <= 2; run += 1) {
+        // The calendar refusal may start the pause, and then the second run
+        // never reaches iCloud; so a session is offered and not required.
+        queued = [() => statusSession(4393, "118")];
+        await makeJobDue(armed.stub);
+        await runAlarm(armed.stub);
+        expect(mcpCalls(calls.splice(0)).map((call) => call.tool), `run ${run}`).toEqual(["changes_since"]);
+        const after = await jobState(armed.stub);
+        expect(after.view.job.authFailures, `run ${run}`).toBe(0);
+        expect(after.record, `run ${run}`).toBeDefined();
+        expect(after.view.job.offAuth, `run ${run}`).toBe(false);
+      }
     } finally {
       await armed.cleanup();
     }

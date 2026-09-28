@@ -121,6 +121,24 @@ export class ImapAuthError extends Error {
   }
 }
 
+/**
+ * The narrower case of `ImapAuthError`: Apple itself refused the saved password
+ * at the sign-in (28-REVIEW CR-01).
+ *
+ * A subclass, so everything that asks `instanceof ImapAuthError` still sees an
+ * auth failure and every category stays as it was. It exists because the auth
+ * category is wider than "the password is wrong": a server fault at the sign-in
+ * (`[SERVERBUG]`, `[CONTACTADMIN]`), a `BAD`, the dead-password pause, and a
+ * password this server will not send all answer it too. The rules job ends a
+ * person's key after two refusals in a row, and must count only this one. So
+ * the mail session raises this class exactly where it records a refusal for the
+ * pause (`credentialRefused` in `src/mail/service.ts`), and the mail tools' error
+ * answer says so in one extra field.
+ *
+ * Same fixed label as its parent, and never constructed with server text.
+ */
+export class ImapCredentialRefusedError extends ImapAuthError {}
+
 /** Thrown when the transport fails to establish, read, or stay open. */
 export class ImapConnectError extends Error {
   readonly kind = "connect" as const;
