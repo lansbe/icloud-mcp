@@ -121,6 +121,24 @@ export type RuleParse =
 /** Characters an address may never hold: controls, spaces and the header specials. */
 const NOT_IN_ADDRESS = /[\u0000- \u007f()<>[\]:;@\\,"]/;
 
+/**
+ * Characters that change how an address LOOKS without being seen (28-REVIEW
+ * WR-07): every "other" character (controls, format characters such as the
+ * bidi embeddings, overrides, isolates and marks, the zero-width characters and
+ * the byte-order mark, surrogates, private use, unassigned), every separator
+ * (the no-break and ideographic spaces, the line and paragraph separators),
+ * and every default-ignorable one (the combining grapheme joiner, the Hangul
+ * fillers and the rest).
+ *
+ * The safety case for replying to the From address is that the person sees the
+ * address before sending. A right-to-left override in the local part reverses
+ * how the rest of the address is shown, domain included, so a stranger could
+ * make their own address look like a trusted one in the draft. The domain is
+ * already letters, digits and hyphens only. A letter from another script is
+ * still allowed: it is visible, and refusing it would refuse real people.
+ */
+const HIDDEN_IN_ADDRESS = /[\p{C}\p{Z}\p{Default_Ignorable_Code_Point}]/u;
+
 /** One domain label: letters, digits and inner hyphens, 1 to 63 characters. */
 const LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/;
 
@@ -133,7 +151,8 @@ function isDomain(value: string): boolean {
 /**
  * Whether `value` is ONE bare address: a local part, one `@`, and a domain of
  * two or more labels. No display name, no angle brackets, no spaces, no line
- * breaks, no second `@`.
+ * breaks, no second `@`, and no character that changes how the address looks
+ * without being seen (28-REVIEW WR-07).
  *
  * The one check both a rule's sender addresses and a reply's recipient go
  * through (D-30), so what a rule may name and what a reply may be sent to are
@@ -146,7 +165,7 @@ export function isBareAddress(value: unknown): value is string {
   if (at < 1 || at !== value.lastIndexOf("@")) return false;
   const local = value.slice(0, at);
   const domain = value.slice(at + 1);
-  if (local.length > 64 || NOT_IN_ADDRESS.test(local)) return false;
+  if (local.length > 64 || NOT_IN_ADDRESS.test(local) || HIDDEN_IN_ADDRESS.test(local)) return false;
   if (local.startsWith(".") || local.endsWith(".") || local.includes("..")) return false;
   return isDomain(domain);
 }

@@ -262,6 +262,54 @@ describe("replyRecipient: the From address, or a named skip (D-30)", () => {
   });
 });
 
+describe("an address with an invisible, format or direction character is refused (28-REVIEW WR-07)", () => {
+  // The case for replying to the From address is that the person sees the
+  // address before sending. A right-to-left override in the local part
+  // reverses how the rest of the address shows, domain included, so a stranger
+  // could make their own address look like a trusted one in the draft. Written
+  // as escapes so no such character sits in this file.
+  const HIDDEN: Array<[string, string]> = [
+    ["a right-to-left override", "‮"],
+    ["a left-to-right embedding", "‪"],
+    ["a right-to-left isolate", "⁧"],
+    ["a pop directional isolate", "⁩"],
+    ["a left-to-right mark", "‎"],
+    ["an Arabic letter mark", "؜"],
+    ["a zero-width space", "​"],
+    ["a zero-width joiner", "‍"],
+    ["a byte-order mark", "﻿"],
+    ["a soft hyphen", "­"],
+    ["a Mongolian vowel separator", "᠎"],
+    ["a combining grapheme joiner", "͏"],
+    ["an ideographic space", "　"],
+    ["a no-break space", " "],
+    ["a line separator", " "],
+    ["a private-use character", ""],
+    ["a C1 control", "\u0085"],
+  ];
+
+  for (const [name, hidden] of HIDDEN) {
+    const address = `dana${hidden}moc.elpmaxe@trusted.example`;
+    it(`${name}: no reply goes to it, and no rule may name it`, () => {
+      expect(replyRecipient(row({ senderAddress: address }), "me@mac.com")).toEqual({
+        kind: "skip",
+        reason: "no-address",
+      });
+      expect(parseRule({ when: { fromAddresses: [address] }, then: { flag: true } })).toMatchObject({
+        ok: false,
+        refusal: "bad-address",
+      });
+    });
+  }
+
+  it("a local part in another script, with no such character, is still an address", () => {
+    expect(replyRecipient(row({ senderAddress: "josé@example.com" }), "me@mac.com")).toEqual({
+      kind: "reply",
+      to: "josé@example.com",
+    });
+  });
+});
+
 // ------------------------------------------------------------- the matcher
 
 describe("evaluate: the conditions (D-03)", () => {
