@@ -36,6 +36,7 @@ import {
   ImapAuthError,
   ImapConnectError,
   ImapNotFoundError,
+  ImapValidityChangedError,
   ImapThrottleError,
 } from "../errors";
 import { MAX_APPEND_LITERAL_BYTES } from "./compose";
@@ -498,8 +499,10 @@ function checkedMailboxFacts(
   // mismatch means the identifiers the caller is holding name different
   // messages now, and answering with whatever sits at that UID today would
   // be a wrong answer reported as the right one.
+  // Its own subclass, so a caller can tell "the mailbox was recreated" from a
+  // refused open (26-REVIEW WR-02). The category is still not_found.
   if (expectedUidValidity !== null && expectedUidValidity !== uidValidity) {
-    throw new ImapNotFoundError();
+    throw new ImapValidityChangedError();
   }
 
   return { uidValidity, exists };

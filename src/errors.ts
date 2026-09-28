@@ -200,6 +200,28 @@ export class ImapNotFoundError extends Error {
 }
 
 /**
+ * The one not-found that says WHY: the mailbox's UIDVALIDITY is not the one
+ * the caller expected (26-REVIEW WR-02).
+ *
+ * Thrown only by the open's validity gate, when the caller named a validity
+ * and the server reported another. Every other not-found cause — a refused
+ * open, a missing validity, a fetch with no row — stays the plain class, so a
+ * caller that treats this one as "the mailbox was recreated" never mistakes a
+ * transient refusal for it. The recall page source relies on that: it reads
+ * the window again from the top only on this class.
+ *
+ * A subclass of `ImapNotFoundError`, so `toErrorCategory` answers `not_found`
+ * through the parent's branch, and every answer the model is given is exactly
+ * what it was before. Fixed label, no constructor argument, as above.
+ */
+export class ImapValidityChangedError extends ImapNotFoundError {
+  constructor() {
+    super();
+    this.name = "ImapValidityChangedError";
+  }
+}
+
+/**
  * Thrown when the confirmation supplied with a mail commit was not accepted.
  *
  * The mail tree's twin of `DavConfirmationError`, and here for the same

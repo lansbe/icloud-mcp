@@ -841,8 +841,10 @@ describe("every error class this repository exports is named in a dispatcher bra
     // LOUDLY, which is the opposite of one written in prose.
     expect(
       EXPORTED_ERROR_CLASSES.size,
-      "four Imap* classes, one Mail* class, ConnectionBusyError and ten Dav* classes ship today",
-    ).toBe(16);
+      "five Imap* classes, one Mail* class, ConnectionBusyError and ten Dav* classes ship today",
+    ).toBe(17);
+    // 26-REVIEW WR-02: the open's validity gate has its own not-found subclass.
+    expect([...EXPORTED_ERROR_CLASSES.keys()]).toContain("ImapValidityChangedError");
     // Phase 21: the mail tree's translation of a refused confirmation.
     expect([...EXPORTED_ERROR_CLASSES.keys()]).toContain("MailConfirmationError");
     expect([...EXPORTED_ERROR_CLASSES.keys()]).toContain("ImapThrottleError");

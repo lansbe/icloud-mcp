@@ -21,7 +21,7 @@
 //
 // No logging, and no caught value is ever read (./.claude/CLAUDE.md §4).
 
-import { ImapNotFoundError } from "../errors";
+import { ImapValidityChangedError } from "../errors";
 import { decodeCursor, decodeMessageId, encodeCursor, type PageCursor } from "../mail/ids";
 import {
   type MessageSummary,
@@ -207,9 +207,12 @@ export const mailRecallSource: RecallSource = {
    *
    * A cursor whose validity the mailbox no longer has is refused by the
    * listing. The page is then read once more from the top, so the answer
-   * carries the mailbox's current validity and the engine resets. The page's
-   * validity is the first row's; with no row, the cursor's when it was
-   * accepted; otherwise the window's UID snapshot is asked for it.
+   * carries the mailbox's current validity and the engine resets. Only that
+   * refusal is retried (26-REVIEW WR-02): any other not-found, such as a
+   * transient refusal to open the mailbox, propagates, so the build keeps its
+   * cursor and is not sent back to the newest mail. The page's validity is
+   * the first row's; with no row, the cursor's when it was accepted; otherwise
+   * the window's UID snapshot is asked for it.
    */
   async page(gate, principal, mailbox, cursor): Promise<RecallPage> {
     let accepted = cursor;
@@ -217,7 +220,7 @@ export const mailRecallSource: RecallSource = {
     try {
       listing = await readWindowPage(gate, principal, mailbox, cursor);
     } catch (error) {
-      if (cursor === null || !(error instanceof ImapNotFoundError)) throw error;
+      if (cursor === null || !(error instanceof ImapValidityChangedError)) throw error;
       accepted = null;
       listing = await readWindowPage(gate, principal, mailbox, null);
     }

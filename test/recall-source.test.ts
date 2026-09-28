@@ -406,6 +406,23 @@ describe("mailRecallSource.page reads the window through the listing (D-11)", ()
     expect(page).toEqual({ uidValidity: UIDVALIDITY + 7, items: [], next: null });
   });
 
+  it("a refused open with the cursor's own validity is not a changed validity: one session, not read again from the top (26-REVIEW WR-02)", async () => {
+    // A transient refusal. Retrying from the top would hand the engine the
+    // newest page with no accepted cursor, and the build would start over.
+    const cursor: PageCursor = { mailbox: MAILBOX, uidValidity: UIDVALIDITY, lastUid: 4000 };
+    const refused = createFakeDuplex([
+      ...authPrefix(),
+      wire("a4 NO [UNAVAILABLE] Mailbox is temporarily unavailable"),
+      logoutExchange("a5"),
+    ]);
+    sessions(refused, pageSession([4800], [row(4800)]));
+
+    await expect(
+      mailRecallSource.page(createSessionGate(), principal, MAILBOX, cursor),
+    ).rejects.toBeInstanceOf(ImapNotFoundError);
+    expect(connectImap).toHaveBeenCalledTimes(1);
+  });
+
   it("an error that is not a refused cursor is not retried", async () => {
     const cursor: PageCursor = { mailbox: MAILBOX, uidValidity: UIDVALIDITY, lastUid: 4000 };
     vi.mocked(connectImap).mockImplementationOnce(() => {
