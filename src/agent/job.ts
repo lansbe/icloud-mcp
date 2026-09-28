@@ -88,6 +88,19 @@ export const JOB_LAST_RUN_KEY = "job:lastRun";
 /** The storage key of the day's reply count: the UTC date and a count. */
 export const JOB_DRAFT_DAY_KEY = "job:draftDay";
 
+/**
+ * The storage key of the count of consecutive auth failures (D-16 as revised).
+ * The failure handling (plan 28-03) writes it; the rules view reads it.
+ */
+export const JOB_AUTH_FAILURES_KEY = "job:authFailures";
+
+/**
+ * The storage key of the job's stopped state (D-16 as revised). `off_auth`
+ * means iCloud refused the sign-in twice in a row and the key was ended. The
+ * failure handling (plan 28-03) writes it; the rules view reads it.
+ */
+export const JOB_STATE_KEY = "job:state";
+
 /** The start of every "already acted" record's key. */
 const ACTED = "acted:";
 
