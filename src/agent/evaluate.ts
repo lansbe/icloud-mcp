@@ -36,6 +36,41 @@ function fromAddressMatches(values: readonly string[], row: EnvelopeRow): boolea
   return values.some((value) => value.toLowerCase() === lower);
 }
 
+/**
+ * Whether the row's sender is at one of the domains, or a subdomain of one.
+ * The domain is the part after the address's last `@`. A lookalike suffix
+ * (`evilexample.com` for `example.com`) does not match: a subdomain must meet
+ * the domain at a dot.
+ */
+function fromDomainMatches(values: readonly string[], row: EnvelopeRow): boolean {
+  const sender = row.senderAddress;
+  if (sender === null) return false;
+  const at = sender.lastIndexOf("@");
+  if (at < 0) return false;
+  const domain = sender.slice(at + 1).toLowerCase();
+  if (domain.length === 0) return false;
+  return values.some((value) => {
+    const wanted = value.toLowerCase();
+    return domain === wanted || domain.endsWith(`.${wanted}`);
+  });
+}
+
+/**
+ * Text as a subject is compared: NFKC, then lower case. The same two steps the
+ * parser applies to a rule's words, repeated here because this module has no
+ * runtime import.
+ */
+function comparable(text: string): string {
+  return text.normalize("NFKC").toLowerCase();
+}
+
+/** Whether the row's subject contains one of the words. */
+function subjectMatches(values: readonly string[], row: EnvelopeRow): boolean {
+  if (row.subject === null) return false;
+  const subject = comparable(row.subject);
+  return values.some((value) => subject.includes(comparable(value)));
+}
+
 /** Whether every condition kind the rule has matches the row. */
 function ruleMatches(rule: Rule, row: EnvelopeRow): boolean {
   // A message received before the rule was added never matches it, and a
@@ -47,6 +82,15 @@ function ruleMatches(rule: Rule, row: EnvelopeRow): boolean {
     kinds += 1;
     if (!fromAddressMatches(when.fromAddresses, row)) return false;
   }
+  if (when.fromDomains !== undefined) {
+    kinds += 1;
+    if (!fromDomainMatches(when.fromDomains, row)) return false;
+  }
+  if (when.subjectContains !== undefined) {
+    kinds += 1;
+    if (!subjectMatches(when.subjectContains, row)) return false;
+  }
+  // A rule with no condition matches nothing. The parser refuses one anyway.
   return kinds > 0;
 }
 

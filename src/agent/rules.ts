@@ -33,6 +33,9 @@ export const MAX_VALUES_PER_KIND = 10;
 /** The most characters of one address, per RFC 5321's path limit. */
 export const MAX_ADDRESS_CHARS = 254;
 
+/** The most characters of one subject word, and the fewest is one (D-03). */
+export const MAX_SUBJECT_WORD_CHARS = 100;
+
 /** The most characters of a draft's text, and the fewest is one (D-05 as revised). */
 export const MAX_DRAFT_TEXT_CHARS = 2000;
 
@@ -41,9 +44,16 @@ export interface RuleDraft {
   readonly text: string;
 }
 
-/** What a rule matches on. Every kind present must match; any value within a kind. */
+/**
+ * What a rule matches on. Every kind present must match; any value within a
+ * kind. `fromAddresses` are whole addresses, lower-cased. `fromDomains` match
+ * the domain or any subdomain of it, lower-cased. `subjectContains` are words
+ * found anywhere in the subject, compared after NFKC and lower-casing.
+ */
 export interface RuleWhen {
   readonly fromAddresses?: readonly string[];
+  readonly fromDomains?: readonly string[];
+  readonly subjectContains?: readonly string[];
 }
 
 /** What a rule does. At least one of the two. */
@@ -76,6 +86,8 @@ export type RuleRefusal =
   | "no-condition"
   | "bad-values"
   | "bad-address"
+  | "bad-domain"
+  | "bad-subject-word"
   | "no-action"
   | "bad-flag"
   | "draft-not-reply"
@@ -89,6 +101,8 @@ const REFUSAL_REASONS: Readonly<Record<RuleRefusal, string>> = Object.freeze({
   "no-condition": "A rule needs at least one condition in its when part.",
   "bad-values": `Each condition holds between 1 and ${MAX_VALUES_PER_KIND} values.`,
   "bad-address": "Each sender address must be one plain address, like name@example.com.",
+  "bad-domain": "Each sender domain must be a plain domain, like example.com.",
+  "bad-subject-word": `Each subject word is between 1 and ${MAX_SUBJECT_WORD_CHARS} characters, on one line.`,
   "no-action": "A rule must flag the message, place a draft reply, or both.",
   "bad-flag": "The flag, when given, can only be true. A rule never clears a flag.",
   "draft-not-reply":
@@ -151,13 +165,20 @@ class Refused {
   constructor(readonly refusal: RuleRefusal) {}
 }
 
-/** A list of 1 to 10 values, each checked and normalised by `each`. */
-function valuesOf(value: unknown, each: (one: unknown) => string | null): string[] {
+/**
+ * A list of 1 to 10 values, each checked and normalised by `each`, which
+ * answers null for a value it refuses; that value is refused as `bad`.
+ */
+function valuesOf(
+  value: unknown,
+  each: (one: unknown) => string | null,
+  bad: RuleRefusal,
+): string[] {
   if (!Array.isArray(value)) throw new Refused("bad-values");
   if (value.length < 1 || value.length > MAX_VALUES_PER_KIND) throw new Refused("bad-values");
   return value.map((one) => {
     const out = each(one);
-    if (out === null) throw new Refused("bad-address");
+    if (out === null) throw new Refused(bad);
     return out;
   });
 }
@@ -167,11 +188,46 @@ function addressValue(one: unknown): string | null {
   return isBareAddress(one) ? one.toLowerCase() : null;
 }
 
+/** A sender domain, lower-cased, or null. */
+function domainValue(one: unknown): string | null {
+  if (typeof one !== "string" || one.length > MAX_ADDRESS_CHARS) return null;
+  return isDomain(one) ? one.toLowerCase() : null;
+}
+
+/** Any control character, a line break among them. */
+const CONTROL = /[\u0000-\u001f\u007f]/;
+
+/**
+ * Text as the matcher compares it: NFKC, then lower case. The matcher applies
+ * the same two steps to the subject, and has its own copy because it may not
+ * import at run time; the parser's tables pin the pair.
+ */
+function comparableText(text: string): string {
+  return text.normalize("NFKC").toLowerCase();
+}
+
+/** A subject word, normalised, or null. One line, 1 to 100 characters. */
+function subjectWordValue(one: unknown): string | null {
+  if (typeof one !== "string" || CONTROL.test(one)) return null;
+  const word = comparableText(one);
+  return word.length >= 1 && word.length <= MAX_SUBJECT_WORD_CHARS ? word : null;
+}
+
 function whenOf(value: unknown): RuleWhen {
   if (!isPlainObject(value)) throw new Refused("no-condition");
-  if (!onlyKeys(value, ["fromAddresses"])) throw new Refused("unknown-key");
-  const when: { fromAddresses?: string[] } = {};
-  if (value.fromAddresses !== undefined) when.fromAddresses = valuesOf(value.fromAddresses, addressValue);
+  if (!onlyKeys(value, ["fromAddresses", "fromDomains", "subjectContains"])) {
+    throw new Refused("unknown-key");
+  }
+  const when: { fromAddresses?: string[]; fromDomains?: string[]; subjectContains?: string[] } = {};
+  if (value.fromAddresses !== undefined) {
+    when.fromAddresses = valuesOf(value.fromAddresses, addressValue, "bad-address");
+  }
+  if (value.fromDomains !== undefined) {
+    when.fromDomains = valuesOf(value.fromDomains, domainValue, "bad-domain");
+  }
+  if (value.subjectContains !== undefined) {
+    when.subjectContains = valuesOf(value.subjectContains, subjectWordValue, "bad-subject-word");
+  }
   if (Object.keys(when).length === 0) throw new Refused("no-condition");
   return when;
 }
