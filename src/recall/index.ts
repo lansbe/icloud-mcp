@@ -53,6 +53,26 @@ const BATCH = 1000;
 /** The most matches one query may ask for, with metadata returned. */
 const TOP_K_MAX = 50;
 
+/**
+ * The least score a match needs to leave this module (Phase 26, D-07).
+ *
+ * SEED-006 D-1 promises that an empty recall means nothing scored high enough.
+ * That is only true if a match can score too low, so this is the line. bge-m3
+ * with cosine puts unrelated short texts well below related ones, and 0.5 is a
+ * starting point: the owner checks it live in plan 26-06, with a known subject
+ * and a nonsense phrase, and raises it in steps of 0.05 if the nonsense phrase
+ * returns anything.
+ *
+ * The score is compared here and nowhere else. It never leaves this module: a
+ * match that passes is mapped to a `RecallMatch`, which has no score.
+ */
+export const RECALL_MIN_SCORE = 0.5;
+
+/** Whether a match's score clears the floor. Anything but a finite number does not. */
+function clearsFloor(score: unknown): boolean {
+  return typeof score === "number" && Number.isFinite(score) && score >= RECALL_MIN_SCORE;
+}
+
 /** A 64-character lower-case hex id, the only shape a ledger id has. */
 const VECTOR_ID = /^[0-9a-f]{64}$/;
 
@@ -160,6 +180,7 @@ export function createRecallStore(index: Vectorize): RecallStore {
       }
       const matches: RecallMatch[] = [];
       for (const match of answer.matches ?? []) {
+        if (!clearsFloor(match.score)) continue;
         const own = ownMatch(match.metadata, principal.userId);
         if (own !== null) matches.push(own);
       }

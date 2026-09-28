@@ -510,12 +510,35 @@ export const FORBIDDEN = [
   // over mailboxes or pages is the same N sockets as a fan-out over the lease
   // runner itself. The object refuses a second page in flight at run time; the
   // scan refuses the fan-out before it ships.
+  //
+  // Phase 26 (D-20 c) names the recall step and the reads it opens a session
+  // for. `recallStep` in src/recall/sync.ts is the step; `runRecallStep` in
+  // src/recall/drive.ts is its one runner; `indexNewMail` in src/recall/sync.ts
+  // indexes new mail; `newMailPage` in src/recall/mail-source.ts is the page
+  // source it reads; `windowUids` and `summariesInRange` in src/mail/service.ts
+  // are the two new reads, and their stream forms (`windowUidsOver`,
+  // `summariesInRangeOver`) are covered by the prefix match. `runRecallStep`
+  // is not shadowed by `recallStep`: the match is case-sensitive and the
+  // runner spells the step with a capital. Each opens the person's one iCloud
+  // connection, so a combinator over mailboxes around any of them is the same
+  // N sockets the names above refuse. Measured at zero hits on the real tree
+  // before it was armed.
+  //
+  // 26-REVIEW WR-08 names the wrappers the step actually opens its sessions
+  // through, which the names above missed: `underLease` (the step's lease
+  // wrapper), `checkBuilt` (a built folder's status check) and `syncDeletions`
+  // (a built folder's deletion sync) in src/recall/sync.ts, and the two
+  // Phase 23 reads the step reaches through its deps, `folderSnapshots` and
+  // `listFolders` in src/mail/service.ts. A fan-out written as
+  // `Promise.all(folders.map((f) => underLease(principal, deps, read)))`
+  // named none of the listed tokens, so only the runtime gate would have
+  // refused it. Measured at zero hits on the real tree before it was armed.
   {
     id: "concurrent-session",
     scope: "src/",
     pattern:
-      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit|indexNextPage|reconcileMailbox)/g,
-    why: "A concurrent combinator wrapped around the per-person lease runner (withConnectionLease in src/agent/lease.ts), either mail session orchestrator (read-only or mutating), the core under them, a triage verb in src/mail/triage.ts (mark read or unread, flag or unflag, move, or move one draft to Trash), the mail move composites (readMoveSet, readDraftForChange, buildMovePreview, applyMailCommit), or a recall build entry point in src/recall/build.ts (indexNextPage, reconcileMailbox). Each recall build entry point takes the person's connection lease and reads mail through one session, so it is a session like the others. Each of those opens a session, and every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial, and a list of messages is worked through one at a time in one session: pass the whole list to moveMessages rather than mapping a verb over it.",
+      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit|indexNextPage|reconcileMailbox|recallStep|runRecallStep|indexNewMail|windowUids|summariesInRange|newMailPage|underLease|checkBuilt|syncDeletions|folderSnapshots|listFolders)/g,
+    why: "A concurrent combinator wrapped around the per-person lease runner (withConnectionLease in src/agent/lease.ts), either mail session orchestrator (read-only or mutating), the core under them, a triage verb in src/mail/triage.ts (mark read or unread, flag or unflag, move, or move one draft to Trash), the mail move composites (readMoveSet, readDraftForChange, buildMovePreview, applyMailCommit), or a recall build entry point in src/recall/build.ts (indexNextPage, reconcileMailbox). Each recall build entry point takes the person's connection lease and reads mail through one session, so it is a session like the others. The same holds for the recall step (recallStep in src/recall/sync.ts), its one runner (runRecallStep in src/recall/drive.ts), the new-mail indexer (indexNewMail) and page source (newMailPage), the two recall reads in src/mail/service.ts (windowUids, summariesInRange, and their stream forms), the step's own lease wrapper and the two per-folder actions it opens a session for (underLease, checkBuilt, syncDeletions in src/recall/sync.ts), and the two reads the step reaches through its deps (folderSnapshots, listFolders in src/mail/service.ts): the recall step and its reads each open the person's one iCloud connection. Each of those opens a session, and every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial, and a list of messages is worked through one at a time in one session: pass the whole list to moveMessages rather than mapping a verb over it.",
   },
   // The same property one protocol over, and the reason is deliberately NOT the
   // same. The two rules above lean on the six-connection platform cap. That cap
@@ -1164,6 +1187,31 @@ export const FORBIDDEN = [
     pattern:
       /\bnamespace\s*\??\s*(?::|=(?!=))(?!\s*[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\.\s*userId\s*[,;)}\n])/g,
     why: "A recall store partition, under src/recall/, whose value is not a Principal's userId member. The partition is the vector index's only query-time boundary between people, and the store fails open: a wrong partition does not error, it answers with somebody else's mail, or with everyone's. So it must come from the signed-in principal the door built, never from a request field, a tool argument, a string literal or a bare variable. Set it as principal.userId, as src/recall/index.ts does at the write and at the query. Do not narrow the pattern and do not widen its scope: src/dav/ uses a key of the same name for XML, and that is unrelated. A second source for the partition is a decision on the isolation boundary, not a refactor.",
+  },
+
+  // ------------------------------------------------------------ recall answer
+  // Phase 26, D-05 (RCLL-09). The exhaustive search was renamed so its name
+  // carries its promise (SEED-006 D-1): the tool that searches every message in
+  // a folder answers "none there" when it finds nothing, and the ranked recall
+  // tool answers "nothing scored high enough". The rename shipped with no
+  // alias. An alias would leave two names answering the same way, and the model
+  // would keep drawing the old conclusion from the old name.
+  //
+  // Scoped to `src/`, comments included, because a comment naming the old tool
+  // is where an alias starts: somebody reads it, and adds the name back "for
+  // compatibility". Tests may name it, to prove it is gone. src/ describes it by
+  // role ("the old name of the exhaustive search").
+  //
+  // No trailing word boundary, on purpose: a suffixed name built on the old one
+  // is the same alias. Measured at zero hits under src/ before it was armed.
+  //
+  // WHAT IT DOES NOT SEE. A name assembled from fragments at run time. That is
+  // a deliberate evasion, not a mistake.
+  {
+    id: "old-search-tool-name",
+    scope: "src/",
+    pattern: /\bmail_search/g,
+    why: "The old name of the exhaustive mail search, under src/, in code or in a comment. That tool was renamed so its name carries its promise: it searches every message in the folder, so an empty answer means none there, while the ranked recall tool only finds what scored high enough. The rename shipped with no alias (RCLL-09). An alias would leave two names answering the same way, and the model would keep drawing the old conclusion from the old name. Use the current name. In a comment, describe the old one by role. Bringing an alias back is a decision on the tool contract, not a refactor: get the decision, never loosen this rule.",
   },
 ];
 
@@ -1971,6 +2019,132 @@ export function collectAiBindingReads(relativePath, contents) {
 }
 
 /**
+ * A model id literal, permitted exactly once in the source tree (Phase 26,
+ * D-10, D-20 b; RCLL-12).
+ *
+ * THE RULE. Exactly one quoted string naming a Workers AI model exists under
+ * `src/`, and it is in `src/recall/embed.ts`: the embedding model that turns
+ * text into numbers. Every OCCURRENCE counts, not every file, so a second id in
+ * the embedder is as much a duplicate as one anywhere else.
+ *
+ * WHY A COUNT. No model sits in the retrieval loop. Recall embeds the query,
+ * asks the store, and returns ids and subject lines; nothing generated reaches
+ * the answer. A second model id is how a summariser, a reranker or a chat model
+ * would arrive without a decision, as one ordinary line. Zero is a violation
+ * too: an embedder with no model named was deleted, emptied or rewired to take
+ * the id from somewhere else, and nothing fails on the way out.
+ *
+ * THE SHAPE. A quote (single, double or backtick) followed by one of the two
+ * Workers AI catalogue prefixes, `@cf/` or `@hf/`. Both prefixes are counted,
+ * although only the first was named when this was planned: a model under the
+ * other prefix is still a second model. A template literal that builds an id
+ * from a prefix is counted too, because its opening backtick and prefix are
+ * still spelled.
+ *
+ * COMMENTS. Matched with comment lines blanked, as the other counts are, so a
+ * commented-out id cannot keep the missing arm quiet, and prose describing a
+ * model by role is not an id.
+ *
+ * WHAT IT DOES NOT SEE. An id assembled from fragments with the prefix split
+ * (`"@c" + "f/..."`), and an id read from configuration at run time. Both are
+ * deliberate evasions, not mistakes.
+ *
+ * Collected from `src/` only. Tests name the id to assert what the embedder
+ * sends. No `g` flag; the collector builds its own global copy per file.
+ */
+export const MODEL_ID_LITERAL = /["'`]@(?:cf|hf)\//;
+
+/** The one file under `MODEL_ID_SCOPE` permitted to match `MODEL_ID_LITERAL`,
+ *  and only once. */
+export const MODEL_ID_OWNER = "src/recall/embed.ts";
+
+/** The tree `MODEL_ID_LITERAL` is collected from. */
+export const MODEL_ID_SCOPE = "src/";
+
+/**
+ * The model id literals one file contributes, as `scan()` collects them. EVERY
+ * match, not the first, with a fresh global copy per call: two ids in the
+ * owner file are two ids. Comment lines blanked, positions unchanged. An empty
+ * list outside `MODEL_ID_SCOPE`.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectModelIdLiterals(relativePath, contents) {
+  if (!relativePath.startsWith(MODEL_ID_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  return [...code.matchAll(new RegExp(MODEL_ID_LITERAL, "g"))].map((match) => ({
+    file: relativePath,
+    ...positionOf(code, match.index),
+  }));
+}
+
+/**
+ * A call of the recall build step, permitted exactly once in the source tree
+ * (Phase 26, D-20 d, as revised on 2026-09-27).
+ *
+ * THE RULE. Exactly one call of `recallStep` exists under `src/`, and it is in
+ * `src/recall/drive.ts`, inside the runner that runs after a signed-in
+ * person's own successful mail call. The step's definition in
+ * `src/recall/sync.ts` is not a call: the pattern refuses a name preceded by
+ * the word that declares a function.
+ *
+ * WHY A COUNT. The owner ruled on 2026-09-27 that only a signed-in person's own
+ * mail calls drive the build, after the call's own answer. Never the per-person
+ * object's alarm, and never the autonomy key. A second caller is how either
+ * would arrive, as an ordinary edit: one line in the alarm handler, or a second
+ * driver somewhere else. Zero is a violation too, and it is the quieter one: a
+ * lost caller stops every person's index from growing, and nothing fails,
+ * because a step that never runs reports nothing.
+ *
+ * THE SHAPE. The step's name as a whole word, then optional space, then an
+ * opening parenthesis, not preceded by `function`. `runRecallStep(` is not a
+ * match: the match is case-sensitive and the runner spells the step with a
+ * capital.
+ *
+ * COMMENTS. Matched with comment lines blanked, so a commented-out call cannot
+ * keep the missing arm quiet, and prose naming the step is not a call.
+ *
+ * A call through a namespace import (`sync.recallStep(...)`) IS seen, because
+ * the name and the parenthesis are still spelled.
+ *
+ * WHAT IT DOES NOT SEE. The step taken as a value and called under another
+ * name (`const step = recallStep; step(...)`), and `.call` or `.apply` on it.
+ * Both are deliberate evasions, not mistakes.
+ *
+ * Collected from `src/` only. Tests call the step directly with fakes. No `g`
+ * flag; the collector builds its own global copy per file.
+ */
+export const RECALL_STEP_CALL = /(?<!\bfunction\s*)\brecallStep\s*\(/;
+
+/** The one file under `RECALL_STEP_SCOPE` permitted to match
+ *  `RECALL_STEP_CALL`, and only once. */
+export const RECALL_STEP_OWNER = "src/recall/drive.ts";
+
+/** The tree `RECALL_STEP_CALL` is collected from. */
+export const RECALL_STEP_SCOPE = "src/";
+
+/**
+ * The calls of the recall step one file contributes, as `scan()` collects
+ * them. EVERY match, with a fresh global copy per call: two calls in the owner
+ * are two calls. Comment lines blanked, positions unchanged. An empty list
+ * outside `RECALL_STEP_SCOPE`.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectRecallStepCalls(relativePath, contents) {
+  if (!relativePath.startsWith(RECALL_STEP_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  return [...code.matchAll(new RegExp(RECALL_STEP_CALL, "g"))].map((match) => ({
+    file: relativePath,
+    ...positionOf(code, match.index),
+  }));
+}
+
+/**
  * A bare network call, permitted in exactly one module of the subscription-feed
  * tree.
  *
@@ -2717,6 +2891,10 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "recall-index-read-missing",
   "ai-binding-read-outside-owner",
   "ai-binding-read-missing",
+  "model-id-duplicated",
+  "model-id-missing",
+  "recall-step-call-duplicated",
+  "recall-step-call-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -2835,8 +3013,8 @@ function walk(absoluteDir, collected = []) {
  * one of those as a comment would blank real code. So a comment trailing code
  * is kept, and so is a block comment opened after code. Used by the two
  * mutating-path counts, the three move-step counts, the namespace-read
- * count, the two recall binding counts, the Durable Object config checks and
- * the recall config checks only.
+ * count, the two recall binding counts, the model id and recall step counts,
+ * the Durable Object config checks and the recall config checks only.
  *
  * @param {string} text
  * @returns {string}
@@ -2970,6 +3148,8 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const agentNamespaceReaders = [];
   const recallIndexReaders = [];
   const aiBindingReaders = [];
+  const modelIdLiterals = [];
+  const recallStepCalls = [];
   const davWriteExports = {};
 
   for (const absolute of files) {
@@ -3108,6 +3288,12 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
     // reads.
     recallIndexReaders.push(...collectRecallIndexReads(relativePath, contents));
     aiBindingReaders.push(...collectAiBindingReads(relativePath, contents));
+    // The two phase 26 counts. The embedder and the driver are not skipped:
+    // each holds its one occurrence. EVERY match, comment lines blanked, a
+    // fresh global copy per file. The step's definition in src/recall/sync.ts
+    // is not a call, so it is not collected.
+    modelIdLiterals.push(...collectModelIdLiterals(relativePath, contents));
+    recallStepCalls.push(...collectRecallStepCalls(relativePath, contents));
     // The write-module manifest collects NAMES rather than a match position, so
     // it is the one collector that keys by module instead of appending to a list.
     // A declared module that is never walked therefore has no key at all, which
@@ -3139,6 +3325,8 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   violations.push(...checkAgentNamespaceReadOwnership(agentNamespaceReaders));
   violations.push(...checkRecallIndexOwnership(recallIndexReaders));
   violations.push(...checkAiBindingOwnership(aiBindingReaders));
+  violations.push(...checkModelIdOwnership(modelIdLiterals));
+  violations.push(...checkRecallStepCallOwnership(recallStepCalls));
   violations.push(...checkDavWriteCoverage(davWriteExports));
 
   return violations.sort(
@@ -3821,6 +4009,84 @@ export function checkAiBindingOwnership(readers) {
       pattern: "ai-binding-read-missing",
       patternIndex: FORBIDDEN.length + 38,
       why: `No file under ${AI_BINDING_SCOPE} reads the Workers AI binding off the environment, which means the embedder in ${AI_BINDING_OWNER} was deleted, renamed, emptied, or rewired to reach the model some other way. Zero is as much a violation as two, and it is the quieter of the pair: nothing fails on the way out, because the tests that covered the deleted code leave with it. A read that survives only in a comment counts as zero. Restore the read in the embedder's production accessor. If the embedder really moved, that is a decision, not a refactor: get it, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The model id count constraint, as a pure function over the collected
+ * literals (Phase 26, D-10; RCLL-12). One owner, one occurrence: the first
+ * literal in the owner is skipped, every other literal anywhere is reported,
+ * and an empty list is the missing arm. See the `MODEL_ID_LITERAL` docstring
+ * for why this is a count and for what it cannot see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} literals
+ */
+export function checkModelIdOwnership(literals) {
+  const violations = [];
+  let ownerLiterals = 0;
+  for (const literal of literals) {
+    if (literal.file === MODEL_ID_OWNER) {
+      ownerLiterals += 1;
+      if (ownerLiterals === 1) continue;
+    }
+    violations.push({
+      file: literal.file,
+      line: literal.line,
+      column: literal.column,
+      pattern: "model-id-duplicated",
+      patternIndex: FORBIDDEN.length + 39,
+      why: `A second model id literal under ${MODEL_ID_SCOPE} -- either in another module, or a second one inside ${MODEL_ID_OWNER} itself, which counts the same. No model sits in the retrieval loop (RCLL-12): the only model this server runs is the one in ${MODEL_ID_OWNER} that turns text into numbers, and nothing generated reaches an answer. A second model id is how a summariser, a reranker or a chat model would arrive without a decision. If a second model genuinely belongs, that is a decision on the tool contract, not a refactor: get the decision, then change the owner, never the pattern.`,
+    });
+  }
+  if (literals.length === 0) {
+    violations.push({
+      file: MODEL_ID_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "model-id-missing",
+      patternIndex: FORBIDDEN.length + 40,
+      why: `No model id literal under ${MODEL_ID_SCOPE}, which means the embedding model in ${MODEL_ID_OWNER} was deleted, emptied, or rewired to take its id from somewhere else. Zero is as much a violation as two, and it is the quieter of the pair: "no second model" is trivially true of a tree where the embedder is gone, and nothing fails on the way out. An id that survives only in a comment counts as zero. Restore the literal in the embedder. If it really moved, that is a decision, not a refactor: get it, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The recall step's one caller, as a pure function over the collected calls
+ * (Phase 26, D-20 d, as revised on 2026-09-27). One owner, one call: the first
+ * call in the owner is skipped, every other call anywhere is reported, and an
+ * empty list is the missing arm. See the `RECALL_STEP_CALL` docstring for why
+ * this is a count and for what it cannot see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} calls
+ */
+export function checkRecallStepCallOwnership(calls) {
+  const violations = [];
+  let ownerCalls = 0;
+  for (const call of calls) {
+    if (call.file === RECALL_STEP_OWNER) {
+      ownerCalls += 1;
+      if (ownerCalls === 1) continue;
+    }
+    violations.push({
+      file: call.file,
+      line: call.line,
+      column: call.column,
+      pattern: "recall-step-call-duplicated",
+      patternIndex: FORBIDDEN.length + 41,
+      why: `A second call of the recall build step under ${RECALL_STEP_SCOPE} -- either in another module, the per-person object included, or a second one inside ${RECALL_STEP_OWNER} itself, which counts the same. The owner ruled on 2026-09-27 that only a signed-in person's own mail calls drive the build, after the call's own answer: never the object's alarm, and never the autonomy key. A second caller is how either would arrive without a decision. Run the step through the one runner in ${RECALL_STEP_OWNER} instead. A second driver is a decision on the recall boundary, not a refactor: get the decision, then change the owner, never the pattern.`,
+    });
+  }
+  if (calls.length === 0) {
+    violations.push({
+      file: RECALL_STEP_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "recall-step-call-missing",
+      patternIndex: FORBIDDEN.length + 42,
+      why: `No call of the recall build step under ${RECALL_STEP_SCOPE}, which means the runner in ${RECALL_STEP_OWNER} was deleted, emptied, or rewired to reach the step some other way. Zero is as much a violation as two, and it is the quieter of the pair: a lost caller stops every person's index from growing, and nothing fails, because a step that never runs reports nothing. A call that survives only in a comment counts as zero. Restore the call in the runner. If the driver really moved, that is a decision, not a refactor: get it, then change the owner, never the pattern.`,
     });
   }
   return violations;

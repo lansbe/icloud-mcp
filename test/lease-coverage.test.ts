@@ -234,7 +234,7 @@ const LEASED: ReadonlyArray<{ name: string; args: Args }> = [
   { name: "mail_get_message", args: { id: MESSAGE_ID } },
   { name: "mail_list_folders", args: {} },
   { name: "mail_list_messages", args: { folderId: FOLDER_ID } },
-  { name: "mail_search", args: { keyword: "invoice" } },
+  { name: "mail_find", args: { keyword: "invoice" } },
   { name: "mail_list_unread", args: {} },
   {
     name: "mail_compose_new",
@@ -278,6 +278,11 @@ const NOT_LEASED: ReadonlyArray<{ name: string; reason: string; args: Args }> = 
       uploadId: encodeUploadId({ key: "staged/lease-coverage", expiresAt: Date.now() + 600000 }),
       sizeBytes: 10,
     },
+  },
+  {
+    name: "mail_recall",
+    reason: "reads the person's recall index only; opens no mail session",
+    args: { query: "staff engineer" },
   },
   { name: "dav_diagnose", reason: "DAV over HTTPS (D-07)", args: {} },
   { name: "calendar_list_calendars", reason: DAV_REASON, args: {} },

@@ -35,7 +35,9 @@ import { reportRefusal } from "../password-pause";
 import {
   ImapAuthError,
   ImapConnectError,
+  ImapGoneError,
   ImapNotFoundError,
+  ImapValidityChangedError,
   ImapThrottleError,
 } from "../errors";
 import { MAX_APPEND_LITERAL_BYTES } from "./compose";
@@ -498,8 +500,10 @@ function checkedMailboxFacts(
   // mismatch means the identifiers the caller is holding name different
   // messages now, and answering with whatever sits at that UID today would
   // be a wrong answer reported as the right one.
+  // Its own subclass, so a caller can tell "the mailbox was recreated" from a
+  // refused open (26-REVIEW WR-02). The category is still not_found.
   if (expectedUidValidity !== null && expectedUidValidity !== uidValidity) {
-    throw new ImapNotFoundError();
+    throw new ImapValidityChangedError();
   }
 
   return { uidValidity, exists };
@@ -579,7 +583,14 @@ export async function withMailSessionOver<T>(
           channel.nextTag(),
           `EXAMINE ${quoted}`,
         );
-        if (examine.status !== "OK") throw new ImapNotFoundError();
+        if (examine.status !== "OK") {
+          // Only the server's NONEXISTENT code says the mailbox is gone
+          // (26-REVIEW WR-03). Any other refusal may be transient.
+          const gone =
+            examine.status === "NO" &&
+            parseCompletionCode(examine.tagged.text) === FOLDER_GONE_CODE;
+          throw gone ? new ImapGoneError() : new ImapNotFoundError();
+        }
 
         ({ uidValidity, exists } = checkedMailboxFacts(
           examine.untagged,
@@ -1096,8 +1107,9 @@ async function readStructure(
 
   const items = firstFetchItems(result.untagged);
   // A UID that matches nothing produces a tagged OK with no untagged reply at
-  // all, which is the commonest shape of "that message is gone".
-  if (items === null) throw new ImapNotFoundError();
+  // all, which is the commonest shape of "that message is gone". That one is
+  // certain, so it is the certain class (26-REVIEW WR-03).
+  if (items === null) throw new ImapGoneError();
 
   // A structure this walk cannot make sense of yields an EMPTY list rather than
   // a throw (T-02-21), and an empty list is survivable here: no text part means
@@ -2846,22 +2858,7 @@ async function newMailIn(
   // row with no validity would mint an id no later call could gate.
   if (mailbox === null || uidValidity === null) throw new ImapNotFoundError();
 
-  const last = toUidExclusive - 1;
-  const result = await sendCommand(
-    session.channel,
-    session.channel.nextTag(),
-    `UID SEARCH UID ${fromUid}:${last}`,
-  );
-  if (result.status !== "OK") throw new ImapNotFoundError();
-
-  const found = new Set<number>();
-  for (const line of result.untagged) {
-    const identifiers = parseSearchLine(line);
-    if (identifiers === null) continue;
-    for (const uid of identifiers) {
-      if (uid >= fromUid && uid <= last) found.add(uid);
-    }
-  }
+  const found = await uidsInRange(session, fromUid, toUidExclusive);
 
   const page = [...found].sort((a, b) => b - a).slice(0, MAX_NEW_MAIL_ROWS);
   if (page.length === 0) return { count: 0, rows: [] };
@@ -2898,6 +2895,40 @@ async function newMailIn(
   }
 
   return { count: found.size, rows };
+}
+
+/**
+ * The UIDs still present in `[fromUid, toUidExclusive)`, inside an open
+ * session. The caller has checked the range is not empty.
+ *
+ * THE ONE BOUNDED RANGE SEARCH (Phase 23 D-18). The range is closed at both
+ * ends: the upper end is `toUidExclusive - 1`, never the open-ended form, which
+ * would always take in the newest message and anything that arrived after the
+ * status reply. Only UIDs inside the range are kept, because a server may
+ * answer a range with a UID outside it. An OK with no search line is none.
+ */
+async function uidsInRange(
+  session: MailSession,
+  fromUid: number,
+  toUidExclusive: number,
+): Promise<Set<number>> {
+  const last = toUidExclusive - 1;
+  const result = await sendCommand(
+    session.channel,
+    session.channel.nextTag(),
+    `UID SEARCH UID ${fromUid}:${last}`,
+  );
+  if (result.status !== "OK") throw new ImapNotFoundError();
+
+  const found = new Set<number>();
+  for (const line of result.untagged) {
+    const identifiers = parseSearchLine(line);
+    if (identifiers === null) continue;
+    for (const uid of identifiers) {
+      if (uid >= fromUid && uid <= last) found.add(uid);
+    }
+  }
+  return found;
 }
 
 /** New mail in one folder's range, over an already-open stream pair. */
@@ -3638,6 +3669,34 @@ async function fetchPage(
   // vanished identifier would be re-requested forever.
   const lastUid = page[page.length - 1]!;
 
+  const messages = await summaryRows(session, mailbox, uidValidity, page);
+
+  return {
+    messages,
+    hasMore,
+    nextCursor: hasMore
+      ? encodeCursor({ mailbox, uidValidity, lastUid })
+      : null,
+    unsupportedCharset: false,
+  };
+}
+
+/**
+ * The listing's rows for `page`, a list of UIDs already chosen and ordered by
+ * the caller, inside an open session.
+ *
+ * THE ONE ROW BUILDER. One batched metadata fetch of `PAGE_ITEMS`, then the
+ * preview fetches, then the assembly, all in the peeking form. The listing, the
+ * search, the unread listing and the recall new-mail read all build their rows
+ * here, so the fields and the fetch items cannot drift between them. Rows come
+ * back in `page`'s order; a UID the fetch did not answer for is left out.
+ */
+async function summaryRows(
+  session: MailSession,
+  mailbox: string,
+  uidValidity: number,
+  page: readonly number[],
+): Promise<MessageSummary[]> {
   const metadata = await sendCommand(
     session.channel,
     session.channel.nextTag(),
@@ -3696,15 +3755,7 @@ async function fetchPage(
       hasAttachments: row.hasAttachments,
     });
   }
-
-  return {
-    messages,
-    hasMore,
-    nextCursor: hasMore
-      ? encodeCursor({ mailbox, uidValidity, lastUid })
-      : null,
-    unsupportedCharset: false,
-  };
+  return messages;
 }
 
 /**
@@ -4090,6 +4141,195 @@ export async function searchMessages(
     mailbox,
     cursor?.uidValidity ?? null,
     (session) => fetchPage(session, mailbox, cursor, pageSize, criteria),
+    options,
+  );
+}
+
+/** One mailbox's validity, and every UID in it since a day. */
+export interface WindowUids {
+  readonly uidValidity: number;
+  readonly uids: number[];
+}
+
+/**
+ * The window's UID snapshot, inside an open session (Phase 26, D-17b, D-19).
+ *
+ * The search is the listing's own private search with no cursor and a start
+ * day only, so the command is built by the one builder the listing uses and no
+ * second search spelling exists. A charset refusal cannot happen on a date-only
+ * search, because no term is sent; if one ever arrives it is reported as
+ * not-found rather than as an empty mailbox, since an empty snapshot would tell
+ * the reconcile to remove everything.
+ */
+async function windowUidsIn(session: MailSession, sinceDay: string): Promise<WindowUids> {
+  const uidValidity = session.uidValidity;
+  if (uidValidity === null) throw new ImapNotFoundError();
+  const found = await searchPage(session, null, { startDate: sinceDay });
+  if (found.unsupportedCharset) throw new ImapNotFoundError();
+  return { uidValidity, uids: [...new Set(found.identifiers)] };
+}
+
+/** The window's UID snapshot over an already-open stream pair. */
+export async function windowUidsOver(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string,
+  sinceDay: string,
+  options: MailSessionOptions = {},
+): Promise<WindowUids> {
+  parseIsoDay(sinceDay);
+  return withMailSessionOver(
+    duplex,
+    principal,
+    gate,
+    mailbox,
+    null,
+    (session) => windowUidsIn(session, sinceDay),
+    options,
+  );
+}
+
+/**
+ * Every UID in `mailbox` received on or after `sinceDay` (`YYYY-MM-DD`), and
+ * the mailbox's UIDVALIDITY (Phase 26, D-17b).
+ *
+ * This is the snapshot the recall reconcile compares the person's ledger
+ * against. It is bounded to the retention window, because a vector outside the
+ * window is expiring anyway, and removing one early is the privacy-safe
+ * direction. One read-only open and one search, in one session, and no fetch at
+ * all, so nothing is read and nothing can be marked read.
+ *
+ * A malformed day is refused before any socket is opened.
+ */
+export async function windowUids(
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string,
+  sinceDay: string,
+  options: MailSessionOptions = {},
+): Promise<WindowUids> {
+  parseIsoDay(sinceDay);
+  return withMailSession(
+    principal,
+    gate,
+    mailbox,
+    null,
+    (session) => windowUidsIn(session, sinceDay),
+    options,
+  );
+}
+
+/** One page of new mail in a UID range, and where the next page starts. */
+export interface RangePage {
+  /** The listing's own rows, oldest first. */
+  readonly rows: MessageSummary[];
+  /**
+   * The first UID not yet read. The last UID this page chose plus one when
+   * more remained in the range; otherwise the range's exclusive upper end.
+   */
+  readonly nextFrom: number;
+}
+
+/** Whether `uid` can be a message UID: a safe integer of at least 1. */
+function isUidValue(uid: number): boolean {
+  return Number.isSafeInteger(uid) && uid >= 1;
+}
+
+/**
+ * The oldest page of `[fromUid, toUidExclusive)`, inside an open session.
+ *
+ * The search is the one bounded range search; the rows are the listing's own
+ * row builder. Chosen oldest first and at most `PAGE_SIZE_DEFAULT`, so a caller
+ * that stores `nextFrom` moves past exactly the UIDs this page chose.
+ */
+async function summariesInRangeIn(
+  session: MailSession,
+  mailbox: string,
+  fromUid: number,
+  toUidExclusive: number,
+): Promise<RangePage> {
+  const uidValidity = session.uidValidity;
+  if (uidValidity === null) throw new ImapNotFoundError();
+
+  const found = await uidsInRange(session, fromUid, toUidExclusive);
+  const ordered = [...found].sort((a, b) => a - b);
+  const page = ordered.slice(0, PAGE_SIZE_DEFAULT);
+  if (page.length === 0) return { rows: [], nextFrom: toUidExclusive };
+
+  const nextFrom = ordered.length > page.length ? page[page.length - 1]! + 1 : toUidExclusive;
+  const rows = await summaryRows(session, mailbox, uidValidity, page);
+  return { rows, nextFrom };
+}
+
+/**
+ * Refuse a range whose ends are not UIDs, before any socket. Answers true when
+ * the range is empty, so the caller can answer at once with no session.
+ */
+function emptyRange(fromUid: number, toUidExclusive: number): boolean {
+  if (!isUidValue(fromUid) || !isUidValue(toUidExclusive)) throw new ImapNotFoundError();
+  return toUidExclusive <= fromUid;
+}
+
+/** New mail in a UID range, oldest first, over an already-open stream pair. */
+export async function summariesInRangeOver(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string,
+  uidValidity: number,
+  fromUid: number,
+  toUidExclusive: number,
+  options: MailSessionOptions = {},
+): Promise<RangePage> {
+  if (emptyRange(fromUid, toUidExclusive)) return { rows: [], nextFrom: fromUid };
+  return withMailSessionOver(
+    duplex,
+    principal,
+    gate,
+    mailbox,
+    uidValidity,
+    (session) => summariesInRangeIn(session, mailbox, fromUid, toUidExclusive),
+    options,
+  );
+}
+
+/**
+ * New mail in `[fromUid, toUidExclusive)`, oldest first, as the listing's own
+ * rows (Phase 26, D-16).
+ *
+ * OLDEST FIRST, so a caller that stores `nextFrom` moves forward past exactly
+ * what it read, and a burst larger than one page is read over several calls
+ * with nothing skipped.
+ *
+ * BOUNDED AT BOTH ENDS, for the reason Phase 23 D-18 gives: the open-ended form
+ * always takes in the newest message and anything that arrived after the
+ * status reply. The upper end is the status reply's next UID minus one.
+ *
+ * THE LISTING'S OWN ITEMS. The rows are built by the listing's row builder, so
+ * every fetch item is the peeking one and no fetch item is added. The folder is
+ * opened read-only through the orchestrator with `uidValidity` as the expected
+ * validity, so a folder whose validity moved is refused before any search.
+ *
+ * An empty range opens no socket. A range whose ends are not UIDs is refused
+ * before any socket.
+ */
+export async function summariesInRange(
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string,
+  uidValidity: number,
+  fromUid: number,
+  toUidExclusive: number,
+  options: MailSessionOptions = {},
+): Promise<RangePage> {
+  if (emptyRange(fromUid, toUidExclusive)) return { rows: [], nextFrom: fromUid };
+  return withMailSession(
+    principal,
+    gate,
+    mailbox,
+    uidValidity,
+    (session) => summariesInRangeIn(session, mailbox, fromUid, toUidExclusive),
     options,
   );
 }

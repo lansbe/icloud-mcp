@@ -88,6 +88,7 @@ const EXPECTED_TOOLS: readonly string[] = [
   "mail_compose_reply",
   "mail_confirm_upload",
   "mail_delete_draft",
+  "mail_find",
   "mail_flag",
   "mail_get_attachment",
   "mail_get_message",
@@ -97,7 +98,7 @@ const EXPECTED_TOOLS: readonly string[] = [
   "mail_list_unread",
   "mail_mark_read",
   "mail_move",
-  "mail_search",
+  "mail_recall",
   "mail_stage_attachment",
   "mail_trash",
 ];
@@ -340,6 +341,20 @@ describe("the tool set is pinned against the instructions", () => {
     const registered = tools!.map((tool) => tool.name).sort();
 
     expect(registered, ALSO_EDIT_THE_STRING).toEqual([...EXPECTED_TOOLS].sort());
+  });
+
+  it("does not register the search tool's old name, nor anything answering for it", async () => {
+    // RCLL-09: the exhaustive search is `mail_find`, and the name it had before
+    // recall existed is gone with no alias. A model that learned the old name
+    // must get "no such tool", not a second door onto the same search, because
+    // the old name made neither of the two promises the new names make.
+    const result = resultFor(await askTheServer([INITIALIZE, TOOLS_LIST]), 2);
+    const names = (result.tools as { name: string }[]).map((tool) => tool.name);
+
+    // Non-vacuity: the new name is there, so the list really is the live one.
+    expect(names).toContain("mail_find");
+    expect(names).not.toContain("mail_search");
+    expect(names.filter((name) => /search/.test(name) && name.startsWith("mail_"))).toEqual([]);
   });
 
   it("keeps the README's headline count equal to the live one", async () => {

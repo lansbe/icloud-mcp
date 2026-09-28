@@ -87,7 +87,7 @@ enforcement, and the module map — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ## Tools
 
-39 tools in five groups. Every tool description carries an untrusted-content
+40 tools in five groups. Every tool description carries an untrusted-content
 notice; event titles, message bodies, and contact fields are treated as data,
 never as instructions.
 
@@ -106,7 +106,8 @@ never as instructions.
 | `mail_list_folders` | List mail folders with role and counts. |
 | `mail_list_messages` | List a folder's messages, newest first (metadata + capped snippet, never bodies). |
 | `mail_list_unread` | List a folder's unread mail. |
-| `mail_search` | Search one folder by keyword, sender, and date range. |
+| `mail_find` | Search one folder by keyword, sender, and date range. Exhaustive in that folder: an empty answer means no such mail is there. |
+| `mail_recall` | Find recent mail by meaning. Ranked and best-effort: an empty answer means nothing scored high enough, not that no such mail exists. Returns message ids and subjects only; open one with `mail_get_message`. It searches a copy of your recent mail this server keeps for everyone who signs in; [SECURITY.md](SECURITY.md#recall-keeps-a-searchable-copy-of-your-recent-mail) says what is kept and for how long. |
 | `mail_get_message` | Read one message in full by opaque id. |
 | `mail_mark_read` | Mark one message read or unread. **Writes immediately** — no preview, because the same tool puts it back. Reports the state iCloud returned. |
 | `mail_flag` | Flag or unflag one message. **Writes immediately** — no preview, because the same tool puts it back. Reports the flag state iCloud returned. |

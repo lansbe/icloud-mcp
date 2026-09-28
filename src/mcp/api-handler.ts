@@ -15,6 +15,8 @@ import { parseAllowList } from "../auth/allow-list";
 import type { Principal } from "../principal";
 import { normaliseAppleId, principalFromProps } from "../principal";
 import { guardAgainstPause } from "../password-pause";
+import type { GrantClient } from "../recall/drive";
+import { grantClientOf } from "./grant-client";
 import { createServerFactory } from "./server";
 
 /**
@@ -359,9 +361,14 @@ function unauthorized(request: Request): Response {
 export function buildRequestHandler(
   principal: Promise<Principal>,
   extraTools: ExtraTool[] = [],
+  // Which client the request's grant belongs to, passed straight to the
+  // factory (Phase 26, D-35). The default answers null, which runs no recall
+  // step; the door below passes the real reader, and the canary fixture keeps
+  // the default.
+  grantClient: GrantClient = async () => null,
 ): ReturnType<typeof createMcpHandler> {
   return createMcpHandler(
-    createServerFactory(principal, extraTools),
+    createServerFactory(principal, extraTools, grantClient),
     HANDLER_OPTIONS,
   );
 }
@@ -464,7 +471,14 @@ export function createMcpApiHandler(extraTools: ExtraTool[] = []): {
       // awaits `principal` itself still sees the rejection.
       principal.catch(() => {});
 
-      return buildRequestHandler(principal, extraTools)(request, env, ctx);
+      // The grant reader is built here and reads nothing here: it only
+      // captures the request and the store, and reads that grant's record when
+      // a recall step is about to run (D-35). So this line adds no await.
+      return buildRequestHandler(
+        principal,
+        extraTools,
+        grantClientOf(request, env.OAUTH_KV),
+      )(request, env, ctx);
     },
   };
 }

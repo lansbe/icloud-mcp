@@ -45,6 +45,7 @@ import type {
 import type { Env } from "../../env";
 import {
   ImapAuthError,
+  ImapGoneError,
   ImapNotFoundError,
   MailConfirmationError,
   toErrorCategory,
@@ -117,6 +118,7 @@ import {
   unflagMessage,
 } from "../../mail/triage";
 import type { Principal } from "../../principal";
+import { forgetDeadRef } from "../../recall/dead-ref";
 import type { ConfirmRefusal } from "../../staging/presign";
 import {
   UPLOAD_URL_TTL_SECONDS,
@@ -2570,17 +2572,35 @@ export function registerMailTools(
       }),
     },
     async ({ id, includeHtml }) => {
+      // Held outside the `try` so the catch can see who asked and which
+      // message, but only once each is known: a principal refusal or a token
+      // that does not decode leaves them null, and nothing is removed.
+      let actor: Principal | null = null;
+      let ref: MessageRef | null = null;
       try {
-        const actor = await principal;
+        actor = await principal;
         // Decoding first means a malformed or stale token is refused before a
         // socket is opened, which is the cheapest possible refusal and the one
         // that spends none of the connection budget.
-        const ref = decodeMessageId(id);
-        const detail = await mail.withConnectionLease(actor, (leased) =>
-          getMessage(actor, leased, ref, { includeHtml }),
+        ref = decodeMessageId(id);
+        const decoded = ref;
+        const reader = actor;
+        const detail = await mail.withConnectionLease(reader, (leased) =>
+          getMessage(reader, leased, decoded, { includeHtml }),
         );
         return messageToolResult(detail);
       } catch (err) {
+        // A message that no longer opens is removed from this person's recall
+        // index at once (RCLL-08, ARCHITECTURE §4.6(a)). Only for a not-found
+        // that is certain (26-REVIEW WR-03): the mailbox's validity changed,
+        // the mailbox does not exist, or the fetch came back with no row. A
+        // transient refusal is not-found too, and removing on it would drop a
+        // live message for good, since nothing re-indexes it. Only when the id
+        // decoded. It never throws, and the answer below is exactly the one
+        // this catch gave before recall existed.
+        if (err instanceof ImapGoneError && actor !== null && ref !== null) {
+          await forgetDeadRef(actor, ref);
+        }
         // The same backstop shape `registerDiagnoseTool` uses: one boundary,
         // one fixed vocabulary, nothing of the caught value escaping.
         return mailErrorResult(err);
@@ -2651,29 +2671,33 @@ export function registerMailTools(
   );
 
   server.registerTool(
-    "mail_search",
+    "mail_find",
     {
-      // The date rule is stated here because a caller cannot infer it from the
-      // parameter names: nothing in `startDate`/`endDate` says both ends are
-      // inclusive, that matching ignores time and timezone, or that it runs on
-      // iCloud's receipt time rather than the sender's own header. The rest
-      // stays terse — a description is a tax paid on every call for the life of
-      // the server, and calendar and contacts tool sets are queued behind these.
+      // The name is the contract (SEED-006 D-1). This tool is exhaustive in the
+      // one folder it searches, so an empty answer means no such mail is there.
+      // The ranked, best-effort lookup is `mail_recall`, and its empty answer
+      // promises much less. The name this tool had before recall existed said
+      // neither, and it is not registered and has no alias: a model reading an
+      // empty answer must know which promise it was given.
+      //
+      // The description leads with that promise. The rest stays terse, because
+      // a description is a tax paid on every call for the life of the server,
+      // and every registered tool is held under a 280-character ceiling. The
+      // promise and the untrusted notice fill most of it.
+      //
+      // So the date rule lives on `startDate` and `endDate`. It is a RELATION
+      // between those two parameters: both ends inclusive, day-granular, on
+      // iCloud's receipt time rather than the sender's own header. A caller
+      // cannot infer any of that from the names, and the input schema travels
+      // to the model alongside this description anyway.
       //
       // The keyword semantics are the same class of unguessable fact, and they
-      // are stated on the PARAMETER rather than added here. Partly arithmetic:
-      // this description is 273 characters against a 280-character ceiling
-      // asserted over every registered tool, and the shortest wording carrying
-      // the keyword facts is over a hundred — so adding them here would force
-      // that ceiling up, which is a decision about a token tax paid on every
-      // call, taken to accommodate a minor documentation gap. Partly fit: the
-      // date rule is a RELATION between two parameters and has nowhere else to
-      // live, whereas keyword matching is a fact about ONE parameter, and the
-      // input schema travels to the model alongside this description anyway.
-      // The next person to add a fact here will meet the same ceiling.
+      // are stated on that PARAMETER for the same reason: they are a fact about
+      // ONE parameter. The next person to add a fact here will meet the same
+      // ceiling. Do not raise it to make room.
       description:
-        "Search one folder. Dates YYYY-MM-DD, inclusive both ends, " +
-        `day-granular, on receipt time. ${UNTRUSTED_NOTICE}`,
+        "Every match in one folder, so an empty answer means none there. " +
+        UNTRUSTED_NOTICE,
       inputSchema: z.object({
         folderId: z
           .string()
@@ -2687,8 +2711,14 @@ export function registerMailTools(
             "adding a word narrows the results rather than widening them.",
         ),
         sender: searchTerm.describe("Matches the sender address or name."),
-        startDate: isoDay.describe("Earliest day to include, YYYY-MM-DD."),
-        endDate: isoDay.describe("Latest day to include, YYYY-MM-DD."),
+        startDate: isoDay.describe(
+          "Earliest day to include, YYYY-MM-DD. Both ends are inclusive, " +
+            "day-granular, and on iCloud's receipt time.",
+        ),
+        endDate: isoDay.describe(
+          "Latest day to include, YYYY-MM-DD. Both ends are inclusive, " +
+            "day-granular, and on iCloud's receipt time.",
+        ),
         pageSize: z
           .number()
           .int()
@@ -2750,7 +2780,7 @@ export function registerMailTools(
     async ({ folderId, pageSize, cursor }) => {
       try {
         const actor = await principal;
-        // Decoded before the lease is taken, as mail_search does it.
+        // Decoded before the lease is taken, as the search above does it.
         const mailbox = resolveMailbox(folderId);
         return messagePageToolResult(
           await mail.withConnectionLease(actor, (leased) =>

@@ -156,6 +156,47 @@ user segment is a key any signed-in caller could name.
 So one person's cache, staging objects and counters cannot be reached through
 another person's session.
 
+### Recall keeps a searchable copy of your recent mail
+
+Recall is inherent. Every person who signs in has their recent mail indexed, so
+Claude can find a message by what it was about. There is no switch to turn it on
+or off. The sign-in page says so, above the sign-in fields, before anyone types
+anything.
+
+**What is kept.** For each message in the inbox and the archive folder from the
+last 90 days: its subject line, and a numeric fingerprint made from the subject,
+the sender's name and the first lines of the body. The message text itself is
+never kept. The text used to make the fingerprint is sent to the embedding
+model, and then thrown away.
+
+**Where.** In the person's own partition of the vector store, and in a ledger
+in their own Durable Object. Every read and write of the index is scoped to the
+signed-in person, and only that person can search it.
+
+**How long.** Each entry expires 90 days after its message's date.
+
+**How it leaves.**
+
+- Mail deleted in iCloud leaves the index on the next sync of its folder, or the
+  first time a recall result fails to open, whichever comes first.
+- Everything is deleted within a day of the person's access ending. Access ends
+  when the owner revokes it, or when the person's last connection ends. Removing
+  someone is still the two steps "Removing someone" describes above; the index
+  follows the second one.
+
+**How the index is built.** Only from mail tool calls made through the person's
+own sign-in. Never from anything this server does on its own. One page of 25
+messages at a time, at most one page a minute, under the same per-person
+connection lease every mail tool takes. So building the index never opens a
+second connection to iCloud at the same time as a tool call.
+
+**The ceilings.** Each person holds at most 10,000 entries, and the index reads
+at most 200 pages for one person in one day. These bound what is kept and what
+it costs.
+
+These numbers are the constants in `src/recall/retention.ts`, and a check keeps
+this section equal to them.
+
 ### The dead-password pause
 
 **What it is.** When Apple itself refuses the password saved in a grant, a

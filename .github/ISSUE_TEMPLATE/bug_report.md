@@ -28,7 +28,7 @@ What you expected instead.
 
 ## Actual behavior
 
-What actually happened. Include the tool name (e.g. `mail_search`) and any
+What actually happened. Include the tool name (e.g. `mail_find`) and any
 **redacted** error category returned.
 
 ## Environment

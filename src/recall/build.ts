@@ -304,12 +304,19 @@ export async function indexNextPage(
  * UID list inside the lease, recomputes the ids that should exist, and removes
  * every other ledger id for that mailbox: UIDs that are gone, and every id
  * recorded under another UIDVALIDITY. Store first, then ledger. When the
- * validity changed, the mailbox's build cursor is reset.
+ * ledger held rows under another validity, the mailbox's build cursor is reset.
+ *
+ * `resetCursor` resets it whatever the ledger held (26-REVIEW CR-02). A caller
+ * that already knows the validity changed passes it, because a ledger with no
+ * rows for the mailbox (nothing in the window when it was built, every vector
+ * expired, or every row already removed) shows no old generation, and a cursor
+ * left at the end of the old build would end the new one before it started.
  */
 export async function reconcileMailbox(
   principal: Principal,
   mailbox: string,
   deps: BuildDeps,
+  options: { readonly resetCursor?: boolean } = {},
 ): Promise<BuildStatus> {
   const slot = await beginSlot(principal, mailbox, "reconcile");
   if (!slot.ok) return slot.reason;
@@ -344,8 +351,45 @@ export async function reconcileMailbox(
       .map((row) => row.vectorId);
     await removeIds(principal, doomed, deps);
 
-    await slot.end(validityChanged ? RESET : KEEP);
+    await slot.end(validityChanged || options.resetCursor === true ? RESET : KEEP);
     return "indexed";
+  } catch {
+    await slot.end(KEEP);
+    throw new RecallBuildError();
+  }
+}
+
+/**
+ * Remove every vector of `mailbox` from the store and the ledger, because the
+ * folder itself is gone (26-REVIEW CR-03).
+ *
+ * The step calls this before it drops a folder its status check reported gone.
+ * A dropped folder gets no further sync, so without this its subject lines
+ * would stay recallable until they expired. It takes the page slot as a
+ * reconcile, so it is paced, exclusive and counted like any other removal,
+ * and it is never refused as full. It reads no mail, so it takes no lease.
+ * Store first, then ledger, batch by batch, so the ledger stays a superset of
+ * the store. The slot ends with the mailbox's build cursor reset.
+ *
+ * Answers `removed`, or the object's refusal with nothing removed. Throws
+ * `RecallBuildError` on any other failure.
+ */
+export async function forgetMailbox(
+  principal: Principal,
+  mailbox: string,
+  deps: RecallDeps,
+): Promise<"removed" | PageRefusal> {
+  const slot = await beginSlot(principal, mailbox, "reconcile");
+  if (!slot.ok) return slot.reason;
+  try {
+    const rows = await mailboxRows(principal, mailbox);
+    await removeIds(
+      principal,
+      rows.map((row) => row.vectorId),
+      deps,
+    );
+    await slot.end(RESET);
+    return "removed";
   } catch {
     await slot.end(KEEP);
     throw new RecallBuildError();

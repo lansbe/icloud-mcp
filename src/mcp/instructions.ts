@@ -110,6 +110,8 @@ There is no tool that edits a draft. To revise one, write the new version first,
 
 \`changes_since\` says what changed since an earlier call: counts first, then new mail by sender and subject, and on every calendar how many events were added or changed and how many removed. Its marker is an opaque token; pass it back exactly as you received it. Checking never marks mail read.
 
+Two tools find mail, and their empty answers mean different things. \`mail_find\` is exhaustive in the one folder it searches, so an empty answer means no such mail is there. \`mail_recall\` finds recent mail by meaning. It is ranked and best-effort, so an empty answer means nothing scored high enough, never that no such mail exists. It returns message ids and subjects only; open results with \`mail_get_message\`.
+
 Calendar EVENTS can be created, updated and deleted, through the preview-and-commit shape above.
 
 An event can carry REMINDERS, set when it is created and changed afterwards. A reminder is a whole number of minutes before the event starts, and an on-screen alert is the only kind this server writes. **Reminders are a WHOLE LIST and never a delta.** Leave the field out and every reminder already on the event stays exactly as it is; supply a list and it REPLACES every one that was there; supplying an EMPTY list removes every one. Be sure which of those three you mean, because the third is destructive and a wrong guess costs the user reminders they set by hand. What this server does is write the reminder onto the event -- whether a device then alerts is the calendar's own affair, and not something to promise the user on this server's behalf.

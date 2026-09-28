@@ -51,12 +51,7 @@ import type { Env } from "../env";
 import { type RecallStore, recallStore } from "../recall/index";
 import { grantsRemainFor } from "../recall/grant-check";
 import { destroyAll, type LedgerHandle, sweepExpired } from "../recall/lifecycle";
-import {
-  RECALL_MAX_PAGES_PER_DAY,
-  RECALL_MAX_VECTORS,
-  RECALL_PAGE_SIZE,
-  RECALL_TTL_MS,
-} from "../recall/retention";
+import { RECALL_MAX_VECTORS, RECALL_TTL_MS } from "../recall/retention";
 import {
   clearCursor,
   clearDestroyPending,
@@ -70,22 +65,34 @@ import {
   ensureRecallSchema,
   expiredIds,
   anyIds,
+  folderListOf,
   forgetVectors,
+  heldIds,
   idsForMailbox,
   markDestroyPending,
   type LedgerRowInput,
   type MailboxRow,
   type PageRefusal,
-  pagesOn,
+  pageRefusal,
+  RECALL_PAGE_PAUSE_MS,
+  readFolders,
+  readListedAt,
+  readListingFailure,
+  readSyncRows,
+  type RetryState,
+  type SyncRow,
   readCursor,
-  readLastPageAt,
   readPageSlot,
   recordVectors,
   type RecordRefusal,
+  syncRowFor,
   utcDay,
   writeCursor,
+  writeFolders,
   writeLastPageAt,
+  writeListingFailure,
   writePageSlot,
+  writeSyncRow,
 } from "./recall-ledger";
 
 /**
@@ -124,14 +131,10 @@ export type RecordAnswer = { ok: true } | { ok: false; reason: RecordRefusal };
 
 /**
  * The least time between the start of one recall page and the next, per person
- * (Phase 25, D-15).
- *
- * This is what keeps a build from monopolising the person's one iCloud
- * connection: a page holds that connection for one read, at most once a
- * minute. The object enforces it, so no caller can shorten it; a caller that
- * comes back early is told `paused`.
+ * (Phase 25, D-15). Defined beside `pageRefusal`, the one predicate that reads
+ * it, and re-exported here where it has always been imported from.
  */
-export const RECALL_PAGE_PAUSE_MS = 60000;
+export { RECALL_PAGE_PAUSE_MS };
 
 /**
  * How long an in-flight page blocks another, in milliseconds.
@@ -172,6 +175,38 @@ const MAX_SCOPE_ROWS = 1000;
 export type BeginPageAnswer =
   | { ok: true; pageToken: string; cursor: string | null }
   | { ok: false; reason: PageRefusal | "invalid" | "unnamed" };
+
+/**
+ * What the object says about the build, before any IMAP (Phase 26, D-29).
+ *
+ * `slot` is the first refusal a deletion sync would get now, or `free`. It is
+ * never `full`: a removal is never refused at the vector ceiling. It is
+ * `unnamed` when the object does not know whose it is: every write would be
+ * refused, a failure could not even be recorded, so a step must open nothing
+ * (26-REVIEW-2 IN-02). `full` says
+ * whether a page that adds vectors would be refused at that ceiling now
+ * (26-REVIEW-2 WR-04). `folders` is the stored folder list, or null before the
+ * first listing. `listedAt` is when that list was listed, or null when it is
+ * due to be listed again (26-REVIEW-2 WR-02). `listing` is the folder
+ * listing's failure record, or null. `sync` is every mailbox's sync row that
+ * parses, keyed by mailbox.
+ */
+export interface RecallSyncState {
+  readonly slot: PageRefusal | "unnamed" | "free";
+  readonly full: boolean;
+  readonly folders: string[] | null;
+  readonly listedAt: number | null;
+  readonly listing: RetryState | null;
+  readonly sync: Record<string, SyncRow>;
+}
+
+/**
+ * The answer to a build-state write (Phase 26, D-15). Shapes, never throws.
+ *
+ * `unnamed` when the object does not know whose it is, `invalid` for a value
+ * the object will not store, `destroying` while a destroy is running.
+ */
+export type SetAnswer = { ok: true } | { ok: false; reason: "unnamed" | "invalid" | "destroying" };
 
 /** What to do with a mailbox's cursor when a page ends. */
 export type CursorUpdate =
@@ -494,7 +529,9 @@ export class UserAgent extends DurableObject<Env> {
    * page's start; `quota` once RECALL_MAX_PAGES_PER_DAY pages began today
    * (UTC), reconciles included; and, for a build only, `full` when one more
    * page could take the ledger past RECALL_MAX_VECTORS. A reconcile only
-   * removes, so it is never refused as full.
+   * removes, so it is never refused as full. Every check after `unnamed` and
+   * `invalid` is `pageRefusal` in ./recall-ledger.ts, the one predicate the
+   * sync-state read below shares (Phase 26, D-29).
    *
    * Otherwise it mints a page token, records the start, counts the page and
    * answers the stored cursor. No `await`, so the check and the set are one
@@ -506,24 +543,131 @@ export class UserAgent extends DurableObject<Env> {
     if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
     if (!isMailbox(mailbox)) return { ok: false, reason: "invalid" };
     if (kind !== "build" && kind !== "reconcile") return { ok: false, reason: "invalid" };
-    if (destroyPending(sql)) return { ok: false, reason: "destroying" };
 
     const now = Date.now();
-    const slot = readPageSlot(sql);
-    if (slot !== null && slot.expiresAt > now) return { ok: false, reason: "busy" };
-    const last = readLastPageAt(sql);
-    if (last !== null && now - last < RECALL_PAGE_PAUSE_MS) return { ok: false, reason: "paused" };
+    const refusal = pageRefusal(sql, kind, now);
+    if (refusal !== null) return { ok: false, reason: refusal };
     const today = utcDay(now);
-    if (pagesOn(sql, today) >= RECALL_MAX_PAGES_PER_DAY) return { ok: false, reason: "quota" };
-    if (kind === "build" && countVectors(sql) + RECALL_PAGE_SIZE > RECALL_MAX_VECTORS) {
-      return { ok: false, reason: "full" };
-    }
 
     const pageToken = crypto.randomUUID();
     writePageSlot(sql, { token: pageToken, expiresAt: now + RECALL_PAGE_TTL_MS });
     writeLastPageAt(sql, now);
     countPageOn(sql, today);
     return { ok: true, pageToken, cursor: readCursor(sql, mailbox) };
+  }
+
+  /**
+   * Report the page slot, the folder list and each folder's sync row, for a
+   * build step to read before it opens any IMAP session (Phase 26, D-29).
+   *
+   * The slot is answered by `pageRefusal`, the same predicate the page start
+   * above asks. `slot` is its answer for a deletion sync, and `full` whether a
+   * build page would also be refused at the vector ceiling (26-REVIEW-2
+   * WR-04). A step that reads a refusal in `slot` stops with no lease and no
+   * session. `unnamed` is such a refusal: an object that does not know whose it
+   * is refuses every write, so nothing a step did could be recorded
+   * (26-REVIEW-2 IN-02). A step that reads `full` still does what shrinks or checks the
+   * index, and only what would add vectors waits: the index is shrunk by those
+   * removals, so stopping them at the ceiling would keep it there.
+   *
+   * Writes nothing, apart from the one-time copy of the object's own name that
+   * every recall method makes (Phase 25, D-22). There is no `off` answer:
+   * recall is inherent.
+   */
+  recallSyncState(): RecallSyncState {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    const named = this.rememberOwnName() !== null;
+    const now = Date.now();
+    return {
+      slot: named ? (pageRefusal(sql, "reconcile", now) ?? "free") : "unnamed",
+      full: pageRefusal(sql, "build", now) === "full",
+      folders: readFolders(sql),
+      listedAt: readListedAt(sql),
+      listing: readListingFailure(sql),
+      sync: readSyncRows(sql),
+    };
+  }
+
+  /**
+   * Record that the folder listing failed at `at` (26-REVIEW CR-01), so the
+   * next step waits before listing again instead of listing on every mail call.
+   *
+   * Refuses, in this order: `unnamed`; `invalid` unless `at` is a finite
+   * number; `destroying` while a destroy is running. Storing a folder list
+   * clears the record. No `await`, so the read, the count and the write are one
+   * atomic step.
+   */
+  recallListingFailed(at: unknown): SetAnswer {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
+    if (typeof at !== "number" || !Number.isFinite(at)) return { ok: false, reason: "invalid" };
+    if (destroyPending(sql)) return { ok: false, reason: "destroying" };
+    writeListingFailure(sql, at);
+    return { ok: true };
+  }
+
+  /**
+   * Store the folder list the build covers (Phase 26, D-12, D-15).
+   *
+   * `listedAt` is when the list was listed, in ms since the epoch: the step
+   * lists again once it is a day old (26-REVIEW-2 WR-02). Null stores no time,
+   * so the next step lists again, which the step asks for after it dropped a
+   * folder as gone. Absent means now, by this object's clock.
+   *
+   * Refuses, in this order: `unnamed`; `invalid` unless the list is 1 to 4
+   * distinct non-empty names of at most 1024 characters, the first exactly
+   * `INBOX`, and `listedAt` is absent, null or a finite number; `destroying`
+   * while a destroy is running, so a step racing a destroy cannot put the list
+   * back. No `await`, so the check and the write are one atomic step. The
+   * destroy already clears these rows: they live in the recall state table.
+   */
+  recallSetFolders(list: unknown, listedAt?: unknown): SetAnswer {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
+    const folders = folderListOf(list);
+    if (folders === null) return { ok: false, reason: "invalid" };
+    const at = listedAt === undefined ? Date.now() : listedAt;
+    if (at !== null && (typeof at !== "number" || !Number.isFinite(at))) {
+      return { ok: false, reason: "invalid" };
+    }
+    if (destroyPending(sql)) return { ok: false, reason: "destroying" };
+    writeFolders(sql, folders, at);
+    return { ok: true };
+  }
+
+  /**
+   * Store one mailbox's sync row (Phase 26, D-15).
+   *
+   * `cursor` is optional. Exactly `"reset"` also forgets the mailbox's build
+   * cursor, in the same write, and is allowed only with a row at seed: a
+   * folder sent back to seed because its validity changed must start its next
+   * build from the top (26-REVIEW-2 WR-01). The step does not trust the page
+   * slot's end to have done it, because that end changes nothing once the
+   * slot's token has expired.
+   *
+   * Refuses, in this order: `unnamed`; `invalid` for a bad mailbox, a row
+   * `parseSyncRow` rejects, a row whose `state` or `seen` names another
+   * mailbox, or a `cursor` that is neither absent nor `"reset"` with a seed
+   * row; `destroying` while a destroy is running. No `await`, so the check and
+   * the writes are one atomic step. The destroy already clears these rows.
+   */
+  recallSetSync(mailbox: unknown, row: unknown, cursor?: unknown): SetAnswer {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
+    if (!isMailbox(mailbox)) return { ok: false, reason: "invalid" };
+    const parsed = syncRowFor(mailbox, row);
+    if (parsed === null) return { ok: false, reason: "invalid" };
+    if (cursor !== undefined && (cursor !== "reset" || parsed.stage !== "seed")) {
+      return { ok: false, reason: "invalid" };
+    }
+    if (destroyPending(sql)) return { ok: false, reason: "destroying" };
+    writeSyncRow(sql, mailbox, parsed);
+    if (cursor === "reset") clearCursor(sql, mailbox);
+    return { ok: true };
   }
 
   /**
@@ -580,6 +724,24 @@ export class UserAgent extends DurableObject<Env> {
       .slice(0, MAX_SCOPE_ROWS)
       .filter((id): id is string => typeof id === "string" && HEX_64.test(id));
     return forgetVectors(sql, valid);
+  }
+
+  /**
+   * Which of these ids the ledger holds (Phase 26, the dead-ref removal).
+   *
+   * Anything that is not a 64-character lower-case hex string is ignored, and at
+   * most 1000 entries are read per call. Answers only the held subset of the ids
+   * it was asked about, so it never lists an id the caller did not name.
+   */
+  recallHolds(ids: unknown): string[] {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    this.rememberOwnName();
+    if (!Array.isArray(ids)) return [];
+    const valid = ids
+      .slice(0, MAX_SCOPE_ROWS)
+      .filter((id): id is string => typeof id === "string" && HEX_64.test(id));
+    return heldIds(sql, valid);
   }
 
   /**

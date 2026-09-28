@@ -40,6 +40,25 @@
 // query here would count as a second site and fail the commit. The answer is
 // at the source, never in the pattern.
 
+import type { FolderState } from "../change-marker";
+import {
+  RECALL_MAX_PAGES_PER_DAY,
+  RECALL_MAX_VECTORS,
+  RECALL_PAGE_SIZE,
+} from "../recall/retention";
+
+/**
+ * The least time between the start of one recall page and the next, per person
+ * (Phase 25, D-15).
+ *
+ * This is what keeps a build from monopolising the person's one iCloud
+ * connection: a page holds that connection for one read, at most once a
+ * minute. The object enforces it, so no caller can shorten it; a caller that
+ * comes back early is told `paused`. It lives here, beside the one predicate
+ * that reads it, and the object module re-exports it.
+ */
+export const RECALL_PAGE_PAUSE_MS = 60000;
+
 /** The reasons a record can be refused. Plan 25-03 appends to this list and nowhere else. */
 export const RECORD_REFUSALS = ["invalid", "unnamed", "full", "destroying"] as const;
 
@@ -86,6 +105,395 @@ const PENDING_DESTROY_ROW = "destroy_pending";
 
 /** The `recall_state` key of one mailbox's build cursor is this plus the mailbox. */
 const CURSOR_ROW = "cursor:";
+
+/** The `recall_state` key of the folder list the build covers (Phase 26, D-12). */
+const FOLDERS_ROW = "folders";
+
+/**
+ * The `recall_state` key of the folder listing's failures (26-REVIEW CR-01).
+ * Cleared when a list is stored.
+ */
+const LISTING_FAILED_ROW = "folders_failed";
+
+/**
+ * The `recall_state` key of when the stored folder list was listed, in ms
+ * since the epoch (26-REVIEW-2 WR-02). Absent means the list is due to be
+ * listed again: after a folder was dropped as gone, and for a list stored
+ * before this key existed.
+ */
+const LISTED_AT_ROW = "folders_listed_at";
+
+/** The `recall_state` key of one mailbox's sync row is this plus the mailbox (D-15). */
+export const SYNC_ROW = "sync:";
+
+/** Where one folder is in its build (Phase 26, D-14). */
+export type SyncStage = "seed" | "build" | "built";
+
+/** What a status check on a built folder said to do next (D-14, D-27). */
+export type SyncDue = "new_mail" | "reconcile";
+
+/** One mailbox's sync row, as `parseSyncRow` reads it. */
+export interface SyncRow {
+  readonly stage: SyncStage;
+  /** The folder's state when it was last seeded or brought up to date. */
+  readonly state: FolderState | null;
+  /** When the last status check ran, in ms since the epoch. */
+  readonly checkedAt: number | null;
+  /** When the last deletion sync ran, in ms since the epoch. */
+  readonly reconciledAt: number | null;
+  /** What the last status check said to do next, or null. */
+  readonly due: SyncDue | null;
+  /** The folder's state as the last status check saw it. */
+  readonly seen: FolderState | null;
+  /**
+   * When the last attempt on this folder failed, in ms since the epoch, or null
+   * when the last attempt did not fail (26-REVIEW CR-01). A step leaves the
+   * folder alone until `recallRetryWaitMs(failures)` has passed.
+   */
+  readonly failedAt: number | null;
+  /** How many attempts on this folder failed in a row, capped at MAX_COUNTED_FAILURES. */
+  readonly failures: number;
+}
+
+/** The most failures in a row a sync row counts. The wait stops growing long before. */
+export const MAX_COUNTED_FAILURES = 100;
+
+/**
+ * How many failed attempts in a row park a folder (26-REVIEW-2 WR-03): nine.
+ *
+ * Decided by Claude, 2026-09-28. By the ninth failure in a row the step's
+ * retry wait is already about 21 hours, and reaching it takes about a day of
+ * steady failure, which a passing iCloud outage does not produce. So parking
+ * hardly changes how often a failing folder is tried. What it adds is an end:
+ * the folder stops counting as "still being built". For a build page that
+ * always fails, nine is three rounds of three failures and a fresh status
+ * check.
+ */
+export const RECALL_PARK_AFTER_FAILURES = 9;
+
+/**
+ * Whether a folder is parked (26-REVIEW-2 WR-03): its last
+ * RECALL_PARK_AFTER_FAILURES attempts or more all failed, and the folders
+ * have not been listed since the last of them. `listedAt` is when the folder
+ * list was listed, or null when it is due to be listed again.
+ *
+ * A parked folder is left alone, and the recall answer does not count it as
+ * still being built. A listing stored after its last failure un-parks it for
+ * one more try. That try failing parks it again, so a folder that always
+ * fails is tried about once a day, when the folders are listed.
+ *
+ * THE ONE PREDICATE. The step and the recall answer both ask it, so the step
+ * never works on a folder the answer calls parked, nor the other way round.
+ */
+export function isParked(
+  row: { readonly failures: number; readonly failedAt: number | null },
+  listedAt: number | null,
+): boolean {
+  if (row.failures < RECALL_PARK_AFTER_FAILURES || row.failedAt === null) return false;
+  return listedAt === null || listedAt <= row.failedAt;
+}
+
+/** How often a failed attempt, and when the last one was (26-REVIEW CR-01). */
+export interface RetryState {
+  readonly failedAt: number;
+  readonly failures: number;
+}
+
+/** 1 to 20 decimal digits: the shape of a mod-sequence as iCloud sends it. */
+const MODSEQ_DIGITS = /^[0-9]{1,20}$/;
+
+/** `value` as a folder state, or undefined when it is not exactly one. */
+function folderStateOf(value: unknown): FolderState | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const s = value as {
+    mailbox?: unknown;
+    uidValidity?: unknown;
+    uidNext?: unknown;
+    highestModseq?: unknown;
+  };
+  if (typeof s.mailbox !== "string" || s.mailbox.length < 1) return undefined;
+  if (typeof s.uidValidity !== "number" || !Number.isSafeInteger(s.uidValidity)) return undefined;
+  if (s.uidValidity < 0) return undefined;
+  if (typeof s.uidNext !== "number" || !Number.isSafeInteger(s.uidNext)) return undefined;
+  if (s.uidNext < 1) return undefined;
+  const modseq = s.highestModseq;
+  if (modseq !== null && (typeof modseq !== "string" || !MODSEQ_DIGITS.test(modseq))) {
+    return undefined;
+  }
+  return {
+    mailbox: s.mailbox,
+    uidValidity: s.uidValidity,
+    uidNext: s.uidNext,
+    highestModseq: modseq,
+  };
+}
+
+/** `value` as null or a folder state, or undefined when it is neither. */
+function optionalFolderState(value: unknown): FolderState | null | undefined {
+  return value === null ? null : folderStateOf(value);
+}
+
+/** `value` as null or a finite time, or undefined when it is neither. */
+function optionalTime(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** `value` as a failure count from 0 to MAX_COUNTED_FAILURES, or undefined. */
+function failureCount(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return undefined;
+  return value >= 0 && value <= MAX_COUNTED_FAILURES ? value : undefined;
+}
+
+/**
+ * One mailbox's sync row, from its stored JSON text, or null when the text is
+ * not exactly one row (D-15).
+ *
+ * THE ONE READER OF A SYNC ROW. The object's read answers only rows this
+ * accepts, and the setter plan 26-03 adds stores only rows this accepts, so a
+ * row that reaches the step always has this shape. Every field must be present:
+ * a missing one is null written out, never assumed.
+ *
+ * With one exception. `failedAt` and `failures` came after rows were already
+ * stored in production (26-REVIEW CR-01). A row stored before them has neither,
+ * and reads as a folder whose last attempt did not fail: `failedAt` null and
+ * `failures` 0. Present, each must be exactly one of those shapes.
+ */
+export function parseSyncRow(value: unknown): SyncRow | null {
+  let parsed: unknown = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const r = parsed as Record<string, unknown>;
+  const stage = r.stage;
+  if (stage !== "seed" && stage !== "build" && stage !== "built") return null;
+  const state = optionalFolderState(r.state);
+  const seen = optionalFolderState(r.seen);
+  const checkedAt = optionalTime(r.checkedAt);
+  const reconciledAt = optionalTime(r.reconciledAt);
+  if (state === undefined || seen === undefined) return null;
+  if (checkedAt === undefined || reconciledAt === undefined) return null;
+  const due = r.due;
+  if (due !== null && due !== "new_mail" && due !== "reconcile") return null;
+  const failedAt = "failedAt" in r ? optionalTime(r.failedAt) : null;
+  const failures = "failures" in r ? failureCount(r.failures) : 0;
+  if (failedAt === undefined || failures === undefined) return null;
+  return { stage, state, checkedAt, reconciledAt, due, seen, failedAt, failures };
+}
+
+/**
+ * The first reason a page of `kind` may not start now, or null when it may
+ * (Phase 26, D-29).
+ *
+ * THE ONE PREDICATE. The object's page start asks this before it mints a token,
+ * and the object's sync-state read asks it too, so a build step's check before
+ * any IMAP can never disagree with the refusal the page start would give. The
+ * order is the page start's own: `destroying`, `busy`, `paused`, `quota`, and
+ * `full` for a build only. A reconcile only removes, so it is never full.
+ *
+ * Reads only. It writes nothing.
+ */
+export function pageRefusal(sql: SqlStorage, kind: PageKind, now: number): PageRefusal | null {
+  if (destroyPending(sql)) return "destroying";
+  const slot = readPageSlot(sql);
+  if (slot !== null && slot.expiresAt > now) return "busy";
+  const last = readLastPageAt(sql);
+  if (last !== null && now - last < RECALL_PAGE_PAUSE_MS) return "paused";
+  if (pagesOn(sql, utcDay(now)) >= RECALL_MAX_PAGES_PER_DAY) return "quota";
+  if (kind === "build" && countVectors(sql) + RECALL_PAGE_SIZE > RECALL_MAX_VECTORS) {
+    return "full";
+  }
+  return null;
+}
+
+/** The stored folder list, or null when there is none or it is malformed. */
+export function readFolders(sql: SqlStorage): string[] | null {
+  const raw = readState(sql, FOLDERS_ROW);
+  if (raw === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  if (!parsed.every((one): one is string => typeof one === "string")) return null;
+  return parsed;
+}
+
+/** The most folders the build covers: INBOX, the archive folder, and room to spare. */
+export const MAX_RECALL_FOLDERS = 4;
+
+/** The most characters of one folder name in the folder list. */
+const MAX_FOLDER_CHARS = 1024;
+
+/**
+ * `value` as a folder list the object stores, or null (Phase 26, D-12).
+ *
+ * 1 to MAX_RECALL_FOLDERS non-empty names of at most 1024 characters each, no
+ * name twice, and the first exactly `INBOX`, so the one folder every account
+ * has is always built first and can never be left out.
+ */
+export function folderListOf(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  if (value.length < 1 || value.length > MAX_RECALL_FOLDERS) return null;
+  if (value[0] !== "INBOX") return null;
+  const out: string[] = [];
+  for (const one of value) {
+    if (typeof one !== "string" || one.length < 1 || one.length > MAX_FOLDER_CHARS) return null;
+    if (out.includes(one)) return null;
+    out.push(one);
+  }
+  return out;
+}
+
+/**
+ * Store the folder list, and when it was listed. The caller has checked the
+ * list with `folderListOf`.
+ *
+ * `listedAt` null stores no listing time, so the next step lists the folders
+ * again (26-REVIEW-2 WR-02). A stored list ends the listing's failure record:
+ * the listing worked. And a folder that is not on it any more leaves nothing
+ * behind (26-REVIEW CR-03): the sync row and the build cursor of every mailbox
+ * outside the list go. The caller removes that folder's vectors first.
+ */
+export function writeFolders(
+  sql: SqlStorage,
+  folders: readonly string[],
+  listedAt: number | null,
+): void {
+  writeState(sql, FOLDERS_ROW, JSON.stringify(folders));
+  if (listedAt === null) clearState(sql, LISTED_AT_ROW);
+  else writeState(sql, LISTED_AT_ROW, String(listedAt));
+  clearState(sql, LISTING_FAILED_ROW);
+  const keep = new Set(folders);
+  for (const prefix of [SYNC_ROW, CURSOR_ROW]) {
+    const keys = sql
+      .exec<{ k: string }>(
+        `select k from recall_state where substr(k, 1, ?) = ?`,
+        prefix.length,
+        prefix,
+      )
+      .toArray()
+      .map((row) => row.k);
+    for (const k of keys) {
+      if (!keep.has(k.slice(prefix.length))) clearState(sql, k);
+    }
+  }
+}
+
+/** When the stored folder list was listed, or null when it is due to be listed again. */
+export function readListedAt(sql: SqlStorage): number | null {
+  const raw = readState(sql, LISTED_AT_ROW);
+  if (raw === null) return null;
+  const at = Number(raw);
+  return Number.isFinite(at) ? at : null;
+}
+
+/** The folder listing's failure record, or null when there is none or it is malformed. */
+export function readListingFailure(sql: SqlStorage): RetryState | null {
+  const raw = readState(sql, LISTING_FAILED_ROW);
+  if (raw === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const p = parsed as { failedAt?: unknown; failures?: unknown };
+  const failedAt = optionalTime(p.failedAt);
+  const failures = failureCount(p.failures);
+  if (failedAt === undefined || failedAt === null || failures === undefined) return null;
+  return { failedAt, failures };
+}
+
+/**
+ * Record one more failed folder listing, at `at` (26-REVIEW CR-01). The count
+ * grows from the stored one, capped at MAX_COUNTED_FAILURES.
+ */
+export function writeListingFailure(sql: SqlStorage, at: number): void {
+  const before = readListingFailure(sql)?.failures ?? 0;
+  const failures = Math.min(before + 1, MAX_COUNTED_FAILURES);
+  writeState(sql, LISTING_FAILED_ROW, JSON.stringify({ failedAt: at, failures }));
+}
+
+/**
+ * `value` as `mailbox`'s sync row, or null (Phase 26, D-15).
+ *
+ * The row must be one `parseSyncRow` accepts, and its `state` and `seen`, when
+ * present, must name `mailbox` itself, so one folder's numbers can never be
+ * stored as another's.
+ */
+export function syncRowFor(mailbox: string, value: unknown): SyncRow | null {
+  const row = parseSyncRow(value);
+  if (row === null) return null;
+  if (row.state !== null && row.state.mailbox !== mailbox) return null;
+  if (row.seen !== null && row.seen.mailbox !== mailbox) return null;
+  return row;
+}
+
+/** Store `mailbox`'s sync row. The caller has checked it with `syncRowFor`. */
+export function writeSyncRow(sql: SqlStorage, mailbox: string, row: SyncRow): void {
+  writeState(sql, SYNC_ROW + mailbox, JSON.stringify(row));
+}
+
+/**
+ * Every sync row that parses, keyed by mailbox. A row that does not parse is
+ * left out.
+ *
+ * The keys are folder names, and the archive folder's name is the account's
+ * own, so it can be `constructor`, `toString` or `__proto__` (26-REVIEW WR-06).
+ * So each row is DEFINED as an own key, never assigned: an assignment to
+ * `__proto__` would replace the map's prototype and lose the row. The map is
+ * an ordinary object because it crosses RPC, which refuses one with no
+ * prototype. Read it with `syncRowIn`, never by indexing it directly.
+ */
+export function readSyncRows(sql: SqlStorage): Record<string, SyncRow> {
+  const out: Record<string, SyncRow> = {};
+  const rows = sql
+    .exec<{ k: string; v: string }>(
+      `select k, v from recall_state where substr(k, 1, ?) = ?`,
+      SYNC_ROW.length,
+      SYNC_ROW,
+    )
+    .toArray();
+  for (const row of rows) {
+    const mailbox = row.k.slice(SYNC_ROW.length);
+    const parsed = parseSyncRow(row.v);
+    if (mailbox.length > 0 && parsed !== null) {
+      Object.defineProperty(out, mailbox, {
+        value: parsed,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * `mailbox`'s row in a map `readSyncRows` built, or undefined (26-REVIEW
+ * WR-06).
+ *
+ * THE ONE WAY TO READ THAT MAP. Only an own key counts, so a folder named
+ * `constructor` or `toString` is a folder with no row yet, never
+ * `Object.prototype`'s member of that name. The map crosses RPC, and a copy of
+ * it has the ordinary prototype again, which is why the reader checks and not
+ * only the builder.
+ */
+export function syncRowIn(
+  sync: Readonly<Record<string, SyncRow>>,
+  mailbox: string,
+): SyncRow | undefined {
+  return Object.hasOwn(sync, mailbox) ? sync[mailbox] : undefined;
+}
 
 /** One row to record. */
 export interface LedgerRowInput {
@@ -297,6 +705,23 @@ export function forgetVectors(sql: SqlStorage, ids: readonly string[]): number {
     removed += sql.exec(`delete from recall_vectors where vector_id = ?`, id).rowsWritten;
   }
   return removed;
+}
+
+/**
+ * Which of `ids` the ledger holds, in the order asked, each at most once.
+ *
+ * Reads only the ids it is given, one at a time, so it can never answer with an
+ * id the caller did not already name.
+ */
+export function heldIds(sql: SqlStorage, ids: readonly string[]): string[] {
+  const held: string[] = [];
+  for (const id of new Set(ids)) {
+    const row = sql
+      .exec<{ n: number }>(`select count(*) as n from recall_vectors where vector_id = ?`, id)
+      .one();
+    if (row.n > 0) held.push(id);
+  }
+  return held;
 }
 
 /** Up to `limit` ids whose expiry is at or before `now`, oldest expiry first. */

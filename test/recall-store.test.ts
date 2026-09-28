@@ -17,7 +17,7 @@ import { ensureRecallSchema } from "../src/agent/recall-ledger";
 import { decodeMessageId, encodeMessageId, type MessageRef } from "../src/mail/ids";
 import { createEmbedder, RECALL_DIMENSIONS, RECALL_MODEL, RecallEmbedError } from "../src/recall/embed";
 import { vectorIdOf } from "../src/recall/ids";
-import { createRecallStore, type RecallStore } from "../src/recall/index";
+import { createRecallStore, RECALL_MIN_SCORE, type RecallStore } from "../src/recall/index";
 import {
   indexItems,
   type RecallDeps,
@@ -223,5 +223,67 @@ describe("recall tracer: one message in, the same message out (plan 25-01)", () 
 
     expect(await indexItems(b, [item(heldRef, "held again", "held")], deps)).toBe(1);
     expect(await ledgerRows(stub)).toHaveLength(RECALL_MAX_VECTORS - 1);
+  });
+});
+
+describe("the relevance floor (Phase 26, D-07)", () => {
+  /** A binding whose one query answers exactly these matches, whatever it is asked. */
+  function scoredIndex(matches: { id: string; score: number; r: string; s: string }[], userId: string) {
+    return {
+      async query() {
+        return {
+          count: matches.length,
+          matches: matches.map((m) => ({
+            id: m.id,
+            score: m.score,
+            namespace: userId,
+            metadata: { u: userId, r: m.r, s: m.s, a: 1790000000000 },
+          })),
+        };
+      },
+    } as unknown as Vectorize;
+  }
+
+  it("drops a match scored just below RECALL_MIN_SCORE and keeps one just above", async () => {
+    const a = await testPrincipal(USER_A);
+    const above = encodeMessageId({ mailbox: "INBOX", uidValidity: 7, uid: 1 });
+    const below = encodeMessageId({ mailbox: "INBOX", uidValidity: 7, uid: 2 });
+    const store = createRecallStore(
+      scoredIndex(
+        [
+          { id: "a".repeat(64), score: RECALL_MIN_SCORE + 0.001, r: above, s: "above" },
+          { id: "b".repeat(64), score: RECALL_MIN_SCORE - 0.001, r: below, s: "below" },
+        ],
+        a.userId,
+      ),
+    );
+
+    const matches = await store.query(a, new Array<number>(1024).fill(0.1), { topK: 10 });
+
+    expect(matches.map((m) => m.ref)).toEqual([above]);
+    expect(matches[0]).toEqual({ ref: above, snippet: "above", indexedAt: 1790000000000 });
+  });
+
+  it("keeps a match scored exactly at the floor, and drops one whose score is not a finite number", async () => {
+    const a = await testPrincipal(USER_A);
+    const at = encodeMessageId({ mailbox: "INBOX", uidValidity: 7, uid: 3 });
+    const nan = encodeMessageId({ mailbox: "INBOX", uidValidity: 7, uid: 4 });
+    const store = createRecallStore(
+      scoredIndex(
+        [
+          { id: "c".repeat(64), score: RECALL_MIN_SCORE, r: at, s: "at" },
+          { id: "d".repeat(64), score: Number.NaN, r: nan, s: "nan" },
+        ],
+        a.userId,
+      ),
+    );
+
+    const matches = await store.query(a, new Array<number>(1024).fill(0.1), { topK: 10 });
+
+    expect(matches.map((m) => m.ref)).toEqual([at]);
+  });
+
+  it("starts at 0.5, the number the owner checks live in plan 26-06", () => {
+    expect(RECALL_MIN_SCORE).toBe(0.5);
   });
 });

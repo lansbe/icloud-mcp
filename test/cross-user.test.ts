@@ -128,6 +128,13 @@ import {
 } from "./fixtures/icloud-bytes";
 import { createFakeDuplex } from "./fixtures/fake-duplex";
 import type { TestUser } from "./fixtures/two-users";
+import { RECALL_TOOL_NAME, registerRecallTools } from "../src/mcp/tools/recall";
+import { createEmbedder } from "../src/recall/embed";
+import { createRecallStore } from "../src/recall/index";
+import { indexItems, type RecallDeps } from "../src/recall/pipeline";
+import { encodeMessageId } from "../src/mail/ids";
+import { createFakeAi } from "./fixtures/fake-embedder";
+import { createFakeVectorize } from "./fixtures/fake-vectorize";
 
 // The socket module, spied on for the change-marker describe at the bottom.
 // The real function stays the default, so every other case in this file
@@ -1862,5 +1869,59 @@ describe("change marker: a marker belongs to the user it was minted for", () => 
     const answerA = await changesFor(USER_A)({ marker: markerB });
     expect(answerA, "A's answer is not the one refusal").toEqual(refusedMarkerResult());
     expect(connectImap, "A's call opened a socket").toHaveBeenCalledTimes(1);
+  });
+});
+
+/** The `mail_recall` callback for `user`, over one shared fake index and model. */
+function recallFor(
+  user: TestUser,
+  deps: RecallDeps,
+): (args: { query: string }) => Promise<RecordedToolResult> {
+  let callback: ((args: { query: string }) => Promise<RecordedToolResult>) | undefined;
+  const server = {
+    registerTool(
+      name: string,
+      _options: unknown,
+      handler: (args: { query: string }) => Promise<RecordedToolResult>,
+    ) {
+      if (name === RECALL_TOOL_NAME) callback = handler;
+    },
+  };
+  registerRecallTools(server as unknown as McpServer, testPrincipal(user), () => deps);
+  expect(callback, `${RECALL_TOOL_NAME} is not registered`).toBeDefined();
+  return callback!;
+}
+
+/** The ids in a recall answer, in order. */
+function recalledIds(answer: RecordedToolResult): string[] {
+  const trusted = JSON.parse(answer.content[0]!.text) as { results: { id: string }[] };
+  return trusted.results.map((row) => row.id);
+}
+
+describe("recall index: a person recalls only their own mail (Phase 26, T-26-01)", () => {
+  it("A and B indexed with the same subject words each get back only their own ids", async () => {
+    const index = createFakeVectorize();
+    const deps: RecallDeps = { store: createRecallStore(index), embedder: createEmbedder(createFakeAi()) };
+    const refA = { mailbox: "INBOX", uidValidity: 1234567890, uid: 42 };
+    const refB = { mailbox: "INBOX", uidValidity: 1234567890, uid: 77 };
+    const messageDate = Date.now() - 24 * 60 * 60 * 1000;
+    const item = { text: "Staff engineer role", snippet: "Staff role", messageDate };
+    expect(await indexItems(await testPrincipal(USER_A), [{ ...item, ref: refA }], deps)).toBe(1);
+    expect(await indexItems(await testPrincipal(USER_B), [{ ...item, ref: refB }], deps)).toBe(1);
+    // Both vectors are in the one shared index, so an empty answer below would be
+    // a real refusal and not a store that held nothing.
+    expect(index.vectors.size).toBe(2);
+
+    const forA = await recallFor(USER_A, deps)({ query: "staff engineer" });
+    const forB = await recallFor(USER_B, deps)({ query: "staff engineer" });
+
+    expect(recalledIds(forA), "A did not get exactly A's own message").toEqual([
+      encodeMessageId(refA),
+    ]);
+    expect(recalledIds(forB), "B did not get exactly B's own message").toEqual([
+      encodeMessageId(refB),
+    ]);
+    expect(JSON.stringify(forA), "A's answer carries B's id").not.toContain(encodeMessageId(refB));
+    expect(JSON.stringify(forB), "B's answer carries A's id").not.toContain(encodeMessageId(refA));
   });
 });
