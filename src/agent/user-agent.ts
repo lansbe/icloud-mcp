@@ -78,8 +78,8 @@ import {
   withAutonomySession,
 } from "./autonomy";
 import { type ActivityEntry, readActivity } from "./activity";
+import { nextWakeAfter } from "./cadence";
 import {
-  JOB_CADENCE_MS,
   JOB_LAST_RUN_KEY,
   JOB_MARKER_KEY,
   JOB_NEXT_AT_KEY,
@@ -1059,7 +1059,8 @@ export class UserAgent extends DurableObject<Env> {
    * own clock, so no caller chooses a rule's age. Refuses, in this order: any
    * parse refusal; `unnamed` when the object does not know whose it is (the job
    * could never run); `too-many-rules` at `MAX_RULES`. Then asks for the job's
-   * next wake through the one scheduling helper.
+   * next wake, on the person's own offset (`./cadence.ts`), through the one
+   * scheduling helper.
    *
    * Its one caller is the rules tool's commit, after the person saw and
    * confirmed the preview (plan 28-04). Never throws: an error's class does not
@@ -1080,8 +1081,11 @@ export class UserAgent extends DurableObject<Env> {
       const createdAt = Date.now();
       const stored: Rule = { v: RULE_VERSION, id: crypto.randomUUID(), createdAt, ...parsed.rule };
       kv.put(RULES_KEY, [...rules, stored]);
+      // The job's next wake on the person's own offset, from the stored name
+      // (25 D-22). The helper keeps an earlier alarm.
+      const name = this.storedOwnName();
       try {
-        await this.scheduleAlarm(createdAt + JOB_CADENCE_MS);
+        if (name !== null) await this.scheduleAlarm(nextWakeAfter(createdAt, name));
       } catch {
         // The rule stands. The next alarm or arm schedules again.
       }

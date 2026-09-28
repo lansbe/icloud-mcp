@@ -93,7 +93,8 @@ export type ActionOutcome =
  * What one run came to. A closed list.
  *
  * Before any I/O: `no_rules`, `not_armed` (no autonomy record), `retry` (the
- * platform's retry of an alarm, which the job never acts on).
+ * platform's retry of an alarm, which the job never acts on), `not_due` (the
+ * shared alarm fired for another job before this job's own time).
  * The session: `not_allowed`, `off`, `revoked`, `session_failed`.
  * The change check: `call_failed`, `unreadable`, `marker_refused`,
  * `markers_unavailable`, `inbox_not_checked`.
@@ -106,6 +107,7 @@ export type RunOutcome =
   | "no_rules"
   | "not_armed"
   | "retry"
+  | "not_due"
   | "not_allowed"
   | "off"
   | "revoked"

@@ -11,7 +11,9 @@
 //   1. Due check, cheapest first: at least one rule (a local read), then an
 //      autonomy record (presence only, through `autonomyArmed`), then not a
 //      platform retry. Any "no" returns at once, having written nothing and
-//      asked for nothing (D-25).
+//      asked for nothing (D-25). Then its own time: a run the shared alarm
+//      woke early for another job asks for its own time again and returns,
+//      having written nothing.
 //   2. Ask for the next wake through the object's one scheduling helper, before
 //      any I/O, so a run that dies still leaves the alarm set.
 //   3. One session, through the `withSession` it is handed. The object binds
@@ -37,24 +39,21 @@
 // build skips requests made with the autonomy key. It never throws, and never
 // reads a caught value. It logs nothing.
 //
-// Plan 28-02 adds the per-person cadence, the reply in the run, the caps and the
-// marker's 24-hour rule; plan 28-03 the failure counter and the owner's status.
+// THE CLOCK. The job wakes on its own fixed cadence, at an offset taken from the
+// person's user id (`./cadence.ts`). Nothing here, and nothing a caller hands
+// in, can change either.
+//
+// Plan 28-02 adds the reply in the run, the caps and the marker's 24-hour rule;
+// plan 28-03 the failure counter and the owner's status.
 
 import { appendActivity, type ActivityKind } from "./activity";
 import { setFlag } from "./actions";
 import { autonomyArmed, type AutonomySessionOutcome } from "./autonomy";
+import { JOB_CADENCE_MS, nextWakeAfter } from "./cadence";
 import { evaluate } from "./evaluate";
 import { type Rule, storedRuleOf } from "./rules";
 import type { ActionOutcome, CallFn, RunOutcome } from "./tool-call";
 import { readChangesAnswer } from "./tool-reply";
-
-/**
- * How often the job wakes, in milliseconds: 15 minutes (D-07).
- *
- * 15 × 60 × 1000 = 900 000. A literal for the tracer; plan 28-02 moves it to
- * its own module with the per-person offset.
- */
-export const JOB_CADENCE_MS = 900000;
 
 /** The storage key of the person's rules. */
 export const RULES_KEY = "rules";
@@ -173,10 +172,25 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
     if (deps.isRetry) return "retry";
 
     now = deps.now();
+    // Its own time: the alarm is shared, so it may have fired for another
+    // job. Then the job asks for its own time again and writes nothing. A
+    // stored time more than one cadence ahead was not written by this code
+    // path, so it is not trusted and the run goes ahead.
+    const storedNextAt = deps.storage.get<unknown>(JOB_NEXT_AT_KEY);
+    if (
+      typeof storedNextAt === "number" &&
+      Number.isFinite(storedNextAt) &&
+      now < storedNextAt &&
+      storedNextAt <= now + JOB_CADENCE_MS
+    ) {
+      await deps.requestWake(storedNextAt);
+      return "not_due";
+    }
+
     runId = crypto.randomUUID();
 
-    // 2. The next wake, asked for before any I/O.
-    const nextAt = now + JOB_CADENCE_MS;
+    // 2. The next wake, on the person's own offset, asked for before any I/O.
+    const nextAt = nextWakeAfter(now, deps.name);
     deps.storage.put(JOB_NEXT_AT_KEY, nextAt);
     await deps.requestWake(nextAt);
 

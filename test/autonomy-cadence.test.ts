@@ -34,7 +34,10 @@ import { UserAgent } from "../src/agent/user-agent";
 import { oauthProviderOptions } from "../src/auth/oauth";
 import { userIdOf } from "../src/principal";
 import { connectImap } from "../src/mail/socket";
+// The two modules' own source, read at build time by Vite, for the literal pin.
+// @ts-expect-error — a raw import has no ambient declaration here.
 import CADENCE_SOURCE from "../src/agent/cadence.ts?raw";
+// @ts-expect-error — a raw import has no ambient declaration here.
 import JOB_SOURCE from "../src/agent/job.ts?raw";
 import { entryEnv } from "./fixtures/bound-secrets";
 import { signInArmed, type Stub } from "./fixtures/rules-job";

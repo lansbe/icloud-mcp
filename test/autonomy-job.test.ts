@@ -383,7 +383,12 @@ describe("the rules job, end to end (AUTO-09, AUTO-12, AUTO-13, D-06, D-14)", ()
       expect(runOneCalls.filter((call) => call.grantType === "refresh_token")).toHaveLength(1);
       expect(allLines().some((line) => /UID STORE/.test(line))).toBe(false);
 
-      // ---- Run two: two new messages, one from the rule's sender.
+      // ---- Run two: two new messages, one from the rule's sender. The alarm
+      // is driven at once, long before the job's own next wake (28-02), so
+      // that stored wake is forgotten first to make this run due.
+      await runInDurableObject(armed.stub, (_i, state) => {
+        state.storage.kv.delete("job:nextAt");
+      });
       const received = Date.now() + 60_000;
       queued.push(
         () => statusSession(4394, "120"),
