@@ -1158,7 +1158,8 @@ export function autonomyStatusText(value, now) {
  * The status line's words for each person who holds an autonomy grant, keyed by
  * user segment. Nobody with an autonomy grant: no read of any kind. Otherwise
  * one listing of the status prefix, then one read per person with a record, in
- * order, one at a time.
+ * order, one at a time. A listing that fails marks every person's status
+ * unreadable and never throws (28-REVIEW IN-05).
  *
  * @param {import("./grants-core.d.mts").GrantStore} kv
  * @param {readonly import("./grants-core.d.mts").GrantGroup[]} groups
@@ -1171,7 +1172,18 @@ export async function readAutonomyStatuses(kv, groups, now) {
     .filter((group) => group.grants.some((grant) => grant.autonomy === true))
     .map((group) => group.userKey);
   if (people.length === 0) return statuses;
-  const recorded = new Set(await allKeysUnder(kv, AUTONOMY_STATUS_KEY_PREFIX));
+  // The status line is secondary. The grant listing above it is the owner's
+  // revocation tool, so a failed listing of the status records must never cost
+  // it (28-REVIEW IN-05): every person's line then says the status could not
+  // be read. The caught value is never read, for the adapter's reason: it
+  // could carry wrangler's stderr.
+  let recorded;
+  try {
+    recorded = new Set(await allKeysUnder(kv, AUTONOMY_STATUS_KEY_PREFIX));
+  } catch {
+    for (const userKey of people) statuses.set(userKey, STATUS_UNREADABLE);
+    return statuses;
+  }
   for (const userKey of people) {
     const key = `${AUTONOMY_STATUS_KEY_PREFIX}${userKey}`;
     if (!STATUS_USER_ID.test(userKey) || !recorded.has(key)) {

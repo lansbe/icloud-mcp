@@ -2553,6 +2553,31 @@ describe("AUTO-15: the owner's listing shows each person's rules job", () => {
     expect(lineAfter(text, "auto-status-2")).toBe("    rules job  next wake 2026-09-28 06:01 UTC  auth failures 0");
   });
 
+  it("a failed listing of the status records never costs the grant listing: each person's line says status unreadable (28-REVIEW IN-05)", async () => {
+    const otherKey = "9".repeat(64);
+    const { kv } = await storeWith(statusRecord({ nextAt: STATUS_NOW + 60_000 }), {
+      [`grant:${otherKey}:auto-status-2`]: namedGrantRecord(
+        otherKey,
+        "auto-status-2",
+        AUTONOMY_CLIENT_ID,
+        AUTONOMY_CLIENT_NAME,
+      ),
+    });
+    const failing: GrantStore = {
+      ...kv,
+      async list(options?: { prefix?: string }) {
+        if (options?.prefix === AUTONOMY_STATUS_KEY_PREFIX) throw new Error("the listing failed");
+        return kv.list(options);
+      },
+    };
+    // listAt asserts the command still exits 0.
+    const text = await listAt(failing);
+    expect(lineFor(text, "auto-status-1")).toMatch(/ {2}autonomy$/);
+    expect(lineFor(text, "plain-status-1")).toContain("plain-status-1");
+    expect(lineAfter(text, "auto-status-1")).toBe("    rules job  status unreadable");
+    expect(lineAfter(text, "auto-status-2")).toBe("    rules job  status unreadable");
+  });
+
   it("prints no rules job line and reads no status for a person with no autonomy grant", async () => {
     const userKey = await listedUserId();
     const { store, seen } = countingStore({
