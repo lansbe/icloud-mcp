@@ -7650,6 +7650,22 @@ describe("the rules job's scan rules (Phase 28, D-21)", () => {
       }
     });
 
+    // 28-REVIEW-2 IN-02. The rule's comment says which prose it matches, so a
+    // comment that trips it is not a mystery. These pin that list: prose that
+    // names one of the keys after a period or between commas or braces fires,
+    // in any letter case, and so does a Unicode property escape whose name is
+    // one of the keys. Built from fragments, so this block spells no key.
+    it("fires on the prose its comment names: a key after a period, a key between commas or braces, any case", () => {
+      for (const line of [
+        `// no copies. ${"B"}${"cc"} is never set`,
+        `// to, ${"c"}${"c"}, ${"b"}${"cc"}`,
+        `// { ${"c"}${"c"} }`,
+        `const R = /[\\p{${"C"}${"c"}}]/u;`,
+      ]) {
+        expect(hits(ID, "src/agent/job.ts", line), line).toBeGreaterThan(0);
+      }
+    });
+
     it("gives nothing on any real src/agent/ file", () => {
       for (const file of agentFiles) expect(hits(ID, file, SRC[file]!), file).toBe(0);
     });

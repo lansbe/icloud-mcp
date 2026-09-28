@@ -1367,7 +1367,15 @@ export const FORBIDDEN = [
   //
   // It does not fire on the row's From field, on the recipient function, on
   // the sign-in check's reader, or on prose that says "the sender" or "a reply
-  // to". Prose with a space between the words is never matched.
+  // to". It DOES fire on some prose (28-REVIEW-2 IN-02), because the rule
+  // ignores letter case and the three arms IN-08 added match on punctuation
+  // alone: a copy-list or blind-copy-list key named straight after a period
+  // (a new sentence that starts with it), a key named in a list between commas
+  // or braces, and a Unicode property escape whose name is one of the keys
+  // (the one for control characters is spelled with the copy-list key, so
+  // write its long name, Control, instead). In a comment, describe the keys by
+  // role, as this comment does. The rule refusing more than it needs is the
+  // safe direction, so the answer is at the source, never a narrower pattern.
   //
   // Measured at zero hits under src/agent/ before it was armed. If it fires on
   // a legitimate line later, fix that line at the source and describe the
