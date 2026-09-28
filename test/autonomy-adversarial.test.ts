@@ -16,7 +16,16 @@
 //   the rules and the job's settings are unchanged. Then each fixture runs
 //   alone, and each reply fixture's written outcome is held by a named case.
 //
-// Levels C and D, the rules_test case and the sweep follow below.
+//   LEVEL C, the wire. The real `changes_since` over the fake socket, serving
+//   the fixture's raw headers, fetches no body, says which mail came from a
+//   list, and gives the job the same rows as level A.
+//   LEVEL D, the real reply tool. Given exactly the arguments level B recorded,
+//   and serving the fixture's raw message, it writes a draft addressed to the
+//   From address alone; for the hostile threading headers it refuses, or adds
+//   no header of its own.
+//   rules_test over the fixture gives level A's verdicts and writes nothing.
+//   A seeded sweep of generated rule sets agrees with a reference matcher
+//   written here from D-03 and D-30.
 //
 // If a case here fails, the defect is in src/agent/ and is fixed there. No
 // assertion in this file may be loosened to make a hostile case pass.
@@ -24,11 +33,43 @@
 // Nothing here opens a network connection and nothing signs in to a real Apple
 // ID.
 
+import type { McpServer } from "@modelcontextprotocol/server";
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../src/mail/socket", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/mail/socket")>()),
+  connectImap: vi.fn(),
+}));
 
 import { ACTIVITY_KEY, type ActivityEntry } from "../src/agent/activity";
+import { createLeasedMail } from "../src/agent/lease";
+import { parseRule, type RuleBody } from "../src/agent/rules";
+import { readFencedJson } from "../src/agent/tool-reply";
+import { type MarkerContent, sealMarker } from "../src/change-marker";
+import { createDavFetch } from "../src/dav/transport";
+import { createSessionGate } from "../src/mail/service";
+import { connectImap } from "../src/mail/socket";
+import { CHANGES_TOOL_NAME, registerChangesTool } from "../src/mcp/tools/changes";
+import { registerMailTools } from "../src/mcp/tools/mail";
+import { registerRulesTools } from "../src/mcp/tools/rules";
+import { userIdOf } from "../src/principal";
+import { ownerPrincipal } from "./fixtures/bound-secrets";
+import { createFakeDuplex, type FakeDuplex } from "./fixtures/fake-duplex";
+import {
+  GREETING,
+  INBOX_UIDVALIDITY,
+  POST_AUTH_CAPABILITY,
+  PRE_AUTH_CAPABILITY,
+  capabilityResponse,
+  examineResponse,
+  logoutExchange,
+  statusResponse,
+  taggedOk,
+  wire,
+} from "./fixtures/icloud-bytes";
+import { type RecordedToolResult, type TestUser, readToolResult, testPrincipal } from "./fixtures/two-users";
 import { AUTONOMY_KEY } from "../src/agent/autonomy";
 import { AUTONOMY_TOOLS } from "../src/agent/autonomy-client";
 import { nextWakeAfter } from "../src/agent/cadence";
@@ -60,9 +101,11 @@ import {
   type HostileMessage,
   RULE_INDEX,
   type RuleName,
+  TRUSTED_ADDRESSES,
   WORD_RULE_TEXT,
   hostile,
   idOf,
+  uidOf,
 } from "./fixtures/hostile-mailbox";
 import {
   HOUR,
@@ -701,4 +744,898 @@ describe("the reply fixtures, one named case each (D-05 as revised, D-30, D-31)"
       }
     }
   });
+});
+
+// ===========================================================================
+// Task 2: the wire, the real reply tool, rules_test and the sweep
+// ===========================================================================
+
+const ENCODER = new TextEncoder();
+const DECODER = new TextDecoder();
+
+function concatBytes(...parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((sum, part) => sum + part.byteLength, 0));
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.byteLength;
+  }
+  return out;
+}
+
+/**
+ * The named fields of a raw message's header, folds kept, as a server answers
+ * a header-fields fetch: the matching lines in message order, then a blank line.
+ */
+function headerFields(raw: string, names: readonly string[]): string {
+  const head = raw.slice(0, raw.indexOf("\r\n\r\n"));
+  const fields: string[] = [];
+  for (const line of head.split("\r\n")) {
+    if (/^[ \t]/.test(line) && fields.length > 0) fields[fields.length - 1] += `\r\n${line}`;
+    else fields.push(line);
+  }
+  const wanted = names.map((name) => name.toLowerCase());
+  const kept = fields.filter((field) => wanted.includes(field.slice(0, field.indexOf(":")).trim().toLowerCase()));
+  return `${kept.join("\r\n")}\r\n\r\n`;
+}
+
+/** One `key {n}\r\n<payload>` item, the count derived from the payload. */
+function literalItem(key: string, payload: string): Uint8Array {
+  const bytes = ENCODER.encode(payload);
+  return concatBytes(ENCODER.encode(`${key} {${bytes.byteLength}}\r\n`), bytes);
+}
+
+/** The four turns every session opens with. The next tag is `a4`. */
+function authPrefix(): Uint8Array[] {
+  return [
+    GREETING,
+    capabilityResponse("a1", PRE_AUTH_CAPABILITY),
+    taggedOk("a2", "LOGIN completed"),
+    capabilityResponse("a3", POST_AUTH_CAPABILITY),
+  ];
+}
+
+/** Copied from test/read-path-wire.test.ts: the login line, reduced. */
+function redacted(lines: readonly string[]): string[] {
+  return lines.map((line) => {
+    const tokens = line.split(" ");
+    return (tokens[1] ?? "").toUpperCase() === "LOGIN" ? `${tokens[0]} ${tokens[1]} [redacted]` : line;
+  });
+}
+
+/** Every duplex handed out, in order, and the ones still queued. */
+const handedOut: FakeDuplex[] = [];
+let queued: (() => FakeDuplex)[] = [];
+
+beforeEach(() => {
+  handedOut.length = 0;
+  queued = [];
+  vi.mocked(connectImap).mockReset();
+  vi.mocked(connectImap).mockImplementation((() => {
+    const next = queued.shift();
+    if (next === undefined) throw new Error("the test queued no more sessions");
+    const duplex = next();
+    handedOut.push(duplex);
+    return duplex;
+  }) as never);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+// ---------------------------------------------------------------------------
+// The forged END marker against the job's fence parser
+// ---------------------------------------------------------------------------
+
+describe("forged-end-marker: the job reads only the exact four-line fence", () => {
+  /** The real change answer for the forged message alone, and its fenced part. */
+  function forgedAnswer(): { result: ToolAnswer; fence: string } {
+    const answer = changesAnswerFor([hostile("forged-end-marker").row], true, "fresh-marker-c");
+    if (answer.kind !== "ok") throw new Error("the change answer was not built");
+    const result = answer.result as ToolAnswer;
+    return { result, fence: result.content[1]?.text as string };
+  }
+
+  /** The forged subject's own lines: the text, the guessed END line, the fake row, the guessed BEGIN line. */
+  const forgedLines = (hostile("forged-end-marker").row.subject as string).split("\n");
+
+  it("the real fence is four lines and reads as the one real row", () => {
+    const { fence } = forgedAnswer();
+    expect(fence.split("\n")).toHaveLength(4);
+    const read = readFencedJson(fence) as { INBOX: { rows: NewMailRow[] } };
+    expect(read.INBOX.rows).toEqual([hostile("forged-end-marker").row]);
+  });
+
+  it("the same fence with the forged END line or the fake row added as a fifth line is unreadable", () => {
+    const { fence } = forgedAnswer();
+    const [, guessedEnd, fakeRow, guessedBegin] = forgedLines as [string, string, string, string];
+    const lines = fence.split("\n");
+    const variants = [
+      `${fence}\n${guessedEnd}`,
+      `${fence}\n${fakeRow}`,
+      `${fence}\n${guessedBegin}`,
+      [lines[0], lines[1], lines[2], fakeRow, lines[3]].join("\n"),
+      [lines[0], lines[1], fakeRow, lines[2], lines[3]].join("\n"),
+    ];
+    for (const variant of variants) {
+      expect(variant.split("\n")).toHaveLength(5);
+      expect(readFencedJson(variant), variant.slice(-60)).toBeNull();
+    }
+  });
+
+  it("the forged subject spliced in with real line breaks is unreadable, and the job stops with no action", async () => {
+    const { result, fence } = forgedAnswer();
+    const spliced = fence.replace(/\\n/g, "\n");
+    expect(spliced.split("\n").length).toBeGreaterThan(4);
+    expect(readFencedJson(spliced)).toBeNull();
+
+    const fiveLines = `${fence}\n${forgedLines[1]}`;
+    const tampered: ToolAnswer = { content: [result.content[0] as ToolAnswer["content"][number], { type: "text", text: fiveLines }] };
+    expect(readChangesAnswer(tampered).kind).toBe("unreadable");
+    const run = await directRun(armedStorage(FIXTURE_RULES as Rule[]), {
+      answer: (tool) => (tool === "changes_since" ? { kind: "ok", result: tampered } : selfAnswer(tool)),
+    });
+    expect(run.outcome).toBe("unreadable");
+    expect(run.calls.map((call) => call.tool)).toEqual(["changes_since"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Level C: the real change check on the wire
+// ---------------------------------------------------------------------------
+
+/** The header-only fetch item the change check sends, and the only one. */
+const NEW_MAIL_FETCH_ITEMS =
+  "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM LIST-ID LIST-UNSUBSCRIBE)])";
+
+/** One header-only fetch reply for `fixtures`, their raw headers served verbatim. */
+function newMailFetchReply(tag: string, fixtures: readonly HostileMessage[]): Uint8Array {
+  const parts: Uint8Array[] = [];
+  fixtures.forEach((one, index) => {
+    parts.push(
+      ENCODER.encode(`* ${index + 1} FETCH (UID ${one.row.uid} FLAGS () INTERNALDATE "${one.row.receivedAt}" `),
+      literalItem(
+        "BODY[HEADER.FIELDS (SUBJECT FROM LIST-ID LIST-UNSUBSCRIBE)]",
+        headerFields(one.raw, ["Subject", "From", "List-Id", "List-Unsubscribe"]),
+      ),
+      ENCODER.encode(")\r\n"),
+    );
+  });
+  parts.push(ENCODER.encode(`${tag} OK UID FETCH completed\r\n`));
+  return concatBytes(...parts);
+}
+
+/** Copied from test/changes-tool.test.ts: discovery and an account with no calendars. */
+const CALDAV_SERVER = "https://caldav.icloud.com";
+const DAV_PRINCIPAL_PATH = "/1234567890/principal/";
+const DAV_HOME = "https://p42-caldav.icloud.com/1234567890/calendars/";
+
+function davMultistatus(body: string): Response {
+  return new Response(
+    `<?xml version="1.0" encoding="UTF-8"?>\n<multistatus xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:CS="http://calendarserver.org/ns/">${body}</multistatus>`,
+    { status: 207, headers: { "content-type": "text/xml; charset=utf-8" } },
+  );
+}
+
+const noCalendars = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  const method = String(init?.method ?? "GET").toUpperCase();
+  if (url.includes("/.well-known/")) return new Response(null, { status: 404 });
+  if (url.startsWith(CALDAV_SERVER)) {
+    if (url.endsWith(DAV_PRINCIPAL_PATH)) {
+      return davMultistatus(
+        `<response><href>${DAV_PRINCIPAL_PATH}</href><propstat><status>HTTP/1.1 200 OK</status><prop><C:calendar-home-set><href>${DAV_HOME}</href></C:calendar-home-set></prop></propstat></response>`,
+      );
+    }
+    return davMultistatus(
+      `<response><href>${DAV_PRINCIPAL_PATH}</href><propstat><status>HTTP/1.1 200 OK</status><prop><current-user-principal><href>${DAV_PRINCIPAL_PATH}</href></current-user-principal></prop></propstat></response>`,
+    );
+  }
+  if (method === "PROPFIND" && url === DAV_HOME) {
+    return davMultistatus(
+      `<response><href>/1234567890/calendars/</href><propstat><prop><resourcetype><collection/></resourcetype></prop><status>HTTP/1.1 200 OK</status></propstat></response>`,
+    );
+  }
+  return new Response(null, { status: 500 });
+}) as typeof globalThis.fetch;
+
+type ToolAnswer = { content: { type: "text"; text: string }[]; isError?: boolean };
+
+/** The change check's registered callback, as the owner. */
+function changesCallback(): (args: { marker?: string }) => Promise<ToolAnswer> {
+  let callback: ((args: { marker?: string }) => Promise<ToolAnswer>) | undefined;
+  const server = {
+    registerTool(name: string, _options: unknown, handler: typeof callback) {
+      if (name === CHANGES_TOOL_NAME) callback = handler;
+    },
+  };
+  registerChangesTool(
+    server as unknown as McpServer,
+    createLeasedMail(createSessionGate()),
+    ownerPrincipal(),
+    createDavFetch(ownerPrincipal()),
+    {},
+  );
+  expect(callback).toBeDefined();
+  return callback as NonNullable<typeof callback>;
+}
+
+/**
+ * One call of the real change check for fixtures `from` to `to - 1`: the marker
+ * says the inbox's next UID was `from`'s, and the status answer says it is now
+ * `to`'s. So exactly those fixtures are new, and the fetch serves their headers.
+ */
+async function changesPage(from: number, to: number): Promise<{ answer: ToolAnswer; read: FakeDuplex; fixtures: HostileMessage[] }> {
+  const fixtures = HOSTILE_MAILBOX.filter((one) => one.row.uid >= uidOf(from) && one.row.uid < uidOf(to));
+  const content: MarkerContent = {
+    folders: [{ mailbox: "INBOX", uidValidity: INBOX_UIDVALIDITY, uidNext: uidOf(from), highestModseq: null }],
+    calendar: null,
+    mintedAt: 1790000000,
+  };
+  const { userId } = await ownerPrincipal();
+  const marker = await sealMarker(content, userId, env.CONFIRM_SECRET);
+  const newestFirst = [...fixtures].sort((a, b) => b.row.uid - a.row.uid);
+  queued.push(
+    () =>
+      createFakeDuplex([
+        ...authPrefix(),
+        statusResponse("a4", "INBOX", INBOX_UIDVALIDITY, uidOf(to), 172, null),
+        logoutExchange("a5"),
+      ]),
+    () =>
+      createFakeDuplex([
+        ...authPrefix(),
+        examineResponse("a4"),
+        wire(`* SEARCH ${fixtures.map((one) => one.row.uid).join(" ")}`, "a5 OK SEARCH completed"),
+        newMailFetchReply("a6", newestFirst),
+        logoutExchange("a7"),
+      ]),
+  );
+  const answer = await changesCallback()({ marker });
+  expect(queued).toHaveLength(0);
+  return { answer, read: handedOut[handedOut.length - 1] as FakeDuplex, fixtures: newestFirst };
+}
+
+/** The whole mailbox through the real tool: two pages, 17 then 25, as its 25-row cap requires. */
+async function wholeMailboxOnTheWire() {
+  const first = await changesPage(1, 18);
+  const second = await changesPage(18, HOSTILE_MAILBOX.length + 1);
+  return [first, second];
+}
+
+describe("level C: the real change check, serving the fixture's raw headers", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", noCalendars);
+  });
+
+  it("fetches headers only, by peeking, and nothing else", async () => {
+    const pages = await wholeMailboxOnTheWire();
+    expect(pages.map((page) => page.fixtures.length)).toEqual([17, 25]);
+    for (const [index, page] of pages.entries()) {
+      const [from, to] = index === 0 ? [1, 18] : [18, HOSTILE_MAILBOX.length + 1];
+      expect(redacted(page.read.writtenLines())).toEqual([
+        "a1 CAPABILITY",
+        "a2 LOGIN [redacted]",
+        "a3 CAPABILITY",
+        'a4 EXAMINE "INBOX"',
+        `a5 UID SEARCH UID ${uidOf(from)}:${uidOf(to) - 1}`,
+        `a6 UID FETCH ${page.fixtures.map((one) => one.row.uid).join(",")} ${NEW_MAIL_FETCH_ITEMS}`,
+        "a7 LOGOUT",
+      ]);
+    }
+    const lines = handedOut.flatMap((duplex) => redacted(duplex.writtenLines()));
+    expect(lines.some((line) => line.includes("UID FETCH"))).toBe(true);
+    for (const line of lines) {
+      expect((line.split(" ")[1] ?? "").toUpperCase(), line).not.toBe("SELECT");
+      expect(line).not.toMatch(/BODYSTRUCTURE|RFC822|\bTEXT\b|\bSTORE\b|\bAPPEND\b/i);
+      expect(line).not.toMatch(/BODY(?!\.PEEK)\[/i);
+      expect(line).not.toMatch(/BODY\.PEEK\[(?!HEADER\.FIELDS \(SUBJECT FROM LIST-ID LIST-UNSUBSCRIBE\)\])/i);
+    }
+  });
+
+  it("the fenced rows are the fixture's rows exactly, so the fixture has not drifted from the real parser", async () => {
+    for (const page of await wholeMailboxOnTheWire()) {
+      const fenced = readFencedJson(page.answer.content[1]?.text as string) as { INBOX: { rows: NewMailRow[] } };
+      expect(fenced.INBOX.rows).toEqual(page.fixtures.map((one) => one.row));
+    }
+  });
+
+  it("mailingList is true for exactly the two list fixtures", async () => {
+    const rows = (await wholeMailboxOnTheWire()).flatMap(
+      (page) => (readFencedJson(page.answer.content[1]?.text as string) as { INBOX: { rows: NewMailRow[] } }).INBOX.rows,
+    );
+    expect(rows.filter((one) => one.mailingList).map((one) => one.id).sort()).toEqual(
+      [hostile("list-id").row.id, hostile("list-unsubscribe").row.id].sort(),
+    );
+  });
+
+  it("the job's parser reads from the real answer the same rows as level A, and the matcher gives the same verdicts", async () => {
+    const pages = await wholeMailboxOnTheWire();
+    const read: EnvelopeRow[] = [];
+    for (const page of pages) {
+      const reading = readChangesAnswer(page.answer);
+      expect(reading.kind).toBe("ok");
+      if (reading.kind !== "ok") return;
+      expect(reading.state).toBe("changes");
+      expect(reading.newMessages).toBe(page.fixtures.length);
+      expect(reading.dropped).toBe(0);
+      read.push(...reading.rows);
+    }
+    const inFixtureOrder = [...read].sort(
+      (a, b) =>
+        HOSTILE_MAILBOX.findIndex((one) => one.row.id === a.id) - HOSTILE_MAILBOX.findIndex((one) => one.row.id === b.id),
+    );
+    expect(inFixtureOrder).toEqual(parsedRows(HOSTILE_ROWS));
+    expect(evaluate(FIXTURE_RULES, inFixtureOrder)).toEqual(expectedVerdicts(HOSTILE_MAILBOX));
+  });
+
+  it("no sender, subject or list header value reaches the trusted block, and no header the check did not ask for reaches the answer", async () => {
+    for (const page of await wholeMailboxOnTheWire()) {
+      const trusted = page.answer.content[0]?.text as string;
+      expect(trusted).not.toContain("@");
+      expect(trusted).not.toContain(COLLECTOR);
+      for (const one of page.fixtures) {
+        if (one.row.subject !== null && one.row.subject.length > 0) expect(trusted).not.toContain(one.row.subject);
+      }
+      // The list header values, the redirect header, the return path and the
+      // recipients are never fetched, so none of them is anywhere in the answer.
+      // (The collector address is in one fixture's SUBJECT, which the answer
+      // legitimately fences, so it is checked through the redirect header's
+      // own display name instead.)
+      const whole = JSON.stringify(page.answer);
+      for (const text of ["applications.news.partner.example", "unsubscribe-7731@board.example", "Front Desk", "bounce@evil.example", "crowd.example", "X-ICloud-MCP-Rule"]) {
+        expect(whole).not.toContain(text);
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Level D: the real reply tool, on the arguments level B recorded
+// ---------------------------------------------------------------------------
+
+/**
+ * The account the reply tool and rules_test run as: the fixture's own address.
+ * Only its address and password reach the principal; the label is the type's
+ * and names nobody here.
+ */
+const SELF_USER: TestUser = {
+  label: "A",
+  appleId: FIXTURE_SELF,
+  appPassword: "ffff-ffff-ffff-ffff",
+  userId: "",
+};
+
+/** The fields the reply tool asks of its parent, as test/autonomy-draft.test.ts serves them. */
+const PARENT_HEADER_NAMES = ["Message-ID", "References", "Reply-To", "From", "To", "Cc"];
+
+function sectionReply(tag: string, uid: number, key: string, payload: string): Uint8Array {
+  return concatBytes(
+    ENCODER.encode(`* 1 FETCH (UID ${uid} `),
+    literalItem(key, payload),
+    ENCODER.encode(`)\r\n${tag} OK UID FETCH completed\r\n`),
+  );
+}
+
+/** The parent read, in the order the reply tool performs it, serving the fixture's raw message. */
+function parentSession(one: HostileMessage): FakeDuplex {
+  const raw = one.raw;
+  const body = raw.slice(raw.indexOf("\r\n\r\n") + 4);
+  const uid = one.row.uid;
+  return createFakeDuplex([
+    ...authPrefix(),
+    examineResponse("a4"),
+    sectionReply("a5", uid, "BODY[HEADER.FIELDS (MESSAGE-ID REFERENCES REPLY-TO FROM TO CC)]", headerFields(raw, PARENT_HEADER_NAMES)),
+    wire(
+      `* 1 FETCH (UID ${uid} FLAGS () INTERNALDATE "${one.row.receivedAt}" ` +
+        `RFC822.SIZE ${ENCODER.encode(raw).byteLength} ` +
+        `BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" ${ENCODER.encode(body).byteLength} 2))`,
+      "a6 OK UID FETCH completed",
+    ),
+    sectionReply("a7", uid, "BODY[]", raw),
+    logoutExchange("a8"),
+  ]);
+}
+
+/** The draft write: the folder listing, the go-ahead, the completion. Copied from test/autonomy-draft.test.ts. */
+function writeSession(): FakeDuplex {
+  return createFakeDuplex([
+    ...authPrefix(),
+    wire(
+      '* LIST (\\HasNoChildren) "/" "INBOX"',
+      '* LIST (\\HasNoChildren) "/" "Drafts"',
+      '* LIST (\\HasNoChildren \\Sent) "/" "Sent Messages"',
+      '* LIST (\\HasNoChildren \\Trash) "/" "Deleted Messages"',
+      "a4 OK LIST completed",
+    ),
+    wire("+ Ready for literal data"),
+    wire("a5 OK [APPENDUID 1237268096 92] APPEND completed"),
+    logoutExchange("a6"),
+  ]);
+}
+
+/** The reply tool's registered callback, running as the fixture's own account. */
+function replyCallback(): (args: Record<string, unknown>) => Promise<ToolAnswer> {
+  let callback: ((args: Record<string, unknown>) => Promise<ToolAnswer>) | undefined;
+  const server = {
+    registerTool(name: string, _options: unknown, handler: typeof callback) {
+      if (name === "mail_compose_reply") callback = handler;
+    },
+  };
+  registerMailTools(server as unknown as McpServer, createLeasedMail(createSessionGate()), testPrincipal(SELF_USER));
+  expect(callback).toBeDefined();
+  return callback as NonNullable<typeof callback>;
+}
+
+/** The arguments level B recorded for this fixture's one reply. */
+async function recordedReplyArgs(one: HostileMessage): Promise<Record<string, unknown>> {
+  const run = await aloneRun(one);
+  const replies = run.calls.filter((call) => call.tool === "mail_compose_reply");
+  expect(replies).toHaveLength(1);
+  return (replies[0] as Recorded).args;
+}
+
+/** The message bytes a write session was sent: the literal the APPEND line declared. */
+function writtenDraft(duplex: FakeDuplex): string {
+  const line = duplex.writtenLines().find((one) => /\bAPPEND\b/.test(one));
+  expect(line, "no draft write in this session").toBeDefined();
+  const count = Number(/\{(\d+)\}$/.exec(line as string)?.[1]);
+  const chunk = duplex.writes.find((one) => one.byteLength === count);
+  expect(chunk, "the declared literal was never written").toBeDefined();
+  return DECODER.decode(chunk);
+}
+
+/** A message's header block as written (folds kept), and its unfolded header lines. */
+function headerOf(message: string): { physical: string[]; lines: string[] } {
+  const head = message.slice(0, message.indexOf("\r\n\r\n"));
+  return { physical: head.split("\r\n"), lines: head.replace(/\r\n[ \t]+/g, " ").split("\r\n") };
+}
+
+function headerNamed(lines: readonly string[], name: string): string[] {
+  const prefix = `${name.toLowerCase()}:`;
+  return lines.filter((line) => line.toLowerCase().startsWith(prefix));
+}
+
+function nameOf(line: string): string {
+  return line.slice(0, line.indexOf(":")).toLowerCase();
+}
+
+interface ReplyOnTheWire {
+  readonly result: ToolAnswer;
+  readonly trusted: Record<string, unknown>;
+  readonly draft: string | null;
+  readonly lines: string[];
+}
+
+/** Run the real reply tool over the fake duplex with level B's arguments for `one`. */
+async function replyOnTheWire(one: HostileMessage): Promise<ReplyOnTheWire> {
+  const args = await recordedReplyArgs(one);
+  queued.push(
+    () => parentSession(one),
+    () => writeSession(),
+  );
+  const result = await replyCallback()(args);
+  const trusted = JSON.parse(result.content[0]?.text as string) as Record<string, unknown>;
+  const lines = handedOut.flatMap((duplex) => duplex.writtenLines());
+  const writer = handedOut.find((duplex) => duplex.writtenLines().some((line) => /\bAPPEND\b/.test(line)));
+  return { result, trusted, draft: writer === undefined ? null : writtenDraft(writer), lines };
+}
+
+/** The header names the builder writes on an ordinary reply, from one ordinary draft. */
+async function builderHeaderNames(): Promise<Set<string>> {
+  const ordinary = await replyOnTheWire(hostile("forged-from"));
+  handedOut.length = 0;
+  return new Set(headerOf(ordinary.draft as string).lines.map(nameOf));
+}
+
+describe("level D: the real reply tool, given exactly what level B recorded", () => {
+  const DRAFTED: readonly [string, readonly string[]][] = [
+    ["forged-from", ["bounce@evil.example", "mx.evil.example"]],
+    ["name-looks-like-address", ["ceo@trusted.example"]],
+    ["name-encoded-word", ["ceo@trusted.example"]],
+    ["name-with-brackets-and-comma", ["ceo@trusted.example", "CEO <"]],
+    ["redirect-header", [COLLECTOR, "Front Desk"]],
+    ["two-from-addresses", ["second@two.example"]],
+  ];
+
+  it.each(DRAFTED)(
+    "%s: the draft's To holds the From address alone, with no display name, no Cc and no Bcc",
+    async (name, absent) => {
+      const one = hostile(name);
+      const wire = await replyOnTheWire(one);
+      expect(wire.result.isError).not.toBe(true);
+      expect(wire.trusted.appended).toBe(true);
+      expect(handedOut).toHaveLength(2);
+      const { lines } = headerOf(wire.draft as string);
+      expect(headerNamed(lines, "To")).toEqual([`To: ${one.row.fromAddress}`]);
+      expect(headerNamed(lines, "Cc")).toEqual([]);
+      expect(headerNamed(lines, "Bcc")).toEqual([]);
+      for (const line of lines) {
+        for (const text of absent) expect(line, line).not.toContain(text);
+        if (one.row.fromName !== null && one.row.fromName !== "") expect(line, line).not.toContain(one.row.fromName);
+      }
+      // One APPEND, into Drafts, and nothing else written anywhere.
+      const appends = wire.lines.filter((line) => /\bAPPEND\b/.test(line));
+      expect(appends).toHaveLength(1);
+      expect(appends[0]).toContain('"Drafts"');
+      for (const line of wire.lines) expect(line).not.toMatch(/\b(STORE|COPY|MOVE|EXPUNGE)\b/);
+    },
+  );
+
+  it("threading-line-break: the tool refuses the build, or writes no header line the builder did not write", async () => {
+    const builder = await builderHeaderNames();
+    const wire = await replyOnTheWire(hostile("threading-line-break"));
+    if (wire.trusted.appended === false) {
+      expect(wire.trusted.refusal).toEqual(expect.any(String));
+      expect(wire.draft).toBeNull();
+      expect(wire.lines.some((line) => /\bAPPEND\b/.test(line))).toBe(false);
+    } else {
+      const { lines } = headerOf(wire.draft as string);
+      for (const line of lines) expect(builder.has(nameOf(line)), line).toBe(true);
+      expect(headerNamed(lines, "Bcc")).toEqual([]);
+      expect(headerNamed(lines, "X-Injected")).toEqual([]);
+    }
+    // Never a second header, on any path: nothing written carries the injected fields.
+    for (const chunk of handedOut.flatMap((duplex) => duplex.writes)) {
+      const text = DECODER.decode(chunk);
+      expect(text).not.toMatch(/^Bcc:/im);
+      expect(text).not.toMatch(/^X-Injected:/im);
+    }
+  });
+
+  it("threading-line-break: a refused reply is recorded as refused and never tried again", async () => {
+    const one = hostile("threading-line-break");
+    const wire = await replyOnTheWire(one);
+    expect(wire.trusted.appended).toBe(false);
+    const real: CallAnswer = { kind: "ok", result: wire.result };
+    const storage = armedStorage(FIXTURE_RULES as Rule[]);
+    const answer = (tool: string) => (tool === "mail_compose_reply" ? real : selfAnswer(tool));
+    const first = await directRun(storage, { rows: [one.row], answer });
+    expect(first.calls.filter((call) => call.tool === "mail_compose_reply")).toHaveLength(1);
+    expect(activityOf(storage).filter((entry) => entry.kind === "draft").map((entry) => entry.outcome)).toEqual(["refused"]);
+    const second = await directRun(storage, { rows: [one.row], answer });
+    expect(second.calls.filter((call) => call.tool === "mail_compose_reply")).toEqual([]);
+  });
+
+  it("threading-oversized: the reply is refused or its chain folded; no line is over the builder's limit, and the call completes", async () => {
+    const builder = await builderHeaderNames();
+    const wire = await replyOnTheWire(hostile("threading-oversized"));
+    if (wire.trusted.appended === false) {
+      expect(wire.trusted.refusal).toEqual(expect.any(String));
+      expect(wire.draft).toBeNull();
+    } else {
+      const { physical, lines } = headerOf(wire.draft as string);
+      for (const line of physical) expect(ENCODER.encode(line).byteLength).toBeLessThanOrEqual(998);
+      for (const line of lines) expect(builder.has(nameOf(line)), line.slice(0, 40)).toBe(true);
+      expect(headerNamed(lines, "References")).toHaveLength(1);
+      expect(headerNamed(lines, "To")).toEqual(["To: longref@evil.example"]);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// rules_test over the fixture mailbox
+// ---------------------------------------------------------------------------
+
+/** The newest 25 fixture messages, newest first: the page the listing reads. */
+const LISTING_PAGE = [...HOSTILE_MAILBOX].sort((a, b) => b.row.uid - a.row.uid).slice(0, 25);
+
+/** The whole listing conversation on a fake duplex, serving the fixture's raw headers. */
+function listingDuplex(): FakeDuplex {
+  const metadata: Uint8Array[] = [];
+  const snippets: Uint8Array[] = [];
+  LISTING_PAGE.forEach((one, i) => {
+    metadata.push(
+      ENCODER.encode(
+        `* ${i + 1} FETCH (UID ${one.row.uid} FLAGS () INTERNALDATE "${one.row.receivedAt}" ` +
+          `RFC822.SIZE ${ENCODER.encode(one.raw).byteLength} BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 12 1) `,
+      ),
+      literalItem("BODY[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID)]", headerFields(one.raw, ["Subject", "From", "Date", "Message-ID"])),
+      ENCODER.encode(")\r\n"),
+    );
+    snippets.push(ENCODER.encode(`* ${i + 1} FETCH (UID ${one.row.uid} `), literalItem("BODY[1]<0>", "Preview."), ENCODER.encode(")\r\n"));
+  });
+  return createFakeDuplex([
+    ...authPrefix(),
+    examineResponse("a4"),
+    wire(`* SEARCH ${HOSTILE_MAILBOX.map((one) => one.row.uid).join(" ")}`, "a5 OK SEARCH completed"),
+    concatBytes(...metadata, ENCODER.encode("a6 OK UID FETCH completed\r\n")),
+    concatBytes(...snippets, ENCODER.encode("a7 OK UID FETCH completed\r\n")),
+    logoutExchange("a8"),
+  ]);
+}
+
+/** Everything the listing sends: the read-only open and the peeking fetches, nothing else. */
+const LISTING_GOLDEN = [
+  "a1 CAPABILITY",
+  "a2 LOGIN [redacted]",
+  "a3 CAPABILITY",
+  'a4 EXAMINE "INBOX"',
+  "a5 UID SEARCH ALL",
+  `a6 UID FETCH ${LISTING_PAGE.map((one) => one.row.uid).join(",")} (UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID)])`,
+  `a7 UID FETCH ${LISTING_PAGE.map((one) => one.row.uid).join(",")} (BODY.PEEK[1]<0.1024>)`,
+  "a8 LOGOUT",
+];
+
+/** rules_test's registered callback, as the fixture's own account. */
+function rulesTestCallback(): (args: Record<string, unknown>) => Promise<RecordedToolResult> {
+  let callback: ((args: Record<string, unknown>) => Promise<RecordedToolResult>) | undefined;
+  const server = {
+    registerTool(name: string, _options: unknown, handler: typeof callback) {
+      if (name === "rules_test") callback = handler;
+    },
+  };
+  registerRulesTools(server as unknown as McpServer, createLeasedMail(createSessionGate()), testPrincipal(SELF_USER), {});
+  expect(callback).toBeDefined();
+  return callback as NonNullable<typeof callback>;
+}
+
+describe("rules_test over the fixture mailbox reports level A's verdicts and writes nothing", () => {
+  const selfStub = async (): Promise<Stub> =>
+    env.USER_AGENT.getByName((await userIdOf(FIXTURE_SELF)) as string) as unknown as Stub;
+
+  afterEach(async () => {
+    await runInDurableObject(await selfStub(), async (_i, state) => {
+      await state.storage.deleteAlarm();
+      await state.storage.deleteAll();
+    });
+  });
+
+  it.each(Object.keys(RULE_INDEX) as RuleName[])("the %s rule, as a candidate", async (ruleName) => {
+    const stored = FIXTURE_RULES[RULE_INDEX[ruleName]] as Rule;
+    const candidate: RuleBody = { when: stored.when, then: stored.then };
+    const before = await (await selfStub()).rulesView();
+    queued.push(() => listingDuplex());
+
+    const result = await rulesTestCallback()({ rule: candidate });
+    const parsed = readToolResult(result);
+
+    expect(parsed.isError).toBe(false);
+    expect(parsed.trusted?.messagesChecked).toBe(25);
+    // Level A's verdicts for this rule, over the page. The listing does not say
+    // whether mail came from a list, so rules_test does not skip list mail and
+    // offers its From address, as its own fixed sentence says.
+    const expected = LISTING_PAGE.flatMap((one) => {
+      const actions = one.verdicts.filter(([rule]) => rule === ruleName).map(([, action]) => action);
+      if (actions.length === 0) return [];
+      const wouldDraft = actions.includes("draft");
+      const skip = one.expected.skip === "mailing-list" ? null : one.expected.skip;
+      return [{ messageId: one.row.id, wouldFlag: actions.includes("flag"), wouldDraft, draftSkip: wouldDraft ? skip : null }];
+    });
+    expect(parsed.trusted?.results).toEqual(expected);
+    const fenced = parsed.untrusted?.results as Array<Record<string, unknown>>;
+    expect(fenced.map((row) => row.messageId)).toEqual(expected.map((row) => row.messageId));
+    for (const [index, row] of expected.entries()) {
+      const one = HOSTILE_MAILBOX.find((m) => m.row.id === row.messageId) as HostileMessage;
+      const replyTo = row.wouldDraft && row.draftSkip === null ? one.row.fromAddress : null;
+      expect(fenced[index]?.replyTo, one.name).toBe(replyTo);
+    }
+
+    // Never a display name in any result, trusted or fenced. (The answer also
+    // echoes the candidate rule, whose own values may coincide with a display
+    // name used as bait, so the results are what is checked.)
+    const results = JSON.stringify([parsed.trusted?.results, parsed.untrusted?.results]);
+    for (const one of LISTING_PAGE) {
+      if (one.row.fromName !== null && one.row.fromName !== "") expect(results, one.name).not.toContain(one.row.fromName);
+    }
+    expect(results).not.toContain(COLLECTOR);
+    expect(results).not.toContain("ceo@trusted.example");
+
+    // The read-only open and the peeking fetches, and nothing else.
+    expect(handedOut).toHaveLength(1);
+    const lines = redacted((handedOut[0] as FakeDuplex).writtenLines());
+    expect(lines).toEqual(LISTING_GOLDEN);
+    for (const line of lines) {
+      expect(line).not.toMatch(/\b(SELECT|STORE|APPEND|EXPUNGE|COPY|MOVE)\b/);
+      expect(line).not.toMatch(/BODY\[|BODY\.PEEK\[\]|RFC822(?!\.SIZE)/);
+    }
+    // Nothing was written to the object.
+    expect(await (await selfStub()).rulesView()).toEqual(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The seeded sweep
+// ---------------------------------------------------------------------------
+
+/** The sweep's seed and size. Both are recorded in the SUMMARY. */
+const SWEEP_SEED = 0x28052026;
+const SWEEP_RULE_SETS = 500;
+
+/** mulberry32: a small seeded generator, so a failure replays exactly. */
+function seeded(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// The reference matcher and reply rule, written here from D-03 and D-30's text
+// and NOT by calling `evaluate` or `replyRecipient`.
+
+const REF_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** A fixture receipt time (`28-Sep-2026 09:11:00 +0000`) in milliseconds. */
+function refReceivedAt(value: string | null): number | null {
+  const m = /^(\d{2})-([A-Za-z]{3})-(\d{4}) (\d{2}):(\d{2}):(\d{2}) \+0000$/.exec(value ?? "");
+  if (m === null) return null;
+  return Date.UTC(Number(m[3]), REF_MONTHS.indexOf(m[2] as string), Number(m[1]), Number(m[4]), Number(m[5]), Number(m[6]));
+}
+
+function refNorm(text: string): string {
+  return text.normalize("NFKC").toLowerCase();
+}
+
+/** D-03: every kind the rule has must match; any value within a kind. */
+function refMatches(rule: Rule, row: NewMailRow): boolean {
+  const at = refReceivedAt(row.receivedAt);
+  if (at === null || at < rule.createdAt) return false;
+  const address = row.fromAddress;
+  const { fromAddresses, fromDomains, subjectContains } = rule.when;
+  if (fromAddresses !== undefined) {
+    if (address === null || !fromAddresses.some((one) => one.toLowerCase() === address.toLowerCase())) return false;
+  }
+  if (fromDomains !== undefined) {
+    if (address === null || !address.includes("@")) return false;
+    const domain = address.slice(address.lastIndexOf("@") + 1).toLowerCase();
+    if (domain === "" || !fromDomains.some((one) => domain === one || domain.endsWith(`.${one}`))) return false;
+  }
+  if (subjectContains !== undefined) {
+    if (row.subject === null || !subjectContains.some((one) => refNorm(row.subject as string).includes(refNorm(one)))) return false;
+  }
+  return fromAddresses !== undefined || fromDomains !== undefined || subjectContains !== undefined;
+}
+
+function refVerdicts(rules: readonly Rule[], rows: readonly NewMailRow[]): Verdict[] {
+  const out: Verdict[] = [];
+  rows.forEach((row, r) =>
+    rules.forEach((rule, i) => {
+      if (!refMatches(rule, row)) return;
+      if (rule.then.flag === true) out.push({ rule: i, row: r, action: "flag" });
+      if (rule.then.draft !== undefined) out.push({ rule: i, row: r, action: "draft" });
+    }),
+  );
+  return out;
+}
+
+/** One plain address: a local part, one @, and a domain of two or more letter-digit-hyphen labels. */
+const REF_BARE = /^[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$/;
+
+/** D-30: a list, then no usable address, then the account's own (Apple siblings included). */
+function refReply(row: NewMailRow, self: string): { to: string } | { skip: ReplySkipName } {
+  if (row.mailingList) return { skip: "mailing-list" };
+  const from = row.fromAddress;
+  if (from === null || !REF_BARE.test(from) || from.startsWith(".") || from.split("@")[0]?.endsWith(".") || from.includes("..")) {
+    return { skip: "no-address" };
+  }
+  const [fl, fd] = from.toLowerCase().split("@") as [string, string];
+  const [sl, sd] = self.toLowerCase().split("@") as [string, string];
+  const apple = ["icloud.com", "me.com", "mac.com"];
+  if (fl === sl && (fd === sd || (apple.includes(fd) && apple.includes(sd)))) return { skip: "own-address" };
+  return { to: from };
+}
+type ReplySkipName = "no-address" | "own-address" | "mailing-list";
+
+/** Pools drawn from the fixture's own senders, domains and subject words. */
+const POOL_ADDRESSES = [
+  ...new Set([
+    ...HOSTILE_MAILBOX.map((one) => one.row.fromAddress).filter((a): a is string => a !== null && REF_BARE.test(a)),
+    ...TRUSTED_ADDRESSES,
+  ]),
+];
+const POOL_DOMAINS = [
+  ...new Set(
+    POOL_ADDRESSES.flatMap((address) => {
+      const labels = address.slice(address.lastIndexOf("@") + 1).toLowerCase().split(".");
+      return labels.slice(0, -1).map((_, i) => labels.slice(i).join("."));
+    }),
+  ),
+];
+const POOL_WORDS = [
+  ...new Set(
+    HOSTILE_MAILBOX.flatMap((one) => (one.row.subject ?? "").split(/\s+/))
+      .filter((word) => word.length >= 1 && word.length <= 100 && !/[\u0000-\u001f\u007f]/.test(word)),
+  ),
+];
+const RANDOM_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789 .-_@:";
+
+interface SweepGen {
+  readonly next: () => number;
+}
+
+function pick<T>(gen: SweepGen, list: readonly T[]): T {
+  return list[Math.floor(gen.next() * list.length)] as T;
+}
+
+function randomText(gen: SweepGen, min: number, max: number): string {
+  const length = min + Math.floor(gen.next() * (max - min + 1));
+  let out = "";
+  for (let i = 0; i < length; i += 1) out += pick(gen, [...RANDOM_ALPHABET]);
+  return out;
+}
+
+function values(gen: SweepGen, pool: readonly string[], random: () => string): string[] {
+  const count = 1 + Math.floor(gen.next() * 3);
+  return Array.from({ length: count }, () => (gen.next() < 0.7 ? pick(gen, pool) : random()));
+}
+
+/** One valid rule, parsed by the real parser so it is one a person could add. */
+function generatedRule(gen: SweepGen, index: number): Rule {
+  for (;;) {
+    const when: Record<string, string[]> = {};
+    const kinds = Math.floor(gen.next() * 7) + 1; // a non-empty subset of the three kinds
+    if (kinds & 1) when.fromAddresses = values(gen, POOL_ADDRESSES, () => `${randomText(gen, 1, 8).replace(/[^a-z0-9]/g, "x")}@evil.example`);
+    if (kinds & 2) when.fromDomains = values(gen, POOL_DOMAINS, () => `${randomText(gen, 1, 8).replace(/[^a-z0-9]/g, "x")}.example`);
+    if (kinds & 4) when.subjectContains = values(gen, POOL_WORDS, () => randomText(gen, 1, 12));
+    const which = Math.floor(gen.next() * 3);
+    const then: Record<string, unknown> = {};
+    if (which !== 1) then.flag = true;
+    if (which !== 0) then.draft = { text: `sweep ${index}: ${randomText(gen, 1, 40)}` };
+    const parsed = parseRule({ when, then });
+    if (!parsed.ok) continue;
+    const window = Date.UTC(2026, 8, 28, 9, 10, 0) + Math.floor(gen.next() * 44) * 60_000;
+    const createdAt = gen.next() < 0.75 ? RULES_ADDED_AT_FOR_SWEEP : window;
+    return { v: 1, id: `sweep-${index}`, createdAt, ...parsed.rule };
+  }
+}
+const RULES_ADDED_AT_FOR_SWEEP = FIXTURE_RULES[0]?.createdAt as number;
+
+describe("the seeded sweep: generated rule sets over every hostile row", () => {
+  it(`seed ${SWEEP_SEED.toString(16)}, ${SWEEP_RULE_SETS} rule sets: every action is one the rules alone justify, and every reply goes to that row's From address`, async () => {
+    const gen: SweepGen = { next: seeded(SWEEP_SEED) };
+    const envelope = parsedRows(HOSTILE_ROWS);
+    const byId = new Map(HOSTILE_ROWS.map((one) => [one.id, one]));
+    let flagsSeen = 0;
+    let repliesSeen = 0;
+    let skipsSeen = 0;
+
+    for (let set = 0; set < SWEEP_RULE_SETS; set += 1) {
+      const count = 1 + Math.floor(gen.next() * 5);
+      const rules = Array.from({ length: count }, (_, i) => generatedRule(gen, set * 10 + i));
+
+      // The reference matcher and the real matcher disagree on nothing.
+      const reference = refVerdicts(rules, HOSTILE_ROWS);
+      expect(evaluate(rules, envelope), `set ${set}`).toEqual(reference);
+
+      const storage = armedStorage(rules);
+      const run = await directRun(storage, { rows: HOSTILE_ROWS, answer: selfAnswer });
+      expect(run.outcome, `set ${set}`).toBe("done");
+      const texts = rules.flatMap((rule) => (rule.then.draft === undefined ? [] : [rule.then.draft.text]));
+      assertCallShapes(run.calls, HOSTILE_ROWS, texts);
+
+      const flagJustified = new Set(
+        reference.filter((v) => v.action === "flag").map((v) => (HOSTILE_ROWS[v.row] as NewMailRow).id),
+      );
+      const flags = run.calls.filter((call) => call.tool === "mail_flag");
+      const replies = run.calls.filter((call) => call.tool === "mail_compose_reply");
+      expect(flags.length).toBeLessThanOrEqual(MAX_FLAGS_PER_RUN);
+      expect(replies.length).toBeLessThanOrEqual(MAX_DRAFTS_PER_RUN);
+      for (const call of flags) expect(flagJustified.has(call.args.id as string), `set ${set}`).toBe(true);
+      for (const call of replies) {
+        const row = byId.get(call.args.parentId as string) as NewMailRow;
+        const matching = reference
+          .filter((v) => v.action === "draft" && (HOSTILE_ROWS[v.row] as NewMailRow).id === row.id)
+          .map((v) => (rules[v.rule] as Rule).then.draft?.text);
+        expect(matching, `set ${set}: a reply no rule justifies`).toContain(call.args.text);
+        const decided = refReply(row, FIXTURE_SELF);
+        expect(decided, `set ${set}: a reply to a row that gets none`).toEqual({ to: row.fromAddress });
+        expect(call.args.to).toEqual([row.fromAddress]);
+      }
+      expect(new Set(replies.map((call) => call.args.parentId)).size).toBe(replies.length);
+      skipsSeen += activityOf(storage).filter((entry) =>
+        ["skipped_own_address", "skipped_mailing_list", "skipped_no_address"].includes(entry.outcome),
+      ).length;
+      flagsSeen += flags.length;
+      repliesSeen += replies.length;
+    }
+    // Non-vacuity: the sweep actually flagged, replied, and reached the reply skips.
+    expect(flagsSeen).toBeGreaterThan(SWEEP_RULE_SETS);
+    expect(repliesSeen).toBeGreaterThan(SWEEP_RULE_SETS / 2);
+    expect(skipsSeen).toBeGreaterThan(0);
+  }, 120_000);
 });
