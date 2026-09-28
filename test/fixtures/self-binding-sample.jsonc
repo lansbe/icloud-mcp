@@ -1,0 +1,10 @@
+// A known-violating Worker config for the SELF binding check (Phase 27, D-22).
+// Its SELF binding names a Worker other than this file's own, which is the one
+// change that would hand another Worker a person's autonomy key and the client
+// secret. Never deployed; read only by test/forbidden-tokens.test.ts through
+// scanWranglerConfig, to prove the check runs from there and not only when
+// called directly.
+{
+  "name": "self-binding-sample",
+  "services": [{ "binding": "SELF", "service": "some-other-worker" }]
+}

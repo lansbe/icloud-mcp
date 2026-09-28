@@ -70,6 +70,16 @@ import {
   RECALL_STEP_SCOPE,
   collectRecallStepCalls,
   checkRecallStepCallOwnership,
+  AUTONOMY_ARM_CALL,
+  AUTONOMY_ARM_OWNER,
+  AUTONOMY_ARM_SCOPE,
+  collectAutonomyArmCalls,
+  checkAutonomyArmOwnership,
+  AGENT_OBJECT_MODULE,
+  AGENT_CLOSURE_FORBIDDEN_DIRS,
+  AGENT_CLOSURE_FORBIDDEN_FILES,
+  checkAgentObjectClosure,
+  checkSelfBindingConfig,
   OWNERSHIP_VIOLATION_IDS,
   PASSWORD_READER_IMPORT,
   PASSWORD_READER_OWNERS,
@@ -1138,6 +1148,11 @@ describe("the patterns have teeth", () => {
     // Phase 26 (RCLL-09). The alias a "keep old clients working" edit would
     // register: the old name of the exhaustive search, beside the new one.
     "old-search-tool-name": 'server.registerTool("mail_search", findConfig, findHandler);',
+    // Phase 27 (AUTO-02). The shortest way to "see whose key this is" from
+    // inside the object that holds the autonomy key: hand the token to the
+    // library's helper and read the props it decrypts.
+    "token-unwrap-helper":
+      "const grant = await env.OAUTH_PROVIDER.unwrapToken(autonomyToken);",
   };
 
   it("covers every rule with a known-violating sample", () => {
@@ -1767,14 +1782,23 @@ describe("the patterns have teeth", () => {
    *  never derived from the shipped pattern: a list read off the rule would
    *  agree with the rule by construction.
    *
-   *  The first three are the Worker's secret bindings. The last two are the
-   *  field names the grant's props use for the same two values. */
+   *  The first three are the Worker's secret bindings. The next two are the
+   *  field names the grant's props use for the same two values. The last six
+   *  are the autonomy key's names (Phase 27, AUTO-07): its plaintext, the
+   *  bearer made from it, its sealed field, its OAuth wire name, and the two
+   *  Worker secrets that seal it and prove the client. */
   const SECRET_LOG_NAMES = [
     "APPLE_APP_PASSWORD",
     "APPLE_ID",
     "AUTH_SECRET",
     "appPassword",
     "appleId",
+    "autonomyRefreshToken",
+    "autonomyAccessToken",
+    "sealedRefreshToken",
+    "refresh_token",
+    "AUTONOMY_CLIENT_SECRET",
+    "AUTONOMY_SEAL_KEY",
   ];
 
   /** A logging call that reads one named field, with the name substituted in.
@@ -1789,7 +1813,10 @@ describe("the patterns have teeth", () => {
     // One line per name. A sample proves the RULE is not vacuous, never that any
     // particular name inside it is live.
     const rule = FORBIDDEN.find((r) => r.id === "secret-binding-in-log-call")!;
-    expect(SECRET_LOG_NAMES.length, "three bindings and the grant's two fields").toBe(5);
+    expect(
+      SECRET_LOG_NAMES.length,
+      "three bindings, the grant's two fields and the autonomy key's six names",
+    ).toBe(11);
     for (const name of SECRET_LOG_NAMES) {
       const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
       expect(
@@ -5596,6 +5623,11 @@ describe("the count constraints as a set", () => {
   const ALARM_STEP_CALL = "    await recallStep(principal, deps);\n";
   const COMMENTED_STEP_CALL = "    // await recallStep(actor, productionStepDeps(mail));\n";
   const OBJECT_MODULE = "src/agent/user-agent.ts";
+  /** Phase 27: the sign-in's one arm call, a second one in the tool layer,
+   *  and a sign-in handler whose only call is inside a comment. */
+  const SIGN_IN_ARM_CALL = "    const answer = await agentFor(principal).armAutonomy(code);\n";
+  const TOOL_ARM_CALL = "  await agentFor(actor).armAutonomy(args.code);\n";
+  const COMMENTED_ARM_CALL = "    // const answer = await agentFor(principal).armAutonomy(code);\n";
 
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
@@ -5714,6 +5746,16 @@ describe("the count constraints as a set", () => {
       ...checkRecallStepCallOwnership(
         collectRecallStepCalls(RECALL_STEP_OWNER, COMMENTED_STEP_CALL),
       ).map((v) => v.pattern),
+      // The phase 27 arm count, one owner, both arms through scan()'s own
+      // collector: an arm call in the tool layer beside the sign-in's one, and
+      // a sign-in handler whose only call is inside a comment.
+      ...checkAutonomyArmOwnership([
+        ...collectAutonomyArmCalls(AUTONOMY_ARM_OWNER, SIGN_IN_ARM_CALL),
+        ...collectAutonomyArmCalls(TOOL_LAYER, TOOL_ARM_CALL),
+      ]).map((v) => v.pattern),
+      ...checkAutonomyArmOwnership(
+        collectAutonomyArmCalls(AUTONOMY_ARM_OWNER, COMMENTED_ARM_CALL),
+      ).map((v) => v.pattern),
       // The second two-owner count, fed the same pair of lists the password
       // count is fed and for the same reason.
       ...checkPrincipalConstructorOwnership([
@@ -5816,6 +5858,12 @@ describe("the count constraints as a set", () => {
       ...checkRecallStepCallOwnership(collectRecallStepCalls(OBJECT_MODULE, ALARM_STEP_CALL)),
       ...checkRecallStepCallOwnership(
         collectRecallStepCalls(RECALL_STEP_OWNER, COMMENTED_STEP_CALL),
+      ),
+      // The phase 27 arm count: a lone arm call in the tool layer, and a
+      // sign-in handler whose only call is commented out, one of each id.
+      ...checkAutonomyArmOwnership(collectAutonomyArmCalls(TOOL_LAYER, TOOL_ARM_CALL)),
+      ...checkAutonomyArmOwnership(
+        collectAutonomyArmCalls(AUTONOMY_ARM_OWNER, COMMENTED_ARM_CALL),
       ),
       // TWO owners again, so the same asymmetric pair the password count needs:
       // both owners plus a non-owner is exactly one outside, and one owner
@@ -6669,6 +6717,419 @@ describe("the recall answer's scan rules (Phase 26, D-20)", () => {
 
     it("finds no fan-out in the real tree", () => {
       expect(scan().map((v) => v.pattern)).not.toContain("concurrent-session");
+    });
+  });
+});
+
+// Phase 27, D-21 (AUTO-01, AUTO-02, AUTO-07). Five additions for the autonomy
+// key, each measured on the real tree before it was armed: six names in the
+// unscoped logging rule; one arm call, in the sign-in handler; the object's
+// import closure walked to the bottom; the library's token-unwrapping helper
+// refused under src/; and SELF naming this Worker in both config files.
+describe("the autonomy key's scan rules (Phase 27, D-21)", () => {
+  const rule = (id: string) => FORBIDDEN.find((r) => r.id === id)!;
+  /** Through the real scope mechanism, at a given path. */
+  const hits = (id: string, path: string, text: string): number =>
+    matchRule(rule(id), FORBIDDEN.indexOf(rule(id)), path, text).length;
+
+  // @ts-expect-error — Vite's `import.meta.glob` has no ambient declaration here; see RAW_SOURCES above.
+  const GLOBBED_SRC: Record<string, string> = import.meta.glob("../src/**/*.ts", {
+    query: "?raw",
+    import: "default",
+    eager: true,
+  });
+  /** Every TypeScript file under src/, keyed by its repo-relative path, the
+   *  same map scan() builds for the closure check. */
+  const SRC: Record<string, string> = Object.fromEntries(
+    Object.entries(GLOBBED_SRC).map(([key, text]) => [key.replace(/^\.\.\//, ""), text]),
+  );
+  /** The real tree with one file's text appended to. */
+  const withAppended = (file: string, extra: string): Record<string, string> => {
+    expect(Object.hasOwn(SRC, file), `${file} was not globbed`).toBe(true);
+    return { ...SRC, [file]: `${SRC[file]}\n${extra}\n` };
+  };
+
+  describe("the key's six names cannot reach a log in any directory (a, AUTO-07)", () => {
+    const NAMES = [
+      "autonomyRefreshToken",
+      "autonomyAccessToken",
+      "sealedRefreshToken",
+      "refresh_token",
+      "AUTONOMY_CLIENT_SECRET",
+      "AUTONOMY_SEAL_KEY",
+    ];
+    const PATHS = ["src/agent/probe.ts", "scripts/probe.mjs", "test/probe.test.ts"];
+
+    it("keeps the rule unscoped, so scripts/ and test/ are reached", () => {
+      expect(rule("secret-binding-in-log-call").scope).toBeUndefined();
+    });
+
+    it("fires on each name inside a logging call, in src/, scripts/ and test/", () => {
+      for (const name of NAMES) {
+        for (const path of PATHS) {
+          expect(
+            hits("secret-binding-in-log-call", path, `console.log("exchanged", holder.${name});`),
+            `${name} in ${path}`,
+          ).toBe(1);
+        }
+      }
+    });
+
+    it("fires on the wire name as a string key and as a bare word in a message too", () => {
+      for (const line of [
+        'console.info("body", { refresh_token: value });',
+        'logger.debug("got refresh_token back");',
+        'console.error("sealed", record.sealedRefreshToken, iv);',
+      ]) {
+        expect(hits("secret-binding-in-log-call", "scripts/probe.mjs", line), line).toBe(1);
+      }
+    });
+
+    it("fires nothing on the same names outside a logging call", () => {
+      for (const name of NAMES) {
+        for (const path of PATHS) {
+          expect(
+            hits("secret-binding-in-log-call", path, `const kept = holder.${name};`),
+            `${name} in ${path}`,
+          ).toBe(0);
+        }
+      }
+    });
+
+    it("does not see a longer identifier that only starts with a name", () => {
+      // The names match as whole words. A known limit, pinned, not a gap to
+      // close by loosening the boundary.
+      expect(
+        hits("secret-binding-in-log-call", "test/probe.test.ts", 'console.log("x", refresh_tokenCount);'),
+      ).toBe(0);
+    });
+  });
+
+  describe("one arm call, in the sign-in handler (b, AUTO-01)", () => {
+    it("names the sign-in handler as the owner, over src/", () => {
+      expect(AUTONOMY_ARM_OWNER).toBe("src/auth/login-handler.ts");
+      expect(AUTONOMY_ARM_SCOPE).toBe("src/");
+    });
+
+    it("finds exactly one call in the real tree, in the handler, and not the method's definition", () => {
+      const collected = Object.entries(SRC).flatMap(([file, text]) =>
+        collectAutonomyArmCalls(file, text),
+      );
+      expect(collected.map((call) => call.file)).toEqual([AUTONOMY_ARM_OWNER]);
+      expect(checkAutonomyArmOwnership(collected)).toEqual([]);
+      expect(SRC[AGENT_OBJECT_MODULE]).toMatch(/async armAutonomy\(/);
+    });
+
+    it("reports a second file under src/ that arms", () => {
+      const owner = collectAutonomyArmCalls(AUTONOMY_ARM_OWNER, SRC[AUTONOMY_ARM_OWNER]!);
+      for (const [file, text] of [
+        ["src/mcp/tools/account.ts", "  await agentFor(actor).armAutonomy(args.code);\n"],
+        ["src/agent/user-agent.ts", "    await this\n      .armAutonomy (code);\n"],
+        ["src/recall/drive.ts", "void stub.armAutonomy(code);\n"],
+      ] as const) {
+        const violations = checkAutonomyArmOwnership([
+          ...owner,
+          ...collectAutonomyArmCalls(file, text),
+        ]);
+        expect(violations.map((v) => v.pattern), file).toEqual(["autonomy-arm-outside-sign-in"]);
+        expect(violations[0]!.file).toBe(file);
+      }
+    });
+
+    it("reports a second call inside the handler itself", () => {
+      const twice = `${SRC[AUTONOMY_ARM_OWNER]}\nasync function again(p: Principal, c: string) {\n  return agentFor(p).armAutonomy(c);\n}\n`;
+      const violations = checkAutonomyArmOwnership(collectAutonomyArmCalls(AUTONOMY_ARM_OWNER, twice));
+      expect(violations.map((v) => v.pattern)).toEqual(["autonomy-arm-outside-sign-in"]);
+    });
+
+    it("reports the handler missing when it holds no call, or only a commented one", () => {
+      for (const contents of [
+        "export async function handleLogin(): Promise<Response> { return new Response(); }\n",
+        "    // const answer = await agentFor(principal).armAutonomy(code);\n",
+        "    /* agentFor(principal).armAutonomy(code) */\n",
+      ]) {
+        const violations = checkAutonomyArmOwnership(
+          collectAutonomyArmCalls(AUTONOMY_ARM_OWNER, contents),
+        );
+        expect(violations.map((v) => v.pattern), contents).toEqual(["autonomy-arm-missing"]);
+        expect(violations[0]!.file).toBe(AUTONOMY_ARM_OWNER);
+      }
+    });
+
+    it("does not count the definition, a type position or the name without a call", () => {
+      const fires = (sample: string): boolean =>
+        new RegExp(AUTONOMY_ARM_CALL.source, AUTONOMY_ARM_CALL.flags).test(sample);
+      for (const sample of [
+        "  async armAutonomy(code: unknown): Promise<ArmOutcome> {",
+        "  armAutonomy (code: unknown) {",
+        'expect(Object.getOwnPropertyNames(proto)).toContain("armAutonomy");',
+        "type Arm = UserAgent[\"armAutonomy\"];",
+      ]) {
+        expect(fires(sample), `false-positived on ${JSON.stringify(sample)}`).toBe(false);
+      }
+      for (const sample of [
+        "await agentFor(principal).armAutonomy(code);",
+        "stub . armAutonomy (code)",
+        "agentFor(p)\n  .armAutonomy(code)",
+      ]) {
+        expect(fires(sample), `missed ${JSON.stringify(sample)}`).toBe(true);
+      }
+    });
+
+    it("collects nothing outside src/", () => {
+      expect(collectAutonomyArmCalls("test/autonomy.test.ts", "await stub.armAutonomy(code);")).toEqual([]);
+    });
+
+    it("is wired into scan(): scripts/ alone reports it missing, the real tree reports neither", () => {
+      expect(scan("scripts").map((v) => v.pattern)).toContain("autonomy-arm-missing");
+      const patterns = scan().map((v) => v.pattern);
+      expect(patterns).not.toContain("autonomy-arm-missing");
+      expect(patterns).not.toContain("autonomy-arm-outside-sign-in");
+    });
+
+    it("gives the two arm ids distinct sort keys after the phase 26 counts'", () => {
+      const index = [
+        ...checkAutonomyArmOwnership([{ file: "src/mcp/server.ts", line: 1, column: 1 }]),
+        ...checkAutonomyArmOwnership([]),
+      ].map((v) => v.patternIndex - FORBIDDEN.length);
+      expect(index).toEqual([43, 44]);
+    });
+  });
+
+  describe("the object's import closure (c, D-14)", () => {
+    const ID = "agent-object-closure-reaches-mail";
+    /** A small tree the walk passes over: the object, the autonomy module, the
+     *  principal. */
+    const BASE: Record<string, string> = {
+      "src/agent/user-agent.ts": 'import { arm } from "./autonomy";\n',
+      "src/agent/autonomy.ts": 'import { makePrincipal } from "../principal";\n',
+      "src/principal.ts": "export const makePrincipal = 1;\n",
+    };
+    const ids = (sources: Record<string, string>) =>
+      checkAgentObjectClosure(sources).map((v) => `${v.pattern} ${v.file}`);
+
+    it("starts at the object module and forbids the trees D-14 names", () => {
+      expect(AGENT_OBJECT_MODULE).toBe("src/agent/user-agent.ts");
+      expect([...AGENT_CLOSURE_FORBIDDEN_DIRS].sort()).toEqual(
+        ["src/dav/", "src/feed/", "src/mail/", "src/mcp/", "src/staging/"].sort(),
+      );
+      expect([...AGENT_CLOSURE_FORBIDDEN_FILES].sort()).toEqual(
+        ["src/auth/login-handler.ts", "src/auth/oauth.ts"].sort(),
+      );
+    });
+
+    it("passes the small tree", () => {
+      expect(ids(BASE)).toEqual([]);
+    });
+
+    it("refuses the autonomy module importing the mail service", () => {
+      expect(ids({ ...BASE, "src/agent/autonomy.ts": 'import { withMailSession } from "../mail/service";\n' }))
+        .toEqual([`${ID} src/agent/autonomy.ts`]);
+    });
+
+    it("refuses an import of the socket module anywhere in the closure", () => {
+      expect(ids({ ...BASE, "src/principal.ts": 'import { connect } from "cloudflare:sockets";\n' }))
+        .toEqual([`${ID} src/principal.ts`]);
+    });
+
+    it("refuses a file two hops away importing the login handler", () => {
+      const violations = checkAgentObjectClosure({
+        ...BASE,
+        "src/principal.ts": 'import { handleLogin } from "./auth/login-handler";\n',
+      });
+      expect(violations.map((v) => `${v.pattern} ${v.file}`)).toEqual([`${ID} src/principal.ts`]);
+      // The reason names the whole path, so the rejected commit can find the edge.
+      expect(violations[0]!.why).toContain(
+        "src/agent/user-agent.ts -> src/agent/autonomy.ts -> src/principal.ts -> src/auth/login-handler.ts",
+      );
+    });
+
+    it("refuses the OAuth wiring module, which reaches the handler", () => {
+      expect(ids({ ...BASE, "src/agent/autonomy.ts": 'import { oauth } from "../auth/oauth";\n' }))
+        .toEqual([`${ID} src/agent/autonomy.ts`]);
+    });
+
+    it("refuses DAV, tool, staging and feed code, a dynamic import, a re-export and a bare import", () => {
+      for (const line of [
+        'import { davFetch } from "../dav/transport";',
+        'import { createServer } from "../mcp/server";',
+        'import { stage } from "../staging/r2";',
+        'import { fetchFeed } from "../feed/subscription-feed";',
+        'const later = await import("../mail/service");',
+        'export { withMailSession } from "../mail/service";',
+        'export * from "../dav/calendar";',
+        'import "../mail/socket";',
+        'import { type LeasedMail } from "../mail/service";',
+      ]) {
+        expect(ids({ ...BASE, "src/agent/autonomy.ts": `${line}\n` }), line).toEqual([
+          `${ID} src/agent/autonomy.ts`,
+        ]);
+      }
+    });
+
+    it("skips the two erased type-only forms, as the Phase 26 closure test does", () => {
+      // The object takes types from the mail tree today; following these would
+      // make the check unpassable. The one-edit widening to a value import is
+      // what the case above refuses.
+      for (const line of [
+        'import type { LeasedMail } from "../mail/service";',
+        'export type { LeasedMail } from "../mail/service";',
+        '// import { withMailSession } from "../mail/service";',
+        '/* import { withMailSession } from "../mail/service"; */',
+      ]) {
+        expect(ids({ ...BASE, "src/agent/autonomy.ts": `${line}\n` }), line).toEqual([]);
+      }
+    });
+
+    it("checks an edge to a file absent from the checkout against every path it could mean", () => {
+      // The same small tree, with no src/mail/ in it at all.
+      expect(ids({ ...BASE, "src/agent/autonomy.ts": 'import { m } from "../mail";\n' })).toEqual([
+        `${ID} src/agent/autonomy.ts`,
+      ]);
+      // An absent file anywhere else is not followed and not refused: the
+      // deployment's generated hostname module is absent on a fresh checkout.
+      expect(
+        ids({ ...BASE, "src/agent/autonomy.ts": 'import { H } from "../deployed-hostname.generated";\n' }),
+      ).toEqual([]);
+    });
+
+    it("reports a missing object module rather than passing an empty walk", () => {
+      const violations = checkAgentObjectClosure({ "src/principal.ts": "" });
+      expect(violations.map((v) => `${v.pattern} ${v.file}`)).toEqual([`${ID} ${AGENT_OBJECT_MODULE}`]);
+      expect(violations[0]!.line).toBe(0);
+    });
+
+    it("passes the real closure: recall, the autonomy modules and the OAuth library included", () => {
+      expect(Object.hasOwn(SRC, AGENT_OBJECT_MODULE)).toBe(true);
+      expect(Object.hasOwn(SRC, "src/agent/autonomy-grants.ts")).toBe(true);
+      expect(checkAgentObjectClosure(SRC)).toEqual([]);
+    });
+
+    it("the walk is real: an edge added deep in the real closure is found", () => {
+      // Positive controls on the shipped tree. Each file below is reached from
+      // the object only through other real files, so a walker that stopped at
+      // the object module would pass the case above and fail these.
+      for (const [file, line] of [
+        ["src/recall/retention.ts", 'import { withMailSession } from "../mail/service";'],
+        ["src/agent/autonomy-grants.ts", 'import { oauth } from "../auth/oauth";'],
+        ["src/auth/allow-list.ts", 'import { handleLogin } from "./login-handler";'],
+      ] as const) {
+        const violations = checkAgentObjectClosure(withAppended(file, line));
+        expect(violations.map((v) => `${v.pattern} ${v.file}`), file).toEqual([`${ID} ${file}`]);
+      }
+    });
+
+    it("agrees with the Phase 26 test: reaching the recall driver reaches mail", () => {
+      // test/recall-import-closure.test.ts forbids the recall driver, the step
+      // and the page source by name. This check forbids the mail tree they
+      // reach, so the same edge fails both.
+      const violations = checkAgentObjectClosure(
+        withAppended("src/agent/autonomy.ts", 'import { runRecallStep } from "../recall/drive";'),
+      );
+      expect(violations.map((v) => v.pattern)).toContain(ID);
+      expect(violations.some((v) => v.why.includes("src/recall/drive.ts"))).toBe(true);
+    });
+
+    it("is wired into scan(): the real tree reports nothing, and scripts/ alone walks no object", () => {
+      expect(scan().map((v) => v.pattern)).not.toContain(ID);
+      expect(scan("scripts").map((v) => v.pattern)).not.toContain(ID);
+    });
+
+    it("sorts after the arm count's two ids", () => {
+      const [violation] = checkAgentObjectClosure({});
+      expect(violation!.patternIndex - FORBIDDEN.length).toBe(45);
+    });
+  });
+
+  describe("the library's token-unwrapping helper stays unused (d, AUTO-02)", () => {
+    const ID = "token-unwrap-helper";
+
+    it("is scoped to src/", () => {
+      expect(rule(ID).scope).toBe("src/");
+    });
+
+    it("fires under src/ on a member call, a destructured call, a value and a comment", () => {
+      for (const line of [
+        "const grant = await env.OAUTH_PROVIDER.unwrapToken(token);",
+        "const grant = await helpers . unwrapToken (token);",
+        "const { unwrapToken } = getOAuthApi(options, env);",
+        "const open = api.unwrapToken;",
+        "// we could call unwrapToken here to see the props",
+      ]) {
+        expect(hits(ID, "src/agent/autonomy.ts", line), line).toBe(1);
+      }
+    });
+
+    it("fires nothing from this rule under test/ or scripts/", () => {
+      const line = "const grant = await env.OAUTH_PROVIDER.unwrapToken(token);";
+      expect(hits(ID, "test/autonomy.test.ts", line)).toBe(0);
+      expect(hits(ID, "scripts/grants-core.mjs", line)).toBe(0);
+    });
+
+    it("does not fire on the library's other helpers or a longer name", () => {
+      for (const line of [
+        "const grants = await api.listUserGrants(userId);",
+        "await api.revokeGrant(grantId, userId);",
+        "const t = unwrapTokenish(x);",
+      ]) {
+        expect(hits(ID, "src/agent/autonomy-grants.ts", line), line).toBe(0);
+      }
+    });
+
+    it("finds nothing in the real tree", () => {
+      expect(scan().map((v) => v.pattern)).not.toContain(ID);
+    });
+  });
+
+  describe("SELF names this Worker (e, D-22)", () => {
+    const ID = "self-binding-not-self";
+    const config = (...lines: string[]) =>
+      ['{', '  "name": "icloud-mcp",', ...lines, '  "compatibility_date": "2026-09-01"', "}"].join("\n");
+    const ids = (text: string) => checkSelfBindingConfig("wrangler.jsonc", text).map((v) => v.pattern);
+    const GOOD = '  "services": [{ "binding": "SELF", "service": "icloud-mcp" }],';
+
+    it("passes a SELF binding to the file's own name", () => {
+      expect(ids(config(GOOD))).toEqual([]);
+      expect(ids(config('  "services": [\n    { "binding": "SELF", "service": "icloud-mcp" }\n  ],'))).toEqual([]);
+    });
+
+    it("fires on SELF naming another Worker", () => {
+      expect(ids(config('  "services": [{ "binding": "SELF", "service": "another-worker" }],'))).toEqual([ID]);
+    });
+
+    it("fires on no SELF binding, on SELF with no service, and on SELF only in a comment", () => {
+      expect(ids(config())).toEqual([ID]);
+      expect(ids(config('  "services": [{ "binding": "OTHER", "service": "icloud-mcp" }],'))).toEqual([ID]);
+      expect(ids(config('  "services": [{ "binding": "SELF" }],'))).toEqual([ID]);
+      expect(ids(config('  // "services": [{ "binding": "SELF", "service": "icloud-mcp" }],'))).toEqual([ID]);
+    });
+
+    it("reads the Worker's own name at the top level, not a binding's name", () => {
+      const nestedOnly = [
+        "{",
+        '  "kv_namespaces": [{ "name": "icloud-mcp", "binding": "OAUTH_KV" }],',
+        GOOD,
+        "}",
+      ].join("\n");
+      expect(ids(nestedOnly)).toEqual([ID]);
+      const renamed = config(GOOD).replace('"name": "icloud-mcp"', '"name": "icloud-mcp-staging"');
+      expect(ids(renamed)).toEqual([ID]);
+    });
+
+    it("passes both real config files", () => {
+      expect(checkSelfBindingConfig("wrangler.jsonc.example", rawSourceOf("wrangler.jsonc.example"))).toEqual([]);
+      expect(scanWranglerConfig("wrangler.jsonc").map((v) => v.pattern)).not.toContain(ID);
+      expect(scanWranglerConfig().map(formatViolation)).toEqual([]);
+    });
+
+    it("is wired into scanWranglerConfig: a known-violating file fires it", () => {
+      expect(scanWranglerConfig("test/fixtures/self-binding-sample.jsonc").map((v) => v.pattern)).toEqual([ID]);
+    });
+
+    it("gives a reason a rejected commit can act on", () => {
+      const [violation] = checkSelfBindingConfig("wrangler.jsonc", config());
+      expect(violation!.why.length).toBeGreaterThan(80);
+      expect(violation!.patternIndex).toBe(6);
     });
   });
 });

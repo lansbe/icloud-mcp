@@ -7,6 +7,9 @@
 // three fire, so the checks are proven to run from scanWranglerConfig and not
 // only when called directly. Nothing deploys this file; it is data for the
 // scanner, not config.
+//
+// The SELF binding is CORRECT on purpose (Phase 27, D-22): it names this
+// file's own Worker, so this sample fires only the three checks above.
 {
   "name": "durable-object-config-sample",
   "durable_objects": {
@@ -15,5 +18,6 @@
   "exports": {
     "Sample": { "type": "durable-object", "storage": "legacy-kv" }
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Sample"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Sample"] }],
+  "services": [{ "binding": "SELF", "service": "durable-object-config-sample" }]
 }

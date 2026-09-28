@@ -68,6 +68,8 @@ export declare function checkRecallPoolConfig(
   poolText: string | null,
   bindingDeclared: boolean,
 ): Violation[];
+/** The SELF service binding check over one Worker config file's text (Phase 27, D-22). */
+export declare function checkSelfBindingConfig(file: string, text: string): Violation[];
 export declare const RECALL_INDEX_MARKER: string;
 export declare const RECALL_CONFIG_VIOLATION_IDS: readonly string[];
 
@@ -150,6 +152,14 @@ export declare const MODEL_ID_SCOPE: string;
 export declare const RECALL_STEP_CALL: RegExp;
 export declare const RECALL_STEP_OWNER: string;
 export declare const RECALL_STEP_SCOPE: string;
+/** Phase 27 (D-21 b): the one arm call, in the sign-in handler. */
+export declare const AUTONOMY_ARM_CALL: RegExp;
+export declare const AUTONOMY_ARM_OWNER: string;
+export declare const AUTONOMY_ARM_SCOPE: string;
+/** Phase 27 (D-21 c): the object's import-closure check. */
+export declare const AGENT_OBJECT_MODULE: string;
+export declare const AGENT_CLOSURE_FORBIDDEN_DIRS: readonly string[];
+export declare const AGENT_CLOSURE_FORBIDDEN_FILES: readonly string[];
 export declare const OWNERSHIP_VIOLATION_IDS: readonly string[];
 
 /** One declared DAV write module: why it is declared, and a disposition for
@@ -265,6 +275,21 @@ export declare function collectRecallStepCalls(
   relativePath: string,
   contents: string,
 ): OwnershipMatch[];
+export declare function checkAutonomyArmOwnership(
+  calls: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function collectAutonomyArmCalls(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+/**
+ * The object's import-closure check over a map of repo-relative path to file
+ * contents. Walks runtime imports from `AGENT_OBJECT_MODULE`, skipping only the
+ * erased `import type` / `export type` statement forms.
+ */
+export declare function checkAgentObjectClosure(
+  sources: Readonly<Record<string, string>>,
+): Violation[];
 
 /** Every name `contents` exports as a `function` declaration, in source order. */
 export declare function exportedFunctionNames(contents: string): string[];
