@@ -27,7 +27,8 @@
 //      point that acts on nothing (D-26). Classify the answer.
 //   5. Evaluate. If a reply is still to be decided, ask the sign-in check once
 //      for the account's own address, before any action (D-30). Then act one
-//      verdict at a time. For each: skip it if its "already acted" record
+//      verdict at a time. For each: skip it if its rule has been removed since
+//      the run began (28-REVIEW WR-04); skip it if its "already acted" record
 //      exists; past a cap, or a reply that must not be placed, write the
 //      record in that final state and make no call; otherwise write the record
 //      as `reserved` synchronously, make the one tool call, then write what
@@ -566,6 +567,12 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
       };
 
       for (const v of verdicts) {
+        // The rule may have been removed while this run awaited an earlier
+        // action: removing a rule is its own call to the object and can land
+        // at any await. rules_remove promises the rule stops at once, so the
+        // rules are read again, synchronously, before each verdict. A removed
+        // rule's verdict makes no call and writes nothing (28-REVIEW WR-04).
+        if (!readRules(deps.storage).some((live) => live.id === v.rule.id)) continue;
         const prior = deps.storage.get<unknown>(v.key);
         const done = prior !== undefined;
         // A record an earlier run left `reserved`: its call went out and what

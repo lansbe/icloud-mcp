@@ -227,6 +227,51 @@ describe("a message moved out of the inbox and back is not acted on again (28-RE
   });
 });
 
+// ========================== a rule removed mid-run stops at once (WR-04)
+
+describe("a rule removed while a run is working stops at once (28-REVIEW WR-04)", () => {
+  // The run reads the rules once, then awaits one iCloud session per action.
+  // Removing a rule is a separate call to the object and can land at any of
+  // those awaits. rules_remove tells the person the rule no longer acts.
+  for (const [what, then, tool] of [
+    ["a flag rule", FLAG, "mail_flag"],
+    ["a reply rule", DRAFT, "mail_compose_reply"],
+  ] as const) {
+    it(`${what} removed after its first action: no further action, and no record for the rest`, async () => {
+      const storage = armedStorage([rule("r1", then)]);
+      let first = true;
+      const run = await directRun(storage, {
+        rows: [newRow(1), newRow(2), newRow(3)],
+        answer: (called) => {
+          if (called === tool && first) {
+            first = false;
+            // The person's rules_remove lands while this call is in flight.
+            storage.delete(RULES_KEY);
+          }
+          return undefined;
+        },
+      });
+      expect(actions(run.calls).map((call) => call.tool)).toEqual([tool]);
+      expect(acted(storage)).toHaveLength(1);
+      expect(ring(storage).filter((entry) => entry.kind !== "run")).toHaveLength(1);
+    });
+  }
+
+  it("another rule that still exists keeps acting", async () => {
+    const storage = armedStorage([rule("r1", FLAG), rule("r2", FLAG, { fromDomains: ["example.com"] })]);
+    const run = await directRun(storage, {
+      rows: [newRow(1), newRow(2)],
+      answer: (called) => {
+        if (called === "mail_flag") storage.put(RULES_KEY, [rule("r2", FLAG, { fromDomains: ["example.com"] })]);
+        return undefined;
+      },
+    });
+    // Row 1: r1 flags (and is then removed), r2 flags. Row 2: only r2.
+    expect(actions(run.calls)).toHaveLength(3);
+    expect(ring(storage).filter((entry) => entry.kind === "flag").map((entry) => entry.ruleId)).toEqual(["r1", "r2", "r2"]);
+  });
+});
+
 // ============================================== the owner's record (AUTO-15)
 
 /** The one status write a run made, parsed. */
