@@ -33,14 +33,20 @@ import {
   type AutonomyEnv,
   type AutonomyStorage,
   seal,
+  sealKeyUsable,
   unseal,
   withAutonomySession,
 } from "../src/agent/autonomy";
 import { AUTONOMY_CLIENT_ID, AUTONOMY_CLIENT_NAME } from "../src/agent/autonomy-client";
 import type { UserAgent } from "../src/agent/user-agent";
 import { ALLOW_LIST_KEY } from "../src/auth/allow-list";
-import { createLoginHandler } from "../src/auth/login-handler";
-import { AUTONOMY_NOTICE_FIELD, AUTONOMY_NOTICE_VERSION } from "../src/auth/login-page";
+import { autonomyConfigured, createLoginHandler, signInNotices } from "../src/auth/login-handler";
+import {
+  AUTONOMY_NOTICE,
+  AUTONOMY_NOTICE_FIELD,
+  AUTONOMY_NOTICE_VERSION,
+  RECALL_NOTICE,
+} from "../src/auth/login-page";
 import { oauthProviderOptions } from "../src/auth/oauth";
 import type { Env } from "../src/env";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
@@ -856,5 +862,78 @@ describe("autonomy credential: no expiry, seal, order, not configured (AUTO-02, 
     await expectOrdinaryAnswer(result);
     expect(result.grantsWritten).toHaveLength(1);
     expect(result.autonomyGrants).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review fix WR-03: a seal key that is set but that the seal would refuse.
+
+/** 16 zero bytes, base64url: set, but not the 32 bytes the seal needs. */
+const SHORT_SEAL_KEY = toBase64Url(new Uint8Array(16));
+
+describe("autonomy credential: a seal key the seal would refuse counts as not set up (review WR-03)", () => {
+  it("sealKeyUsable accepts exactly a 32-byte base64url value, the same shape the seal needs", () => {
+    expect(sealKeyUsable(poolSealKey())).toBe(true);
+    expect(sealKeyUsable(toBase64Url(new Uint8Array(32)))).toBe(true);
+    for (const refused of [
+      undefined,
+      null,
+      42,
+      "",
+      SHORT_SEAL_KEY,
+      toBase64Url(new Uint8Array(24)),
+      toBase64Url(new Uint8Array(33)),
+      // Standard base64 of 32 bytes: padding, and the two letters base64url swaps.
+      btoa(String.fromCharCode(...new Uint8Array(32).fill(0xfb))),
+      `${poolSealKey()}=`,
+    ]) {
+      expect(sealKeyUsable(refused)).toBe(false);
+    }
+  });
+
+  it("the page shows no autonomy notice when the seal key is not 32 bytes", () => {
+    const env = allowAllEnv({ AUTONOMY_SEAL_KEY: SHORT_SEAL_KEY });
+    expect(autonomyConfigured(env)).toBe(false);
+    expect(signInNotices(env)).toEqual([RECALL_NOTICE]);
+    expect(signInNotices(allowAllEnv())).toEqual([RECALL_NOTICE, AUTONOMY_NOTICE]);
+  });
+
+  it("a sign-in with a 16-byte seal key: the same 302, one grant written, and the key the person had is untouched", async () => {
+    const armed = await signInArmed(LISTED_APPLE_ID, "autonomy short seal key, first");
+    const clientId = await register(allowAllEnv(), "autonomy short seal key", CLAUDE_WEB_REDIRECT);
+    try {
+      const readRecord = () =>
+        runInDurableObject(entryEnv().USER_AGENT.getByName(armed.userId), (_i, state) =>
+          JSON.stringify(state.storage.kv.get(AUTONOMY_KEY)),
+        );
+      const before = await readRecord();
+      expect(before).toContain(armed.autonomyGrantId);
+
+      const recorder = recordingKv(entryEnv().OAUTH_KV);
+      const env = allowAllEnv({
+        AUTONOMY_SEAL_KEY: SHORT_SEAL_KEY,
+        OAUTH_KV: recorder.kv,
+        OAUTH_PROVIDER: undefined,
+      });
+      const query = authorizeQuery(clientId, CLAUDE_WEB_REDIRECT, "short-seal-key");
+      recorder.written.length = 0;
+      const ctx = createExecutionContext();
+      const answer = await worker.fetch(postFrom(freshSource(), LISTED_APPLE_ID, query), env, ctx);
+      await waitOnExecutionContext(ctx);
+
+      expect(answer.status).toBe(302);
+      const location = answer.headers.get("location") ?? "";
+      expect(location.startsWith(`${CLAUDE_WEB_REDIRECT}?`)).toBe(true);
+      expect(new URL(location).searchParams.get("code")).toMatch(new RegExp(`^${armed.userId}:`));
+      expect(recorder.written.filter((key) => key.startsWith("grant:"))).toHaveLength(1);
+      const autonomy = (await grantsOf(env, armed.userId)).filter(
+        (grant) => grant.clientId === AUTONOMY_CLIENT_ID,
+      );
+      expect(autonomy.map((grant) => grant.id)).toEqual([armed.autonomyGrantId]);
+      expect(await readRecord()).toBe(before);
+    } finally {
+      await entryEnv().OAUTH_KV.delete(`client:${clientId}`);
+      await armed.cleanup();
+    }
   });
 });

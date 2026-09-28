@@ -230,6 +230,25 @@ function base64UrlFromBytes(bytes: Uint8Array): string {
 }
 
 /**
+ * Whether `value` is a seal key the seal will accept: set, base64url with no
+ * padding, and decoding to exactly 32 bytes.
+ *
+ * The ONE shape check for the seal key (review WR-03). The seal below asks it,
+ * and so does the login handler's `autonomyConfigured`, which decides both the
+ * sign-in notice and whether a sign-in mints an autonomy grant. Before this,
+ * that predicate asked only whether the value was set. A value that was set
+ * but the wrong shape (a hand-set value, standard base64, a 16-byte key) then
+ * showed the notice, minted a grant on every sign-in, and failed every seal,
+ * and each failed arm ended the key the person already had. One decoder for
+ * both is what keeps the page and the seal from disagreeing again.
+ */
+export function sealKeyUsable(value: unknown): value is string {
+  if (!isConfiguredSecret(value)) return false;
+  const raw = bytesFromBase64Url(value);
+  return raw !== null && raw.length === SEAL_KEY_BYTES;
+}
+
+/**
  * The seal key as a non-extractable AES-GCM key, or null.
  *
  * Refuses a key that does not decode to exactly 32 bytes. A short key would
@@ -237,9 +256,9 @@ function base64UrlFromBytes(bytes: Uint8Array): string {
  * promises, so the length is checked here rather than trusted.
  */
 async function sealKeyFrom(sealKey: unknown): Promise<CryptoKey | null> {
-  if (!isConfiguredSecret(sealKey)) return null;
+  if (!sealKeyUsable(sealKey)) return null;
   const raw = bytesFromBase64Url(sealKey);
-  if (raw === null || raw.length !== SEAL_KEY_BYTES) return null;
+  if (raw === null) return null;
   try {
     return await crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, [
       "encrypt",
@@ -734,7 +753,10 @@ async function answersAs(result: unknown, name: string): Promise<boolean> {
 export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutcome> {
   const clientSecret = deps.env.AUTONOMY_CLIENT_SECRET;
   const sealKey = deps.env.AUTONOMY_SEAL_KEY;
-  if (!isConfiguredSecret(clientSecret) || !isConfiguredSecret(sealKey)) {
+  // A seal key the seal would refuse is an input check too (review WR-03): the
+  // arm could only fail at the seal, and failing there would end the key the
+  // person already had over a server fault.
+  if (!isConfiguredSecret(clientSecret) || !sealKeyUsable(sealKey)) {
     return { kind: "not_armed" };
   }
   const codeParts = code.split(":");

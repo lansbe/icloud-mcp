@@ -122,6 +122,7 @@ import {
   AUTONOMY_CLIENT_NAME,
   AUTONOMY_REDIRECT_PATH,
 } from "../agent/autonomy-client";
+import { sealKeyUsable } from "../agent/autonomy";
 import { agentFor } from "../agent/lease";
 import { isConfiguredSecret } from "../configured-secret";
 import { DEPLOYED_HOSTNAME } from "../deployed-hostname.generated";
@@ -1337,13 +1338,19 @@ export function createLoginHandler(
 /**
  * Whether autonomy is set up on this deployment (Phase 27, D-17).
  *
- * Both autonomy secrets must pass `isConfiguredSecret`. This is the ONE place
- * this file decides it, so the sign-in page's notice (plan 27-02) and the
- * arming below cannot disagree. Not set up means the sign-in works exactly as
- * it always did, and nothing is minted.
+ * The client secret must pass `isConfiguredSecret`, and the seal key must pass
+ * `sealKeyUsable`: set, AND the exact shape the seal accepts, checked by the
+ * seal's own decoder (review WR-03). A seal key that is set but the wrong shape
+ * is not set up. Otherwise the page would promise a key that could never arm,
+ * and every sign-in would mint a grant, fail at the seal, and end the key the
+ * person already had.
+ *
+ * This is the ONE place this file decides it, so the sign-in page's notice
+ * (plan 27-02) and the arming below cannot disagree. Not set up means the
+ * sign-in works exactly as it always did, and nothing is minted.
  */
 export function autonomyConfigured(env: Env): boolean {
-  return isConfiguredSecret(env.AUTONOMY_CLIENT_SECRET) && isConfiguredSecret(env.AUTONOMY_SEAL_KEY);
+  return isConfiguredSecret(env.AUTONOMY_CLIENT_SECRET) && sealKeyUsable(env.AUTONOMY_SEAL_KEY);
 }
 
 /**
