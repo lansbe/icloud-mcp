@@ -322,7 +322,11 @@ describe("a built folder's status check runs alone, at most once in five minutes
 // New mail (D-16, D-27, D-30)
 // ---------------------------------------------------------------------------
 
-/** INBOX built at next UID 100, checked 10 minutes ago, with 40 new messages waiting. */
+/**
+ * INBOX built at next UID 100, checked and synced 10 minutes ago, with 40 new
+ * messages waiting. The new mail moved the mod-sequence, and the recent sync
+ * means no deletion sync is owed, so new mail is what the check finds.
+ */
 async function inboxWithBurst(): Promise<{ h: StepHarness; now: number }> {
   const h = fakeStepDeps({
     folders: [INBOX],
@@ -331,7 +335,10 @@ async function inboxWithBurst(): Promise<{ h: StepHarness; now: number }> {
   const now = Date.now();
   h.setNow(now);
   await seedRows(USER_A.userId, [INBOX], {
-    [INBOX]: builtRow(stateOf(INBOX, 100, 100), { checkedAt: now - 10 * MINUTE }),
+    [INBOX]: builtRow(stateOf(INBOX, 100, 100), {
+      checkedAt: now - 10 * MINUTE,
+      reconciledAt: now - 10 * MINUTE,
+    }),
   });
   h.addMessages(INBOX, messagesFrom(100, 40));
   h.setModseq(INBOX, "9");
@@ -356,7 +363,12 @@ describe("new mail is found by the status check and read by the next step, oldes
     ]);
     expect(h.newMailCalls).toEqual([]);
     expect(await rowOf(USER_A.userId, INBOX)).toEqual(
-      builtRow(stateOf(INBOX, 100, 100), { checkedAt: now, due: "new_mail", seen }),
+      builtRow(stateOf(INBOX, 100, 100), {
+        checkedAt: now,
+        reconciledAt: now - 10 * MINUTE,
+        due: "new_mail",
+        seen,
+      }),
     );
     expect(await ledgerCount(USER_A.userId)).toBe(0);
 
@@ -375,7 +387,12 @@ describe("new mail is found by the status check and read by the next step, oldes
     ]);
     expect(await ledgerCount(USER_A.userId)).toBe(25);
     expect(await rowOf(USER_A.userId, INBOX)).toEqual(
-      builtRow(stateOf(INBOX, 100, 125), { checkedAt: now, due: "new_mail", seen }),
+      builtRow(stateOf(INBOX, 100, 125), {
+        checkedAt: now,
+        reconciledAt: now - 10 * MINUTE,
+        due: "new_mail",
+        seen,
+      }),
     );
 
     // Too early for the next page.
@@ -394,7 +411,7 @@ describe("new mail is found by the status check and read by the next step, oldes
     expect(await ledgerCount(USER_A.userId)).toBe(40);
     // The validity and mod-sequence are the stored ones: only the next UID moved.
     expect(await rowOf(USER_A.userId, INBOX)).toEqual(
-      builtRow(stateOf(INBOX, 100, 140), { checkedAt: now }),
+      builtRow(stateOf(INBOX, 100, 140), { checkedAt: now, reconciledAt: now - 10 * MINUTE }),
     );
 
     const ids = upsertedIds(h);
@@ -881,6 +898,56 @@ describe("removals reach the index on the folder's next sync", () => {
     expect(waited.outcome).toBe("full");
     expect(waited.log).toEqual([]);
     expect(h.newMailCalls).toEqual([]);
+  });
+
+  it("new mail before every status check does not starve the deletion sync: it runs once the hour is up, and the new mail follows it (26-REVIEW-2 WR-05)", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX],
+      mailboxes: { [INBOX]: { uidValidity: 100, messages: scriptedMessages(5) } },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    await buildInbox(a, h);
+    const built = (await rowOf(USER_A.userId, INBOX))!;
+    expect(
+      await objectFor(USER_A.userId).recallSetSync(INBOX, { ...built, reconciledAt: now }),
+    ).toEqual({ ok: true });
+
+    // Message 2 is deleted in iCloud right after that sync. Then one new
+    // message arrives before every five-minute check, for 65 minutes, and each
+    // moves the mod-sequence.
+    const outcomes: StepOutcome[][] = [];
+    for (let i = 1; i <= 13; i += 1) {
+      h.addMessages(INBOX, messagesFrom(5 + i, 1));
+      h.setModseq(INBOX, String(7 + i));
+      h.sources[INBOX]!.setUids([1, 3, 4, 5, ...Array.from({ length: i }, (_, k) => 6 + k)]);
+      h.setNow(now + i * RECALL_CHECK_INTERVAL_MS);
+      const round: StepOutcome[] = [];
+      for (let n = 0; n < 4; n += 1) {
+        await passPause(USER_A.userId);
+        const outcome = (await step(a, h)).outcome;
+        round.push(outcome);
+        if (outcome === "idle") break;
+      }
+      outcomes.push(round);
+    }
+
+    // Before the hour: new mail each time, and no sync.
+    for (const round of outcomes.slice(0, 11)) expect(round).toEqual(["due", "indexed", "idle"]);
+    // At the hour: the check records the sync, the sync runs, then the new mail.
+    expect(outcomes[11]).toEqual(["due", "indexed", "indexed", "idle"]);
+    expect(h.log.filter((entry) => entry === `uids:${INBOX}:start`)).toHaveLength(1);
+    // After it: new mail again.
+    expect(outcomes[12]).toEqual(["due", "indexed", "idle"]);
+
+    // Message 2 is gone from the index; every new message is in it.
+    expect(await ledgerCount(USER_A.userId)).toBe(4 + 13);
+    expect(h.index.vectors.size).toBe(4 + 13);
+    const row = (await rowOf(USER_A.userId, INBOX))!;
+    expect(row.reconciledAt).toBe(now + 12 * RECALL_CHECK_INTERVAL_MS);
+    expect(row.state!.uidNext).toBe(19);
+    expect(row.due).toBeNull();
   });
 
   it("iCloud reporting no mod-sequence: a deletion sync is due at most once an hour", async () => {

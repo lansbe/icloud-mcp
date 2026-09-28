@@ -591,12 +591,17 @@ async function checkBuilt(
   // No stored state to compare with reads as a changed validity: the deletion
   // sync then sends the folder back to seed.
   if (stored === null || seen.uidValidity !== stored.uidValidity) return record("reconcile");
-  if (seen.uidNext > stored.uidNext) return record("new_mail");
+  // A deletion sync that is owed goes before new mail (26-REVIEW-2 WR-05).
+  // New mail also moves the mod-sequence, so a folder that gets mail before
+  // every check would otherwise always be due new mail and never a sync, and
+  // mail deleted from it would stay recallable. The new mail is not lost: the
+  // sync hands it on as the next thing due.
   const moved = !sameModseq(seen.highestModseq, stored.highestModseq);
   const lastSync = row.reconciledAt;
   if (moved && (lastSync === null || now - lastSync >= RECALL_RECONCILE_INTERVAL_MS)) {
     return record("reconcile");
   }
+  if (seen.uidNext > stored.uidNext) return record("new_mail");
   return record(null);
 }
 
@@ -746,14 +751,17 @@ async function syncDeletions(
   }
   if (status !== "indexed") return status;
 
+  // New mail the check also saw is due next (WR-05): the sync went first only
+  // because it was owed.
+  const newMail = stored !== null && seen !== null && seen.uidNext > stored.uidNext;
   const now = deps.now();
   const synced: SyncRow = {
     ...row,
     state: seen === null ? stored : { ...stored, highestModseq: seen.highestModseq },
     checkedAt: now,
     reconciledAt: now,
-    due: null,
-    seen: null,
+    due: newMail ? "new_mail" : null,
+    seen: newMail ? seen : null,
     ...NO_FAILURE,
   };
   return afterSet(await stub.recallSetSync(mailbox, synced)) ?? status;
