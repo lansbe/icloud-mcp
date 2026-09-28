@@ -11,6 +11,7 @@ import { createDavFetch } from "../dav/transport";
 import { createSessionGate } from "../mail/service";
 import { answersDuringPause } from "../password-pause";
 import type { Principal } from "../principal";
+import { type GrantClient, withRecallStep } from "../recall/drive";
 import { SERVER_INSTRUCTIONS } from "./instructions";
 import { registerAccountTool } from "./tools/account";
 import { registerCalendarTools } from "./tools/calendar";
@@ -45,6 +46,12 @@ import { registerRecallTools } from "./tools/recall";
 export function createServerFactory(
   principal: Promise<Principal>,
   extraTools: Array<(server: McpServer) => void> = [],
+  // Which client the request's grant belongs to, read only when a recall step
+  // is about to run (Phase 26, D-35). The default answers null, and null runs
+  // no step. That is the safe direction: a factory built without knowing whose
+  // grant it serves never indexes anybody's mail. The door is the only
+  // production caller and passes the real reader.
+  grantClient: GrantClient = async () => null,
 ): McpServerFactory {
   return () => {
     // The second argument is the SDK's `ServerOptions`, and `instructions` is
@@ -87,6 +94,21 @@ export function createServerFactory(
     // wants the raw gate is a decision, not a refactor
     // (`test/lease-coverage.test.ts` fails on it).
     const leasedMail = createLeasedMail(gate);
+    // The recall build is driven from here (Phase 26, RCLL-08, D-26, D-28).
+    // `driven` is the same server, except that a tool registered through it
+    // runs one recall step after it answers without an error, and then hands
+    // back the very same answer. The step takes the person's lease itself,
+    // after the tool's own session has closed, through this same leased
+    // runner. No tool handler knows about it.
+    //
+    // Only the mail registrars get it, below: every tool that reads or changes
+    // mail, recall itself and the change check. The IMAP diagnostic does not.
+    // It runs on the pause-exempt principal, and a step must never sign in for
+    // a person whose password Apple just refused. Nor do the account answer and
+    // the calendar, contacts and DAV tools, which are not mail.
+    // `test/recall-drive.test.ts` classifies every registered tool, so a new
+    // one must be put on one side or the other.
+    const driven = withRecallStep(server, principal, leasedMail, grantClient);
     // **The per-tool opt-out from the dead-password pause, and the ONLY place it
     // is granted (owner decision, 2026-09-22 — code review WR-04).** The same
     // principal, armed exactly as `principal` is, with the pause check removed.
@@ -135,19 +157,27 @@ export function createServerFactory(
     // environment. It cannot reach a socket or a DAV host, which is exactly why
     // it needs neither.
     registerAccountTool(server, principal);
-    registerMailTools(server, leasedMail, principal);
-    // Recall by meaning (Phase 26, RCLL-08). The same principal promise the
-    // mail tools get, and nothing else: no leased runner, because it opens no
-    // mail session. It reads the person's own object and their own part of the
-    // recall index, both chosen by the principal alone.
-    registerRecallTools(server, principal);
-    // The change check (CHNG-01). The same leased gate as the mail tools, so a
-    // second session while one is held is refused rather than opening a
-    // second socket; neither the gate nor the lease queues. It takes the
-    // lease once per mail session, never across two. And the same `davFetch`
-    // the calendar tools get below, so its calendar requests share their one
-    // queue. The calendar side is DAV and takes no lease (D-07).
-    registerChangesTool(server, leasedMail, principal, davFetch);
+    // The three mail registrars, each handed the DRIVEN server. The parameter
+    // is named `server` on purpose, so each registration below reads exactly as
+    // it did before the build was driven, and the one line after this block is
+    // where the driven server goes in.
+    const registerMailRegistrars = (server: McpServer): void => {
+      registerMailTools(server, leasedMail, principal);
+      // Recall by meaning (Phase 26, RCLL-08). The same principal promise the
+      // mail tools get, and nothing else: no leased runner, because it opens
+      // no mail session. It reads the person's own object and their own part
+      // of the recall index, both chosen by the principal alone.
+      registerRecallTools(server, principal);
+      // The change check (CHNG-01). The same leased gate as the mail tools, so
+      // a second session while one is held is refused rather than opening a
+      // second socket; neither the gate nor the lease queues. It takes the
+      // lease once per mail session, never across two. And the same
+      // `davFetch` the calendar tools get below, so its calendar requests
+      // share their one queue. The calendar side is DAV and takes no lease
+      // (D-07).
+      registerChangesTool(server, leasedMail, principal, davFetch);
+    };
+    registerMailRegistrars(driven);
     registerDavDiagnoseTool(server, davFetch, unpaused);
     // The same `davFetch` the diagnostic takes, deliberately: one queue per
     // request means a calendar call and a diagnosis issued in the same request
