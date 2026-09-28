@@ -481,24 +481,45 @@ async function readTokenAnswer(
 }
 
 /**
- * Revoke one autonomy refresh token at the token endpoint, which revokes its
- * whole grant. Never throws. The endpoint always answers 200 (RFC 7009), so the
- * answer says nothing and is only drained.
+ * Revoke one autonomy token at the token endpoint. Never throws. The endpoint
+ * always answers 200 (RFC 7009), so the answer says nothing and is only
+ * drained.
+ *
+ * A refresh token (the default hint) revokes its whole grant. An access token
+ * (`"access_token"`) revokes only that one bearer and leaves the grant and its
+ * refresh token alone (review IN-04).
  */
 async function revokeAtEndpoint(
   deps: AutonomyDeps,
   clientSecret: string,
-  autonomyRefreshToken: string,
+  token: string,
+  hint: "refresh_token" | "access_token" = "refresh_token",
 ): Promise<void> {
   try {
     const response = await deps.selfFetch(
-      tokenRequest(clientSecret, { token: autonomyRefreshToken, token_type_hint: "refresh_token" }),
+      tokenRequest(clientSecret, { token, token_type_hint: hint }),
     );
     await response.arrayBuffer();
   } catch {
     // Nothing to do. The sign-in also revokes the grant it minted when the
-    // arm did not report it armed.
+    // arm did not report it armed, and an access token ends by itself when
+    // its lifetime runs out.
   }
+}
+
+/**
+ * Revoke the bearer a token-endpoint answer carries, if it carries one
+ * (review IN-04). The code exchange hands back a bearer the arm never uses;
+ * this ends it at once instead of leaving it live for its whole lifetime. It
+ * is read straight out of the answer and never held under a name of its own.
+ */
+async function revokeBearerIn(
+  deps: AutonomyDeps,
+  clientSecret: string,
+  body: Record<string, unknown>,
+): Promise<void> {
+  if (typeof body.access_token !== "string") return;
+  await revokeAtEndpoint(deps, clientSecret, body.access_token, "access_token");
 }
 
 // ------------------------------------------------------------ the allow list
@@ -616,6 +637,9 @@ function rpcMessageWithId(bodyText: string, id: number): Record<string, unknown>
  *   7. `use` is handed one function, `call(tool, args)`. It refuses any tool
  *      not in `AUTONOMY_TOOLS` without making a request, and stops working
  *      once `use` has returned.
+ *   8. Once `use` settles, returned or thrown, the bearer is revoked at the
+ *      token endpoint (review IN-04). The grant and the stored refresh token
+ *      are untouched.
  *
  * The bearer lives in one variable, `autonomyAccessToken`, inside this
  * function. It is never returned, stored, or handed to `use`.
@@ -721,11 +745,15 @@ export async function withAutonomySession<T>(
     const autonomyAccessToken = answer.body.access_token;
     const rotated = answer.body.refresh_token;
     if (typeof autonomyAccessToken !== "string" || typeof rotated !== "string") {
+      await revokeBearerIn(deps, clientSecret, answer.body);
       return { kind: "failed" };
     }
 
     const resealed = await seal(sealKey, deps.name, rotated);
-    if (resealed === null) return { kind: "failed" };
+    if (resealed === null) {
+      await revokeAtEndpoint(deps, clientSecret, autonomyAccessToken, "access_token");
+      return { kind: "failed" };
+    }
     // THE GENERATION CHECK (D-15 step 6). The record may have been replaced by
     // a new arm, or deleted, while the refresh was out. Writing the rotated
     // token back then would bring back a key that was ended or replaced. So the
@@ -794,6 +822,13 @@ export async function withAutonomySession<T>(
       return { kind: "ok", value };
     } finally {
       open = false;
+      // The bearer ends with the session (review IN-04). It could call every
+      // tool at `/mcp`; only `call` above narrows it to `AUTONOMY_TOOLS`. So it
+      // is revoked as soon as `use` settles, whether `use` returned or threw,
+      // instead of staying live for the provider's whole access-token lifetime.
+      // Only this bearer is revoked: the grant and the rotated refresh token
+      // just stored are untouched. Best effort, and it never throws.
+      await revokeAtEndpoint(deps, clientSecret, autonomyAccessToken, "access_token");
     }
   } catch {
     return { kind: "failed" };
@@ -910,6 +945,10 @@ export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutc
     // revokes the grant it minted, because this answer is not `armed`.
     if (answer.kind === "config") return { kind: "not_armed" };
     if (answer.kind !== "ok") return await fail();
+    // The exchange also hands back a bearer. The arm never uses it (the proof
+    // below mints its own, in a session), so it is revoked at once rather than
+    // left live for its whole lifetime (review IN-04).
+    await revokeBearerIn(deps, clientSecret, answer.body);
     const exchanged = answer.body.refresh_token;
     if (typeof exchanged !== "string") return await fail();
     autonomyRefreshToken = exchanged;

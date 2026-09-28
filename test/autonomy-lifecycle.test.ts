@@ -1346,6 +1346,43 @@ describe("autonomy credential: one at a time (D-27, RESEARCH §7)", () => {
     }
   });
 
+  it("a session leaves no live bearer behind, whether use returns or throws (review IN-04)", async () => {
+    // The access token a session mints could call every tool at /mcp; only
+    // the session's own `call` narrows it. So it is revoked as soon as `use`
+    // settles, rather than left live for its whole lifetime.
+    const world = await setUp("lifecycle bearer revoked");
+    try {
+      await world.signIn();
+      const record = (await storedRecord(world.userId)) as AutonomyRecord;
+      const accessTokens = () => keysUnder(`token:${world.userId}:${record.grantId}:`);
+      expect(await accessTokens()).toEqual([]);
+
+      const fetcher = recordingFetch();
+      const outcome = (await world.session(fetcher.selfFetch)) as { kind: string };
+      expect(outcome.kind).toBe("ok");
+      expect(await accessTokens()).toEqual([]);
+      expect(fetcher.seen).toEqual([
+        { path: "/oauth/token", grantType: "refresh_token", revokes: false },
+        { path: "/mcp", grantType: null, revokes: false },
+        { path: "/oauth/token", grantType: null, revokes: true },
+      ]);
+
+      const throwing = await runInDurableObject(objectOf(world.userId), async (_i, state) =>
+        sessionInQueue(depsOver(state.storage.kv, world.userId, recordingFetch().selfFetch), async () => {
+          throw new Error("the caller's own work failed");
+        }),
+      );
+      expect(throwing).toEqual({ kind: "failed" });
+      expect(await accessTokens()).toEqual([]);
+
+      // The key itself is untouched: the next session still works.
+      expect(((await world.session(recordingFetch().selfFetch)) as { kind: string }).kind).toBe("ok");
+      expect((await storedRecord(world.userId))?.grantId).toBe(record.grantId);
+    } finally {
+      await world.cleanup();
+    }
+  });
+
   it("a session with no interference changes only the sealed token and the IV", async () => {
     const world = await setUp("lifecycle no interference");
     try {

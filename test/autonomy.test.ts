@@ -324,11 +324,15 @@ describe("autonomy credential: the tracer (AUTO-01, AUTO-02, AUTO-06, D-26)", ()
       for (const value of inside.values) expect(value).not.toContain(tokenShape);
       expect(inside.ownName).toBe(userId);
 
-      // 6. The object's self-calls, in order: the exchange, one refresh, one tool call.
+      // 6. The object's self-calls, in order: the exchange, the exchange's
+      // unused bearer revoked, one refresh, one tool call, and that session's
+      // bearer revoked (the two revocations are review IN-04).
       expect(recorded).toEqual([
         { path: "/oauth/token", grantType: "authorization_code" },
+        { path: "/oauth/token", grantType: null },
         { path: "/oauth/token", grantType: "refresh_token" },
         { path: "/mcp", grantType: null },
+        { path: "/oauth/token", grantType: null },
       ]);
     } finally {
       for (const grant of await grantsOf(env, userId)) {
@@ -572,7 +576,9 @@ describe("autonomy credential: no expiry, seal, order, not configured (AUTO-02, 
         expect((outcome as { value: { kind: string } }).value.kind).toBe("ok");
         expectCleanOutcome(outcome, armed.userId, armed.autonomyGrantId);
       }
-      expect(fetcher.paths).toEqual(["/oauth/token", "/mcp", "/oauth/token", "/mcp", "/oauth/token", "/mcp"]);
+      // Per session: the refresh, the tool call, the bearer revoked (IN-04).
+      const perSession = ["/oauth/token", "/mcp", "/oauth/token"];
+      expect(fetcher.paths).toEqual([...perSession, ...perSession, ...perSession]);
       for (const grantId of [armed.autonomyGrantId, armed.ordinaryGrantId]) {
         expect((await grantRecord(armed.userId, grantId)).expiresAt).toBeUndefined();
         expect(await grantExpiration(armed.userId, grantId)).toBeUndefined();
@@ -669,7 +675,8 @@ describe("autonomy credential: no expiry, seal, order, not configured (AUTO-02, 
       );
       expect(outcome.kind).toBe("ok");
       expectCleanOutcome(outcome, userId, grantId);
-      expect(fetcher.paths).toEqual(["/oauth/token", "/mcp"]);
+      // The refresh, the tool call, the bearer revoked (IN-04).
+      expect(fetcher.paths).toEqual(["/oauth/token", "/mcp", "/oauth/token"]);
     } finally {
       await entryEnv().ALLOW_LIST_KV.delete(ALLOW_LIST_KEY);
       if (armed !== null) await armed.cleanup();
@@ -731,7 +738,8 @@ describe("autonomy credential: no expiry, seal, order, not configured (AUTO-02, 
       expect(refused).toHaveLength(5);
       for (const answer of refused) expect(answer).toEqual({ kind: "failed" });
       expect(outcome.late).toEqual({ kind: "failed" });
-      expect(fetcher.paths).toEqual(["/oauth/token"]);
+      // The refresh and the bearer revoked (IN-04), and no tool call at all.
+      expect(fetcher.paths).toEqual(["/oauth/token", "/oauth/token"]);
       expectCleanOutcome(outcome.session, armed.userId, armed.autonomyGrantId);
     } finally {
       await armed.cleanup();
