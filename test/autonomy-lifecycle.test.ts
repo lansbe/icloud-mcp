@@ -1334,12 +1334,14 @@ describe("autonomy credential: one at a time (D-27, RESEARCH §7)", () => {
       await runInDurableObject(objectOf(world.userId), (instance: UserAgent) => {
         if (original !== null) instance.autonomySelfFetch = original;
       });
-    };    try {
+    };
+    try {
       const queryA = authorizeQuery(world.clientId, CLAUDE_WEB_REDIRECT, "at-once-a");
       const queryB = authorizeQuery(world.clientId, CLAUDE_WEB_REDIRECT, "at-once-b");
       const ctxA = createExecutionContext();
       const ctxB = createExecutionContext();
-      const answerA = await worker.fetch(postFrom(freshSource(), LISTED_APPLE_ID, queryA), world.env, ctxA);      const answerB = await worker.fetch(postFrom(freshSource(), LISTED_APPLE_ID, queryB), world.env, ctxB);
+      const answerA = await worker.fetch(postFrom(freshSource(), LISTED_APPLE_ID, queryA), world.env, ctxA);
+      const answerB = await worker.fetch(postFrom(freshSource(), LISTED_APPLE_ID, queryB), world.env, ctxB);
       expect(answerA.status).toBe(302);
       expect(answerB.status).toBe(302);
       await waitOnExecutionContext(ctxA);
