@@ -64,6 +64,15 @@
 //     client's secret and the old seal key both stop working. Rotating the seal
 //     key by any other road has the same effect.
 //
+// **The rules job, in `list` (Phase 28, AUTO-15).** Under each autonomy grant,
+// `list` prints one line saying how that person's rules job stands: the next
+// wake while it is ahead, otherwise "idle since" the last run, and how many
+// sign-ins in a row iCloud refused. It reads the `autonomy-status:v1:<userId>`
+// record each run writes to this store. Most people write no rules, so most say
+// "no run recorded". The prefix is listed once, then each record is read one at
+// a time. Only the three numbers are read out of a record, so the line can never
+// carry an address or a rule's words. `revoke` does not print the line.
+//
 // **IT NEEDS NODE 22.18 OR LATER**, and the requirement is not cosmetic. Two
 // things below exist only from that version. `module.registerHooks` — the
 // synchronous resolve hook in step 1 — landed in 22.15, and unflagged TypeScript
