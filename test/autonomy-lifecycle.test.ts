@@ -42,11 +42,14 @@ import { createLeasedMail } from "../src/agent/lease";
 import {
   AUTONOMY_KEY,
   armWith,
+  type AutonomyCall,
   type AutonomyDeps,
   type AutonomyQueue,
   type AutonomyRecord,
+  type AutonomySessionOutcome,
   type AutonomyStorage,
   disarmWith,
+  oneAtATime,
   recordOf,
   seal,
   STANDING_GRACE_SECONDS,
@@ -314,6 +317,17 @@ function depsOver(
   return { storage, name, env: entryEnv(), selfFetch, now: () => Date.now(), ...extra };
 }
 
+/**
+ * Open one session the way the object does: inside a queue's run, with the
+ * ticket that run hands out (review WR-04). The queue here is the case's own.
+ */
+function sessionInQueue<T>(
+  deps: AutonomyDeps,
+  use: (call: AutonomyCall) => Promise<T>,
+): Promise<AutonomySessionOutcome<T>> {
+  return oneAtATime().run((ticket) => withAutonomySession({ ...deps, ticket }, use));
+}
+
 /** A clock `seconds` after the stored record was armed. */
 function clockAfterArming(record: AutonomyRecord, seconds: number): () => number {
   return () => (record.armedAt + seconds) * 1000;
@@ -368,7 +382,7 @@ async function setUp(name: string, options: { install: boolean } = { install: tr
     },
     async session(fetcher, extra = {}) {
       return runInDurableObject(objectOf(userId), async (_i, state) =>
-        withAutonomySession(depsOver(state.storage.kv, userId, fetcher, extra), (call) =>
+        sessionInQueue(depsOver(state.storage.kv, userId, fetcher, extra), (call) =>
           call("account_whoami", {}),
         ),
       );
@@ -526,7 +540,7 @@ describe("autonomy credential: re-arm, sweep and failure isolation (D-11, D-13, 
       const lagging = listingWithout(entryEnv().OAUTH_KV, `grant:${world.userId}:${replaced.grantId}`);
 
       const outcome = await runInDurableObject(objectOf(world.userId), async (instance: UserAgent, state) =>
-        instance.autonomyQueue.run(async () =>
+        instance.autonomyQueue.run(async (ticket) =>
           armWith(
             {
               storage: state.storage.kv,
@@ -534,6 +548,7 @@ describe("autonomy credential: re-arm, sweep and failure isolation (D-11, D-13, 
               env: { ...entryEnv(), OAUTH_KV: lagging },
               selfFetch: (request) => entryEnv().SELF.fetch(request),
               now: () => Date.now(),
+              ticket,
             },
             code,
           ),
@@ -1134,8 +1149,8 @@ describe("autonomy credential: one at a time (D-27, RESEARCH §7)", () => {
         };
         const deps = depsOver(state.storage.kv, world.userId, selfFetch);
         const run = () =>
-          instance.autonomyQueue.run(() =>
-            withAutonomySession(deps, (call) => call("account_whoami", {})),
+          instance.autonomyQueue.run((ticket) =>
+            withAutonomySession({ ...deps, ticket }, (call) => call("account_whoami", {})),
           );
         const first = run();
         const second = run();
@@ -1174,7 +1189,7 @@ describe("autonomy credential: one at a time (D-27, RESEARCH §7)", () => {
         }
         return entryEnv().SELF.fetch(request);
       };
-      const pending = withAutonomySession(depsOver(state.storage.kv, userId, selfFetch), (call) =>
+      const pending = sessionInQueue(depsOver(state.storage.kv, userId, selfFetch), (call) =>
         call("account_whoami", {}),
       );
       await reached.promise;

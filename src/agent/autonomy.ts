@@ -150,6 +150,10 @@ export type AutonomyEnv = Pick<
  * `pendingArms` answers the grant ids whose arm is waiting in the object's
  * queue right now: other sign-ins, still in flight. No sweep revokes one of
  * them (D-27). Left out, nothing is pending.
+ *
+ * `ticket` is the one the object's queue handed the operation this runs in
+ * (review WR-04). `withAutonomySession` refuses without a live one. `armWith`
+ * passes it through to its proof. Other functions here ignore it.
  */
 export interface AutonomyDeps {
   readonly storage: AutonomyStorage;
@@ -159,6 +163,29 @@ export interface AutonomyDeps {
   readonly now: () => number;
   readonly keyStanding?: (grantId: string) => Promise<KeyStanding>;
   readonly pendingArms?: () => ReadonlySet<string>;
+  readonly ticket?: AutonomyTicket;
+}
+
+declare const TICKET_BRAND: unique symbol;
+
+/**
+ * Proof that the holder is running inside a queue's `run` right now (review
+ * WR-04). Opaque: only `oneAtATime` makes one, and the object tells a live one
+ * from anything else by identity, so a made-up object is refused at run time
+ * whatever its type says.
+ */
+export type AutonomyTicket = { readonly [TICKET_BRAND]: true };
+
+/**
+ * Every ticket whose run has not settled yet. A ticket joins when its
+ * operation starts and leaves when that operation settles, so a ticket kept
+ * after its run counts for nothing. Weak, so a leaked ticket holds nothing.
+ */
+const liveTickets = new WeakSet<object>();
+
+/** Whether `ticket` is one a queue handed out, for a run that has not settled. */
+function ticketIsLive(ticket: unknown): boolean {
+  return typeof ticket === "object" && ticket !== null && liveTickets.has(ticket);
 }
 
 /**
@@ -167,17 +194,29 @@ export interface AutonomyDeps {
  * Each `run` waits for the one before it to settle, then runs. A rejection in
  * one never blocks the next. A second caller waits and then runs its own
  * operation; it never shares the first one's result.
+ *
+ * Each operation is handed a ticket, live only while that operation runs
+ * (review WR-04). A session needs one, so the only way to open a session is
+ * from inside a `run`.
  */
 export interface AutonomyQueue {
-  run<T>(operation: () => Promise<T>): Promise<T>;
+  run<T>(operation: (ticket: AutonomyTicket) => Promise<T>): Promise<T>;
 }
 
 /** A fresh, empty queue. The object holds exactly one. */
 export function oneAtATime(): AutonomyQueue {
   let tail: Promise<void> = Promise.resolve();
   return {
-    run<T>(operation: () => Promise<T>): Promise<T> {
-      const result = tail.then(operation);
+    run<T>(operation: (ticket: AutonomyTicket) => Promise<T>): Promise<T> {
+      const result = tail.then(async () => {
+        const ticket = Object.freeze({}) as unknown as AutonomyTicket;
+        liveTickets.add(ticket);
+        try {
+          return await operation(ticket);
+        } finally {
+          liveTickets.delete(ticket);
+        }
+      });
       tail = result.then(
         () => undefined,
         () => undefined,
@@ -537,6 +576,9 @@ function rpcMessageWithId(bodyText: string, id: number): Record<string, unknown>
  * Use the autonomy key once (D-15, D-31). The one way to use it.
  *
  * In this order and no other:
+ *   0. The caller must hold a live ticket from the object's queue
+ *      (`deps.ticket`, review WR-04). Without one it answers `failed`, and
+ *      reads, writes and sends nothing. See "ONE AT A TIME" below.
  *   1. The allow list, seed then store, by the object's own user id. Not
  *      admitted answers `not_allowed`: the record is not read and not touched.
  *   2. Both autonomy secrets must be set. Not set answers `failed` and keeps
@@ -562,12 +604,33 @@ function rpcMessageWithId(bodyText: string, id: number): Record<string, unknown>
  *
  * The bearer lives in one variable, `autonomyAccessToken`, inside this
  * function. It is never returned, stored, or handed to `use`.
+ *
+ * ONE AT A TIME, AND WHY THE TICKET (D-27, review WR-04). Two sessions on the
+ * same record must never refresh at once. Both would read the same token T1.
+ * The first refresh leaves the library holding T2 as current and T1 as
+ * previous. The second, still presenting T1, is accepted as the previous
+ * token, and the library moves to T3, which makes T2 dead. Both sessions then
+ * pass the generation check below, because neither changed the generation or
+ * the grant. If the first one's write lands last, the record holds the dead
+ * T2, and the next use gets `invalid_grant` and ends the key. The generation
+ * check cannot see this. Only running one at a time prevents it.
+ *
+ * So the queue is part of this function's contract, not a habit its callers
+ * are trusted to keep. The object's queue hands each operation a ticket that
+ * is live only while that operation runs, and this function refuses without
+ * a live one. It does not enter the queue itself: the arm's proof already
+ * runs inside the queue, and waiting on the queue from inside it would never
+ * finish. A caller outside an arm (Phase 28's job) opens its session from
+ * inside `autonomyQueue.run((ticket) => ...)`, and passes that ticket.
+ * Creating a second queue just to get a ticket defeats this on purpose, and
+ * is a decision on the safety boundary, not a refactor.
  */
 export async function withAutonomySession<T>(
   deps: AutonomyDeps,
   use: (call: AutonomyCall) => Promise<T>,
 ): Promise<AutonomySessionOutcome<T>> {
   try {
+    if (!ticketIsLive(deps.ticket)) return { kind: "failed" };
     if (!(await admitted(deps))) return { kind: "not_allowed" };
 
     const clientSecret = deps.env.AUTONOMY_CLIENT_SECRET;
@@ -610,11 +673,12 @@ export async function withAutonomySession<T>(
       return { kind: "off" };
     }
 
-    // One at a time (D-27). This function never enters the object's queue
-    // itself, because the arm's proof calls it from inside the queue. Every
-    // caller outside an arm (plan 27-05's alarm job, Phase 28's job) enters
-    // through `autonomyQueue.run` in the object. The generation checks below
-    // hold even for a caller that did not.
+    // One at a time (D-27). The ticket checked at the top is what holds this:
+    // this code runs only inside a run of the object's queue. The generation
+    // checks below DO NOT make a caller outside the queue safe. They catch a
+    // record replaced or deleted while the refresh was out. They cannot catch
+    // two sessions refreshing the same token at once, which leaves a dead
+    // token stored (see "ONE AT A TIME" in the docstring above).
 
     let answer: Awaited<ReturnType<typeof readTokenAnswer>>;
     try {
@@ -740,8 +804,10 @@ async function answersAs(result: unknown, name: string): Promise<boolean> {
  * Arm the key from a one-time code (D-09, D-10, D-11, D-13, D-28).
  *
  * Refuses (`not_armed`), and changes nothing, unless both autonomy secrets are
- * set and the code's user segment is the object's own name, so a wiring
- * mistake refuses rather than arming the wrong person's object. Then: exchange
+ * set (the seal key in the shape the seal accepts), `deps.ticket` is live (it
+ * runs inside the object's queue), and the code's user segment is the object's
+ * own name, so a wiring mistake refuses rather than arming the wrong person's
+ * object. Then: exchange
  * the code at this Worker's token endpoint; take the grant id from the refresh
  * token; seal it; write the record, with `generation` one more than any record
  * it replaces; prove it, with one session that calls `account_whoami` and
@@ -764,6 +830,10 @@ export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutc
   if (!isConfiguredSecret(clientSecret) || !sealKeyUsable(sealKey)) {
     return { kind: "not_armed" };
   }
+  // So is the queue's ticket (review WR-04). The arm's proof is a session, and
+  // a session refuses without one; refusing here instead means an arm run
+  // outside the queue changes nothing, rather than failing toward off.
+  if (!ticketIsLive(deps.ticket)) return { kind: "not_armed" };
   const codeParts = code.split(":");
   if (codeParts.length !== 3 || typeof deps.name !== "string" || codeParts[0] !== deps.name) {
     return { kind: "not_armed" };

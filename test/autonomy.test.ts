@@ -29,9 +29,12 @@ import { getOAuthApi } from "@cloudflare/workers-oauth-provider";
 import { describe, expect, it } from "vitest";
 import {
   AUTONOMY_KEY,
+  type AutonomyCall,
   type AutonomyDeps,
+  type AutonomySessionOutcome,
   type AutonomyEnv,
   type AutonomyStorage,
+  oneAtATime,
   seal,
   sealKeyUsable,
   unseal,
@@ -500,6 +503,17 @@ async function signInArmed(appleId: string, name: string): Promise<Armed> {
   }
 }
 
+/**
+ * Open one session the way the object does: inside a queue's run, with the
+ * ticket that run hands out (review WR-04). The queue here is the case's own.
+ */
+function sessionInQueue<T>(
+  deps: AutonomyDeps,
+  use: (call: AutonomyCall) => Promise<T>,
+): Promise<AutonomySessionOutcome<T>> {
+  return oneAtATime().run((ticket) => withAutonomySession({ ...deps, ticket }, use));
+}
+
 /** Session deps over a real object's storage, reaching this Worker. */
 function depsOver(
   storage: AutonomyStorage,
@@ -548,7 +562,7 @@ describe("autonomy credential: no expiry, seal, order, not configured (AUTO-02, 
           const deps = depsOver(state.storage.kv, armed.userId, fetcher.selfFetch);
           const out: unknown[] = [];
           for (let i = 0; i < 3; i += 1) {
-            out.push(await withAutonomySession(deps, (call) => call("account_whoami", {})));
+            out.push(await sessionInQueue(deps, (call) => call("account_whoami", {})));
           }
           return out;
         },
@@ -609,7 +623,7 @@ describe("autonomy credential: no expiry, seal, order, not configured (AUTO-02, 
           ...entryEnv(),
           ALLOWED_APPLE_IDS_SEED: '["*"]',
         });
-        const outcome = await withAutonomySession(deps, (call) => call("account_whoami", {}));
+        const outcome = await sessionInQueue(deps, (call) => call("account_whoami", {}));
         return { outcome, after: state.storage.kv.get(AUTONOMY_KEY) };
       },
     );
@@ -626,7 +640,7 @@ describe("autonomy credential: no expiry, seal, order, not configured (AUTO-02, 
       state.storage.kv.put(AUTONOMY_KEY, record);
       const before = JSON.stringify(state.storage.kv.get(AUTONOMY_KEY));
       const counted = countingStorage(state.storage.kv);
-      const outcome = await withAutonomySession(depsOver(counted.storage, name, fetcher.selfFetch), (call) =>
+      const outcome = await sessionInQueue(depsOver(counted.storage, name, fetcher.selfFetch), (call) =>
         call("account_whoami", {}),
       );
       const after = JSON.stringify(state.storage.kv.get(AUTONOMY_KEY));
@@ -649,7 +663,7 @@ describe("autonomy credential: no expiry, seal, order, not configured (AUTO-02, 
       const grantId = armed.autonomyGrantId;
       const fetcher = recordingFetch();
       const outcome = await runInDurableObject(entryEnv().USER_AGENT.getByName(userId), async (_i, state) =>
-        withAutonomySession(depsOver(state.storage.kv, userId, fetcher.selfFetch), (call) =>
+        sessionInQueue(depsOver(state.storage.kv, userId, fetcher.selfFetch), (call) =>
           call("account_whoami", {}),
         ),
       );
@@ -679,7 +693,7 @@ describe("autonomy credential: no expiry, seal, order, not configured (AUTO-02, 
         ...entryEnv(),
         ALLOW_LIST_KV: brokenStore,
       });
-      const outcome = await withAutonomySession(deps, (call) => call("account_whoami", {}));
+      const outcome = await sessionInQueue(deps, (call) => call("account_whoami", {}));
       const after = JSON.stringify(state.storage.kv.get(AUTONOMY_KEY));
       state.storage.kv.delete(AUTONOMY_KEY);
       return { outcome, before, after };
@@ -697,7 +711,7 @@ describe("autonomy credential: no expiry, seal, order, not configured (AUTO-02, 
         entryEnv().USER_AGENT.getByName(armed.userId),
         async (_i, state) => {
           let kept: ((tool: string, args: Record<string, unknown>) => Promise<unknown>) | null = null;
-          const session = await withAutonomySession(
+          const session = await sessionInQueue(
             depsOver(state.storage.kv, armed.userId, fetcher.selfFetch),
             async (call) => {
               kept = call;
@@ -862,6 +876,61 @@ describe("autonomy credential: no expiry, seal, order, not configured (AUTO-02, 
     await expectOrdinaryAnswer(result);
     expect(result.grantsWritten).toHaveLength(1);
     expect(result.autonomyGrants).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review fix WR-04: a session runs only inside the object's queue.
+
+describe("autonomy credential: a session needs a live ticket from the queue (review WR-04)", () => {
+  /** Open one session with `ticket`, and answer the outcome, the requests and the record before and after. */
+  async function sessionWithTicket(armed: Armed, ticket: unknown) {
+    const fetcher = recordingFetch();
+    const result = await runInDurableObject(
+      entryEnv().USER_AGENT.getByName(armed.userId),
+      async (_i, state) => {
+        const before = JSON.stringify(state.storage.kv.get(AUTONOMY_KEY));
+        const counted = countingStorage(state.storage.kv);
+        const deps = { ...depsOver(counted.storage, armed.userId, fetcher.selfFetch), ticket } as AutonomyDeps;
+        const outcome = await withAutonomySession(deps, (call) => call("account_whoami", {}));
+        return {
+          outcome,
+          before,
+          after: JSON.stringify(state.storage.kv.get(AUTONOMY_KEY)),
+          reads: counted.reads.get(AUTONOMY_KEY) ?? 0,
+        };
+      },
+    );
+    return { ...result, paths: fetcher.paths };
+  }
+
+  it("refuses a session with no ticket, a made-up ticket, or a ticket kept after its run: failed, nothing read, nothing sent", async () => {
+    const armed = await signInArmed(LISTED_APPLE_ID, "autonomy ticket");
+    try {
+      const kept = await oneAtATime().run(async (ticket) => ticket);
+      for (const ticket of [undefined, {}, Object.freeze({}), kept]) {
+        const result = await sessionWithTicket(armed, ticket);
+        expect(result.outcome).toEqual({ kind: "failed" });
+        expect(result.reads).toBe(0);
+        expect(result.paths).toEqual([]);
+        expect(result.after).toBe(result.before);
+      }
+
+      // The control: the same session inside a run works.
+      const inside = await runInDurableObject(
+        entryEnv().USER_AGENT.getByName(armed.userId),
+        async (_i, state) =>
+          oneAtATime().run((ticket) =>
+            withAutonomySession(
+              { ...depsOver(state.storage.kv, armed.userId, recordingFetch().selfFetch), ticket },
+              (call) => call("account_whoami", {}),
+            ),
+          ),
+      );
+      expect(inside.kind).toBe("ok");
+    } finally {
+      await armed.cleanup();
+    }
   });
 });
 

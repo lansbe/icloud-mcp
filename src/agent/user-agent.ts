@@ -427,6 +427,12 @@ export class UserAgent extends DurableObject<Env> {
    * the session function directly. The lease and every other method never
    * wait on it.
    *
+   * Each run hands its operation a ticket, live only while that operation
+   * runs, and a session refuses without one (review WR-04). So opening a
+   * session from outside this queue is refused at run time, not merely
+   * discouraged: Phase 28's job opens its session inside
+   * `autonomyQueue.run((ticket) => ...)` and passes that ticket.
+   *
    * WHY. The Claude client submits the sign-in form twice, about 1.4 seconds
    * apart (measured 2026-09-21), so every sign-in arms twice. Without one at a
    * time, the two arms interleave at every `await`, sweep each other's grants,
@@ -901,7 +907,7 @@ export class UserAgent extends DurableObject<Env> {
     const pending = this.pendingArmGrants;
     pending.set(grantId, (pending.get(grantId) ?? 0) + 1);
     try {
-      return await this.autonomyQueue.run(async () => {
+      return await this.autonomyQueue.run(async (ticket) => {
         const outcome = await armWith(
           {
             storage: this.ctx.storage.kv,
@@ -910,6 +916,9 @@ export class UserAgent extends DurableObject<Env> {
             selfFetch: (request) => this.autonomySelfFetch(request),
             now: () => Date.now(),
             pendingArms: () => new Set(pending.keys()),
+            // The arm's proof is a session, and a session opens only with the
+            // queue's live ticket (review WR-04).
+            ticket,
           },
           code,
         );
