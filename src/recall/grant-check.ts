@@ -13,14 +13,22 @@
 // Recall is inherent (owner, 2026-09-27), so this is the only wholesale
 // destroy, and every way a person's access ends arrives here as "no grant
 // left": the owner's revoke, the person disconnecting, a grant expiring, and
-// removal from the allow list through its revoke step (D-25). Phase 27-05 will
-// make this ignore the autonomy grant (27-CONTEXT D-32).
+// removal from the allow list through its revoke step (D-25).
+//
+// IT IGNORES THE AUTONOMY GRANT (Phase 27, 27-CONTEXT D-32). Autonomy is
+// inherent, so every signed-in person also holds one grant for the autonomy
+// client. Counting it would mean a person whose access was revoked still reads
+// as signed in, and their recall data would never be destroyed. So only grants
+// from any other client count. When the first page holds only autonomy grants
+// and more pages exist, the pages are followed, one after another, until an
+// ordinary grant turns up or the pages end.
 //
 // It asks through the OAuth library's own public listing, the same call the
 // grants script uses, and never reads the library's storage format itself. No
 // caught value is read, and nothing is logged (./.claude/CLAUDE.md §4).
 
 import { getOAuthApi, type OAuthProviderOptions } from "@cloudflare/workers-oauth-provider";
+import { AUTONOMY_CLIENT_ID } from "../agent/autonomy-client";
 
 /** A user id: 64 lower-case hex characters. */
 const USER_ID = /^[0-9a-f]{64}$/;
@@ -49,7 +57,23 @@ function minimalOptions(): OAuthProviderOptions<{ OAUTH_KV: KVNamespace }> {
   };
 }
 
-/** Whether `userId` holds any grant: some, none, or unknown on any failure. */
+/** A page cap, so a store that keeps handing back a cursor cannot spin forever. */
+const MAX_PAGES = 1000;
+
+/**
+ * Whether one listed grant summary counts: anything whose client id is not
+ * exactly the autonomy client's. A summary with no readable client id counts,
+ * because only a definite "none" destroys.
+ */
+function isOrdinary(item: unknown): boolean {
+  return (item as { clientId?: unknown } | null)?.clientId !== AUTONOMY_CLIENT_ID;
+}
+
+/**
+ * Whether `userId` holds any grant from a client other than the autonomy one:
+ * some, none, or unknown on any failure. Every page is followed until an
+ * ordinary grant is found or the pages end. Hitting the page cap is unknown.
+ */
 export async function grantsRemainFor(
   kv: KVNamespace,
   userId: string,
@@ -57,12 +81,19 @@ export async function grantsRemainFor(
   if (typeof userId !== "string" || !USER_ID.test(userId)) return "unknown";
   try {
     const helpers = getOAuthApi(minimalOptions(), { OAUTH_KV: kv });
-    const page = await helpers.listUserGrants(userId);
-    const items = Array.isArray(page?.items) ? page.items : null;
-    if (items === null) return "unknown";
-    if (items.length > 0) return "some";
-    // An empty page that still offers a cursor is not a definite answer.
-    return page.cursor === undefined || page.cursor === "" ? "none" : "unknown";
+    let cursor: string | undefined;
+    for (let pages = 0; pages < MAX_PAGES; pages += 1) {
+      const page = await helpers.listUserGrants(
+        userId,
+        cursor === undefined ? undefined : { cursor },
+      );
+      const items: unknown = page?.items;
+      if (!Array.isArray(items)) return "unknown";
+      if (items.some(isOrdinary)) return "some";
+      if (typeof page.cursor !== "string" || page.cursor === "") return "none";
+      cursor = page.cursor;
+    }
+    return "unknown";
   } catch {
     return "unknown";
   }

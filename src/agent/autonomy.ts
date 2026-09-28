@@ -18,7 +18,8 @@
 // exactly as long as the person's ordinary connection. The record carries no
 // expiry, the grant carries none, and no code here sets one. The standing
 // check in `withAutonomySession` ends the key with the ordinary connection, at
-// the next use at the latest.
+// the next use at the latest, and `autonomyAlarmJob` asks the same question on
+// the object's alarm, so a key nobody uses ends within a day.
 //
 // THE ORDER OF A SESSION, and why. `withAutonomySession` is the one way to use
 // the key (D-31). It asks the allow list FIRST, by user id, from the seed and
@@ -823,6 +824,118 @@ export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutc
   }
 }
 
+// ------------------------------------------------------------ the alarm job
+
+/** How far ahead the alarm job wants the next run while a key is held: one day. */
+export const AUTONOMY_ALARM_INTERVAL_MS = 86400000;
+
+/** When the alarm job wants to run again after it could not finish: one hour. */
+export const AUTONOMY_ALARM_RETRY_MS = 3600000;
+
+/**
+ * Everything the alarm job needs, handed in by the object.
+ *
+ * `name` is the object's stored own name, from `storedOwnName()`. The job never
+ * looks for a name itself. `keyStanding` is 27-02's `keyStandingFor` over the
+ * sign-in store, and `sweep` is 27-02's `sweepAutonomyGrants` keeping no grant.
+ * Both are seams on the object, so tests can answer for the listing. `now`
+ * answers milliseconds since the epoch.
+ */
+export interface AutonomyAlarmDeps {
+  readonly storage: AutonomyStorage;
+  readonly name: string;
+  readonly keyStanding: (name: string, grantId: string) => Promise<KeyStanding>;
+  readonly sweep: (name: string) => Promise<unknown>;
+  readonly now: () => number;
+}
+
+/**
+ * What the alarm job did, and when it next wants to run.
+ *
+ * `none`: no record. `kept`: the record stays. `ended`: the record was deleted.
+ * `failed`: something threw, and the record was not touched. `wantedAt` is
+ * milliseconds since the epoch, or null when the job has nothing left to do.
+ */
+export interface AutonomyAlarmOutcome {
+  readonly kind: "none" | "kept" | "ended" | "failed";
+  readonly wantedAt: number | null;
+}
+
+/**
+ * The autonomy job on the object's one alarm (27-05, D-25, D-33, AUTO-04,
+ * AUTO-06 as revised).
+ *
+ * WHY IT RUNS AT ALL, when every session already asks the same question. The
+ * owner's answer is that the key lives exactly as long as the person's ordinary
+ * connection. A session asks only when the key is used, and a key nobody uses
+ * would then outlive the connection forever. So the alarm asks too, at least
+ * once a day while a record exists, and a key nobody uses still ends within a
+ * day.
+ *
+ * WHY IT NEEDS NO ALLOW-LIST CHECK. It reads the record's grant id and
+ * `armedAt`, and nothing else. It never unseals the token, never redeems it and
+ * never makes a call to this Worker. The allow-list check guards USING the key;
+ * this job only decides whether to throw it away.
+ *
+ * In order:
+ *   1. No record: nothing to do, no time wanted. A malformed record is deleted,
+ *      the same as a session does.
+ *   2. Inside the grace after arming (`STANDING_GRACE_SECONDS`): kept, without
+ *      asking. The store's listing can lag behind the sign-in that armed it.
+ *   3. Otherwise the standing question (D-33). `revoked` or `connection_ended`
+ *      sweeps every autonomy grant this person holds, then deletes the record
+ *      only if it is still the one read (D-27), and wants no time. `standing`
+ *      or `unknown` keeps it and wants one day from now: a listing error must
+ *      not end every person's key at once.
+ *
+ * There is no expiry and no timer. The key ends only when its grant is gone or
+ * the person holds no ordinary grant. Never throws: every `catch` answers a
+ * fixed outcome and never reads what it caught. The object runs this inside
+ * its one autonomy queue.
+ */
+export async function autonomyAlarmJob(deps: AutonomyAlarmDeps): Promise<AutonomyAlarmOutcome> {
+  let now: number;
+  try {
+    now = deps.now();
+  } catch {
+    now = Date.now();
+  }
+  try {
+    const stored = deps.storage.get<unknown>(AUTONOMY_KEY);
+    if (stored === undefined) return { kind: "none", wantedAt: null };
+    const record = recordOf(stored);
+    if (record === null) {
+      deps.storage.delete(AUTONOMY_KEY);
+      return { kind: "ended", wantedAt: null };
+    }
+
+    const age = Math.floor(now / 1000) - record.armedAt;
+    if (age >= 0 && age < STANDING_GRACE_SECONDS) {
+      return { kind: "kept", wantedAt: now + AUTONOMY_ALARM_INTERVAL_MS };
+    }
+
+    let standing: KeyStanding;
+    try {
+      standing = await deps.keyStanding(deps.name, record.grantId);
+    } catch {
+      standing = "unknown";
+    }
+    if (standing === "revoked" || standing === "connection_ended") {
+      try {
+        await deps.sweep(deps.name);
+      } catch {
+        // An incomplete sweep still ends the key. A stray autonomy grant opens
+        // nothing without the record, and the next arm sweeps again.
+      }
+      deleteIfStill(deps.storage, record);
+      return { kind: "ended", wantedAt: null };
+    }
+    return { kind: "kept", wantedAt: now + AUTONOMY_ALARM_INTERVAL_MS };
+  } catch {
+    return { kind: "failed", wantedAt: now + AUTONOMY_ALARM_RETRY_MS };
+  }
+}
+
 // ---------------------------------------------------------------- disarming
 
 /**
@@ -835,7 +948,10 @@ export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutc
  *
  * A module function and never an RPC method: nothing outside the object turns
  * autonomy off, because there is no user switch (owner, 2026-09-27). Its
- * callers are plan 27-05's alarm job and Phase 28's second-failure rule.
+ * caller is Phase 28's second-failure rule. The alarm job does not use it: the
+ * revoke here is a call to this Worker, and the alarm job makes none. A caller
+ * inside the object calls `scheduleAlarm` after it, so the alarm goes when no
+ * job is left.
  */
 export async function disarmWith(deps: AutonomyDeps): Promise<{ kind: "off" }> {
   try {
