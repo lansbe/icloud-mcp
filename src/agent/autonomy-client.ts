@@ -32,9 +32,28 @@
 // exactly as long as the person's ordinary connection and ends with it. So
 // nothing here sets a lifetime, and nothing anywhere sets one for this client.
 //
-// `AUTONOMY_TOOLS` IS THE WHOLE LIST of tools the key may call. In this phase
-// it holds only the check that the key works. Widening it is a decision on the
-// safety boundary, not a refactor (Phase 28).
+// `AUTONOMY_TOOLS` IS THE WHOLE LIST of tools the key may call, and it is
+// closed. Phase 27 put one name on it: the check that the key works. Phase 28
+// widened it to four under its D-09 (28-CONTEXT.md), for the rules job that runs
+// on the person's own object with nobody present:
+//   - the sign-in check, which also tells the job the account's own address, so
+//     it never drafts a reply to it;
+//   - the change check, which lists new inbox mail by sender and subject;
+//   - the flag, which the job only ever sets and never clears;
+//   - the reply tool, which places a threaded draft reply and never sends it.
+// Nothing else. The tool that writes a brand-new message to anyone is NOT on
+// it: a rule's draft is always a reply to the sender (D-05 as revised). So the
+// job cannot send, delete, move, write a new message, answer an invitation or
+// write an event. Phase 27's `call` refuses any name outside this list before a
+// request leaves the object.
+//
+// The change check's name is held here as a literal because the object may not
+// import tool code. A test ties it to the tool module's own constant, so a
+// rename fails a test instead of silently stopping the job.
+//
+// There is ONE list, here. No second list of tool names lives anywhere under
+// `src/agent/`. Adding a fifth name is a decision on the autonomous layer's rule
+// in CLAUDE.md, not a refactor.
 //
 // No imports, on purpose. The owner's Node scripts import this file too, so it
 // must stay a leaf: a leaf that imports nothing can be imported from anywhere
@@ -53,9 +72,15 @@ export const AUTONOMY_CLIENT_NAME = "iCloud MCP autonomy";
 export const AUTONOMY_REDIRECT_PATH = "/autonomy/internal";
 
 /**
- * Every tool the autonomy key may call, and nothing else.
+ * Every tool the autonomy key may call, and nothing else (Phase 28, D-09).
  *
- * Frozen, so no module can push a name onto it at run time. Phase 28 widens it
- * under its own decision.
+ * Frozen, so no module can push a name onto it at run time. Its element type
+ * is the job's tool-name type, so a call naming anything else does not compile
+ * either. A fifth name is a decision, not a refactor.
  */
-export const AUTONOMY_TOOLS: readonly string[] = Object.freeze(["account_whoami"]);
+export const AUTONOMY_TOOLS = Object.freeze([
+  "account_whoami",
+  "changes_since",
+  "mail_flag",
+  "mail_compose_reply",
+] as const);

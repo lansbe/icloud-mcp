@@ -862,7 +862,9 @@ async function sessionOnTicket<T>(
     let open = true;
     let nextId = 1;
     const call: AutonomyCall = async (tool, args) => {
-      if (!open || !live() || !AUTONOMY_TOOLS.includes(tool)) return { kind: "failed" };
+      if (!open || !live() || !(AUTONOMY_TOOLS as readonly string[]).includes(tool)) {
+        return { kind: "failed" };
+      }
       const id = nextId;
       nextId += 1;
       try {
@@ -1227,6 +1229,29 @@ export async function autonomyAlarmJob(deps: AutonomyAlarmDeps): Promise<Autonom
     return { kind: "kept", wantedAt: now + AUTONOMY_ALARM_INTERVAL_MS };
   } catch {
     return { kind: "failed", wantedAt: now + AUTONOMY_ALARM_RETRY_MS };
+  }
+}
+
+// ------------------------------------------------------------ presence only
+
+/**
+ * Whether an autonomy record is stored for this person (Phase 28, D-27).
+ *
+ * Presence and nothing else. It never returns, parses, unseals or copies the
+ * record, so the rules job learns one bit about the key and no field of it. A
+ * record that turns out to be malformed still counts as present here: the
+ * session that tries to use it is what deletes it, as it always has.
+ *
+ * Autonomy is inherent, so for a signed-in person this is normally true. It is
+ * false when the key has gone: revoked, ended with the ordinary connection, or
+ * dropped after refused sign-ins. False also on any throw, which stops the job
+ * rather than letting it reach for the key.
+ */
+export function autonomyArmed(storage: Pick<AutonomyStorage, "get">): boolean {
+  try {
+    return storage.get<unknown>(AUTONOMY_KEY) !== undefined;
+  } catch {
+    return false;
   }
 }
 

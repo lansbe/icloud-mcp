@@ -37,9 +37,17 @@
 // recall tables (Phase 26 keeps its folder state there too), its one alarm, and
 // that one sealed record. Still no address and no password.
 //
+// Since Phase 28 it also holds the person's autonomy rules, what the rules job
+// did (a ring of the last 100 entries, with no subject, address or text), the
+// job's own state (the stored change marker, the next wake, the last run), and
+// one "already acted" record per rule, action and message. No grant id is
+// stored for the job, and nothing in it reads the autonomy record's fields.
+//
 // It still never opens a socket and never imports mail, DAV, tool or auth code.
 // It reaches this Worker only through `autonomySelfFetch`, its one seam to the
-// Worker's own endpoints.
+// Worker's own endpoints. The rules job reaches mail that way too: each call it
+// makes is a tool call at this Worker's own `/mcp`, where the door takes the
+// person's connection lease like any other request.
 //
 // Recall is inherent (owner, 2026-09-27), so there is no switch here: no method
 // that turns recall on or off, and no enabled flag. The first record for a
@@ -47,14 +55,13 @@
 //
 // ONE ALARM SLOT, SHARED. An object has one alarm, and recall was its first
 // user. Its jobs today, in the order `alarm()` runs them: autonomy first (Phase
-// 27: does the key still stand?), then recall's revocation (a pending destroy,
-// or no grant left), then recall's expiry. All three keep the alarm through
-// `anyJobPending()`. Every set and every removal goes through one helper,
-// `scheduleAlarm`, which removes the alarm only when `anyJobPending()` says no
-// job is left and otherwise never moves a set alarm later. Phase 28 folds its
-// job into the same handler, the same helper and the same predicate. A second
-// call that sets the alarm, or a second condition for removing it, would
-// silently drop another job's schedule.
+// 27: does the key still stand?), then the rules job (Phase 28), then recall's
+// revocation (a pending destroy, or no grant left), then recall's expiry. All
+// of them keep the alarm through `anyJobPending()`. Every set and every removal
+// goes through one helper, `scheduleAlarm`, which removes the alarm only when
+// `anyJobPending()` says no job is left and otherwise never moves a set alarm
+// later. A second call that sets the alarm, or a second condition for removing
+// it, would silently drop another job's schedule.
 //
 // This module logs nothing (./.claude/CLAUDE.md §4).
 
@@ -66,8 +73,21 @@ import {
   type AutonomyQueue,
   armWith,
   autonomyAlarmJob,
+  autonomyArmed,
   oneAtATime,
+  withAutonomySession,
 } from "./autonomy";
+import { type ActivityEntry, readActivity } from "./activity";
+import {
+  JOB_CADENCE_MS,
+  JOB_LAST_RUN_KEY,
+  JOB_MARKER_KEY,
+  JOB_NEXT_AT_KEY,
+  RULES_KEY,
+  readRules,
+  runAutonomyJob,
+} from "./job";
+import { MAX_RULES, parseRule, type Rule, RULE_VERSION, type RuleRefusal } from "./rules";
 import { type KeyStanding, keyStandingFor, sweepAutonomyGrants } from "./autonomy-grants";
 import { type RecallStore, recallStore } from "../recall/index";
 import { grantsRemainFor } from "../recall/grant-check";
@@ -281,6 +301,39 @@ function validRows(rows: unknown): LedgerRowInput[] | null {
   return out;
 }
 
+/** How many activity entries the rules view returns, newest first (D-18). */
+const RULES_VIEW_ACTIVITY = 50;
+
+/** Why adding a rule was refused, beyond the parser's own refusals. */
+type AddRuleRefusal = RuleRefusal | "unnamed" | "too-many-rules" | "failed";
+
+/** The fixed sentences for the object's own refusals. */
+const ADD_RULE_REASONS = Object.freeze({
+  unnamed: "This account's rules could not be stored right now. Try again.",
+  "too-many-rules": `A person can hold at most ${MAX_RULES} rules. Remove one first.`,
+  failed: "The rule could not be stored right now. Try again.",
+});
+
+/** The answer to adding a rule. Shapes, never throws. */
+export type AddRuleAnswer =
+  | { ok: true; id: string; createdAt: number }
+  | { ok: false; refusal: AddRuleRefusal; reason: string };
+
+/**
+ * What the rules view answers (D-18 as revised). No token, no record field, no
+ * marker: the job's state is times and the last run's outcome only.
+ */
+export interface RulesView {
+  readonly rules: Rule[];
+  readonly activity: ActivityEntry[];
+  readonly job: {
+    readonly nextAt: number | null;
+    readonly markerAt: number | null;
+    readonly lastRun: { readonly at: number; readonly outcome: string } | null;
+  };
+  readonly armed: boolean;
+}
+
 /** What is stored while a lease is held. */
 interface LeaseRecord {
   /** Minted per grant. A release must present it. */
@@ -349,7 +402,11 @@ export class UserAgent extends DurableObject<Env> {
    *     never parsed or unsealed here. So an empty recall ledger on its own
    *     does not remove the alarm while a key is held, and the key's standing
    *     is asked at least once a day.
-   * Phase 28's job adds its clause here too.
+   *   - the rules job has a rule to run and a key to run it with (Phase 28,
+   *     D-27). Both, not either: a person with no rules has no job, and a
+   *     person with rules but no key has nothing the job could do. Today the
+   *     clause above already holds whenever this one does; it is written out
+   *     so the rules job's reason for the alarm does not rest on another job's.
    */
   anyJobPending = (): boolean => {
     const sql = this.ctx.storage.sql;
@@ -357,7 +414,8 @@ export class UserAgent extends DurableObject<Env> {
     return (
       countVectors(sql) > 0 ||
       destroyPending(sql) ||
-      this.ctx.storage.kv.get<unknown>(AUTONOMY_KEY) !== undefined
+      this.ctx.storage.kv.get<unknown>(AUTONOMY_KEY) !== undefined ||
+      (readRules(this.ctx.storage.kv).length > 0 && autonomyArmed(this.ctx.storage.kv))
     );
   };
 
@@ -586,9 +644,14 @@ export class UserAgent extends DurableObject<Env> {
   /**
    * The object's one alarm (Phase 25, D-09, D-13, D-22; Phase 27, D-25).
    *
-   * Its jobs, in order: the autonomy job (Phase 27); finish a pending destroy;
-   * destroy everything when the person holds no grant any more, asked about the
-   * object's stored own name; then sweep expired vectors.
+   * Its jobs, in order: the autonomy job (Phase 27); the rules job (Phase 28);
+   * finish a pending destroy; destroy everything when the person holds no
+   * grant any more, asked about the object's stored own name; then sweep
+   * expired vectors.
+   *
+   * `alarmInfo` is the platform's; only whether this run is a retry is read,
+   * and the rules job acts on no retry. It may be absent, as it is when a test
+   * runs the alarm, and absent counts as not a retry.
    *
    * The autonomy job runs FIRST, in its own `try`, through the one autonomy
    * queue (D-27). First, so recall's early returns cannot skip it, and so that
@@ -607,7 +670,7 @@ export class UserAgent extends DurableObject<Env> {
    * alarm and removes the alarm when no job is left. The caught value is never
    * read.
    */
-  async alarm(): Promise<void> {
+  async alarm(alarmInfo?: { readonly isRetry?: boolean }): Promise<void> {
     // 0. Autonomy: does the key still stand? Never skipped by what follows.
     try {
       const ownName = this.storedOwnName();
@@ -627,6 +690,41 @@ export class UserAgent extends DurableObject<Env> {
       }
     } catch {
       // Recall's jobs below still run, and each ends through the helper.
+    }
+    // 0b. The rules job (Phase 28, D-27): after the key's own job, so a key
+    //     that job just ended is seen as gone; in its own queue run and its own
+    //     `try`, so a fault in it cannot starve recall's jobs below, and
+    //     recall's early returns cannot skip it. The name is the stored one;
+    //     with none, the job is skipped for this alarm. It opens at most one
+    //     session, with this run's ticket.
+    try {
+      const ownName = this.storedOwnName();
+      if (ownName !== null) {
+        const storage = this.ctx.storage.kv;
+        await this.autonomyQueue.run((ticket) =>
+          runAutonomyJob({
+            storage,
+            name: ownName,
+            now: () => Date.now(),
+            isRetry: alarmInfo?.isRetry === true,
+            requestWake: (wantedAt) => this.scheduleAlarm(wantedAt),
+            withSession: (use) =>
+              withAutonomySession(
+                {
+                  storage,
+                  name: ownName,
+                  env: this.env,
+                  selfFetch: (request) => this.autonomySelfFetch(request),
+                  now: () => Date.now(),
+                  ticket,
+                },
+                use,
+              ),
+          }),
+        );
+      }
+    } catch {
+      // The job never throws. Recall's jobs below still run.
     }
     try {
       // Recall's tables may not exist yet: since Phase 27 an object can hold an
@@ -950,6 +1048,103 @@ export class UserAgent extends DurableObject<Env> {
       if (left > 0) pending.set(grantId, left);
       else pending.delete(grantId);
     }
+  }
+
+  /**
+   * Add one autonomy rule (Phase 28, D-03, D-08, D-11).
+   *
+   * The rule is parsed again here with `parseRule`, whatever the caller already
+   * checked: this object is where a rule starts to act, so this is the check
+   * that counts. The object stamps the rule's id and its `createdAt` from its
+   * own clock, so no caller chooses a rule's age. Refuses, in this order: any
+   * parse refusal; `unnamed` when the object does not know whose it is (the job
+   * could never run); `too-many-rules` at `MAX_RULES`. Then asks for the job's
+   * next wake through the one scheduling helper.
+   *
+   * Its one caller is the rules tool's commit, after the person saw and
+   * confirmed the preview (plan 28-04). Never throws: an error's class does not
+   * survive RPC.
+   */
+  async addRule(rule: unknown): Promise<AddRuleAnswer> {
+    try {
+      const parsed = parseRule(rule);
+      if (!parsed.ok) return { ok: false, refusal: parsed.refusal, reason: parsed.reason };
+      if (this.rememberOwnName() === null) {
+        return { ok: false, refusal: "unnamed", reason: ADD_RULE_REASONS.unnamed };
+      }
+      const kv = this.ctx.storage.kv;
+      const rules = readRules(kv);
+      if (rules.length >= MAX_RULES) {
+        return { ok: false, refusal: "too-many-rules", reason: ADD_RULE_REASONS["too-many-rules"] };
+      }
+      const createdAt = Date.now();
+      const stored: Rule = { v: RULE_VERSION, id: crypto.randomUUID(), createdAt, ...parsed.rule };
+      kv.put(RULES_KEY, [...rules, stored]);
+      try {
+        await this.scheduleAlarm(createdAt + JOB_CADENCE_MS);
+      } catch {
+        // The rule stands. The next alarm or arm schedules again.
+      }
+      return { ok: true, id: stored.id, createdAt };
+    } catch {
+      return { ok: false, refusal: "failed", reason: ADD_RULE_REASONS.failed };
+    }
+  }
+
+  /**
+   * Remove one of this person's rules by id. Answers whether one was removed.
+   *
+   * It only ever reduces what the job does. After the last rule goes, the rules
+   * job's clause in `anyJobPending()` is false, and the one scheduling helper
+   * does the rest. Never throws.
+   */
+  async removeRule(id: unknown): Promise<{ removed: boolean }> {
+    try {
+      if (typeof id !== "string") return { removed: false };
+      const kv = this.ctx.storage.kv;
+      const rules = readRules(kv);
+      const kept = rules.filter((rule) => rule.id !== id);
+      if (kept.length === rules.length) return { removed: false };
+      if (kept.length === 0) kv.delete(RULES_KEY);
+      else kv.put(RULES_KEY, kept);
+      try {
+        await this.scheduleAlarm(Date.now() + RECALL_SWEEP_MAX_INTERVAL_MS);
+      } catch {
+        // The removal stands.
+      }
+      return { removed: true };
+    } catch {
+      return { removed: false };
+    }
+  }
+
+  /**
+   * This person's rules, the newest 50 things the job did, the job's state,
+   * and whether they hold an autonomy key right now (Phase 28, D-18).
+   *
+   * `armed` is presence only, through `autonomyArmed`: no token and no field of
+   * the record is read or returned. No iCloud connection, and no write.
+   */
+  rulesView(): RulesView {
+    const kv = this.ctx.storage.kv;
+    const nextAt = kv.get<unknown>(JOB_NEXT_AT_KEY);
+    const marker = kv.get<unknown>(JOB_MARKER_KEY);
+    const lastRun = kv.get<unknown>(JOB_LAST_RUN_KEY);
+    const markerAt = (marker as { at?: unknown } | undefined)?.at;
+    const last = lastRun as { at?: unknown; outcome?: unknown } | undefined;
+    return {
+      rules: readRules(kv),
+      activity: readActivity(kv, RULES_VIEW_ACTIVITY),
+      job: {
+        nextAt: typeof nextAt === "number" ? nextAt : null,
+        markerAt: typeof markerAt === "number" ? markerAt : null,
+        lastRun:
+          typeof last?.at === "number" && typeof last.outcome === "string"
+            ? { at: last.at, outcome: last.outcome }
+            : null,
+      },
+      armed: autonomyArmed(kv),
+    };
   }
 
   /**
