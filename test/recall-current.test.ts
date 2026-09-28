@@ -556,6 +556,41 @@ describe("removals reach the index on the folder's next sync", () => {
     });
   });
 
+  it("a validity change on a folder whose ledger holds no rows still resets the build, so the new generation is indexed (26-REVIEW CR-02)", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX],
+      mailboxes: { [INBOX]: { uidValidity: 100, messages: scriptedMessages(5) } },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    await buildInbox(a, h);
+
+    // Every row gone before the reset: expired, or removed as dead refs. The
+    // build's cursor still says it reached the oldest page.
+    await withSql(USER_A.userId, (sql) => sql.exec("delete from recall_vectors"));
+    h.index.vectors.clear();
+    expect(await ledgerCount(USER_A.userId)).toBe(0);
+
+    h.setNow(now + 6 * MINUTE);
+    h.setValidity(INBOX, 200);
+    expect((await step(a, h)).outcome).toBe("due");
+    expect((await step(a, h)).outcome).toBe("indexed");
+    expect((await rowOf(USER_A.userId, INBOX))!.stage).toBe("seed");
+
+    // Seed, then the build starts again from the top and indexes all five
+    // under the new validity.
+    await passPause(USER_A.userId);
+    expect((await step(a, h)).outcome).toBe("seeded");
+    const pagesBefore = h.sources[INBOX]!.calls.filter((call) => call.kind === "page").length;
+    expect((await step(a, h)).outcome).toBe("done");
+    const pages = h.sources[INBOX]!.calls.filter((call) => call.kind === "page");
+    expect(pages).toHaveLength(pagesBefore + 1);
+    expect(pages[pages.length - 1]).toEqual({ kind: "page", mailbox: INBOX, cursor: null });
+    expect(await ledgerCount(USER_A.userId)).toBe(5);
+    expect((await rowOf(USER_A.userId, INBOX))!.stage).toBe("built");
+  });
+
   it("the mod-sequence moved and the last sync was two hours ago: the deletion sync removes what iCloud no longer has, and counts", async () => {
     const a = await testPrincipal(USER_A);
     const h = fakeStepDeps({

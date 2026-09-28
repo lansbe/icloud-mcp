@@ -304,12 +304,19 @@ export async function indexNextPage(
  * UID list inside the lease, recomputes the ids that should exist, and removes
  * every other ledger id for that mailbox: UIDs that are gone, and every id
  * recorded under another UIDVALIDITY. Store first, then ledger. When the
- * validity changed, the mailbox's build cursor is reset.
+ * ledger held rows under another validity, the mailbox's build cursor is reset.
+ *
+ * `resetCursor` resets it whatever the ledger held (26-REVIEW CR-02). A caller
+ * that already knows the validity changed passes it, because a ledger with no
+ * rows for the mailbox (nothing in the window when it was built, every vector
+ * expired, or every row already removed) shows no old generation, and a cursor
+ * left at the end of the old build would end the new one before it started.
  */
 export async function reconcileMailbox(
   principal: Principal,
   mailbox: string,
   deps: BuildDeps,
+  options: { readonly resetCursor?: boolean } = {},
 ): Promise<BuildStatus> {
   const slot = await beginSlot(principal, mailbox, "reconcile");
   if (!slot.ok) return slot.reason;
@@ -344,7 +351,7 @@ export async function reconcileMailbox(
       .map((row) => row.vectorId);
     await removeIds(principal, doomed, deps);
 
-    await slot.end(validityChanged ? RESET : KEEP);
+    await slot.end(validityChanged || options.resetCursor === true ? RESET : KEEP);
     return "indexed";
   } catch {
     await slot.end(KEEP);

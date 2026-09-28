@@ -669,8 +669,9 @@ export async function indexNewMail(
  * window's UIDs, which takes the slot as a reconcile, so it counts and is
  * never refused as full.
  *
- * When the status check saw a new validity, the old generation is removed and
- * the folder goes back to seed. Otherwise the stored mod-sequence becomes the
+ * When the status check saw a new validity, the old generation is removed, the
+ * folder goes back to seed and its build cursor is reset, whether or not the
+ * ledger held any old rows (26-REVIEW CR-02). Otherwise the stored mod-sequence becomes the
  * one the check saw, and the sync time is recorded. A refusal leaves the sync
  * due for the next step. A failure is recorded by the step, which clears what
  * was due (CR-01).
@@ -681,14 +682,16 @@ async function syncDeletions(
   row: SyncRow,
   deps: StepDeps,
 ): Promise<StepOutcome> {
-  const status = await reconcileMailbox(principal, mailbox, deps);
   const stub = agentFor(principal);
   const stored = row.state;
   const seen = row.seen;
   const reset = stored === null || (seen !== null && seen.uidValidity !== stored.uidValidity);
+  // On a reset the cursor goes with the slot's end, in the same object call,
+  // so the folder is never back at seed with the old build's cursor still set.
+  const status = await reconcileMailbox(principal, mailbox, deps, { resetCursor: reset });
 
   if (reset) {
-    if (status === "indexed" || status === "reset") {
+    if (status === "indexed") {
       return afterSet(await stub.recallSetSync(mailbox, SEED_ROW)) ?? status;
     }
     return status;
