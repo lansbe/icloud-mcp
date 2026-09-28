@@ -6594,4 +6594,81 @@ describe("the recall answer's scan rules (Phase 26, D-20)", () => {
       expect(scan().map((v) => v.pattern)).not.toContain("concurrent-session");
     });
   });
+
+  describe("the fan-out rule reaches the step's own session wrappers (26-REVIEW WR-08)", () => {
+    /** `concurrent-session` exactly as it shipped before the WR-08 fix, typed
+     *  out so the widening has something to be measured against. */
+    const CONCURRENT_SESSION_BEFORE_WR_08 =
+      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit|indexNextPage|reconcileMailbox|recallStep|runRecallStep|indexNewMail|windowUids|summariesInRange|newMailPage)/g;
+
+    const ADDED = ["underLease", "checkBuilt", "syncDeletions", "folderSnapshots", "listFolders"];
+
+    /** The known-violating sample the review gave: a fan-out around the step's
+     *  lease wrapper that names no token the rule listed before. */
+    const REVIEW_SAMPLE =
+      "const outcomes = await Promise.all(folders.map((f) => underLease(principal, deps, (g) => deps.reads.snapshot(g, principal, f))));";
+
+    const fanOut = (name: string, combinator = "all"): string =>
+      `await Promise.${combinator}(folders.map((f) => ${name}(principal, deps, f)));`;
+
+    it("fires on the review's own sample, which the rule as it shipped missed", () => {
+      expect(hits("concurrent-session", "src/recall/sync.ts", REVIEW_SAMPLE)).toBe(1);
+      expect(
+        new RegExp(CONCURRENT_SESSION_BEFORE_WR_08.source, CONCURRENT_SESSION_BEFORE_WR_08.flags).test(
+          REVIEW_SAMPLE,
+        ),
+      ).toBe(false);
+    });
+
+    it("fires on a combinator around each added name, and the old rule missed each", () => {
+      for (const name of ADDED) {
+        for (const combinator of ["all", "allSettled", "any", "race"]) {
+          expect(
+            hits("concurrent-session", "src/recall/sync.ts", fanOut(name, combinator)),
+            `${name} ${combinator}`,
+          ).toBe(1);
+        }
+        const old = new RegExp(
+          CONCURRENT_SESSION_BEFORE_WR_08.source,
+          CONCURRENT_SESSION_BEFORE_WR_08.flags,
+        );
+        expect(old.test(fanOut(name)), `the old pattern already saw ${name}`).toBe(false);
+      }
+      // The typed-out text really was the rule: it fires on the standing sample.
+      expect(
+        new RegExp(CONCURRENT_SESSION_BEFORE_WR_08.source, CONCURRENT_SESSION_BEFORE_WR_08.flags).test(
+          violatingSamples_concurrentSession,
+        ),
+      ).toBe(true);
+    });
+
+    it("every added name is a function the step or the service module really has", () => {
+      const sync = rawSourceOf("src/recall/sync.ts");
+      for (const name of ["underLease", "checkBuilt", "syncDeletions"]) {
+        expect(sync, `${name} is not a function in src/recall/sync.ts`).toMatch(
+          new RegExp(`\\basync\\s+function\\s+${name}\\b`),
+        );
+      }
+      const service = exportedFunctionNames(rawSourceOf("src/mail/service.ts"));
+      for (const name of ["folderSnapshots", "listFolders"]) {
+        expect(service, `${name} was not read from the service module`).toContain(name);
+      }
+    });
+
+    it("does not fire on one awaited call to each", () => {
+      for (const permitted of [
+        "const outcome = await underLease(principal, deps, (gate) => deps.reads.snapshot(gate, principal, mailbox));",
+        "return checkBuilt(principal, folders, mailbox, row, deps);",
+        "return syncDeletions(principal, mailbox, row, deps);",
+        "const [outcome] = await folderSnapshots(principal, gate, [mailbox]);",
+        "return recallFoldersOf(await listFolders(principal, gate));",
+      ]) {
+        expect(hits("concurrent-session", "src/recall/sync.ts", permitted), permitted).toBe(0);
+      }
+    });
+
+    it("finds no fan-out in the real tree", () => {
+      expect(scan().map((v) => v.pattern)).not.toContain("concurrent-session");
+    });
+  });
 });
