@@ -80,7 +80,9 @@ import {
 import { type ActivityEntry, readActivity } from "./activity";
 import { nextWakeAfter } from "./cadence";
 import {
+  JOB_AUTH_FAILURES_KEY,
   JOB_LAST_RUN_KEY,
+  JOB_STATE_KEY,
   JOB_MARKER_KEY,
   JOB_NEXT_AT_KEY,
   RULES_KEY,
@@ -330,6 +332,13 @@ export interface RulesView {
     readonly nextAt: number | null;
     readonly markerAt: number | null;
     readonly lastRun: { readonly at: number; readonly outcome: string } | null;
+    /** Consecutive auth failures, 0 when none is stored (D-16, D-18). */
+    readonly authFailures: number;
+    /**
+     * True when the job stopped because iCloud refused the sign-in twice in a
+     * row: the stored state or the last run's outcome is `off_auth` (D-18).
+     */
+    readonly offAuth: boolean;
   };
   readonly armed: boolean;
 }
@@ -1134,6 +1143,8 @@ export class UserAgent extends DurableObject<Env> {
     const nextAt = kv.get<unknown>(JOB_NEXT_AT_KEY);
     const marker = kv.get<unknown>(JOB_MARKER_KEY);
     const lastRun = kv.get<unknown>(JOB_LAST_RUN_KEY);
+    const failures = kv.get<unknown>(JOB_AUTH_FAILURES_KEY);
+    const state = kv.get<unknown>(JOB_STATE_KEY);
     const markerAt = (marker as { at?: unknown } | undefined)?.at;
     const last = lastRun as { at?: unknown; outcome?: unknown } | undefined;
     return {
@@ -1146,6 +1157,11 @@ export class UserAgent extends DurableObject<Env> {
           typeof last?.at === "number" && typeof last.outcome === "string"
             ? { at: last.at, outcome: last.outcome }
             : null,
+        authFailures:
+          typeof failures === "number" && Number.isSafeInteger(failures) && failures > 0
+            ? failures
+            : 0,
+        offAuth: state === "off_auth" || last?.outcome === "off_auth",
       },
       armed: autonomyArmed(kv),
     };

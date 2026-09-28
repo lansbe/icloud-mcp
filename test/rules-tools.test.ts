@@ -35,7 +35,13 @@ import { createLeasedMail } from "../src/agent/lease";
 import type { Rule } from "../src/agent/rules";
 import type { CallAnswer } from "../src/agent/tool-call";
 import type { UserAgent } from "../src/agent/user-agent";
-import { CONFIRM_TTL_SECONDS, CONFIRM_VERSION, mintConfirmation } from "../src/confirm";
+import {
+  CONFIRM_TTL_SECONDS,
+  CONFIRM_VERSION,
+  ConfirmationInvalidError,
+  mintConfirmation,
+  verifyConfirmation,
+} from "../src/confirm";
 import type { ConfirmPayload } from "../src/confirm";
 import type { DavFetch } from "../src/dav/transport";
 import type { MailSessionOptions, NewMailRow } from "../src/mail/service";
@@ -68,8 +74,8 @@ interface Registered {
   readonly callback: Callback;
 }
 
-/** The five names, as D-10 fixed them. */
-const RULES_TOOLS = ["rules_list", "rules_add", "rules_commit", "rules_remove", "rules_test"];
+/** The names, as D-10 fixed them. `rules_test` joins with plan 28-04's second task. */
+const RULES_TOOLS = ["rules_list", "rules_add", "rules_commit", "rules_remove"];
 
 /** Every tool the rules registrar registers, for `user`. */
 function registered(user: TestUser, options: MailSessionOptions = {}): Map<string, Registered> {
@@ -374,6 +380,65 @@ async function foreignToken(user: TestUser, arm: "contact" | "calendar" | "colle
   } as unknown as Record<typeof arm, ConfirmPayload>;
   return mintConfirmation(payloads[arm], SECRET());
 }
+
+describe("the rule arm and every other arm refuse each other", () => {
+  /** A rule payload for USER_A. */
+  function rulePayload(): Record<string, unknown> {
+    return {
+      v: CONFIRM_VERSION,
+      k: "rule",
+      t: "rule",
+      j: crypto.randomUUID(),
+      h: "AAAA",
+      x: Math.floor(Date.now() / 1000) + CONFIRM_TTL_SECONDS,
+      u: USER_A.userId,
+    };
+  }
+
+  it("a rule payload verifies as a rule, and only as a rule", async () => {
+    const built = rulePayload();
+    const token = await mintConfirmation(built as unknown as ConfirmPayload, SECRET());
+
+    expect(await verifyConfirmation(token, SECRET(), USER_A.userId, "rule")).toEqual(built);
+    for (const other of ["dav", "col", "mail"] as const) {
+      await expect(verifyConfirmation(token, SECRET(), USER_A.userId, other)).rejects.toBeInstanceOf(
+        ConfirmationInvalidError,
+      );
+    }
+  });
+
+  it("a rule payload relabelled as another arm, and another arm's kind under the rule arm, are refused", async () => {
+    for (const other of ["dav", "col", "mail"] as const) {
+      const relabelled = { ...rulePayload(), t: other };
+      const token = await mintConfirmation(relabelled as unknown as ConfirmPayload, SECRET());
+      await expect(verifyConfirmation(token, SECRET(), USER_A.userId, other)).rejects.toBeInstanceOf(
+        ConfirmationInvalidError,
+      );
+    }
+    for (const kind of ["create", "update", "delete", "reply", "move"]) {
+      const token = await mintConfirmation({ ...rulePayload(), k: kind } as unknown as ConfirmPayload, SECRET());
+      await expect(verifyConfirmation(token, SECRET(), USER_A.userId, "rule")).rejects.toBeInstanceOf(
+        ConfirmationInvalidError,
+      );
+    }
+  });
+
+  it("every other arm's field set, relabelled as a rule, is refused", async () => {
+    for (const arm of ["contact", "calendar", "collection", "mail"] as const) {
+      const token = await foreignToken(USER_A, arm);
+      const payload = JSON.parse(atob(token.split(".")[0]!.replace(/-/g, "+").replace(/_/g, "/"))) as Record<
+        string,
+        unknown
+      >;
+      for (const relabel of [{ t: "rule" }, { t: "rule", k: "rule" }]) {
+        const sealed = await mintConfirmation({ ...payload, ...relabel } as unknown as ConfirmPayload, SECRET());
+        await expect(verifyConfirmation(sealed, SECRET(), USER_A.userId, "rule")).rejects.toBeInstanceOf(
+          ConfirmationInvalidError,
+        );
+      }
+    }
+  });
+});
 
 describe("rules_commit stores exactly the previewed rule, or nothing", () => {
   it("stores the rule once, and repeats the sentence in the past tense", async () => {

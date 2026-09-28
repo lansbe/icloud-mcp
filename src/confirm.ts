@@ -237,8 +237,15 @@ export const CONFIRM_VERSION = 4;
  * field of any token already in flight changes meaning, every existing token
  * still names one of the four kinds above, and a build that predates `move`
  * refuses one through its own `hasConfirmPayloadBase`. So no version bump.
+ *
+ * **`rule` joined the same way, for the same reason (Phase 28, D-11).** It
+ * authorises adding one autonomy rule to the person's own object, and it is the
+ * only kind the rule arm (`t: "rule"`) carries. No field of any token already in
+ * flight changes meaning, and a build that predates `rule` refuses one through
+ * its own `hasConfirmPayloadBase`, which admits only the kinds it knows. So no
+ * version bump.
  */
-export type ConfirmKind = "create" | "update" | "delete" | "reply" | "move";
+export type ConfirmKind = "create" | "update" | "delete" | "reply" | "move" | "rule";
 
 /**
  * How long a confirmation stays usable: five minutes.
@@ -408,9 +415,10 @@ export interface ConfirmPayloadBase {
  * written once rather than widened each time a phase lands.
  *
  * `"dav"` is one CalDAV or CardDAV OBJECT; `"col"` is a DAV COLLECTION;
- * `"mail"` is one message in one mailbox.
+ * `"mail"` is one message in one mailbox; `"rule"` is one autonomy rule about to
+ * be added to the person's own object (Phase 28).
  */
-export type ConfirmTarget = "dav" | "col" | "mail";
+export type ConfirmTarget = "dav" | "col" | "mail" | "rule";
 
 /** A confirmation naming ONE CalDAV or CardDAV object. */
 export interface DavObjectConfirmPayload extends ConfirmPayloadBase {
@@ -838,7 +846,27 @@ export interface MailConfirmPayload extends ConfirmPayloadBase {
 export type ConfirmPayload =
   | DavObjectConfirmPayload
   | DavCollectionConfirmPayload
-  | MailConfirmPayload;
+  | MailConfirmPayload
+  | RuleConfirmPayload;
+
+/**
+ * A confirmation naming ONE autonomy rule to add (Phase 28, D-11).
+ *
+ * It adds no field to the base. The rule itself is bound by the change hash
+ * `h`, taken over `canonicalRuleChange`, and the person by `u`, exactly as on
+ * every other arm. There is no resource to name: the rule goes into the signed-in
+ * person's own object, which the commit reaches from the principal and never from
+ * the token.
+ *
+ * `k` is always `rule` on this arm, and `rule` appears on no other arm. The
+ * predicate checks both directions, so a rule token cannot be read as a calendar,
+ * contact or mail confirmation, and none of those can be read as a rule one.
+ */
+export interface RuleConfirmPayload extends ConfirmPayloadBase {
+  /** The kind of resource this confirmation names. See `DavObjectConfirmPayload.t`. */
+  t: "rule";
+  k: "rule";
+}
 
 /**
  * True only for a signing key this module is willing to use.
@@ -1658,6 +1686,55 @@ export async function draftChangeHashOf(
 }
 
 /**
+ * One autonomy rule as the preview parsed it, before it is hashed (Phase 28,
+ * D-11).
+ *
+ * The parsed rule's own fields, flattened, with every optional value an
+ * explicit `null` and never absent. This module imports nothing from the agent
+ * tree, so the rules tool builds this from the parser's answer. Its own shape and
+ * its own hash domain, on `NormalizedMailMove`'s reasoning, so no calendar,
+ * contact or mail change can hash to the same value.
+ */
+export interface NormalizedRuleChange {
+  fromAddresses: readonly string[] | null;
+  fromDomains: readonly string[] | null;
+  subjectContains: readonly string[] | null;
+  flag: boolean;
+  /** The draft's words, or `null` for a rule with no draft. */
+  draftText: string | null;
+}
+
+/** The domain string a rule's tuple starts with. Used by no other change. */
+const AUTONOMY_RULE_DOMAIN = "autonomy-rule";
+
+/**
+ * The bytes a rule hashes to, as a fixed-order tuple.
+ *
+ * Every field read by name, so key order in what a caller passed back cannot
+ * reach the output. Value lists keep their order: the preview showed them in
+ * that order, and a reordered list is not the rule passed back unaltered.
+ */
+export function canonicalRuleChange(change: NormalizedRuleChange): string {
+  return JSON.stringify([
+    AUTONOMY_RULE_DOMAIN,
+    change.fromAddresses === null ? null : [...change.fromAddresses],
+    change.fromDomains === null ? null : [...change.fromDomains],
+    change.subjectContains === null ? null : [...change.subjectContains],
+    change.flag,
+    change.draftText,
+  ]);
+}
+
+/** The canonical rule, digested and carried as base64url. */
+export async function ruleChangeHashOf(change: NormalizedRuleChange): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    TOKEN_ENCODER.encode(canonicalRuleChange(change)),
+  );
+  return toBase64Url(new Uint8Array(digest));
+}
+
+/**
  * The resource words this server will ever name in a composed line.
  *
  * A CLOSED vocabulary rather than a caller-supplied string, on `changedFields`'
@@ -1727,9 +1804,10 @@ export interface ConfirmationSummary {
   /**
    * The operation, matching the confirmation's own `k`. Never `move`: a move
    * has its own summary, `MoveLineSummary`, whose fields are about folders and
-   * counts rather than about one resource.
+   * counts rather than about one resource. Never `rule` either, for the same
+   * reason: see `RuleLineSummary`.
    */
-  kind: Exclude<ConfirmKind, "move">;
+  kind: Exclude<ConfirmKind, "move" | "rule">;
   /** The resource word, from the closed vocabulary. */
   noun: ConfirmationNoun;
   /** The resource's own name, or `null` when there is none to give. */
@@ -1869,6 +1947,87 @@ export interface DraftLineSummary {
 }
 
 /**
+ * What the composer takes for one autonomy rule being added (Phase 28, D-11).
+ *
+ * A fourth member of the composer's input, on `MoveLineSummary`'s precedent:
+ * none of the one-resource clauses apply. Every condition value is named in the
+ * sentence, each through `quotedName`. The draft's own words are NOT here and
+ * never reach the sentence: the tool publishes them beside it, fenced.
+ */
+export interface RuleLineSummary {
+  kind: "rule";
+  /** Sender addresses, as the parser normalised them. Empty when the rule has none. */
+  fromAddresses: readonly string[];
+  /** Sender domains, as the parser normalised them. Empty when the rule has none. */
+  fromDomains: readonly string[];
+  /** Subject words, as the parser normalised them. Empty when the rule has none. */
+  subjectWords: readonly string[];
+  /** Whether the rule flags a matching message. */
+  flag: boolean;
+  /** Whether the rule places a draft reply to a matching message's sender. */
+  draft: boolean;
+}
+
+/**
+ * The fixed sentences a rule's line is built from. Tense-free, for
+ * `CONFIRMATION_VERBS`' reason: strip the leading verb and a preview's line and
+ * a commit's line are byte-identical.
+ *
+ * The draft sentences say, in this server's own words, the four things a person
+ * adding a reply rule must know before agreeing (D-11 as revised again, D-05 as
+ * revised, D-30): who the reply goes to and where that address comes from; that
+ * the address can be faked; which mail gets no reply; and that nothing is sent.
+ */
+const RULE_RUNS =
+  "a rule that runs on its own every 15 minutes, with nobody present, for as long as you stay signed in.";
+const RULE_BEFORE = "Mail that arrived before the rule was added never matches it.";
+const RULE_FLAG = "flags the message";
+const RULE_DRAFT =
+  "places a draft reply to that message's sender, in the rule's own words, with the subject \"Re: \" and the original subject";
+const RULE_DRAFT_RECIPIENT =
+  "Each reply goes only to the address in the matching message's From line. That address comes from the message, and a sender can fake it, so a reply may be addressed to someone who did not write the message.";
+const RULE_DRAFT_SKIPS =
+  "No reply goes to your own address, to mailing-list mail, or when the From line has no usable address.";
+const RULE_DRAFT_UNSENT = "Nothing is sent: each reply waits in Drafts, and only you can send it.";
+
+/** Values joined as `'a'`, `'a' or 'b'`, `'a', 'b' or 'c'`, each folded first. */
+function quotedAlternatives(values: readonly string[]): string {
+  const quoted = values.map((value) => `'${quotedName(value)}'`);
+  if (quoted.length <= 1) return quoted.join("");
+  return `${quoted.slice(0, -1).join(", ")} or ${quoted[quoted.length - 1]}`;
+}
+
+/** The line for a rule being added, or added. See `RuleLineSummary`. */
+function ruleLine(summary: RuleLineSummary, tense: ConfirmationTense): string {
+  const clauses: string[] = [];
+  if (summary.fromAddresses.length > 0) {
+    clauses.push(`sent from ${quotedAlternatives(summary.fromAddresses)}`);
+  }
+  if (summary.fromDomains.length > 0) {
+    clauses.push(
+      `sent from an address at ${quotedAlternatives(summary.fromDomains)}, or at any subdomain of it`,
+    );
+  }
+  if (summary.subjectWords.length > 0) {
+    clauses.push(`with ${quotedAlternatives(summary.subjectWords)} in the subject`);
+  }
+  const matches =
+    clauses.length === 1
+      ? `It matches new inbox mail ${clauses[0]}.`
+      : `It matches new inbox mail that meets all of these: ${clauses.join("; ")}.`;
+
+  const actions: string[] = [];
+  if (summary.flag) actions.push(RULE_FLAG);
+  if (summary.draft) actions.push(RULE_DRAFT);
+  const does = `For each match it ${actions.join(" and ")}.`;
+
+  const parts = [`${CONFIRMATION_VERBS.rule[tense]} ${RULE_RUNS}`, matches, RULE_BEFORE, does];
+  if (summary.draft) parts.push(RULE_DRAFT_RECIPIENT, RULE_DRAFT_SKIPS, RULE_DRAFT_UNSENT);
+  parts.push(CONFIRMATION_CONSEQUENCES.rule);
+  return parts.join(" ");
+}
+
+/**
  * Which way a reminder change goes.
  *
  * Three literals rather than a pair of booleans or a signed count, for
@@ -1913,6 +2072,7 @@ const CONFIRMATION_VERBS: Record<
   delete: { would: "Deleting", did: "Deleted" },
   reply: { would: "Answering", did: "Answered" },
   move: { would: "Moving", did: "Moved" },
+  rule: { would: "Adding", did: "Added" },
 };
 
 /**
@@ -1957,6 +2117,8 @@ const CONFIRMATION_CONSEQUENCES: Record<ConfirmKind, string> = {
   // Kept so the table stays total. The move branch of the composer picks its
   // own consequence, because it depends on the count and on the destination.
   move: "They can be moved back.",
+  // A rule acts until it is removed, and removing it stops it at once (D-12).
+  rule: "Removing the rule with rules_remove stops it at once.",
 };
 
 /**
@@ -2201,9 +2363,14 @@ function quotedName(name: string): string {
  * a failed preview.
  */
 export function composeConfirmationLine(
-  summary: ConfirmationSummary | MoveLineSummary | DraftLineSummary,
+  summary: ConfirmationSummary | MoveLineSummary | DraftLineSummary | RuleLineSummary,
   tense: ConfirmationTense,
 ): string {
+  // An autonomy rule has its own sentences, still this function's: one
+  // composer, one tense table, one quoting rule. Every condition value goes
+  // through `quotedName`; the draft's words never reach the sentence.
+  if (summary.kind === "rule") return ruleLine(summary, tense);
+
   // A draft moved to Trash has its own five sentences, still this function's:
   // one composer, one tense table, one quoting rule. It returns early because
   // none of the clauses below can apply. The subject goes through `quotedName`
@@ -2506,10 +2673,40 @@ function isConfirmPayload(value: unknown): value is ConfirmPayload {
   // does not know — a value from a later build, or no `t` at all — reaches the
   // `false` below and the token is refused. An arm added without a branch here
   // is therefore refused rather than admitted with nothing checked.
+  //
+  // The rule kind and the rule arm go together in both directions: a rule
+  // kind under any other arm, or another kind under the rule arm, is refused
+  // here before any arm is asked.
+  if ((candidate.k === "rule") !== (candidate.t === "rule")) return false;
   if (candidate.t === "dav") return hasDavObjectArm(candidate);
   if (candidate.t === "col") return hasDavCollectionArm(candidate);
   if (candidate.t === "mail") return hasMailArm(candidate);
+  if (candidate.t === "rule") return hasRuleArm(candidate);
   return false;
+}
+
+/**
+ * The rule arm adds no field, so what it checks is the absence of every field
+ * the other arms carry. A payload holding one of them is one that could be read
+ * under two arms, which the discriminator exists to forbid.
+ */
+function hasRuleArm(candidate: Record<string, unknown>): boolean {
+  return (
+    candidate.k === "rule" &&
+    !("c" in candidate) &&
+    !("o" in candidate) &&
+    !("r" in candidate) &&
+    !("e" in candidate) &&
+    !("s" in candidate) &&
+    !("b" in candidate) &&
+    !("f" in candidate) &&
+    !("g" in candidate) &&
+    !("m" in candidate) &&
+    !("uv" in candidate) &&
+    !("q" in candidate) &&
+    !("qr" in candidate) &&
+    !("l" in candidate)
+  );
 }
 
 /** The protocol-neutral fields every arm carries. See `ConfirmPayloadBase`. */
@@ -2520,7 +2717,8 @@ function hasConfirmPayloadBase(candidate: Record<string, unknown>): boolean {
       candidate.k === "update" ||
       candidate.k === "delete" ||
       candidate.k === "reply" ||
-      candidate.k === "move") &&
+      candidate.k === "move" ||
+      candidate.k === "rule") &&
     typeof candidate.j === "string" &&
     typeof candidate.h === "string" &&
     // No `"u" in candidate` companion, and the difference from `s` on the
