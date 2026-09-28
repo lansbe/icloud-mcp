@@ -895,27 +895,74 @@ describe("a failure is recorded and waited out, and never stops the other folder
     });
     h.setSnapshot(ARCHIVE, { mailbox: ARCHIVE, answered: false });
 
-    expect((await step(a, h)).outcome).toBe("unanswered");
+    // INBOX's check is due, so it goes first (WR-04); then the archive is
+    // asked, and does not answer.
     let run = await step(a, h);
     expect(run.outcome).toBe("checked");
     expect(run.log).toContain(`snapshot:${INBOX}:start`);
+    expect((await step(a, h)).outcome).toBe("unanswered");
     expect((await step(a, h)).outcome).toBe("idle");
 
-    // Five minutes on: the archive is asked again, then INBOX is checked.
+    // Five minutes on: INBOX is checked, then the archive is asked again.
     h.setNow(now + RECALL_CHECK_INTERVAL_MS);
-    expect((await step(a, h)).outcome).toBe("unanswered");
-    expect((await rowOf(USER_A.userId, ARCHIVE))!.failures).toBe(2);
     run = await step(a, h);
     expect(run.outcome).toBe("checked");
     expect(run.log).toContain(`snapshot:${INBOX}:start`);
+    expect((await step(a, h)).outcome).toBe("unanswered");
+    expect((await rowOf(USER_A.userId, ARCHIVE))!.failures).toBe(2);
 
-    // Five more: INBOX is due its check, the archive is still waiting (ten
-    // minutes after its second failure).
+    // Five more: INBOX is checked, and the archive is still waiting (ten
+    // minutes after its second failure), so nothing else runs.
     h.setNow(now + 2 * RECALL_CHECK_INTERVAL_MS);
     run = await step(a, h);
     expect(run.outcome).toBe("checked");
     expect(run.log).toContain(`snapshot:${INBOX}:start`);
+    expect((await step(a, h)).outcome).toBe("idle");
     expect(count(h, `snapshot:${ARCHIVE}:start`)).toBe(2);
+  });
+
+  it("while the archive is still building, INBOX still gets its status check and its new mail (26-REVIEW WR-04)", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX, ARCHIVE],
+      mailboxes: {
+        [INBOX]: { uidValidity: 100, messages: scriptedMessages(30) },
+        [ARCHIVE]: { uidValidity: 300, messages: scriptedMessages(80) },
+      },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    await seedRows(USER_A.userId, [INBOX, ARCHIVE], {
+      [INBOX]: builtRow(stateOf(INBOX, 100, 31), { checkedAt: now - 10 * MINUTE }),
+      [ARCHIVE]: { ...builtRow(stateOf(ARCHIVE, 300, 81), { checkedAt: now }), stage: "build" },
+    });
+    h.addMessages(INBOX, messagesFrom(31, 2));
+
+    // INBOX's check, and its new mail, come before the archive's next page.
+    let run = await step(a, h);
+    expect(run.outcome).toBe("due");
+    expect(run.log).toContain(`snapshot:${INBOX}:start`);
+    run = await step(a, h);
+    expect(run.outcome).toBe("indexed");
+    expect(run.log).toContain(`newMail:${INBOX}:start`);
+    expect((await rowOf(USER_A.userId, INBOX))!.state!.uidNext).toBe(33);
+
+    // Then the archive's build goes on, page by page.
+    await passPause(USER_A.userId);
+    run = await step(a, h);
+    expect(run.outcome).toBe("indexed");
+    expect(run.log).toContain(`page:${ARCHIVE}:start`);
+    await passPause(USER_A.userId);
+    expect((await step(a, h)).log).toContain(`page:${ARCHIVE}:start`);
+
+    // Five minutes after INBOX's check, it is checked again, still before the
+    // archive's next page.
+    h.setNow(now + RECALL_CHECK_INTERVAL_MS);
+    await passPause(USER_A.userId);
+    run = await step(a, h);
+    expect(run.outcome).toBe("checked");
+    expect(run.log).toContain(`snapshot:${INBOX}:start`);
+    expect((await rowOf(USER_A.userId, ARCHIVE))!.stage).toBe("build");
   });
 
   it("a build page that keeps failing goes back to seed after three, and its status check then drops the folder", async () => {

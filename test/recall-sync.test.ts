@@ -308,8 +308,10 @@ describe("recallStep does one session of work, in the fixed order (D-13, D-27)",
     const h = twoFolders();
     const stub = objectFor(USER_A.userId);
     expect((await step(a, h)).outcome).toBe("folders");
+    // Built and just checked, so its own status check is not due and the
+    // archive's seed comes next.
     expect(
-      await stub.recallSetSync(INBOX, { ...SEED_ROW, stage: "built" }),
+      await stub.recallSetSync(INBOX, { ...SEED_ROW, stage: "built", checkedAt: Date.now() }),
     ).toEqual({ ok: true });
 
     h.setSnapshot(ARCHIVE, { mailbox: ARCHIVE, answered: false, gone: true });

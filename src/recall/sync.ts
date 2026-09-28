@@ -37,6 +37,14 @@
 //      that opens no mailbox. It records what is due and what it saw, and
 //      stops. The next step does that one thing.
 //
+// THE ORDER (26-REVIEW WR-04). A due folder first; then a built folder whose
+// status check is due; then the first folder not built. So a built folder is
+// kept current while another folder is still building: an archive of a few
+// thousand messages takes days of mail calls to fill, and without this INBOX
+// would get no new-mail page and no deletion sync for all of that time. The
+// build loses at most one step in five minutes per built folder to it, and
+// that step takes no page slot.
+//
 // There is no loop over pages, no second read after the first, no sleep, no
 // retry and no combinator. Nothing sweeps every folder. The pace is the
 // object's: a step that comes too early is told `paused` and stops. Recall is
@@ -343,8 +351,9 @@ function folderStateOf(mailbox: string, outcome: FolderSnapshotOutcome): FolderS
  * Move `principal`'s recall build forward by at most one IMAP session.
  *
  * Reads the object's slot first and stops on any refusal. Otherwise lists the
- * folders, seeds one folder, or indexes one page of one folder, in that order
- * of need, and answers what it did.
+ * folders, does what a built folder's last check left due, checks a built
+ * folder, or seeds or indexes one page of a folder not built yet, in that
+ * order of need, and answers what it did.
  */
 export async function recallStep(principal: Principal, deps: StepDeps): Promise<StepOutcome> {
   const stub = agentFor(principal);
@@ -390,22 +399,10 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
     );
   }
 
-  // 4. The first listed folder not built, and not waiting out a failure. A
-  //    folder with no row is at seed.
-  const unbuilt = folders.find((one) => {
-    const row = state.sync[one] ?? SEED_ROW;
-    return row.stage !== "built" && !waiting(row, now);
-  });
-  if (unbuilt !== undefined) {
-    const row = state.sync[unbuilt] ?? SEED_ROW;
-    return attempt(principal, unbuilt, row, deps, () =>
-      advanceUnbuilt(principal, folders, unbuilt, row, deps),
-    );
-  }
-
-  // 5. Otherwise the built folder checked longest ago, never-checked first,
-  //    and only once its last check is RECALL_CHECK_INTERVAL_MS old. A folder
-  //    still building, or waiting out a failure, is not a candidate.
+  // 4. A built folder whose status check is due: the one checked longest ago,
+  //    never-checked first, once its last check is RECALL_CHECK_INTERVAL_MS
+  //    old. This comes before the build of another folder (WR-04). A folder
+  //    waiting out a failure is not a candidate.
   let oldest: string | null = null;
   let oldestRow: SyncRow | null = null;
   for (const one of folders) {
@@ -422,15 +419,33 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
       oldestRow = row;
     }
   }
-  if (oldest === null || oldestRow === null) return "idle";
-  if (oldestRow.checkedAt !== null && now - oldestRow.checkedAt < RECALL_CHECK_INTERVAL_MS) {
-    return "idle";
+  if (
+    oldest !== null &&
+    oldestRow !== null &&
+    (oldestRow.checkedAt === null || now - oldestRow.checkedAt >= RECALL_CHECK_INTERVAL_MS)
+  ) {
+    const checked = oldest;
+    const checkedRow = oldestRow;
+    return attempt(principal, checked, checkedRow, deps, () =>
+      checkBuilt(principal, folders, checked, checkedRow, deps),
+    );
   }
-  const checked = oldest;
-  const checkedRow = oldestRow;
-  return attempt(principal, checked, checkedRow, deps, () =>
-    checkBuilt(principal, folders, checked, checkedRow, deps),
-  );
+
+  // 5. The first listed folder not built, and not waiting out a failure. A
+  //    folder with no row is at seed.
+  const unbuilt = folders.find((one) => {
+    const row = state.sync[one] ?? SEED_ROW;
+    return row.stage !== "built" && !waiting(row, now);
+  });
+  if (unbuilt !== undefined) {
+    const row = state.sync[unbuilt] ?? SEED_ROW;
+    return attempt(principal, unbuilt, row, deps, () =>
+      advanceUnbuilt(principal, folders, unbuilt, row, deps),
+    );
+  }
+
+  // Nothing is due, no check is due, and nothing is left to build.
+  return "idle";
 }
 
 /**
