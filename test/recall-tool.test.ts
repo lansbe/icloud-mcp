@@ -23,11 +23,11 @@ import {
   registerRecallTools,
 } from "../src/mcp/tools/recall";
 import { UNTRUSTED_NOTICE } from "../src/mcp/untrusted";
-import { createEmbedder } from "../src/recall/embed";
+import { createEmbedder, RECALL_MODEL } from "../src/recall/embed";
 import { createRecallStore } from "../src/recall/index";
 import { indexItems, type RecallDeps } from "../src/recall/pipeline";
-import { RECALL_MAX_PAGES_PER_DAY } from "../src/recall/retention";
-import { createFakeAi, type FakeAi } from "./fixtures/fake-embedder";
+import { RECALL_MAX_PAGES_PER_DAY, SNIPPET_MAX_CHARS } from "../src/recall/retention";
+import { createFakeAi, type FakeAi, fakeVectorOf } from "./fixtures/fake-embedder";
 import { createFakeVectorize, type FakeVectorize } from "./fixtures/fake-vectorize";
 import { USER_A, USER_B, testPrincipal, type TestUser } from "./fixtures/two-users";
 
@@ -263,5 +263,204 @@ describe("the object's sync-state read (D-29)", () => {
     expect(built.index).toBe("built");
     expect(built.note).not.toContain("still being built");
     expect(built.note).toContain("nothing scored high enough");
+  });
+});
+
+/** Every path in `value` that holds a JSON number, and every key named like a count. */
+function numbersAndCountKeys(value: unknown, path = "$"): string[] {
+  const found: string[] = [];
+  if (typeof value === "number") return [path];
+  if (Array.isArray(value)) {
+    value.forEach((item, i) => found.push(...numbersAndCountKeys(item, `${path}[${i}]`)));
+    return found;
+  }
+  if (typeof value === "object" && value !== null) {
+    for (const [key, inner] of Object.entries(value)) {
+      if (/^(score|count|total|rank|of)$/i.test(key)) found.push(`${path}.${key} (key)`);
+      found.push(...numbersAndCountKeys(inner, `${path}.${key}`));
+    }
+  }
+  return found;
+}
+
+/** Three unrelated messages for `user`, with uids 1, 2 and 3. */
+async function indexThree(user: TestUser, deps: RecallDeps): Promise<void> {
+  await indexOne(user, deps, { ref: ref(1), text: "Staff engineer role", snippet: "Staff role" });
+  await indexOne(user, deps, { ref: ref(2), text: "Dentist appointment reminder", snippet: "Dentist" });
+  await indexOne(user, deps, { ref: ref(3), text: "Quarterly tax invoice", snippet: "Tax invoice" });
+}
+
+/** The error body of a failed recall, parsed. */
+function failureOf(answer: ToolAnswer): Record<string, unknown> {
+  expect(answer.isError).toBe(true);
+  expect(answer.content).toHaveLength(1);
+  return JSON.parse(answer.content[0]!.text) as Record<string, unknown>;
+}
+
+describe("the recall contract (RCLL-08, RCLL-10, RCLL-11, RCLL-12)", () => {
+  it("no numbers: no JSON number and no score, count, total, rank or of key anywhere in the answer", async () => {
+    const { deps } = fakes();
+    await indexThree(USER_A, deps);
+    const { call } = recallTool(USER_A, deps);
+
+    const answer = await call({ query: "staff engineer" });
+
+    const trusted = trustedOf(answer);
+    expect((trusted.results as unknown[]).length).toBeGreaterThan(0);
+    expect(numbersAndCountKeys(trusted)).toEqual([]);
+    expect(numbersAndCountKeys(untrustedOf(answer))).toEqual([]);
+  });
+
+  it("no body: the stored subject comes back and the embedded body text does not", async () => {
+    const { deps } = fakes();
+    await indexOne(USER_A, deps, {
+      ref: ref(7),
+      text: "Offer letter BODY-CANARY-9",
+      snippet: "Offer letter",
+    });
+    const { call } = recallTool(USER_A, deps);
+
+    const answer = await call({ query: "offer letter" });
+
+    const text = JSON.stringify(answer);
+    expect(text).toContain("Offer letter");
+    expect(text).not.toContain("BODY-CANARY-9");
+  });
+
+  it("every snippet is at most SNIPPET_MAX_CHARS code points", async () => {
+    const { deps } = fakes();
+    const long = "Staff engineer role " + "\u{1F600}".repeat(400);
+    await indexOne(USER_A, deps, { ref: ref(8), text: "Staff engineer role", snippet: long });
+    const { call } = recallTool(USER_A, deps);
+
+    const snippets = untrustedOf(await call({ query: "staff engineer" })).snippets as Record<
+      string,
+      string
+    >;
+
+    const values = Object.values(snippets);
+    expect(values).toHaveLength(1);
+    for (const snippet of values) {
+      expect(Array.from(snippet).length).toBeLessThanOrEqual(SNIPPET_MAX_CHARS);
+    }
+  });
+
+  it("the fence: snippets only in the untrusted block, the trusted block holds only index, note and results", async () => {
+    const { deps } = fakes();
+    await indexThree(USER_A, deps);
+    const { call, description } = recallTool(USER_A, deps);
+
+    const answer = await call({ query: "staff engineer role" });
+
+    const trusted = trustedOf(answer);
+    expect(Object.keys(trusted).sort()).toEqual(["index", "note", "results"]);
+    for (const row of trusted.results as Record<string, unknown>[]) {
+      expect(Object.keys(row).sort()).toEqual(["id", "indexedAt"]);
+    }
+    const snippets = untrustedOf(answer).snippets as Record<string, string>;
+    expect(Object.values(snippets)).toContain("Staff role");
+    for (const snippet of Object.values(snippets)) {
+      expect(answer.content[0]!.text).not.toContain(snippet);
+      expect(answer.content[1]!.text).toContain(snippet);
+    }
+    expect(description).toContain(UNTRUSTED_NOTICE);
+  });
+
+  it("the floor: a query sharing no words answers an empty list and the note; a query sharing the subject's words finds it", async () => {
+    const { deps } = fakes();
+    await indexThree(USER_A, deps);
+    const { call } = recallTool(USER_A, deps);
+
+    const nonsense = await call({ query: "zebra kumquat xylophone" });
+    expect(nonsense.isError).toBeUndefined();
+    const empty = trustedOf(nonsense);
+    expect(empty.results).toEqual([]);
+    expect(empty.note).toContain(
+      "An empty answer means nothing scored high enough, not that no such mail exists.",
+    );
+    expect(untrustedOf(nonsense)).toEqual({ snippets: {} });
+
+    const hit = trustedOf(await call({ query: "dentist appointment" }));
+    const ids = (hit.results as { id: string }[]).map((row) => row.id);
+    expect(ids).toEqual([encodeMessageId(ref(2))]);
+  });
+
+  it("failure is not empty: the store rejecting answers the fixed error with no results key", async () => {
+    const { deps, index } = fakes();
+    await indexThree(USER_A, deps);
+    index.failing.add("query");
+    const { call } = recallTool(USER_A, deps);
+
+    const body = failureOf(await call({ query: "staff engineer" }));
+
+    expect(body).toEqual({ message: RECALL_UNAVAILABLE });
+    expect("results" in body).toBe(false);
+  });
+
+  it("failure is not empty: the model rejecting answers the fixed error with no results key", async () => {
+    const { deps, index } = fakes();
+    await indexThree(USER_A, deps);
+    const broken: RecallDeps = {
+      store: createRecallStore(index),
+      embedder: createEmbedder(createFakeAi({ reject: true })),
+    };
+    const { call } = recallTool(USER_A, broken);
+
+    const body = failureOf(await call({ query: "staff engineer" }));
+
+    expect(body).toEqual({ message: RECALL_UNAVAILABLE });
+  });
+
+  it("failure is not empty: the object read rejecting answers the fixed error, and nothing is searched", async () => {
+    const { deps, index, ai } = fakes();
+    await runInDurableObject(objectFor(USER_A.userId), (instance: UserAgent) => {
+      const prototype = Object.getPrototypeOf(instance) as UserAgent;
+      vi.spyOn(prototype, "recallSyncState").mockImplementation(() => {
+        throw new Error("the object could not answer");
+      });
+    });
+    const { call } = recallTool(USER_A, deps);
+
+    const body = failureOf(await call({ query: "staff engineer" }));
+
+    expect(body).toEqual({ message: RECALL_UNAVAILABLE });
+    expect(index.calls.filter((one) => one.method === "query")).toEqual([]);
+    expect(ai.calls).toEqual([]);
+  });
+
+  it("only the embedder: one recall makes exactly one model call, to the recall model, with text", async () => {
+    const indexing = fakes();
+    await indexThree(USER_A, indexing.deps);
+    const ai = createFakeAi();
+    const deps: RecallDeps = {
+      store: createRecallStore(indexing.index),
+      embedder: createEmbedder(ai),
+    };
+    const { call } = recallTool(USER_A, deps);
+
+    await call({ query: "staff engineer" });
+
+    expect(ai.calls).toHaveLength(1);
+    expect(ai.calls[0]!.model).toBe(RECALL_MODEL);
+    expect(ai.calls[0]!.input).toEqual({ text: ["staff engineer"] });
+  });
+
+  it("a match whose ref does not decode is dropped, and the others come back", async () => {
+    const { deps, index } = fakes();
+    await indexOne(USER_A, deps, { ref: ref(42), text: "Staff engineer role", snippet: "Staff role" });
+    index.vectors.set("f".repeat(64), {
+      id: "f".repeat(64),
+      values: fakeVectorOf("Staff engineer role"),
+      namespace: USER_A.userId,
+      metadata: { u: USER_A.userId, r: "garbage", s: "Junk", a: Date.now() },
+    });
+    const { call } = recallTool(USER_A, deps);
+
+    const answer = await call({ query: "staff engineer" });
+
+    const ids = (trustedOf(answer).results as { id: string }[]).map((row) => row.id);
+    expect(ids).toEqual([encodeMessageId(ref(42))]);
+    expect(untrustedOf(answer)).toEqual({ snippets: { [ids[0]!]: "Staff role" } });
+    expect(JSON.stringify(answer)).not.toContain("Junk");
   });
 });
