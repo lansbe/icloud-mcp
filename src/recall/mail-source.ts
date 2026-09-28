@@ -28,6 +28,7 @@ import {
   type SearchPage,
   type SessionGate,
   searchMessages,
+  summariesInRange,
   windowUids,
 } from "../mail/service";
 import type { Principal } from "../principal";
@@ -122,6 +123,52 @@ export function recallItemOf(row: MessageSummary): RecallItem | null {
   return { ref, text, snippet: subject, messageDate };
 }
 
+/** Every row that makes an item, in the rows' order. */
+function itemsOf(rows: readonly MessageSummary[]): RecallItem[] {
+  const items: RecallItem[] = [];
+  for (const row of rows) {
+    const item = recallItemOf(row);
+    if (item !== null) items.push(item);
+  }
+  return items;
+}
+
+/** One page of new mail as items to index, and where the next page starts. */
+export interface NewMailPage {
+  readonly items: RecallItem[];
+  readonly nextFrom: number;
+}
+
+/**
+ * One page of the new mail in `[fromUid, toUidExclusive)`, oldest first
+ * (Phase 26, D-16).
+ *
+ * The read is `summariesInRange`: read-only, bounded at both ends, and the
+ * listing's own peeking rows. Each row goes through `recallItemOf`, the same
+ * function the window's pages use, so the subject is stored, the body preview
+ * is only embedded, and a row whose date does not parse is left out.
+ * `nextFrom` is the read's own, unchanged: a row left out here was still read,
+ * and is not read again.
+ */
+export async function newMailPage(
+  gate: SessionGate,
+  principal: Principal,
+  mailbox: string,
+  uidValidity: number,
+  fromUid: number,
+  toUidExclusive: number,
+): Promise<NewMailPage> {
+  const page = await summariesInRange(
+    principal,
+    gate,
+    mailbox,
+    uidValidity,
+    fromUid,
+    toUidExclusive,
+  );
+  return { items: itemsOf(page.rows), nextFrom: page.nextFrom };
+}
+
 /** The validity of the first row that decodes, or null. */
 function validityOfRows(rows: readonly MessageSummary[]): number | null {
   for (const row of rows) {
@@ -175,11 +222,7 @@ export const mailRecallSource: RecallSource = {
       listing = await readWindowPage(gate, principal, mailbox, null);
     }
 
-    const items: RecallItem[] = [];
-    for (const row of listing.messages) {
-      const item = recallItemOf(row);
-      if (item !== null) items.push(item);
-    }
+    const items = itemsOf(listing.messages);
     const next = listing.nextCursor === null ? null : decodeCursor(listing.nextCursor);
 
     let uidValidity = validityOfRows(listing.messages);

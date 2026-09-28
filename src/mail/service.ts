@@ -4208,6 +4208,120 @@ export async function windowUids(
   );
 }
 
+/** One page of new mail in a UID range, and where the next page starts. */
+export interface RangePage {
+  /** The listing's own rows, oldest first. */
+  readonly rows: MessageSummary[];
+  /**
+   * The first UID not yet read. The last UID this page chose plus one when
+   * more remained in the range; otherwise the range's exclusive upper end.
+   */
+  readonly nextFrom: number;
+}
+
+/** Whether `uid` can be a message UID: a safe integer of at least 1. */
+function isUidValue(uid: number): boolean {
+  return Number.isSafeInteger(uid) && uid >= 1;
+}
+
+/**
+ * The oldest page of `[fromUid, toUidExclusive)`, inside an open session.
+ *
+ * The search is the one bounded range search; the rows are the listing's own
+ * row builder. Chosen oldest first and at most `PAGE_SIZE_DEFAULT`, so a caller
+ * that stores `nextFrom` moves past exactly the UIDs this page chose.
+ */
+async function summariesInRangeIn(
+  session: MailSession,
+  mailbox: string,
+  fromUid: number,
+  toUidExclusive: number,
+): Promise<RangePage> {
+  const uidValidity = session.uidValidity;
+  if (uidValidity === null) throw new ImapNotFoundError();
+
+  const found = await uidsInRange(session, fromUid, toUidExclusive);
+  const ordered = [...found].sort((a, b) => a - b);
+  const page = ordered.slice(0, PAGE_SIZE_DEFAULT);
+  if (page.length === 0) return { rows: [], nextFrom: toUidExclusive };
+
+  const nextFrom = ordered.length > page.length ? page[page.length - 1]! + 1 : toUidExclusive;
+  const rows = await summaryRows(session, mailbox, uidValidity, page);
+  return { rows, nextFrom };
+}
+
+/**
+ * Refuse a range whose ends are not UIDs, before any socket. Answers true when
+ * the range is empty, so the caller can answer at once with no session.
+ */
+function emptyRange(fromUid: number, toUidExclusive: number): boolean {
+  if (!isUidValue(fromUid) || !isUidValue(toUidExclusive)) throw new ImapNotFoundError();
+  return toUidExclusive <= fromUid;
+}
+
+/** New mail in a UID range, oldest first, over an already-open stream pair. */
+export async function summariesInRangeOver(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string,
+  uidValidity: number,
+  fromUid: number,
+  toUidExclusive: number,
+  options: MailSessionOptions = {},
+): Promise<RangePage> {
+  if (emptyRange(fromUid, toUidExclusive)) return { rows: [], nextFrom: fromUid };
+  return withMailSessionOver(
+    duplex,
+    principal,
+    gate,
+    mailbox,
+    uidValidity,
+    (session) => summariesInRangeIn(session, mailbox, fromUid, toUidExclusive),
+    options,
+  );
+}
+
+/**
+ * New mail in `[fromUid, toUidExclusive)`, oldest first, as the listing's own
+ * rows (Phase 26, D-16).
+ *
+ * OLDEST FIRST, so a caller that stores `nextFrom` moves forward past exactly
+ * what it read, and a burst larger than one page is read over several calls
+ * with nothing skipped.
+ *
+ * BOUNDED AT BOTH ENDS, for the reason Phase 23 D-18 gives: the open-ended form
+ * always takes in the newest message and anything that arrived after the
+ * status reply. The upper end is the status reply's next UID minus one.
+ *
+ * THE LISTING'S OWN ITEMS. The rows are built by the listing's row builder, so
+ * every fetch item is the peeking one and no fetch item is added. The folder is
+ * opened read-only through the orchestrator with `uidValidity` as the expected
+ * validity, so a folder whose validity moved is refused before any search.
+ *
+ * An empty range opens no socket. A range whose ends are not UIDs is refused
+ * before any socket.
+ */
+export async function summariesInRange(
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string,
+  uidValidity: number,
+  fromUid: number,
+  toUidExclusive: number,
+  options: MailSessionOptions = {},
+): Promise<RangePage> {
+  if (emptyRange(fromUid, toUidExclusive)) return { rows: [], nextFrom: fromUid };
+  return withMailSession(
+    principal,
+    gate,
+    mailbox,
+    uidValidity,
+    (session) => summariesInRangeIn(session, mailbox, fromUid, toUidExclusive),
+    options,
+  );
+}
+
 /** List one page of a folder's unread mail over an already-open stream pair. */
 export async function listUnreadOver(
   duplex: DuplexLike,

@@ -1,9 +1,9 @@
 // The recall build's own mail read, written down byte for byte (Phase 26, D-19).
 //
-// This is the window's UID snapshot, recorded by the rules
-// test/read-path-wire.test.ts keeps for every other read. That file is not
-// edited by this phase: it holds the reads that existed before, and this one is
-// new.
+// These are the window's UID snapshot and the new-mail range read, recorded by
+// the rules test/read-path-wire.test.ts keeps for every other read. That file is
+// not edited by this phase: it holds the reads that existed before, and these
+// are new.
 //
 // The rules:
 //
@@ -25,7 +25,7 @@
 
 import { beforeAll, describe, expect, it } from "vitest";
 import { ImapNotFoundError } from "../src/errors";
-import { createSessionGate, windowUidsOver } from "../src/mail/service";
+import { createSessionGate, summariesInRangeOver, windowUidsOver } from "../src/mail/service";
 import type { Principal } from "../src/principal";
 import {
   GREETING,
@@ -114,6 +114,68 @@ function searchReply(tag: string, uids: readonly number[]): Uint8Array {
   return wire(`* SEARCH ${uids.join(" ")}`, `${tag} OK SEARCH completed`);
 }
 
+/** A single-part plain text structure. Copied from test/read-path-wire.test.ts. */
+const PLAIN_STRUCTURE = '("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 12 1)';
+
+function concatBytes(...parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    joined.set(part, offset);
+    offset += part.byteLength;
+  }
+  return joined;
+}
+
+function literalItem(key: string, payload: string): Uint8Array {
+  const bytes = ENCODER.encode(payload);
+  return concatBytes(ENCODER.encode(`${key} {${bytes.byteLength}}\r\n`), bytes);
+}
+
+/** The listing's batched metadata reply. Copied from test/read-path-wire.test.ts. */
+function pageMetadataReply(tag: string, uids: readonly number[]): Uint8Array {
+  const chunks: Uint8Array[] = [];
+  for (const [i, uid] of uids.entries()) {
+    chunks.push(
+      ENCODER.encode(
+        `* ${i + 1} FETCH (UID ${uid} FLAGS () ` +
+          `INTERNALDATE "26-Sep-2026 10:15:02 +0000" ` +
+          `RFC822.SIZE ${12000 + uid} ` +
+          `BODYSTRUCTURE ${PLAIN_STRUCTURE} `,
+      ),
+      literalItem(
+        "BODY[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID)]",
+        [
+          `Subject: Subject for ${uid}`,
+          `From: "Sender ${uid}" <s${uid}@example.invalid>`,
+          "Date: Thu, 13 Aug 2026 09:14:02 -0700",
+          `Message-ID: <m${uid}@example.invalid>`,
+          "",
+          "",
+        ].join("\r\n"),
+      ),
+      ENCODER.encode(")\r\n"),
+    );
+  }
+  chunks.push(ENCODER.encode(`${tag} OK UID FETCH completed\r\n`));
+  return concatBytes(...chunks);
+}
+
+/** The listing's preview reply. Copied from test/read-path-wire.test.ts. */
+function snippetReply(tag: string, uids: readonly number[]): Uint8Array {
+  const chunks: Uint8Array[] = [];
+  for (const [i, uid] of uids.entries()) {
+    chunks.push(
+      ENCODER.encode(`* ${i + 1} FETCH (UID ${uid} `),
+      literalItem("BODY[1]<0>", `Preview of message ${uid}.`),
+      ENCODER.encode(")\r\n"),
+    );
+  }
+  chunks.push(ENCODER.encode(`${tag} OK UID FETCH completed\r\n`));
+  return concatBytes(...chunks);
+}
+
 // ---------------------------------------------------------------------------
 // The window's UID snapshot
 // ---------------------------------------------------------------------------
@@ -185,6 +247,62 @@ describe("windowUidsOver records exactly one read-only open and one search (D-17
     }
 
     expect(wireOf(duplex)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The new-mail range
+// ---------------------------------------------------------------------------
+
+describe("summariesInRangeOver records one read-only open, one bounded search and the listing's own fetches (D-16, D-19)", () => {
+  it("40 new messages from 100: the search is 100:139, the oldest 25 are fetched, and the next read starts at 125", async () => {
+    // The server answers the range out of order; every UID in it exists.
+    const present = Array.from({ length: 40 }, (_, i) => 139 - i);
+    const oldest25 = Array.from({ length: 25 }, (_, i) => 100 + i);
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      examineReply("a4"),
+      searchReply("a5", present),
+      pageMetadataReply("a6", oldest25),
+      snippetReply("a7", oldest25),
+      logoutExchange("a8"),
+    ]);
+
+    const page = await summariesInRangeOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      MAILBOX,
+      UIDVALIDITY,
+      100,
+      140,
+      FAST_BOUNDS,
+    );
+
+    expect(wireOf(duplex)).toEqual([
+      "a1 CAPABILITY",
+      "a2 LOGIN [redacted]",
+      "a3 CAPABILITY",
+      'a4 EXAMINE "INBOX"',
+      "a5 UID SEARCH UID 100:139",
+      "a6 UID FETCH 100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124 (UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID)])",
+      "a7 UID FETCH 100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124 (BODY.PEEK[1]<0.1024>)",
+      "a8 LOGOUT",
+    ]);
+    expect(page.nextFrom).toBe(125);
+    expect(page.rows.map((row) => row.uid)).toEqual(oldest25);
+    expect(page.rows[0]).toEqual({
+      id: expect.any(String),
+      uid: 100,
+      unread: true,
+      internalDate: "26-Sep-2026 10:15:02 +0000",
+      wireSizeBytes: 12100,
+      subject: "Subject for 100",
+      fromName: "Sender 100",
+      fromAddress: "s100@example.invalid",
+      snippet: "Preview of message 100.",
+      hasAttachments: false,
+    });
   });
 });
 
