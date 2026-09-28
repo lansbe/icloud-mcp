@@ -7605,6 +7605,20 @@ describe("the rules job's scan rules (Phase 28, D-21)", () => {
       `await call("mail_compose_reply", { parentId, text, ${"attachment"}${"Ids"}: [] });`,
       `const m = { ${"folder"}${"Id"}: "x" };`,
       `const m = { "${"c"}${"c"}": [x] };`,
+      // 28-REVIEW IN-08: a member assignment or read, a bracket access, and a
+      // shorthand property carry the same key without the key-colon form.
+      `args.${"c"}${"c"} = [x];`,
+      `args.${"b"}${"cc"} = [x];`,
+      `args . ${"reply"}${"All"} = true;`,
+      `args.${"attachment"}${"Ids"}.push(id);`,
+      `const f = args.${"folder"}${"Id"};`,
+      `args["${"b"}${"cc"}"] = [x];`,
+      `args['${"c"}${"c"}'] = [x];`,
+      `const r = args[\`${"reply"}${"All"}\`];`,
+      `args[ "${"folder"}${"Id"}" ] = "x";`,
+      `Object.assign(args, { ${"c"}${"c"} });`,
+      `await call("mail_compose_reply", { parentId, text, ${"b"}${"cc"} });`,
+      `const m = { ...args, ${"attachment"}${"Ids"} };`,
     ];
 
     it("is scoped to src/agent/", () => {
@@ -7628,6 +7642,9 @@ describe("the rules job's scan rules (Phase 28, D-21)", () => {
         'await call("mail_compose_reply", { parentId: row.id, text: draft.text, to: [recipient.to] });',
         'const NOT_REPLY_KEYS = Object.freeze(["to", "subject", "cc", "bcc", "html"]);',
         "const account = { signedInAs };",
+        "const ccount = row.ccount;",
+        "const { parentId, text } = args;",
+        "// a copy list, a blind copy list, reply-all",
       ]) {
         expect(hits(ID, "src/agent/actions.ts", line), line).toBe(0);
       }

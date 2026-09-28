@@ -1353,6 +1353,18 @@ export const FORBIDDEN = [
   // the return path; the sender header's name in quotes; and a key naming a
   // copy list, a blind copy list, reply-all, attachments or a folder.
   //
+  // The copy, blind copy, reply-all, attachments and folder keys are refused
+  // in four forms: a key with a colon (`{ key: x }`), a member read or
+  // assignment (`args.key = x`), a bracket access with a literal
+  // (`args["key"] = x`), and a shorthand property (`{ key }`). The last three
+  // were added by 28-REVIEW IN-08; before that only the colon form was seen.
+  //
+  // WHAT IT DOES NOT SEE, named so nobody believes it proves more: a key held
+  // in a variable and used in brackets (`args[name] = x`), an object built
+  // somewhere else and spread in, and `Object.defineProperty` or any other
+  // reflective write. Each needs the key's name written somewhere, and that
+  // somewhere is under src/agent/ only if this rule sees it there.
+  //
   // It does not fire on the row's From field, on the recipient function, on
   // the sign-in check's reader, or on prose that says "the sender" or "a reply
   // to". Prose with a space between the words is never matched.
@@ -1364,8 +1376,8 @@ export const FORBIDDEN = [
     id: "agent-reads-other-address",
     scope: "src/agent/",
     pattern:
-      /\breply[-_]?to\b|\breturn[-_]?path\b|\b(?:from|sender|display)[-_]?name\b|["'`]sender["'`]|(?:\b|["'`])(?:cc|bcc|replyAll|attachmentIds|folderId)["'`]?\s*:/gi,
-    why: "Under src/agent/, a second address field: the header that asks for replies to go somewhere else (any spelling), a display-name field, the return path, the sender header by name, or a key for a copy list, a blind copy list, reply-all, attachments or a folder. The job may take exactly one address from a stranger's message, the From address, through one function (replyRecipient in src/agent/recipient.ts). A second way to read an address is how a reply gets aimed somewhere the stranger chose: the redirect header exists precisely to send replies elsewhere, and a copy list or reply-all widens who is told. PITFALLS #12 forbids a write target taken from content; the From address is the one exception, decided by the owner on 2026-09-27, and this keeps it the only one. If this fired on a comment, describe the header by role. Do not narrow the pattern: a second address is a decision on the boundary, not a refactor.",
+      /\breply[-_]?to\b|\breturn[-_]?path\b|\b(?:from|sender|display)[-_]?name\b|["'`]sender["'`]|(?:\b|["'`])(?:cc|bcc|replyAll|attachmentIds|folderId)["'`]?\s*:|\.\s*(?:cc|bcc|replyAll|attachmentIds|folderId)\b|\[\s*["'`](?:cc|bcc|replyAll|attachmentIds|folderId)["'`]\s*\]|[{,]\s*(?:cc|bcc|replyAll|attachmentIds|folderId)\s*(?=[,}])/gi,
+    why: "Under src/agent/, a second address field: the header that asks for replies to go somewhere else (any spelling), a display-name field, the return path, the sender header by name, or a key for a copy list, a blind copy list, reply-all, attachments or a folder, in any of four forms (a key with a colon, a member, a bracket access, a shorthand property). The job may take exactly one address from a stranger's message, the From address, through one function (replyRecipient in src/agent/recipient.ts). A second way to read an address is how a reply gets aimed somewhere the stranger chose: the redirect header exists precisely to send replies elsewhere, and a copy list or reply-all widens who is told. PITFALLS #12 forbids a write target taken from content; the From address is the one exception, decided by the owner on 2026-09-27, and this keeps it the only one. If this fired on a comment, describe the header by role. Do not narrow the pattern: a second address is a decision on the boundary, not a refactor.",
   },
 ];
 
