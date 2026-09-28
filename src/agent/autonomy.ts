@@ -313,11 +313,25 @@ function base64UrlFromBytes(bytes: Uint8Array): string {
  * showed the notice, minted a grant on every sign-in, and failed every seal,
  * and each failed arm ended the key the person already had. One decoder for
  * both is what keeps the page and the seal from disagreeing again.
+ *
+ * A plain `boolean`, not a type guard (review R2-IN-03). A guard would tell
+ * the compiler that a `false` answer means "not a string", and a 16-byte
+ * base64url string is a string that answers `false`. Any later
+ * `if (!sealKeyUsable(k)) { ... }` block would then treat `k` as impossible.
  */
-export function sealKeyUsable(value: unknown): value is string {
-  if (!isConfiguredSecret(value)) return false;
+export function sealKeyUsable(value: unknown): boolean {
+  return sealKeyBytes(value) !== null;
+}
+
+/**
+ * The seal key's 32 raw bytes, or null when it is unset, not base64url with no
+ * padding, or any other length. The one decoder behind `sealKeyUsable` and the
+ * seal.
+ */
+function sealKeyBytes(value: unknown): Uint8Array | null {
+  if (!isConfiguredSecret(value)) return null;
   const raw = bytesFromBase64Url(value);
-  return raw !== null && raw.length === SEAL_KEY_BYTES;
+  return raw !== null && raw.length === SEAL_KEY_BYTES ? raw : null;
 }
 
 /**
@@ -328,8 +342,7 @@ export function sealKeyUsable(value: unknown): value is string {
  * promises, so the length is checked here rather than trusted.
  */
 async function sealKeyFrom(sealKey: unknown): Promise<CryptoKey | null> {
-  if (!sealKeyUsable(sealKey)) return null;
-  const raw = bytesFromBase64Url(sealKey);
+  const raw = sealKeyBytes(sealKey);
   if (raw === null) return null;
   try {
     return await crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, [

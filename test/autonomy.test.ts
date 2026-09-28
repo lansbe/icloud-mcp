@@ -1079,6 +1079,19 @@ describe("autonomy credential: a seal key the seal would refuse counts as not se
     }
   });
 
+  it("sealKeyUsable answers a plain boolean, so a refused key is still a string to the compiler (review R2-IN-03)", () => {
+    // This case is checked by the compiler as much as by the run. Were
+    // `sealKeyUsable` declared `value is string`, a false answer would tell
+    // the compiler the value is not a string, it would call `key` impossible
+    // inside this block, and `key.length` would not compile.
+    const key: unknown = SHORT_SEAL_KEY;
+    if (typeof key === "string" && !sealKeyUsable(key)) {
+      expect(key.length).toBe(22);
+      return;
+    }
+    expect.unreachable("a 16-byte key is a string the seal refuses");
+  });
+
   it("the page shows no autonomy notice when the seal key is not 32 bytes", () => {
     const env = allowAllEnv({ AUTONOMY_SEAL_KEY: SHORT_SEAL_KEY });
     expect(autonomyConfigured(env)).toBe(false);
