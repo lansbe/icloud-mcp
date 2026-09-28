@@ -36,6 +36,18 @@ export interface GrantStore {
   get(name: string, options?: { type?: string }): Promise<unknown>;
   delete(name: string): Promise<void>;
   /**
+   * Write one value. Optional because only the autonomy setup writes, and the
+   * listing and revoke doubles never need it.
+   *
+   * The wrangler adapter's version carries only client records, which hold a
+   * hash and no secret, and refuses any write that would expire.
+   */
+  put?(
+    name: string,
+    value: string,
+    options?: { expiration?: number; expirationTtl?: number },
+  ): Promise<void>;
+  /**
    * How many reads the adapter could not complete, when it counts them.
    *
    * Optional because a real KV binding has no such method. The wrangler adapter
@@ -89,6 +101,20 @@ export interface GrantGroup {
   readonly grants: readonly GrantRow[];
 }
 
+/** Somewhere to set a Worker secret. The value never reaches a command line. */
+export interface SecretStore {
+  put(name: string, value: string): Promise<void>;
+}
+
+/** What `autonomy-setup` needs beyond the store. Absent: the command refuses. */
+export interface AutonomySetupDeps {
+  /** The deployed hostname. Called only by `autonomy-setup`. */
+  hostname(): string;
+  /** Cryptographically random bytes. */
+  randomBytes(length: number): Uint8Array;
+  readonly secrets: SecretStore;
+}
+
 /** What `runGrants` needs from the world around it. */
 export interface GrantDeps {
   readonly kv: GrantStore;
@@ -98,7 +124,53 @@ export interface GrantDeps {
   write(text: string): void;
   /** Where refusals go. Defaults to `write`. */
   writeError?(text: string): void;
+  /** Only `autonomy-setup` reads this. */
+  readonly autonomy?: AutonomySetupDeps;
 }
+
+/** The library helpers `installAutonomyClientRecord` calls. */
+export interface ClientHelpers {
+  createClient(info: Record<string, unknown>): Promise<{ clientId: string }>;
+  updateClient(
+    clientId: string,
+    updates: { clientSecret: string },
+  ): Promise<unknown | null>;
+}
+
+export interface InstallAutonomyClientOptions {
+  /** The library's helpers over the SAME store as `kv`. */
+  readonly helpers: ClientHelpers;
+  readonly kv: GrantStore;
+  /** Exactly one (D-29). */
+  readonly redirectUris: readonly string[];
+  /** The value the library hashes onto the record. Never stored in the clear. */
+  readonly clientSecret: string;
+  /** Replace an existing autonomy client. Ends everyone's key. */
+  readonly replace?: boolean;
+}
+
+/**
+ * Create the autonomy client through the library and re-key it under the fixed
+ * id, leaving no random-id copy. The one place this project writes a client
+ * record; the test pool's autonomy fixture calls it too.
+ */
+export declare function installAutonomyClientRecord(
+  options: InstallAutonomyClientOptions,
+): Promise<{ kind: "installed"; replaced: boolean } | { kind: "exists" }>;
+
+/**
+ * Wrap a runner that feeds standard input as a secret store. The secret's name
+ * is the only thing on the command line; the value goes to standard input.
+ */
+export declare function createWranglerSecrets(
+  runWithInput: (args: readonly string[], input: string) => string,
+): SecretStore;
+
+/** The two Worker secrets `autonomy-setup` sets, by name. */
+export declare const AUTONOMY_SECRET_NAMES: readonly string[];
+
+/** What `--replace` costs, word for word. */
+export declare const REPLACE_ENDS_KEYS: string;
 
 /** The first sentence printed when `--yes` was not given. Plan 12-05 greps it. */
 export declare const NOTHING_REVOKED: string;

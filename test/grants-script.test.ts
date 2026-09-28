@@ -54,21 +54,37 @@
 
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { AUTONOMY_CLIENT_ID, AUTONOMY_CLIENT_NAME } from "../src/agent/autonomy-client";
+import {
+  AUTONOMY_CLIENT_ID,
+  AUTONOMY_CLIENT_NAME,
+  AUTONOMY_REDIRECT_PATH,
+} from "../src/agent/autonomy-client";
 import type { Env } from "../src/env";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 import { maskAppleId, userIdOf } from "../src/principal";
+import { getOAuthApi } from "@cloudflare/workers-oauth-provider";
 import {
+  AUTONOMY_SECRET_NAMES,
   NOTHING_PRUNED,
   NOTHING_REVOKED,
+  REPLACE_ENDS_KEYS,
+  USAGE,
   createWranglerKv,
+  createWranglerSecrets,
+  installAutonomyClientRecord,
   listGrants,
   orphanClientIds,
   prunedSummary,
   renderGrants,
   runGrants,
 } from "../scripts/grants-core.mjs";
-import type { GrantDeps, GrantGroup, GrantStore } from "../scripts/grants-core.mjs";
+import type {
+  AutonomySetupDeps,
+  GrantDeps,
+  GrantGroup,
+  GrantStore,
+} from "../scripts/grants-core.mjs";
+import { oauthProviderOptions } from "../src/auth/oauth";
 import { entryEnv } from "./fixtures/bound-secrets";
 import worker, {
   FAKE_APP_PASSWORD,
@@ -1924,5 +1940,478 @@ describe("AUTO-03, AUTO-04: the owner's listing marks autonomy grants by client 
     expect(out.text()).toContain("Deleted 1 client record");
     // The orphan listing never showed it as a candidate either.
     expect(out.text()).not.toContain(`${AUTONOMY_CLIENT_ID.slice(0, 8)}…`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The owner's autonomy setup (Phase 27, AUTO-03, D-05, D-07, D-18, D-29).
+//
+// Nothing here touches a real store or a real Worker. The setup runs against a
+// store double, or against a fake wrangler that records every argument list and
+// every standard-input value separately, so the one thing this command must
+// never do -- put a secret on a command line or on the screen -- is checked
+// against what was actually passed.
+// ---------------------------------------------------------------------------
+
+/** The one redirect URI the client must carry. */
+const AUTONOMY_REDIRECT = `https://${DEPLOYED_HOSTNAME}${AUTONOMY_REDIRECT_PATH}`;
+
+/** A store this case owns that can be written, and remembers each write's options. */
+function writableStore(records: Record<string, string> = {}): {
+  kv: GrantStore;
+  data: Map<string, string>;
+  puts: Array<{ name: string; options: unknown }>;
+} {
+  const data = new Map(Object.entries(records));
+  const puts: Array<{ name: string; options: unknown }> = [];
+  const kv: GrantStore = {
+    async list(options?: { prefix?: string }) {
+      const prefix = options?.prefix ?? "";
+      return {
+        keys: [...data.keys()]
+          .filter((name) => name.startsWith(prefix))
+          .sort()
+          .map((name) => ({ name })),
+        list_complete: true,
+      };
+    },
+    async get(name: string, options?: unknown) {
+      const value = data.get(name);
+      if (value === undefined) return null;
+      const type =
+        typeof options === "string" ? options : (options as { type?: string })?.type;
+      return type === "json" ? JSON.parse(value) : value;
+    },
+    async put(name: string, value: string, options?: unknown) {
+      puts.push({ name, options });
+      data.set(name, value);
+    },
+    async delete(name: string) {
+      data.delete(name);
+    },
+  };
+  return { kv, data, puts };
+}
+
+/** The library's hash of a client secret, computed here so it is not trusted. */
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** base64url with no padding, decoded, for checking the seal key's length. */
+function bytesOf(base64url: string): Uint8Array {
+  const padded =
+    base64url.replace(/-/g, "+").replace(/_/g, "/") +
+    "=".repeat((4 - (base64url.length % 4)) % 4);
+  return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+}
+
+/** A secret store that records names and values apart. */
+function recordingSecrets(): {
+  secrets: AutonomySetupDeps["secrets"];
+  set: Array<{ name: string; value: string }>;
+} {
+  const set: Array<{ name: string; value: string }> = [];
+  return {
+    set,
+    secrets: {
+      async put(name: string, value: string) {
+        set.push({ name, value });
+      },
+    },
+  };
+}
+
+/** The setup's own dependencies, with the pool's hostname and real randomness. */
+function setupDeps(secrets: AutonomySetupDeps["secrets"]): AutonomySetupDeps {
+  return {
+    hostname: () => DEPLOYED_HOSTNAME,
+    randomBytes: (length: number) => crypto.getRandomValues(new Uint8Array(length)),
+    secrets,
+  };
+}
+
+/**
+ * A fake wrangler. It serves the four `kv key` verbs from memory, and records
+ * every argument list, and every standard-input value, separately.
+ */
+function fakeWrangler(): {
+  run(args: readonly string[]): string;
+  runWithInput(args: readonly string[], input: string): string;
+  argumentLists: string[][];
+  inputs: Array<{ args: string[]; input: string }>;
+  data: Map<string, string>;
+} {
+  const data = new Map<string, string>();
+  const argumentLists: string[][] = [];
+  const inputs: Array<{ args: string[]; input: string }> = [];
+  return {
+    data,
+    argumentLists,
+    inputs,
+    run(args) {
+      argumentLists.push([...args]);
+      const verb = args[2];
+      if (args[0] !== "kv" || args[1] !== "key") throw new Error("not a kv command");
+      if (verb === "list") {
+        const prefix = args[args.indexOf("--prefix") + 1] ?? "";
+        return JSON.stringify(
+          [...data.keys()].filter((name) => name.startsWith(prefix)).map((name) => ({ name })),
+        );
+      }
+      if (verb === "get") {
+        const name = args[args.length - 1] as string;
+        const value = data.get(name);
+        if (value === undefined) throw new Error("no such key");
+        return value;
+      }
+      if (verb === "put") {
+        data.set(args[args.length - 2] as string, args[args.length - 1] as string);
+        return "";
+      }
+      if (verb === "delete") {
+        data.delete(args[args.length - 1] as string);
+        return "";
+      }
+      throw new Error("unknown kv verb");
+    },
+    runWithInput(args, input) {
+      argumentLists.push([...args]);
+      inputs.push({ args: [...args], input });
+      return "";
+    },
+  };
+}
+
+describe("AUTO-03: the owner's autonomy setup creates the client and sets both secrets unseen", () => {
+  it("installAutonomyClientRecord makes one client, under the fixed id, with the library's hash", async () => {
+    const { kv, data, puts } = writableStore();
+    const helpers = getOAuthApi(oauthProviderOptions, { OAUTH_KV: kv } as never);
+    const clientSecret = "a-known-test-client-secret-not-real";
+
+    const installed = await installAutonomyClientRecord({
+      helpers,
+      kv,
+      redirectUris: [AUTONOMY_REDIRECT],
+      clientSecret,
+      replace: false,
+    });
+    expect(installed).toEqual({ kind: "installed", replaced: false });
+
+    const client = await helpers.lookupClient(AUTONOMY_CLIENT_ID);
+    expect(client).not.toBeNull();
+    expect(client?.clientId).toBe(AUTONOMY_CLIENT_ID);
+    expect(client?.redirectUris).toEqual([AUTONOMY_REDIRECT]);
+    expect(client?.tokenEndpointAuthMethod).toBe("client_secret_basic");
+    expect(client?.grantTypes).toEqual(["authorization_code", "refresh_token"]);
+    expect(client?.responseTypes).toEqual(["code"]);
+    expect(client?.clientName).toBe(AUTONOMY_CLIENT_NAME);
+
+    // No random-id copy left behind (T-27-27).
+    expect([...data.keys()].filter((name) => name.startsWith("client:"))).toEqual([
+      `client:${AUTONOMY_CLIENT_ID}`,
+    ]);
+
+    // The library's hash of the value given, and never the value.
+    const stored = JSON.parse(data.get(`client:${AUTONOMY_CLIENT_ID}`) as string) as {
+      clientSecret?: string;
+    };
+    expect(stored.clientSecret).toBe(await sha256Hex(clientSecret));
+    expect(data.get(`client:${AUTONOMY_CLIENT_ID}`)).not.toContain(clientSecret);
+
+    // No write of a client record carried an expiry (T-27-26).
+    const clientPuts = puts.filter((put) => put.name.startsWith("client:"));
+    expect(clientPuts.length).toBeGreaterThanOrEqual(3);
+    for (const put of clientPuts) {
+      const options = put.options as { expiration?: unknown; expirationTtl?: unknown } | undefined;
+      expect(options?.expiration, put.name).toBeUndefined();
+      expect(options?.expirationTtl, put.name).toBeUndefined();
+    }
+  });
+
+  it("refuses when the client exists and changes nothing, unless replace is true", async () => {
+    const { kv, data } = writableStore();
+    const helpers = getOAuthApi(oauthProviderOptions, { OAUTH_KV: kv } as never);
+    await installAutonomyClientRecord({
+      helpers,
+      kv,
+      redirectUris: [AUTONOMY_REDIRECT],
+      clientSecret: "first-secret-not-real",
+      replace: false,
+    });
+    const before = new Map(data);
+
+    const refused = await installAutonomyClientRecord({
+      helpers,
+      kv,
+      redirectUris: [AUTONOMY_REDIRECT],
+      clientSecret: "second-secret-not-real",
+      replace: false,
+    });
+    expect(refused).toEqual({ kind: "exists" });
+    expect(new Map(data)).toEqual(before);
+
+    const replaced = await installAutonomyClientRecord({
+      helpers,
+      kv,
+      redirectUris: [AUTONOMY_REDIRECT],
+      clientSecret: "second-secret-not-real",
+      replace: true,
+    });
+    expect(replaced).toEqual({ kind: "installed", replaced: true });
+    const stored = JSON.parse(data.get(`client:${AUTONOMY_CLIENT_ID}`) as string) as {
+      clientSecret?: string;
+    };
+    expect(stored.clientSecret).toBe(await sha256Hex("second-secret-not-real"));
+    expect([...data.keys()].filter((name) => name.startsWith("client:"))).toEqual([
+      `client:${AUTONOMY_CLIENT_ID}`,
+    ]);
+  });
+
+  it("refuses anything but exactly one redirect URI (D-29)", async () => {
+    const { kv, data } = writableStore();
+    const helpers = getOAuthApi(oauthProviderOptions, { OAUTH_KV: kv } as never);
+    for (const redirectUris of [[], [AUTONOMY_REDIRECT, `${AUTONOMY_REDIRECT}/2`]]) {
+      await expect(
+        installAutonomyClientRecord({
+          helpers,
+          kv,
+          redirectUris,
+          clientSecret: "a-secret-not-real",
+        }),
+      ).rejects.toThrow();
+    }
+    expect(data.size).toBe(0);
+  });
+
+  it("autonomy-setup without --yes says what it would do and changes nothing", async () => {
+    const { kv, data, puts } = writableStore();
+    const { secrets, set } = recordingSecrets();
+    const out = sink();
+
+    const code = await runGrants(["autonomy-setup"], {
+      kv,
+      async knownAddresses() {
+        return [];
+      },
+      write: out.write,
+      writeError: out.write,
+      autonomy: setupDeps(secrets),
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain(`Would create the autonomy client ${AUTONOMY_CLIENT_ID}`);
+    expect(out.text()).toContain(AUTONOMY_REDIRECT);
+    expect(out.text()).toContain("AUTONOMY_CLIENT_SECRET");
+    expect(out.text()).toContain("AUTONOMY_SEAL_KEY");
+    expect(out.text()).toContain("Nothing was changed");
+    expect(puts).toEqual([]);
+    expect(data.size).toBe(0);
+    expect(set).toEqual([]);
+  });
+
+  it("autonomy-setup --yes writes the client with no expiry, over the script's own options", async () => {
+    // The script builds its helpers over its OWN minimal options, not the
+    // Worker's. Without `clientRegistrationTTL: undefined` there, the library's
+    // 90-day default reaches `updateClient` and the record would lapse.
+    const { kv, data, puts } = writableStore();
+    const { secrets, set } = recordingSecrets();
+    const out = sink();
+
+    const code = await runGrants(["autonomy-setup", "--yes"], {
+      kv,
+      async knownAddresses() {
+        return [];
+      },
+      write: out.write,
+      writeError: out.write,
+      autonomy: setupDeps(secrets),
+    });
+    expect(`${code} ${out.text()}`).toBe(`0 ${out.text()}`);
+
+    const clientPuts = puts.filter((put) => put.name.startsWith("client:"));
+    expect(clientPuts.length).toBeGreaterThanOrEqual(3);
+    for (const put of clientPuts) {
+      const options = put.options as { expiration?: unknown; expirationTtl?: unknown } | undefined;
+      expect(options?.expiration, put.name).toBeUndefined();
+      expect(options?.expirationTtl, put.name).toBeUndefined();
+    }
+    expect([...data.keys()]).toEqual([`client:${AUTONOMY_CLIENT_ID}`]);
+
+    // The secret the Worker is given is the one the record's hash is of.
+    const clientSecret = set.find((entry) => entry.name === "AUTONOMY_CLIENT_SECRET")?.value;
+    expect(typeof clientSecret).toBe("string");
+    const stored = JSON.parse(data.get(`client:${AUTONOMY_CLIENT_ID}`) as string) as {
+      clientSecret?: string;
+      redirectUris?: string[];
+    };
+    expect(stored.clientSecret).toBe(await sha256Hex(clientSecret as string));
+    expect(stored.redirectUris).toEqual([AUTONOMY_REDIRECT]);
+  });
+
+  it("autonomy-setup --yes puts each secret on standard input only, and never shows one", async () => {
+    const wrangler = fakeWrangler();
+    const out = sink();
+
+    const code = await runGrants(["autonomy-setup", "--yes"], {
+      kv: createWranglerKv(wrangler.run, "OAUTH_KV"),
+      async knownAddresses() {
+        return [];
+      },
+      write: out.write,
+      writeError: out.write,
+      autonomy: setupDeps(createWranglerSecrets(wrangler.runWithInput)),
+    });
+    expect(`${code} ${out.text()}`).toBe(`0 ${out.text()}`);
+
+    // Exactly two secret puts, by name, in this order, each value on stdin.
+    expect(wrangler.inputs.map((entry) => entry.args)).toEqual([
+      ["secret", "put", "AUTONOMY_CLIENT_SECRET"],
+      ["secret", "put", "AUTONOMY_SEAL_KEY"],
+    ]);
+    expect(AUTONOMY_SECRET_NAMES).toEqual(["AUTONOMY_CLIENT_SECRET", "AUTONOMY_SEAL_KEY"]);
+    const clientSecret = wrangler.inputs[0]?.input as string;
+    const sealKey = wrangler.inputs[1]?.input as string;
+    // Non-vacuity: `not.toContain("")` would be true of anything.
+    expect(clientSecret.length).toBeGreaterThan(0);
+    expect(sealKey.length).toBeGreaterThan(0);
+    expect(clientSecret).not.toBe(sealKey);
+    expect(bytesOf(sealKey)).toHaveLength(32);
+    expect(bytesOf(clientSecret)).toHaveLength(32);
+    expect(sealKey).toMatch(/^[A-Za-z0-9_-]+$/);
+
+    // Neither value on any command line, and neither on the screen (T-27-23).
+    for (const args of wrangler.argumentLists) {
+      for (const arg of args) {
+        expect(arg).not.toContain(clientSecret);
+        expect(arg).not.toContain(sealKey);
+      }
+    }
+    expect(out.text()).not.toContain(clientSecret);
+    expect(out.text()).not.toContain(sealKey);
+    // The names are printed, and so is the client id.
+    expect(out.text()).toContain("AUTONOMY_CLIENT_SECRET");
+    expect(out.text()).toContain("AUTONOMY_SEAL_KEY");
+    expect(out.text()).toContain(AUTONOMY_CLIENT_ID);
+
+    // Every store command carried the binding and the remote flag, and no write
+    // carried an expiry.
+    const kvCommands = wrangler.argumentLists.filter((args) => args[0] === "kv");
+    expect(kvCommands.length).toBeGreaterThan(0);
+    for (const args of kvCommands) {
+      expect(args).toContain("--remote");
+      expect(args.slice(3, 5)).toEqual(["--binding", "OAUTH_KV"]);
+      expect(args).not.toContain("--ttl");
+      expect(args).not.toContain("--expiration");
+    }
+    expect(kvCommands.some((args) => args[2] === "put")).toBe(true);
+
+    // One client record, under the fixed id, holding the hash of the value the
+    // Worker was given.
+    expect([...wrangler.data.keys()]).toEqual([`client:${AUTONOMY_CLIENT_ID}`]);
+    const stored = JSON.parse(wrangler.data.get(`client:${AUTONOMY_CLIENT_ID}`) as string) as {
+      clientSecret?: string;
+    };
+    expect(stored.clientSecret).toBe(await sha256Hex(clientSecret));
+  });
+
+  it("autonomy-setup --yes refuses an existing client and says what --replace costs", async () => {
+    const { kv: seeded, data } = writableStore();
+    await installAutonomyClientRecord({
+      helpers: getOAuthApi(oauthProviderOptions, { OAUTH_KV: seeded } as never),
+      kv: seeded,
+      redirectUris: [AUTONOMY_REDIRECT],
+      clientSecret: "the-existing-secret-not-real",
+    });
+    const before = new Map(data);
+    const { secrets, set } = recordingSecrets();
+    const out = sink();
+    const deps: GrantDeps = {
+      kv: seeded,
+      async knownAddresses() {
+        return [];
+      },
+      write: out.write,
+      writeError: out.write,
+      autonomy: setupDeps(secrets),
+    };
+
+    expect(await runGrants(["autonomy-setup", "--yes"], deps)).toBe(1);
+    expect(out.text()).toContain("already exists");
+    expect(out.text()).toContain(REPLACE_ENDS_KEYS);
+    expect(REPLACE_ENDS_KEYS).toBe(
+      "--replace ends everyone's autonomy key until their next sign-in.",
+    );
+    expect(new Map(data)).toEqual(before);
+    expect(set).toEqual([]);
+
+    const replaced = sink();
+    expect(
+      await runGrants(["autonomy-setup", "--replace", "--yes"], { ...deps, write: replaced.write }),
+    ).toBe(0);
+    expect(replaced.text()).toContain(`Replaced the autonomy client ${AUTONOMY_CLIENT_ID}`);
+    expect(replaced.text()).toContain("Every stored autonomy key has stopped working");
+    expect(set.map((entry) => entry.name)).toEqual([
+      "AUTONOMY_CLIENT_SECRET",
+      "AUTONOMY_SEAL_KEY",
+    ]);
+    const stored = JSON.parse(data.get(`client:${AUTONOMY_CLIENT_ID}`) as string) as {
+      clientSecret?: string;
+    };
+    expect(stored.clientSecret).toBe(await sha256Hex(set[0]?.value as string));
+    expect([...data.keys()]).toEqual([`client:${AUTONOMY_CLIENT_ID}`]);
+  });
+
+  it("refuses --replace elsewhere, and a target on autonomy-setup, without touching the store", async () => {
+    for (const argv of [
+      ["list", "--replace"],
+      ["revoke", "some-grant-id", "--replace", "--yes"],
+      ["prune-clients", "--replace"],
+      ["autonomy-setup", "some-id"],
+      ["autonomy-setup", "--address", "someone@example.invalid"],
+      ["autonomy-setup", "--legacy-owner"],
+    ]) {
+      const calls: string[] = [];
+      const out = sink();
+      const code = await runGrants(argv, refusingDeps(calls, out));
+      expect(code, `${argv.join(" ")} was not refused`).toBe(2);
+      expect(calls, `${argv.join(" ")} reached the store`).toEqual([]);
+    }
+  });
+
+  it("autonomy-setup refuses when it has no way to set secrets, before any store call", async () => {
+    const calls: string[] = [];
+    const out = sink();
+    const code = await runGrants(["autonomy-setup", "--yes"], refusingDeps(calls, out));
+    expect(code).toBe(1);
+    expect(calls).toEqual([]);
+    expect(out.text()).toContain("Nothing was changed");
+  });
+
+  it("the store adapter refuses an expiring write, and reads back its own write", async () => {
+    const seen: string[][] = [];
+    const kv = createWranglerKv((args) => {
+      seen.push([...args]);
+      return "";
+    }, "OAUTH_KV");
+
+    await expect(kv.put?.("client:x", "{}", { expirationTtl: 60 })).rejects.toThrow();
+    await expect(kv.put?.("client:x", "{}", { expiration: 1_900_000_000 })).rejects.toThrow();
+    expect(seen).toEqual([]);
+
+    await kv.put?.("client:x", '{"clientId":"x"}');
+    expect(seen).toEqual([
+      ["kv", "key", "put", "--binding", "OAUTH_KV", "--remote", "client:x", '{"clientId":"x"}'],
+    ]);
+    // Served from memory: the remote store may not show a fresh write to a
+    // read for up to a minute, and the setup reads back what it just wrote.
+    expect(await kv.get("client:x", { type: "json" })).toEqual({ clientId: "x" });
+    expect(seen).toHaveLength(1);
+  });
+
+  it("names autonomy-setup in the usage text", () => {
+    expect(USAGE).toContain("autonomy-setup [--replace] [--yes]");
+    expect(USAGE).toContain(REPLACE_ENDS_KEYS);
   });
 });

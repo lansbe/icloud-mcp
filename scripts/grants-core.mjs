@@ -64,12 +64,23 @@
 // chooses. The id comes from `src/agent/autonomy-client.ts`, a leaf that imports
 // nothing, so it is spelled once for the Worker and this script alike.
 //
+// **And one thing it can create: the autonomy client (Phase 27, D-18).**
+// `installAutonomyClientRecord` is the one place this project writes a client
+// record, and `autonomy-setup` is the one command that calls it. The same
+// command sets the two Worker secrets through standard input, via
+// `createWranglerSecrets`, and neither value is ever returned, printed, or put
+// on a command line. The test pool's autonomy fixture calls the same function.
+//
 // The full grant id IS printed. It is needed to revoke, and it is not a
 // credential on its own — an access token is `userId:grantId:secret` and the
 // secret is the part that is never stored in the clear anywhere.
 
 import { getOAuthApi } from "@cloudflare/workers-oauth-provider";
-import { AUTONOMY_CLIENT_ID } from "../src/agent/autonomy-client";
+import {
+  AUTONOMY_CLIENT_ID,
+  AUTONOMY_CLIENT_NAME,
+  AUTONOMY_REDIRECT_PATH,
+} from "../src/agent/autonomy-client";
 import { maskAppleId, userIdOf } from "../src/principal";
 
 /** The store's user segment for a grant made before this milestone. */
@@ -132,6 +143,13 @@ const KEPT_CLAIMED_CLIENT =
 const NOTHING_FOUND =
   "No grants found. This read the REMOTE store, not the local simulator.";
 
+/**
+ * What `--replace` costs, word for word. Printed in the refusal and after a
+ * replace, and compared against this export by the test.
+ */
+export const REPLACE_ENDS_KEYS =
+  "--replace ends everyone's autonomy key until their next sign-in.";
+
 /** Every usage form, in one place, so the entry's --help is not a second copy. */
 export const USAGE = [
   "List and revoke the grants that let a Claude app reach this server.",
@@ -143,7 +161,14 @@ export const USAGE = [
   "  node scripts/grants.mjs revoke --address <a> [--yes]",
   "  node scripts/grants.mjs revoke --legacy-owner [--yes]",
   "  node scripts/grants.mjs prune-clients [--yes]",
+  "  node scripts/grants.mjs autonomy-setup [--replace] [--yes]",
   "  node scripts/grants.mjs --help",
+  "",
+  "autonomy-setup creates the autonomy client and sets its two Worker secrets,",
+  "AUTONOMY_CLIENT_SECRET and AUTONOMY_SEAL_KEY, through standard input. It",
+  "never prints either one. Setting a secret deploys a new version of the Worker,",
+  "and from then on every sign-in also arms that person's autonomy key. It",
+  "refuses if the client exists. " + REPLACE_ENDS_KEYS,
   "",
   "prune-clients deletes client registrations that NO grant names. Registration",
   "is unauthenticated and a client record never expires, so they accumulate. A",
@@ -182,6 +207,41 @@ const ADDRESS_REFUSED =
 const NO_TARGETS = "No grants match that target. Nothing was revoked.";
 const READS_INCOMPLETE =
   "Some records could not be read, so the listing above may be incomplete.";
+const REPLACE_ONLY_FOR_SETUP = "--replace means something only for autonomy-setup.";
+const SETUP_TAKES_NO_TARGET =
+  "autonomy-setup takes no grant id, no --address and no --legacy-owner.";
+
+/** Fixed sentences for the store adapter. Neither carries the value. */
+const EXPIRING_WRITE =
+  "This store never writes a record that expires. Nothing was written.";
+const NOT_TEXT = "Only text can be written to the store. Nothing was written.";
+
+/** The two Worker secrets the autonomy setup sets. Names only, never values. */
+export const AUTONOMY_SECRET_NAMES = Object.freeze([
+  "AUTONOMY_CLIENT_SECRET",
+  "AUTONOMY_SEAL_KEY",
+]);
+
+/** Random bytes in each generated secret. The seal key must be exactly 32. */
+const SECRET_BYTES = 32;
+
+const SETUP_EXISTS =
+  "The autonomy client already exists, so nothing was changed. Run again with " +
+  "--replace --yes to replace it. " +
+  REPLACE_ENDS_KEYS;
+const SETUP_NOT_WIRED =
+  "This run cannot set up autonomy: it was given no way to set secrets. " +
+  "Nothing was changed.";
+const SETUP_NO_HOSTNAME =
+  "Could not read the deployed hostname from the local wrangler.jsonc, so the " +
+  "client's redirect address cannot be built. Nothing was changed.";
+const SETUP_CLIENT_FAILED =
+  "The autonomy client could not be written, and no secret was set. Run this " +
+  "again. If it then says the client exists, run it with --replace --yes.";
+const SETUP_SECRET_FAILED =
+  "The client record was written but a secret could not be set, so autonomy " +
+  "is not working yet. Run this again with --replace --yes. Nobody holds a key " +
+  "that this could break until both secrets are set.";
 
 /**
  * A string safe to put in a terminal: control characters replaced, length cut.
@@ -372,6 +432,16 @@ function minimalOptions() {
     defaultHandler: handler,
     authorizeEndpoint: "/authorize",
     tokenEndpoint: "/oauth/token",
+    // EXPLICITLY undefined, and the key must stay present (T-27-26). The library
+    // builds its options by spreading these over its own defaults, and a spread
+    // copies an own key even when its value is undefined — the same trick
+    // `src/auth/oauth.ts` relies on. Without this key the library's default of
+    // 90 days applies, and `updateClient`, which the autonomy setup calls, would
+    // write the autonomy client's record with that expiry. The record would then
+    // vanish three months later and every stored key would answer
+    // `invalid_client`. The store adapter below refuses an expiring write as
+    // well, so a missing key here fails loudly rather than quietly.
+    clientRegistrationTTL: undefined,
   };
 }
 
@@ -383,7 +453,7 @@ function minimalOptions() {
  * too, and the reason it exists is that such an object is shared.
  *
  * @param {import("./grants-core.d.mts").GrantStore} kv
- * @returns {{ listUserGrants: Function, revokeGrant: Function }}
+ * @returns {{ listUserGrants: Function, revokeGrant: Function, createClient: Function, updateClient: Function, lookupClient: Function }}
  */
 function helpersOver(kv) {
   return getOAuthApi(minimalOptions(), { OAUTH_KV: kv });
@@ -413,6 +483,11 @@ function helpersOver(kv) {
  */
 export function createWranglerKv(run, binding) {
   let failures = 0;
+  // Values THIS process wrote, served back to its own reads. The remote store
+  // may take up to a minute to show a write to a read, and the autonomy setup
+  // reads back the record the library has just written. Only a `put` fills it;
+  // a `delete` empties that one entry and then asks the store, as before.
+  const written = new Map();
 
   return {
     async list(options) {
@@ -438,6 +513,10 @@ export function createWranglerKv(run, binding) {
     },
 
     async get(name, options) {
+      if (written.has(name)) {
+        const value = written.get(name);
+        return options?.type === "json" ? JSON.parse(value) : value;
+      }
       let output;
       try {
         output = run([
@@ -470,13 +549,268 @@ export function createWranglerKv(run, binding) {
     },
 
     async delete(name) {
+      written.delete(name);
       run(["kv", "key", "delete", "--binding", binding, "--remote", name]);
+    },
+
+    /**
+     * Write one value. The ONLY value this ever carries is a client record,
+     * written by the autonomy setup. A client record holds the library's hash of
+     * the client secret and never the secret itself, which is why it may sit on
+     * a command line at all. The two secrets never pass through here: they go to
+     * `createWranglerSecrets`, on standard input.
+     *
+     * It refuses an expiring write rather than dropping the expiry (T-27-26).
+     * Nothing in this project writes a client record that expires, and one that
+     * did would end every stored key when it lapsed.
+     */
+    async put(name, value, options) {
+      if (
+        options?.expirationTtl !== undefined ||
+        options?.expiration !== undefined
+      ) {
+        throw new Error(EXPIRING_WRITE);
+      }
+      if (typeof value !== "string") throw new Error(NOT_TEXT);
+      run(["kv", "key", "put", "--binding", binding, "--remote", name, value]);
+      written.set(name, value);
     },
 
     readFailures() {
       return failures;
     },
   };
+}
+
+/**
+ * Wrap a runner that feeds standard input as a way to set Worker secrets.
+ *
+ * `runWithInput(args, input)` runs the repository's own pinned wrangler with
+ * `input` as its standard input, captures every output stream, and throws one
+ * fixed sentence on failure. The secret's NAME is the only thing on the command
+ * line. The VALUE goes only to standard input, so it never appears in the
+ * process list, in the terminal, or in the scrollback (T-27-23). wrangler reads
+ * a secret from standard input whenever that is not a terminal.
+ *
+ * @param {(args: readonly string[], input: string) => string} runWithInput
+ * @returns {import("./grants-core.d.mts").SecretStore}
+ */
+export function createWranglerSecrets(runWithInput) {
+  return {
+    async put(name, value) {
+      runWithInput(["secret", "put", name], value);
+    },
+  };
+}
+
+/**
+ * Bytes as base64url with no padding, the form the Worker decodes the seal key
+ * from. Written with the web platform's own `btoa`, so this file still imports
+ * nothing from Node and still loads in the Workers pool.
+ *
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
+function base64UrlFromBytes(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * Whether the autonomy client's record is in the store.
+ *
+ * LISTED, never read. Under the wrangler adapter a read of a key that is not
+ * there is a failed command, which the adapter counts and answers with null —
+ * the same answer a transient failure gets. Reading it would let one hiccup
+ * make an existing client look absent, and the setup would then replace it
+ * without `--replace` and end everyone's key. A listing that fails throws
+ * instead, and the setup stops.
+ *
+ * @param {import("./grants-core.d.mts").GrantStore} kv
+ * @returns {Promise<boolean>}
+ */
+async function autonomyClientExists(kv) {
+  const name = `client:${AUTONOMY_CLIENT_ID}`;
+  return (await allKeysUnder(kv, name)).includes(name);
+}
+
+/**
+ * Create the autonomy client and put it under its fixed id. The ONE place this
+ * project writes a client record.
+ *
+ * **Why a re-key.** The library's own client creation always picks a random
+ * sixteen-character id, so no registration can ever produce the fixed id — which
+ * is exactly what makes the id safe to label and exempt by. So the client is
+ * made through the library's `createClient`, which gives it the library's own
+ * record shape, and then that one record is written again under
+ * `client:<AUTONOMY_CLIENT_ID>` with its id field rewritten, and the random-id
+ * copy is deleted. Last, `updateClient` sets the secret, so the library stores
+ * its OWN hash of `clientSecret`. The secret `createClient` generated is never
+ * used and never returned.
+ *
+ * **One redirect URI (D-29).** On this server's origin, never served, and never
+ * visited by a browser. Anything but exactly one is refused.
+ *
+ * **It refuses** when the fixed id already exists, unless `replace` is true, and
+ * then it changes nothing.
+ *
+ * The test pool's autonomy fixture (`test/fixtures/autonomy-client.ts`) calls
+ * this too, so the procedure the tests exercise is the one the owner runs.
+ *
+ * `helpers` must be the library's helpers over the SAME `kv`.
+ *
+ * @param {import("./grants-core.d.mts").InstallAutonomyClientOptions} options
+ * @returns {Promise<{ kind: "installed", replaced: boolean } | { kind: "exists" }>}
+ */
+export async function installAutonomyClientRecord({
+  helpers,
+  kv,
+  redirectUris,
+  clientSecret,
+  replace,
+}) {
+  if (!Array.isArray(redirectUris) || redirectUris.length !== 1) {
+    throw new Error("The autonomy client carries exactly one redirect URI.");
+  }
+  if (typeof clientSecret !== "string" || clientSecret.length === 0) {
+    throw new Error("The autonomy client needs a client secret.");
+  }
+  if (typeof kv.put !== "function") {
+    throw new Error("This store cannot be written.");
+  }
+
+  const exists = await autonomyClientExists(kv);
+  if (exists && replace !== true) return { kind: "exists" };
+
+  const created = await helpers.createClient({
+    clientName: AUTONOMY_CLIENT_NAME,
+    redirectUris: [...redirectUris],
+    tokenEndpointAuthMethod: "client_secret_basic",
+    grantTypes: ["authorization_code", "refresh_token"],
+    responseTypes: ["code"],
+  });
+
+  const randomKey = `client:${created.clientId}`;
+  const record = await kv.get(randomKey, { type: "json" });
+  if (record === null || typeof record !== "object") {
+    throw new Error("The created client record was not found.");
+  }
+  await kv.put(
+    `client:${AUTONOMY_CLIENT_ID}`,
+    JSON.stringify({ ...record, clientId: AUTONOMY_CLIENT_ID }),
+  );
+  await kv.delete(randomKey);
+
+  const updated = await helpers.updateClient(AUTONOMY_CLIENT_ID, { clientSecret });
+  if (updated === null) {
+    throw new Error("The re-keyed client record was not found.");
+  }
+  return { kind: "installed", replaced: exists };
+}
+
+/**
+ * `autonomy-setup [--replace] [--yes]`: create the client and set both secrets.
+ *
+ * Order: check the client, then (with `--yes`) generate both values, write the
+ * client record, and set the two secrets. Everything it prints is a fixed
+ * sentence, the client id, or a secret's NAME. Neither generated value is ever
+ * passed to `write` or `writeError`, and neither is ever returned.
+ *
+ * @param {Record<string, unknown>} asked
+ * @param {import("./grants-core.d.mts").GrantDeps} deps
+ * @param {(text: string) => void} write
+ * @param {(text: string) => void} writeError
+ * @returns {Promise<number>}
+ */
+async function runAutonomySetup(asked, deps, write, writeError) {
+  const autonomy = deps.autonomy;
+  if (autonomy === undefined) {
+    writeError(`${SETUP_NOT_WIRED}\n`);
+    return EXIT_FAILED;
+  }
+
+  let hostname;
+  try {
+    hostname = autonomy.hostname();
+  } catch {
+    hostname = undefined;
+  }
+  if (typeof hostname !== "string" || !/^[A-Za-z0-9.-]+$/.test(hostname)) {
+    writeError(`${SETUP_NO_HOSTNAME}\n`);
+    return EXIT_FAILED;
+  }
+  const redirectUri = `https://${hostname}${AUTONOMY_REDIRECT_PATH}`;
+
+  const exists = await autonomyClientExists(deps.kv);
+  if (exists && !asked.replace) {
+    writeError(`${SETUP_EXISTS}\n`);
+    return EXIT_FAILED;
+  }
+
+  const plan = [
+    exists
+      ? `Would replace the autonomy client ${AUTONOMY_CLIENT_ID}.`
+      : `Would create the autonomy client ${AUTONOMY_CLIENT_ID}.`,
+    `Its one redirect address: ${redirectUri} (never served).`,
+    `Would set two Worker secrets: ${AUTONOMY_SECRET_NAMES.join(" and ")}.`,
+    "Setting a secret deploys a new version of the Worker.",
+  ];
+  if (exists) plan.push(REPLACE_ENDS_KEYS);
+  if (!asked.yes) {
+    write(`${plan.join("\n")}\nNothing was changed. Re-run with --yes to do this.\n`);
+    return EXIT_OK;
+  }
+
+  const clientSecret = base64UrlFromBytes(autonomy.randomBytes(SECRET_BYTES));
+  const sealKey = base64UrlFromBytes(autonomy.randomBytes(SECRET_BYTES));
+
+  let installed;
+  try {
+    installed = await installAutonomyClientRecord({
+      helpers: helpersOver(deps.kv),
+      kv: deps.kv,
+      redirectUris: [redirectUri],
+      clientSecret,
+      replace: asked.replace === true,
+    });
+  } catch {
+    // Never read the caught value: under the wrangler adapter it carries that
+    // command's own output.
+    writeError(`${SETUP_CLIENT_FAILED}\n`);
+    return EXIT_FAILED;
+  }
+  if (installed.kind === "exists") {
+    // Somebody created it between the check above and this call.
+    writeError(`${SETUP_EXISTS}\n`);
+    return EXIT_FAILED;
+  }
+
+  try {
+    await autonomy.secrets.put(AUTONOMY_SECRET_NAMES[0], clientSecret);
+    await autonomy.secrets.put(AUTONOMY_SECRET_NAMES[1], sealKey);
+  } catch {
+    // Never read the caught value: it carries wrangler's own output.
+    writeError(`${SETUP_SECRET_FAILED}\n`);
+    return EXIT_FAILED;
+  }
+
+  const done = [
+    installed.replaced
+      ? `Replaced the autonomy client ${AUTONOMY_CLIENT_ID}.`
+      : `Created the autonomy client ${AUTONOMY_CLIENT_ID}.`,
+    `Set two Worker secrets: ${AUTONOMY_SECRET_NAMES.join(" and ")}. Neither ` +
+      "was printed, and neither was put on a command line.",
+    "From now on every sign-in also arms that person's autonomy key.",
+  ];
+  if (installed.replaced) {
+    done.push(
+      "Every stored autonomy key has stopped working. Each person gets a new " +
+        "one at their next sign-in.",
+    );
+  }
+  write(`${done.join("\n")}\n`);
+  return EXIT_OK;
 }
 
 /**
@@ -792,7 +1126,12 @@ function readArguments(argv) {
   if (rest.length > 0 && !String(rest[0]).startsWith("-")) {
     command = String(rest.shift());
   }
-  if (command !== "list" && command !== "revoke" && command !== "prune-clients") {
+  if (
+    command !== "list" &&
+    command !== "revoke" &&
+    command !== "prune-clients" &&
+    command !== "autonomy-setup"
+  ) {
     return { error: UNKNOWN_COMMAND };
   }
 
@@ -800,6 +1139,7 @@ function readArguments(argv) {
   const addresses = [];
   let legacyOwner = false;
   let yes = false;
+  let replace = false;
 
   // A FLAG IS RECOGNISED BY ITS EXACT SPELLING, NEVER BY A LEADING DASH, AND
   // THE DASH COUNT IS THE WHOLE OF THE FALLBACK TEST.
@@ -843,6 +1183,10 @@ function readArguments(argv) {
         legacyOwner = true;
         continue;
       }
+      if (token === "--replace") {
+        replace = true;
+        continue;
+      }
       if (token === "--address") {
         const value = rest.shift();
         // The guard is on the VALUE being the next flag rather than on it
@@ -861,6 +1205,17 @@ function readArguments(argv) {
       if (token.startsWith("--")) return { error: UNKNOWN_FLAG };
     }
     ids.push(token);
+  }
+
+  // `--replace` is the one flag that ends everyone's key, so it means nothing
+  // anywhere else and is refused rather than ignored there.
+  if (replace && command !== "autonomy-setup") {
+    return { error: REPLACE_ONLY_FOR_SETUP };
+  }
+  if (command === "autonomy-setup") {
+    if (ids.length > 0 || addresses.length > 0 || legacyOwner) {
+      return { error: SETUP_TAKES_NO_TARGET };
+    }
   }
 
   if (command === "list") {
@@ -890,7 +1245,7 @@ function readArguments(argv) {
     return { error: REVOKE_NEEDS_TARGET };
   }
 
-  return { command, ids, addresses, legacyOwner, yes };
+  return { command, ids, addresses, legacyOwner, yes, replace };
 }
 
 /**
@@ -1105,6 +1460,11 @@ export async function runGrants(argv, deps) {
   if (asked.error !== undefined) {
     writeError(`${asked.error}\n\n${USAGE}\n`);
     return EXIT_USAGE;
+  }
+
+  // Before any grant is listed: the setup reads nothing but the one client key.
+  if (asked.command === "autonomy-setup") {
+    return runAutonomySetup(asked, deps, write, writeError);
   }
 
   const addresses = [
