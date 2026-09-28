@@ -207,7 +207,6 @@ it costs.
 These numbers are the constants in `src/recall/retention.ts`, and a check keeps
 this section equal to them.
 
-<!-- DRAFT: awaiting owner approval in 27-06 -->
 ### Autonomy (inherent)
 
 Autonomy is inherent. Every sign-in also makes a second sign-in, just for
@@ -254,7 +253,6 @@ their app-specific password at account.apple.com.** Nothing on a timer protects
 the password: the key has no expiry, and an app-specific password opens the
 whole mail account.
 
-<!-- DRAFT: awaiting owner approval in 28-07 -->
 ### Autonomous rules
 
 - What the job can do: flag a message, and place a draft reply to its sender.
@@ -274,8 +272,14 @@ whole mail account.
   address, to mailing-list mail, or when the From line has no usable address.
 - Limits: 10 flags and 3 replies a run, 10 replies a day, 20 rules. A reply is
   two iCloud sessions.
-- If iCloud refuses the sign-in twice in a row, the job drops that person's key.
-  Their next sign-in makes a new one, and their rules run again.
+- If Apple twice refuses the password itself, the two refusals at least one
+  wake apart, the job drops that person's key. Their next sign-in makes a new
+  one, and their rules run again. An iCloud outage, a server error, or a
+  refusal that does not name the password never counts: the job waits longer
+  between tries instead, up to a day, and makes no sign-in attempt while it
+  waits.
+- When a person holds no sign-in of any kind, seen on two checks a day apart,
+  their rules, activity and job state are deleted.
 - How to stop it: the person removes every rule. The owner revokes the person's
   key or access, or takes them off the allow list.
 - Where to see it: `rules_list` for the person; `grants.mjs list` for the owner

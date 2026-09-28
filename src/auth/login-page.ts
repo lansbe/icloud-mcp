@@ -486,7 +486,7 @@ export const AUTONOMY_NOTICE: SignInNotice = {
   heading: "It also works while you are away",
   lines: [
     "Signing in also lets this server open your iCloud mail on its own, when you are not there. This is part of signing in, for everyone. There is no separate switch.",
-    "It acts only on rules you write yourself. With no rules, it does nothing with your mail.",
+    "It acts only on rules you write yourself. With no rules, it takes no action on your mail.",
     "It can only flag a message or put a draft in your Drafts folder. It never sends, deletes or moves mail.",
     "It lasts as long as your connection to this server. When the connection is removed, it stops too.",
     "To stop it, delete your app-specific password at account.apple.com, or ask the person who runs this server to remove you.",
