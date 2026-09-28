@@ -48,10 +48,20 @@ export type SweepOutcome = "done" | "incomplete";
  */
 export type KeyStanding = "standing" | "revoked" | "connection_ended" | "unknown";
 
+/**
+ * How long, in seconds, the library keeps a grant whose code has not been
+ * exchanged: its code record is written with a ten-minute expiry. A grant
+ * younger than this may belong to a sign-in whose arm has not reached the
+ * object yet (review WR-01).
+ */
+export const AUTONOMY_CODE_LIFETIME_SECONDS = 600;
+
 /** One listed grant, as much of its summary as autonomy reads. */
 interface ListedGrant {
   readonly id: string;
   readonly clientId: string;
+  /** Seconds since the epoch, or null when the summary carried none. */
+  readonly createdAt: number | null;
 }
 
 /**
@@ -96,10 +106,12 @@ async function everyGrantOf(kv: KVNamespace, userId: string): Promise<ListedGran
       const items: unknown = result?.items;
       if (!Array.isArray(items)) return null;
       for (const item of items) {
-        const summary = item as { id?: unknown; clientId?: unknown } | null;
+        const summary = item as { id?: unknown; clientId?: unknown; createdAt?: unknown } | null;
+        const createdAt = summary?.createdAt;
         grants.push({
           id: typeof summary?.id === "string" ? summary.id : "",
           clientId: typeof summary?.clientId === "string" ? summary.clientId : "",
+          createdAt: typeof createdAt === "number" && Number.isFinite(createdAt) ? createdAt : null,
         });
       }
       if (typeof result.cursor !== "string" || result.cursor.length === 0) return grants;
@@ -120,6 +132,24 @@ async function everyGrantOf(kv: KVNamespace, userId: string): Promise<ListedGran
  * queue: those are other sign-ins still in flight, and revoking one would make
  * that arm fail and end the person's key (D-27).
  *
+ * A SUCCESSFUL ARM'S SWEEP (a `keepGrantId` given) also leaves every autonomy
+ * grant created less than `AUTONOMY_CODE_LIFETIME_SECONDS` before `nowSeconds`
+ * (review WR-01). `alsoKeep` covers a sibling sign-in only once its arm has
+ * reached the object. Its grant exists earlier than that: the sign-in mints it,
+ * builds its answer, and only then sends the arm. The Claude client submits the
+ * form twice, about 1.4 seconds apart, so a first arm's sweep regularly lands in
+ * that window. Revoking the sibling's grant there makes the sibling's arm fail,
+ * and its fail-toward-off then ends the first arm's key too, so the person is
+ * left with none. A young grant that is left alone is either about to be armed,
+ * or was never exchanged and ends by itself when its code record expires. The
+ * grant a re-arm replaced is revoked by id instead (`revokeAutonomyGrant`), so
+ * this age rule does not keep it alive. A grant with no readable `createdAt` is
+ * treated as old.
+ *
+ * A sweep that ENDS the key (`keepGrantId` null: a failed arm, the standing
+ * check, the alarm job) leaves only `alsoKeep`. It does not apply the age rule,
+ * because leaving young grants there could leave a live grant with no record.
+ *
  * Revokes one at a time, through the library's own revoke, which deletes the
  * grant and every token under it. Answers `done`, or `incomplete` when the
  * listing failed or any revoke rejected. An incomplete sweep is not a failure
@@ -131,6 +161,7 @@ export async function sweepAutonomyGrants(
   userId: string,
   keepGrantId: string | null,
   alsoKeep: ReadonlySet<string> = new Set(),
+  nowSeconds: number = Math.floor(Date.now() / 1000),
 ): Promise<SweepOutcome> {
   const grants = await everyGrantOf(kv, userId);
   if (grants === null) return "incomplete";
@@ -142,6 +173,13 @@ export async function sweepAutonomyGrants(
       continue;
     }
     if (grant.id === keepGrantId || alsoKeep.has(grant.id)) continue;
+    if (
+      keepGrantId !== null &&
+      grant.createdAt !== null &&
+      nowSeconds - grant.createdAt < AUTONOMY_CODE_LIFETIME_SECONDS
+    ) {
+      continue;
+    }
     try {
       await helpersOver(kv).revokeGrant(grant.id, userId);
     } catch {

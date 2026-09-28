@@ -857,8 +857,17 @@ export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutc
     // revoked, so at most one survives any sign-in. It lists rather than
     // trusting the record it replaced, so a grant minted and never armed is
     // caught too. It is the backstop to the revoke above, not the only way the
-    // replaced grant ends. An incomplete sweep does not fail the arm.
-    await sweepAutonomyGrants(deps.env.OAUTH_KV, deps.name, grantId, othersPending());
+    // replaced grant ends. It leaves any autonomy grant younger than a code's
+    // lifetime, because a sibling sign-in may have minted it and not yet sent
+    // its arm (review WR-01; see `sweepAutonomyGrants`). An incomplete sweep
+    // does not fail the arm.
+    await sweepAutonomyGrants(
+      deps.env.OAUTH_KV,
+      deps.name,
+      grantId,
+      othersPending(),
+      Math.floor(deps.now() / 1000),
+    );
     return { kind: "armed", grantId };
   } catch {
     return await fail();

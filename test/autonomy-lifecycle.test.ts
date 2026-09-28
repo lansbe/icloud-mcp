@@ -416,6 +416,17 @@ async function mintAutonomyCode(env: Env, userId: string): Promise<string> {
   return new URL(minted.redirectTo).searchParams.get("code") as string;
 }
 
+/** Rewrite a grant's `createdAt` to `seconds` ago. Test-only; the grant keeps no TTL after. */
+async function backdateGrant(userId: string, grantId: string, seconds: number): Promise<void> {
+  const kv = entryEnv().OAUTH_KV;
+  const key = `grant:${userId}:${grantId}`;
+  const raw = await kv.get(key);
+  expect(raw).not.toBeNull();
+  const record = JSON.parse(raw as string) as Record<string, unknown>;
+  record.createdAt = Math.floor(Date.now() / 1000) - seconds;
+  await kv.put(key, JSON.stringify(record));
+}
+
 /**
  * A store whose listing does not show `hidden` yet, the way a KV listing can
  * lag a fresh write by up to a minute. Reads, writes and deletes are the real
@@ -461,18 +472,45 @@ describe("autonomy credential: re-arm, sweep and failure isolation (D-11, D-13, 
     }
   });
 
-  it("revokes an autonomy grant minted and never armed, at the next successful arm", async () => {
+  it("revokes an autonomy grant minted and never armed, older than a code's lifetime, at the next successful arm", async () => {
     const world = await setUp("lifecycle stray");
     try {
       await world.signIn();
       const stray = await mintStrayAutonomyGrant(world.env, world.userId);
       expect(await autonomyGrantIds(world.userId)).toContain(stray);
+      // Minted eleven minutes ago: past the code's ten-minute lifetime, so no
+      // sign-in can still be about to arm it (review WR-01).
+      await backdateGrant(world.userId, stray, PAST_GRACE_SECONDS);
 
       await world.signIn();
       const after = await autonomyGrantIds(world.userId);
       expect(after).toHaveLength(1);
       expect(after).not.toContain(stray);
       expect(after[0]).toBe((await storedRecord(world.userId))?.grantId);
+    } finally {
+      await world.cleanup();
+    }
+  });
+
+  it("a successful arm's sweep leaves a sibling sign-in's fresh grant that is not yet pending, and that sign-in then arms (review WR-01)", async () => {
+    const world = await setUp("lifecycle sibling in flight");
+    try {
+      await world.signIn();
+      // Two submissions of one form. A's code is armed first. B's grant is
+      // already minted, but B's arm has not reached the object, so it is not
+      // in the pending list when A's sweep runs.
+      const codeA = await mintAutonomyCode(world.env, world.userId);
+      const codeB = await mintAutonomyCode(world.env, world.userId);
+      const grantA = codeA.split(":")[1] as string;
+      const grantB = codeB.split(":")[1] as string;
+      const stub = objectOf(world.userId);
+
+      expect(await stub.armAutonomy(codeA)).toEqual({ kind: "armed", grantId: grantA });
+      expect(await autonomyGrantIds(world.userId)).toContain(grantB);
+
+      expect(await stub.armAutonomy(codeB)).toEqual({ kind: "armed", grantId: grantB });
+      expect(await autonomyGrantIds(world.userId)).toEqual([grantB]);
+      expect((await storedRecord(world.userId))?.grantId).toBe(grantB);
     } finally {
       await world.cleanup();
     }
@@ -809,7 +847,13 @@ describe("autonomy credential: the library, asked once (autonomy-grants)", () =>
     try {
       const kv = onePerPage(entryEnv().OAUTH_KV);
       const kept = minted.autonomyIds[1] as string;
+      // Keeping one, at "now": every grant is younger than a code's lifetime,
+      // so each may be a sign-in still in flight, and all are left (WR-01).
       expect(await sweepAutonomyGrants(kv, minted.userId, kept)).toBe("done");
+      expect((await autonomyGrantIds(minted.userId)).sort()).toEqual([...minted.autonomyIds].sort());
+      // Eleven minutes on, the same sweep revokes all but the kept one.
+      const later = Math.floor(Date.now() / 1000) + PAST_GRACE_SECONDS;
+      expect(await sweepAutonomyGrants(kv, minted.userId, kept, new Set(), later)).toBe("done");
       expect(await autonomyGrantIds(minted.userId)).toEqual([kept]);
       expect((await ordinaryGrantIds(minted.userId)).sort()).toEqual([...minted.ordinaryIds].sort());
 
