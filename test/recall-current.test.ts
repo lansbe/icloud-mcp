@@ -1340,6 +1340,102 @@ describe("a failure is recorded and waited out, and never stops the other folder
     expect((await step(a, h)).outcome).toBe("idle");
   });
 
+  it("a failure the object refuses to record still holds the next step off, at the slot, for the page pause (26-REVIEW-2 IN-02)", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX, ARCHIVE],
+      mailboxes: {
+        [INBOX]: { uidValidity: 100, messages: scriptedMessages(30) },
+        [ARCHIVE]: { uidValidity: 300, messages: scriptedMessages(10) },
+      },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    await seedRows(USER_A.userId, [INBOX, ARCHIVE], {
+      [INBOX]: builtRow(stateOf(INBOX, 100, 31), { checkedAt: now + 24 * 60 * MINUTE }),
+    });
+    h.setSnapshot(ARCHIVE, { mailbox: ARCHIVE, answered: false });
+    const stub = objectFor(USER_A.userId);
+    await runInDurableObject(stub, (instance: UserAgent) => {
+      const prototype = Object.getPrototypeOf(instance) as UserAgent;
+      vi.spyOn(prototype, "recallSetSync").mockImplementation(() => ({
+        ok: false,
+        reason: "invalid",
+      }));
+    });
+    const checks = () => h.log.filter((entry) => entry === `snapshot:${ARCHIVE}:start`).length;
+
+    try {
+      expect((await step(a, h)).outcome).toBe("unanswered");
+      expect(await rowOf(USER_A.userId, ARCHIVE)).toBeUndefined();
+
+      // Not recorded, so the pause holds the next steps off before any session.
+      for (let i = 0; i < 3; i += 1) {
+        const run = await step(a, h);
+        expect(run.outcome).toBe("paused");
+        expect(run.log).toEqual([]);
+      }
+      expect(checks()).toBe(1);
+
+      // Once the pause has passed: one more attempt, and held off again.
+      await passPause(USER_A.userId);
+      expect((await step(a, h)).outcome).toBe("unanswered");
+      expect((await step(a, h)).outcome).toBe("paused");
+      expect(checks()).toBe(2);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("a failed listing whose record is refused too still holds the next listing off (26-REVIEW-2 IN-02)", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX],
+      mailboxes: { [INBOX]: { uidValidity: 100, messages: scriptedMessages(3) } },
+    });
+    h.setNow(Date.now());
+    h.setListingFails(true);
+    const stub = objectFor(USER_A.userId);
+    await runInDurableObject(stub, (instance: UserAgent) => {
+      const prototype = Object.getPrototypeOf(instance) as UserAgent;
+      vi.spyOn(prototype, "recallListingFailed").mockImplementation(() => ({
+        ok: false,
+        reason: "invalid",
+      }));
+    });
+
+    try {
+      await expect(recallStep(a, h.deps)).rejects.toBeInstanceOf(RecallBuildError);
+      expect((await stub.recallSyncState()).listing).toBeNull();
+      const run = await step(a, h);
+      expect(run.outcome).toBe("paused");
+      expect(run.log).toEqual([]);
+      expect(h.log.filter((entry) => entry === "folders:start")).toHaveLength(1);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("an object that does not know whose it is stops the step at the slot, before any session (26-REVIEW-2 IN-02)", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX],
+      mailboxes: { [INBOX]: { uidValidity: 100, messages: scriptedMessages(3) } },
+    });
+    // A stored name that is not a user id: the object refuses every write.
+    await runInDurableObject(objectFor(USER_A.userId), (_instance, state) => {
+      state.storage.kv.put("own-name", "not-a-user-id");
+    });
+    expect((await objectFor(USER_A.userId).recallSyncState()).slot).toBe("unnamed");
+
+    for (let i = 0; i < 3; i += 1) {
+      const run = await step(a, h);
+      expect(run.outcome).toBe("unnamed");
+      expect(run.log).toEqual([]);
+    }
+    expect(await recallTables(USER_A.userId)).toEqual({ state: [], vectors: 0 });
+  });
+
   it("a folder listing that fails is recorded, and is not tried again until its wait has passed", async () => {
     const a = await testPrincipal(USER_A);
     const h = fakeStepDeps({

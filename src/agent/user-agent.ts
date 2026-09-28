@@ -180,7 +180,10 @@ export type BeginPageAnswer =
  * What the object says about the build, before any IMAP (Phase 26, D-29).
  *
  * `slot` is the first refusal a deletion sync would get now, or `free`. It is
- * never `full`: a removal is never refused at the vector ceiling. `full` says
+ * never `full`: a removal is never refused at the vector ceiling. It is
+ * `unnamed` when the object does not know whose it is: every write would be
+ * refused, a failure could not even be recorded, so a step must open nothing
+ * (26-REVIEW-2 IN-02). `full` says
  * whether a page that adds vectors would be refused at that ceiling now
  * (26-REVIEW-2 WR-04). `folders` is the stored folder list, or null before the
  * first listing. `listedAt` is when that list was listed, or null when it is
@@ -189,7 +192,7 @@ export type BeginPageAnswer =
  * parses, keyed by mailbox.
  */
 export interface RecallSyncState {
-  readonly slot: PageRefusal | "free";
+  readonly slot: PageRefusal | "unnamed" | "free";
   readonly full: boolean;
   readonly folders: string[] | null;
   readonly listedAt: number | null;
@@ -561,7 +564,9 @@ export class UserAgent extends DurableObject<Env> {
    * above asks. `slot` is its answer for a deletion sync, and `full` whether a
    * build page would also be refused at the vector ceiling (26-REVIEW-2
    * WR-04). A step that reads a refusal in `slot` stops with no lease and no
-   * session. A step that reads `full` still does what shrinks or checks the
+   * session. `unnamed` is such a refusal: an object that does not know whose it
+   * is refuses every write, so nothing a step did could be recorded
+   * (26-REVIEW-2 IN-02). A step that reads `full` still does what shrinks or checks the
    * index, and only what would add vectors waits: the index is shrunk by those
    * removals, so stopping them at the ceiling would keep it there.
    *
@@ -572,10 +577,10 @@ export class UserAgent extends DurableObject<Env> {
   recallSyncState(): RecallSyncState {
     const sql = this.ctx.storage.sql;
     ensureRecallSchema(sql);
-    this.rememberOwnName();
+    const named = this.rememberOwnName() !== null;
     const now = Date.now();
     return {
-      slot: pageRefusal(sql, "reconcile", now) ?? "free",
+      slot: named ? (pageRefusal(sql, "reconcile", now) ?? "free") : "unnamed",
       full: pageRefusal(sql, "build", now) === "full",
       folders: readFolders(sql),
       listedAt: readListedAt(sql),

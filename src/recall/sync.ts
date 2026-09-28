@@ -8,8 +8,9 @@
 //
 // THE SLOT FIRST (D-29). A step reads the person's object before anything
 // else. When the object says a page may not start now (destroying, busy,
-// paused or quota), the step answers that word and stops: no lease, no
-// session, no write.
+// paused or quota), or that it does not know whose it is (unnamed, so it
+// would refuse every write, 26-REVIEW-2 IN-02), the step answers that word
+// and stops: no lease, no session, no write.
 //
 // AT THE VECTOR CEILING ONLY ADDING STOPS (26-REVIEW-2 WR-04). `full` is not
 // one of those stops. At the ceiling the step still lists folders, runs status
@@ -96,6 +97,15 @@
 // `isParked` in ../agent/recall-ledger.ts is the one predicate, shared with
 // the recall answer. A parked folder keeps its vectors: nothing says its mail
 // is gone, and a gone folder is found by its status check, as before.
+//
+// A FAILURE THAT CANNOT BE RECORDED STILL HOLDS THE NEXT STEP OFF (26-REVIEW-2
+// IN-02). When the object refuses the failure write, or the call to it fails,
+// the step takes the page slot and ends it at once, as a removal that removes
+// nothing. The object's pause then stops every step for a minute, at the slot,
+// before any session, and the day's page cap counts it. So the worst case is
+// one attempt a minute and RECALL_MAX_PAGES_PER_DAY a day, never one on every
+// mail call. If even that call fails, the object is out of reach, and the next
+// step's first call to it fails too, before any session.
 //
 // The failure itself still propagates, as `RecallBuildError`. No caught value
 // is read (./.claude/CLAUDE.md §4), and nothing here logs.
@@ -221,12 +231,14 @@ export type StepDeps = BuildDeps & {
  * `folders`: the folder list was stored. `seeded`: a folder's status check was
  * stored. `gone`: the status check said the folder no longer exists, and it was
  * dropped. `unanswered`: the status check gave no answer; nothing was stored.
- * `idle`: every folder is built and none is due a status check. `checked`: a
+ * `idle`: every folder is built and none is due a status check. `unnamed`:
+ * the object does not know whose it is, so nothing was opened. `checked`: a
  * built folder's status check found nothing to do. `due`: it found new mail or
  * a deletion sync to do, and recorded it for the next step. Or any build
  * status, which carries `lease_busy` and every page refusal.
  */
 export type StepOutcome =
+  | "unnamed"
   | "folders"
   | "seeded"
   | "gone"
@@ -271,18 +283,40 @@ function failedRow(row: SyncRow, now: number): SyncRow {
   return { ...row, ...mark };
 }
 
-/** Record one failed attempt on `mailbox`. Never throws: a failed write leaves the row as it was. */
+/**
+ * Hold the next step off for the object's page pause, because a failure could
+ * not be recorded (26-REVIEW-2 IN-02): take the page slot as a removal and end
+ * it at once, changing nothing else. A refusal means a pause or a stop is
+ * already in force. Never throws.
+ */
+async function holdOff(principal: Principal, mailbox: string): Promise<void> {
+  const stub = agentFor(principal);
+  try {
+    const begun = await stub.recallBeginPage(mailbox, "reconcile");
+    if (begun.ok) await stub.recallEndPage(begun.pageToken, mailbox, KEEP);
+  } catch {
+    // The object is out of reach: the next step's first call to it fails too,
+    // before any session. Not read.
+  }
+}
+
+/**
+ * Record one failed attempt on `mailbox`. Never throws. A write the object
+ * refuses, or a call that fails, holds the next step off instead (IN-02).
+ */
 async function noteFailure(
   principal: Principal,
   mailbox: string,
   row: SyncRow,
   deps: StepDeps,
 ): Promise<void> {
+  let recorded = false;
   try {
-    await agentFor(principal).recallSetSync(mailbox, failedRow(row, deps.now()));
+    recorded = (await agentFor(principal).recallSetSync(mailbox, failedRow(row, deps.now()))).ok;
   } catch {
-    // The next step finds the row as it was and tries again. Not read.
+    // Not read.
   }
+  if (!recorded) await holdOff(principal, mailbox);
 }
 
 /**
@@ -539,11 +573,14 @@ async function listFoldersStep(
     const listedAt = pending.length > 0 ? null : deps.now();
     return afterSet(await stub.recallSetFolders([...next, ...pending], listedAt)) ?? "folders";
   } catch {
+    let recorded = false;
     try {
-      await stub.recallListingFailed(deps.now());
+      recorded = (await stub.recallListingFailed(deps.now())).ok;
     } catch {
-      // The next step lists again. Not read.
+      // Not read.
     }
+    // Not recorded: the page pause holds the next listing off instead (IN-02).
+    if (!recorded) await holdOff(principal, DEFAULT_MAILBOX);
     throw new RecallBuildError();
   }
 }
