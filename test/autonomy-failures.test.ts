@@ -285,6 +285,46 @@ describe("only iCloud refusing the password counts toward ending the key (28-REV
   }
 });
 
+describe("one refusal is never enough to end the key (28-REVIEW WR-01)", () => {
+  // The pause lasts 900 s and the cadence is 900 s, so the run after a refusal
+  // almost always meets the pause, not iCloud. Counting the pause's answer
+  // made one refusal end the key 15 minutes later.
+  const PAUSED = () => toolError(new ImapAuthError());
+
+  it("a refusal, then the pause answering for it: counted once and the key stays; a second refusal after the pause ends it", async () => {
+    const storage = armedStorage([rule("r1", FLAG)]);
+    const on = (answer: () => CallAnswer) => (tool: string) => (tool === "changes_since" ? answer() : undefined);
+
+    const refused = await directRun(storage, { rows: [newRow(1)], answer: on(REFUSED) });
+    expect(refused.outcome).toBe("auth_failed");
+    expect(failures(storage)).toBe(1);
+
+    const paused = await directRun(storage, { now: T0 + 15 * MIN, rows: [newRow(1)], answer: on(PAUSED) });
+    expect(paused.outcome).toBe("sign_in_unavailable");
+    expect(paused.disarms).toBe(0);
+    expect(failures(storage)).toBe(1);
+    expect(storage.get(AUTONOMY_KEY)).toBeDefined();
+
+    // The pause has expired: the next run reaches iCloud, and iCloud refuses again.
+    const again = await directRun(storage, { now: T0 + 30 * MIN, rows: [newRow(1)], answer: on(REFUSED) });
+    expect(again.outcome).toBe("off_auth");
+    expect(again.disarms).toBe(1);
+    expect(storage.get(AUTONOMY_KEY)).toBeUndefined();
+  });
+
+  it("a refusal, then the pause, then the pause again: never ended", async () => {
+    const storage = armedStorage([rule("r1", FLAG)]);
+    const on = (answer: () => CallAnswer) => (tool: string) => (tool === "changes_since" ? answer() : undefined);
+    await directRun(storage, { rows: [newRow(1)], answer: on(REFUSED) });
+    for (const step of [1, 2, 3]) {
+      const run = await directRun(storage, { now: T0 + step * 15 * MIN, rows: [newRow(1)], answer: on(PAUSED) });
+      expect(run.disarms, `step ${step}`).toBe(0);
+    }
+    expect(failures(storage)).toBe(1);
+    expect(storage.get(AUTONOMY_KEY)).toBeDefined();
+  });
+});
+
 describe("every other failure stops the run, keeps the marker and leaves the counter alone (AUTO-13, D-16)", () => {
   const cases: Array<[string, () => CallAnswer, string]> = [
     ["connection_busy", () => toolError(new ConnectionBusyError()), "busy"],

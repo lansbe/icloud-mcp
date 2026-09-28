@@ -145,11 +145,21 @@ export const JOB_STATE_KEY = "job:state";
 export const JOB_OFF_AUTH = "off_auth";
 
 /**
- * How many auth failures in a row end the key (D-16 as revised): two.
+ * How many refusals of the password in a row end the key (D-16 as revised):
+ * two, and they must be two separate refusals by Apple (28-REVIEW WR-01).
  *
- * Two, not one: a single refusal can be a blip on Apple's side, and the pause
- * already stops the second from reaching Apple. Not more: each one that does
- * reach Apple is a failed login against an unpublished lockout threshold.
+ * Two, not one: a single refusal can be a blip on Apple's side. Only an answer
+ * marked as Apple refusing the password is counted, and the dead-password
+ * pause's answer is not one (28-REVIEW CR-01). The pause lasts 900 seconds and
+ * the cadence is 900 seconds, so the run after a refusal almost always meets
+ * the pause, which stops the run and leaves the count at 1. The second counted
+ * refusal therefore comes from a run that reached Apple after the pause ran
+ * out: in practice two refusals about 30 minutes apart. Before this was fixed,
+ * the pause's own answer was counted, so one refusal ended the key 15 minutes
+ * later. Decided by Claude, owner may revise.
+ *
+ * Not more: each counted refusal is a failed login against Apple's unpublished
+ * lockout threshold.
  */
 export const AUTH_FAILURES_TO_DISARM = 2;
 
