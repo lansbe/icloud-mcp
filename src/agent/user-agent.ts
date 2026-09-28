@@ -66,6 +66,7 @@ import {
   expiredIds,
   anyIds,
   forgetVectors,
+  heldIds,
   idsForMailbox,
   markDestroyPending,
   type LedgerRowInput,
@@ -606,6 +607,24 @@ export class UserAgent extends DurableObject<Env> {
       .slice(0, MAX_SCOPE_ROWS)
       .filter((id): id is string => typeof id === "string" && HEX_64.test(id));
     return forgetVectors(sql, valid);
+  }
+
+  /**
+   * Which of these ids the ledger holds (Phase 26, the dead-ref removal).
+   *
+   * Anything that is not a 64-character lower-case hex string is ignored, and at
+   * most 1000 entries are read per call. Answers only the held subset of the ids
+   * it was asked about, so it never lists an id the caller did not name.
+   */
+  recallHolds(ids: unknown): string[] {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    this.rememberOwnName();
+    if (!Array.isArray(ids)) return [];
+    const valid = ids
+      .slice(0, MAX_SCOPE_ROWS)
+      .filter((id): id is string => typeof id === "string" && HEX_64.test(id));
+    return heldIds(sql, valid);
   }
 
   /**

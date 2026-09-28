@@ -117,6 +117,7 @@ import {
   unflagMessage,
 } from "../../mail/triage";
 import type { Principal } from "../../principal";
+import { forgetDeadRef } from "../../recall/dead-ref";
 import type { ConfirmRefusal } from "../../staging/presign";
 import {
   UPLOAD_URL_TTL_SECONDS,
@@ -2570,17 +2571,31 @@ export function registerMailTools(
       }),
     },
     async ({ id, includeHtml }) => {
+      // Held outside the `try` so the catch can see who asked and which
+      // message, but only once each is known: a principal refusal or a token
+      // that does not decode leaves them null, and nothing is removed.
+      let actor: Principal | null = null;
+      let ref: MessageRef | null = null;
       try {
-        const actor = await principal;
+        actor = await principal;
         // Decoding first means a malformed or stale token is refused before a
         // socket is opened, which is the cheapest possible refusal and the one
         // that spends none of the connection budget.
-        const ref = decodeMessageId(id);
-        const detail = await mail.withConnectionLease(actor, (leased) =>
-          getMessage(actor, leased, ref, { includeHtml }),
+        ref = decodeMessageId(id);
+        const decoded = ref;
+        const reader = actor;
+        const detail = await mail.withConnectionLease(reader, (leased) =>
+          getMessage(reader, leased, decoded, { includeHtml }),
         );
         return messageToolResult(detail);
       } catch (err) {
+        // A message that no longer opens is removed from this person's recall
+        // index at once (RCLL-08, ARCHITECTURE §4.6(a)). Only for the not-found
+        // class, and only when the id decoded. It never throws, and the answer
+        // below is exactly the one this catch gave before recall existed.
+        if (err instanceof ImapNotFoundError && actor !== null && ref !== null) {
+          await forgetDeadRef(actor, ref);
+        }
         // The same backstop shape `registerDiagnoseTool` uses: one boundary,
         // one fixed vocabulary, nothing of the caught value escaping.
         return mailErrorResult(err);

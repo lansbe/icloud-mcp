@@ -476,6 +476,23 @@ export function forgetVectors(sql: SqlStorage, ids: readonly string[]): number {
   return removed;
 }
 
+/**
+ * Which of `ids` the ledger holds, in the order asked, each at most once.
+ *
+ * Reads only the ids it is given, one at a time, so it can never answer with an
+ * id the caller did not already name.
+ */
+export function heldIds(sql: SqlStorage, ids: readonly string[]): string[] {
+  const held: string[] = [];
+  for (const id of new Set(ids)) {
+    const row = sql
+      .exec<{ n: number }>(`select count(*) as n from recall_vectors where vector_id = ?`, id)
+      .one();
+    if (row.n > 0) held.push(id);
+  }
+  return held;
+}
+
 /** Up to `limit` ids whose expiry is at or before `now`, oldest expiry first. */
 export function expiredIds(sql: SqlStorage, now: number, limit: number): string[] {
   return sql
