@@ -4094,6 +4094,81 @@ export async function searchMessages(
   );
 }
 
+/** One mailbox's validity, and every UID in it since a day. */
+export interface WindowUids {
+  readonly uidValidity: number;
+  readonly uids: number[];
+}
+
+/**
+ * The window's UID snapshot, inside an open session (Phase 26, D-17b, D-19).
+ *
+ * The search is the listing's own private search with no cursor and a start
+ * day only, so the command is built by the one builder the listing uses and no
+ * second search spelling exists. A charset refusal cannot happen on a date-only
+ * search, because no term is sent; if one ever arrives it is reported as
+ * not-found rather than as an empty mailbox, since an empty snapshot would tell
+ * the reconcile to remove everything.
+ */
+async function windowUidsIn(session: MailSession, sinceDay: string): Promise<WindowUids> {
+  const uidValidity = session.uidValidity;
+  if (uidValidity === null) throw new ImapNotFoundError();
+  const found = await searchPage(session, null, { startDate: sinceDay });
+  if (found.unsupportedCharset) throw new ImapNotFoundError();
+  return { uidValidity, uids: [...new Set(found.identifiers)] };
+}
+
+/** The window's UID snapshot over an already-open stream pair. */
+export async function windowUidsOver(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string,
+  sinceDay: string,
+  options: MailSessionOptions = {},
+): Promise<WindowUids> {
+  parseIsoDay(sinceDay);
+  return withMailSessionOver(
+    duplex,
+    principal,
+    gate,
+    mailbox,
+    null,
+    (session) => windowUidsIn(session, sinceDay),
+    options,
+  );
+}
+
+/**
+ * Every UID in `mailbox` received on or after `sinceDay` (`YYYY-MM-DD`), and
+ * the mailbox's UIDVALIDITY (Phase 26, D-17b).
+ *
+ * This is the snapshot the recall reconcile compares the person's ledger
+ * against. It is bounded to the retention window, because a vector outside the
+ * window is expiring anyway, and removing one early is the privacy-safe
+ * direction. One read-only open and one search, in one session, and no fetch at
+ * all, so nothing is read and nothing can be marked read.
+ *
+ * A malformed day is refused before any socket is opened.
+ */
+export async function windowUids(
+  principal: Principal,
+  gate: SessionGate,
+  mailbox: string,
+  sinceDay: string,
+  options: MailSessionOptions = {},
+): Promise<WindowUids> {
+  parseIsoDay(sinceDay);
+  return withMailSession(
+    principal,
+    gate,
+    mailbox,
+    null,
+    (session) => windowUidsIn(session, sinceDay),
+    options,
+  );
+}
+
 /** List one page of a folder's unread mail over an already-open stream pair. */
 export async function listUnreadOver(
   duplex: DuplexLike,
