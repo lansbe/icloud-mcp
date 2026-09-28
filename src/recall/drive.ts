@@ -39,6 +39,20 @@
 // NOTHING THE STEP DOES REACHES THE ANSWER. A step that is refused, finds the
 // lease busy, or fails, is silent. The caught value is never read, nothing here
 // logs (./.claude/CLAUDE.md §4), and nothing is thrown.
+//
+// WHAT THE BACKFILL COSTS PER PERSON (D-31). Recall is inherent, so this runs
+// for everyone who signs in, and this is what each of them costs. One step per
+// successful mail call, and at most one iCloud session per step. Pages (build,
+// new mail, deletion sync) run at most one a minute and
+// `RECALL_MAX_PAGES_PER_DAY` (200) a day, and a person holds at most
+// `RECALL_MAX_VECTORS` (10,000) vectors. Both ceilings are Phase 25's, and this
+// phase lowers neither. A typical 90-day window of 1,500 messages is 60 pages:
+// about $0.02 once to embed, and about $0.02 a month to hold and query, filled
+// over about 60 of the person's mail calls. A person at the ceiling costs about
+// $0.12 once and $0.11 a month. The daily cap bounds a runaway at about $0.06
+// of embedding per person per day. Status checks run at most once per folder
+// per five minutes, and the folder listing once. The numbers and their
+// assumptions are in 26-CONTEXT D-31 and 25-CONTEXT D-24.
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { AUTONOMY_CLIENT_ID } from "../agent/autonomy-client";
