@@ -109,6 +109,12 @@ const CURSOR_ROW = "cursor:";
 /** The `recall_state` key of the folder list the build covers (Phase 26, D-12). */
 const FOLDERS_ROW = "folders";
 
+/**
+ * The `recall_state` key of the folder listing's failures, while there is no
+ * folder list yet (26-REVIEW CR-01). Cleared when a list is stored.
+ */
+const LISTING_FAILED_ROW = "folders_failed";
+
 /** The `recall_state` key of one mailbox's sync row is this plus the mailbox (D-15). */
 export const SYNC_ROW = "sync:";
 
@@ -131,6 +137,23 @@ export interface SyncRow {
   readonly due: SyncDue | null;
   /** The folder's state as the last status check saw it. */
   readonly seen: FolderState | null;
+  /**
+   * When the last attempt on this folder failed, in ms since the epoch, or null
+   * when the last attempt did not fail (26-REVIEW CR-01). A step leaves the
+   * folder alone until `recallRetryWaitMs(failures)` has passed.
+   */
+  readonly failedAt: number | null;
+  /** How many attempts on this folder failed in a row, capped at MAX_COUNTED_FAILURES. */
+  readonly failures: number;
+}
+
+/** The most failures in a row a sync row counts. The wait stops growing long before. */
+export const MAX_COUNTED_FAILURES = 100;
+
+/** How often a failed attempt, and when the last one was (26-REVIEW CR-01). */
+export interface RetryState {
+  readonly failedAt: number;
+  readonly failures: number;
 }
 
 /** 1 to 20 decimal digits: the shape of a mod-sequence as iCloud sends it. */
@@ -173,6 +196,12 @@ function optionalTime(value: unknown): number | null | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/** `value` as a failure count from 0 to MAX_COUNTED_FAILURES, or undefined. */
+function failureCount(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return undefined;
+  return value >= 0 && value <= MAX_COUNTED_FAILURES ? value : undefined;
+}
+
 /**
  * One mailbox's sync row, from its stored JSON text, or null when the text is
  * not exactly one row (D-15).
@@ -181,6 +210,11 @@ function optionalTime(value: unknown): number | null | undefined {
  * accepts, and the setter plan 26-03 adds stores only rows this accepts, so a
  * row that reaches the step always has this shape. Every field must be present:
  * a missing one is null written out, never assumed.
+ *
+ * With one exception. `failedAt` and `failures` came after rows were already
+ * stored in production (26-REVIEW CR-01). A row stored before them has neither,
+ * and reads as a folder whose last attempt did not fail: `failedAt` null and
+ * `failures` 0. Present, each must be exactly one of those shapes.
  */
 export function parseSyncRow(value: unknown): SyncRow | null {
   let parsed: unknown = value;
@@ -203,7 +237,10 @@ export function parseSyncRow(value: unknown): SyncRow | null {
   if (checkedAt === undefined || reconciledAt === undefined) return null;
   const due = r.due;
   if (due !== null && due !== "new_mail" && due !== "reconcile") return null;
-  return { stage, state, checkedAt, reconciledAt, due, seen };
+  const failedAt = "failedAt" in r ? optionalTime(r.failedAt) : null;
+  const failures = "failures" in r ? failureCount(r.failures) : 0;
+  if (failedAt === undefined || failures === undefined) return null;
+  return { stage, state, checkedAt, reconciledAt, due, seen, failedAt, failures };
 }
 
 /**
@@ -272,9 +309,42 @@ export function folderListOf(value: unknown): string[] | null {
   return out;
 }
 
-/** Store the folder list. The caller has checked it with `folderListOf`. */
+/**
+ * Store the folder list. The caller has checked it with `folderListOf`.
+ *
+ * A stored list ends the listing's failure record: the listing worked.
+ */
 export function writeFolders(sql: SqlStorage, folders: readonly string[]): void {
   writeState(sql, FOLDERS_ROW, JSON.stringify(folders));
+  clearState(sql, LISTING_FAILED_ROW);
+}
+
+/** The folder listing's failure record, or null when there is none or it is malformed. */
+export function readListingFailure(sql: SqlStorage): RetryState | null {
+  const raw = readState(sql, LISTING_FAILED_ROW);
+  if (raw === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const p = parsed as { failedAt?: unknown; failures?: unknown };
+  const failedAt = optionalTime(p.failedAt);
+  const failures = failureCount(p.failures);
+  if (failedAt === undefined || failedAt === null || failures === undefined) return null;
+  return { failedAt, failures };
+}
+
+/**
+ * Record one more failed folder listing, at `at` (26-REVIEW CR-01). The count
+ * grows from the stored one, capped at MAX_COUNTED_FAILURES.
+ */
+export function writeListingFailure(sql: SqlStorage, at: number): void {
+  const before = readListingFailure(sql)?.failures ?? 0;
+  const failures = Math.min(before + 1, MAX_COUNTED_FAILURES);
+  writeState(sql, LISTING_FAILED_ROW, JSON.stringify({ failedAt: at, failures }));
 }
 
 /**

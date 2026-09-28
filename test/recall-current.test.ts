@@ -145,6 +145,8 @@ function builtRow(state: FolderState, over: Partial<SyncRow> = {}): SyncRow {
     reconciledAt: null,
     due: null,
     seen: null,
+    failedAt: null,
+    failures: 0,
     ...over,
   };
 }
@@ -278,7 +280,7 @@ describe("a built folder's status check runs alone, at most once in five minutes
     expect(await recallTables(USER_A.userId)).toEqual(before);
   });
 
-  it("the status check reporting the archive folder gone drops it; INBOX never is", async () => {
+  it("the status check reporting the archive folder gone drops it; INBOX never is, and is recorded as a failure", async () => {
     const a = await testPrincipal(USER_A);
     const h = fakeStepDeps({
       folders: [INBOX, ARCHIVE],
@@ -299,10 +301,14 @@ describe("a built folder's status check runs alone, at most once in five minutes
     expect((await objectFor(USER_A.userId).recallSyncState()).folders).toEqual([INBOX]);
 
     h.setSnapshot(INBOX, { mailbox: INBOX, answered: false, gone: true });
-    const before = await recallTables(USER_A.userId);
     expect((await step(a, h)).outcome).toBe("unanswered");
     expect((await objectFor(USER_A.userId).recallSyncState()).folders).toEqual([INBOX]);
-    expect(await recallTables(USER_A.userId)).toEqual(before);
+    // Not dropped, but the check time moves and the failure is counted (CR-01),
+    // so INBOX waits five minutes before it is asked again.
+    expect(await rowOf(USER_A.userId, INBOX)).toEqual(
+      builtRow(stateOf(INBOX, 100, 31), { checkedAt: now, failedAt: now, failures: 1 }),
+    );
+    expect((await step(a, h)).outcome).toBe("idle");
   });
 });
 
@@ -440,22 +446,41 @@ describe("new mail is found by the status check and read by the next step, oldes
     expect(await recallTables(USER_A.userId)).toEqual(before);
   });
 
-  it("the store failing part-way leaves the mark and the due where they were, and the next step reads the same range", async () => {
+  it("the store failing part-way leaves the mark where it was and clears the due; after the wait the check finds the same mail and the next step reads the same range", async () => {
     const a = await testPrincipal(USER_A);
-    const { h } = await inboxWithBurst();
+    const { h, now } = await inboxWithBurst();
     expect((await step(a, h)).outcome).toBe("due");
-    const due = await rowOf(USER_A.userId, INBOX);
+    const due = (await rowOf(USER_A.userId, INBOX))!;
 
     h.index.failing.add("upsert");
     await expect(recallStep(a, h.deps)).rejects.toBeInstanceOf(RecallBuildError);
-    expect(await rowOf(USER_A.userId, INBOX)).toEqual(due);
+    // The mark did not move. What was due is cleared and the failure recorded
+    // (CR-01), so the next attempt is a fresh status check.
+    expect(await rowOf(USER_A.userId, INBOX)).toEqual({
+      ...due,
+      checkedAt: now,
+      due: null,
+      seen: null,
+      failedAt: now,
+      failures: 1,
+    });
     expect((await objectFor(USER_A.userId).recallSyncState()).slot).not.toBe("busy");
 
+    // Inside the wait: nothing is read.
     h.index.failing.delete("upsert");
     await passPause(USER_A.userId);
+    expect((await step(a, h)).outcome).toBe("idle");
+
+    // After it: the check finds the same new mail, and the next step reads it
+    // from the same place, and clears the failure.
+    h.setNow(now + RECALL_CHECK_INTERVAL_MS);
+    expect((await step(a, h)).outcome).toBe("due");
     expect((await step(a, h)).outcome).toBe("indexed");
     expect(h.newMailCalls.map((call) => call.fromUid)).toEqual([100, 100]);
-    expect((await rowOf(USER_A.userId, INBOX))!.state!.uidNext).toBe(125);
+    const after = (await rowOf(USER_A.userId, INBOX))!;
+    expect(after.state!.uidNext).toBe(125);
+    expect(after.failedAt).toBeNull();
+    expect(after.failures).toBe(0);
   });
 
   it("a folder with something due is served before a folder waiting to be built", async () => {
@@ -526,6 +551,8 @@ describe("removals reach the index on the folder's next sync", () => {
       reconciledAt: null,
       due: null,
       seen: null,
+      failedAt: null,
+      failures: 0,
     });
   });
 
@@ -631,5 +658,220 @@ describe("removals reach the index on the folder's next sync", () => {
     h.setNow(t);
     expect((await step(a, h)).outcome).toBe("due");
     expect((await rowOf(USER_A.userId, INBOX))!.due).toBe("reconcile");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A folder that keeps failing does not wedge the build (26-REVIEW CR-01)
+// ---------------------------------------------------------------------------
+
+describe("a failure is recorded and waited out, and never stops the other folders (26-REVIEW CR-01)", () => {
+  /** How many times the log shows `entry`. */
+  function count(h: StepHarness, entry: string): number {
+    return h.log.filter((one) => one === entry).length;
+  }
+
+  it("a folder deleted while its new mail is due: one failed read, nothing more until the wait has passed, then the check drops it", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX, ARCHIVE],
+      mailboxes: {
+        [INBOX]: { uidValidity: 100, messages: scriptedMessages(30) },
+        [ARCHIVE]: { uidValidity: 300, messages: scriptedMessages(10) },
+      },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    await seedRows(USER_A.userId, [INBOX, ARCHIVE], {
+      // Checked a minute in the future, so INBOX is not due a check in this case.
+      [INBOX]: builtRow(stateOf(INBOX, 100, 31), { checkedAt: now + MINUTE }),
+      [ARCHIVE]: builtRow(stateOf(ARCHIVE, 300, 11), {
+        checkedAt: now,
+        due: "new_mail",
+        seen: stateOf(ARCHIVE, 300, 14),
+      }),
+    });
+    h.setGone(ARCHIVE, true);
+
+    await expect(recallStep(a, h.deps)).rejects.toBeInstanceOf(RecallBuildError);
+    expect(count(h, `newMail:${ARCHIVE}:start`)).toBe(1);
+    expect(await rowOf(USER_A.userId, ARCHIVE)).toEqual(
+      builtRow(stateOf(ARCHIVE, 300, 11), { checkedAt: now, failedAt: now, failures: 1 }),
+    );
+
+    // Ten more mail calls inside the wait: not one of them touches the archive.
+    for (let i = 0; i < 10; i += 1) {
+      await passPause(USER_A.userId);
+      const run = await step(a, h);
+      expect(run.outcome).toBe("idle");
+      expect(run.log).toEqual([]);
+    }
+    expect(count(h, `newMail:${ARCHIVE}:start`)).toBe(1);
+
+    // After the wait, a fresh status check finds it gone, and it is dropped.
+    await passPause(USER_A.userId);
+    h.setNow(now + RECALL_CHECK_INTERVAL_MS);
+    const run = await step(a, h);
+    expect(run.outcome).toBe("gone");
+    expect(run.log).toContain(`snapshot:${ARCHIVE}:start`);
+    expect((await objectFor(USER_A.userId).recallSyncState()).folders).toEqual([INBOX]);
+    expect(count(h, `newMail:${ARCHIVE}:start`)).toBe(1);
+  });
+
+  it("the validity changing between the status check and the new-mail read: one failed read, then the next check sees the new validity and the folder goes back to seed", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX],
+      mailboxes: { [INBOX]: { uidValidity: 100, messages: scriptedMessages(5) } },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    await buildInbox(a, h);
+
+    h.addMessages(INBOX, messagesFrom(6, 3));
+    let t = now + 6 * MINUTE;
+    h.setNow(t);
+    expect((await step(a, h)).outcome).toBe("due");
+    expect((await rowOf(USER_A.userId, INBOX))!.due).toBe("new_mail");
+
+    // The mailbox is recreated before the read.
+    h.setValidity(INBOX, 200);
+    await expect(recallStep(a, h.deps)).rejects.toBeInstanceOf(RecallBuildError);
+    expect(h.newMailCalls).toHaveLength(1);
+    expect((await rowOf(USER_A.userId, INBOX))!.due).toBeNull();
+
+    // Inside the wait: nothing is read.
+    for (let i = 0; i < 5; i += 1) {
+      await passPause(USER_A.userId);
+      expect((await step(a, h)).outcome).toBe("idle");
+    }
+    expect(h.newMailCalls).toHaveLength(1);
+
+    // After it: the check sees the new validity, and the deletion sync sends
+    // the folder back to seed.
+    t += RECALL_CHECK_INTERVAL_MS;
+    h.setNow(t);
+    expect((await step(a, h)).outcome).toBe("due");
+    expect((await rowOf(USER_A.userId, INBOX))!.due).toBe("reconcile");
+    await passPause(USER_A.userId);
+    expect((await step(a, h)).outcome).toBe("indexed");
+    expect((await rowOf(USER_A.userId, INBOX))!.stage).toBe("seed");
+    expect(h.newMailCalls).toHaveLength(1);
+  });
+
+  it("the archive refusing its status check with a plain refusal does not stop INBOX's checks, and is asked less often each time", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX, ARCHIVE],
+      mailboxes: {
+        [INBOX]: { uidValidity: 100, messages: scriptedMessages(30) },
+        [ARCHIVE]: { uidValidity: 300, messages: scriptedMessages(10) },
+      },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    await seedRows(USER_A.userId, [INBOX, ARCHIVE], {
+      [INBOX]: builtRow(stateOf(INBOX, 100, 31), { checkedAt: now - 10 * MINUTE }),
+    });
+    h.setSnapshot(ARCHIVE, { mailbox: ARCHIVE, answered: false });
+
+    expect((await step(a, h)).outcome).toBe("unanswered");
+    let run = await step(a, h);
+    expect(run.outcome).toBe("checked");
+    expect(run.log).toContain(`snapshot:${INBOX}:start`);
+    expect((await step(a, h)).outcome).toBe("idle");
+
+    // Five minutes on: the archive is asked again, then INBOX is checked.
+    h.setNow(now + RECALL_CHECK_INTERVAL_MS);
+    expect((await step(a, h)).outcome).toBe("unanswered");
+    expect((await rowOf(USER_A.userId, ARCHIVE))!.failures).toBe(2);
+    run = await step(a, h);
+    expect(run.outcome).toBe("checked");
+    expect(run.log).toContain(`snapshot:${INBOX}:start`);
+
+    // Five more: INBOX is due its check, the archive is still waiting (ten
+    // minutes after its second failure).
+    h.setNow(now + 2 * RECALL_CHECK_INTERVAL_MS);
+    run = await step(a, h);
+    expect(run.outcome).toBe("checked");
+    expect(run.log).toContain(`snapshot:${INBOX}:start`);
+    expect(count(h, `snapshot:${ARCHIVE}:start`)).toBe(2);
+  });
+
+  it("a build page that keeps failing goes back to seed after three, and its status check then drops the folder", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX, ARCHIVE],
+      mailboxes: {
+        [INBOX]: { uidValidity: 100, messages: scriptedMessages(30) },
+        [ARCHIVE]: { uidValidity: 300, messages: scriptedMessages(10) },
+      },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    await seedRows(USER_A.userId, [INBOX, ARCHIVE], {
+      // Checked a day ahead, so INBOX's checks stay out of this case.
+      [INBOX]: builtRow(stateOf(INBOX, 100, 31), { checkedAt: now + 24 * 60 * MINUTE }),
+      [ARCHIVE]: {
+        ...builtRow(stateOf(ARCHIVE, 300, 11), { checkedAt: now }),
+        stage: "build",
+      },
+    });
+    h.setGone(ARCHIVE, true);
+
+    // Three failed pages, each after the last one's wait: 5, then 10 minutes.
+    let t = now;
+    for (const wait of [0, 5 * MINUTE, 10 * MINUTE]) {
+      t += wait;
+      h.setNow(t);
+      await passPause(USER_A.userId);
+      await expect(recallStep(a, h.deps)).rejects.toBeInstanceOf(RecallBuildError);
+      // Inside the wait that follows: nothing.
+      await passPause(USER_A.userId);
+      expect((await step(a, h)).outcome).toBe("idle");
+    }
+    expect(count(h, `page:${ARCHIVE}:start`)).toBe(3);
+    expect(await rowOf(USER_A.userId, ARCHIVE)).toMatchObject({
+      stage: "seed",
+      failedAt: t,
+      failures: 3,
+    });
+
+    // Twenty minutes after the third: the status check finds it gone.
+    h.setNow(t + 20 * MINUTE);
+    await passPause(USER_A.userId);
+    expect((await step(a, h)).outcome).toBe("gone");
+    expect((await objectFor(USER_A.userId).recallSyncState()).folders).toEqual([INBOX]);
+    expect(count(h, `page:${ARCHIVE}:start`)).toBe(3);
+  });
+
+  it("a folder listing that fails is recorded, and is not tried again until its wait has passed", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX],
+      mailboxes: { [INBOX]: { uidValidity: 100, messages: scriptedMessages(3) } },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    h.setListingFails(true);
+
+    await expect(recallStep(a, h.deps)).rejects.toBeInstanceOf(RecallBuildError);
+    expect((await objectFor(USER_A.userId).recallSyncState()).listing).toEqual({
+      failedAt: now,
+      failures: 1,
+    });
+    for (let i = 0; i < 5; i += 1) {
+      const run = await step(a, h);
+      expect(run.outcome).toBe("idle");
+      expect(run.log).toEqual([]);
+    }
+    expect(count(h, "folders:start")).toBe(1);
+
+    h.setListingFails(false);
+    h.setNow(now + RECALL_CHECK_INTERVAL_MS);
+    expect((await step(a, h)).outcome).toBe("folders");
+    const state = await objectFor(USER_A.userId).recallSyncState();
+    expect(state.folders).toEqual([INBOX]);
+    expect(state.listing).toBeNull();
   });
 });

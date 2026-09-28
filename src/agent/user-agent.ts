@@ -76,7 +76,9 @@ import {
   pageRefusal,
   RECALL_PAGE_PAUSE_MS,
   readFolders,
+  readListingFailure,
   readSyncRows,
+  type RetryState,
   type SyncRow,
   readCursor,
   readPageSlot,
@@ -87,6 +89,7 @@ import {
   writeCursor,
   writeFolders,
   writeLastPageAt,
+  writeListingFailure,
   writePageSlot,
   writeSyncRow,
 } from "./recall-ledger";
@@ -176,12 +179,14 @@ export type BeginPageAnswer =
  * What the object says about the build, before any IMAP (Phase 26, D-29).
  *
  * `slot` is the first refusal a build page would get now, or `free`. `folders`
- * is the stored folder list, or null before the first listing. `sync` is every
- * mailbox's sync row that parses, keyed by mailbox.
+ * is the stored folder list, or null before the first listing. `listing` is
+ * the folder listing's failure record while there is no list, or null.
+ * `sync` is every mailbox's sync row that parses, keyed by mailbox.
  */
 export interface RecallSyncState {
   readonly slot: PageRefusal | "free";
   readonly folders: string[] | null;
+  readonly listing: RetryState | null;
   readonly sync: Record<string, SyncRow>;
 }
 
@@ -561,8 +566,28 @@ export class UserAgent extends DurableObject<Env> {
     return {
       slot: pageRefusal(sql, "build", Date.now()) ?? "free",
       folders: readFolders(sql),
+      listing: readListingFailure(sql),
       sync: readSyncRows(sql),
     };
+  }
+
+  /**
+   * Record that the folder listing failed at `at` (26-REVIEW CR-01), so the
+   * next step waits before listing again instead of listing on every mail call.
+   *
+   * Refuses, in this order: `unnamed`; `invalid` unless `at` is a finite
+   * number; `destroying` while a destroy is running. Storing a folder list
+   * clears the record. No `await`, so the read, the count and the write are one
+   * atomic step.
+   */
+  recallListingFailed(at: unknown): SetAnswer {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
+    if (typeof at !== "number" || !Number.isFinite(at)) return { ok: false, reason: "invalid" };
+    if (destroyPending(sql)) return { ok: false, reason: "destroying" };
+    writeListingFailure(sql, at);
+    return { ok: true };
   }
 
   /**

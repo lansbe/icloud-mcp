@@ -206,10 +206,10 @@ describe("the object's sync-state read (D-29)", () => {
 
   it("answers free, no folder list and no sync rows for a fresh object", async () => {
     const state = await objectFor(USER_A.userId).recallSyncState();
-    expect(state).toEqual({ slot: "free", folders: null, sync: {} });
+    expect(state).toEqual({ slot: "free", folders: null, listing: null, sync: {} });
   });
 
-  it("reads the folder list and every sync row that parses, leaving out one that does not", async () => {
+  it("reads the folder list and every sync row that parses, leaving out one that does not; a row stored before the failure fields reads as never failed", async () => {
     const seen = { mailbox: "INBOX", uidValidity: VALIDITY, uidNext: 43, highestModseq: "9001" };
     await withSql(USER_A.userId, (sql) => {
       writeState(sql, "folders", JSON.stringify(["INBOX", "Archive"]));
@@ -239,6 +239,8 @@ describe("the object's sync-state read (D-29)", () => {
       reconciledAt: null,
       due: "new_mail",
       seen,
+      failedAt: null,
+      failures: 0,
     });
   });
 

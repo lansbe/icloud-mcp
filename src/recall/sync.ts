@@ -42,12 +42,40 @@
 // object's: a step that comes too early is told `paused` and stops. Recall is
 // inherent (owner, 2026-09-27), so there is no off state to check.
 //
-// A lease refusal answers `lease_busy` and stores nothing. Every other failure
-// propagates to the caller. No caught value is read (./.claude/CLAUDE.md §4),
-// and nothing here logs.
+// A lease refusal answers `lease_busy` and stores nothing.
+//
+// A FAILURE IS RECORDED AND WAITED OUT (26-REVIEW CR-01). Any other failure on
+// a folder, and a status check that gives no answer, is written on that
+// folder's sync row as the time it failed and how many times in a row it has.
+// The step then leaves that folder alone for `recallRetryWaitMs(failures)`:
+// five minutes after the first failure, doubling after each more, at most a
+// day. While it waits, the step works on the other folders, so one folder that
+// keeps failing never stops the rest and never opens a session on every mail
+// call. What the failure clears depends on the stage:
+//   - built: whatever was due is cleared and the check time is stamped, so the
+//     next attempt is a fresh status check. That check sees a new validity or
+//     a folder that is gone, which a retried read never would.
+//   - build: after RECALL_RESEED_AFTER_FAILURES failures in a row the folder
+//     goes back to seed, so its status check can find it gone. Its cursor is
+//     kept: nothing says the validity changed, and the engine resets the
+//     cursor itself when it did.
+//   - seed: the row stays at seed.
+// A failed folder listing is recorded on the object the same way, and waited
+// out the same way. Success clears the count: a page, a new-mail page or a
+// deletion sync that worked. A status check that worked keeps the count, so a
+// folder whose reads keep failing waits longer each time and does not start
+// over at five minutes.
+//
+// The failure itself still propagates, as `RecallBuildError`. No caught value
+// is read (./.claude/CLAUDE.md §4), and nothing here logs.
 
 import { agentFor, type LeasedMail } from "../agent/lease";
-import { PAGE_REFUSALS, type PageRefusal, type SyncRow } from "../agent/recall-ledger";
+import {
+  MAX_COUNTED_FAILURES,
+  PAGE_REFUSALS,
+  type PageRefusal,
+  type SyncRow,
+} from "../agent/recall-ledger";
 import type { CursorUpdate } from "../agent/user-agent";
 import type { FolderState } from "../change-marker";
 import { ConnectionBusyError } from "../errors";
@@ -84,6 +112,36 @@ export const RECALL_CHECK_INTERVAL_MS = 5 * 60 * 1000;
  * deletion sync reads the window's whole UID list.
  */
 export const RECALL_RECONCILE_INTERVAL_MS = 60 * 60 * 1000;
+
+/**
+ * How many failed build pages in a row send a folder back to seed, so its
+ * status check can find out whether it is gone (26-REVIEW CR-01).
+ */
+export const RECALL_RESEED_AFTER_FAILURES = 3;
+
+/** The longest a failing folder, or a failing listing, is left alone: a day. */
+export const RECALL_MAX_RETRY_WAIT_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * How long a folder, or the folder listing, is left alone after `failures`
+ * failed attempts in a row (26-REVIEW CR-01): RECALL_CHECK_INTERVAL_MS after
+ * the first, doubling after each more, and never more than a day. No wait at
+ * all when nothing failed.
+ */
+export function recallRetryWaitMs(failures: number): number {
+  if (failures < 1) return 0;
+  const doublings = Math.min(failures - 1, 16);
+  return Math.min(RECALL_CHECK_INTERVAL_MS * 2 ** doublings, RECALL_MAX_RETRY_WAIT_MS);
+}
+
+/** Whether something that failed at `failedAt`, `failures` times in a row, is still waiting at `now`. */
+function waiting(
+  retry: { readonly failedAt: number | null; readonly failures: number } | null | undefined,
+  now: number,
+): boolean {
+  if (retry === null || retry === undefined || retry.failedAt === null) return false;
+  return now - retry.failedAt < recallRetryWaitMs(retry.failures);
+}
 
 /** The reads a step makes, each inside the person's connection lease. */
 export interface StepReads {
@@ -141,7 +199,74 @@ const SEED_ROW: SyncRow = {
   reconciledAt: null,
   due: null,
   seen: null,
+  failedAt: null,
+  failures: 0,
 };
+
+/** No failure recorded: what a success writes. */
+const NO_FAILURE = { failedAt: null, failures: 0 } as const;
+
+/**
+ * `row` after one more failed attempt at `now` (26-REVIEW CR-01).
+ *
+ * A built folder has what was due cleared and its check time stamped, so the
+ * next attempt is a fresh status check. A build folder goes back to seed after
+ * RECALL_RESEED_AFTER_FAILURES failures in a row, keeping its count and its
+ * cursor. A seed folder stays at seed.
+ */
+function failedRow(row: SyncRow, now: number): SyncRow {
+  const failures = Math.min(row.failures + 1, MAX_COUNTED_FAILURES);
+  const mark = { failedAt: now, failures };
+  if (row.stage === "built") return { ...row, checkedAt: now, due: null, seen: null, ...mark };
+  if (row.stage === "build" && failures >= RECALL_RESEED_AFTER_FAILURES) {
+    return { ...SEED_ROW, ...mark };
+  }
+  return { ...row, ...mark };
+}
+
+/** Record one failed attempt on `mailbox`. Never throws: a failed write leaves the row as it was. */
+async function noteFailure(
+  principal: Principal,
+  mailbox: string,
+  row: SyncRow,
+  deps: StepDeps,
+): Promise<void> {
+  try {
+    await agentFor(principal).recallSetSync(mailbox, failedRow(row, deps.now()));
+  } catch {
+    // The next step finds the row as it was and tries again. Not read.
+  }
+}
+
+/**
+ * Run one attempt on `mailbox`. A throw records the failure on the folder's
+ * row, and becomes `RecallBuildError`. The caught value is not read.
+ */
+async function attempt(
+  principal: Principal,
+  mailbox: string,
+  row: SyncRow,
+  deps: StepDeps,
+  work: () => Promise<StepOutcome>,
+): Promise<StepOutcome> {
+  try {
+    return await work();
+  } catch {
+    await noteFailure(principal, mailbox, row, deps);
+    throw new RecallBuildError();
+  }
+}
+
+/** A status check that gave no answer: recorded as a failure, answered `unanswered`. */
+async function unanswered(
+  principal: Principal,
+  mailbox: string,
+  row: SyncRow,
+  deps: StepDeps,
+): Promise<StepOutcome> {
+  await noteFailure(principal, mailbox, row, deps);
+  return "unanswered";
+}
 
 /**
  * The folders a listing gives the build (D-12): INBOX, then the folder the
@@ -226,14 +351,26 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
   // 1. The slot, before anything else (D-29).
   const state = await stub.recallSyncState();
   if (state.slot !== "free") return state.slot;
+  const now = deps.now();
 
-  // 2. No folder list yet: list them, store them, stop.
+  // 2. No folder list yet: list them, store them, stop. A listing that failed
+  //    is left alone until its wait has passed (CR-01).
   if (state.folders === null) {
-    const folders = await underLease(principal, deps, (gate) =>
-      deps.reads.folders(gate, principal),
-    );
-    if (folders === LEASE_BUSY) return "lease_busy";
-    return afterSet(await stub.recallSetFolders(folders)) ?? "folders";
+    if (waiting(state.listing, now)) return "idle";
+    try {
+      const folders = await underLease(principal, deps, (gate) =>
+        deps.reads.folders(gate, principal),
+      );
+      if (folders === LEASE_BUSY) return "lease_busy";
+      return afterSet(await stub.recallSetFolders(folders)) ?? "folders";
+    } catch {
+      try {
+        await stub.recallListingFailed(deps.now());
+      } catch {
+        // The next step lists again. Not read.
+      }
+      throw new RecallBuildError();
+    }
   }
 
   const folders = state.folders;
@@ -245,82 +382,125 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
   });
   if (dueFolder !== undefined) {
     const row = state.sync[dueFolder]!;
-    if (row.due === "new_mail") return indexNewMail(principal, dueFolder, row, deps);
-    return syncDeletions(principal, dueFolder, row, deps);
+    return attempt(principal, dueFolder, row, deps, () =>
+      row.due === "new_mail"
+        ? indexNewMail(principal, dueFolder, row, deps)
+        : syncDeletions(principal, dueFolder, row, deps),
+    );
   }
 
-  // 4. The first listed folder not built. A folder with no row is at seed.
-  const unbuilt = folders.find((one) => state.sync[one]?.stage !== "built");
+  // 4. The first listed folder not built, and not waiting out a failure. A
+  //    folder with no row is at seed.
+  const unbuilt = folders.find((one) => {
+    const row = state.sync[one] ?? SEED_ROW;
+    return row.stage !== "built" && !waiting(row, now);
+  });
   if (unbuilt !== undefined) {
     const row = state.sync[unbuilt] ?? SEED_ROW;
-
-    // Seed: the status check alone. The first page is the next step.
-    if (row.stage === "seed") {
-      const outcome = await underLease(principal, deps, (gate) =>
-        deps.reads.snapshot(gate, principal, unbuilt),
-      );
-      if (outcome === LEASE_BUSY) return "lease_busy";
-      const gone = await dropIfGone(principal, folders, unbuilt, outcome);
-      if (gone !== null) return gone;
-
-      const folderState = folderStateOf(unbuilt, outcome);
-      if (folderState === null) return "unanswered";
-      const seeded: SyncRow = {
-        stage: "build",
-        state: folderState,
-        checkedAt: deps.now(),
-        reconciledAt: null,
-        due: null,
-        seen: null,
-      };
-      return afterSet(await stub.recallSetSync(unbuilt, seeded)) ?? "seeded";
-    }
-
-    // Build: one page through Phase 25's engine.
-    const status = await indexNextPage(principal, unbuilt, deps);
-    if (status === "done") {
-      const built: SyncRow = { ...row, stage: "built" };
-      return afterSet(await stub.recallSetSync(unbuilt, built)) ?? status;
-    }
-    if (status === "reset") {
-      return afterSet(await stub.recallSetSync(unbuilt, SEED_ROW)) ?? status;
-    }
-    return status;
+    return attempt(principal, unbuilt, row, deps, () =>
+      advanceUnbuilt(principal, folders, unbuilt, row, deps),
+    );
   }
 
-  // 5. Every folder is built: the one checked longest ago, never-checked first,
-  //    and only once its last check is RECALL_CHECK_INTERVAL_MS old.
+  // 5. Otherwise the built folder checked longest ago, never-checked first,
+  //    and only once its last check is RECALL_CHECK_INTERVAL_MS old. A folder
+  //    still building, or waiting out a failure, is not a candidate.
   let oldest: string | null = null;
+  let oldestRow: SyncRow | null = null;
   for (const one of folders) {
-    const at = state.sync[one]!.checkedAt;
-    if (oldest === null) {
+    const row = state.sync[one];
+    if (row === undefined || row.stage !== "built" || waiting(row, now)) continue;
+    if (oldestRow === null) {
       oldest = one;
+      oldestRow = row;
       continue;
     }
-    const best = state.sync[oldest]!.checkedAt;
-    if (best !== null && (at === null || at < best)) oldest = one;
+    const best = oldestRow.checkedAt;
+    if (best !== null && (row.checkedAt === null || row.checkedAt < best)) {
+      oldest = one;
+      oldestRow = row;
+    }
   }
-  if (oldest === null) return "idle";
-  const row = state.sync[oldest]!;
-  if (row.checkedAt !== null && deps.now() - row.checkedAt < RECALL_CHECK_INTERVAL_MS) {
+  if (oldest === null || oldestRow === null) return "idle";
+  if (oldestRow.checkedAt !== null && now - oldestRow.checkedAt < RECALL_CHECK_INTERVAL_MS) {
     return "idle";
   }
-  return checkBuilt(principal, folders, oldest, row, deps);
+  const checked = oldest;
+  const checkedRow = oldestRow;
+  return attempt(principal, checked, checkedRow, deps, () =>
+    checkBuilt(principal, folders, checked, checkedRow, deps),
+  );
+}
+
+/**
+ * One step of a folder that is not built yet: its status check at seed, or one
+ * page through Phase 25's engine at build.
+ */
+async function advanceUnbuilt(
+  principal: Principal,
+  folders: readonly string[],
+  mailbox: string,
+  row: SyncRow,
+  deps: StepDeps,
+): Promise<StepOutcome> {
+  const stub = agentFor(principal);
+
+  // Seed: the status check alone. The first page is the next step.
+  if (row.stage === "seed") {
+    const outcome = await underLease(principal, deps, (gate) =>
+      deps.reads.snapshot(gate, principal, mailbox),
+    );
+    if (outcome === LEASE_BUSY) return "lease_busy";
+    const gone = await dropIfGone(principal, folders, mailbox, row, outcome, deps);
+    if (gone !== null) return gone;
+
+    const folderState = folderStateOf(mailbox, outcome);
+    if (folderState === null) return unanswered(principal, mailbox, row, deps);
+    // A status check that worked keeps the failure count (see the header).
+    const seeded: SyncRow = {
+      stage: "build",
+      state: folderState,
+      checkedAt: deps.now(),
+      reconciledAt: null,
+      due: null,
+      seen: null,
+      failedAt: row.failedAt,
+      failures: row.failures,
+    };
+    return afterSet(await stub.recallSetSync(mailbox, seeded)) ?? "seeded";
+  }
+
+  // Build: one page through Phase 25's engine.
+  const status = await indexNextPage(principal, mailbox, deps);
+  if (status === "done") {
+    const built: SyncRow = { ...row, stage: "built", ...NO_FAILURE };
+    return afterSet(await stub.recallSetSync(mailbox, built)) ?? status;
+  }
+  if (status === "reset") {
+    return afterSet(await stub.recallSetSync(mailbox, SEED_ROW)) ?? status;
+  }
+  if (status === "indexed" && row.failures > 0) {
+    return afterSet(await stub.recallSetSync(mailbox, { ...row, ...NO_FAILURE })) ?? status;
+  }
+  return status;
 }
 
 /**
  * Drop `mailbox` from the folder list when the status check says it is gone,
- * and answer `gone`. INBOX is never dropped: it answers `unanswered`. Answers
- * null when the check did not say gone.
+ * and answer `gone`. INBOX is never dropped: it answers `unanswered`, recorded
+ * as a failure like any check with no answer. Answers null when the check did
+ * not say gone.
  */
 async function dropIfGone(
   principal: Principal,
   folders: readonly string[],
   mailbox: string,
+  row: SyncRow,
   outcome: FolderSnapshotOutcome,
+  deps: StepDeps,
 ): Promise<StepOutcome | null> {
   if (outcome.answered || outcome.gone !== true) return null;
-  if (mailbox === DEFAULT_MAILBOX) return "unanswered";
+  if (mailbox === DEFAULT_MAILBOX) return unanswered(principal, mailbox, row, deps);
   const kept = folders.filter((one) => one !== mailbox);
   return afterSet(await agentFor(principal).recallSetFolders(kept)) ?? "gone";
 }
@@ -335,7 +515,9 @@ function sameModseq(a: string | null, b: string | null): boolean {
  * folder, in a session that opens no mailbox, compared with the stored state.
  *
  * Records what is due, and what the check saw, for the next step to do. Never
- * reads a message here. With nothing to do, records the check time.
+ * reads a message here. With nothing to do, records the check time. A check
+ * with no answer is recorded as a failure (CR-01), so the check time moves and
+ * the folder cannot stay the oldest for ever.
  */
 async function checkBuilt(
   principal: Principal,
@@ -348,11 +530,11 @@ async function checkBuilt(
     deps.reads.snapshot(gate, principal, mailbox),
   );
   if (outcome === LEASE_BUSY) return "lease_busy";
-  const gone = await dropIfGone(principal, folders, mailbox, outcome);
+  const gone = await dropIfGone(principal, folders, mailbox, row, outcome, deps);
   if (gone !== null) return gone;
 
   const seen = folderStateOf(mailbox, outcome);
-  if (seen === null) return "unanswered";
+  if (seen === null) return unanswered(principal, mailbox, row, deps);
 
   const now = deps.now();
   const stored = row.state;
@@ -399,8 +581,11 @@ function isNewMailPage(page: unknown, from: number, to: number): page is NewMail
  * a build page. Then reads up to 25 of the OLDEST new messages, in the range
  * from the stored next UID to the seen next UID minus one, under the lease,
  * and indexes them. Only after the slot has ended is the stored next UID moved,
- * to exactly past what was read. A failure part-way leaves it where it was,
- * with the new mail still due, so the next step reads the same range again.
+ * to exactly past what was read. A failure part-way leaves it where it was.
+ * The step then records the failure and clears what was due (CR-01), so the
+ * next attempt, once the wait has passed, is a fresh status check: it finds the
+ * same new mail again when nothing else changed, and a new validity or a folder
+ * that is gone when something did.
  */
 export async function indexNewMail(
   principal: Principal,
@@ -474,6 +659,7 @@ export async function indexNewMail(
     state: { ...stored, uidNext: nextFrom },
     due: reached ? null : "new_mail",
     seen: reached ? null : seen,
+    ...NO_FAILURE,
   };
   return afterSet(await stub.recallSetSync(mailbox, moved)) ?? "indexed";
 }
@@ -486,7 +672,8 @@ export async function indexNewMail(
  * When the status check saw a new validity, the old generation is removed and
  * the folder goes back to seed. Otherwise the stored mod-sequence becomes the
  * one the check saw, and the sync time is recorded. A refusal leaves the sync
- * due for the next step.
+ * due for the next step. A failure is recorded by the step, which clears what
+ * was due (CR-01).
  */
 async function syncDeletions(
   principal: Principal,
@@ -516,6 +703,7 @@ async function syncDeletions(
     reconciledAt: now,
     due: null,
     seen: null,
+    ...NO_FAILURE,
   };
   return afterSet(await stub.recallSetSync(mailbox, synced)) ?? status;
 }

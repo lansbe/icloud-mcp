@@ -122,6 +122,8 @@ const SEED_ROW: SyncRow = {
   reconciledAt: null,
   due: null,
   seen: null,
+  failedAt: null,
+  failures: 0,
 };
 
 beforeEach(async () => {
@@ -227,6 +229,8 @@ describe("recallStep does one session of work, in the fixed order (D-13, D-27)",
       reconciledAt: null,
       due: null,
       seen: null,
+      failedAt: null,
+      failures: 0,
     });
 
     // 3. INBOX is at build: one page from the top, indexed.
@@ -312,28 +316,49 @@ describe("recallStep does one session of work, in the fixed order (D-13, D-27)",
     expect((await step(a, h)).outcome).toBe("gone");
     expect((await syncState(USER_A.userId)).folders).toEqual([INBOX]);
 
-    // INBOX reported gone: nothing is dropped and nothing is stored.
+    // INBOX reported gone: nothing is dropped. The check is recorded as a
+    // failure (CR-01), so INBOX is not asked again on the very next call.
     expect(await stub.recallSetSync(INBOX, SEED_ROW)).toEqual({ ok: true });
     h.setSnapshot(INBOX, { mailbox: INBOX, answered: false, gone: true });
-    const before = await recallTables(USER_A.userId);
+    const now = Date.now();
+    h.setNow(now);
     expect((await step(a, h)).outcome).toBe("unanswered");
     expect((await syncState(USER_A.userId)).folders).toEqual([INBOX]);
-    expect(await recallTables(USER_A.userId)).toEqual(before);
+    expect((await syncState(USER_A.userId)).sync[INBOX]).toEqual({
+      ...SEED_ROW,
+      failedAt: now,
+      failures: 1,
+    });
+    expect((await step(a, h)).outcome).toBe("idle");
   });
 
-  it("a status check that does not answer stores nothing, and the next step tries again", async () => {
+  it("a status check that does not answer is recorded as a failure; the next step moves on, and the folder is asked again once its wait has passed", async () => {
     const a = await testPrincipal(USER_A);
     const h = twoFolders();
+    const now = Date.now();
+    h.setNow(now);
     expect((await step(a, h)).outcome).toBe("folders");
 
     h.setSnapshot(INBOX, { mailbox: INBOX, answered: false });
-    const before = await recallTables(USER_A.userId);
     expect((await step(a, h)).outcome).toBe("unanswered");
-    expect(await recallTables(USER_A.userId)).toEqual(before);
-    expect((await syncState(USER_A.userId)).sync[INBOX]).toBeUndefined();
+    expect((await syncState(USER_A.userId)).sync[INBOX]).toEqual({
+      ...SEED_ROW,
+      failedAt: now,
+      failures: 1,
+    });
 
+    // INBOX is waiting, so the next step seeds the archive instead.
+    let run = await step(a, h);
+    expect(run.outcome).toBe("seeded");
+    expect(run.log).toContain(`snapshot:${ARCHIVE}:start`);
+    expect(run.log).not.toContain(`snapshot:${INBOX}:start`);
+
+    // Once the wait has passed, INBOX is asked again, and seeds.
     h.setSnapshot(INBOX, null);
-    expect((await step(a, h)).outcome).toBe("seeded");
+    h.setNow(now + 5 * 60 * 1000);
+    run = await step(a, h);
+    expect(run.outcome).toBe("seeded");
+    expect(run.log).toContain(`snapshot:${INBOX}:start`);
   });
 });
 

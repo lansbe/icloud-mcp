@@ -74,6 +74,14 @@ export interface StepHarness {
   setSnapshot(mailbox: string, outcome: FolderSnapshotOutcome | null): void;
   /** The clock `deps.now()` reads. */
   setNow(now: number): void;
+  /**
+   * `mailbox` is deleted in iCloud from now on: its status check answers gone,
+   * and every read of it (a page, the UIDs, new mail) opens it and is refused
+   * as not found. False puts it back.
+   */
+  setGone(mailbox: string, gone: boolean): void;
+  /** The folder listing fails from now on, or works again. */
+  setListingFails(fails: boolean): void;
 }
 
 /** One turn of the event loop. */
@@ -116,6 +124,8 @@ export function fakeStepDeps(options: {
   let listed = options.folders ?? Object.keys(options.mailboxes);
   const overrides = new Map<string, FolderSnapshotOutcome>();
   let clock: number | null = null;
+  const gone = new Set<string>();
+  let listingFails = false;
 
   const newMailCalls: NewMailCall[] = [];
 
@@ -147,6 +157,11 @@ export function fakeStepDeps(options: {
   const source: RecallSource = {
     async page(gate, principal, mailbox, cursor) {
       log.push(`page:${mailbox}:start`);
+      if (gone.has(mailbox)) {
+        await tick();
+        log.push(`page:${mailbox}:end`);
+        throw new ImapNotFoundError();
+      }
       const page = await sourceFor(mailbox).page(gate, principal, mailbox, cursor);
       await tick();
       log.push(`page:${mailbox}:end`);
@@ -154,6 +169,11 @@ export function fakeStepDeps(options: {
     },
     async uids(gate, principal, mailbox) {
       log.push(`uids:${mailbox}:start`);
+      if (gone.has(mailbox)) {
+        await tick();
+        log.push(`uids:${mailbox}:end`);
+        throw new ImapNotFoundError();
+      }
       const answer = await sourceFor(mailbox).uids(gate, principal, mailbox);
       await tick();
       log.push(`uids:${mailbox}:end`);
@@ -187,12 +207,14 @@ export function fakeStepDeps(options: {
         log.push("folders:start");
         await tick();
         log.push("folders:end");
+        if (listingFails) throw new ImapNotFoundError();
         return [...listed];
       },
       async snapshot(_gate, _principal, mailbox) {
         log.push(`snapshot:${mailbox}:start`);
         await tick();
         log.push(`snapshot:${mailbox}:end`);
+        if (gone.has(mailbox)) return { mailbox, answered: false, gone: true };
         const override = overrides.get(mailbox);
         if (override !== undefined) return override;
         const folder = live[mailbox];
@@ -203,6 +225,7 @@ export function fakeStepDeps(options: {
         newMailCalls.push({ mailbox, uidValidity, fromUid, toUidExclusive });
         await tick();
         log.push(`newMail:${mailbox}:end`);
+        if (gone.has(mailbox)) throw new ImapNotFoundError();
         const folder = liveFor(mailbox);
         // The real read opens with the stored validity as the expected one.
         if (folder.uidValidity !== uidValidity) throw new ImapNotFoundError();
@@ -253,6 +276,13 @@ export function fakeStepDeps(options: {
     },
     setNow(now) {
       clock = now;
+    },
+    setGone(mailbox, isGone) {
+      if (isGone) gone.add(mailbox);
+      else gone.delete(mailbox);
+    },
+    setListingFails(fails) {
+      listingFails = fails;
     },
   };
 }
