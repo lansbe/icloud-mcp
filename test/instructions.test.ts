@@ -97,6 +97,7 @@ const EXPECTED_TOOLS: readonly string[] = [
   "mail_list_unread",
   "mail_mark_read",
   "mail_move",
+  "mail_recall",
   "mail_search",
   "mail_stage_attachment",
   "mail_trash",

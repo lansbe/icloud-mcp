@@ -40,6 +40,25 @@
 // query here would count as a second site and fail the commit. The answer is
 // at the source, never in the pattern.
 
+import type { FolderState } from "../change-marker";
+import {
+  RECALL_MAX_PAGES_PER_DAY,
+  RECALL_MAX_VECTORS,
+  RECALL_PAGE_SIZE,
+} from "../recall/retention";
+
+/**
+ * The least time between the start of one recall page and the next, per person
+ * (Phase 25, D-15).
+ *
+ * This is what keeps a build from monopolising the person's one iCloud
+ * connection: a page holds that connection for one read, at most once a
+ * minute. The object enforces it, so no caller can shorten it; a caller that
+ * comes back early is told `paused`. It lives here, beside the one predicate
+ * that reads it, and the object module re-exports it.
+ */
+export const RECALL_PAGE_PAUSE_MS = 60000;
+
 /** The reasons a record can be refused. Plan 25-03 appends to this list and nowhere else. */
 export const RECORD_REFUSALS = ["invalid", "unnamed", "full", "destroying"] as const;
 
@@ -86,6 +105,164 @@ const PENDING_DESTROY_ROW = "destroy_pending";
 
 /** The `recall_state` key of one mailbox's build cursor is this plus the mailbox. */
 const CURSOR_ROW = "cursor:";
+
+/** The `recall_state` key of the folder list the build covers (Phase 26, D-12). */
+const FOLDERS_ROW = "folders";
+
+/** The `recall_state` key of one mailbox's sync row is this plus the mailbox (D-15). */
+export const SYNC_ROW = "sync:";
+
+/** Where one folder is in its build (Phase 26, D-14). */
+export type SyncStage = "seed" | "build" | "built";
+
+/** What a status check on a built folder said to do next (D-14, D-27). */
+export type SyncDue = "new_mail" | "reconcile";
+
+/** One mailbox's sync row, as `parseSyncRow` reads it. */
+export interface SyncRow {
+  readonly stage: SyncStage;
+  /** The folder's state when it was last seeded or brought up to date. */
+  readonly state: FolderState | null;
+  /** When the last status check ran, in ms since the epoch. */
+  readonly checkedAt: number | null;
+  /** When the last deletion sync ran, in ms since the epoch. */
+  readonly reconciledAt: number | null;
+  /** What the last status check said to do next, or null. */
+  readonly due: SyncDue | null;
+  /** The folder's state as the last status check saw it. */
+  readonly seen: FolderState | null;
+}
+
+/** 1 to 20 decimal digits: the shape of a mod-sequence as iCloud sends it. */
+const MODSEQ_DIGITS = /^[0-9]{1,20}$/;
+
+/** `value` as a folder state, or undefined when it is not exactly one. */
+function folderStateOf(value: unknown): FolderState | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const s = value as {
+    mailbox?: unknown;
+    uidValidity?: unknown;
+    uidNext?: unknown;
+    highestModseq?: unknown;
+  };
+  if (typeof s.mailbox !== "string" || s.mailbox.length < 1) return undefined;
+  if (typeof s.uidValidity !== "number" || !Number.isSafeInteger(s.uidValidity)) return undefined;
+  if (s.uidValidity < 0) return undefined;
+  if (typeof s.uidNext !== "number" || !Number.isSafeInteger(s.uidNext)) return undefined;
+  if (s.uidNext < 1) return undefined;
+  const modseq = s.highestModseq;
+  if (modseq !== null && (typeof modseq !== "string" || !MODSEQ_DIGITS.test(modseq))) {
+    return undefined;
+  }
+  return {
+    mailbox: s.mailbox,
+    uidValidity: s.uidValidity,
+    uidNext: s.uidNext,
+    highestModseq: modseq,
+  };
+}
+
+/** `value` as null or a folder state, or undefined when it is neither. */
+function optionalFolderState(value: unknown): FolderState | null | undefined {
+  return value === null ? null : folderStateOf(value);
+}
+
+/** `value` as null or a finite time, or undefined when it is neither. */
+function optionalTime(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * One mailbox's sync row, from its stored JSON text, or null when the text is
+ * not exactly one row (D-15).
+ *
+ * THE ONE READER OF A SYNC ROW. The object's read answers only rows this
+ * accepts, and the setter plan 26-03 adds stores only rows this accepts, so a
+ * row that reaches the step always has this shape. Every field must be present:
+ * a missing one is null written out, never assumed.
+ */
+export function parseSyncRow(value: unknown): SyncRow | null {
+  let parsed: unknown = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const r = parsed as Record<string, unknown>;
+  const stage = r.stage;
+  if (stage !== "seed" && stage !== "build" && stage !== "built") return null;
+  const state = optionalFolderState(r.state);
+  const seen = optionalFolderState(r.seen);
+  const checkedAt = optionalTime(r.checkedAt);
+  const reconciledAt = optionalTime(r.reconciledAt);
+  if (state === undefined || seen === undefined) return null;
+  if (checkedAt === undefined || reconciledAt === undefined) return null;
+  const due = r.due;
+  if (due !== null && due !== "new_mail" && due !== "reconcile") return null;
+  return { stage, state, checkedAt, reconciledAt, due, seen };
+}
+
+/**
+ * The first reason a page of `kind` may not start now, or null when it may
+ * (Phase 26, D-29).
+ *
+ * THE ONE PREDICATE. The object's page start asks this before it mints a token,
+ * and the object's sync-state read asks it too, so a build step's check before
+ * any IMAP can never disagree with the refusal the page start would give. The
+ * order is the page start's own: `destroying`, `busy`, `paused`, `quota`, and
+ * `full` for a build only. A reconcile only removes, so it is never full.
+ *
+ * Reads only. It writes nothing.
+ */
+export function pageRefusal(sql: SqlStorage, kind: PageKind, now: number): PageRefusal | null {
+  if (destroyPending(sql)) return "destroying";
+  const slot = readPageSlot(sql);
+  if (slot !== null && slot.expiresAt > now) return "busy";
+  const last = readLastPageAt(sql);
+  if (last !== null && now - last < RECALL_PAGE_PAUSE_MS) return "paused";
+  if (pagesOn(sql, utcDay(now)) >= RECALL_MAX_PAGES_PER_DAY) return "quota";
+  if (kind === "build" && countVectors(sql) + RECALL_PAGE_SIZE > RECALL_MAX_VECTORS) {
+    return "full";
+  }
+  return null;
+}
+
+/** The stored folder list, or null when there is none or it is malformed. */
+export function readFolders(sql: SqlStorage): string[] | null {
+  const raw = readState(sql, FOLDERS_ROW);
+  if (raw === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  if (!parsed.every((one): one is string => typeof one === "string")) return null;
+  return parsed;
+}
+
+/** Every sync row that parses, keyed by mailbox. A row that does not parse is left out. */
+export function readSyncRows(sql: SqlStorage): Record<string, SyncRow> {
+  const out: Record<string, SyncRow> = {};
+  const rows = sql
+    .exec<{ k: string; v: string }>(
+      `select k, v from recall_state where substr(k, 1, ?) = ?`,
+      SYNC_ROW.length,
+      SYNC_ROW,
+    )
+    .toArray();
+  for (const row of rows) {
+    const mailbox = row.k.slice(SYNC_ROW.length);
+    const parsed = parseSyncRow(row.v);
+    if (mailbox.length > 0 && parsed !== null) out[mailbox] = parsed;
+  }
+  return out;
+}
 
 /** One row to record. */
 export interface LedgerRowInput {

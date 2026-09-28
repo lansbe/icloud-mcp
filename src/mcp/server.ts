@@ -19,6 +19,7 @@ import { registerContactsTools } from "./tools/contacts";
 import { registerDavDiagnoseTool } from "./tools/dav-diagnose";
 import { registerDiagnoseTool } from "./tools/diagnose";
 import { registerMailTools } from "./tools/mail";
+import { registerRecallTools } from "./tools/recall";
 
 /**
  * Build the per-request server factory.
@@ -135,6 +136,11 @@ export function createServerFactory(
     // it needs neither.
     registerAccountTool(server, principal);
     registerMailTools(server, leasedMail, principal);
+    // Recall by meaning (Phase 26, RCLL-08). The same principal promise the
+    // mail tools get, and nothing else: no leased runner, because it opens no
+    // mail session. It reads the person's own object and their own part of the
+    // recall index, both chosen by the principal alone.
+    registerRecallTools(server, principal);
     // The change check (CHNG-01). The same leased gate as the mail tools, so a
     // second session while one is held is refused rather than opening a
     // second socket; neither the gate nor the lease queues. It takes the

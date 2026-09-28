@@ -51,12 +51,7 @@ import type { Env } from "../env";
 import { type RecallStore, recallStore } from "../recall/index";
 import { grantsRemainFor } from "../recall/grant-check";
 import { destroyAll, type LedgerHandle, sweepExpired } from "../recall/lifecycle";
-import {
-  RECALL_MAX_PAGES_PER_DAY,
-  RECALL_MAX_VECTORS,
-  RECALL_PAGE_SIZE,
-  RECALL_TTL_MS,
-} from "../recall/retention";
+import { RECALL_MAX_VECTORS, RECALL_TTL_MS } from "../recall/retention";
 import {
   clearCursor,
   clearDestroyPending,
@@ -76,9 +71,12 @@ import {
   type LedgerRowInput,
   type MailboxRow,
   type PageRefusal,
-  pagesOn,
+  pageRefusal,
+  RECALL_PAGE_PAUSE_MS,
+  readFolders,
+  readSyncRows,
+  type SyncRow,
   readCursor,
-  readLastPageAt,
   readPageSlot,
   recordVectors,
   type RecordRefusal,
@@ -124,14 +122,10 @@ export type RecordAnswer = { ok: true } | { ok: false; reason: RecordRefusal };
 
 /**
  * The least time between the start of one recall page and the next, per person
- * (Phase 25, D-15).
- *
- * This is what keeps a build from monopolising the person's one iCloud
- * connection: a page holds that connection for one read, at most once a
- * minute. The object enforces it, so no caller can shorten it; a caller that
- * comes back early is told `paused`.
+ * (Phase 25, D-15). Defined beside `pageRefusal`, the one predicate that reads
+ * it, and re-exported here where it has always been imported from.
  */
-export const RECALL_PAGE_PAUSE_MS = 60000;
+export { RECALL_PAGE_PAUSE_MS };
 
 /**
  * How long an in-flight page blocks another, in milliseconds.
@@ -172,6 +166,19 @@ const MAX_SCOPE_ROWS = 1000;
 export type BeginPageAnswer =
   | { ok: true; pageToken: string; cursor: string | null }
   | { ok: false; reason: PageRefusal | "invalid" | "unnamed" };
+
+/**
+ * What the object says about the build, before any IMAP (Phase 26, D-29).
+ *
+ * `slot` is the first refusal a build page would get now, or `free`. `folders`
+ * is the stored folder list, or null before the first listing. `sync` is every
+ * mailbox's sync row that parses, keyed by mailbox.
+ */
+export interface RecallSyncState {
+  readonly slot: PageRefusal | "free";
+  readonly folders: string[] | null;
+  readonly sync: Record<string, SyncRow>;
+}
 
 /** What to do with a mailbox's cursor when a page ends. */
 export type CursorUpdate =
@@ -494,7 +501,9 @@ export class UserAgent extends DurableObject<Env> {
    * page's start; `quota` once RECALL_MAX_PAGES_PER_DAY pages began today
    * (UTC), reconciles included; and, for a build only, `full` when one more
    * page could take the ledger past RECALL_MAX_VECTORS. A reconcile only
-   * removes, so it is never refused as full.
+   * removes, so it is never refused as full. Every check after `unnamed` and
+   * `invalid` is `pageRefusal` in ./recall-ledger.ts, the one predicate the
+   * sync-state read below shares (Phase 26, D-29).
    *
    * Otherwise it mints a page token, records the start, counts the page and
    * answers the stored cursor. No `await`, so the check and the set are one
@@ -506,24 +515,41 @@ export class UserAgent extends DurableObject<Env> {
     if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
     if (!isMailbox(mailbox)) return { ok: false, reason: "invalid" };
     if (kind !== "build" && kind !== "reconcile") return { ok: false, reason: "invalid" };
-    if (destroyPending(sql)) return { ok: false, reason: "destroying" };
 
     const now = Date.now();
-    const slot = readPageSlot(sql);
-    if (slot !== null && slot.expiresAt > now) return { ok: false, reason: "busy" };
-    const last = readLastPageAt(sql);
-    if (last !== null && now - last < RECALL_PAGE_PAUSE_MS) return { ok: false, reason: "paused" };
+    const refusal = pageRefusal(sql, kind, now);
+    if (refusal !== null) return { ok: false, reason: refusal };
     const today = utcDay(now);
-    if (pagesOn(sql, today) >= RECALL_MAX_PAGES_PER_DAY) return { ok: false, reason: "quota" };
-    if (kind === "build" && countVectors(sql) + RECALL_PAGE_SIZE > RECALL_MAX_VECTORS) {
-      return { ok: false, reason: "full" };
-    }
 
     const pageToken = crypto.randomUUID();
     writePageSlot(sql, { token: pageToken, expiresAt: now + RECALL_PAGE_TTL_MS });
     writeLastPageAt(sql, now);
     countPageOn(sql, today);
     return { ok: true, pageToken, cursor: readCursor(sql, mailbox) };
+  }
+
+  /**
+   * Report the page slot, the folder list and each folder's sync row, for a
+   * build step to read before it opens any IMAP session (Phase 26, D-29).
+   *
+   * The slot is answered by `pageRefusal`, the same predicate the page start
+   * above asks, for a build page. So a step that reads `free` here and then
+   * asks to start a page is refused only if something changed in between, and
+   * a step that reads a refusal here stops with no lease and no session.
+   *
+   * Writes nothing, apart from the one-time copy of the object's own name that
+   * every recall method makes (Phase 25, D-22). There is no `off` answer:
+   * recall is inherent.
+   */
+  recallSyncState(): RecallSyncState {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    this.rememberOwnName();
+    return {
+      slot: pageRefusal(sql, "build", Date.now()) ?? "free",
+      folders: readFolders(sql),
+      sync: readSyncRows(sql),
+    };
   }
 
   /**
