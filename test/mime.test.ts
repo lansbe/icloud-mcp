@@ -919,7 +919,7 @@ describe("snippetFromPart — a malformed numeric reference costs no row (CR-01)
   it("keeps the prose around the reference rather than losing the preview", async () => {
     // The consequence spelled out. A snippet is a convenience and a page is
     // not: before this fix the FIRST of these four shapes sitting anywhere in
-    // an INBOX made `mail_list`, `mail_search` and `mail_list_unread` answer
+    // an INBOX made `mail_list`, `mail_find` and `mail_list_unread` answer
     // with an error for every page it landed on, naming no message.
     const snippet = await snippetFromPart(
       bytes(

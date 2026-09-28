@@ -1662,7 +1662,7 @@ const TOOL_SHAPES: {
     listShaped: true,
   },
   {
-    tool: "mail_search",
+    tool: "mail_find",
     source: markedSearchPage(),
     serverKeys: PAGE_SERVER_KEYS,
     build: () => searchPageToolResult(markedSearchPage()),
@@ -1915,6 +1915,9 @@ describe("the search and unread registrations", () => {
       // The seventeenth: a preview of moving one draft to Trash, applied by
       // mail_commit (Phase 22, DRFT-03).
       "mail_delete_draft",
+      // The exhaustive search: every match in one folder, so an empty answer
+      // means none there. Named for that promise (SEED-006 D-1).
+      "mail_find",
       // The sixteenth: flag or unflag one message, written at once with no
       // preview, the same shape as mail_mark_read (D-01).
       "mail_flag",
@@ -1932,7 +1935,6 @@ describe("the search and unread registrations", () => {
       "mail_mark_read",
       // The twelfth: a preview of moving messages, which writes nothing.
       "mail_move",
-      "mail_search",
       // The ninth, and the ONE place D-80's departure is actually spent: a
       // single name carrying a source discriminator, rather than one name per
       // ingress. The price is named at the registration itself.
@@ -1944,7 +1946,7 @@ describe("the search and unread registrations", () => {
   });
 
   it("takes a folder, three filters, a date range, a page size and a cursor", () => {
-    expect(Object.keys(schemaFor("mail_search").shape).sort()).toEqual([
+    expect(Object.keys(schemaFor("mail_find").shape).sort()).toEqual([
       "cursor",
       "endDate",
       "folderId",
@@ -1958,9 +1960,9 @@ describe("the search and unread registrations", () => {
   it("lets every search parameter be omitted, because the folder defaults", () => {
     // D-27: one folder, defaulting to the inbox. A required folder would make
     // "search my mail" a two-call operation.
-    expect(schemaFor("mail_search").safeParse({}).success).toBe(true);
+    expect(schemaFor("mail_find").safeParse({}).success).toBe(true);
     expect(
-      schemaFor("mail_search").safeParse({
+      schemaFor("mail_find").safeParse({
         keyword: "offer",
         sender: "jane@example.invalid",
         startDate: "2026-02-01",
@@ -1975,37 +1977,49 @@ describe("the search and unread registrations", () => {
     // is not a preference about input hygiene, it is the one character that
     // cannot be sent.
     expect(
-      schemaFor("mail_search").safeParse({ keyword: "offer\u0000letter" }).success,
+      schemaFor("mail_find").safeParse({ keyword: "offer\u0000letter" }).success,
     ).toBe(false);
     expect(
-      schemaFor("mail_search").safeParse({ sender: "jane\u0000@example.invalid" })
+      schemaFor("mail_find").safeParse({ sender: "jane\u0000@example.invalid" })
         .success,
     ).toBe(false);
     // Non-vacuous: the same terms without the NUL are accepted.
-    expect(schemaFor("mail_search").safeParse({ keyword: "offerletter" }).success).toBe(
+    expect(schemaFor("mail_find").safeParse({ keyword: "offerletter" }).success).toBe(
       true,
     );
   });
 
   it("refuses a date that is not a calendar day", () => {
-    const schema = schemaFor("mail_search");
+    const schema = schemaFor("mail_find");
 
     expect(schema.safeParse({ startDate: "2026-02-01" }).success).toBe(true);
     expect(schema.safeParse({ startDate: "1 Feb 2026" }).success).toBe(false);
     expect(schema.safeParse({ endDate: "2026-2-1" }).success).toBe(false);
   });
 
-  it("states the date rule in the description, because the names cannot", () => {
+  it("leads the description with the exhaustive promise, and states the date rule on both dates", () => {
+    // RCLL-09: the name and the description carry the promise that an empty
+    // answer means none in that folder. The promise and the untrusted notice
+    // fill the 280-character ceiling, so the date rule moved onto the two
+    // parameters it relates.
+    const description = String(
+      registered().find((one) => one.name === "mail_find")!.options.description,
+    );
+
+    expect(description.startsWith("Every match in one folder")).toBe(true);
+    expect(description).toContain("empty answer means none there");
+    expect(description).toContain(UNTRUSTED_NOTICE);
+
     // A caller cannot infer from `startDate`/`endDate` that both ends are
     // inclusive, that matching is day-granular, or that it runs on the receipt
     // time rather than the sender's own header.
-    const description = String(
-      registered().find((one) => one.name === "mail_search")!.options.description,
-    );
-
-    expect(description).toContain("inclusive");
-    expect(description).toContain("day-granular");
-    expect(description).toContain(UNTRUSTED_NOTICE);
+    for (const param of ["startDate", "endDate"]) {
+      const text = describedParam("mail_find", param);
+      expect(text, param).toContain("YYYY-MM-DD");
+      expect(text, param).toContain("inclusive");
+      expect(text, param).toContain("day-granular");
+      expect(text, param).toContain("receipt time");
+    }
   });
 
   it("states the keyword matching semantics, because the parameter name cannot", () => {
@@ -2020,7 +2034,7 @@ describe("the search and unread registrations", () => {
     //
     // Read off the REGISTERED tool's schema rather than the source module, so
     // this asserts what actually ships to the model.
-    const description = describedParam("mail_search", "keyword");
+    const description = describedParam("mail_find", "keyword");
 
     expect(description).toContain("token-based");
     expect(description).toContain("accent-");
@@ -2064,7 +2078,7 @@ describe("the search and unread registrations", () => {
     // use, so a blanket edit to the constant would satisfy the three assertions
     // above while also claiming the same behaviour for `sender` — which maps to
     // a different IMAP key whose semantics were never measured.
-    const sender = describedParam("mail_search", "sender");
+    const sender = describedParam("mail_find", "sender");
     // Non-vacuous: a `describedParam` that read nothing would return the string
     // "undefined", and the negative assertion below would pass on it happily.
     expect(sender).toContain("sender address");
