@@ -83,11 +83,20 @@ interface SyncStateView {
   readonly sync: Readonly<Record<string, { readonly stage: string }>>;
 }
 
-/** `built` only when a folder list exists and every listed folder is built. */
+/**
+ * `built` only when a folder list exists and every listed folder is built.
+ *
+ * A folder's row is read as an own key only, because the name is the
+ * account's own and may be `constructor` (26-REVIEW WR-06).
+ */
 export function indexWordOf(state: SyncStateView): RecallIndexWord {
   const folders = state.folders;
   if (folders === null || folders.length === 0) return "building";
-  return folders.every((mailbox) => state.sync[mailbox]?.stage === "built") ? "built" : "building";
+  return folders.every(
+    (mailbox) => Object.hasOwn(state.sync, mailbox) && state.sync[mailbox]?.stage === "built",
+  )
+    ? "built"
+    : "building";
 }
 
 /** Whether `ref` is a message id this server minted. A thrown decode means no. */

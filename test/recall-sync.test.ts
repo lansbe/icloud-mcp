@@ -367,6 +367,47 @@ describe("recallStep does one session of work, in the fixed order (D-13, D-27)",
 });
 
 // ---------------------------------------------------------------------------
+// A folder named like an object member (26-REVIEW WR-06)
+// ---------------------------------------------------------------------------
+
+describe("an archive folder named like an object member is an ordinary folder (26-REVIEW WR-06)", () => {
+  for (const name of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+    it(`"${name}": seeded, built page by page and reported built, like any other name`, async () => {
+      const a = await testPrincipal(USER_A);
+      const mailboxes: Record<string, { uidValidity: number; messages: ReturnType<typeof scriptedMessages> }> =
+        Object.create(null);
+      mailboxes[INBOX] = { uidValidity: 100, messages: scriptedMessages(3) };
+      mailboxes[name] = { uidValidity: 300, messages: scriptedMessages(4) };
+      const h = fakeStepDeps({ folders: [INBOX, name], mailboxes });
+      h.setNow(Date.now());
+
+      expect((await step(a, h)).outcome).toBe("folders");
+      expect((await step(a, h)).outcome).toBe("seeded");
+      expect((await step(a, h)).outcome).toBe("done");
+      await passPause(USER_A.userId);
+
+      let run = await step(a, h);
+      expect(run.outcome).toBe("seeded");
+      expect(run.log).toContain(`snapshot:${name}:start`);
+      const seeded = await syncState(USER_A.userId);
+      expect(Object.hasOwn(seeded.sync, name)).toBe(true);
+      expect(seeded.sync[name]!.stage).toBe("build");
+
+      run = await step(a, h);
+      expect(run.outcome).toBe("done");
+      expect(run.log).toContain(`page:${name}:start`);
+      expect(await ledgerCount(USER_A.userId)).toBe(7);
+      const built = await syncState(USER_A.userId);
+      expect(Object.hasOwn(built.sync, name)).toBe(true);
+      expect(built.sync[name]!.stage).toBe("built");
+
+      await passPause(USER_A.userId);
+      expect((await step(a, h)).outcome).toBe("idle");
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // The lease (D-27)
 // ---------------------------------------------------------------------------
 

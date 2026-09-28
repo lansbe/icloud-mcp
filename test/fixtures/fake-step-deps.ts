@@ -129,8 +129,13 @@ export function fakeStepDeps(options: {
 
   const newMailCalls: NewMailCall[] = [];
 
-  const sources: Record<string, FakeRecallSource> = {};
-  const live: Record<string, LiveFolder> = {};
+  // No prototype, so a folder named `__proto__` or `constructor` is an own key
+  // here too (26-REVIEW WR-06).
+  const sources: Record<string, FakeRecallSource> = Object.create(null) as Record<
+    string,
+    FakeRecallSource
+  >;
+  const live: Record<string, LiveFolder> = Object.create(null) as Record<string, LiveFolder>;
   for (const [mailbox, folder] of Object.entries(options.mailboxes)) {
     sources[mailbox] = createFakeRecallSource({
       mailbox,

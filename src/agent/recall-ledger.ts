@@ -383,7 +383,17 @@ export function writeSyncRow(sql: SqlStorage, mailbox: string, row: SyncRow): vo
   writeState(sql, SYNC_ROW + mailbox, JSON.stringify(row));
 }
 
-/** Every sync row that parses, keyed by mailbox. A row that does not parse is left out. */
+/**
+ * Every sync row that parses, keyed by mailbox. A row that does not parse is
+ * left out.
+ *
+ * The keys are folder names, and the archive folder's name is the account's
+ * own, so it can be `constructor`, `toString` or `__proto__` (26-REVIEW WR-06).
+ * So each row is DEFINED as an own key, never assigned: an assignment to
+ * `__proto__` would replace the map's prototype and lose the row. The map is
+ * an ordinary object because it crosses RPC, which refuses one with no
+ * prototype. Read it with `syncRowIn`, never by indexing it directly.
+ */
 export function readSyncRows(sql: SqlStorage): Record<string, SyncRow> {
   const out: Record<string, SyncRow> = {};
   const rows = sql
@@ -396,9 +406,33 @@ export function readSyncRows(sql: SqlStorage): Record<string, SyncRow> {
   for (const row of rows) {
     const mailbox = row.k.slice(SYNC_ROW.length);
     const parsed = parseSyncRow(row.v);
-    if (mailbox.length > 0 && parsed !== null) out[mailbox] = parsed;
+    if (mailbox.length > 0 && parsed !== null) {
+      Object.defineProperty(out, mailbox, {
+        value: parsed,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
   }
   return out;
+}
+
+/**
+ * `mailbox`'s row in a map `readSyncRows` built, or undefined (26-REVIEW
+ * WR-06).
+ *
+ * THE ONE WAY TO READ THAT MAP. Only an own key counts, so a folder named
+ * `constructor` or `toString` is a folder with no row yet, never
+ * `Object.prototype`'s member of that name. The map crosses RPC, and a copy of
+ * it has the ordinary prototype again, which is why the reader checks and not
+ * only the builder.
+ */
+export function syncRowIn(
+  sync: Readonly<Record<string, SyncRow>>,
+  mailbox: string,
+): SyncRow | undefined {
+  return Object.hasOwn(sync, mailbox) ? sync[mailbox] : undefined;
 }
 
 /** One row to record. */

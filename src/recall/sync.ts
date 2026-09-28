@@ -83,6 +83,7 @@ import {
   PAGE_REFUSALS,
   type PageRefusal,
   type SyncRow,
+  syncRowIn,
 } from "../agent/recall-ledger";
 import type { CursorUpdate } from "../agent/user-agent";
 import type { FolderState } from "../change-marker";
@@ -384,14 +385,16 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
   }
 
   const folders = state.folders;
+  // A folder name is the account's own, so it is only ever an own key (WR-06).
+  const rowOf = (mailbox: string): SyncRow | undefined => syncRowIn(state.sync, mailbox);
 
   // 3. A built folder whose last status check left something due goes first.
   const dueFolder = folders.find((one) => {
-    const row = state.sync[one];
+    const row = rowOf(one);
     return row !== undefined && row.stage === "built" && row.due !== null;
   });
   if (dueFolder !== undefined) {
-    const row = state.sync[dueFolder]!;
+    const row = rowOf(dueFolder)!;
     return attempt(principal, dueFolder, row, deps, () =>
       row.due === "new_mail"
         ? indexNewMail(principal, dueFolder, row, deps)
@@ -406,7 +409,7 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
   let oldest: string | null = null;
   let oldestRow: SyncRow | null = null;
   for (const one of folders) {
-    const row = state.sync[one];
+    const row = rowOf(one);
     if (row === undefined || row.stage !== "built" || waiting(row, now)) continue;
     if (oldestRow === null) {
       oldest = one;
@@ -434,11 +437,11 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
   // 5. The first listed folder not built, and not waiting out a failure. A
   //    folder with no row is at seed.
   const unbuilt = folders.find((one) => {
-    const row = state.sync[one] ?? SEED_ROW;
+    const row = rowOf(one) ?? SEED_ROW;
     return row.stage !== "built" && !waiting(row, now);
   });
   if (unbuilt !== undefined) {
-    const row = state.sync[unbuilt] ?? SEED_ROW;
+    const row = rowOf(unbuilt) ?? SEED_ROW;
     return attempt(principal, unbuilt, row, deps, () =>
       advanceUnbuilt(principal, folders, unbuilt, row, deps),
     );
