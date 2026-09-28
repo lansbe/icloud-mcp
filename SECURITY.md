@@ -254,6 +254,40 @@ their app-specific password at account.apple.com.** Nothing on a timer protects
 the password: the key has no expiry, and an app-specific password opens the
 whole mail account.
 
+<!-- DRAFT: awaiting owner approval in 28-07 -->
+### Autonomous rules
+
+- What the job can do: flag a message, and place a draft reply to its sender.
+  Nothing else, enforced by the scan.
+- When it runs: every 15 minutes, only for a person who has at least one rule
+  and holds an autonomy key. Every signed-in person holds a key (autonomy is
+  inherent), so in practice: only for people with rules. With no rules it does
+  nothing, and makes no iCloud connection.
+- What it reads: the sender and subject of new inbox mail, and whether it came
+  from a mailing list. The job never reads a body. When it places a reply, the
+  reply tool reads that one message to thread and quote the reply, as it does
+  for any reply.
+- What a draft holds: a reply to the matching message. The rule's text, "Re: "
+  and the original subject, the threading headers, and the original, quoted.
+  The one recipient is the message's From address. Never Reply-To, Sender,
+  anyone copied or an address in the text. No reply to the account's own
+  address, to mailing-list mail, or when the From line has no usable address.
+- Limits: 10 flags and 3 replies a run, 10 replies a day, 20 rules. A reply is
+  two iCloud sessions.
+- If iCloud refuses the sign-in twice in a row, the job drops that person's key.
+  Their next sign-in makes a new one, and their rules run again.
+- How to stop it: the person removes every rule. The owner revokes the person's
+  key or access, or takes them off the allow list.
+- Where to see it: `rules_list` for the person; `grants.mjs list` for the owner
+  (next wake, failures, for each person with rules).
+- Known and accepted: a stranger can make a rule fire by writing a matching
+  sender and subject. The result is the user's own flag, or a draft reply in the
+  user's words to the address the stranger put in From. From can be forged, so
+  that reply may be addressed to someone who did not write the message, and it
+  quotes whatever the message said. The person sees both before sending. A
+  stranger can also leave off the mailing-list headers to get a reply. A flood
+  spends the day's replies.
+
 ### The dead-password pause
 
 **What it is.** When Apple itself refuses the password saved in a grant, a
