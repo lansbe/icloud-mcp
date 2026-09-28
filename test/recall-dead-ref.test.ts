@@ -169,6 +169,31 @@ function serverWithNewValidity(): FakeDuplex {
   ]);
 }
 
+/** Sign in, and have the open refused with this completion text. */
+function serverRefusingTheOpen(refusal: string): FakeDuplex {
+  return createFakeDuplex([
+    GREETING,
+    capabilityResponse("a1", PRE_AUTH_CAPABILITY),
+    taggedOk("a2", "LOGIN completed"),
+    capabilityResponse("a3", POST_AUTH_CAPABILITY),
+    wire(`a4 ${refusal}`),
+    logoutExchange("a5"),
+  ]);
+}
+
+/** Sign in, open the inbox, and have the fetch itself refused. */
+function serverRefusingTheFetch(): FakeDuplex {
+  return createFakeDuplex([
+    GREETING,
+    capabilityResponse("a1", PRE_AUTH_CAPABILITY),
+    taggedOk("a2", "LOGIN completed"),
+    capabilityResponse("a3", POST_AUTH_CAPABILITY),
+    examineResponse("a4"),
+    wire("a5 NO [UNAVAILABLE] Try again later"),
+    logoutExchange("a6"),
+  ]);
+}
+
 /** A small plain-text message, whole. */
 const RAW = "From: Jane <jane@example.invalid>\r\nSubject: Hello\r\n\r\nHello there.\r\n";
 const RAW_BYTES = new TextEncoder().encode(RAW).byteLength;
@@ -240,6 +265,44 @@ describe("mail_get_message removes a recall result that no longer opens", () => 
     expect(f.index.vectors.has(id)).toBe(false);
     expect(await ledgerHolds(principal, id)).toBe(false);
   });
+
+  it("removes it when the open is refused because the mailbox does not exist", async () => {
+    const f = fakes();
+    current.deps = f.deps;
+    const id = await indexed(principal, f, REF);
+    vi.mocked(connectImap).mockReturnValue(
+      serverRefusingTheOpen("NO [NONEXISTENT] Mailbox does not exist") as never,
+    );
+
+    const answer = await getMessageCallback()({ id: encodeMessageId(REF) });
+
+    expect(answer).toEqual(NOT_FOUND);
+    expect(f.index.vectors.has(id)).toBe(false);
+    expect(await ledgerHolds(principal, id)).toBe(false);
+  });
+
+  // 26-REVIEW WR-03: a transient refusal is a not-found answer too, but it is
+  // not a deletion. Removing the vector would drop a live message from recall
+  // for good, because nothing re-indexes it.
+  for (const [name, server] of [
+    ["the open is refused as unavailable", () => serverRefusingTheOpen("NO [UNAVAILABLE] Try again later")],
+    ["the open is refused with no code", () => serverRefusingTheOpen("NO Mailbox is busy")],
+    ["the fetch is refused as unavailable", serverRefusingTheFetch],
+  ] as const) {
+    it(`keeps the vector when ${name}, and answers exactly the not-found answer (26-REVIEW WR-03)`, async () => {
+      const f = fakes();
+      current.deps = f.deps;
+      const id = await indexed(principal, f, REF);
+      vi.mocked(connectImap).mockReturnValue(server() as never);
+
+      const answer = await getMessageCallback()({ id: encodeMessageId(REF) });
+
+      expect(answer).toEqual(NOT_FOUND);
+      expect(f.index.calls.filter((call) => call.method === "deleteByIds")).toEqual([]);
+      expect(f.index.vectors.has(id)).toBe(true);
+      expect(await ledgerHolds(principal, id)).toBe(true);
+    });
+  }
 
   it("gives the same answer for a message that was never indexed, and makes no store call", async () => {
     const f = fakes();

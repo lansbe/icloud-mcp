@@ -45,6 +45,7 @@ import type {
 import type { Env } from "../../env";
 import {
   ImapAuthError,
+  ImapGoneError,
   ImapNotFoundError,
   MailConfirmationError,
   toErrorCategory,
@@ -2590,10 +2591,14 @@ export function registerMailTools(
         return messageToolResult(detail);
       } catch (err) {
         // A message that no longer opens is removed from this person's recall
-        // index at once (RCLL-08, ARCHITECTURE §4.6(a)). Only for the not-found
-        // class, and only when the id decoded. It never throws, and the answer
-        // below is exactly the one this catch gave before recall existed.
-        if (err instanceof ImapNotFoundError && actor !== null && ref !== null) {
+        // index at once (RCLL-08, ARCHITECTURE §4.6(a)). Only for a not-found
+        // that is certain (26-REVIEW WR-03): the mailbox's validity changed,
+        // the mailbox does not exist, or the fetch came back with no row. A
+        // transient refusal is not-found too, and removing on it would drop a
+        // live message for good, since nothing re-indexes it. Only when the id
+        // decoded. It never throws, and the answer below is exactly the one
+        // this catch gave before recall existed.
+        if (err instanceof ImapGoneError && actor !== null && ref !== null) {
           await forgetDeadRef(actor, ref);
         }
         // The same backstop shape `registerDiagnoseTool` uses: one boundary,

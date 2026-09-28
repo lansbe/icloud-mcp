@@ -200,6 +200,29 @@ export class ImapNotFoundError extends Error {
 }
 
 /**
+ * A not-found that is certain: what was named is gone, not merely unreachable
+ * right now (26-REVIEW WR-03).
+ *
+ * Thrown only where the server's own answer settles it: an open refused with
+ * the NONEXISTENT response code (RFC 5530), and a fetch by UID that completed
+ * OK with no row for that UID. The subclass below, a changed validity, is
+ * certain too: the id names a generation of the mailbox that no longer exists.
+ * Every other not-found — a plain refusal, `[UNAVAILABLE]`, a malformed reply —
+ * stays the plain class, because a transient refusal must never be read as a
+ * deletion. `mail_get_message` removes a recall result only on this class.
+ *
+ * A subclass of `ImapNotFoundError`, so `toErrorCategory` answers `not_found`
+ * through the parent's branch and the answer the model gets is unchanged.
+ * Fixed label, no constructor argument, as above.
+ */
+export class ImapGoneError extends ImapNotFoundError {
+  constructor() {
+    super();
+    this.name = "ImapGoneError";
+  }
+}
+
+/**
  * The one not-found that says WHY: the mailbox's UIDVALIDITY is not the one
  * the caller expected (26-REVIEW WR-02).
  *
@@ -210,11 +233,12 @@ export class ImapNotFoundError extends Error {
  * transient refusal for it. The recall page source relies on that: it reads
  * the window again from the top only on this class.
  *
- * A subclass of `ImapNotFoundError`, so `toErrorCategory` answers `not_found`
- * through the parent's branch, and every answer the model is given is exactly
- * what it was before. Fixed label, no constructor argument, as above.
+ * A subclass of `ImapGoneError`, and so of `ImapNotFoundError`:
+ * `toErrorCategory` answers `not_found` through the parent's branch, and every
+ * answer the model is given is exactly what it was before. Fixed label, no
+ * constructor argument, as above.
  */
-export class ImapValidityChangedError extends ImapNotFoundError {
+export class ImapValidityChangedError extends ImapGoneError {
   constructor() {
     super();
     this.name = "ImapValidityChangedError";

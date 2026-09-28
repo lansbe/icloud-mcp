@@ -35,6 +35,7 @@ import { reportRefusal } from "../password-pause";
 import {
   ImapAuthError,
   ImapConnectError,
+  ImapGoneError,
   ImapNotFoundError,
   ImapValidityChangedError,
   ImapThrottleError,
@@ -582,7 +583,14 @@ export async function withMailSessionOver<T>(
           channel.nextTag(),
           `EXAMINE ${quoted}`,
         );
-        if (examine.status !== "OK") throw new ImapNotFoundError();
+        if (examine.status !== "OK") {
+          // Only the server's NONEXISTENT code says the mailbox is gone
+          // (26-REVIEW WR-03). Any other refusal may be transient.
+          const gone =
+            examine.status === "NO" &&
+            parseCompletionCode(examine.tagged.text) === FOLDER_GONE_CODE;
+          throw gone ? new ImapGoneError() : new ImapNotFoundError();
+        }
 
         ({ uidValidity, exists } = checkedMailboxFacts(
           examine.untagged,
@@ -1099,8 +1107,9 @@ async function readStructure(
 
   const items = firstFetchItems(result.untagged);
   // A UID that matches nothing produces a tagged OK with no untagged reply at
-  // all, which is the commonest shape of "that message is gone".
-  if (items === null) throw new ImapNotFoundError();
+  // all, which is the commonest shape of "that message is gone". That one is
+  // certain, so it is the certain class (26-REVIEW WR-03).
+  if (items === null) throw new ImapGoneError();
 
   // A structure this walk cannot make sense of yields an EMPTY list rather than
   // a throw (T-02-21), and an empty list is survivable here: no text part means
