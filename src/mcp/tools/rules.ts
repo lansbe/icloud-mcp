@@ -96,7 +96,11 @@ const OFF_AUTH_SENTENCE =
   "Signing in again (reconnecting iCloud MCP in a Claude app) makes a new key, and the job then starts again on its own.";
 
 /** The answer to removing a rule, and to finding none. */
-const REMOVED_SENTENCE = "Removed the rule. It no longer acts on any mail.";
+// The job reads the rules again before each action (28-REVIEW WR-04), so a
+// removed rule starts nothing more; an action it had already started still
+// finishes (28-REVIEW-2 IN-03).
+const REMOVED_SENTENCE =
+  "Removed the rule. It starts no new action on any mail. An action already under way when it was removed still finishes.";
 const NOT_FOUND_SENTENCE = "You have no rule with that id. Nothing was changed.";
 
 /** How many of the newest inbox messages a test reads (D-13). */

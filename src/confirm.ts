@@ -2151,8 +2151,10 @@ const CONFIRMATION_CONSEQUENCES: Record<ConfirmKind, string> = {
   // Kept so the table stays total. The move branch of the composer picks its
   // own consequence, because it depends on the count and on the destination.
   move: "They can be moved back.",
-  // A rule acts until it is removed, and removing it stops it at once (D-12).
-  rule: "Removing the rule with rules_remove stops it at once.",
+  // A rule acts until it is removed (D-12). Removing it stops the job starting
+  // any new action for it, but a flag or a draft already being placed at that
+  // moment cannot be called back, so the sentence says so (28-REVIEW-2 IN-03).
+  rule: "Removing the rule with rules_remove stops it. An action already under way at that moment still finishes.",
 };
 
 /**

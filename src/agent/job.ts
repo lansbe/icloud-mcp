@@ -754,9 +754,11 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
       for (const v of verdicts) {
         // The rule may have been removed while this run awaited an earlier
         // action: removing a rule is its own call to the object and can land
-        // at any await. rules_remove promises the rule stops at once, so the
-        // rules are read again, synchronously, before each verdict. A removed
-        // rule's verdict makes no call and writes nothing (28-REVIEW WR-04).
+        // at any await. rules_remove promises the rule starts no new action,
+        // so the rules are read again, synchronously, before each verdict. A
+        // removed rule's verdict makes no call and writes nothing (28-REVIEW
+        // WR-04). An action already awaited when the removal lands cannot be
+        // called back, and the answers say so (28-REVIEW-2 IN-03).
         if (!readRules(deps.storage).some((live) => live.id === v.rule.id)) continue;
         const prior = deps.storage.get<unknown>(v.key);
         const done = prior !== undefined;

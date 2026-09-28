@@ -187,7 +187,7 @@ const FLAG_RULE_LINE =
   "If the rules job is not already running for you, its first check, within 15 minutes, only marks where to start, " +
   "so mail that arrives before that check is not looked at. " +
   "For each match it flags the message. " +
-  "Removing the rule with rules_remove stops it at once.";
+  "Removing the rule with rules_remove stops it. An action already under way at that moment still finishes.";
 
 /** The draft's own words. Never in a sentence and never in a trusted block. */
 const DRAFT_TEXT = "Thank you for writing. I will reply properly within a day.";
@@ -612,7 +612,11 @@ describe("rules_remove removes at once, and only the caller's own rule", () => {
 
     expect(parsed.isError).toBe(false);
     expect(parsed.trusted?.removed).toBe(true);
-    expect(parsed.trusted?.sentence).toBe("Removed the rule. It no longer acts on any mail.");
+    // 28-REVIEW-2 IN-03: a flag or a draft already being placed when the rule
+    // goes cannot be called back, so the answer says so.
+    expect(parsed.trusted?.sentence).toBe(
+      "Removed the rule. It starts no new action on any mail. An action already under way when it was removed still finishes.",
+    );
     expect(await storedRules(USER_A)).toEqual([]);
     expect(connectImap).not.toHaveBeenCalled();
   });
