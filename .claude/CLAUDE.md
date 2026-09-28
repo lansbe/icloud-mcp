@@ -179,7 +179,7 @@ one account, and that is no longer what this is.)*
 
 ## Conventions
 
-These five are safety boundaries, not style preferences. Each one states its
+These six are safety boundaries, not style preferences. Each one states its
 reason, because a rule without a reason is a rule a future session will reason
 its way around.
 
@@ -225,7 +225,8 @@ be a safety regression dressed up as a feature.
 A draft reaches the iCloud Drafts folder via IMAP `APPEND`. The other mail
 writes go through the separate path in §5 under "One path may change a mailbox,
 and it is not a read path", and none of them sends anything. Two change one flag
-on one message, when the user asks: read status, and the flag. One moves mail.
+on one message, when the user asks: read status, and the flag. The flag may
+also be set by a rule the user wrote, with nobody present (§6). One moves mail.
 It copies a message the user already has into another folder, then removes the
 original. That copy places a message, so it is now the one other write that
 does. It only ever places a copy of mail already in the account, never new
@@ -377,6 +378,31 @@ reasons. A session reading §2 alone would see a tool that makes iCloud send a
 reply, find no argument for it, and delete it. A session reading this alone
 might take it as leave to send replies in general. It is leave for this one
 tool, answering the user's own invitation when the user asks.
+
+#### A reply the autonomous layer drafts is not this rule's subject either
+
+Phase 28 lets the server place a draft with nobody asking. The draft is a reply to the sender of a
+message that matched one of the user's rules. That looks like the thing this rule forbids. It is
+not. The argument is written down here so nobody has to work it out again.
+
+1. **§2's reason still holds.** A person looks before anything leaves. The reply sits in Drafts, and
+   this server never sends it.
+2. **The words are the user's.** The reply's text is written into a rule the user added through a
+   previewed tool. The model writes nothing into it when it is placed. The subject, the threading
+   headers and the quoted original are added by the same reply tool a user's own reply goes through.
+3. **The write path is the same one.** The job calls the reply tool the user's own Claude calls. No
+   second write site exists, and the count rule still sees exactly one.
+4. **PITFALLS #12 is bent in one place, on purpose.** That rule forbids a write target taken from
+   content a stranger wrote. The reply's one recipient is taken from the message's From line, which a
+   stranger wrote. It is allowed for three reasons. It is a draft, and this server never sends it. It
+   goes only to the claimed sender: never to the Reply-To address, never to anyone copied, never to
+   an address in the text. And From can be forged, so the draft may be addressed to someone other
+   than the real sender. The person sees that address before sending.
+5. **Nothing else is taken.** No other address in a message becomes a recipient: no attendee list,
+   no copy list, no reply-all. One function reads the From address, and the scan counts it.
+6. **The exception covers this one job.** Each of these is a decision on this boundary, not a
+   refactor: a second address the job reads, a recipient other than From, a copy to anyone, and
+   sending the reply.
 
 ### 3. One socket importer
 
@@ -658,6 +684,9 @@ verb: moving one draft to Trash.
    message, move a list of messages from one folder to another, and move one
    draft from the drafts folder to Trash. Archive and Trash are moves to a
    folder the account itself names. Each verb acts only when the user asks.
+   The one exception is the flag: the autonomous job may set it, never clear
+   it, on a rule the user wrote (§6). It reaches the verb through the same
+   tool, so the fences below still hold.
 
 3. **What this gives up.** Before Phase 20, iCloud itself refused a read-status
    change in every session this server opened. Now that is true only on read
@@ -712,9 +741,68 @@ verb: moving one draft to Trash.
      without the draft flag.
    - Finding a draft by subject or message id.
 
+### 6. The autonomous layer may flag and may place a draft reply, and nothing else
+
+Autonomy is inherent (Phase 27): every person who signs in holds a key that lets this server reach
+their mail with nobody present. For a person who adds rules, this server then acts on their new mail
+on its own. For a person with no rules, it does nothing. There are no default or starter rules. It
+can do exactly two things: set the flag on a message, and place a draft reply to that message's
+sender in the Drafts folder. Nothing else.
+
+The reason is §2's reason, with the person removed. The job reads mail written by strangers, and
+nobody is looking when it acts. So the only safe design is one where nothing a stranger writes can
+change what the job does.
+
+That is held five ways:
+
+1. **Nothing interprets the mail.** Rules match the sender's address, the sender's domain and words
+   in the subject. No model reads the message. The job's own code never reads a body. The reply
+   tool it calls reads the message to thread the reply and quote it, as it does for any reply. The
+   job reads back only whether the draft was placed.
+2. **The answer is two numbers and a word.** The matcher says which rule, which message, and flag or
+   draft. The code that acts takes the message from its own list, the words from the rule, and the
+   one recipient from the message's From line. No identifier comes out of the matcher.
+3. **A draft is a reply to the sender, in the rule's words.** The text is the rule's own. The
+   subject is "Re: " and the original subject. The one recipient is the address in the message's
+   From line, read through one function. Never the Reply-To address, never the Sender line, never
+   anyone copied, never an address in the text. No reply goes to this account's own address, to
+   mailing-list mail, or when the From line has no usable address.
+4. **From can be forged, and that is accepted, not hidden.** Anyone can put any address in From. So
+   a reply may be addressed to someone who did not write the message. Because the reply quotes the
+   original, it would also carry the forger's words. It is only a draft. The person sees the address
+   before sending, and nothing sends it for them.
+5. **The job can only name four tools.** The change check, the flag, the reply tool, and the
+   sign-in check, which also tells the job the account's own address. It has no way to name any
+   other tool, so it cannot send, delete, move, write a new message, answer an invitation or write
+   an event. The scan refuses any other tool name in the object's code.
+
+The job reaches mail only through `/mcp`, like any other request. Each call takes the connection
+lease inside the door. The job never takes the lease itself, and its calls go one at a time. The
+scan refuses any import of the lease module under `src/agent/`.
+
+An autonomous draft carries no marker. The owner decided that on 2026-09-23. It means a reply
+nobody asked for looks like one you wrote. What holds it: the rules are your own and listed back to
+you, every rule is previewed before it is added, the job records every reply it places, and nothing
+is ever sent.
+
+There is no switch, because autonomy is inherent. The job stops acting for a person when they
+remove every rule, when the owner revokes their key or their access, when they leave the allow
+list, when their connection ends, or when Apple twice refuses the password itself, the two refusals
+at least one wake apart. In that case their next sign-in makes a new key. An iCloud outage, a server
+error, or a refusal that does not name the password never counts: the job waits longer between tries
+instead, up to a day, and makes no sign-in attempt while it waits. When a person holds no sign-in of
+any kind, seen on two checks a day apart, their rules, activity and job state are deleted.
+
+Widening this is a decision, not a refactor. Each of these is one: a third action; a tool the job
+can name; a model anywhere in the job; a recipient other than the From address, or a second
+address the job reads; a copy to anyone; a reply that is sent; any part of the message put into the
+draft beyond what the reply tool already adds (the subject, the threading headers and the quote); a
+rule field that sets the cadence; a way to add a rule without the preview; a rule the person did not
+add, such as a default or starter rule.
+
 ### Enforcement
 
-All five are enforced by `scripts/forbidden-tokens.mjs`, which runs from the
+All six are enforced by `scripts/forbidden-tokens.mjs`, which runs from the
 test suite (`test/forbidden-tokens.test.ts`) and from `.husky/pre-commit`. Two
 independent gates, because a skipped test run must not disable the ban, and
 because a large share of commits here are agent-authored while there is no CI
@@ -818,7 +906,7 @@ included, so **describe it by role** ("the library's token-unwrapping helper")
 in any `src/` comment, exactly as §2 and the Phase 17 paragraph say for the
 other banned names. Both Worker configs must bind `SELF` to their own name.
 
-Changing any of these five is a change to the project's safety boundary, not a
+Changing any of these six is a change to the project's safety boundary, not a
 refactor. If one of them is genuinely in the way, say so and get a decision —
 do not loosen the pattern list to make a commit go through. Exclusion is by
 PATH and never by weakening a pattern: when a rule fires on something
