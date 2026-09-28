@@ -491,7 +491,11 @@ describe("the name the job asks about is the stored one (25 D-22, T-27-64)", () 
     expect(asked).toEqual([]);
     expect(await storedRecord(a)).toEqual(record);
     expect(await anyJobPending(a)).toBe(true);
-    expect(await alarmAt(a)).not.toBeNull();
+    // Set by recall's own path (a day out), not by the failure retry (an hour
+    // out): an object that never had a recall call still runs recall's jobs.
+    const at = await alarmAt(a);
+    expect(at).not.toBeNull();
+    expect(at! - Date.now()).toBeGreaterThan(2 * HOUR);
     expect(seen).toEqual([]);
   });
 });

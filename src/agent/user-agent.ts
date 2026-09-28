@@ -612,6 +612,10 @@ export class UserAgent extends DurableObject<Env> {
       // Recall's jobs below still run, and each ends through the helper.
     }
     try {
+      // Recall's tables may not exist yet: since Phase 27 an object can hold an
+      // alarm for its autonomy record before any recall call. Creating them is
+      // idempotent, and without them the read below throws.
+      ensureRecallSchema(this.ctx.storage.sql);
       // 1. A destroy that started and did not finish is finished first.
       if (destroyPending(this.ctx.storage.sql)) {
         await this.destroyRecall();
