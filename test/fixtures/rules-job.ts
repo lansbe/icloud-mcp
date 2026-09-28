@@ -88,7 +88,65 @@ export interface Armed {
   readonly stub: Stub;
   /** The ordinary connection's access token, for a direct tool call. */
   readonly accessToken: string;
+  /**
+   * Sign the same person in again, through the same client, and settle the
+   * execution context, which is when a new autonomy key is armed (plan 28-03).
+   */
+  signInAgain(): Promise<void>;
   cleanup(): Promise<void>;
+}
+
+/**
+ * One sign-in through the login-proof worker for `clientId`, and the code
+ * exchange. Answers the ordinary connection's access token.
+ */
+async function authorizeOnce(env: Env, clientId: string): Promise<string> {
+  const query = new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: CLAUDE_WEB_REDIRECT,
+    code_challenge: CODE_CHALLENGE,
+    code_challenge_method: "S256",
+    state: "rules-job",
+  }).toString();
+  resetLoginProof();
+  const ctx = createExecutionContext();
+  const answer = await worker.fetch(
+    new Request(`${ORIGIN}/authorize`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        "cf-connecting-ip": `test-source-${crypto.randomUUID()}`,
+      },
+      body: new URLSearchParams({
+        apple_id: LISTED_APPLE_ID,
+        app_password: FAKE_APP_PASSWORD,
+        oauth_request: query,
+        [AUTONOMY_NOTICE_FIELD]: AUTONOMY_NOTICE_VERSION,
+      }).toString(),
+    }),
+    env,
+    ctx,
+  );
+  expect(answer.status).toBe(302);
+  await waitOnExecutionContext(ctx);
+  const code = new URL(answer.headers.get("location") as string).searchParams.get("code");
+  const exchanged = await callWorker(
+    new Request(`${ORIGIN}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: code as string,
+        redirect_uri: CLAUDE_WEB_REDIRECT,
+        client_id: clientId,
+        code_verifier: CODE_VERIFIER,
+      }).toString(),
+    }),
+    env,
+  );
+  expect(exchanged.status).toBe(200);
+  return ((await exchanged.json()) as { access_token: string }).access_token;
 }
 
 /**
@@ -122,6 +180,10 @@ export async function signInArmed(): Promise<Armed> {
     for (const prefix of [`grant:${userId}:`, `token:${userId}:`]) {
       for (const key of (await kv.list({ prefix })).keys) await kv.delete(key.name);
     }
+    // The dead-password pause a refused sign-in starts, and the owner's status
+    // record a run writes (plan 28-03).
+    await kv.delete(`password-pause:v1:${userId}`);
+    await kv.delete(`autonomy-status:v1:${userId}`);
     await runInDurableObject(stub, async (_i, state) => {
       for (const [key] of state.storage.kv.list()) state.storage.kv.delete(key);
       state.storage.sql.exec("DROP TABLE IF EXISTS recall_vectors");
@@ -132,60 +194,19 @@ export async function signInArmed(): Promise<Armed> {
     await removeAutonomyClient();
   };
 
+  const signInAgain = async () => {
+    await authorizeOnce(env, clientId);
+  };
+
   try {
-    const query = new URLSearchParams({
-      response_type: "code",
-      client_id: clientId,
-      redirect_uri: CLAUDE_WEB_REDIRECT,
-      code_challenge: CODE_CHALLENGE,
-      code_challenge_method: "S256",
-      state: "rules-job",
-    }).toString();
-    resetLoginProof();
-    const ctx = createExecutionContext();
-    const answer = await worker.fetch(
-      new Request(`${ORIGIN}/authorize`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/x-www-form-urlencoded",
-          "cf-connecting-ip": `test-source-${crypto.randomUUID()}`,
-        },
-        body: new URLSearchParams({
-          apple_id: LISTED_APPLE_ID,
-          app_password: FAKE_APP_PASSWORD,
-          oauth_request: query,
-          [AUTONOMY_NOTICE_FIELD]: AUTONOMY_NOTICE_VERSION,
-        }).toString(),
-      }),
-      env,
-      ctx,
-    );
-    expect(answer.status).toBe(302);
-    await waitOnExecutionContext(ctx);
-    const code = new URL(answer.headers.get("location") as string).searchParams.get("code");
-    const exchanged = await callWorker(
-      new Request(`${ORIGIN}/oauth/token`, {
-        method: "POST",
-        headers: { "content-type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          grant_type: "authorization_code",
-          code: code as string,
-          redirect_uri: CLAUDE_WEB_REDIRECT,
-          client_id: clientId,
-          code_verifier: CODE_VERIFIER,
-        }).toString(),
-      }),
-      env,
-    );
-    expect(exchanged.status).toBe(200);
-    const accessToken = ((await exchanged.json()) as { access_token: string }).access_token;
+    const accessToken = await authorizeOnce(env, clientId);
     const grants = (await getOAuthApi(oauthProviderOptions, env).listUserGrants(userId)).items;
     expect(grants.filter((grant) => grant.clientId === AUTONOMY_CLIENT_ID)).toHaveLength(1);
     const armed = await runInDurableObject(stub, (_i, state) =>
       state.storage.kv.get(AUTONOMY_KEY) !== undefined,
     );
     expect(armed).toBe(true);
-    return { env, userId, stub, accessToken, cleanup };
+    return { env, userId, stub, accessToken, signInAgain, cleanup };
   } catch (error) {
     await cleanup();
     throw error;
