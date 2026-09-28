@@ -1992,14 +1992,20 @@ const RULE_BEFORE = "Mail that arrived before the rule was added never matches i
  * starting point stored (a first rule, or none for more than a day), the job's
  * next check can only mark where to start: the change check lists nothing new
  * the first time it is asked. Mail that arrives between adding the rule and
- * that check is not looked at. Closing the gap needs a look back over mail
+ * that check is not looked at. The same gap opens when the stored starting
+ * point ages past a day (`JOB_MARKER_MAX_AGE_MS` in `src/agent/job.ts`):
+ * only a finished run refreshes it, so a day of runs that stop (a sign-in
+ * that does not go through and its backoff, a long busy stretch) drops the
+ * mail of that day, and the second sentence says so (28-REVIEW-2 IN-04).
+ * Closing the gap needs a look back over mail
  * received since the rule was added, which is a read-path change, or an
  * immediate wake, which would fire the object's alarm at once in every test
  * that adds a rule. Neither was taken; the sentence says what happens instead.
  * Decided by Claude, owner may revise.
  */
 const RULE_FIRST_CHECK =
-  "If the rules job is not already running for you, its first check, within 15 minutes, only marks where to start, so mail that arrives before that check is not looked at.";
+  "If the rules job is not already running for you, its first check, within 15 minutes, only marks where to start, so mail that arrives before that check is not looked at. " +
+  "The same is true after the job goes a day without finishing a check, as it can while it cannot sign in: its next finished check only marks where to start, and mail from that time is not looked at.";
 const RULE_FLAG = "flags the message";
 const RULE_DRAFT =
   "places a draft reply to that message's sender, in the rule's own words, with the subject \"Re: \" and the original subject";

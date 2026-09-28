@@ -186,6 +186,8 @@ const FLAG_RULE_LINE =
   "Mail that arrived before the rule was added never matches it. " +
   "If the rules job is not already running for you, its first check, within 15 minutes, only marks where to start, " +
   "so mail that arrives before that check is not looked at. " +
+  "The same is true after the job goes a day without finishing a check, as it can while it cannot sign in: " +
+  "its next finished check only marks where to start, and mail from that time is not looked at. " +
   "For each match it flags the message. " +
   "Removing the rule with rules_remove stops it. An action already under way at that moment still finishes.";
 
