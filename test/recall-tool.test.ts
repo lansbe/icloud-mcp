@@ -19,6 +19,7 @@ import type { UserAgent } from "../src/agent/user-agent";
 import { decodeMessageId, encodeMessageId, type MessageRef } from "../src/mail/ids";
 import {
   RECALL_TOOL_NAME,
+  NOTE_PARKED,
   RECALL_UNAVAILABLE,
   registerRecallTools,
 } from "../src/mcp/tools/recall";
@@ -272,6 +273,49 @@ describe("the object's sync-state read (D-29)", () => {
     expect(built.index).toBe("built");
     expect(built.note).not.toContain("still being built");
     expect(built.note).toContain("nothing scored high enough");
+  });
+
+  it("a parked folder is not counted as being built, and the note says a folder could not be read (26-REVIEW-2 WR-03)", async () => {
+    const { deps } = fakes();
+    await indexOne(USER_A, deps, { ref: ref(42), text: "Staff engineer role", snippet: "Staff role" });
+    const row = (stage: string, failures: number, failedAt: number | null) =>
+      JSON.stringify({
+        stage,
+        state: null,
+        checkedAt: null,
+        reconciledAt: null,
+        due: null,
+        seen: null,
+        failedAt,
+        failures,
+      });
+    await withSql(USER_A.userId, (sql) => {
+      writeState(sql, "folders", JSON.stringify(["INBOX", "Archive"]));
+      writeState(sql, "folders_listed_at", "1000");
+      writeState(sql, "sync:INBOX", row("built", 0, null));
+      writeState(sql, "sync:Archive", row("seed", 9, 2000));
+    });
+    const { call } = recallTool(USER_A, deps);
+
+    const parked = trustedOf(await call({ query: "staff engineer" }));
+    expect(parked.index).toBe("built");
+    expect(parked.note).toContain(NOTE_PARKED);
+    expect(parked.note).not.toContain("still being built");
+
+    // Eight failures: still being built, and no parked sentence.
+    await withSql(USER_A.userId, (sql) => writeState(sql, "sync:Archive", row("seed", 8, 2000)));
+    const eight = trustedOf(await call({ query: "staff engineer" }));
+    expect(eight.index).toBe("building");
+    expect(eight.note).not.toContain(NOTE_PARKED);
+
+    // Nine, but listed since: it is being tried again, so building.
+    await withSql(USER_A.userId, (sql) => {
+      writeState(sql, "sync:Archive", row("seed", 9, 2000));
+      writeState(sql, "folders_listed_at", "3000");
+    });
+    const tried = trustedOf(await call({ query: "staff engineer" }));
+    expect(tried.index).toBe("building");
+    expect(tried.note).not.toContain(NOTE_PARKED);
   });
 });
 

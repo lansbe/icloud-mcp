@@ -20,6 +20,7 @@ import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ensureRecallSchema,
+  RECALL_PARK_AFTER_FAILURES,
   type SyncRow,
   utcDay,
   writeState,
@@ -27,6 +28,7 @@ import {
 import type { UserAgent } from "../src/agent/user-agent";
 import type { FolderState } from "../src/change-marker";
 import type { Principal } from "../src/principal";
+import { indexWordOf, NOTE_PARKED, parkedIn, recallResult } from "../src/mcp/tools/recall";
 import { RecallBuildError } from "../src/recall/build";
 import {
   RECALL_MAX_PAGES_PER_DAY,
@@ -38,6 +40,7 @@ import {
   RECALL_CHECK_INTERVAL_MS,
   RECALL_RECONCILE_INTERVAL_MS,
   RECALL_RELIST_INTERVAL_MS,
+  recallRetryWaitMs,
   recallStep,
   type StepOutcome,
 } from "../src/recall/sync";
@@ -1220,6 +1223,121 @@ describe("a failure is recorded and waited out, and never stops the other folder
     expect((await step(a, h)).outcome).toBe("gone");
     expect((await objectFor(USER_A.userId).recallSyncState()).folders).toEqual([INBOX]);
     expect(count(h, `page:${ARCHIVE}:start`)).toBe(3);
+  });
+
+  it("after a reseed and a seed that works, one more failed page does not reseed at once: the next reseed is three failures later (26-REVIEW-2 WR-03)", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX, ARCHIVE],
+      mailboxes: {
+        [INBOX]: { uidValidity: 100, messages: scriptedMessages(30) },
+        [ARCHIVE]: { uidValidity: 300, messages: scriptedMessages(10) },
+      },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    await seedRows(USER_A.userId, [INBOX, ARCHIVE], {
+      [INBOX]: builtRow(stateOf(INBOX, 100, 31), { checkedAt: now + 2 * 24 * 60 * MINUTE }),
+      [ARCHIVE]: { ...builtRow(stateOf(ARCHIVE, 300, 11), { checkedAt: now }), stage: "build" },
+    });
+    // The archive's status check works, but every page of it fails at the store.
+    h.index.failing.add("upsert");
+
+    /** Run the next step once the archive's wait has passed. */
+    async function next(): Promise<StepOutcome | "failed"> {
+      const row = (await rowOf(USER_A.userId, ARCHIVE))!;
+      h.setNow((row.failedAt ?? now) + recallRetryWaitMs(row.failures));
+      await passPause(USER_A.userId);
+      try {
+        return await recallStep(a, h.deps);
+      } catch (error) {
+        expect(error).toBeInstanceOf(RecallBuildError);
+        return "failed";
+      }
+    }
+
+    const stages: string[] = [];
+    for (let i = 0; i < 8; i += 1) {
+      const outcome = await next();
+      const row = (await rowOf(USER_A.userId, ARCHIVE))!;
+      stages.push(`${outcome}:${row.stage}:${row.failures}`);
+    }
+    expect(stages).toEqual([
+      "failed:build:1",
+      "failed:build:2",
+      "failed:seed:3",
+      "seeded:build:3",
+      "failed:build:4",
+      "failed:build:5",
+      "failed:seed:6",
+      "seeded:build:6",
+    ]);
+  });
+
+  it("a folder that keeps failing is parked after nine: the step leaves it alone, the answer stops saying building, and the next listing gives it one more try (26-REVIEW-2 WR-03)", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX, ARCHIVE],
+      mailboxes: {
+        [INBOX]: { uidValidity: 100, messages: scriptedMessages(30) },
+        [ARCHIVE]: { uidValidity: 300, messages: scriptedMessages(10) },
+      },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    await seedRows(USER_A.userId, [INBOX, ARCHIVE], {
+      [INBOX]: builtRow(stateOf(INBOX, 100, 31), { checkedAt: now + 4 * 24 * 60 * MINUTE }),
+    });
+    // The archive refuses its status check with a plain refusal, every time.
+    h.setSnapshot(ARCHIVE, { mailbox: ARCHIVE, answered: false });
+    const stub = objectFor(USER_A.userId);
+
+    let failedAt = now;
+    for (let i = 1; i <= RECALL_PARK_AFTER_FAILURES; i += 1) {
+      const row = await rowOf(USER_A.userId, ARCHIVE);
+      failedAt = row === undefined ? now : row.failedAt! + recallRetryWaitMs(row.failures);
+      h.setNow(failedAt);
+      // Listed just before this failure, so no listing comes due in this case.
+      expect(await stub.recallSetFolders([INBOX, ARCHIVE], failedAt - 1)).toEqual({ ok: true });
+      expect((await step(a, h)).outcome).toBe("unanswered");
+      // Short of nine, the answer still says building.
+      if (i < RECALL_PARK_AFTER_FAILURES) {
+        expect(indexWordOf(await stub.recallSyncState())).toBe("building");
+      }
+    }
+    expect((await rowOf(USER_A.userId, ARCHIVE))!.failures).toBe(RECALL_PARK_AFTER_FAILURES);
+    const checks = () => h.log.filter((entry) => entry === `snapshot:${ARCHIVE}:start`).length;
+    expect(checks()).toBe(RECALL_PARK_AFTER_FAILURES);
+
+    // Parked: the answer calls the index built and says a folder could not be read.
+    const parked = await stub.recallSyncState();
+    expect(indexWordOf(parked)).toBe("built");
+    expect(parkedIn(parked)).toBe(true);
+    const note = JSON.parse(
+      (recallResult([], indexWordOf(parked), parkedIn(parked)).content[0] as { text: string }).text,
+    ).note as string;
+    expect(note).toContain(NOTE_PARKED);
+    expect(note).not.toContain("still being built");
+
+    // Past the retry wait, and short of the next listing: still left alone.
+    const late = failedAt + recallRetryWaitMs(RECALL_PARK_AFTER_FAILURES) + MINUTE;
+    expect(late).toBeLessThan(failedAt - 1 + RECALL_RELIST_INTERVAL_MS);
+    h.setNow(late);
+    const run = await step(a, h);
+    expect(run.outcome).toBe("idle");
+    expect(run.log).toEqual([]);
+    expect(checks()).toBe(RECALL_PARK_AFTER_FAILURES);
+
+    // The next listing un-parks it for one more try, at once.
+    const listed = failedAt - 1 + RECALL_RELIST_INTERVAL_MS;
+    h.setNow(listed);
+    expect((await step(a, h)).outcome).toBe("folders");
+    expect(indexWordOf(await stub.recallSyncState())).toBe("building");
+    expect((await step(a, h)).outcome).toBe("unanswered");
+    expect(checks()).toBe(RECALL_PARK_AFTER_FAILURES + 1);
+    // That try failed, so it is parked again until the listing after.
+    expect(parkedIn(await stub.recallSyncState())).toBe(true);
+    expect((await step(a, h)).outcome).toBe("idle");
   });
 
   it("a folder listing that fails is recorded, and is not tried again until its wait has passed", async () => {

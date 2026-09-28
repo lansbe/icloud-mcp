@@ -73,24 +73,39 @@
 //   - built: whatever was due is cleared and the check time is stamped, so the
 //     next attempt is a fresh status check. That check sees a new validity or
 //     a folder that is gone, which a retried read never would.
-//   - build: after RECALL_RESEED_AFTER_FAILURES failures in a row the folder
-//     goes back to seed, so its status check can find it gone. Its cursor is
-//     kept: nothing says the validity changed, and the engine resets the
-//     cursor itself when it did.
+//   - build: after every RECALL_RESEED_AFTER_FAILURES failures in a row the
+//     folder goes back to seed, so its status check can find it gone. Its
+//     cursor is kept: nothing says the validity changed, and the engine resets
+//     the cursor itself when it did.
 //   - seed: the row stays at seed.
 // A failed folder listing is recorded on the object the same way, and waited
 // out the same way. Success clears the count: a page, a new-mail page or a
-// deletion sync that worked. A status check that worked keeps the count, so a
-// folder whose reads keep failing waits longer each time and does not start
-// over at five minutes.
+// deletion sync that worked. A status check that worked keeps the count, at
+// seed too, so a folder whose reads keep failing waits longer each time and
+// does not start over at five minutes (26-REVIEW-2 WR-03). A seed check that
+// works proves nothing about reading the folder's mail; clearing the count
+// there would let a folder whose pages always fail go round build, fail,
+// reseed, seed for ever. That is why the reseed comes every three failures,
+// counted from the last one, and not whenever the count is three or more.
+//
+// A FOLDER THAT ALWAYS FAILS IS PARKED (26-REVIEW-2 WR-03). After
+// RECALL_PARK_AFTER_FAILURES failures in a row, the step leaves the folder
+// alone until the folders are next listed (at most a day), and the recall
+// answer stops counting it as still being built. The next listing gives it one
+// more try at once, without the retry wait; a failure then parks it again.
+// `isParked` in ../agent/recall-ledger.ts is the one predicate, shared with
+// the recall answer. A parked folder keeps its vectors: nothing says its mail
+// is gone, and a gone folder is found by its status check, as before.
 //
 // The failure itself still propagates, as `RecallBuildError`. No caught value
 // is read (./.claude/CLAUDE.md §4), and nothing here logs.
 
 import { agentFor, type LeasedMail } from "../agent/lease";
 import {
+  isParked,
   MAX_COUNTED_FAILURES,
   PAGE_REFUSALS,
+  RECALL_PARK_AFTER_FAILURES,
   type PageRefusal,
   type SyncRow,
   syncRowIn,
@@ -143,7 +158,9 @@ export const RECALL_RELIST_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * How many failed build pages in a row send a folder back to seed, so its
- * status check can find out whether it is gone (26-REVIEW CR-01).
+ * status check can find out whether it is gone (26-REVIEW CR-01). It happens
+ * at every multiple of this, counted from the last success (26-REVIEW-2
+ * WR-03).
  */
 export const RECALL_RESEED_AFTER_FAILURES = 3;
 
@@ -238,15 +255,17 @@ const NO_FAILURE = { failedAt: null, failures: 0 } as const;
  * `row` after one more failed attempt at `now` (26-REVIEW CR-01).
  *
  * A built folder has what was due cleared and its check time stamped, so the
- * next attempt is a fresh status check. A build folder goes back to seed after
- * RECALL_RESEED_AFTER_FAILURES failures in a row, keeping its count and its
- * cursor. A seed folder stays at seed.
+ * next attempt is a fresh status check. A build folder goes back to seed at
+ * every RECALL_RESEED_AFTER_FAILURES-th failure in a row, keeping its count
+ * and its cursor, so a seed that worked in between does not make the next
+ * single failure reseed at once (26-REVIEW-2 WR-03). A seed folder stays at
+ * seed.
  */
 function failedRow(row: SyncRow, now: number): SyncRow {
   const failures = Math.min(row.failures + 1, MAX_COUNTED_FAILURES);
   const mark = { failedAt: now, failures };
   if (row.stage === "built") return { ...row, checkedAt: now, due: null, seen: null, ...mark };
-  if (row.stage === "build" && failures >= RECALL_RESEED_AFTER_FAILURES) {
+  if (row.stage === "build" && failures % RECALL_RESEED_AFTER_FAILURES === 0) {
     return { ...SEED_ROW, ...mark };
   }
   return { ...row, ...mark };
@@ -399,6 +418,13 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
   const folders = state.folders;
   // A folder name is the account's own, so it is only ever an own key (WR-06).
   const rowOf = (mailbox: string): SyncRow | undefined => syncRowIn(state.sync, mailbox);
+  // Whether a folder may be tried now: not while it waits out a failure
+  // (CR-01), and not while it is parked (WR-03). A folder un-parked by a
+  // listing since its last failure is tried at once, without the wait.
+  const ready = (row: SyncRow): boolean =>
+    row.failures >= RECALL_PARK_AFTER_FAILURES
+      ? !isParked(row, state.listedAt)
+      : !waiting(row, now);
 
   // 3. A built folder whose last status check left something due goes first.
   //    At the vector ceiling a new-mail page would add vectors, so it waits;
@@ -420,12 +446,12 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
   // 4. A built folder whose status check is due: the one checked longest ago,
   //    never-checked first, once its last check is RECALL_CHECK_INTERVAL_MS
   //    old. This comes before the build of another folder (WR-04). A folder
-  //    waiting out a failure is not a candidate.
+  //    waiting out a failure, or parked, is not a candidate.
   let oldest: string | null = null;
   let oldestRow: SyncRow | null = null;
   for (const one of folders) {
     const row = rowOf(one);
-    if (row === undefined || row.stage !== "built" || waiting(row, now)) continue;
+    if (row === undefined || row.stage !== "built" || !ready(row)) continue;
     if (oldestRow === null) {
       oldest = one;
       oldestRow = row;
@@ -449,11 +475,11 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
     );
   }
 
-  // 5. The first listed folder not built, and not waiting out a failure. A
-  //    folder with no row is at seed.
+  // 5. The first listed folder not built, and not waiting out a failure or
+  //    parked. A folder with no row is at seed.
   const unbuilt = folders.find((one) => {
     const row = rowOf(one) ?? SEED_ROW;
-    return row.stage !== "built" && !waiting(row, now);
+    return row.stage !== "built" && ready(row);
   });
   if (unbuilt !== undefined) {
     const row = rowOf(unbuilt) ?? SEED_ROW;

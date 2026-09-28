@@ -42,6 +42,7 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { agentFor } from "../../agent/lease";
+import { isParked } from "../../agent/recall-ledger";
 import { toErrorCategory } from "../../errors";
 import { decodeMessageId } from "../../mail/ids";
 import type { Principal } from "../../principal";
@@ -73,30 +74,67 @@ const NOTE_ALWAYS = [
 const NOTE_BUILDING =
   "The index is still being built as mail tools are used, so it covers less mail than it will.";
 
+/**
+ * The one more sentence while a folder is parked (26-REVIEW-2 WR-03): it
+ * failed too often in a row, and is tried again about once a day.
+ */
+export const NOTE_PARKED =
+  "A folder could not be read lately, so some of its mail may be missing from the index for now.";
+
 /** The one sentence a failed recall answers with (D-09). */
 export const RECALL_UNAVAILABLE =
   "Recall could not be reached just now, so nothing was searched. mail_find still works.";
 
+/** One folder's row, as far as this tool reads it. */
+interface SyncRowView {
+  readonly stage: string;
+  readonly failures: number;
+  readonly failedAt: number | null;
+}
+
 /** What the object reports, as far as this tool reads it. */
 interface SyncStateView {
   readonly folders: readonly string[] | null;
-  readonly sync: Readonly<Record<string, { readonly stage: string }>>;
+  readonly listedAt: number | null;
+  readonly sync: Readonly<Record<string, SyncRowView>>;
+}
+
+/** Every listed folder's own row, or null when a listed folder has none yet. */
+function listedRows(state: SyncStateView): SyncRowView[] | null {
+  const folders = state.folders;
+  if (folders === null || folders.length === 0) return null;
+  const rows: SyncRowView[] = [];
+  for (const mailbox of folders) {
+    // An own key only: the name is the account's own and may be `constructor`
+    // (26-REVIEW WR-06).
+    if (!Object.hasOwn(state.sync, mailbox)) return null;
+    rows.push(state.sync[mailbox]!);
+  }
+  return rows;
 }
 
 /**
- * `built` only when a folder list exists and every listed folder is built.
+ * `built` only when a folder list exists and every listed folder is built or
+ * parked.
  *
- * A folder's row is read as an own key only, because the name is the
- * account's own and may be `constructor` (26-REVIEW WR-06).
+ * A parked folder (26-REVIEW-2 WR-03) is not being built: the step leaves it
+ * alone. Calling the index `building` for it would say, for as long as the
+ * folder keeps failing, that more mail is on the way. `parkedIn` says it
+ * instead.
  */
 export function indexWordOf(state: SyncStateView): RecallIndexWord {
-  const folders = state.folders;
-  if (folders === null || folders.length === 0) return "building";
-  return folders.every(
-    (mailbox) => Object.hasOwn(state.sync, mailbox) && state.sync[mailbox]?.stage === "built",
-  )
+  const rows = listedRows(state);
+  if (rows === null) return "building";
+  return rows.every((row) => row.stage === "built" || isParked(row, state.listedAt))
     ? "built"
     : "building";
+}
+
+/** Whether any listed folder is parked (26-REVIEW-2 WR-03). */
+export function parkedIn(state: SyncStateView): boolean {
+  const rows = listedRows(state);
+  if (rows === null) return false;
+  return rows.some((row) => isParked(row, state.listedAt));
 }
 
 /** Whether `ref` is a message id this server minted. A thrown decode means no. */
@@ -113,11 +151,18 @@ function decodes(ref: string): boolean {
  * The recall answer: ids and indexed times trusted, subjects fenced.
  *
  * Exported so the answer's shape can be asserted without a server. A match
- * whose ref does not decode is dropped, silently.
+ * whose ref does not decode is dropped, silently. `parked` adds the sentence
+ * that says a folder could not be read lately.
  */
-export function recallResult(matches: readonly RecallMatch[], index: RecallIndexWord): ToolResult {
+export function recallResult(
+  matches: readonly RecallMatch[],
+  index: RecallIndexWord,
+  parked = false,
+): ToolResult {
   const kept = matches.filter((match) => decodes(match.ref));
-  const note = index === "building" ? [...NOTE_ALWAYS, NOTE_BUILDING] : [...NOTE_ALWAYS];
+  const note: string[] = [...NOTE_ALWAYS];
+  if (index === "building") note.push(NOTE_BUILDING);
+  if (parked) note.push(NOTE_PARKED);
   return untrustedToolResult(
     {
       index,
@@ -188,7 +233,7 @@ export function registerRecallTools(
       try {
         const state = await agentFor(actor).recallSyncState();
         const matches = await recallFor(actor, query, deps(), RECALL_TOP_K);
-        return recallResult(matches, indexWordOf(state));
+        return recallResult(matches, indexWordOf(state), parkedIn(state));
       } catch {
         return unavailableResult();
       }

@@ -158,6 +158,41 @@ export interface SyncRow {
 /** The most failures in a row a sync row counts. The wait stops growing long before. */
 export const MAX_COUNTED_FAILURES = 100;
 
+/**
+ * How many failed attempts in a row park a folder (26-REVIEW-2 WR-03): nine.
+ *
+ * Decided by Claude, 2026-09-28. By the ninth failure in a row the step's
+ * retry wait is already about 21 hours, and reaching it takes about a day of
+ * steady failure, which a passing iCloud outage does not produce. So parking
+ * hardly changes how often a failing folder is tried. What it adds is an end:
+ * the folder stops counting as "still being built". For a build page that
+ * always fails, nine is three rounds of three failures and a fresh status
+ * check.
+ */
+export const RECALL_PARK_AFTER_FAILURES = 9;
+
+/**
+ * Whether a folder is parked (26-REVIEW-2 WR-03): its last
+ * RECALL_PARK_AFTER_FAILURES attempts or more all failed, and the folders
+ * have not been listed since the last of them. `listedAt` is when the folder
+ * list was listed, or null when it is due to be listed again.
+ *
+ * A parked folder is left alone, and the recall answer does not count it as
+ * still being built. A listing stored after its last failure un-parks it for
+ * one more try. That try failing parks it again, so a folder that always
+ * fails is tried about once a day, when the folders are listed.
+ *
+ * THE ONE PREDICATE. The step and the recall answer both ask it, so the step
+ * never works on a folder the answer calls parked, nor the other way round.
+ */
+export function isParked(
+  row: { readonly failures: number; readonly failedAt: number | null },
+  listedAt: number | null,
+): boolean {
+  if (row.failures < RECALL_PARK_AFTER_FAILURES || row.failedAt === null) return false;
+  return listedAt === null || listedAt <= row.failedAt;
+}
+
 /** How often a failed attempt, and when the last one was (26-REVIEW CR-01). */
 export interface RetryState {
   readonly failedAt: number;
