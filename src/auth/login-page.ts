@@ -92,8 +92,14 @@
 // declared in THIS file and calls nothing outside it. Do not reach across the
 // cycle from that initialiser — building the constant from `originOf` or from
 // the allowlist would be the cold-start failure this note is about.
+//
+// `RECALL_NOTICE` is the other value built at module-evaluation time. Its day
+// count is computed from `RECALL_TTL_MS`, imported from `../recall/retention`.
+// That module holds constants and imports nothing, so it is outside this cycle
+// and adds nothing to it.
 // ---------------------------------------------------------------------------
 
+import { RECALL_TTL_MS } from "../recall/retention";
 import type { ClientIdentity } from "./login-handler";
 import {
   APP_PASSWORD_FIELD,
@@ -406,6 +412,49 @@ export const EXPLAINER_SECTIONS: readonly ExplainerSection[] = [
 ];
 
 /**
+ * One notice shown above the sign-in fields: a heading and its lines.
+ *
+ * The page shows every notice in the list it is handed, in order. The list is
+ * built in one place, `signInNotices` in `./login-handler`, so a later phase adds
+ * its own notice there without touching the page or either call site.
+ */
+export interface SignInNotice {
+  readonly heading: string;
+  readonly lines: readonly string[];
+}
+
+/** One day, in milliseconds. */
+const DAY_MS = 86_400_000;
+
+/**
+ * The recall notice: this server keeps a searchable copy of your recent mail.
+ *
+ * Recall is inherent (owner, 2026-09-27). Every person who signs in has their
+ * recent mail indexed, and there is no switch. So this notice is the consent,
+ * and it must be read before anyone types a credential. That is why it sits
+ * above the fields, on every render, for every client.
+ *
+ * The only copy of these words. The test imports this constant rather than
+ * retyping it, so an edit here moves the pin with it, while a stray second copy
+ * elsewhere still fails.
+ *
+ * The day count is computed from `RECALL_TTL_MS`, never typed, so the page
+ * cannot state a retention term the code does not hold. It is the only digit in
+ * these lines.
+ *
+ * These are the owner's draft words. The owner approves them at plan 26-06 and
+ * edits this one constant if he wants them changed.
+ */
+export const RECALL_NOTICE: SignInNotice = {
+  heading: "A searchable copy of your recent mail",
+  lines: [
+    "This server also keeps a searchable copy of your recent mail, so Claude can find a message by what it was about.",
+    `It keeps each message's subject line and a numeric fingerprint, never the body, for ${RECALL_TTL_MS / DAY_MS} days.`,
+    "It is deleted within a day of your access ending.",
+  ],
+};
+
+/**
  * How many characters of a registered client's name the page will show.
  *
  * Registration is unauthenticated, so the name is an arbitrary attacker-chosen
@@ -519,6 +568,12 @@ function failureLines(failure: LoginFailure): readonly string[] {
  * ring and the two links. Nothing else is ever accent-coloured, because the
  * submit button is the page's single focal point and the only full-width block
  * of solid colour.
+ *
+ * The notice block above the fields follows the same rules: the existing border
+ * and text tokens, spacing from the scale of four, 14px lines like the
+ * explainer, no accent colour and no media query of its own. It is framed by a
+ * border rather than coloured, so it reads as part of the page and not as the
+ * page's focal point.
  */
 const STYLE = `
   :root {
@@ -577,6 +632,16 @@ const STYLE = `
   }
   .error p { margin: 0 0 4px; font-size: 14px; }
   .error p:last-child { margin-bottom: 0; }
+  .notice {
+    margin: 0 0 16px;
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .notice section + section { margin-top: 16px; }
+  .notice ul { margin: 0; padding-left: 16px; }
+  .notice li { font-size: 14px; margin: 0 0 4px; overflow-wrap: anywhere; }
+  .notice li:last-child { margin-bottom: 0; }
   label {
     display: block;
     font-size: 14px;
@@ -643,6 +708,26 @@ function renderSection(section: ExplainerSection): string {
 }
 
 /**
+ * The notice block, or nothing at all when the list is empty.
+ *
+ * Every string goes through `copy`, and every one is a source constant. No
+ * request value reaches a notice, so the text is the same for any client name,
+ * destination or query.
+ */
+function renderNotices(notices: readonly SignInNotice[]): string {
+  if (notices.length === 0) return "";
+  const sections = notices
+    .map(
+      (notice) =>
+        `<section><h2>${copy(notice.heading)}</h2><ul>${notice.lines
+          .map((line) => `<li>${copy(line)}</li>`)
+          .join("")}</ul></section>`,
+    )
+    .join("");
+  return `<div class="notice">${sections}</div>`;
+}
+
+/**
  * The login page, for a first load or for either failed render.
  *
  * `query` is the raw authorization query, round-tripped through a hidden field
@@ -652,11 +737,18 @@ function renderSection(section: ExplainerSection): string {
  *
  * Order on the page is fixed and is not a suggestion: heading, lead, the
  * consent block naming the client and then the destination origin, the
- * not-an-Apple-page line, the error region when a previous attempt failed, the
- * form, then the four explainer sections. The consent block stays ABOVE the
- * credential fields — do not move it, collapse it, or put it behind a
- * disclosure. It is the control that lets a person tell an attacker's client
- * from their own before they type anything.
+ * not-an-Apple-page line, the notice block, the error region when a previous
+ * attempt failed, the form, then the four explainer sections. The consent block
+ * stays ABOVE the credential fields — do not move it, collapse it, or put it
+ * behind a disclosure. It is the control that lets a person tell an attacker's
+ * client from their own before they type anything.
+ *
+ * `notices` is REQUIRED, not optional, so a call site that forgets it fails to
+ * compile rather than silently hiding the notice. The notice block sits above
+ * the fields for the same reason the consent block does: it is consent. It tells
+ * a person what this server keeps before they type anything, and a notice read
+ * after signing in is not consent. It shows on every render, first load and
+ * failed attempt alike. An empty list renders nothing, not an empty box.
  *
  * **Neither credential input carries a pre-filled-value attribute on any path**,
  * and nothing the reader submitted reaches this function at all. The only
@@ -713,6 +805,7 @@ export function renderForm(
   query: string,
   failure: LoginFailure,
   identity: ClientIdentity,
+  notices: readonly SignInNotice[],
 ): Response {
   const lines = failureLines(failure);
   const failed = lines.length > 0;
@@ -753,6 +846,7 @@ export function renderForm(
     <p>If you do not recognise both, close this page.</p>
   </div>
   <p class="not-apple">This is not an Apple page, and Apple did not send you here. Check the web address against the one you were given.</p>
+  ${renderNotices(notices)}
   ${errorRegion}
   <form method="post" action="/authorize">
     <input type="hidden" name="oauth_request" value="${escapeHtml(query)}">

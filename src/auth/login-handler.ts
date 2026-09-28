@@ -127,7 +127,9 @@ import type { Principal } from "../principal";
 import { normaliseAppleId, principalFromProps, userIdOf } from "../principal";
 import type { AllowList } from "./allow-list";
 import { isAllowed, parseAllowList, readStoredAllowList } from "./allow-list";
+import type { SignInNotice } from "./login-page";
 import {
+  RECALL_NOTICE,
   RESPONSE_HEADERS,
   SOURCE_REFUSAL_BODY,
   renderForm,
@@ -1315,6 +1317,25 @@ export function createLoginHandler(
 export const loginHandler = createLoginHandler();
 
 /**
+ * The notices the sign-in page shows above its fields, in order.
+ *
+ * The ONE place this list is built. Both `renderForm` call sites pass it: the
+ * first load, and the re-render after a failed attempt. So a notice added here
+ * reaches every render, and nothing else has to change.
+ *
+ * Called only inside a request, never at module load, per the import-cycle note
+ * at the top of `./login-page`: `RECALL_NOTICE` is imported across that cycle.
+ *
+ * Phase 27 appends its autonomy notice here when autonomy is configured, and
+ * renders its hidden field inside the form when that notice is in the list.
+ * Nothing else needs to change for it. The recall notice is always first and
+ * always present, because recall is inherent: it does not depend on any setting.
+ */
+export function signInNotices(_env: Env): readonly SignInNotice[] {
+  return [RECALL_NOTICE];
+}
+
+/**
  * One `/authorize` request, from the pathname check to the redirect.
  *
  * A plain function rather than a method so the factory above is the only thing
@@ -1422,6 +1443,7 @@ async function handleAuthorize(
         url.search.replace(/^\?/, ""),
         null,
         identityOf(client, oauthRequest.redirectUri),
+        signInNotices(env),
       );
     }
 
@@ -1611,7 +1633,7 @@ async function handleAuthorize(
       // the address passed the allow list, and that is accepted, because it can
       // only be built after Apple has already answered — which already means
       // the address was listed.
-      return renderForm(query, failure, identity);
+      return renderForm(query, failure, identity, signInNotices(env));
     }
 
     // The shape check sits ABOVE the allow-list check, and the placement is

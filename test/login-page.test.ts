@@ -52,15 +52,22 @@
 import { AuthorizationError } from "@cloudflare/workers-oauth-provider";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { loginHandler } from "../src/auth/login-handler";
+import {
+  createLoginHandler,
+  loginHandler,
+  signInNotices,
+} from "../src/auth/login-handler";
 import {
   APPLE_THROTTLE_BODY,
   CREDENTIAL_FAILURE_BODY,
   EXPLAINER_SECTIONS,
+  RECALL_NOTICE,
   RESPONSE_HEADERS,
   renderForm,
 } from "../src/auth/login-page";
 import type { Env } from "../src/env";
+import { ImapThrottleError } from "../src/errors";
+import { RECALL_TTL_MS } from "../src/recall/retention";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 import { entryEnv } from "./fixtures/bound-secrets";
 import worker, {
@@ -809,10 +816,12 @@ describe("form-action names the destination the flow is about to redirect to", (
     // both answer the narrow directive rather than interpolating whatever came
     // in.
     for (const redirectUri of ["myapp:/cb", "not a url at all"]) {
-      const response = renderForm(STUB_QUERY, null, {
-        name: "Native Client",
-        redirectUri,
-      });
+      const response = renderForm(
+        STUB_QUERY,
+        null,
+        { name: "Native Client", redirectUri },
+        [RECALL_NOTICE],
+      );
 
       expect(response.status).toBe(200);
       expect(policyOf(response)).toBe(POLICY_SELF);
@@ -852,7 +861,7 @@ describe("there are two failure states on the credential path, and no more", () 
     // The handler does not build this state yet — branching on the throttle
     // error's type is plan 11-04's — so the case drives the renderer, which is
     // the surface that has to be right when that branch lands.
-    const response = renderForm("", "throttled", STUB_IDENTITY);
+    const response = renderForm("", "throttled", STUB_IDENTITY, [RECALL_NOTICE]);
     const body = await response.text();
 
     expect(response.status).toBe(401);
@@ -866,7 +875,7 @@ describe("there are two failure states on the credential path, and no more", () 
   it("puts the alert region immediately above the form, on both", async () => {
     for (const body of [
       await (await postForm({}, "203.0.113.212")).text(),
-      await renderForm("", "throttled", STUB_IDENTITY).text(),
+      await renderForm("", "throttled", STUB_IDENTITY, [RECALL_NOTICE]).text(),
     ]) {
       const regionAt = body.indexOf(`id="login-error"`);
       expect(regionAt).toBeGreaterThan(-1);
@@ -898,6 +907,194 @@ describe("there are two failure states on the credential path, and no more", () 
 
     expect(clientFrom(body)).toBe("Stub Client");
     expect(body).toContain(`<code class="dest">https://claude.ai</code>`);
+  });
+});
+
+describe("the recall notice is above the fields, on every render", () => {
+  // RCLL-13, CONTEXT D-32. Recall is inherent, so this notice is the consent: a
+  // person must read what this server keeps before they type a credential. The
+  // words are pinned by importing RECALL_NOTICE, never by retyping them.
+
+  /** The not-an-Apple-page line's opening, used as a position marker. */
+  const NOT_APPLE = `<p class="not-apple">`;
+
+  /** A floor small enough that the POST cases below cost almost nothing. */
+  const FAST_FLOOR_MS = 10;
+
+  /** A POST of a listed address with a well-formed password, to reach the proof. */
+  function postListed(source: string): Request {
+    return new Request(`${ORIGIN}/authorize`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        "cf-connecting-ip": source,
+      },
+      body: new URLSearchParams({
+        apple_id: LISTED_APPLE_ID,
+        app_password: FAKE_APP_PASSWORD,
+        oauth_request: STUB_QUERY,
+      }).toString(),
+    });
+  }
+
+  /**
+   * Assert the notice block is present once, in its place, with every line.
+   *
+   * Its place: after the not-an-Apple-page line, and before the error region
+   * (when there is one) and the form.
+   */
+  function expectNoticeInPlace(body: string): void {
+    const noticeAt = body.indexOf(`<div class="notice">`);
+    expect(noticeAt, "no notice block").toBeGreaterThan(-1);
+    expect(body.indexOf(`<div class="notice">`, noticeAt + 1)).toBe(-1);
+    expect(noticeAt).toBeGreaterThan(body.indexOf(NOT_APPLE));
+    expect(body.indexOf(NOT_APPLE)).toBeGreaterThan(-1);
+
+    const formAt = body.indexOf("<form");
+    expect(noticeAt).toBeLessThan(formAt);
+    const errorAt = body.indexOf(`id="login-error"`);
+    if (errorAt > -1) expect(noticeAt).toBeLessThan(errorAt);
+
+    // Every line, in order, inside the block.
+    const block = body.slice(noticeAt, body.indexOf("</div>", noticeAt));
+    const text = textOf(block);
+    expect(text).toContain(RECALL_NOTICE.heading);
+    let from = text.indexOf(RECALL_NOTICE.heading);
+    for (const line of RECALL_NOTICE.lines) {
+      const at = text.indexOf(line, from);
+      expect(at, line).toBeGreaterThan(-1);
+      from = at + line.length;
+    }
+  }
+
+  it("has a heading and three lines, which keeps the cases below non-vacuous", () => {
+    expect(RECALL_NOTICE.heading).toBe("A searchable copy of your recent mail");
+    expect(RECALL_NOTICE.lines).toHaveLength(3);
+  });
+
+  it("shows on the first load, for an ordinary client", async () => {
+    const response = await getForm();
+    expect(response.status).toBe(200);
+    expectNoticeInPlace(await response.text());
+  });
+
+  it("shows again on the re-render after a credential failure, before the error region", async () => {
+    const proof = async (): Promise<void> => {
+      throw new Error("an unlisted address must not reach the proof");
+    };
+    const response = await createLoginHandler(proof, FAST_FLOOR_MS).fetch(
+      new Request(`${ORIGIN}/authorize`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          "cf-connecting-ip": "203.0.113.220",
+        },
+        body: new URLSearchParams({
+          apple_id: TYPED_APPLE_ID,
+          app_password: TYPED_PASSWORD,
+          oauth_request: STUB_QUERY,
+        }).toString(),
+      }),
+      stubEnv(),
+    );
+    const body = await response.text();
+
+    expect(response.status).toBe(401);
+    expect(textOf(body)).toContain(CREDENTIAL_FAILURE_BODY[0]);
+    expectNoticeInPlace(body);
+  });
+
+  it("shows again on the re-render after Apple's throttle, before the error region", async () => {
+    let proofCalls = 0;
+    const proof = async (): Promise<void> => {
+      proofCalls += 1;
+      throw new ImapThrottleError();
+    };
+    const response = await createLoginHandler(proof, FAST_FLOOR_MS).fetch(
+      postListed("203.0.113.221"),
+      stubEnv(),
+    );
+    const body = await response.text();
+
+    // Non-vacuous: the proof really ran and Apple's throttle is what came back.
+    expect(proofCalls).toBe(1);
+    expect(response.status).toBe(401);
+    expect(textOf(body)).toContain(APPLE_THROTTLE_BODY[0]);
+    expectNoticeInPlace(body);
+  });
+
+  it("renders the day count from RECALL_TTL_MS, and no other digit", async () => {
+    const days = RECALL_TTL_MS / 86_400_000;
+    expect(Number.isInteger(days)).toBe(true);
+
+    const text = textOf(await (await getForm()).text());
+    expect(text).toContain(`for ${days} days`);
+
+    const digits = RECALL_NOTICE.lines.join(" ").match(/\d+/g) ?? [];
+    expect(digits).toEqual([String(days)]);
+    expect(RECALL_NOTICE.heading).not.toMatch(/\d/);
+  });
+
+  it("renders no notice block and no empty wrapper for an empty list", async () => {
+    const body = await renderForm(STUB_QUERY, null, STUB_IDENTITY, []).text();
+    expect(body).not.toContain(`class="notice"`);
+    expect(textOf(body)).not.toContain(RECALL_NOTICE.heading);
+    // The rest of the page is still there.
+    expect(body).toContain("<form");
+  });
+
+  it("renders exactly one section per notice, in list order", async () => {
+    const second = { heading: "A second notice", lines: ["One more line."] };
+    const one = await renderForm(STUB_QUERY, null, STUB_IDENTITY, [
+      RECALL_NOTICE,
+    ]).text();
+    const block = (body: string) =>
+      body.slice(
+        body.indexOf(`<div class="notice">`),
+        body.indexOf("</div>", body.indexOf(`<div class="notice">`)),
+      );
+    expect(block(one).match(/<section>/g)).toHaveLength(1);
+
+    const two = await renderForm(STUB_QUERY, null, STUB_IDENTITY, [
+      RECALL_NOTICE,
+      second,
+    ]).text();
+    expect(block(two).match(/<section>/g)).toHaveLength(2);
+    expect(block(two).indexOf(RECALL_NOTICE.heading)).toBeLessThan(
+      block(two).indexOf(second.heading),
+    );
+  });
+
+  it("builds the list in one place, and that list is the recall notice alone", () => {
+    expect(signInNotices(emptyEnv())).toEqual([RECALL_NOTICE]);
+  });
+
+  it("puts no notice inside a collapsible disclosure", async () => {
+    const body = await (await getForm()).text();
+    const noticeAt = body.indexOf(`<div class="notice">`);
+    const block = body.slice(noticeAt, body.indexOf("</div>", noticeAt));
+    expect(block).not.toContain("<details");
+    expect(block).not.toContain("<summary");
+    expect(block).not.toContain("hidden");
+  });
+
+  it("carries no request value: the notice is the same for any client, destination or query", async () => {
+    const block = (body: string) => {
+      const at = body.indexOf(`<div class="notice">`);
+      return body.slice(at, body.indexOf("</div>", at) + "</div>".length);
+    };
+    const plain = block(await (await getForm()).text());
+    const odd = block(
+      await renderForm(
+        "response_type=code&client_id=<script>&state=%3Cb%3E",
+        null,
+        { name: "<b>Evil & Co</b>", redirectUri: LOOPBACK_REDIRECT },
+        signInNotices(emptyEnv()),
+      ).text(),
+    );
+
+    expect(plain.length).toBeGreaterThan(0);
+    expect(odd).toBe(plain);
   });
 });
 
