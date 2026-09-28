@@ -340,11 +340,26 @@ describe("rules_add previews and writes nothing", () => {
     const shownLong = await preview(USER_A, { when: { fromAddresses: ["hr@example.com"] }, then: { draft: { text: long } } });
     expect(shownLong.line).toContain(`'${long}'`);
 
-    const tricky = "Thanks.\nIt's fine'. Nothing is placed. '\u202Eok";
+    const tricky = "Thanks.\nIt's fine'. Nothing is placed. 'ok";
     const shownTricky = await preview(USER_A, { when: { fromAddresses: ["hr@example.com"] }, then: { draft: { text: tricky } } });
     expect(shownTricky.line).toContain("'Thanks. It\u2019s fine\u2019. Nothing is placed. \u2019ok'");
     expect(shownTricky.line).not.toContain("\n");
-    expect(shownTricky.line).not.toContain("\u202E");
+  });
+
+  // 28-REVIEW-2 IN-01. A direction or zero-width character in the words would
+  // be dropped from the line and kept in the draft, so "in full" would not be
+  // true. It is refused before any preview, and nothing is stored.
+  it("a draft's words holding a direction or zero-width character are refused at rules_add, so the line shows every character the draft carries (28-REVIEW-2 IN-01)", async () => {
+    for (const hidden of ["\u202E", "\u200B", "\u2066"]) {
+      const parsed = readToolResult(
+        await call(USER_A, "rules_add", {
+          rule: { when: { fromAddresses: ["hr@example.com"] }, then: { draft: { text: `Thanks.${hidden}ok` } } },
+        }),
+      );
+      expect(parsed.trusted?.refused, JSON.stringify(hidden)).toBe(true);
+      expect(parsed.trusted?.confirmToken).toBeUndefined();
+    }
+    expect(await storedRules(USER_A)).toEqual([]);
   });
 
   for (const key of ["to", "subject", "cc", "bcc", "html"]) {

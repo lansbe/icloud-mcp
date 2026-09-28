@@ -2009,7 +2009,15 @@ const RULE_DRAFT_SKIPS =
   "No reply goes to your own address, to mailing-list mail, or when the From line has no usable address.";
 const RULE_DRAFT_UNSENT = "Nothing is sent: each reply waits in Drafts, and only you can send it.";
 
-/** The sentence that names the reply's words, whole (28-REVIEW WR-06). */
+/**
+ * The sentence that names the reply's words, whole (28-REVIEW WR-06).
+ *
+ * "In full" holds because the rule parser refuses, in a draft's text, every
+ * character the fold below would drop but a line break (28-REVIEW-2 IN-01,
+ * `HIDDEN_IN_TEXT` in `src/agent/rules.ts`). So what the fold changes is only
+ * how a character looks, never whether it is there: a line break reads as a
+ * space and a straight quote as a curly one.
+ */
 function ruleDraftWords(text: string): string {
   return `Each reply says, in full: '${foldedForSentence(text)}'.`;
 }

@@ -107,7 +107,7 @@ const REFUSAL_REASONS: Readonly<Record<RuleRefusal, string>> = Object.freeze({
   "bad-flag": "The flag, when given, can only be true. A rule never clears a flag.",
   "draft-not-reply":
     "A rule's draft is always a reply to the sender of the matching message, and takes only text. It has no recipients, subject, copies or HTML of its own.",
-  "bad-draft-text": `A draft's text is between 1 and ${MAX_DRAFT_TEXT_CHARS} characters.`,
+  "bad-draft-text": `A draft's text is between 1 and ${MAX_DRAFT_TEXT_CHARS} characters, with no invisible, direction-changing or control characters except line breaks.`,
 });
 
 /** The keys a draft may not carry, each refused with the reply sentence (D-29). */
@@ -138,6 +138,34 @@ const NOT_IN_ADDRESS = /[\u0000- \u007f()<>[\]:;@\\,"]/;
  * still allowed: it is visible, and refusing it would refuse real people.
  */
 const HIDDEN_IN_ADDRESS = /[\p{C}\p{Z}\p{Default_Ignorable_Code_Point}]/u;
+
+/**
+ * Characters a draft's text may not hold (28-REVIEW-2 IN-01): every control
+ * character but the line break, every format character (the direction marks,
+ * embeddings, overrides and isolates, the zero-width space, the word joiner,
+ * the invisible operators, the soft hyphen, the byte-order mark, the tag
+ * characters), private use, surrogates, unassigned code points, the line and
+ * paragraph separators, and every other default-ignorable one (the Hangul
+ * fillers, the combining grapheme joiner).
+ *
+ * WHY. The rule's confirmation line says "Each reply says, in full: '...'",
+ * and the line drops exactly these characters before it quotes the words
+ * (`foldedForSentence` in `src/confirm.ts`), because they can reorder the rest
+ * of the sentence or hide inside it. The draft is built from the text as
+ * stored. So a text holding one read one way in the line the person approved
+ * and another way in the draft that goes out under their name. Refused here,
+ * the line and the draft carry the same characters; the line's fold is then a
+ * second guard, not the thing that makes them differ.
+ *
+ * KEPT, on purpose: the line break (it folds to a space in the line and stays
+ * a line break in the draft, and every word is still shown), the zero-width
+ * non-joiner and joiner (Persian, Arabic and the Indic scripts spell with them,
+ * emoji sequences are built with them, and they neither move nor hide text),
+ * and the variation selectors (they pick a character's glyph, such as an
+ * emoji's colour form). Decided by Claude, owner may revise.
+ */
+const HIDDEN_IN_TEXT =
+  /(?![\n\r\u200c\u200d\u180b-\u180d\u180f\ufe00-\ufe0f\u{e0100}-\u{e01ef}])[\p{Control}\p{Format}\p{Private_Use}\p{Surrogate}\p{Unassigned}\p{Line_Separator}\p{Paragraph_Separator}\p{Default_Ignorable_Code_Point}]/u;
 
 /** One domain label: letters, digits and inner hyphens, 1 to 63 characters. */
 const LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/;
@@ -261,6 +289,7 @@ function draftOf(value: unknown): RuleDraft {
   if (typeof text !== "string" || text.length < 1 || text.length > MAX_DRAFT_TEXT_CHARS) {
     throw new Refused("bad-draft-text");
   }
+  if (HIDDEN_IN_TEXT.test(text)) throw new Refused("bad-draft-text");
   return { text };
 }
 

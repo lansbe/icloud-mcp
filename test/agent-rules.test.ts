@@ -262,6 +262,60 @@ describe("replyRecipient: the From address, or a named skip (D-30)", () => {
   });
 });
 
+describe("a reply's text may not hold a character the confirmation line would not show (28-REVIEW-2 IN-01)", () => {
+  // The confirmation line says "Each reply says, in full: '...'". The line
+  // drops direction, zero-width and control characters before it quotes the
+  // words, and the draft is built from the text as stored. So a text holding one
+  // would read one way in the line and another in the draft. The parser refuses
+  // them, and the line and the draft then carry the same characters.
+  const HIDDEN: Array<[string, string]> = [
+    ["a right-to-left override", "\u202E"],
+    ["a left-to-right embedding", "\u202A"],
+    ["a first strong isolate", "\u2068"],
+    ["a left-to-right mark", "\u200E"],
+    ["an Arabic letter mark", "\u061C"],
+    ["a zero-width space", "\u200B"],
+    ["a word joiner", "\u2060"],
+    ["an invisible times", "\u2062"],
+    ["a byte-order mark", "\uFEFF"],
+    ["a soft hyphen", "\u00AD"],
+    ["a tag letter", "\u{E0041}"],
+    ["a Hangul filler", "\u3164"],
+    ["a combining grapheme joiner", "\u034F"],
+    ["a bell", "\u0007"],
+    ["a tab", "\t"],
+    ["a C1 control", "\u0085"],
+    ["a line separator", "\u2028"],
+    ["a paragraph separator", "\u2029"],
+    ["a private-use character", "\uE000"],
+    ["a lone surrogate", "\uD800"],
+  ];
+  for (const [name, hidden] of HIDDEN) {
+    it(`${name}: the rule is refused as a bad draft text`, () => {
+      expect(parseRule(draftRule({ text: `Thanks${hidden} for writing.` }))).toMatchObject({
+        ok: false,
+        refusal: "bad-draft-text",
+      });
+    });
+  }
+
+  // Visible text in any script stays allowed, and so do the joiners that
+  // Persian, Arabic, the Indic scripts and emoji sequences need, and the
+  // variation selector that picks an emoji's colour form.
+  const VISIBLE: Array<[string, string]> = [
+    ["line breaks", "Thanks.\nTalk soon.\r\nDana"],
+    ["accents, a dash and an emoji with its variation selector", "Merci \u2014 \u00E0 bient\u00F4t \u2764\uFE0F"],
+    ["a zero-width non-joiner in Persian", "\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645"],
+    ["a zero-width joiner in an emoji sequence", "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}"],
+    ["an ideographic space and a no-break space", "\u65E5\u672C\u3000\u8A9E and\u00A0more"],
+  ];
+  for (const [name, text] of VISIBLE) {
+    it(`${name}: still a draft text`, () => {
+      expect(parseRule(draftRule({ text }))).toMatchObject({ ok: true });
+    });
+  }
+});
+
 describe("an address with an invisible, format or direction character is refused (28-REVIEW WR-07)", () => {
   // The case for replying to the From address is that the person sees the
   // address before sending. A right-to-left override in the local part
