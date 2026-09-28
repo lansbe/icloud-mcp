@@ -79,6 +79,17 @@ const NO_KEY_SENTENCE =
   "The rules job is not running for you, because this account holds no autonomy key right now. " +
   "Signing in again (reconnecting iCloud MCP in a Claude app) makes a new one.";
 
+/**
+ * The status sentence while every run stops at the sign-in (28-REVIEW-2 WR-03):
+ * the last run ended `sign_in_unavailable`, and the job is backing off before
+ * it tries again. It acts on nothing in the meantime, so it must not be
+ * reported as running. The time is the backoff's, from the stored next wake.
+ */
+function signInUnavailableSentence(nextAt: string | null): string {
+  const again = nextAt === null ? "It will try again on its own." : `It will try again on its own at ${nextAt}.`;
+  return `The rules job cannot sign in to iCloud right now, so it is not acting on your mail. ${again}`;
+}
+
 /** The status sentence after iCloud refused the sign-in twice (D-16, D-18). */
 const OFF_AUTH_SENTENCE =
   "The rules job stopped because iCloud refused the sign-in twice in a row. " +
@@ -250,19 +261,27 @@ async function commitRule(
 /** The job's status, from the view, per D-18 as revised. */
 function statusOf(view: RulesView): Record<string, unknown> {
   const hasRules = view.rules.length > 0;
-  const running = hasRules && view.armed;
+  const scheduled = hasRules && view.armed;
+  const lastRun = view.job.lastRun;
+  // A backed-off wake writes no run, so the last run stays the one that could
+  // not sign in until a run gets through (28-REVIEW-2 WR-03).
+  const signInUnavailable = scheduled && lastRun?.outcome === "sign_in_unavailable";
+  const running = scheduled && !signInUnavailable;
+  const nextWakeAt = scheduled ? isoOf(view.job.nextAt) : null;
   const sentence = !hasRules
     ? NO_RULES_SENTENCE
     : view.armed
-      ? RUNNING_SENTENCE
+      ? signInUnavailable
+        ? signInUnavailableSentence(nextWakeAt)
+        : RUNNING_SENTENCE
       : view.job.offAuth
         ? OFF_AUTH_SENTENCE
         : NO_KEY_SENTENCE;
-  const lastRun = view.job.lastRun;
   return {
     running,
     holdsAutonomyKey: view.armed,
-    nextWakeAt: running ? isoOf(view.job.nextAt) : null,
+    signInUnavailable,
+    nextWakeAt,
     consecutiveAuthFailures: view.job.authFailures,
     lastRun:
       lastRun === null ? null : { at: isoOf(lastRun.at), outcome: lastRun.outcome },

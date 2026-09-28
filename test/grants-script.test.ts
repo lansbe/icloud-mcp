@@ -2518,7 +2518,7 @@ describe("AUTO-15: the owner's listing shows each person's rules job", () => {
       statusRecord({ nextAt: STATUS_NOW + 15 * 60_000, authFailures: 1, lastRunAt: STATUS_NOW - 60_000 }),
     );
     const text = await listAt(kv);
-    expect(lineAfter(text, "auto-status-1")).toBe("    rules job  next wake 2026-09-28 06:15 UTC  auth failures 1");
+    expect(lineAfter(text, "auto-status-1")).toBe("    rules job  next wake 2026-09-28 06:15 UTC  auth failures 1  last no_new_mail");
     // The grant row itself is byte-identical to Phase 27's.
     expect(lineFor(text, "auto-status-1")).toMatch(/ {2}autonomy$/);
   });
@@ -2528,8 +2528,26 @@ describe("AUTO-15: the owner's listing shows each person's rules job", () => {
       statusRecord({ nextAt: STATUS_NOW - 60_000, authFailures: 0, lastRunAt: STATUS_NOW - 16 * 60_000 }),
     );
     expect(lineAfter(await listAt(kv), "auto-status-1")).toBe(
-      "    rules job  idle since 2026-09-28 05:44 UTC  auth failures 0",
+      "    rules job  idle since 2026-09-28 05:44 UTC  auth failures 0  last no_new_mail",
     );
+  });
+
+  // 28-REVIEW-2 WR-03. A job stuck at the sign-in for weeks looked exactly
+  // like a working one. The last outcome is one word from the job's closed
+  // list, so it is printed; anything else is left off.
+  it("shows the last run's outcome word, so a job that cannot sign in stands out", async () => {
+    const { kv } = await storeWith(
+      statusRecord({ nextAt: STATUS_NOW + 30 * 60_000, lastRunAt: STATUS_NOW - 60_000, lastOutcome: "sign_in_unavailable" }),
+    );
+    expect(lineAfter(await listAt(kv), "auto-status-1")).toBe(
+      "    rules job  next wake 2026-09-28 06:30 UTC  auth failures 0  last sign_in_unavailable",
+    );
+    for (const word of ["Not A Word", "done\u001b[31m", "x".repeat(41), 7, null]) {
+      expect(
+        autonomyStatusText(statusRecord({ nextAt: STATUS_NOW + 60_000, lastOutcome: word }), STATUS_NOW),
+        String(word),
+      ).toBe("next wake 2026-09-28 06:01 UTC  auth failures 0");
+    }
   });
 
   it("says no run recorded for an autonomy grant with no record, as most people have", async () => {
@@ -2550,7 +2568,7 @@ describe("AUTO-15: the owner's listing shows each person's rules job", () => {
     });
     const text = await listAt(kv);
     expect(lineAfter(text, "auto-status-1")).toBe("    rules job  status unreadable");
-    expect(lineAfter(text, "auto-status-2")).toBe("    rules job  next wake 2026-09-28 06:01 UTC  auth failures 0");
+    expect(lineAfter(text, "auto-status-2")).toBe("    rules job  next wake 2026-09-28 06:01 UTC  auth failures 0  last no_new_mail");
   });
 
   it("a failed listing of the status records never costs the grant listing: each person's line says status unreadable (28-REVIEW IN-05)", async () => {
@@ -2608,11 +2626,13 @@ describe("AUTO-15: the owner's listing shows each person's rules job", () => {
       }),
     );
     const text = await listAt(kv);
-    for (const leak of ["Offer letter", "Thanks, I will reply soon.", LISTED_APPLE_ID, "auth_failed", "rules 7"]) {
+    // The outcome word is printed since 28-REVIEW-2 WR-03; it is a word from
+    // the job's closed list, never a value from mail or a rule.
+    for (const leak of ["Offer letter", "Thanks, I will reply soon.", LISTED_APPLE_ID, "rules 7"]) {
       expect(text, leak).not.toContain(leak);
     }
     expect(text).toContain(maskAppleId(LISTED_APPLE_ID));
-    expect(lineAfter(text, "auto-status-1")).toBe("    rules job  next wake 2026-09-28 06:01 UTC  auth failures 2");
+    expect(lineAfter(text, "auto-status-1")).toBe("    rules job  next wake 2026-09-28 06:01 UTC  auth failures 2  last auth_failed");
   });
 
   it("reads statuses one at a time: one listing, then one read per person with a record", async () => {

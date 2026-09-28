@@ -697,6 +697,29 @@ describe("rules_list shows the rules, the job's status and what it did", () => {
     );
   });
 
+  // 28-REVIEW-2 WR-03. A job whose every run stops at the sign-in acts on
+  // nothing, and it can stay that way for days. It must not be reported as
+  // running and acting on new mail.
+  it("holding a key, and the last run could not sign in: not running, and the sentence says so and when it tries again", async () => {
+    await addRule(USER_A, FLAG_RULE);
+    const next = Date.UTC(2026, 8, 28, 12, 30, 0);
+    await seed(USER_A, AUTONOMY_KEY, { held: true });
+    await seed(USER_A, JOB_NEXT_AT_KEY, next);
+    await seed(USER_A, JOB_LAST_RUN_KEY, { at: Date.UTC(2026, 8, 28, 11, 45, 0), outcome: "sign_in_unavailable" });
+    const status = readToolResult(await call(USER_A, "rules_list")).trusted?.status as Status & {
+      signInUnavailable: boolean;
+    };
+
+    expect(status.running).toBe(false);
+    expect(status.holdsAutonomyKey).toBe(true);
+    expect(status.signInUnavailable).toBe(true);
+    expect(status.nextWakeAt).toBe(new Date(next).toISOString());
+    expect(status.sentence).toBe(
+      "The rules job cannot sign in to iCloud right now, so it is not acting on your mail. " +
+        `It will try again on its own at ${new Date(next).toISOString()}.`,
+    );
+  });
+
   it("no rules answer names a renewal, an expiry or a lifetime for the key", async () => {
     const texts: string[] = [];
     texts.push(textOf(await call(USER_A, "rules_list")));

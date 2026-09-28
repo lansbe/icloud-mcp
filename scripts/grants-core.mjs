@@ -1090,6 +1090,13 @@ export const NO_RUN_RECORDED = "no run recorded";
 /** What the line says when a record is there but cannot be read. */
 export const STATUS_UNREADABLE = "status unreadable";
 
+/**
+ * The shape of a word on the job's closed list of run outcomes: the same shape
+ * the job checks before it writes one (`src/agent/status.ts`). Only such a word
+ * is printed, so nothing else in a record can reach the owner's terminal.
+ */
+const STATUS_OUTCOME_WORD = /^[a-z_]{1,40}$/;
+
 /** The shape of a user id, the only kind of segment a record is written for. */
 const STATUS_USER_ID = /^[0-9a-f]{64}$/;
 
@@ -1116,7 +1123,9 @@ function utcMinute(ms) {
  * store may hand back) is read as is. A record must be version 1, with a failure
  * count that is a whole number at least 0. Then: the next wake when it is still
  * ahead of `now`; otherwise "idle since" the last run; otherwise unreadable.
- * Only those three fields are read. Never throws.
+ * Then the last run's outcome word, when it is one (28-REVIEW-2 WR-03): a job
+ * whose every run stops at the sign-in looked exactly like a working one. Only
+ * those four fields are read. Never throws.
  *
  * @param {unknown} value
  * @param {number} now  ms since the epoch
@@ -1141,14 +1150,18 @@ export function autonomyStatusText(value, now) {
     if (typeof failures !== "number" || !Number.isSafeInteger(failures) || failures < 0) {
       return STATUS_UNREADABLE;
     }
+    const outcome =
+      typeof record.lastOutcome === "string" && STATUS_OUTCOME_WORD.test(record.lastOutcome)
+        ? `  last ${record.lastOutcome}`
+        : "";
     const next = typeof record.nextAt === "number" ? record.nextAt : null;
     if (next !== null && next > now) {
       const at = utcMinute(next);
-      return at === null ? STATUS_UNREADABLE : `next wake ${at}  auth failures ${failures}`;
+      return at === null ? STATUS_UNREADABLE : `next wake ${at}  auth failures ${failures}${outcome}`;
     }
     const last = utcMinute(record.lastRunAt);
     if (last === null) return STATUS_UNREADABLE;
-    return `idle since ${last}  auth failures ${failures}`;
+    return `idle since ${last}  auth failures ${failures}${outcome}`;
   } catch {
     return STATUS_UNREADABLE;
   }
