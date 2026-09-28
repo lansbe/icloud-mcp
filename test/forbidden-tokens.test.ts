@@ -6826,6 +6826,9 @@ describe("the autonomy key's scan rules (Phase 27, D-21)", () => {
         ["src/mcp/tools/account.ts", "  await agentFor(actor).armAutonomy(args.code);\n"],
         ["src/agent/user-agent.ts", "    await this\n      .armAutonomy (code);\n"],
         ["src/recall/drive.ts", "void stub.armAutonomy(code);\n"],
+        // The optional-call form (review IN-01): an ordinary spelling, not an evasion.
+        ["src/recall/step.ts", "void stub.armAutonomy?.(code);\n"],
+        ["src/agent/autonomy.ts", "await agentFor(p)?.armAutonomy ?. (code);\n"],
       ] as const) {
         const violations = checkAutonomyArmOwnership([
           ...owner,
@@ -6864,6 +6867,7 @@ describe("the autonomy key's scan rules (Phase 27, D-21)", () => {
         "  armAutonomy (code: unknown) {",
         'expect(Object.getOwnPropertyNames(proto)).toContain("armAutonomy");',
         "type Arm = UserAgent[\"armAutonomy\"];",
+        "const optional = { armAutonomy?: undefined };",
       ]) {
         expect(fires(sample), `false-positived on ${JSON.stringify(sample)}`).toBe(false);
       }
@@ -6871,6 +6875,11 @@ describe("the autonomy key's scan rules (Phase 27, D-21)", () => {
         "await agentFor(principal).armAutonomy(code);",
         "stub . armAutonomy (code)",
         "agentFor(p)\n  .armAutonomy(code)",
+        // The optional-call forms (review IN-01).
+        "stub.armAutonomy?.(code)",
+        "stub?.armAutonomy?.(code)",
+        "agentFor(p).armAutonomy ?. (code)",
+        "agentFor(p)\n  .armAutonomy?.\n  (code)",
       ]) {
         expect(fires(sample), `missed ${JSON.stringify(sample)}`).toBe(true);
       }

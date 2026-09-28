@@ -2209,8 +2209,13 @@ export function collectRecallStepCalls(relativePath, contents) {
  * getting a key, and nothing fails on the way out.
  *
  * THE SHAPE. A dot, optional white space, the method's name, optional white
- * space, an opening parenthesis. So `agentFor(principal).armAutonomy(code)` and
- * a call split over lines after the dot are both seen.
+ * space, an optional `?.` with optional white space after it, an opening
+ * parenthesis. So `agentFor(principal).armAutonomy(code)`, a call split over
+ * lines after the dot, and the optional-call form `stub.armAutonomy?.(code)`
+ * are all seen. The optional-call form was missed until review IN-01 of
+ * 2026-09-28; it is an ordinary spelling, not an evasion, so the pattern was
+ * widened for it. An optional chain on the receiver (`stub?.armAutonomy(`)
+ * already ends in the dot the pattern needs.
  *
  * COMMENTS. Matched with comment lines blanked, so a commented-out call cannot
  * keep the missing arm quiet, and prose naming the method is not a call.
@@ -2225,7 +2230,7 @@ export function collectRecallStepCalls(relativePath, contents) {
  * test is not a code path. No `g` flag; the collector builds its own global
  * copy per file.
  */
-export const AUTONOMY_ARM_CALL = /\.\s*armAutonomy\s*\(/;
+export const AUTONOMY_ARM_CALL = /\.\s*armAutonomy\s*(?:\?\.\s*)?\(/;
 
 /** The one file under `AUTONOMY_ARM_SCOPE` permitted to match
  *  `AUTONOMY_ARM_CALL`, and only once. */
