@@ -1069,46 +1069,54 @@ async function refreshTokenIn(response: Response): Promise<string | null> {
 describe("autonomy credential: one at a time (D-27, RESEARCH §7)", () => {
   it("two sign-ins at once leave exactly one autonomy grant, the one the record names, and it works", async () => {
     const world = await setUp("lifecycle two at once");
+    // A's first token request is held until B's arm is known to be WAITING in
+    // the object: both grant ids are in `pendingArmGrants` (review WR-05). So
+    // the two arms really overlap, and the case fails if they do not. Before,
+    // A was held for at most 200 ms and the case passed whether or not B had
+    // arrived. While A is held, the queue must keep every request of B's away
+    // from the seam.
     let heldCount = 0;
-    let releasedBy: "second request" | "timeout" | null = null;
+    let overlapped = false;
     let seenWhileHeld = 0;
     let holding = false;
-    let secondRequest = gate();
-    const restore = await replaceSeam(world.userId, (forward) => async (request) => {
-      if (holding) {
-        seenWhileHeld += 1;
-        secondRequest.open();
-      }
-      if (heldCount === 0 && new URL(request.url).pathname === "/oauth/token") {
-        heldCount += 1;
-        holding = true;
-        secondRequest = gate();
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const timeout = new Promise<"timeout">((resolve) => {
-          timer = setTimeout(() => resolve("timeout"), 200);
-        });
-        releasedBy = await Promise.race([
-          secondRequest.promise.then(() => "second request" as const),
-          timeout,
-        ]);
-        if (timer !== undefined) clearTimeout(timer);
-        holding = false;
-      }
-      return forward(request);
+    let original: ((request: Request) => Promise<Response>) | null = null;
+    await runInDurableObject(objectOf(world.userId), (instance: UserAgent) => {
+      original = instance.autonomySelfFetch;
+      const forward = original;
+      instance.autonomySelfFetch = async (request: Request): Promise<Response> => {
+        if (holding) seenWhileHeld += 1;
+        if (heldCount === 0 && new URL(request.url).pathname === "/oauth/token") {
+          heldCount += 1;
+          holding = true;
+          // At most three seconds, inside the case's timeout. A request of B's
+          // reaching the seam ends the hold at once: the queue has failed, and
+          // the assertion below says so.
+          for (let i = 0; i < 300 && instance.pendingArmGrants.size < 2 && seenWhileHeld === 0; i += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          overlapped = instance.pendingArmGrants.size >= 2;
+          holding = false;
+        }
+        return forward(request);
+      };
     });
-    try {
+    const restore = async () => {
+      await runInDurableObject(objectOf(world.userId), (instance: UserAgent) => {
+        if (original !== null) instance.autonomySelfFetch = original;
+      });
+    };    try {
       const queryA = authorizeQuery(world.clientId, CLAUDE_WEB_REDIRECT, "at-once-a");
       const queryB = authorizeQuery(world.clientId, CLAUDE_WEB_REDIRECT, "at-once-b");
       const ctxA = createExecutionContext();
       const ctxB = createExecutionContext();
-      const answerA = await worker.fetch(postFrom(freshSource(), LISTED_APPLE_ID, queryA), world.env, ctxA);
-      const answerB = await worker.fetch(postFrom(freshSource(), LISTED_APPLE_ID, queryB), world.env, ctxB);
+      const answerA = await worker.fetch(postFrom(freshSource(), LISTED_APPLE_ID, queryA), world.env, ctxA);      const answerB = await worker.fetch(postFrom(freshSource(), LISTED_APPLE_ID, queryB), world.env, ctxB);
       expect(answerA.status).toBe(302);
       expect(answerB.status).toBe(302);
       await waitOnExecutionContext(ctxA);
       await waitOnExecutionContext(ctxB);
 
-      expect(releasedBy).toBe("timeout");
+      expect(heldCount).toBe(1);
+      expect(overlapped).toBe(true);
       expect(seenWhileHeld).toBe(0);
       const grants = await autonomyGrantIds(world.userId);
       const record = await storedRecord(world.userId);
