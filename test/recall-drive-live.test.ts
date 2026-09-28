@@ -110,10 +110,20 @@ async function countSlotReads() {
 // ---------------------------------------------------------------------------
 
 /**
- * A folder listing session: sign in, list INBOX, a sent folder and an archive
- * folder with its role, and log out.
+ * A folder listing session: sign in, list INBOX, a sent folder and, unless
+ * told otherwise, an archive folder with its role, and log out.
+ *
+ * The tool's session in the order case is scripted WITHOUT the archive
+ * folder, so the stored folder list says which socket the step listed on: a
+ * step that ran first, on the tool's socket, would store INBOX alone.
  */
-function listingSession(): FakeDuplex {
+function listingSession(withArchive = true): FakeDuplex {
+  const archive = withArchive
+    ? [
+        `* LIST (\\HasNoChildren \\Archive) "/" "${ARCHIVE}"`,
+        `* STATUS "${ARCHIVE}" (MESSAGES 900 UNSEEN 0)`,
+      ]
+    : [];
   return createFakeDuplex([
     GREETING,
     capabilityResponse("a1", PRE_AUTH_CAPABILITY),
@@ -124,8 +134,7 @@ function listingSession(): FakeDuplex {
       '* STATUS "INBOX" (MESSAGES 172 UNSEEN 4)',
       '* LIST (\\HasNoChildren \\Sent) "/" "Sent Messages"',
       '* STATUS "Sent Messages" (MESSAGES 40 UNSEEN 0)',
-      `* LIST (\\HasNoChildren \\Archive) "/" "${ARCHIVE}"`,
-      `* STATUS "${ARCHIVE}" (MESSAGES 900 UNSEEN 0)`,
+      ...archive,
       "a4 OK LIST completed",
     ),
     logoutExchange("a5"),
@@ -183,7 +192,7 @@ describe("one successful mail call moves a fresh person's build by one step (D-2
   it("two sockets, in order; the step lists the folders; the answer is the one a null reader gets", async () => {
     // The answer from a factory that runs no step, for the compare. It opens
     // exactly one socket: the default-null reader runs nothing.
-    const alone = listingSession();
+    const alone = listingSession(false);
     vi.mocked(connectImap).mockReturnValueOnce(alone as never);
     const baseline = await realTool("mail_list_folders", async () => null)({});
     expect(baseline.isError).toBeUndefined();
@@ -193,8 +202,8 @@ describe("one successful mail call moves a fresh person's build by one step (D-2
 
     // Now the driven call. The second socket records whether the tool's own
     // session had already logged out at the moment it was opened.
-    const toolSession = listingSession();
-    const stepSession = listingSession();
+    const toolSession = listingSession(false);
+    const stepSession = listingSession(true);
     let toolHadLoggedOut: boolean | null = null;
     vi.mocked(connectImap)
       .mockImplementationOnce(() => toolSession as never)
@@ -211,6 +220,8 @@ describe("one successful mail call moves a fresh person's build by one step (D-2
     expect(stepSession.writtenLines().some((line) => /^a4 LIST /.test(line))).toBe(true);
     expect(sentLogout(stepSession)).toBe(true);
     // The object holds the build's folders: INBOX, then the archive folder.
+    // Only the second socket's listing has the archive folder, so this also
+    // says the step listed on the second socket, after the tool.
     expect(await storedFolders()).toEqual(["INBOX", ARCHIVE]);
     // The answer is untouched by the step.
     expect(answer.isError).toBeUndefined();
