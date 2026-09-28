@@ -1152,10 +1152,12 @@ export function refuseUnlistedRedirects(
     // owner's grant listing shows a grant's client name, and only the fixed
     // autonomy id may carry this one. A registration whose name reads the
     // same is refused. Both sides go through `foldClientName` first (review
-    // IN-02), so doubled or unusual spaces, full-width letters, and invisible
-    // characters cannot make a name that looks identical but compares
-    // different. Look-alike letters from other scripts are NOT caught: that
-    // needs a confusables table, and the listing labels autonomy by id anyway.
+    // IN-02, R2-IN-02), so doubled or unusual spaces, blank-looking letters,
+    // full-width letters, and the invisible characters it names cannot make a
+    // name that looks identical but compares different. Look-alike letters
+    // from other scripts are NOT caught: that needs a confusables table, and
+    // the listing labels autonomy by id anyway. `foldClientName` names what
+    // else it misses.
     const posingAsAutonomy =
       typeof name === "string" &&
       foldClientName(name) === foldClientName(AUTONOMY_CLIENT_NAME);
@@ -1171,26 +1173,44 @@ export function refuseUnlistedRedirects(
 }
 
 /**
+ * Letters that draw as an empty space: the Hangul fillers (U+115F, U+1160,
+ * U+3164 and the half-width U+FFA0) and the Braille blank (U+2800). They are
+ * not white space to the regex engine, so a name that puts one where a space
+ * goes would otherwise fold to a different string (review R2-IN-02).
+ */
+const BLANK_LETTERS = /[\u115F\u1160\u3164\uFFA0\u2800]/gu;
+
+/**
  * A client name reduced to what a person reading it would see (review IN-02),
  * for the autonomy-name refusal above and nothing else.
  *
  * In order: NFKC, which turns full-width and other compatibility letters and
- * spaces into their plain forms; every format character removed (`\p{Cf}`:
- * zero-width spaces and joiners, the soft hyphen, the byte-order mark); every
- * run of white space collapsed to one space; the ends trimmed; letter case
- * folded to lower case.
+ * spaces into their plain forms; every letter that draws as an empty space
+ * (`BLANK_LETTERS`) turned into a space; every format character and every
+ * default-ignorable code point removed (`\p{Cf}`: zero-width spaces and
+ * joiners, the soft hyphen, the byte-order mark; `\p{Default_Ignorable_Code_Point}`:
+ * the combining grapheme joiner, variation selectors, the Khmer inherent
+ * vowels, and the rest of the characters a renderer is told to draw as
+ * nothing, review R2-IN-02); every run of white space collapsed to one space;
+ * the ends trimmed; letter case folded to lower case. The blanks become
+ * spaces BEFORE the invisible characters go, because the Hangul fillers are
+ * default-ignorable too, and stripping one that stands in for a space would
+ * join the two words either side of it.
  *
  * WHAT IT DOES NOT CATCH. Look-alike letters from other scripts, such as a
  * Cyrillic letter that looks like a Latin one. NFKC leaves those alone, and
- * catching them needs a confusables table this project does not carry. It is a
- * residual, not a hole: the owner's listing labels a grant as autonomy by its
- * client id, never by its name, so a look-alike name fools only a person
- * reading the consent page.
+ * catching them needs a confusables table this project does not carry. Nor
+ * does it catch a blank-looking character this list does not name, or a
+ * combining mark that draws as nothing in some fonts but is not
+ * default-ignorable. It is a residual, not a hole: the owner's listing labels
+ * a grant as autonomy by its client id, never by its name, so a look-alike
+ * name fools only a person reading the consent page.
  */
 function foldClientName(value: string): string {
   return value
     .normalize("NFKC")
-    .replace(/\p{Cf}/gu, "")
+    .replace(BLANK_LETTERS, " ")
+    .replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "")
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();

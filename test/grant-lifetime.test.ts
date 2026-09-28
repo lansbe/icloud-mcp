@@ -760,7 +760,8 @@ describe("LIFE-02: a registration off the allowlist is refused at the door", () 
 
   it("refuses the autonomy client's name however it is spaced, width-shifted or padded with invisible characters (review IN-02)", () => {
     // Each of these looks like the autonomy client's name on a consent page.
-    // The name is normalised before it is compared: NFKC, format characters
+    // The name is normalised before it is compared: NFKC, blank-looking
+    // letters turned into spaces, format and default-ignorable characters
     // removed, runs of white space collapsed, case folded.
     const good = "https://claude.ai/api/mcp/auth_callback";
     const nameOf = (client_name: unknown) =>
@@ -782,6 +783,18 @@ describe("LIFE-02: a registration off the allowlist is refused at the door", () 
       "﻿iCloud MCP auto­nomy",
       "ｉＣｌｏｕｄ ＭＣＰ autonomy",
       "iCloud MCP autonomy",
+      // Default-ignorable code points outside the format category, each
+      // measured by the second review (R2-IN-02): combining grapheme joiner,
+      // variation selector 16, Hangul filler standing in for the space, and
+      // the Khmer inherent vowel.
+      "iCloud MCP autono\u034Fmy",
+      "iCloud MCP autonomy\uFE0F",
+      "iCloud\u3164MCP autonomy",
+      "iCloud MCP autonom\u17B4y",
+      // Two more blanks that stand in for a space: the half-width Hangul
+      // filler and the Braille blank.
+      "iCloud\uFFA0MCP autonomy",
+      "iCloud MCP\u2800autonomy",
     ]) {
       expect(nameOf(posing), JSON.stringify(posing)).toEqual(REGISTRATION_REFUSAL);
     }
