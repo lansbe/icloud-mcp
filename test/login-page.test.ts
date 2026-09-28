@@ -972,6 +972,16 @@ describe("the recall notice is above the fields, on every render", () => {
     expect(RECALL_NOTICE.lines).toHaveLength(3);
   });
 
+  it("does not claim the body is never read: it says what the fingerprint is made from (26-REVIEW WR-01)", () => {
+    // The fingerprint is made from the subject, the sender's name and the
+    // first lines of the body, so "never the body" overstated. The notice says
+    // what is kept and what it is made from, and that the text is not kept.
+    const text = RECALL_NOTICE.lines.join(" ");
+    expect(text).not.toMatch(/never the body/i);
+    expect(text).toMatch(/fingerprint made from its opening lines/);
+    expect(text).toMatch(/does not keep the text itself/);
+  });
+
   it("shows on the first load, for an ordinary client", async () => {
     const response = await getForm();
     expect(response.status).toBe(200);

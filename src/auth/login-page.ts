@@ -442,14 +442,19 @@ const DAY_MS = 86_400_000;
  * cannot state a retention term the code does not hold. It is the only digit in
  * these lines.
  *
- * These are the owner's draft words. The owner approves them at plan 26-06 and
- * edits this one constant if he wants them changed.
+ * Lines one and three are the owner's draft words. Line two is the truthful
+ * default from 26-CONTEXT's notice-accuracy note (D-32), not the owner's draft:
+ * the draft said "never the body", but the fingerprint is made from the
+ * subject, the sender's name and the first lines of the body, so that was true
+ * of what is kept and not of what is read (26-REVIEW WR-01). It agrees with
+ * SECURITY.md's "What is kept". The owner still approves the words, and edits
+ * this one constant if he wants them changed.
  */
 export const RECALL_NOTICE: SignInNotice = {
   heading: "A searchable copy of your recent mail",
   lines: [
     "This server also keeps a searchable copy of your recent mail, so Claude can find a message by what it was about.",
-    `It keeps each message's subject line and a numeric fingerprint, never the body, for ${RECALL_TTL_MS / DAY_MS} days.`,
+    `It keeps each message's subject line and a numeric fingerprint made from its opening lines, for ${RECALL_TTL_MS / DAY_MS} days. It does not keep the text itself.`,
     "It is deleted within a day of your access ending.",
   ],
 };
