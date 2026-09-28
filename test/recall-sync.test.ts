@@ -548,6 +548,42 @@ describe("recallSetFolders and recallSetSync refuse what they must not store", (
     expect((await stub.recallSyncState()).sync[INBOX]).toEqual(good);
   });
 
+  it("recallSetSync forgets the build cursor in the same write only for a seed row with exactly \"reset\" (26-REVIEW-2 WR-01)", async () => {
+    const stub = objectFor(USER_A.userId);
+    const cursorOf = () =>
+      withSql(USER_A.userId, (sql) =>
+        sql
+          .exec<{ v: string }>("select v from recall_state where k = ?", `cursor:${INBOX}`)
+          .toArray()
+          .map((row) => row.v),
+      );
+    await withSql(USER_A.userId, (sql) => writeState(sql, `cursor:${INBOX}`, "~done"));
+    const built = { ...SEED_ROW, stage: "built", state: state(INBOX), checkedAt: 1 };
+
+    // Refused, and nothing written: not a seed row, or not exactly "reset".
+    expect(await stub.recallSetSync(INBOX, built, "reset")).toEqual({
+      ok: false,
+      reason: "invalid",
+    });
+    for (const bad of ["RESET", "keep", true, null, 0, { kind: "reset" }]) {
+      expect(await stub.recallSetSync(INBOX, SEED_ROW, bad)).toEqual({
+        ok: false,
+        reason: "invalid",
+      });
+    }
+    expect((await stub.recallSyncState()).sync[INBOX]).toBeUndefined();
+    expect(await cursorOf()).toEqual(["~done"]);
+
+    // No third argument: the row is stored and the cursor kept.
+    expect(await stub.recallSetSync(INBOX, SEED_ROW)).toEqual({ ok: true });
+    expect(await cursorOf()).toEqual(["~done"]);
+
+    // A seed row with "reset": both, in one call.
+    expect(await stub.recallSetSync(INBOX, SEED_ROW, "reset")).toEqual({ ok: true });
+    expect((await stub.recallSyncState()).sync[INBOX]).toEqual(SEED_ROW);
+    expect(await cursorOf()).toEqual([]);
+  });
+
   it("recallSetFolders stores INBOX first, up to four, and refuses anything else", async () => {
     const stub = objectFor(USER_A.userId);
 

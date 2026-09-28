@@ -593,6 +593,61 @@ describe("removals reach the index on the folder's next sync", () => {
     expect((await rowOf(USER_A.userId, INBOX))!.stage).toBe("built");
   });
 
+  it("a validity reset whose slot end changes nothing (the token expired) still resets the build, so the new generation is indexed (26-REVIEW-2 WR-01)", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX],
+      mailboxes: { [INBOX]: { uidValidity: 100, messages: scriptedMessages(5) } },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    await buildInbox(a, h);
+
+    h.setNow(now + 6 * MINUTE);
+    h.setValidity(INBOX, 200);
+    expect((await step(a, h)).outcome).toBe("due");
+
+    // The reconcile's end comes too late: its token expired and the object
+    // answers false and changes nothing, as it does for any stale token.
+    const stub = objectFor(USER_A.userId);
+    await runInDurableObject(stub, (instance: UserAgent) => {
+      const prototype = Object.getPrototypeOf(instance) as UserAgent;
+      const real = prototype.recallEndPage;
+      let first = true;
+      vi.spyOn(prototype, "recallEndPage").mockImplementation(function (
+        this: UserAgent,
+        _token: unknown,
+        mailbox: unknown,
+        update: unknown,
+      ) {
+        if (first) {
+          first = false;
+          return real.call(this, "an-expired-token", mailbox, update);
+        }
+        return real.call(this, _token, mailbox, update);
+      });
+    });
+    try {
+      expect((await step(a, h)).outcome).toBe("indexed");
+    } finally {
+      vi.restoreAllMocks();
+    }
+    expect((await rowOf(USER_A.userId, INBOX))!.stage).toBe("seed");
+    expect(await ledgerCount(USER_A.userId)).toBe(0);
+
+    // The token the end never cleared expires on its own.
+    await withSql(USER_A.userId, (sql) => sql.exec("delete from recall_state where k = 'page'"));
+    await passPause(USER_A.userId);
+
+    // Seed, then the build starts again from the top and indexes all five.
+    expect((await step(a, h)).outcome).toBe("seeded");
+    expect((await step(a, h)).outcome).toBe("done");
+    const pages = h.sources[INBOX]!.calls.filter((call) => call.kind === "page");
+    expect(pages[pages.length - 1]).toEqual({ kind: "page", mailbox: INBOX, cursor: null });
+    expect(await ledgerCount(USER_A.userId)).toBe(5);
+    expect((await rowOf(USER_A.userId, INBOX))!.stage).toBe("built");
+  });
+
   it("a folder dropped as gone takes its vectors, its sync row and its cursor with it (26-REVIEW CR-03)", async () => {
     const a = await testPrincipal(USER_A);
     const h = fakeStepDeps({

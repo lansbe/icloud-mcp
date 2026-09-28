@@ -496,7 +496,8 @@ async function advanceUnbuilt(
     return afterSet(await stub.recallSetSync(mailbox, built)) ?? status;
   }
   if (status === "reset") {
-    return afterSet(await stub.recallSetSync(mailbox, SEED_ROW)) ?? status;
+    // The cursor goes in the same write as the row (26-REVIEW-2 WR-01).
+    return afterSet(await stub.recallSetSync(mailbox, SEED_ROW, "reset")) ?? status;
   }
   if (status === "indexed" && row.failures > 0) {
     return afterSet(await stub.recallSetSync(mailbox, { ...row, ...NO_FAILURE })) ?? status;
@@ -703,6 +704,13 @@ export async function indexNewMail(
  * one the check saw, and the sync time is recorded. A refusal leaves the sync
  * due for the next step. A failure is recorded by the step, which clears what
  * was due (CR-01).
+ *
+ * The reset does not rest on the page slot's end (26-REVIEW-2 WR-01). That end
+ * changes nothing once the slot's token has expired, for example when the
+ * reconcile ran past the slot's lifetime and another page took it, and its
+ * answer is not read. So the row goes back to seed and the cursor is forgotten
+ * in one object write, and that write's answer is checked. The folder can
+ * never be at seed with the old build's finished cursor still set.
  */
 async function syncDeletions(
   principal: Principal,
@@ -714,13 +722,11 @@ async function syncDeletions(
   const stored = row.state;
   const seen = row.seen;
   const reset = stored === null || (seen !== null && seen.uidValidity !== stored.uidValidity);
-  // On a reset the cursor goes with the slot's end, in the same object call,
-  // so the folder is never back at seed with the old build's cursor still set.
   const status = await reconcileMailbox(principal, mailbox, deps, { resetCursor: reset });
 
   if (reset) {
     if (status === "indexed") {
-      return afterSet(await stub.recallSetSync(mailbox, SEED_ROW)) ?? status;
+      return afterSet(await stub.recallSetSync(mailbox, SEED_ROW, "reset")) ?? status;
     }
     return status;
   }

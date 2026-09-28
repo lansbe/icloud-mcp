@@ -614,20 +614,32 @@ export class UserAgent extends DurableObject<Env> {
   /**
    * Store one mailbox's sync row (Phase 26, D-15).
    *
+   * `cursor` is optional. Exactly `"reset"` also forgets the mailbox's build
+   * cursor, in the same write, and is allowed only with a row at seed: a
+   * folder sent back to seed because its validity changed must start its next
+   * build from the top (26-REVIEW-2 WR-01). The step does not trust the page
+   * slot's end to have done it, because that end changes nothing once the
+   * slot's token has expired.
+   *
    * Refuses, in this order: `unnamed`; `invalid` for a bad mailbox, a row
-   * `parseSyncRow` rejects, or a row whose `state` or `seen` names another
-   * mailbox; `destroying` while a destroy is running. No `await`, so the check
-   * and the write are one atomic step. The destroy already clears these rows.
+   * `parseSyncRow` rejects, a row whose `state` or `seen` names another
+   * mailbox, or a `cursor` that is neither absent nor `"reset"` with a seed
+   * row; `destroying` while a destroy is running. No `await`, so the check and
+   * the writes are one atomic step. The destroy already clears these rows.
    */
-  recallSetSync(mailbox: unknown, row: unknown): SetAnswer {
+  recallSetSync(mailbox: unknown, row: unknown, cursor?: unknown): SetAnswer {
     const sql = this.ctx.storage.sql;
     ensureRecallSchema(sql);
     if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
     if (!isMailbox(mailbox)) return { ok: false, reason: "invalid" };
     const parsed = syncRowFor(mailbox, row);
     if (parsed === null) return { ok: false, reason: "invalid" };
+    if (cursor !== undefined && (cursor !== "reset" || parsed.stage !== "seed")) {
+      return { ok: false, reason: "invalid" };
+    }
     if (destroyPending(sql)) return { ok: false, reason: "destroying" };
     writeSyncRow(sql, mailbox, parsed);
+    if (cursor === "reset") clearCursor(sql, mailbox);
     return { ok: true };
   }
 
