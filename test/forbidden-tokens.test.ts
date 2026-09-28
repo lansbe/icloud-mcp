@@ -1193,6 +1193,9 @@ describe("the patterns have teeth", () => {
     // from fragments, as the plan asks for every sample of this rule, so this
     // table does not spell the header's name.
     "agent-reads-other-address": `const to = row.${["reply", "To"].join("")};`,
+    // 28-VERIFICATION. The job reaching for the Worker-side lease module, the
+    // first line of any edit that has the job take the lease itself.
+    "agent-imports-lease": 'import { agentFor } from "./lease";',
   };
 
   it("covers every rule with a known-violating sample", () => {
@@ -7672,6 +7675,52 @@ describe("the rules job's scan rules (Phase 28, D-21)", () => {
 
     it("fires nothing outside src/agent/", () => {
       expect(hits(ID, "src/mail/service.ts", REFUSED[0]!)).toBe(0);
+    });
+  });
+
+  describe("nothing under src/agent/ imports the lease module (28-VERIFICATION)", () => {
+    const ID = "agent-imports-lease";
+
+    it("is scoped to src/agent/", () => {
+      expect(rule(ID).scope).toBe("src/agent/");
+    });
+
+    it("fires on a value, a type, a side-effect and a dynamic import, and a re-export, from the job, the actions, the parser and the evaluator", () => {
+      for (const file of ["src/agent/job.ts", "src/agent/actions.ts", "src/agent/rules.ts", "src/agent/evaluate.ts"]) {
+        for (const line of [
+          'import { agentFor } from "./lease";',
+          "import type { LeasedMail } from './lease';",
+          'import { agentFor } from "./lease.ts";',
+          'import "./lease";',
+          'const lease = await import("./lease");',
+          'const lease = await import( "./lease.js" );',
+          'export { agentFor } from "./lease";',
+          'export * from "../agent/lease";',
+        ]) {
+          expect(hits(ID, file, line), `${file}: ${line}`).toBe(1);
+        }
+      }
+    });
+
+    it("does not fire on another module, a longer name, or prose", () => {
+      for (const line of [
+        'import { readRules } from "./job";',
+        'import { LEASE_TTL_MS } from "./leasehold";',
+        'import { x } from "./lease-cost";',
+        "// It never takes the connection lease: each tool call takes it inside the door.",
+        'const LEASE_KEY = "lease";',
+      ]) {
+        expect(hits(ID, "src/agent/job.ts", line), line).toBe(0);
+      }
+    });
+
+    it("gives nothing on any real src/agent/ file", () => {
+      for (const file of agentFiles) expect(hits(ID, file, SRC[file]!), file).toBe(0);
+    });
+
+    it("fires nothing outside src/agent/, where the Worker side imports it on purpose", () => {
+      expect(hits(ID, "src/mcp/tools/rules.ts", 'import { type LeasedMail, agentFor } from "../../agent/lease";')).toBe(0);
+      expect(hits(ID, "src/recall/pipeline.ts", 'import { agentFor } from "./lease";')).toBe(0);
     });
   });
 

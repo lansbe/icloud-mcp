@@ -1275,7 +1275,8 @@ export const FORBIDDEN = [
   // than prose: "and archive" arrives one reasonable commit at a time, and a
   // limit written only in a comment is not enforced by anything.
   //
-  // Four pattern rules here. The five count constraints beside them live with
+  // Five pattern rules here (the fifth, the lease import, from
+  // 28-VERIFICATION). The five count constraints beside them live with
   // the other counts below, and the two widenings are the closure list and the
   // fan-out alternation above.
   //
@@ -1386,6 +1387,35 @@ export const FORBIDDEN = [
     pattern:
       /\breply[-_]?to\b|\breturn[-_]?path\b|\b(?:from|sender|display)[-_]?name\b|["'`]sender["'`]|(?:\b|["'`])(?:cc|bcc|replyAll|attachmentIds|folderId)["'`]?\s*:|\.\s*(?:cc|bcc|replyAll|attachmentIds|folderId)\b|\[\s*["'`](?:cc|bcc|replyAll|attachmentIds|folderId)["'`]\s*\]|[{,]\s*(?:cc|bcc|replyAll|attachmentIds|folderId)\s*(?=[,}])/gi,
     why: "Under src/agent/, a second address field: the header that asks for replies to go somewhere else (any spelling), a display-name field, the return path, the sender header by name, or a key for a copy list, a blind copy list, reply-all, attachments or a folder, in any of four forms (a key with a colon, a member, a bracket access, a shorthand property). The job may take exactly one address from a stranger's message, the From address, through one function (replyRecipient in src/agent/recipient.ts). A second way to read an address is how a reply gets aimed somewhere the stranger chose: the redirect header exists precisely to send replies elsewhere, and a copy list or reply-all widens who is told. PITFALLS #12 forbids a write target taken from content; the From address is the one exception, decided by the owner on 2026-09-27, and this keeps it the only one. If this fired on a comment, describe the header by role. Do not narrow the pattern: a second address is a decision on the boundary, not a refactor.",
+  },
+  // (e) The lease module's importers. src/agent/lease.ts is the Worker-side
+  // half of the connection lease: the one place a request takes and gives back
+  // the person's lease, and builds their object's stub. The rules job must
+  // never take the lease itself (AUTO-13): each of its tool calls takes it
+  // inside the door, like any other request, so a lease held by the job would
+  // make every one of its own calls answer busy. Plan 28-01 wrote this as a
+  // test-tier prohibition on the job, the actions and the rule parser; the
+  // behaviour half is proved through the real door, but nothing refused the
+  // import itself until 28-VERIFICATION asked for it.
+  //
+  // Scoped to the whole of src/agent/, which is wider than the three modules
+  // the prohibition named, and only refuses more. Nothing under src/agent/
+  // imports the lease module (measured at zero on 2026-09-28, before it was
+  // armed): every importer is Worker-side, under src/mcp/, src/auth/ and
+  // src/recall/. The object and its jobs are the other side of the lease, and
+  // lease.ts already imports the object's type, so an import back would be a
+  // cycle as well. Type imports are refused too: a type is where a second use
+  // starts. Decided by Claude, owner may revise.
+  //
+  // WHAT IT DOES NOT SEE. A specifier assembled at run time, a path that goes
+  // up and back down some other way (`../agent/../agent/lease`), and a
+  // CommonJS require. Each is a deliberate evasion, not a mistake.
+  {
+    id: "agent-imports-lease",
+    scope: "src/agent/",
+    pattern:
+      /(?:\bfrom\s*|\bimport\s*(?:\(\s*)?)["'`](?:\.\/|\.\.\/agent\/)lease(?:\.[cm]?[jt]s)?["'`]/g,
+    why: "A module under src/agent/ imports src/agent/lease.ts, the Worker-side half of the connection lease. The rules job runs on the person's own object with nobody present, and it must never take the lease itself (AUTO-13): each of its tool calls takes the lease inside the door at /mcp, like any other request, so a lease held by the job would make every one of its own calls answer busy, and the lease is what keeps two connections to the person's iCloud account from opening at once. The object and its jobs are the other side of the lease; only Worker-side code under src/mcp/, src/auth/ and src/recall/ imports it. Reach mail through the job's tool calls. A lease taken from inside the object is a decision on the autonomous layer's boundary, not a refactor: get it, then change this rule, never narrow the pattern.",
   },
 ];
 
