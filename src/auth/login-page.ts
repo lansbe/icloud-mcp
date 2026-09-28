@@ -462,6 +462,51 @@ export const RECALL_NOTICE: SignInNotice = {
 };
 
 /**
+ * The autonomy notice: this server also works on your mail while you are away
+ * (Phase 27, D-30).
+ *
+ * Autonomy is inherent (owner, 2026-09-27). Every sign-in also arms a key the
+ * server can use on its own, and there is no switch. So, like the recall notice
+ * above it, this is the consent, and it must be read before anyone types a
+ * credential. It is shown after the recall notice, in the same block, and only
+ * when autonomy is set up: `signInNotices` in `./login-handler` is the one place
+ * that decides, with the same predicate the arming uses.
+ *
+ * The only copy of these words. The test imports this constant, so an edit
+ * here moves the pin with it, while a stray second copy elsewhere still fails.
+ *
+ * The key has no timer (owner's answers, 2026-09-27), so these lines name none,
+ * and no value is rendered into them. None of them holds a digit.
+ *
+ * PENDING OWNER APPROVAL. These are the draft words from 27-CONTEXT.md, word
+ * for word. The owner approves or edits them in plan 27-06, after reading the
+ * whole notice, and edits this one constant if he wants them changed.
+ */
+export const AUTONOMY_NOTICE: SignInNotice = {
+  heading: "It also works while you are away",
+  lines: [
+    "Signing in also lets this server open your iCloud mail on its own, when you are not there. This is part of signing in, for everyone. There is no separate switch.",
+    "It acts only on rules you write yourself. With no rules, it does nothing with your mail.",
+    "It can only flag a message or put a draft in your Drafts folder. It never sends, deletes or moves mail.",
+    "It lasts as long as your connection to this server. When the connection is removed, it stops too.",
+    "To stop it, delete your app-specific password at account.apple.com, or ask the person who runs this server to remove you.",
+  ],
+};
+
+/**
+ * The hidden field that says the page showed the autonomy notice (D-30).
+ *
+ * `renderForm` puts it inside the form exactly when the notices list holds
+ * `AUTONOMY_NOTICE`, and the sign-in arms the key only when it came back with
+ * `AUTONOMY_NOTICE_VERSION`. So nobody is armed from a page that did not show
+ * the words, such as one opened before autonomy was set up.
+ */
+export const AUTONOMY_NOTICE_FIELD = "autonomy_notice";
+
+/** The version of the autonomy notice the hidden field carries. */
+export const AUTONOMY_NOTICE_VERSION = "1";
+
+/**
  * How many characters of a registered client's name the page will show.
  *
  * Registration is unauthenticated, so the name is an arbitrary attacker-chosen
@@ -822,6 +867,13 @@ export function renderForm(
   const clientName = escapeHtml(truncateForDisplay(identity.name));
   const destination = escapeHtml(displayDestination(identity.redirectUri));
 
+  // The autonomy notice's hidden field, exactly when the list holds that
+  // notice (an identity check on the constant), and nothing at all otherwise,
+  // so a page without it is byte for byte the page before Phase 27.
+  const autonomyField = notices.includes(AUTONOMY_NOTICE)
+    ? `<input type="hidden" name="${AUTONOMY_NOTICE_FIELD}" value="${AUTONOMY_NOTICE_VERSION}">`
+    : "";
+
   const errorRegion = failed
     ? `<div id="${ERROR_REGION_ID}" role="alert" class="error">${lines
         .map((line) => `<p>${copy(line)}</p>`)
@@ -856,7 +908,7 @@ export function renderForm(
   ${renderNotices(notices)}
   ${errorRegion}
   <form method="post" action="/authorize">
-    <input type="hidden" name="oauth_request" value="${escapeHtml(query)}">
+    <input type="hidden" name="oauth_request" value="${escapeHtml(query)}">${autonomyField}
     <label for="apple-id">Apple ID</label>
     <input id="apple-id" name="${APPLE_ID_FIELD}" type="text" autocomplete="username" inputmode="email" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="${describes("apple-id-help")}"${invalid} autofocus required>
     <p class="help" id="apple-id-help">The iCloud Mail address you sign in to Apple with.</p>

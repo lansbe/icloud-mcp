@@ -136,6 +136,9 @@ import type { AllowList } from "./allow-list";
 import { isAllowed, parseAllowList, readStoredAllowList } from "./allow-list";
 import type { SignInNotice } from "./login-page";
 import {
+  AUTONOMY_NOTICE,
+  AUTONOMY_NOTICE_FIELD,
+  AUTONOMY_NOTICE_VERSION,
   RECALL_NOTICE,
   RESPONSE_HEADERS,
   SOURCE_REFUSAL_BODY,
@@ -1144,7 +1147,15 @@ export function refuseUnlistedRedirects(
     const boundedWhole =
       JSON.stringify(clientMetadata).length <= MAX_REGISTRATION_BYTES;
 
-    return allowed && namedSafely && boundedUris && boundedWhole
+    // THE AUTONOMY CLIENT'S NAME IS NOT FOR REGISTRANTS (Phase 27, D-23). The
+    // owner's grant listing shows a grant's client name, and only the fixed
+    // autonomy id may carry this one. A registration naming itself the same,
+    // in any letter case and with any surrounding spaces, is refused.
+    const posingAsAutonomy =
+      typeof name === "string" &&
+      name.trim().toLowerCase() === AUTONOMY_CLIENT_NAME.toLowerCase();
+
+    return allowed && namedSafely && boundedUris && boundedWhole && !posingAsAutonomy
       ? undefined
       : { description: REGISTRATION_REFUSED_DESCRIPTION };
   } catch {
@@ -1386,13 +1397,16 @@ export const loginHandler = createLoginHandler();
  * Called only inside a request, never at module load, per the import-cycle note
  * at the top of `./login-page`: `RECALL_NOTICE` is imported across that cycle.
  *
- * Phase 27 appends its autonomy notice here when autonomy is configured, and
- * renders its hidden field inside the form when that notice is in the list.
- * Nothing else needs to change for it. The recall notice is always first and
- * always present, because recall is inherent: it does not depend on any setting.
+ * Phase 27 appends its autonomy notice here, after the recall notice, when
+ * autonomy is configured, and only then (D-17, D-30). `autonomyConfigured` is
+ * the same predicate the arming uses, and this is the one place the list is
+ * built, so the page and the arming cannot disagree. The page renders the
+ * autonomy notice's hidden field exactly when the notice is in this list. The
+ * recall notice is always first and always present, because recall is
+ * inherent: it does not depend on any setting.
  */
-export function signInNotices(_env: Env): readonly SignInNotice[] {
-  return [RECALL_NOTICE];
+export function signInNotices(env: Env): readonly SignInNotice[] {
+  return autonomyConfigured(env) ? [RECALL_NOTICE, AUTONOMY_NOTICE] : [RECALL_NOTICE];
 }
 
 /**
@@ -1579,6 +1593,7 @@ async function handleAuthorize(
     const submittedAppleId = String(form.get(APPLE_ID_FIELD) ?? "");
     const submittedPassword = String(form.get(APP_PASSWORD_FIELD) ?? "");
     const query = String(form.get("oauth_request") ?? "");
+    const noticeVersion = String(form.get(AUTONOMY_NOTICE_FIELD) ?? "");
 
     // Resolution sits BELOW the flood brake and ABOVE the credential checks,
     // and both edges are deliberate.
@@ -2114,8 +2129,18 @@ async function handleAuthorize(
     // The whole call sits in a `try` whose `catch` reads nothing: a missing
     // client record, a store error, anything, means this sign-in arms nothing
     // and answers exactly as it would have.
+    //
+    // THE NOTICE FIELD (D-30). Arming also needs the hidden field the page
+    // renders only when it shows the autonomy notice, carrying that notice's
+    // version. Nobody is armed from a page that did not show the words, such as
+    // one opened before autonomy was set up, and the field costs nothing to a
+    // person who saw them.
     let autonomyCode: string | null = null;
-    if (ctx !== undefined && autonomyConfigured(env)) {
+    if (
+      ctx !== undefined &&
+      autonomyConfigured(env) &&
+      noticeVersion === AUTONOMY_NOTICE_VERSION
+    ) {
       try {
         const autonomy = await env.OAUTH_PROVIDER.completeAuthorization({
           request: {

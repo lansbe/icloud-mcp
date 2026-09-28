@@ -40,6 +40,7 @@ import { AUTONOMY_CLIENT_ID, AUTONOMY_CLIENT_NAME } from "../src/agent/autonomy-
 import type { UserAgent } from "../src/agent/user-agent";
 import { ALLOW_LIST_KEY } from "../src/auth/allow-list";
 import { createLoginHandler } from "../src/auth/login-handler";
+import { AUTONOMY_NOTICE_FIELD, AUTONOMY_NOTICE_VERSION } from "../src/auth/login-page";
 import { oauthProviderOptions } from "../src/auth/oauth";
 import type { Env } from "../src/env";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
@@ -140,6 +141,8 @@ function postFrom(source: string, appleId: string, query: string): Request {
       apple_id: appleId,
       app_password: FAKE_APP_PASSWORD,
       oauth_request: query,
+      // The field the page renders when it shows the autonomy notice (D-30).
+      [AUTONOMY_NOTICE_FIELD]: AUTONOMY_NOTICE_VERSION,
     }).toString(),
   });
 }

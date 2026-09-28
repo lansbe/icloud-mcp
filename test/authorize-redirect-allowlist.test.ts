@@ -42,19 +42,27 @@
 //   options and substitutes exactly one thing: the proof. The registration, the
 //   provider, the allowlist check and the redirect are all the production ones.
 
+import { getOAuthApi } from "@cloudflare/workers-oauth-provider";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { AUTONOMY_CLIENT_ID } from "../src/agent/autonomy-client";
 import {
   isAllowedRedirectOrigin,
   loginHandler,
   refusedRedirectBody,
 } from "../src/auth/login-handler";
+import { AUTONOMY_NOTICE_FIELD, AUTONOMY_NOTICE_VERSION } from "../src/auth/login-page";
+import { oauthProviderOptions } from "../src/auth/oauth";
 import type { Env } from "../src/env";
+import { userIdOf } from "../src/principal";
+import { AUTONOMY_REDIRECT_URI, installAutonomyClient } from "./fixtures/autonomy-client";
 import { entryEnv } from "./fixtures/bound-secrets";
 import worker, {
   FAKE_APP_PASSWORD,
   LISTED_APPLE_ID,
   UNLISTED_APPLE_ID,
+  loginProofCalls,
+  resetLoginProof,
 } from "./fixtures/worker-with-login-proof";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 
@@ -466,5 +474,72 @@ describe("the observed origins still authorize end to end", () => {
     expect(authorized.headers.get("location") ?? "").toContain(
       `${OTHER_PORT_LOOPBACK_CALLBACK}?code=`,
     );
+  });
+});
+
+describe("a browser cannot drive the autonomy client through /authorize (Phase 27, D-29)", () => {
+  // The autonomy client's one redirect URI is on this server's own origin, and
+  // it is never served. The redirect allow list is NOT widened for it: it
+  // already refuses this origin, so the existing refusal answers. This case
+  // proves that with the client really installed, on both verbs.
+
+  it("refuses GET and POST for the autonomy client with the existing refusal, calls no proof, and mints no grant", async () => {
+    const env = {
+      ...entryEnv(),
+      LOGIN_IP_LIMITER: openLimiter(),
+      LOGIN_ID_LIMITER: openLimiter(),
+    } as unknown as Env;
+    const removeAutonomyClient = await installAutonomyClient(env);
+    const userId = (await userIdOf(LISTED_APPLE_ID)) as string;
+    const helpers = getOAuthApi(oauthProviderOptions, env);
+    const grantIds = async () =>
+      (await helpers.listUserGrants(userId)).items.map((grant) => grant.id).sort();
+    const drive = async (request: Request) => {
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(request, env, ctx);
+      await waitOnExecutionContext(ctx);
+      return response;
+    };
+    try {
+      const before = await grantIds();
+      resetLoginProof();
+      const query = new URLSearchParams({
+        response_type: "code",
+        client_id: AUTONOMY_CLIENT_ID,
+        redirect_uri: AUTONOMY_REDIRECT_URI,
+        state: "xyz",
+      }).toString();
+
+      const got = await drive(get(query));
+      expect(got.status).toBe(403);
+      expect(got.headers.get("location")).toBeNull();
+      const gotBody = await got.text();
+      expect(gotBody).not.toContain(SECRET_FIELD);
+      expect(gotBody).toBe(refusedRedirectBody(ORIGIN));
+
+      const posted = await drive(
+        new Request(`${ORIGIN}/authorize`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            "cf-connecting-ip": "203.0.113.29",
+          },
+          body: new URLSearchParams({
+            apple_id: LISTED_APPLE_ID,
+            app_password: FAKE_APP_PASSWORD,
+            oauth_request: query,
+            [AUTONOMY_NOTICE_FIELD]: AUTONOMY_NOTICE_VERSION,
+          }).toString(),
+        }),
+      );
+      expect(posted.status).toBe(403);
+      expect(posted.headers.get("location")).toBeNull();
+      expect(await posted.text()).toBe(refusedRedirectBody(ORIGIN));
+
+      expect(loginProofCalls()).toBe(0);
+      expect(await grantIds()).toEqual(before);
+    } finally {
+      await removeAutonomyClient();
+    }
   });
 });

@@ -77,6 +77,7 @@ import {
   createLoginHandler,
   refuseUnlistedRedirects,
 } from "../src/auth/login-handler";
+import { AUTONOMY_CLIENT_NAME } from "../src/agent/autonomy-client";
 import { oauthProviderOptions } from "../src/auth/oauth";
 import type { Env } from "../src/env";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
@@ -725,6 +726,55 @@ describe("LIFE-02: a registration off the allowlist is refused at the door", () 
     // cannot vouch for.
     expect(nameOf(7)).toEqual(REGISTRATION_REFUSAL);
     expect(nameOf({ toString: () => "short" })).toEqual(REGISTRATION_REFUSAL);
+  });
+
+  it("refuses a registration named as the autonomy client, in any letter case and with any surrounding spaces (Phase 27, D-23)", () => {
+    // The owner's grant listing shows a grant's client name, and only the fixed
+    // autonomy id may carry this one. The name is compared trimmed and
+    // case-folded, so a registrant cannot pass with a capital or a space.
+    const good = "https://claude.ai/api/mcp/auth_callback";
+    const nameOf = (client_name: unknown) =>
+      refuseUnlistedRedirects(
+        registrationOptions({
+          client_name,
+          redirect_uris: [good],
+          token_endpoint_auth_method: "none",
+        }),
+      );
+
+    for (const posing of [
+      AUTONOMY_CLIENT_NAME,
+      AUTONOMY_CLIENT_NAME.toUpperCase(),
+      AUTONOMY_CLIENT_NAME.toLowerCase(),
+      `  ${AUTONOMY_CLIENT_NAME}  `,
+      `\t${AUTONOMY_CLIENT_NAME}\n`,
+    ]) {
+      expect(nameOf(posing), JSON.stringify(posing)).toEqual(REGISTRATION_REFUSAL);
+    }
+
+    // Near names are ordinary names. The rule is equality, not a prefix match.
+    expect(nameOf(`${AUTONOMY_CLIENT_NAME} 2`)).toBeUndefined();
+    expect(nameOf("iCloud MCP")).toBeUndefined();
+    expect(nameOf("a client")).toBeUndefined();
+  });
+
+  it("refuses the autonomy client's name at the real registration endpoint, and stores nothing", async () => {
+    const puts: string[] = [];
+    const env = allowAllEnv({ OAUTH_KV: recordingKv(puts) });
+    const response = await callWorker(
+      registerRequest({
+        client_name: ` ${AUTONOMY_CLIENT_NAME.toUpperCase()} `,
+        redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+      }),
+      env,
+    );
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error_description?: unknown };
+    expect(body.error_description).toBe(REGISTRATION_REFUSED_DESCRIPTION);
+    expect(puts.filter((key) => key.startsWith("client:"))).toEqual([]);
   });
 
   it("caps the redirect addresses too, which the origin gate does not", () => {

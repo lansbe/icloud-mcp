@@ -59,6 +59,9 @@ import {
 } from "../src/auth/login-handler";
 import {
   APPLE_THROTTLE_BODY,
+  AUTONOMY_NOTICE,
+  AUTONOMY_NOTICE_FIELD,
+  AUTONOMY_NOTICE_VERSION,
   CREDENTIAL_FAILURE_BODY,
   EXPLAINER_SECTIONS,
   RECALL_NOTICE,
@@ -240,9 +243,16 @@ function stubEnv(
     redirectUri?: string;
     kv?: unknown;
     floodRefused?: boolean;
+    /**
+     * The two autonomy secrets (Phase 27). Absent, the env carries neither, so
+     * autonomy is not set up and every case written before Phase 27 sees the
+     * page it always saw.
+     */
+    autonomySecrets?: { AUTONOMY_CLIENT_SECRET?: unknown; AUTONOMY_SEAL_KEY?: unknown };
   } = {},
 ): Env {
   return {
+    ...(options.autonomySecrets ?? {}),
     OAUTH_KV: options.kv ?? quietKv(),
     LOGIN_IP_LIMITER: limiter(options.floodRefused !== true),
     LOGIN_ID_LIMITER: limiter(true),
@@ -1114,6 +1124,169 @@ describe("the recall notice is above the fields, on every render", () => {
 
     expect(plain.length).toBeGreaterThan(0);
     expect(odd).toBe(plain);
+  });
+});
+
+describe("the autonomy notice follows the recall notice, when autonomy is set up (Phase 27, D-30)", () => {
+  // Autonomy is inherent, so this notice is consent too, and it rides in the
+  // same block Phase 26 put on the page, after the recall notice. The words
+  // are pinned by importing AUTONOMY_NOTICE, never by retyping them. Phase
+  // 26's own pins above run unedited: their env carries no autonomy secret.
+
+  /** The pool's two fake autonomy secrets, both set. */
+  function bothSecrets() {
+    return {
+      AUTONOMY_CLIENT_SECRET: entryEnv().AUTONOMY_CLIENT_SECRET,
+      AUTONOMY_SEAL_KEY: entryEnv().AUTONOMY_SEAL_KEY,
+    };
+  }
+
+  /** The hidden field, exactly as the page renders it. */
+  const FIELD = `<input type="hidden" name="${AUTONOMY_NOTICE_FIELD}" value="${AUTONOMY_NOTICE_VERSION}">`;
+
+  /** The notice block, from its opening tag to its closing one. */
+  function noticeBlock(body: string): string {
+    const at = body.indexOf(`<div class="notice">`);
+    expect(at, "no notice block").toBeGreaterThan(-1);
+    return body.slice(at, body.indexOf("</div>", at) + "</div>".length);
+  }
+
+  /** Assert every line of `notice`, in order, from `from` on. Answers where it ended. */
+  function expectLinesInOrder(text: string, notice: { heading: string; lines: readonly string[] }, from = 0): number {
+    let at = text.indexOf(notice.heading, from);
+    expect(at, notice.heading).toBeGreaterThan(-1);
+    at += notice.heading.length;
+    for (const line of notice.lines) {
+      const found = text.indexOf(line, at);
+      expect(found, line).toBeGreaterThan(-1);
+      at = found + line.length;
+    }
+    return at;
+  }
+
+  it("has a heading and lines, none of them holding a digit, and a field with a version", () => {
+    // Not retyped: the owner may edit the words in plan 27-06, and the pins
+    // below follow the constant. Non-empty keeps the cases below non-vacuous.
+    expect(AUTONOMY_NOTICE.heading.length).toBeGreaterThan(0);
+    expect(AUTONOMY_NOTICE.lines.length).toBeGreaterThan(0);
+    expect(AUTONOMY_NOTICE.heading).not.toMatch(/\d/);
+    for (const line of AUTONOMY_NOTICE.lines) expect(line).not.toMatch(/\d/);
+    expect(AUTONOMY_NOTICE_FIELD).toBe("autonomy_notice");
+    expect(AUTONOMY_NOTICE_VERSION).toBe("1");
+  });
+
+  it("builds the list in one place: both notices when autonomy is set up, the recall notice alone when either secret is unset", () => {
+    const configured = signInNotices(stubEnv({ autonomySecrets: bothSecrets() }));
+    expect(configured).toHaveLength(2);
+    expect(configured[0]).toBe(RECALL_NOTICE);
+    expect(configured[1]).toBe(AUTONOMY_NOTICE);
+
+    for (const unset of ["AUTONOMY_CLIENT_SECRET", "AUTONOMY_SEAL_KEY"] as const) {
+      const notices = signInNotices(
+        stubEnv({ autonomySecrets: { ...bothSecrets(), [unset]: undefined } }),
+      );
+      expect(notices, unset).toEqual([RECALL_NOTICE]);
+      expect(notices[0]).toBe(RECALL_NOTICE);
+    }
+    expect(signInNotices(emptyEnv())).toEqual([RECALL_NOTICE]);
+  });
+
+  it("shows the recall notice first, unchanged, then every autonomy line in order, above the fields, and the field inside the form", async () => {
+    const response = await getForm({ autonomySecrets: bothSecrets() });
+    expect(response.status).toBe(200);
+    const body = await response.text();
+
+    const block = noticeBlock(body);
+    expect(block.match(/<section>/g)).toHaveLength(2);
+    const text = textOf(block);
+    const afterRecall = expectLinesInOrder(text, RECALL_NOTICE);
+    expectLinesInOrder(text, AUTONOMY_NOTICE, afterRecall);
+    expect(body.indexOf(`<div class="notice">`)).toBeLessThan(body.indexOf("<form"));
+
+    const formAt = body.indexOf("<form");
+    const formEnd = body.indexOf("</form>");
+    const fieldAt = body.indexOf(FIELD);
+    expect(fieldAt).toBeGreaterThan(formAt);
+    expect(fieldAt).toBeLessThan(formEnd);
+    expect(body.indexOf(FIELD, fieldAt + 1)).toBe(-1);
+  });
+
+  it("renders the field exactly when the list it is handed holds AUTONOMY_NOTICE itself", async () => {
+    const recallOnly = await renderForm(STUB_QUERY, null, STUB_IDENTITY, [RECALL_NOTICE]).text();
+    expect(recallOnly).not.toContain(AUTONOMY_NOTICE_FIELD);
+
+    const both = await renderForm(STUB_QUERY, null, STUB_IDENTITY, [
+      RECALL_NOTICE,
+      AUTONOMY_NOTICE,
+    ]).text();
+    expect(both).toContain(FIELD);
+
+    // An identity check, not a match on the words: a copy of the constant
+    // shows the words and carries no field.
+    const copyOfIt = { heading: AUTONOMY_NOTICE.heading, lines: [...AUTONOMY_NOTICE.lines] };
+    const copied = await renderForm(STUB_QUERY, null, STUB_IDENTITY, [RECALL_NOTICE, copyOfIt]).text();
+    expect(copied).not.toContain(AUTONOMY_NOTICE_FIELD);
+  });
+
+  it("shows both notices and the field again on the re-render after a credential failure", async () => {
+    const proof = async (): Promise<void> => {
+      throw new Error("an unlisted address must not reach the proof");
+    };
+    const response = await createLoginHandler(proof, 10).fetch(
+      new Request(`${ORIGIN}/authorize`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          "cf-connecting-ip": "203.0.113.230",
+        },
+        body: new URLSearchParams({
+          apple_id: TYPED_APPLE_ID,
+          app_password: TYPED_PASSWORD,
+          oauth_request: STUB_QUERY,
+          [AUTONOMY_NOTICE_FIELD]: AUTONOMY_NOTICE_VERSION,
+        }).toString(),
+      }),
+      stubEnv({ autonomySecrets: bothSecrets() }),
+    );
+    const body = await response.text();
+    expect(response.status).toBe(401);
+    expect(textOf(body)).toContain(CREDENTIAL_FAILURE_BODY[0]);
+    const text = textOf(noticeBlock(body));
+    expectLinesInOrder(text, AUTONOMY_NOTICE, expectLinesInOrder(text, RECALL_NOTICE));
+    expect(body.indexOf(`<div class="notice">`)).toBeLessThan(body.indexOf(`id="login-error"`));
+    expect(body).toContain(FIELD);
+  });
+
+  it("with either secret unset, serves Phase 26's page byte for byte: no autonomy lines and no field", async () => {
+    const configured = await (await getForm({ autonomySecrets: bothSecrets() })).text();
+    const autonomySection = `<section><h2>${AUTONOMY_NOTICE.heading}</h2>`;
+    expect(configured).toContain(autonomySection);
+
+    // The configured page with exactly the autonomy section and the field taken
+    // out. Everything else on the page is shared, so this is Phase 26's page.
+    const sectionAt = configured.indexOf(autonomySection);
+    const sectionEnd = configured.indexOf("</section>", sectionAt) + "</section>".length;
+    const phase26 = (configured.slice(0, sectionAt) + configured.slice(sectionEnd)).replace(FIELD, "");
+    expect(phase26).not.toContain(AUTONOMY_NOTICE_FIELD);
+    expect(phase26).toBe(await renderForm(STUB_QUERY, null, STUB_IDENTITY, [RECALL_NOTICE]).text());
+
+    for (const unset of ["AUTONOMY_CLIENT_SECRET", "AUTONOMY_SEAL_KEY"] as const) {
+      const page = await (
+        await getForm({ autonomySecrets: { ...bothSecrets(), [unset]: undefined } })
+      ).text();
+      expect(page, unset).toBe(phase26);
+    }
+    expect(await (await getForm()).text()).toBe(phase26);
+  });
+
+  it("leaves the explainer sections exactly as they were", async () => {
+    const withAutonomy = await (await getForm({ autonomySecrets: bothSecrets() })).text();
+    const without = await (await getForm()).text();
+    const explainer = (body: string) => body.slice(body.indexOf(`<div class="explainer">`));
+    expect(explainer(withAutonomy)).toBe(explainer(without));
+    for (const section of EXPLAINER_SECTIONS) {
+      expect(textOf(explainer(withAutonomy))).toContain(section.heading);
+    }
   });
 });
 

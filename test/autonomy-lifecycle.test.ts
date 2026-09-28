@@ -61,6 +61,7 @@ import {
 import { UserAgent as UserAgentClass } from "../src/agent/user-agent";
 import type { UserAgent } from "../src/agent/user-agent";
 import { oauthProviderOptions } from "../src/auth/oauth";
+import { AUTONOMY_NOTICE_FIELD, AUTONOMY_NOTICE_VERSION } from "../src/auth/login-page";
 import type { Env } from "../src/env";
 import { createSessionGate } from "../src/mail/service";
 import { connectImap } from "../src/mail/socket";
@@ -179,6 +180,8 @@ function postFrom(source: string, appleId: string, query: string): Request {
       apple_id: appleId,
       app_password: FAKE_APP_PASSWORD,
       oauth_request: query,
+      // The field the page renders when it shows the autonomy notice (D-30).
+      [AUTONOMY_NOTICE_FIELD]: AUTONOMY_NOTICE_VERSION,
     }).toString(),
   });
 }
@@ -1184,4 +1187,52 @@ describe("autonomy credential: one at a time (D-27, RESEARCH §7)", () => {
       await world.cleanup();
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// Task 3: the notice field is a condition of arming.
+
+describe("autonomy credential: nobody is armed from a page that did not show the notice (D-30)", () => {
+  /** A sign-in POST whose notice field is `field`, or absent when null. */
+  function postWithField(query: string, field: string | null): Request {
+    const form: Record<string, string> = {
+      apple_id: LISTED_APPLE_ID,
+      app_password: FAKE_APP_PASSWORD,
+      oauth_request: query,
+    };
+    if (field !== null) form[AUTONOMY_NOTICE_FIELD] = field;
+    return new Request(`${ORIGIN}/authorize`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        "cf-connecting-ip": freshSource(),
+      },
+      body: new URLSearchParams(form).toString(),
+    });
+  }
+
+  for (const [label, field, armed] of [
+    ["carried no field", null, 0],
+    ["carried a different value", "0", 0],
+    ["carried an empty value", "", 0],
+    ["carried the field", AUTONOMY_NOTICE_VERSION, 1],
+  ] as const) {
+    it(`a POST that ${label} answers the same 302 and mints ${armed} autonomy grant(s)`, async () => {
+      const world = await setUp(`lifecycle notice field ${label}`);
+      try {
+        const query = authorizeQuery(world.clientId, CLAUDE_WEB_REDIRECT, "notice-field");
+        const ctx = createExecutionContext();
+        const answer = await worker.fetch(postWithField(query, field), world.env, ctx);
+        await waitOnExecutionContext(ctx);
+        expectOrdinaryAnswer(
+          { status: answer.status, location: answer.headers.get("location") ?? "" },
+          world.userId,
+        );
+        expect(await autonomyGrantIds(world.userId)).toHaveLength(armed);
+        expect((await storedRecord(world.userId)) !== undefined).toBe(armed === 1);
+      } finally {
+        await world.cleanup();
+      }
+    });
+  }
 });
