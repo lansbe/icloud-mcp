@@ -236,6 +236,17 @@ function rowOf(value: unknown): EnvelopeRow | null {
 }
 
 /**
+ * What names one message across a move (28-REVIEW WR-03): iCloud's receipt
+ * time, the From address without case, and the subject, as one string. The
+ * job hashes it into the "already acted" key, so a message moved out of the
+ * inbox and back, which gets a new id, is still known as the one already acted
+ * on. It is never sent anywhere and never becomes a recipient.
+ */
+export function messageIdentity(row: EnvelopeRow): string {
+  return JSON.stringify([row.receivedAt, row.senderAddress?.toLowerCase() ?? null, row.subject]);
+}
+
+/**
  * Read a change-check answer (C-08).
  *
  * One text part holding `{ refusal, overall }` is a refusal: the marker was not

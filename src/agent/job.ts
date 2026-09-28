@@ -109,6 +109,7 @@ import { type StatusStore, writeAutonomyStatus } from "./status";
 import type { ActionOutcome, CallAnswer, CallFn, EnvelopeRow, RunOutcome } from "./tool-call";
 import {
   isErrorAnswer,
+  messageIdentity,
   readChangesAnswer,
   readCredentialRefused,
   readSignedInAs,
@@ -269,11 +270,26 @@ async function sha256Hex(text: string): Promise<string> {
 
 /**
  * The key of the "already acted" record for one rule, one action and one
- * message (D-15). The message id is hashed, so no mailbox name sits in a key
- * and every key has the same length.
+ * message (D-15).
+ *
+ * The message is named by what survives a move: iCloud's receipt time, the
+ * From address (without case) and the subject, through `messageIdentity` in
+ * `./tool-reply.ts`, the module that reads a row's fields (28-REVIEW WR-03). Not by its
+ * id, because the id names the message's PLACE: moving a message to another
+ * folder and back gives it a new id above the stored marker, so the change
+ * check lists it as new mail, and a key on the id let the job flag it again
+ * (a flag the user cleared came back) and place a second reply. The receipt
+ * time is iCloud's, not the sender's, so two different messages share a key
+ * only when the same sender sent the same subject within the same second; then
+ * the second is not acted on, which is the safe direction (a missed draft
+ * beats two). The three values are hashed, so no address or subject sits in a
+ * key and every key has the same length.
+ *
+ * Not the Message-ID header: the change check's rows do not carry it, a header
+ * fetch change is a read-path decision, and a stranger chooses it.
  */
-export async function actedKey(ruleId: string, action: "flag" | "draft", messageId: string): Promise<string> {
-  return `${ACTED}${ruleId}:${action}:${await sha256Hex(messageId)}`;
+export async function actedKey(ruleId: string, action: "flag" | "draft", row: EnvelopeRow): Promise<string> {
+  return `${ACTED}${ruleId}:${action}:${await sha256Hex(messageIdentity(row))}`;
 }
 
 /** Outcomes that mean the account could not be reached: the run stops. */
@@ -510,7 +526,7 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
         const rule = rules[verdict.rule];
         const row = reading.rows[verdict.row];
         if (rule === undefined || row === undefined) continue;
-        verdicts.push({ rule, row, action: verdict.action, key: await actedKey(rule.id, verdict.action, row.id) });
+        verdicts.push({ rule, row, action: verdict.action, key: await actedKey(rule.id, verdict.action, row) });
       }
 
       // The account's own address, read once, before any action, and only in a

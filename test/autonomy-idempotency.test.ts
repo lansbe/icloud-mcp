@@ -194,6 +194,39 @@ describe("a busy or refused sign-in is tried again on the next run (28-REVIEW WR
   });
 });
 
+// ==================== a message moved out and back is the same message (WR-03)
+
+describe("a message moved out of the inbox and back is not acted on again (28-REVIEW WR-03)", () => {
+  // Moving a message to another folder and back gives it a new place and a new
+  // UID above the stored one, so the change check lists it as new mail. Its
+  // receipt time, sender and subject do not change.
+  const original = newRow(1, { receivedAt: "27-Sep-2026 18:00:05 +0000", subject: "About the role" });
+  const movedBack = newRow(1, { id: "INBOX-msg-moved-back", uid: 6001, receivedAt: "27-Sep-2026 18:00:05 +0000" });
+
+  for (const [what, then, tool] of [
+    ["the flag the user cleared", FLAG, "mail_flag"],
+    ["a second reply", DRAFT, "mail_compose_reply"],
+  ] as const) {
+    it(`${what} does not come back`, async () => {
+      const storage = armedStorage([rule("r1", then)]);
+      const first = await directRun(storage, { rows: [original] });
+      expect(actions(first.calls).map((call) => call.tool)).toEqual([tool]);
+
+      const second = await directRun(storage, { rows: [movedBack], now: T0 + 15 * MIN });
+      expect(actions(second.calls)).toEqual([]);
+      expect(second.outcome).toBe("done");
+    });
+  }
+
+  it("a different message from the same sender with the same subject, received at another time, is acted on", async () => {
+    const storage = armedStorage([rule("r1", FLAG)]);
+    await directRun(storage, { rows: [original] });
+    const later = newRow(2, { receivedAt: "27-Sep-2026 18:07:00 +0000", fromAddress: original.fromAddress });
+    const second = await directRun(storage, { rows: [later], now: T0 + 15 * MIN });
+    expect(actions(second.calls).map((call) => call.tool)).toEqual(["mail_flag"]);
+  });
+});
+
 // ============================================== the owner's record (AUTO-15)
 
 /** The one status write a run made, parsed. */
