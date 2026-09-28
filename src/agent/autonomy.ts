@@ -1,0 +1,649 @@
+// The autonomy key, inside the person's own Durable Object (Phase 27).
+//
+// Autonomy is inherent (owner, 2026-09-27). Every interactive sign-in also
+// mints a second grant, for the autonomy client, and hands its one-time code to
+// the person's object. The object exchanges the code here, seals the refresh
+// token and keeps it under one key, `autonomy`. So every person who has signed
+// in since autonomy was set up, and is still connected, has one sealed record
+// here. The long-lived token is born inside the object and never exists in the
+// sign-in's memory.
+//
+// WHAT THE KEY IS. The refresh token of the autonomy grant. It opens that one
+// grant and nothing else. It is sealed with AES-GCM under a Worker secret, and
+// the seal is tied to the person's user id, so a record copied into another
+// person's object does not open there. Reading every store this server has
+// opens nothing, because the seal key is in no store.
+//
+// NO TIMER OF ITS OWN (D-33, owner's answers of 2026-09-27). The key lives
+// exactly as long as the person's ordinary connection. The record carries no
+// expiry, the grant carries none, and no code here sets one. Plan 27-02 adds
+// the check that ends the key with the ordinary connection.
+//
+// THE ORDER OF A SESSION, and why. `withAutonomySession` is the one way to use
+// the key (D-31). It asks the allow list FIRST, by user id, from the seed and
+// then the store, before the record is read at all (AUTO-05). A person who is
+// not admitted is refused, and the record is KEPT: the store reader turns a
+// store error into "nobody", so a refusal cannot tell a removal from a blip,
+// and deleting on a blip would end every person's key at once. Only then is
+// the record read, unsealed and redeemed once at this Worker's own token
+// endpoint. What the session hands its caller is a function that calls one
+// tool at this Worker's own `/mcp`. The bearer is never handed out.
+//
+// NOTHING SECRET LEAVES THIS MODULE. No function returns a token or a bearer.
+// No token is stored unsealed. Outcomes are small fixed shapes, and the grant
+// id is the most any of them carries.
+//
+// WHAT THIS MODULE NEVER DOES. It never reads a grant's props. It never calls
+// the OAuth library's token-unwrapping helper, which hands back decrypted
+// props. It never touches the password, never builds a principal, and never
+// writes to the sign-in store except through the token endpoint, which is the
+// library's own code. It reaches this Worker only through the fetch seam its
+// caller hands in, at URLs built from the deployed hostname and exact paths
+// (SPIKE-08). It never reads the platform's name for the object and never takes
+// a name from a caller: the name is the one the object stored for itself (Phase
+// 25, D-22).
+//
+// Every `catch` below answers a fixed outcome and never reads what it caught.
+// This module logs nothing (./.claude/CLAUDE.md §4).
+
+import { parseAllowList, readStoredAllowList, type AllowList } from "../auth/allow-list";
+import { isConfiguredSecret } from "../configured-secret";
+import { DEPLOYED_HOSTNAME } from "../deployed-hostname.generated";
+import type { Env } from "../env";
+import { userIdOf } from "../principal";
+import {
+  AUTONOMY_CLIENT_ID,
+  AUTONOMY_REDIRECT_PATH,
+  AUTONOMY_TOOLS,
+} from "./autonomy-client";
+
+/** The object's key-value key for the one autonomy record. */
+export const AUTONOMY_KEY = "autonomy";
+
+/** The version tag on the seal's additional data. Bumping it opens nothing old. */
+const SEAL_AAD_PREFIX = "autonomy:v1:";
+
+/** AES-GCM key length the seal key must decode to, in bytes (256 bits). */
+const SEAL_KEY_BYTES = 32;
+
+/** AES-GCM IV length, in bytes (96 bits), fresh for every seal. */
+const SEAL_IV_BYTES = 12;
+
+/** This Worker's token endpoint, built from the deployed hostname (SPIKE-08). */
+const TOKEN_URL = `https://${DEPLOYED_HOSTNAME}/oauth/token`;
+
+/** This Worker's MCP endpoint. Exactly `/mcp`: a longer path is a 404 (SPIKE-08). */
+const MCP_URL = `https://${DEPLOYED_HOSTNAME}/mcp`;
+
+/** The autonomy client's one redirect URI, never served (D-29). */
+const AUTONOMY_REDIRECT_URI = `https://${DEPLOYED_HOSTNAME}${AUTONOMY_REDIRECT_PATH}`;
+
+/** The MCP protocol version the tool call is made under, as the door expects. */
+const MCP_PROTOCOL_VERSION = "2026-07-28";
+
+/**
+ * The one stored record (D-10, as revised 2026-09-27).
+ *
+ * No address, no password, no plaintext token and no expiry. Times are in
+ * seconds. `generation` starts at 1 and each arming writes one more than the
+ * record it replaced, so a later write can tell whether the record it read is
+ * still the one stored (plan 27-02 uses it).
+ */
+export interface AutonomyRecord {
+  readonly v: 1;
+  readonly grantId: string;
+  readonly sealedRefreshToken: string;
+  readonly iv: string;
+  readonly armedAt: number;
+  readonly generation: number;
+}
+
+/** The object's synchronous key-value storage, as much of it as this module uses. */
+export interface AutonomyStorage {
+  get<T = unknown>(key: string): T | undefined;
+  put<T>(key: string, value: T): void;
+  delete(key: string): boolean;
+}
+
+/** The bindings this module reads. Nothing holding them is ever returned. */
+export type AutonomyEnv = Pick<
+  Env,
+  "ALLOWED_APPLE_IDS_SEED" | "ALLOW_LIST_KV" | "AUTONOMY_CLIENT_SECRET" | "AUTONOMY_SEAL_KEY"
+>;
+
+/**
+ * Everything a session or an arming needs, handed in by the object.
+ *
+ * `name` is the object's own stored name, which is the person's user id:
+ * `rememberOwnName()` in an RPC method, `storedOwnName()` in the alarm.
+ * `selfFetch` is the object's one seam to this Worker. `now` answers
+ * milliseconds since the epoch.
+ */
+export interface AutonomyDeps {
+  readonly storage: AutonomyStorage;
+  readonly name: string;
+  readonly env: AutonomyEnv;
+  readonly selfFetch: (request: Request) => Promise<Response>;
+  readonly now: () => number;
+}
+
+/** What one tool call through the key answers. Never the bearer. */
+export type AutonomyCallOutcome = { kind: "ok"; result: unknown } | { kind: "failed" };
+
+/** The one function a session hands its caller. */
+export type AutonomyCall = (
+  tool: string,
+  args: Record<string, unknown>,
+) => Promise<AutonomyCallOutcome>;
+
+/**
+ * What a session answers. Exactly these five kinds, and no expiry kind: the key
+ * has no timer (D-15 as revised).
+ */
+export type AutonomySessionOutcome<T> =
+  | { kind: "ok"; value: T }
+  | { kind: "not_allowed" }
+  | { kind: "off" }
+  | { kind: "revoked" }
+  | { kind: "failed" };
+
+/** What an arming answers. The grant id is the most it ever carries. */
+export type ArmOutcome = { kind: "armed"; grantId: string } | { kind: "not_armed" };
+
+// ------------------------------------------------------------------ the seal
+
+/** Bytes from base64url with no padding, or null for anything else. */
+function bytesFromBase64Url(value: string): Uint8Array | null {
+  if (!/^[A-Za-z0-9_-]*$/.test(value)) return null;
+  const padded =
+    value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (value.length % 4)) % 4);
+  try {
+    const binary = atob(padded);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+/** Base64url with no padding. */
+function base64UrlFromBytes(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * The seal key as a non-extractable AES-GCM key, or null.
+ *
+ * Refuses a key that does not decode to exactly 32 bytes. A short key would
+ * still import as AES-128 or AES-192 and seal quietly with less than D-06
+ * promises, so the length is checked here rather than trusted.
+ */
+async function sealKeyFrom(sealKey: unknown): Promise<CryptoKey | null> {
+  if (!isConfiguredSecret(sealKey)) return null;
+  const raw = bytesFromBase64Url(sealKey);
+  if (raw === null || raw.length !== SEAL_KEY_BYTES) return null;
+  try {
+    return await crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, [
+      "encrypt",
+      "decrypt",
+    ]);
+  } catch {
+    return null;
+  }
+}
+
+/** The additional data that binds a sealed value to one person. */
+function sealAad(userId: string): Uint8Array {
+  return new TextEncoder().encode(`${SEAL_AAD_PREFIX}${userId}`);
+}
+
+/**
+ * Seal a refresh token for one person (D-06).
+ *
+ * AES-GCM 256 under the seal key, a fresh 12-byte IV per call, and the
+ * additional data `autonomy:v1:<userId>`, so the result opens only in that
+ * person's object. Null when the key is unusable or the platform refuses.
+ */
+export async function seal(
+  sealKey: unknown,
+  userId: string,
+  autonomyRefreshToken: string,
+): Promise<{ sealedRefreshToken: string; iv: string } | null> {
+  const key = await sealKeyFrom(sealKey);
+  if (key === null) return null;
+  const iv = crypto.getRandomValues(new Uint8Array(SEAL_IV_BYTES));
+  try {
+    const sealed = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv, additionalData: sealAad(userId) },
+      key,
+      new TextEncoder().encode(autonomyRefreshToken),
+    );
+    return {
+      sealedRefreshToken: base64UrlFromBytes(new Uint8Array(sealed)),
+      iv: base64UrlFromBytes(iv),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Open a sealed refresh token, or null.
+ *
+ * Every way this can fail is the same one outcome: a wrong key, another
+ * person's additional data, a changed byte, a malformed field. Nothing is
+ * thrown to the caller.
+ */
+export async function unseal(
+  sealKey: unknown,
+  userId: string,
+  sealed: { sealedRefreshToken: string; iv: string },
+): Promise<string | null> {
+  const key = await sealKeyFrom(sealKey);
+  if (key === null) return null;
+  const iv = bytesFromBase64Url(sealed.iv);
+  const data = bytesFromBase64Url(sealed.sealedRefreshToken);
+  if (iv === null || iv.length !== SEAL_IV_BYTES || data === null) return null;
+  try {
+    const opened = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv, additionalData: sealAad(userId) },
+      key,
+      data,
+    );
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(opened);
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------- the record
+
+/** `value` as a record, or null when it is not exactly one. */
+export function recordOf(value: unknown): AutonomyRecord | null {
+  if (typeof value !== "object" || value === null) return null;
+  const r = value as Partial<Record<keyof AutonomyRecord, unknown>>;
+  if (r.v !== 1) return null;
+  if (typeof r.grantId !== "string" || r.grantId.length === 0) return null;
+  if (typeof r.sealedRefreshToken !== "string" || typeof r.iv !== "string") return null;
+  if (typeof r.armedAt !== "number" || !Number.isFinite(r.armedAt)) return null;
+  if (typeof r.generation !== "number" || !Number.isSafeInteger(r.generation)) return null;
+  if (r.generation < 1) return null;
+  return {
+    v: 1,
+    grantId: r.grantId,
+    sealedRefreshToken: r.sealedRefreshToken,
+    iv: r.iv,
+    armedAt: r.armedAt,
+    generation: r.generation,
+  };
+}
+
+// ------------------------------------------------------ the token endpoint
+
+/**
+ * A request to this Worker's token endpoint, as the autonomy client (D-07).
+ *
+ * Form-encoded, with `client_secret_basic`: the id and the secret are each
+ * form-encoded, joined with a colon, then base64, as RFC 6749 §2.3.1 says and
+ * as the library decodes them.
+ */
+function tokenRequest(clientSecret: string, fields: Record<string, string>): Request {
+  const basic = btoa(
+    `${encodeURIComponent(AUTONOMY_CLIENT_ID)}:${encodeURIComponent(clientSecret)}`,
+  );
+  return new Request(TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      authorization: `Basic ${basic}`,
+    },
+    body: new URLSearchParams(fields).toString(),
+  });
+}
+
+/**
+ * What the token endpoint answered, read once.
+ *
+ * `final` is `invalid_grant` or `invalid_client`: the grant, the token or the
+ * client is gone, and no retry can bring it back. `failed` is everything else
+ * that is not a success. `ok` carries the parsed body, which holds tokens, so
+ * a caller takes what it needs out of it at once and keeps nothing else.
+ */
+async function readTokenAnswer(
+  response: Response,
+): Promise<{ kind: "ok"; body: Record<string, unknown> } | { kind: "final" } | { kind: "failed" }> {
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return { kind: "failed" };
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return { kind: "failed" };
+  const parsed = body as Record<string, unknown>;
+  if (response.ok) return { kind: "ok", body: parsed };
+  if (parsed.error === "invalid_grant" || parsed.error === "invalid_client") return { kind: "final" };
+  return { kind: "failed" };
+}
+
+/**
+ * Revoke one autonomy refresh token at the token endpoint, which revokes its
+ * whole grant. Never throws. The endpoint always answers 200 (RFC 7009), so the
+ * answer says nothing and is only drained.
+ */
+async function revokeAtEndpoint(
+  deps: AutonomyDeps,
+  clientSecret: string,
+  autonomyRefreshToken: string,
+): Promise<void> {
+  try {
+    const response = await deps.selfFetch(
+      tokenRequest(clientSecret, { token: autonomyRefreshToken, token_type_hint: "refresh_token" }),
+    );
+    await response.arrayBuffer();
+  } catch {
+    // Nothing to do. The sign-in also revokes the grant it minted when the
+    // arm did not report it armed.
+  }
+}
+
+// ------------------------------------------------------------ the allow list
+
+/** Whether `list` admits the person whose user id is `name`. Serial, never a combinator. */
+async function listAdmits(list: AllowList, name: string): Promise<boolean> {
+  if (list.kind === "everybody") return true;
+  if (list.kind === "nobody") return false;
+  for (const address of list.addresses) {
+    if ((await userIdOf(address)) === name) return true;
+  }
+  return false;
+}
+
+/**
+ * The allow-list verdict for the object's own user id: the seed first, then
+ * the store, and either admitting is enough, the same rule the sign-in page
+ * uses. The store is not read when the seed already admits.
+ */
+async function admitted(deps: AutonomyDeps): Promise<boolean> {
+  if (await listAdmits(parseAllowList(deps.env.ALLOWED_APPLE_IDS_SEED), deps.name)) return true;
+  return listAdmits(await readStoredAllowList(deps.env.ALLOW_LIST_KV), deps.name);
+}
+
+// -------------------------------------------------------------- the session
+
+/** The JSON-RPC message with id `id` in an MCP answer, on either lane, or null. */
+function rpcMessageWithId(bodyText: string, id: number): Record<string, unknown> | null {
+  const trimmed = bodyText.trim();
+  const candidates = trimmed.startsWith("{")
+    ? [trimmed]
+    : trimmed
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice("data:".length).trim());
+  for (const candidate of candidates) {
+    try {
+      const parsed: unknown = JSON.parse(candidate);
+      if (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        !Array.isArray(parsed) &&
+        (parsed as { id?: unknown }).id === id
+      ) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Not this line. Try the next one.
+    }
+  }
+  return null;
+}
+
+/**
+ * Use the autonomy key once (D-15, D-31). The one way to use it.
+ *
+ * In this order and no other:
+ *   1. The allow list, seed then store, by the object's own user id. Not
+ *      admitted answers `not_allowed`: the record is not read and not touched.
+ *   2. Both autonomy secrets must be set. Not set answers `failed` and keeps
+ *      the record: an unset secret is a server fault, not a revocation.
+ *   3. The record. Absent answers `off`. Malformed is deleted, `off`.
+ *   4. Unseal. Any failure deletes the record, `off`.
+ *   5. One refresh at the token endpoint. `invalid_grant` or `invalid_client`
+ *      deletes the record, `revoked`, with no retry. Anything else that is not
+ *      a success answers `failed` and keeps the record.
+ *   6. The rotated token is sealed and written at once, before the access
+ *      token is used for anything. The seal itself is the one `await` between
+ *      the parsed answer and the write, because the platform's cipher has no
+ *      synchronous form.
+ *   7. `use` is handed one function, `call(tool, args)`. It refuses any tool
+ *      not in `AUTONOMY_TOOLS` without making a request, and stops working
+ *      once `use` has returned.
+ *
+ * The bearer lives in one variable, `autonomyAccessToken`, inside this
+ * function. It is never returned, stored, or handed to `use`.
+ */
+export async function withAutonomySession<T>(
+  deps: AutonomyDeps,
+  use: (call: AutonomyCall) => Promise<T>,
+): Promise<AutonomySessionOutcome<T>> {
+  try {
+    if (!(await admitted(deps))) return { kind: "not_allowed" };
+
+    const clientSecret = deps.env.AUTONOMY_CLIENT_SECRET;
+    const sealKey = deps.env.AUTONOMY_SEAL_KEY;
+    if (!isConfiguredSecret(clientSecret) || !isConfiguredSecret(sealKey)) {
+      return { kind: "failed" };
+    }
+
+    const stored = deps.storage.get<unknown>(AUTONOMY_KEY);
+    if (stored === undefined) return { kind: "off" };
+    const record = recordOf(stored);
+    if (record === null) {
+      deps.storage.delete(AUTONOMY_KEY);
+      return { kind: "off" };
+    }
+
+    // 27-02: D-33's standing check goes here, after the record is read and before it is unsealed.
+
+    const autonomyRefreshToken = await unseal(sealKey, deps.name, record);
+    if (autonomyRefreshToken === null) {
+      deps.storage.delete(AUTONOMY_KEY);
+      return { kind: "off" };
+    }
+
+    // 27-02: D-27's one-at-a-time queue wraps everything from the refresh to the end of `use`.
+
+    let answer: Awaited<ReturnType<typeof readTokenAnswer>>;
+    try {
+      const response = await deps.selfFetch(
+        tokenRequest(clientSecret, {
+          grant_type: "refresh_token",
+          refresh_token: autonomyRefreshToken,
+        }),
+      );
+      answer = await readTokenAnswer(response);
+    } catch {
+      return { kind: "failed" };
+    }
+    if (answer.kind === "final") {
+      deps.storage.delete(AUTONOMY_KEY);
+      return { kind: "revoked" };
+    }
+    if (answer.kind !== "ok") return { kind: "failed" };
+
+    const autonomyAccessToken = answer.body.access_token;
+    const rotated = answer.body.refresh_token;
+    if (typeof autonomyAccessToken !== "string" || typeof rotated !== "string") {
+      return { kind: "failed" };
+    }
+
+    const resealed = await seal(sealKey, deps.name, rotated);
+    if (resealed === null) return { kind: "failed" };
+    // 27-02: the generation compare goes here: write only if the record still has the generation read above.
+    deps.storage.put<AutonomyRecord>(AUTONOMY_KEY, {
+      ...record,
+      sealedRefreshToken: resealed.sealedRefreshToken,
+      iv: resealed.iv,
+    });
+
+    let open = true;
+    let nextId = 1;
+    const call: AutonomyCall = async (tool, args) => {
+      if (!open || !AUTONOMY_TOOLS.includes(tool)) return { kind: "failed" };
+      const id = nextId;
+      nextId += 1;
+      try {
+        const response = await deps.selfFetch(
+          new Request(MCP_URL, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              accept: "application/json, text/event-stream",
+              host: DEPLOYED_HOSTNAME,
+              "Mcp-Method": "tools/call",
+              "Mcp-Name": tool,
+              authorization: `Bearer ${autonomyAccessToken}`,
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              method: "tools/call",
+              params: {
+                name: tool,
+                arguments: args,
+                _meta: {
+                  "io.modelcontextprotocol/protocolVersion": MCP_PROTOCOL_VERSION,
+                  "io.modelcontextprotocol/clientCapabilities": {},
+                },
+              },
+            }),
+          }),
+        );
+        const text = await response.text();
+        if (!response.ok) return { kind: "failed" };
+        const message = rpcMessageWithId(text, id);
+        if (message === null || !("result" in message)) return { kind: "failed" };
+        const result = message.result;
+        if (typeof result === "object" && result !== null && (result as { isError?: unknown }).isError === true) {
+          return { kind: "failed" };
+        }
+        return { kind: "ok", result };
+      } catch {
+        return { kind: "failed" };
+      }
+    };
+
+    try {
+      const value = await use(call);
+      return { kind: "ok", value };
+    } finally {
+      open = false;
+    }
+  } catch {
+    return { kind: "failed" };
+  }
+}
+
+// ---------------------------------------------------------------- arming
+
+/**
+ * Whether an `account_whoami` answer names the person whose user id is `name`.
+ * The address is used for this comparison and nothing else.
+ */
+async function answersAs(result: unknown, name: string): Promise<boolean> {
+  try {
+    const content = (result as { content?: unknown }).content;
+    if (!Array.isArray(content)) return false;
+    const text = (content[0] as { text?: unknown } | undefined)?.text;
+    if (typeof text !== "string") return false;
+    const signedInAs = (JSON.parse(text) as { signedInAs?: unknown }).signedInAs;
+    if (typeof signedInAs !== "string") return false;
+    return (await userIdOf(signedInAs)) === name;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Arm the key from a one-time code (D-09, D-10, D-11).
+ *
+ * Refuses (`not_armed`) unless both autonomy secrets are set and the code's
+ * user segment is the object's own name, so a wiring mistake refuses rather
+ * than arming the wrong person's object. Then: exchange the code at this
+ * Worker's token endpoint; take the grant id from the refresh token; seal it;
+ * write the record, with `generation` one more than any record it replaces;
+ * and prove it, with one session that calls `account_whoami` and checks the
+ * answer is this person.
+ *
+ * Fails toward off (D-11): on any failure after the exchange, the new token is
+ * revoked at the endpoint and the record is deleted, including a record an
+ * earlier sign-in left. Plan 27-02 adds the sweep of other autonomy grants.
+ */
+export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutcome> {
+  const clientSecret = deps.env.AUTONOMY_CLIENT_SECRET;
+  const sealKey = deps.env.AUTONOMY_SEAL_KEY;
+  if (!isConfiguredSecret(clientSecret) || !isConfiguredSecret(sealKey)) {
+    return { kind: "not_armed" };
+  }
+  const codeParts = code.split(":");
+  if (codeParts.length !== 3 || typeof deps.name !== "string" || codeParts[0] !== deps.name) {
+    return { kind: "not_armed" };
+  }
+
+  let answer: Awaited<ReturnType<typeof readTokenAnswer>>;
+  try {
+    const response = await deps.selfFetch(
+      tokenRequest(clientSecret, {
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: AUTONOMY_REDIRECT_URI,
+      }),
+    );
+    answer = await readTokenAnswer(response);
+  } catch {
+    return { kind: "not_armed" };
+  }
+  if (answer.kind !== "ok") return { kind: "not_armed" };
+  const autonomyRefreshToken = answer.body.refresh_token;
+  if (typeof autonomyRefreshToken !== "string") return { kind: "not_armed" };
+
+  // From here on a token exists, so every failure revokes it and deletes the record.
+  const fail = async (): Promise<ArmOutcome> => {
+    deps.storage.delete(AUTONOMY_KEY);
+    await revokeAtEndpoint(deps, clientSecret, autonomyRefreshToken);
+    return { kind: "not_armed" };
+  };
+
+  try {
+    const tokenParts = autonomyRefreshToken.split(":");
+    const grantId = tokenParts[1];
+    if (tokenParts.length !== 3 || tokenParts[0] !== deps.name || grantId !== codeParts[1]) {
+      return await fail();
+    }
+    if (grantId === undefined || grantId.length === 0) return await fail();
+
+    const sealed = await seal(sealKey, deps.name, autonomyRefreshToken);
+    if (sealed === null) return await fail();
+
+    const previous = recordOf(deps.storage.get<unknown>(AUTONOMY_KEY));
+    deps.storage.put<AutonomyRecord>(AUTONOMY_KEY, {
+      v: 1,
+      grantId,
+      sealedRefreshToken: sealed.sealedRefreshToken,
+      iv: sealed.iv,
+      armedAt: Math.floor(deps.now() / 1000),
+      generation: (previous?.generation ?? 0) + 1,
+    });
+
+    const proof = await withAutonomySession(deps, (call) => call("account_whoami", {}));
+    if (proof.kind !== "ok" || proof.value.kind !== "ok") return await fail();
+    if (!(await answersAs(proof.value.result, deps.name))) return await fail();
+
+    // 27-02: the sweep of this person's other autonomy grants goes here (D-13, D-28).
+    return { kind: "armed", grantId };
+  } catch {
+    return await fail();
+  }
+}

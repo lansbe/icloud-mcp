@@ -117,7 +117,14 @@ import type {
   ClientRegistrationCallbackOptions,
   ClientRegistrationCallbackResult,
 } from "@cloudflare/workers-oauth-provider";
+import {
+  AUTONOMY_CLIENT_ID,
+  AUTONOMY_CLIENT_NAME,
+  AUTONOMY_REDIRECT_PATH,
+} from "../agent/autonomy-client";
+import { agentFor } from "../agent/lease";
 import { isConfiguredSecret } from "../configured-secret";
+import { DEPLOYED_HOSTNAME } from "../deployed-hostname.generated";
 import type { Env } from "../env";
 import { ImapConnectError, ImapThrottleError } from "../errors";
 import type { SessionGate } from "../mail/service";
@@ -1290,12 +1297,20 @@ export function createLoginHandler(
   floorMs: number = FAILURE_FLOOR_MS,
   clock: () => number = () => Date.now(),
 ): {
-  fetch(request: Request, env: Env): Promise<Response>;
+  fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response>;
 } {
   return {
     async fetch(
       request: Request,
       env: Env,
+      // The request's execution context. The provider always passes it to its
+      // default handler, and the arming of the autonomy key needs it: the arm
+      // runs through its `waitUntil`, after the answer has gone. Optional
+      // because many tests call this handler with two arguments, and with no
+      // context nothing is minted and nothing is armed; the sign-in answers
+      // exactly as before. The tracer in test/autonomy.test.ts drives the real
+      // provider, and is what proves production passes it.
+      ctx?: ExecutionContext,
     ): Promise<Response> {
       // The floor's clock starts HERE, as the first statement of the request
       // handler, before the pathname is read and before any branch exists to
@@ -1303,9 +1318,54 @@ export function createLoginHandler(
       // work, and the amount of work already done is exactly what the floor is
       // hiding.
       const started = Date.now();
-      return handleAuthorize(request, env, proof, floorMs, started, clock);
+      return handleAuthorize(request, env, proof, floorMs, started, clock, ctx);
     },
   };
+}
+
+/**
+ * Whether autonomy is set up on this deployment (Phase 27, D-17).
+ *
+ * Both autonomy secrets must pass `isConfiguredSecret`. This is the ONE place
+ * this file decides it, so the sign-in page's notice (plan 27-02) and the
+ * arming below cannot disagree. Not set up means the sign-in works exactly as
+ * it always did, and nothing is minted.
+ */
+export function autonomyConfigured(env: Env): boolean {
+  return isConfiguredSecret(env.AUTONOMY_CLIENT_SECRET) && isConfiguredSecret(env.AUTONOMY_SEAL_KEY);
+}
+
+/**
+ * Arm the autonomy key, after the sign-in's answer has gone (D-26).
+ *
+ * Asks the person's own object to arm from `code`. Unless it answers `armed`
+ * for exactly the grant this sign-in minted, that grant is revoked, so a
+ * failed arming leaves no autonomy grant behind. That includes a call that
+ * rejects. Every step sits inside a `try` whose `catch` reads nothing, and this
+ * never rejects: it runs under `waitUntil`, where a rejection would reach
+ * nobody who could act on it.
+ */
+async function armAfterAnswer(
+  env: Env,
+  principal: Principal,
+  userId: string,
+  code: string,
+): Promise<void> {
+  const grantId = code.split(":")[1] ?? "";
+  let armed = false;
+  try {
+    const answer = await agentFor(principal).armAutonomy(code);
+    armed = answer.kind === "armed" && answer.grantId === grantId;
+  } catch {
+    // Not armed. The caught value is not read.
+  }
+  if (armed || grantId.length === 0) return;
+  try {
+    await env.OAUTH_PROVIDER.revokeGrant(grantId, userId);
+  } catch {
+    // Nothing left to try. A grant that was never exchanged ends on its own
+    // when its ten-minute code record expires.
+  }
 }
 
 /**
@@ -1353,6 +1413,7 @@ async function handleAuthorize(
   floorMs: number,
   started: number,
   clock: () => number,
+  ctx: ExecutionContext | undefined,
 ): Promise<Response> {
   {
     const url = new URL(request.url);
@@ -1855,6 +1916,11 @@ async function handleAuthorize(
     // thing that decides, whether the counter above moves.
     let askedApple = false;
 
+    // Declared here and assigned inside the `try`, so the principal the proof
+    // used is still in scope after it: the autonomy arm below names the
+    // person's object from it, and from nothing else.
+    let principal: Principal;
+
     try {
       // `principalFromProps` is the ONE constructor, and it refuses before any
       // socket exists: an unusable password — empty, whitespace-only, or
@@ -1863,7 +1929,7 @@ async function handleAuthorize(
       // so the login this proves and every later request replay the identical
       // bytes. They are the same expression, not two derivations that happen to
       // agree.
-      const principal = await principalFromProps({
+      principal = await principalFromProps({
         v: PROPS_VERSION,
         appleId,
         appPassword: submittedPassword,
@@ -1957,6 +2023,24 @@ async function handleAuthorize(
     );
     const granted = requested.length > 0 ? requested : [...SUPPORTED_SCOPES];
 
+    // Exactly the three keys `principalFromProps` accepts, and no fourth. It
+    // derives the user id from the address every time, so a props object
+    // carrying one of its own is refused for having an extra key.
+    //
+    // Built ONCE, and the same object goes to both authorizations below: the
+    // ordinary one and, when autonomy is set up, the autonomy one. So the two
+    // grants cannot carry different credentials.
+    //
+    // `submittedPassword` is named here for the SECOND and last time — the
+    // proof above named it once. Both sites name the same expression rather
+    // than a derived variable, which is what makes "the grant replays exactly
+    // what Apple accepted" true by construction instead of by inspection.
+    const props = {
+      v: PROPS_VERSION,
+      appleId,
+      appPassword: submittedPassword,
+    };
+
     // The user id is the one derived above the limiter layers, not a second
     // derivation. It used to be computed here, which was harmless while it had
     // one reader; with three readers a second derivation is how the id that
@@ -1970,19 +2054,8 @@ async function handleAuthorize(
       // address, not the id derived from it.
       metadata: { clientName: client.clientName },
       scope: granted,
-      // Exactly the three keys `principalFromProps` accepts, and no fourth. It
-      // derives the user id from the address every time, so a props object
-      // carrying one of its own is refused for having an extra key.
-      //
-      // `submittedPassword` is named here for the SECOND and last time — the
-      // proof above named it once. Both sites name the same expression rather
-      // than a derived variable, which is what makes "the grant replays exactly
-      // what Apple accepted" true by construction instead of by inspection.
-      props: {
-        v: PROPS_VERSION,
-        appleId,
-        appPassword: submittedPassword,
-      },
+      // The one props object built above. See the comment there.
+      props,
       // TRUE was the default and it locked the owner out of his own server on
       // 2026-09-21, hours after the phase shipped. Measured, not theorised.
       //
@@ -2016,6 +2089,54 @@ async function handleAuthorize(
       revokeExistingGrants: false,
     });
 
+    // THE AUTONOMY KEY (Phase 27, D-26). Autonomy is inherent, so this runs on
+    // every sign-in, for every client, whenever autonomy is set up.
+    //
+    // WHY HERE AND NOWHERE ELSE (AUTO-01). This is the only place outside the
+    // door that holds a principal Apple has just proved, and the only place a
+    // person has just read the sign-in page. A Claude app refreshing its own
+    // token never reaches this line, so nothing is minted without an
+    // interactive sign-in.
+    //
+    // A second authorization, for the autonomy client, with the same user id
+    // and the same props object as the ordinary one above. The ordinary grant,
+    // its props, its metadata and the 302 below are not changed by it.
+    //
+    // `revokeExistingGrants: false` here too, for a reason of its own: the
+    // library's sweep would revoke the autonomy grant a second sign-in is still
+    // arming (the client submits this form twice). The object's arm is the only
+    // sweep of autonomy grants (D-13, D-28).
+    //
+    // THE CODE NEVER REACHES THE BROWSER. It is read out of the library's
+    // redirect URL here, in memory, and handed to the person's own object. The
+    // redirect URI is never served and no browser is ever sent there (D-29).
+    //
+    // The whole call sits in a `try` whose `catch` reads nothing: a missing
+    // client record, a store error, anything, means this sign-in arms nothing
+    // and answers exactly as it would have.
+    let autonomyCode: string | null = null;
+    if (ctx !== undefined && autonomyConfigured(env)) {
+      try {
+        const autonomy = await env.OAUTH_PROVIDER.completeAuthorization({
+          request: {
+            responseType: "code",
+            clientId: AUTONOMY_CLIENT_ID,
+            redirectUri: `https://${DEPLOYED_HOSTNAME}${AUTONOMY_REDIRECT_PATH}`,
+            scope: [...SUPPORTED_SCOPES],
+            state: "",
+          },
+          userId,
+          metadata: { clientName: AUTONOMY_CLIENT_NAME },
+          scope: [...SUPPORTED_SCOPES],
+          props,
+          revokeExistingGrants: false,
+        });
+        autonomyCode = new URL(autonomy.redirectTo).searchParams.get("code");
+      } catch {
+        autonomyCode = null;
+      }
+    }
+
     // Constructed explicitly rather than through the static redirect helper,
     // and this is the site where that matters most: this location header
     // carries the authorization code, so a cached copy of this redirect is a
@@ -2030,12 +2151,20 @@ async function handleAuthorize(
     // where the fix has to land, and this response carries the matching
     // directive so the whole surface answers with one value per destination.
     // The URI is the one the allowlist already accepted twice on this path.
-    return new Response(null, {
+    const answer = new Response(null, {
       status: 302,
       headers: {
         ...responseHeadersFor(oauthRequest.redirectUri),
         location: redirectTo,
       },
     });
+
+    // The arm runs AFTER the answer is built, through the request's
+    // `waitUntil`, so it can neither slow nor fail the person's sign-in. It
+    // never rejects.
+    if (autonomyCode !== null && ctx !== undefined) {
+      ctx.waitUntil(armAfterAnswer(env, principal, userId, autonomyCode));
+    }
+    return answer;
   }
 }

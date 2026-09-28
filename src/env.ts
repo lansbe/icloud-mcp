@@ -424,6 +424,66 @@ declare global {
        */
       CONFIRM_SECRET: string | undefined;
 
+      /**
+       * A service binding to THIS Worker (Phase 27, D-22; SPIKE-08).
+       *
+       * The autonomy key is redeemed at this Worker's own token endpoint and
+       * used at its own `/mcp`, in-process, through this binding. The person's
+       * Durable Object is the only caller, through one seam on the object.
+       *
+       * It must name this Worker. A binding to any other Worker would hand that
+       * Worker a person's token. And it carries no identity: the caller builds
+       * the exact deployed hostname and the exact path itself, and presents a
+       * real token for the person it acts for (SPIKE-08's findings, in the
+       * header of `test/self-binding.test.ts`).
+       *
+       * Typed `Fetcher` and not widened: a service binding either resolves at
+       * deploy time or fails the deploy, like the namespaces above.
+       */
+      SELF: Fetcher;
+
+      /**
+       * The autonomy client's secret (Phase 27, D-07). Workers Secret.
+       *
+       * Source: set once by the owner's setup command in plan 27-03, which puts
+       * it through `wrangler secret put` on standard input and never prints it.
+       * The same value's hash is what the library stores on the autonomy
+       * client's record.
+       *
+       * The autonomy client is confidential, so a refresh token that leaked on
+       * its own cannot be cashed in at the public token endpoint: the endpoint
+       * also wants this secret, on the code exchange, on every refresh and on a
+       * revocation.
+       *
+       * Admits `undefined` for the reason every Workers Secret does: unset,
+       * deleted and never-provisioned all arrive absent. `isConfiguredSecret`
+       * narrows it. Consumed by the person's object through
+       * `src/agent/autonomy.ts`, and by the sign-in's one "is autonomy set up"
+       * predicate. No object holding it is ever built to be serialised, attached
+       * to an error, or spread into a response (./.claude/CLAUDE.md §4).
+       */
+      AUTONOMY_CLIENT_SECRET: string | undefined;
+
+      /**
+       * The key that seals every stored autonomy refresh token (Phase 27,
+       * D-06). Workers Secret: 32 random bytes, base64url.
+       *
+       * Source: set once by the owner's setup command in plan 27-03, the same
+       * way as the secret above. Two separate values rather than one derived
+       * pair, so each fails on its own: rotating the client secret destroys no
+       * seal, and rotating this key ends everyone's autonomy key until their
+       * next sign-in, because nothing sealed under the old key opens any more.
+       *
+       * With it, reading every store this server has still opens nothing: a
+       * sealed token needs this secret, and no store holds it.
+       *
+       * Admits `undefined`, narrowed by `isConfiguredSecret`, for the reason
+       * the secret above gives. Consumed only by `src/agent/autonomy.ts`, which
+       * imports it as a non-extractable key and returns nothing that carries
+       * it, and by the sign-in's one "is autonomy set up" predicate.
+       */
+      AUTONOMY_SEAL_KEY: string | undefined;
+
       // The single write-only Secret that used to hold the whole allow list is
       // GONE from this type, along with its two readers, in one commit — a
       // half-removed binding is a name the compiler still accepts and nobody

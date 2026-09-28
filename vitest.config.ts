@@ -95,6 +95,22 @@ export default defineConfig({
                 R2_SECRET_ACCESS_KEY: "test-secret-key-not-real",
                 CONFIRM_SECRET: "test-confirm-secret-not-real",
 
+                // The two autonomy secrets (Phase 27, D-06, D-07), both plainly
+                // fake. The seal key must be exactly 32 bytes once decoded from
+                // base64url, or the autonomy module refuses it; this one is the
+                // 32 ASCII bytes "test-seal-key-32-bytes-not-real!". The client
+                // secret is any fixed string: the autonomy fixture hashes it
+                // onto the test client's record, the same way the owner's setup
+                // command does for the real one.
+                //
+                // With both set, every sign-in in the pool that passes an
+                // execution context tries to arm. That is the production shape.
+                // A file that never installs the autonomy client gets nothing
+                // minted: the second authorization finds no client and arms
+                // nothing, and the sign-in answers exactly as before.
+                AUTONOMY_SEAL_KEY: "dGVzdC1zZWFsLWtleS0zMi1ieXRlcy1ub3QtcmVhbCE",
+                AUTONOMY_CLIENT_SECRET: "test-autonomy-client-secret-not-real",
+
                 // The SEED half of the allow list, as the JSON array string the
                 // real `vars` entry holds. The single write-only Secret this
                 // replaces is gone from every file in this repository.

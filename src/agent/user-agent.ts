@@ -29,7 +29,17 @@
 // know whose grants to ask about, and the platform's name is not documented as
 // present inside an alarm.
 //
+// Since Phase 27 it also holds, because autonomy is inherent, one sealed
+// autonomy record for every person who has signed in since autonomy was set up
+// and is still connected: the refresh token of their autonomy grant, sealed
+// under a Worker secret and tied to their user id (./autonomy.ts says how). So
+// what the object holds is: a lease record, its own stored name, Phase 25's
+// recall tables (Phase 26 keeps its folder state there too), its one alarm, and
+// that one sealed record. Still no address and no password.
+//
 // It still never opens a socket and never imports mail, DAV, tool or auth code.
+// It reaches this Worker only through `autonomySelfFetch`, its one seam to the
+// Worker's own endpoints.
 //
 // Recall is inherent (owner, 2026-09-27), so there is no switch here: no method
 // that turns recall on or off, and no enabled flag. The first record for a
@@ -48,6 +58,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
+import { type ArmOutcome, armWith } from "./autonomy";
 import { type RecallStore, recallStore } from "../recall/index";
 import { grantsRemainFor } from "../recall/grant-check";
 import { destroyAll, type LedgerHandle, sweepExpired } from "../recall/lifecycle";
@@ -359,6 +370,17 @@ export class UserAgent extends DurableObject<Env> {
    */
   grantsRemain = (userId: string): Promise<"some" | "none" | "unknown"> =>
     grantsRemainFor(this.env.OAUTH_KV, userId);
+
+  /**
+   * The one thing this object uses to reach this Worker (Phase 27, D-22).
+   *
+   * Every autonomy request goes through it: the code exchange, the refresh, the
+   * revocation and the one tool call. `./autonomy.ts` builds each URL from the
+   * deployed hostname and an exact path, and the binding adds no identity.
+   * Tests replace this property through `runInDurableObject`, to record what
+   * the object sent; production never overrides it.
+   */
+  autonomySelfFetch = (request: Request): Promise<Response> => this.env.SELF.fetch(request);
 
   /**
    * The object's stored own name, when it is a 64-hex user id, else null.
@@ -742,6 +764,46 @@ export class UserAgent extends DurableObject<Env> {
       .slice(0, MAX_SCOPE_ROWS)
       .filter((id): id is string => typeof id === "string" && HEX_64.test(id));
     return heldIds(sql, valid);
+  }
+
+  /**
+   * Arm the autonomy key from a one-time code (Phase 27, D-09, D-16, D-26).
+   *
+   * The one RPC method autonomy adds. The sign-in calls it after its answer has
+   * gone, through the request's `waitUntil`, with the code of the autonomy grant
+   * it just minted. Answers `{ kind: "armed", grantId }` or
+   * `{ kind: "not_armed" }`, and nothing else: no token and no bearer ever
+   * crosses back out.
+   *
+   * The name comes from Phase 25's `rememberOwnName()`, called FIRST (25 D-22).
+   * An autonomy record can exist before this object ever had a recall call, so
+   * arming must store the name itself: the alarm (plan 27-05) reads the stored
+   * copy to know whose grants to ask about, and a record in an object with no
+   * stored name could never be ended by it. With no name, nothing is armed.
+   * This method never reads the platform's name itself; the one reader of it in
+   * this module stays inside `rememberOwnName`.
+   *
+   * Never throws: an error's class does not survive RPC, and the caller must be
+   * able to tell "not armed" from nothing at all.
+   */
+  async armAutonomy(code: unknown): Promise<ArmOutcome> {
+    if (typeof code !== "string") return { kind: "not_armed" };
+    const name = this.rememberOwnName();
+    if (name === null) return { kind: "not_armed" };
+    try {
+      return await armWith(
+        {
+          storage: this.ctx.storage.kv,
+          name,
+          env: this.env,
+          selfFetch: (request) => this.autonomySelfFetch(request),
+          now: () => Date.now(),
+        },
+        code,
+      );
+    } catch {
+      return { kind: "not_armed" };
+    }
   }
 
   /**

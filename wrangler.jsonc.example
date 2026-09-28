@@ -428,7 +428,25 @@
   "observability": {
     "enabled": true,
     "logs": { "enabled": true, "invocation_logs": true }
-  }
+  },
+
+  // SELF: a service binding to THIS Worker (Phase 27, D-22).
+  //
+  // The autonomy key is redeemed at this Worker's own token endpoint and used
+  // at its own /mcp, in-process, through this binding. The person's Durable
+  // Object is the only caller. SPIKE-08 measured that the platform accepts a
+  // binding that names its own Worker (Phase 14), and that the door serves a
+  // caller-built request with a real bearer (test/self-binding.test.ts).
+  //
+  // It MUST name this Worker: `service` equals `name` at the top of this file.
+  // A binding to any other Worker would hand that Worker a person's token.
+  //
+  // It carries no identity. A caller must build the exact deployed hostname
+  // and the exact path itself (/oauth/token, or exactly /mcp), and present a
+  // real token for the person it acts for. The binding adds nothing to that.
+  "services": [
+    { "binding": "SELF", "service": "icloud-mcp" }
+  ]
 
   // NOTE: the "limits" block accepts ONLY `cpu_ms` and `subrequests`.
   // UserLimits declares "additionalProperties": false, but that lives in
