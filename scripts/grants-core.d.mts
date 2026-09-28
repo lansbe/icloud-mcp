@@ -68,6 +68,14 @@ export interface GrantRow {
   readonly expires: string;
   /** Whether the `client:` record behind it still exists. */
   readonly clientPresent: boolean;
+  /**
+   * Whether this is an autonomy grant: its client id is `AUTONOMY_CLIENT_ID`.
+   *
+   * Set from the client id ONLY, never from the client name, which any
+   * registrant chooses. `listGrants` always sets it. It is optional so a row
+   * built by hand, as a test builds one, reads as not autonomy without it.
+   */
+  readonly autonomy?: boolean;
 }
 
 /** One person (or one unlabelled user segment), with their grants. */
@@ -153,6 +161,9 @@ export declare function presentClientIds(
  * A record a grant still claims is never in the result: deleting one makes that
  * grant's next refresh answer `invalid_client` even though the grant is fine,
  * which signs the person out (spike S2).
+ *
+ * The autonomy client is never in the result either, claimed or not: right
+ * after setup no grant names it, and deleting it would end every key.
  */
 export declare function orphanClientIds(
   presentClients: ReadonlySet<string>,

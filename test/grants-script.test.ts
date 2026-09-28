@@ -54,6 +54,7 @@
 
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { AUTONOMY_CLIENT_ID, AUTONOMY_CLIENT_NAME } from "../src/agent/autonomy-client";
 import type { Env } from "../src/env";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
 import { maskAppleId, userIdOf } from "../src/principal";
@@ -1725,5 +1726,203 @@ describe("LIFE-05: the owner lists grants by masked address and revokes them", (
 
     expect(code).toBe(0);
     expect(out.text()).toContain("REMOTE");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Autonomy in the owner's listing (Phase 27, AUTO-03, AUTO-04, D-18).
+//
+// Every case here runs over a store it OWNS. The autonomy grant is written in
+// the library's own summary shape rather than minted by a sign-in, because
+// minting one needs the autonomy client installed in the pool's shared store,
+// and a sibling file signing in at the same moment would then arm a key too.
+// test/autonomy.test.ts and test/autonomy-lifecycle.test.ts already prove the
+// grant a real sign-in mints carries AUTONOMY_CLIENT_ID; this file proves what
+// the owner's tool does with a grant that carries it.
+// ---------------------------------------------------------------------------
+
+/** A grant record naming a client and a client name, for a store we own. */
+function namedGrantRecord(
+  userKey: string,
+  grantId: string,
+  clientId: string,
+  clientName: string,
+): Record<string, unknown> {
+  return { ...grantRecord(userKey, grantId, clientId), metadata: { clientName } };
+}
+
+/** The one rendered line carrying a grant id. */
+function lineFor(text: string, grantId: string): string {
+  const line = text.split("\n").find((candidate) => candidate.includes(grantId));
+  expect(line, `no line for ${grantId}`).toBeDefined();
+  return line as string;
+}
+
+describe("AUTO-03, AUTO-04: the owner's listing marks autonomy grants by client id", () => {
+  it("marks the autonomy grant, and only by its client id, never by its name", async () => {
+    const userKey = await listedUserId();
+    const kv = ownStore({
+      [`grant:${userKey}:auto-grant-1`]: namedGrantRecord(
+        userKey,
+        "auto-grant-1",
+        AUTONOMY_CLIENT_ID,
+        AUTONOMY_CLIENT_NAME,
+      ),
+      // A registrant chooses its own name. One that picks the autonomy client's
+      // name must not be labelled autonomy (T-27-24).
+      [`grant:${userKey}:posing-grant-1`]: namedGrantRecord(
+        userKey,
+        "posing-grant-1",
+        "a-random-client-id",
+        AUTONOMY_CLIENT_NAME,
+      ),
+      [`grant:${userKey}:plain-grant-1`]: namedGrantRecord(
+        userKey,
+        "plain-grant-1",
+        "another-client-id",
+        "Claude",
+      ),
+      [`client:${AUTONOMY_CLIENT_ID}`]: { clientId: AUTONOMY_CLIENT_ID },
+      "client:a-random-client-id": { clientId: "a-random-client-id" },
+      "client:another-client-id": { clientId: "another-client-id" },
+    });
+
+    const groups = await listGrants(kv, [LISTED_APPLE_ID]);
+    const rows = groupFor(groups, userKey)?.grants ?? [];
+    const row = (id: string) => rows.find((grant) => grant.id === id);
+    expect(row("auto-grant-1")?.autonomy).toBe(true);
+    expect(row("posing-grant-1")?.autonomy).toBe(false);
+    expect(row("plain-grant-1")?.autonomy).toBe(false);
+
+    // No timer of its own: the autonomy row shows the same expiry as every
+    // ordinary row, and only the marker tells it apart.
+    expect(row("auto-grant-1")?.expires).toBe("never");
+
+    const text = renderGrants(groups);
+    expect(lineFor(text, "auto-grant-1")).toBe(
+      `  auto-grant-1  client "${AUTONOMY_CLIENT_NAME}"  created 2026-05-28` +
+        "  expires never  client present  autonomy",
+    );
+    // Every other row is byte-identical to the listing before this phase.
+    expect(lineFor(text, "posing-grant-1")).toBe(
+      `  posing-grant-1  client "${AUTONOMY_CLIENT_NAME}"  created 2026-05-28` +
+        "  expires never  client present",
+    );
+    expect(lineFor(text, "plain-grant-1")).toBe(
+      '  plain-grant-1  client "Claude"  created 2026-05-28  expires never  client present',
+    );
+  });
+
+  it("after revoke --address --yes the listing shows no row for that person, autonomy included", async () => {
+    const userKey = await listedUserId();
+    const otherKey = "9".repeat(64);
+    const kv = ownStore({
+      [`grant:${userKey}:plain-grant-2`]: namedGrantRecord(
+        userKey,
+        "plain-grant-2",
+        "a-client-id",
+        "Claude",
+      ),
+      [`token:${userKey}:plain-grant-2:t1`]: { id: "t1" },
+      [`grant:${userKey}:auto-grant-2`]: namedGrantRecord(
+        userKey,
+        "auto-grant-2",
+        AUTONOMY_CLIENT_ID,
+        AUTONOMY_CLIENT_NAME,
+      ),
+      [`token:${userKey}:auto-grant-2:t2`]: { id: "t2" },
+      [`grant:${otherKey}:someone-else-grant`]: namedGrantRecord(
+        otherKey,
+        "someone-else-grant",
+        AUTONOMY_CLIENT_ID,
+        AUTONOMY_CLIENT_NAME,
+      ),
+      "client:a-client-id": { clientId: "a-client-id" },
+      [`client:${AUTONOMY_CLIENT_ID}`]: { clientId: AUTONOMY_CLIENT_ID },
+    });
+    const deps = (out: { write(text: string): void }): GrantDeps => ({
+      kv,
+      async knownAddresses() {
+        return [LISTED_APPLE_ID];
+      },
+      write: out.write,
+      writeError: out.write,
+    });
+
+    // The positive control, before the revoke: the person's autonomy row is
+    // listed and marked, so its absence afterwards means something.
+    const before = sink();
+    expect(await runGrants(["list"], deps(before))).toBe(0);
+    expect(before.text()).toContain(maskAppleId(LISTED_APPLE_ID));
+    expect(lineFor(before.text(), "auto-grant-2")).toMatch(/ {2}autonomy$/);
+
+    const revoke = sink();
+    const code = await runGrants(
+      ["revoke", "--address", LISTED_APPLE_ID, "--yes"],
+      deps(revoke),
+    );
+    expect(`${code} ${revoke.text()}`).toBe(`0 ${revoke.text()}`);
+
+    const after = sink();
+    expect(await runGrants(["list"], deps(after))).toBe(0);
+    expect(after.text()).not.toContain(maskAppleId(LISTED_APPLE_ID));
+    expect(after.text()).not.toContain("auto-grant-2");
+    expect(after.text()).not.toContain("plain-grant-2");
+    // Nothing of the person's is left in the store, tokens included.
+    const names = await namesIn(kv);
+    expect(names.filter((name) => name.includes(userKey))).toEqual([]);
+    // Somebody else's autonomy key is untouched, and still marked.
+    expect(lineFor(after.text(), "someone-else-grant")).toMatch(/ {2}autonomy$/);
+  });
+
+  it("orphanClientIds never names the autonomy client, with or without a grant naming it", () => {
+    const withGrant: GrantGroup[] = [
+      {
+        userKey: "u1",
+        label: "somebody",
+        kind: "address",
+        grants: [
+          {
+            id: "g1",
+            userKey: "u1",
+            clientId: AUTONOMY_CLIENT_ID,
+            clientName: AUTONOMY_CLIENT_NAME,
+            created: "2026-01-01",
+            expires: "never",
+            clientPresent: true,
+            autonomy: true,
+          },
+        ],
+      },
+    ];
+    const present = new Set([AUTONOMY_CLIENT_ID, "orphan-z", "orphan-a"]);
+
+    // Right after setup nobody has signed in, so no grant names the client.
+    expect(orphanClientIds(present, [])).toEqual(["orphan-a", "orphan-z"]);
+    expect(orphanClientIds(present, withGrant)).toEqual(["orphan-a", "orphan-z"]);
+    expect(orphanClientIds(new Set([AUTONOMY_CLIENT_ID]), [])).toEqual([]);
+  });
+
+  it("prune-clients --yes deletes a true orphan and keeps the autonomy client", async () => {
+    const kv = ownStore({
+      [`client:${AUTONOMY_CLIENT_ID}`]: { clientId: AUTONOMY_CLIENT_ID },
+      "client:true-orphan-id": { clientId: "true-orphan-id" },
+    });
+    const out = sink();
+
+    const code = await runGrants(["prune-clients", "--yes"], {
+      kv,
+      async knownAddresses() {
+        return [];
+      },
+      write: out.write,
+      writeError: out.write,
+    });
+
+    expect(code).toBe(0);
+    expect(await namesIn(kv)).toEqual([`client:${AUTONOMY_CLIENT_ID}`]);
+    expect(out.text()).toContain("Deleted 1 client record");
+    // The orphan listing never showed it as a candidate either.
+    expect(out.text()).not.toContain(`${AUTONOMY_CLIENT_ID.slice(0, 8)}…`);
   });
 });

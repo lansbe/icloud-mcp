@@ -57,11 +57,19 @@
 // person out (spike S2). The records are LISTED and never READ — a `client_name`
 // is chosen by whoever registered and the endpoint accepts a body up to 1 MiB.
 //
+// **One client is never pruned: the autonomy client (Phase 27, D-18).** No grant
+// names it until somebody signs in, so the grants-first rule above would call it
+// an orphan. It is exempted by its fixed id, and the listing marks a grant as
+// autonomy by that same id — never by its client name, which any registrant
+// chooses. The id comes from `src/agent/autonomy-client.ts`, a leaf that imports
+// nothing, so it is spelled once for the Worker and this script alike.
+//
 // The full grant id IS printed. It is needed to revoke, and it is not a
 // credential on its own — an access token is `userId:grantId:secret` and the
 // secret is the part that is never stored in the clear anywhere.
 
 import { getOAuthApi } from "@cloudflare/workers-oauth-provider";
+import { AUTONOMY_CLIENT_ID } from "../src/agent/autonomy-client";
 import { maskAppleId, userIdOf } from "../src/principal";
 
 /** The store's user segment for a grant made before this milestone. */
@@ -533,6 +541,11 @@ export async function listGrants(kv, knownAddresses, presentClients) {
               ? "never"
               : isoDay(item.expiresAt),
           clientPresent: clients.has(clientId),
+          // By client id and NEVER by name (D-18, T-27-24). A client name is
+          // chosen by whoever registered, so any stranger can call a client
+          // "iCloud MCP autonomy". The id is fixed and no registration can
+          // produce it, because the library always picks a random one.
+          autonomy: clientId === AUTONOMY_CLIENT_ID,
         });
       }
       if (typeof result?.cursor !== "string" || result.cursor.length === 0) break;
@@ -610,6 +623,11 @@ export function orphanClientIds(presentClients, groups) {
   }
   const orphans = [];
   for (const id of presentClients) {
+    // NEVER the autonomy client (D-18, T-27-25). Right after the owner's setup,
+    // and whenever nobody has signed in since, no grant names it. Deleting its
+    // record then would make every sign-in arm nothing and every stored key
+    // answer `invalid_client` at its next use.
+    if (id === AUTONOMY_CLIENT_ID) continue;
     if (!claimed.has(id)) orphans.push(id);
   }
   // Stable, so two runs read the same and a diff of two captures means the store
@@ -673,6 +691,9 @@ function renderOrphans(orphans) {
  */
 async function pruneClients(kv, orphans, claimed, writeError) {
   for (const id of orphans) {
+    // The same exemption `orphanClientIds` makes, checked again at the one line
+    // that does the damage, for the same reason the claimed check below is.
+    if (id === AUTONOMY_CLIENT_ID) continue;
     if (claimed.has(id)) {
       writeError(`${KEPT_CLAIMED_CLIENT}\n`);
       continue;
@@ -735,7 +756,12 @@ export function renderGrants(groups) {
           `  client "${printable(grant.clientName, CLIENT_NAME_MAX)}"` +
           `  created ${printable(grant.created, 10)}` +
           `  expires ${printable(grant.expires, 10)}` +
-          `  ${grant.clientPresent ? "client present" : "client gone"}`,
+          `  ${grant.clientPresent ? "client present" : "client gone"}` +
+          // A trailing marker, so every other row stays byte-identical to the
+          // listing before Phase 27. The expiry says `never` on this row too:
+          // the key has no timer of its own and ends with the person's
+          // ordinary connection, so only this word tells it apart.
+          `${grant.autonomy === true ? "  autonomy" : ""}`,
       );
     }
     lines.push("");
