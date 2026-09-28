@@ -184,6 +184,8 @@ const FLAG_RULE_LINE =
   "It matches new inbox mail that meets all of these: sent from 'recruiter@example.com'; " +
   "sent from an address at 'jobs.example.org', or at any subdomain of it; with 'interview' in the subject. " +
   "Mail that arrived before the rule was added never matches it. " +
+  "If the rules job is not already running for you, its first check, within 15 minutes, only marks where to start, " +
+  "so mail that arrives before that check is not looked at. " +
   "For each match it flags the message. " +
   "Removing the rule with rules_remove stops it at once.";
 

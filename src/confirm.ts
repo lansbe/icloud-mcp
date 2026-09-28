@@ -1981,6 +1981,19 @@ export interface RuleLineSummary {
 const RULE_RUNS =
   "a rule that runs on its own every 15 minutes, with nobody present, for as long as you stay signed in.";
 const RULE_BEFORE = "Mail that arrived before the rule was added never matches it.";
+/**
+ * The gap before the job's starting point (28-REVIEW WR-05). With no recent
+ * starting point stored (a first rule, or none for more than a day), the job's
+ * next check can only mark where to start: the change check lists nothing new
+ * the first time it is asked. Mail that arrives between adding the rule and
+ * that check is not looked at. Closing the gap needs a look back over mail
+ * received since the rule was added, which is a read-path change, or an
+ * immediate wake, which would fire the object's alarm at once in every test
+ * that adds a rule. Neither was taken; the sentence says what happens instead.
+ * Decided by Claude, owner may revise.
+ */
+const RULE_FIRST_CHECK =
+  "If the rules job is not already running for you, its first check, within 15 minutes, only marks where to start, so mail that arrives before that check is not looked at.";
 const RULE_FLAG = "flags the message";
 const RULE_DRAFT =
   "places a draft reply to that message's sender, in the rule's own words, with the subject \"Re: \" and the original subject";
@@ -2021,7 +2034,7 @@ function ruleLine(summary: RuleLineSummary, tense: ConfirmationTense): string {
   if (summary.draft) actions.push(RULE_DRAFT);
   const does = `For each match it ${actions.join(" and ")}.`;
 
-  const parts = [`${CONFIRMATION_VERBS.rule[tense]} ${RULE_RUNS}`, matches, RULE_BEFORE, does];
+  const parts = [`${CONFIRMATION_VERBS.rule[tense]} ${RULE_RUNS}`, matches, RULE_BEFORE, RULE_FIRST_CHECK, does];
   if (summary.draft) parts.push(RULE_DRAFT_RECIPIENT, RULE_DRAFT_SKIPS, RULE_DRAFT_UNSENT);
   parts.push(CONFIRMATION_CONSEQUENCES.rule);
   return parts.join(" ");
