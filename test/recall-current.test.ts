@@ -28,7 +28,11 @@ import type { UserAgent } from "../src/agent/user-agent";
 import type { FolderState } from "../src/change-marker";
 import type { Principal } from "../src/principal";
 import { RecallBuildError } from "../src/recall/build";
-import { RECALL_MAX_PAGES_PER_DAY } from "../src/recall/retention";
+import {
+  RECALL_MAX_PAGES_PER_DAY,
+  RECALL_MAX_VECTORS,
+  RECALL_PAGE_SIZE,
+} from "../src/recall/retention";
 import {
   indexNewMail,
   RECALL_CHECK_INTERVAL_MS,
@@ -800,6 +804,83 @@ describe("removals reach the index on the folder's next sync", () => {
     expect(row.due).toBeNull();
     expect(row.checkedAt).toBe(later);
     expect(row.state!.highestModseq).toBe("7");
+  });
+
+  it("at the vector ceiling a deletion sync still runs and a gone folder's vectors still go, while new mail waits with no read (26-REVIEW-2 WR-04)", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = fakeStepDeps({
+      folders: [INBOX, ARCHIVE],
+      mailboxes: {
+        [INBOX]: { uidValidity: 100, messages: scriptedMessages(5) },
+        [ARCHIVE]: { uidValidity: 300, messages: scriptedMessages(4) },
+      },
+    });
+    const now = Date.now();
+    h.setNow(now);
+    expect((await step(a, h)).outcome).toBe("folders");
+    expect((await step(a, h)).outcome).toBe("seeded");
+    expect((await step(a, h)).outcome).toBe("done");
+    await passPause(USER_A.userId);
+    expect((await step(a, h)).outcome).toBe("seeded");
+    expect((await step(a, h)).outcome).toBe("done");
+    await passPause(USER_A.userId);
+    expect(await ledgerCount(USER_A.userId)).toBe(9);
+
+    // Fill the ledger past the ceiling's threshold with rows of a folder the
+    // build does not cover, far enough that it stays full after the two
+    // removals below (six rows between them).
+    await withSql(USER_A.userId, (sql) =>
+      sql.exec(
+        `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < ?)
+         INSERT INTO recall_vectors (vector_id, mailbox, uid_validity, expires_at)
+         SELECT printf('%064x', x), 'Elsewhere', 1, ? FROM c`,
+        RECALL_MAX_VECTORS - RECALL_PAGE_SIZE + 1 + 6 - 9,
+        Date.now() + 24 * 60 * MINUTE,
+      ),
+    );
+    expect((await objectFor(USER_A.userId).recallSyncState()).full).toBe(true);
+    const built = (await rowOf(USER_A.userId, INBOX))!;
+    expect(
+      await objectFor(USER_A.userId).recallSetSync(INBOX, {
+        ...built,
+        reconciledAt: now - 2 * 60 * MINUTE,
+      }),
+    ).toEqual({ ok: true });
+
+    // INBOX: messages 4 and 5 deleted in iCloud. The archive: deleted.
+    h.sources[INBOX]!.setUids([1, 2, 3]);
+    h.setModseq(INBOX, "12");
+    h.setGone(ARCHIVE, true);
+    let t = now + 6 * MINUTE;
+    h.setNow(t);
+
+    expect((await step(a, h)).outcome).toBe("due");
+    const sync = await step(a, h);
+    expect(sync.outcome).toBe("indexed");
+    expect(sync.log).toContain(`uids:${INBOX}:start`);
+    expect(await ledgerCount(USER_A.userId)).toBe(RECALL_MAX_VECTORS - RECALL_PAGE_SIZE + 1 + 6 - 2);
+    expect(h.index.vectors.size).toBe(7);
+    await passPause(USER_A.userId);
+
+    // Still full. The archive's check finds it gone, and its vectors go.
+    expect((await objectFor(USER_A.userId).recallSyncState()).full).toBe(true);
+    expect((await step(a, h)).outcome).toBe("gone");
+    expect(h.index.vectors.size).toBe(3);
+    expect((await objectFor(USER_A.userId).recallSyncState()).folders).toEqual([INBOX]);
+    await passPause(USER_A.userId);
+
+    // Still full. New mail is found by the check, then waits: no read, no
+    // lease, and the step says the index is full.
+    expect((await objectFor(USER_A.userId).recallSyncState()).full).toBe(true);
+    h.addMessages(INBOX, messagesFrom(6, 2));
+    t += RECALL_CHECK_INTERVAL_MS;
+    h.setNow(t);
+    expect((await step(a, h)).outcome).toBe("due");
+    expect((await rowOf(USER_A.userId, INBOX))!.due).toBe("new_mail");
+    const waited = await step(a, h);
+    expect(waited.outcome).toBe("full");
+    expect(waited.log).toEqual([]);
+    expect(h.newMailCalls).toEqual([]);
   });
 
   it("iCloud reporting no mod-sequence: a deletion sync is due at most once an hour", async () => {

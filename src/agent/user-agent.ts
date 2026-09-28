@@ -178,13 +178,17 @@ export type BeginPageAnswer =
 /**
  * What the object says about the build, before any IMAP (Phase 26, D-29).
  *
- * `slot` is the first refusal a build page would get now, or `free`. `folders`
- * is the stored folder list, or null before the first listing. `listing` is
- * the folder listing's failure record while there is no list, or null.
- * `sync` is every mailbox's sync row that parses, keyed by mailbox.
+ * `slot` is the first refusal a deletion sync would get now, or `free`. It is
+ * never `full`: a removal is never refused at the vector ceiling. `full` says
+ * whether a page that adds vectors would be refused at that ceiling now
+ * (26-REVIEW-2 WR-04). `folders` is the stored folder list, or null before the
+ * first listing. `listing` is the folder listing's failure record while there
+ * is no list, or null. `sync` is every mailbox's sync row that parses, keyed
+ * by mailbox.
  */
 export interface RecallSyncState {
   readonly slot: PageRefusal | "free";
+  readonly full: boolean;
   readonly folders: string[] | null;
   readonly listing: RetryState | null;
   readonly sync: Record<string, SyncRow>;
@@ -551,9 +555,12 @@ export class UserAgent extends DurableObject<Env> {
    * build step to read before it opens any IMAP session (Phase 26, D-29).
    *
    * The slot is answered by `pageRefusal`, the same predicate the page start
-   * above asks, for a build page. So a step that reads `free` here and then
-   * asks to start a page is refused only if something changed in between, and
-   * a step that reads a refusal here stops with no lease and no session.
+   * above asks. `slot` is its answer for a deletion sync, and `full` whether a
+   * build page would also be refused at the vector ceiling (26-REVIEW-2
+   * WR-04). A step that reads a refusal in `slot` stops with no lease and no
+   * session. A step that reads `full` still does what shrinks or checks the
+   * index, and only what would add vectors waits: the index is shrunk by those
+   * removals, so stopping them at the ceiling would keep it there.
    *
    * Writes nothing, apart from the one-time copy of the object's own name that
    * every recall method makes (Phase 25, D-22). There is no `off` answer:
@@ -563,8 +570,10 @@ export class UserAgent extends DurableObject<Env> {
     const sql = this.ctx.storage.sql;
     ensureRecallSchema(sql);
     this.rememberOwnName();
+    const now = Date.now();
     return {
-      slot: pageRefusal(sql, "build", Date.now()) ?? "free",
+      slot: pageRefusal(sql, "reconcile", now) ?? "free",
+      full: pageRefusal(sql, "build", now) === "full",
       folders: readFolders(sql),
       listing: readListingFailure(sql),
       sync: readSyncRows(sql),

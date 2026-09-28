@@ -150,18 +150,6 @@ describe("recallStep reads the slot first, and a refusal opens nothing (D-29, T-
         writeState(sql, "pages_count", String(RECALL_MAX_PAGES_PER_DAY));
       },
     ],
-    [
-      "full",
-      (sql) => {
-        sql.exec(
-          `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < ?)
-           INSERT INTO recall_vectors (vector_id, mailbox, uid_validity, expires_at)
-           SELECT printf('%064x', x), 'Archive', 1, ? FROM c`,
-          RECALL_MAX_VECTORS - RECALL_PAGE_SIZE + 1,
-          Date.now() + DAY_MS,
-        );
-      },
-    ],
   ];
 
   it.each(seeds)("answers %s with no lease, no read and no write", async (word, seed) => {
@@ -191,6 +179,33 @@ describe("recallStep reads the slot first, and a refusal opens nothing (D-29, T-
 
     expect(outcome).toBe("quota");
     expect(log).toEqual([]);
+  });
+
+  it("at the vector ceiling only a page that adds vectors waits: the listing and the status check still run, and the build page is refused as full with no lease (26-REVIEW-2 WR-04)", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders();
+    await withSql(USER_A.userId, (sql) => {
+      sql.exec(
+        `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < ?)
+         INSERT INTO recall_vectors (vector_id, mailbox, uid_validity, expires_at)
+         SELECT printf('%064x', x), 'Archive', 1, ? FROM c`,
+        RECALL_MAX_VECTORS - RECALL_PAGE_SIZE + 1,
+        Date.now() + DAY_MS,
+      );
+    });
+    const state = await syncState(USER_A.userId);
+    expect(state.slot).toBe("free");
+    expect(state.full).toBe(true);
+
+    expect((await step(a, h)).outcome).toBe("folders");
+    expect((await step(a, h)).outcome).toBe("seeded");
+
+    const before = await recallTables(USER_A.userId);
+    const { outcome, log } = await step(a, h);
+    expect(outcome).toBe("full");
+    expect(log).toEqual([]);
+    expect(h.sources[INBOX]!.calls).toEqual([]);
+    expect(await recallTables(USER_A.userId)).toEqual(before);
   });
 });
 

@@ -7,9 +7,17 @@
 // object never imports this module.
 //
 // THE SLOT FIRST (D-29). A step reads the person's object before anything
-// else. When the object says a build page may not start now (destroying, busy,
-// paused, quota or full), the step answers that word and stops: no lease, no
+// else. When the object says a page may not start now (destroying, busy,
+// paused or quota), the step answers that word and stops: no lease, no
 // session, no write.
+//
+// AT THE VECTOR CEILING ONLY ADDING STOPS (26-REVIEW-2 WR-04). `full` is not
+// one of those stops. At the ceiling the step still lists folders, runs status
+// checks, runs deletion syncs and removes a folder that is gone, because those
+// are what shrink the index; stopping them would keep it at the ceiling, and
+// keep deleted mail recallable. Only what adds vectors waits: a due new-mail
+// page is passed over, and a build page is refused as `full` by the object
+// before any lease is taken.
 //
 // ONE SESSION PER STEP (D-27). Otherwise the step does exactly one of these,
 // each one IMAP session under the person's connection lease, and holds the
@@ -359,9 +367,11 @@ function folderStateOf(mailbox: string, outcome: FolderSnapshotOutcome): FolderS
 export async function recallStep(principal: Principal, deps: StepDeps): Promise<StepOutcome> {
   const stub = agentFor(principal);
 
-  // 1. The slot, before anything else (D-29).
+  // 1. The slot, before anything else (D-29). `full` is not a stop: at the
+  //    ceiling only what adds vectors waits (WR-04).
   const state = await stub.recallSyncState();
   if (state.slot !== "free") return state.slot;
+  const full = state.full;
   const now = deps.now();
 
   // 2. No folder list yet: list them, store them, stop. A listing that failed
@@ -389,9 +399,12 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
   const rowOf = (mailbox: string): SyncRow | undefined => syncRowIn(state.sync, mailbox);
 
   // 3. A built folder whose last status check left something due goes first.
+  //    At the vector ceiling a new-mail page would add vectors, so it waits;
+  //    a deletion sync does not (WR-04).
   const dueFolder = folders.find((one) => {
     const row = rowOf(one);
-    return row !== undefined && row.stage === "built" && row.due !== null;
+    if (row === undefined || row.stage !== "built" || row.due === null) return false;
+    return !(full && row.due === "new_mail");
   });
   if (dueFolder !== undefined) {
     const row = rowOf(dueFolder)!;
@@ -447,8 +460,9 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
     );
   }
 
-  // Nothing is due, no check is due, and nothing is left to build.
-  return "idle";
+  // Nothing is due, no check is due, and nothing is left to build. At the
+  // ceiling, say so: new mail may be waiting for room.
+  return full ? "full" : "idle";
 }
 
 /**
