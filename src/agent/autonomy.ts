@@ -16,8 +16,9 @@
 //
 // NO TIMER OF ITS OWN (D-33, owner's answers of 2026-09-27). The key lives
 // exactly as long as the person's ordinary connection. The record carries no
-// expiry, the grant carries none, and no code here sets one. Plan 27-02 adds
-// the check that ends the key with the ordinary connection.
+// expiry, the grant carries none, and no code here sets one. The standing
+// check in `withAutonomySession` ends the key with the ordinary connection, at
+// the next use at the latest.
 //
 // THE ORDER OF A SESSION, and why. `withAutonomySession` is the one way to use
 // the key (D-31). It asks the allow list FIRST, by user id, from the seed and
@@ -100,7 +101,7 @@ export const STANDING_GRACE_SECONDS = 600;
  * No address, no password, no plaintext token and no expiry. Times are in
  * seconds. `generation` starts at 1 and each arming writes one more than the
  * record it replaced, so a later write can tell whether the record it read is
- * still the one stored (plan 27-02 uses it).
+ * still the one stored (`stillStored` below).
  */
 export interface AutonomyRecord {
   readonly v: 1;
@@ -139,6 +140,10 @@ export type AutonomyEnv = Pick<
  * `keyStanding` asks whether the key whose grant is `grantId` still stands
  * (D-33). Left out, it asks the library through `keyStandingFor` over
  * `env.OAUTH_KV`. It exists so tests can answer for the listing.
+ *
+ * `pendingArms` answers the grant ids whose arm is waiting in the object's
+ * queue right now: other sign-ins, still in flight. No sweep revokes one of
+ * them (D-27). Left out, nothing is pending.
  */
 export interface AutonomyDeps {
   readonly storage: AutonomyStorage;
@@ -147,6 +152,33 @@ export interface AutonomyDeps {
   readonly selfFetch: (request: Request) => Promise<Response>;
   readonly now: () => number;
   readonly keyStanding?: (grantId: string) => Promise<KeyStanding>;
+  readonly pendingArms?: () => ReadonlySet<string>;
+}
+
+/**
+ * Runs one autonomy operation at a time (D-27).
+ *
+ * Each `run` waits for the one before it to settle, then runs. A rejection in
+ * one never blocks the next. A second caller waits and then runs its own
+ * operation; it never shares the first one's result.
+ */
+export interface AutonomyQueue {
+  run<T>(operation: () => Promise<T>): Promise<T>;
+}
+
+/** A fresh, empty queue. The object holds exactly one. */
+export function oneAtATime(): AutonomyQueue {
+  let tail: Promise<void> = Promise.resolve();
+  return {
+    run<T>(operation: () => Promise<T>): Promise<T> {
+      const result = tail.then(operation);
+      tail = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
+    },
+  };
 }
 
 /** What one tool call through the key answers. Never the bearer. */
@@ -283,6 +315,30 @@ export async function unseal(
 
 // ---------------------------------------------------------------- the record
 
+/**
+ * Whether the stored record is still the one read before an `await`: the same
+ * generation and the same grant (D-15 step 6, RESEARCH §7).
+ *
+ * The grant is compared as well as the generation because a record deleted
+ * and armed afresh starts again at generation 1, and a new arm always carries
+ * a new grant. The sealed token is deliberately NOT compared: a mismatch makes
+ * the caller revoke its own fresh token, which revokes that token's whole
+ * grant, and when the grant is the stored one that would end the live key.
+ */
+function stillStored(storage: AutonomyStorage, read: AutonomyRecord): boolean {
+  const current = recordOf(storage.get<unknown>(AUTONOMY_KEY));
+  return current !== null && current.generation === read.generation && current.grantId === read.grantId;
+}
+
+/**
+ * Delete the record only if it is still the one read before an `await`.
+ * Synchronous: the check and the delete have nothing between them. With
+ * nothing read, there is nothing of this caller's to delete.
+ */
+function deleteIfStill(storage: AutonomyStorage, read: AutonomyRecord | null): void {
+  if (read !== null && stillStored(storage, read)) storage.delete(AUTONOMY_KEY);
+}
+
 /** `value` as a record, or null when it is not exactly one. */
 export function recordOf(value: unknown): AutonomyRecord | null {
   if (typeof value !== "object" || value === null) return null;
@@ -408,6 +464,15 @@ async function standingOf(deps: AutonomyDeps, grantId: string): Promise<KeyStand
   }
 }
 
+/** The grant ids whose arm is waiting in the object's queue. */
+function pendingOf(deps: AutonomyDeps): ReadonlySet<string> {
+  try {
+    return deps.pendingArms?.() ?? new Set();
+  } catch {
+    return new Set();
+  }
+}
+
 /** Whether a record armed at `armedAt` (seconds) is still inside the grace. */
 function insideGrace(deps: AutonomyDeps, armedAt: number): boolean {
   const age = Math.floor(deps.now() / 1000) - armedAt;
@@ -461,7 +526,9 @@ function rpcMessageWithId(bodyText: string, id: number): Record<string, unknown>
  *      deletes the record, `revoked`, with no retry. Anything else that is not
  *      a success answers `failed` and keeps the record.
  *   6. The rotated token is sealed and written at once, before the access
- *      token is used for anything. The seal itself is the one `await` between
+ *      token is used for anything, and only if the record is still the one
+ *      read in step 3 (same generation, same grant). Otherwise the fresh
+ *      token is revoked and the answer is `off`. The seal itself is the one `await` between
  *      the parsed answer and the write, because the platform's cipher has no
  *      synchronous form.
  *   7. `use` is handed one function, `call(tool, args)`. It refuses any tool
@@ -506,19 +573,23 @@ export async function withAutonomySession<T>(
       const standing = await standingOf(deps, record.grantId);
       if (standing === "unknown") return { kind: "failed" };
       if (standing !== "standing") {
-        await sweepAutonomyGrants(deps.env.OAUTH_KV, deps.name, null);
-        deps.storage.delete(AUTONOMY_KEY);
+        await sweepAutonomyGrants(deps.env.OAUTH_KV, deps.name, null, pendingOf(deps));
+        deleteIfStill(deps.storage, record);
         return { kind: "revoked" };
       }
     }
 
     const autonomyRefreshToken = await unseal(sealKey, deps.name, record);
     if (autonomyRefreshToken === null) {
-      deps.storage.delete(AUTONOMY_KEY);
+      deleteIfStill(deps.storage, record);
       return { kind: "off" };
     }
 
-    // 27-02: D-27's one-at-a-time queue wraps everything from the refresh to the end of `use`.
+    // One at a time (D-27). This function never enters the object's queue
+    // itself, because the arm's proof calls it from inside the queue. Every
+    // caller outside an arm (plan 27-05's alarm job, Phase 28's job) enters
+    // through `autonomyQueue.run` in the object. The generation checks below
+    // hold even for a caller that did not.
 
     let answer: Awaited<ReturnType<typeof readTokenAnswer>>;
     try {
@@ -533,7 +604,7 @@ export async function withAutonomySession<T>(
       return { kind: "failed" };
     }
     if (answer.kind === "final") {
-      deps.storage.delete(AUTONOMY_KEY);
+      deleteIfStill(deps.storage, record);
       return { kind: "revoked" };
     }
     if (answer.kind !== "ok") return { kind: "failed" };
@@ -546,7 +617,16 @@ export async function withAutonomySession<T>(
 
     const resealed = await seal(sealKey, deps.name, rotated);
     if (resealed === null) return { kind: "failed" };
-    // 27-02: the generation compare goes here: write only if the record still has the generation read above.
+    // THE GENERATION CHECK (D-15 step 6). The record may have been replaced by
+    // a new arm, or deleted, while the refresh was out. Writing the rotated
+    // token back then would bring back a key that was ended or replaced. So the
+    // write happens only if the record is still the one read above; otherwise
+    // the fresh token is revoked and this session answers `off`. The check and
+    // the write below are synchronous, with no `await` between them.
+    if (!stillStored(deps.storage, record)) {
+      await revokeAtEndpoint(deps, clientSecret, rotated);
+      return { kind: "off" };
+    }
     deps.storage.put<AutonomyRecord>(AUTONOMY_KEY, {
       ...record,
       sealedRefreshToken: resealed.sealedRefreshToken,
@@ -665,12 +745,25 @@ export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutc
   // revokes it.
   let autonomyRefreshToken: string | null = null;
 
+  // The record as this arm last knew it: the one there before it started, then
+  // the one it wrote. A delete after an `await` removes only that record.
+  let known = recordOf(deps.storage.get<unknown>(AUTONOMY_KEY));
+
+  // Other sign-ins' arms, waiting in the queue behind this one. The sweeps
+  // leave their grants alone, because each is about to be armed (D-27). This
+  // arm's own grant is never among them.
+  const othersPending = (): ReadonlySet<string> => {
+    const others = new Set(pendingOf(deps));
+    others.delete(codeParts[1] ?? "");
+    return others;
+  };
+
   const fail = async (): Promise<ArmOutcome> => {
     if (autonomyRefreshToken !== null) {
       await revokeAtEndpoint(deps, clientSecret, autonomyRefreshToken);
     }
-    deps.storage.delete(AUTONOMY_KEY);
-    await sweepAutonomyGrants(deps.env.OAUTH_KV, deps.name, null);
+    deleteIfStill(deps.storage, known);
+    await sweepAutonomyGrants(deps.env.OAUTH_KV, deps.name, null, othersPending());
     return { kind: "not_armed" };
   };
 
@@ -704,14 +797,16 @@ export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutc
     if (sealed === null) return await fail();
 
     const previous = recordOf(deps.storage.get<unknown>(AUTONOMY_KEY));
-    deps.storage.put<AutonomyRecord>(AUTONOMY_KEY, {
+    const written: AutonomyRecord = {
       v: 1,
       grantId,
       sealedRefreshToken: sealed.sealedRefreshToken,
       iv: sealed.iv,
       armedAt: Math.floor(deps.now() / 1000),
       generation: (previous?.generation ?? 0) + 1,
-    });
+    };
+    deps.storage.put<AutonomyRecord>(AUTONOMY_KEY, written);
+    known = written;
 
     const proof = await withAutonomySession(deps, (call) => call("account_whoami", {}));
     if (proof.kind !== "ok" || proof.value.kind !== "ok") return await fail();
@@ -721,7 +816,7 @@ export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutc
     // revoked, so at most one survives any sign-in. It lists rather than
     // trusting the record it replaced, so a grant minted and never armed is
     // caught too. An incomplete sweep does not fail the arm.
-    await sweepAutonomyGrants(deps.env.OAUTH_KV, deps.name, grantId);
+    await sweepAutonomyGrants(deps.env.OAUTH_KV, deps.name, grantId, othersPending());
     return { kind: "armed", grantId };
   } catch {
     return await fail();
@@ -756,7 +851,7 @@ export async function disarmWith(deps: AutonomyDeps): Promise<{ kind: "off" }> {
     if (autonomyRefreshToken !== null && isConfiguredSecret(clientSecret)) {
       await revokeAtEndpoint(deps, clientSecret, autonomyRefreshToken);
     }
-    deps.storage.delete(AUTONOMY_KEY);
+    deleteIfStill(deps.storage, record);
   } catch {
     // Nothing to read. The answer is the same.
   }

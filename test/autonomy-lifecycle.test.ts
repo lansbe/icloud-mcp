@@ -42,12 +42,14 @@ import { createLeasedMail } from "../src/agent/lease";
 import {
   AUTONOMY_KEY,
   type AutonomyDeps,
+  type AutonomyQueue,
   type AutonomyRecord,
   type AutonomyStorage,
   disarmWith,
   recordOf,
   seal,
   STANDING_GRACE_SECONDS,
+  unseal,
   withAutonomySession,
 } from "../src/agent/autonomy";
 import { AUTONOMY_CLIENT_ID, AUTONOMY_CLIENT_NAME } from "../src/agent/autonomy-client";
@@ -56,6 +58,7 @@ import {
   keyStandingFor,
   sweepAutonomyGrants,
 } from "../src/agent/autonomy-grants";
+import { UserAgent as UserAgentClass } from "../src/agent/user-agent";
 import type { UserAgent } from "../src/agent/user-agent";
 import { oauthProviderOptions } from "../src/auth/oauth";
 import type { Env } from "../src/env";
@@ -915,6 +918,269 @@ describe("autonomy credential: nothing without a sign-in, and nothing extra (D-0
         }
       }
     } finally {
+      await world.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 2: one at a time, and the generation guards.
+
+/** A promise this case resolves by hand. */
+function gate(): { promise: Promise<void>; open(): void } {
+  let open = (): void => {};
+  const promise = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { promise, open };
+}
+
+/** The refresh token a token-endpoint answer carries, read from a clone, or null. */
+async function refreshTokenIn(response: Response): Promise<string | null> {
+  try {
+    const body = (await response.clone().json()) as { refresh_token?: unknown };
+    return typeof body.refresh_token === "string" ? body.refresh_token : null;
+  } catch {
+    return null;
+  }
+}
+
+describe("autonomy credential: one at a time (D-27, RESEARCH §7)", () => {
+  it("two sign-ins at once leave exactly one autonomy grant, the one the record names, and it works", async () => {
+    const world = await setUp("lifecycle two at once");
+    let heldCount = 0;
+    let releasedBy: "second request" | "timeout" | null = null;
+    let seenWhileHeld = 0;
+    let holding = false;
+    let secondRequest = gate();
+    const restore = await replaceSeam(world.userId, (forward) => async (request) => {
+      if (holding) {
+        seenWhileHeld += 1;
+        secondRequest.open();
+      }
+      if (heldCount === 0 && new URL(request.url).pathname === "/oauth/token") {
+        heldCount += 1;
+        holding = true;
+        secondRequest = gate();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), 200);
+        });
+        releasedBy = await Promise.race([
+          secondRequest.promise.then(() => "second request" as const),
+          timeout,
+        ]);
+        if (timer !== undefined) clearTimeout(timer);
+        holding = false;
+      }
+      return forward(request);
+    });
+    try {
+      const queryA = authorizeQuery(world.clientId, CLAUDE_WEB_REDIRECT, "at-once-a");
+      const queryB = authorizeQuery(world.clientId, CLAUDE_WEB_REDIRECT, "at-once-b");
+      const ctxA = createExecutionContext();
+      const ctxB = createExecutionContext();
+      const answerA = await worker.fetch(postFrom(freshSource(), LISTED_APPLE_ID, queryA), world.env, ctxA);
+      const answerB = await worker.fetch(postFrom(freshSource(), LISTED_APPLE_ID, queryB), world.env, ctxB);
+      expect(answerA.status).toBe(302);
+      expect(answerB.status).toBe(302);
+      await waitOnExecutionContext(ctxA);
+      await waitOnExecutionContext(ctxB);
+
+      expect(releasedBy).toBe("timeout");
+      expect(seenWhileHeld).toBe(0);
+      const grants = await autonomyGrantIds(world.userId);
+      const record = await storedRecord(world.userId);
+      expect(grants).toHaveLength(1);
+      expect(grants[0]).toBe(record?.grantId);
+      expect(record?.generation).toBe(2);
+
+      const outcome = (await world.session(recordingFetch().selfFetch)) as { kind: string; value?: { kind: string } };
+      expect(outcome.kind).toBe("ok");
+      expect(outcome.value?.kind).toBe("ok");
+    } finally {
+      await restore();
+      await world.cleanup();
+    }
+  });
+
+  it("two sessions through the object's queue: the second refresh starts only after the first answered", async () => {
+    const world = await setUp("lifecycle two sessions");
+    try {
+      await world.signIn();
+      const events: string[] = [];
+      const returned: string[] = [];
+      const result = await runInDurableObject(objectOf(world.userId), async (instance: UserAgent, state) => {
+        let refreshes = 0;
+        const selfFetch = async (request: Request): Promise<Response> => {
+          const seen = await describeRequest(request);
+          if (seen.grantType !== "refresh_token") return entryEnv().SELF.fetch(request);
+          refreshes += 1;
+          const n = refreshes;
+          events.push(`start ${n}`);
+          // Give a second caller every chance to start while this one is out.
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          const response = await entryEnv().SELF.fetch(request);
+          const token = await refreshTokenIn(response);
+          if (token !== null) returned.push(token);
+          events.push(`answered ${n}`);
+          return response;
+        };
+        const deps = depsOver(state.storage.kv, world.userId, selfFetch);
+        const run = () =>
+          instance.autonomyQueue.run(() =>
+            withAutonomySession(deps, (call) => call("account_whoami", {})),
+          );
+        const first = run();
+        const second = run();
+        return { first: await first, second: await second, stored: state.storage.kv.get<AutonomyRecord>(AUTONOMY_KEY) };
+      });
+      expect(result.first.kind).toBe("ok");
+      expect(result.second.kind).toBe("ok");
+      expect(events).toEqual(["start 1", "answered 1", "start 2", "answered 2"]);
+      expect(returned).toHaveLength(2);
+      const stored = result.stored as AutonomyRecord;
+      expect(await unseal(entryEnv().AUTONOMY_SEAL_KEY, world.userId, stored)).toBe(returned[1]);
+    } finally {
+      await world.cleanup();
+    }
+  });
+
+  /**
+   * Run one session below the queue, held at its refresh, and do `meanwhile`
+   * to the object's storage while it is held. Answers the outcome, what the
+   * seam saw, and the record afterwards.
+   */
+  async function heldSession(
+    userId: string,
+    meanwhile: (storage: AutonomyStorage) => void,
+  ): Promise<{ outcome: unknown; seen: Seen[]; after: unknown }> {
+    return runInDurableObject(objectOf(userId), async (_i, state) => {
+      const seen: Seen[] = [];
+      const reached = gate();
+      const release = gate();
+      const selfFetch = async (request: Request): Promise<Response> => {
+        const described = await describeRequest(request);
+        seen.push(described);
+        if (described.grantType === "refresh_token") {
+          reached.open();
+          await release.promise;
+        }
+        return entryEnv().SELF.fetch(request);
+      };
+      const pending = withAutonomySession(depsOver(state.storage.kv, userId, selfFetch), (call) =>
+        call("account_whoami", {}),
+      );
+      await reached.promise;
+      meanwhile(state.storage.kv);
+      release.open();
+      const outcome = await pending;
+      return { outcome, seen, after: state.storage.kv.get(AUTONOMY_KEY) };
+    });
+  }
+
+  it("a record replaced by a higher generation while the refresh waited is left alone, and the fresh token is revoked", async () => {
+    const world = await setUp("lifecycle replaced while waiting");
+    try {
+      await world.signIn();
+      const record = (await storedRecord(world.userId)) as AutonomyRecord;
+      const sealed = await seal(entryEnv().AUTONOMY_SEAL_KEY, world.userId, `${world.userId}:replaced:not-a-real-token`);
+      const replacement: AutonomyRecord = {
+        v: 1,
+        grantId: "replaced",
+        sealedRefreshToken: sealed?.sealedRefreshToken as string,
+        iv: sealed?.iv as string,
+        armedAt: Math.floor(Date.now() / 1000),
+        generation: record.generation + 1,
+      };
+      const result = await heldSession(world.userId, (storage) => {
+        storage.put(AUTONOMY_KEY, replacement);
+      });
+      expect(result.outcome).toEqual({ kind: "off" });
+      expect(JSON.stringify(result.after)).toBe(JSON.stringify(replacement));
+      expect(result.seen).toEqual([
+        { path: "/oauth/token", grantType: "refresh_token", revokes: false },
+        { path: "/oauth/token", grantType: null, revokes: true },
+      ]);
+      expect(await autonomyGrantIds(world.userId)).not.toContain(record.grantId);
+    } finally {
+      await world.cleanup();
+    }
+  });
+
+  it("a record deleted while the refresh waited stays deleted, and the fresh token is revoked", async () => {
+    const world = await setUp("lifecycle deleted while waiting");
+    try {
+      await world.signIn();
+      const record = (await storedRecord(world.userId)) as AutonomyRecord;
+      const result = await heldSession(world.userId, (storage) => {
+        storage.delete(AUTONOMY_KEY);
+      });
+      expect(result.outcome).toEqual({ kind: "off" });
+      expect(result.after).toBeUndefined();
+      expect(result.seen).toEqual([
+        { path: "/oauth/token", grantType: "refresh_token", revokes: false },
+        { path: "/oauth/token", grantType: null, revokes: true },
+      ]);
+      expect(await autonomyGrantIds(world.userId)).not.toContain(record.grantId);
+    } finally {
+      await world.cleanup();
+    }
+  });
+
+  it("a session with no interference changes only the sealed token and the IV", async () => {
+    const world = await setUp("lifecycle no interference");
+    try {
+      await world.signIn();
+      const before = (await storedRecord(world.userId)) as AutonomyRecord;
+      const outcome = (await world.session(recordingFetch().selfFetch)) as { kind: string };
+      expect(outcome.kind).toBe("ok");
+      const after = (await storedRecord(world.userId)) as AutonomyRecord;
+      expect(after.sealedRefreshToken).not.toBe(before.sealedRefreshToken);
+      expect(after.iv).not.toBe(before.iv);
+      expect({ ...after, sealedRefreshToken: "", iv: "" }).toEqual({ ...before, sealedRefreshToken: "", iv: "" });
+    } finally {
+      await world.cleanup();
+    }
+  });
+
+  it("a stub reaches armAutonomy and nothing else autonomy holds: the seam and the queue are refused", async () => {
+    // Workers RPC serves only what is on the class's prototype. The seam, the
+    // queue and the pending list are instance properties, so they are not.
+    for (const member of ["autonomySelfFetch", "autonomyQueue", "pendingArmGrants"]) {
+      expect(Object.getOwnPropertyNames(UserAgentClass.prototype)).not.toContain(member);
+    }
+    expect(Object.getOwnPropertyNames(UserAgentClass.prototype)).toContain("armAutonomy");
+
+    // And through a real stub: reading any of the three is refused, while
+    // armAutonomy answers. Awaiting the property is the one read of it.
+    const stub = entryEnv().USER_AGENT.getByName(freshUserId()) as unknown as Record<string, unknown>;
+    for (const member of ["autonomySelfFetch", "autonomyQueue", "pendingArmGrants"]) {
+      await expect(Promise.resolve().then(async () => await stub[member])).rejects.toThrow(
+        /does not implement/,
+      );
+    }
+    expect(await (stub.armAutonomy as (code: unknown) => Promise<unknown>)(42)).toEqual({ kind: "not_armed" });
+  });
+
+  it("an arm whose queue rejects: the same 302, and the handler revokes the grant it minted", async () => {
+    const world = await setUp("lifecycle rejected arm");
+    let original: AutonomyQueue | null = null;
+    await runInDurableObject(objectOf(world.userId), (instance: UserAgent) => {
+      original = instance.autonomyQueue;
+      instance.autonomyQueue = {
+        run: () => Promise.reject(new Error("the queue refused")),
+      };
+    });
+    try {
+      const result = await world.signIn();
+      expectOrdinaryAnswer(result, world.userId);
+      expect(await autonomyGrantIds(world.userId)).toEqual([]);
+      expect(await storedRecord(world.userId)).toBeUndefined();
+    } finally {
+      await runInDurableObject(objectOf(world.userId), (instance: UserAgent) => {
+        if (original !== null) instance.autonomyQueue = original;
+      });
       await world.cleanup();
     }
   });

@@ -58,7 +58,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
-import { type ArmOutcome, armWith } from "./autonomy";
+import { type ArmOutcome, type AutonomyQueue, armWith, oneAtATime } from "./autonomy";
 import { type RecallStore, recallStore } from "../recall/index";
 import { grantsRemainFor } from "../recall/grant-check";
 import { destroyAll, type LedgerHandle, sweepExpired } from "../recall/lifecycle";
@@ -381,6 +381,35 @@ export class UserAgent extends DurableObject<Env> {
    * the object sent; production never overrides it.
    */
   autonomySelfFetch = (request: Request): Promise<Response> => this.env.SELF.fetch(request);
+
+  /**
+   * The one autonomy queue (Phase 27, D-27). Every autonomy entry point runs
+   * through it, one operation at a time: `armAutonomy` today, plan 27-05's
+   * alarm job and Phase 28's job later. Those two take the object's name from
+   * `storedOwnName()`. Inner calls never re-enter it: the arm's proof calls
+   * the session function directly. The lease and every other method never
+   * wait on it.
+   *
+   * WHY. The Claude client submits the sign-in form twice, about 1.4 seconds
+   * apart (measured 2026-09-21), so every sign-in arms twice. Without one at a
+   * time, the two arms interleave at every `await`, sweep each other's grants,
+   * and the person ends with no key. It is also what meets D-15's "one
+   * redemption at a time": a second caller waits and then runs its own
+   * operation, so no two refreshes of one token are ever out at once.
+   *
+   * An instance property, not a method, so no Worker holding a stub can reach
+   * it (the seam above follows the same rule). If the object is evicted, the
+   * queue is lost with everything in it. That is safe: the stored token is
+   * still the current one or the previous one, and the library accepts both.
+   */
+  autonomyQueue: AutonomyQueue = oneAtATime();
+
+  /**
+   * How many arms are waiting in the queue for each grant id. The sweeps leave
+   * these grants alone, because each belongs to a sign-in whose arm has not
+   * run yet (D-27). An instance property, for the same reason as the queue.
+   */
+  pendingArmGrants = new Map<string, number>();
 
   /**
    * The object's stored own name, when it is a 64-hex user id, else null.
@@ -783,6 +812,11 @@ export class UserAgent extends DurableObject<Env> {
    * This method never reads the platform's name itself; the one reader of it in
    * this module stays inside `rememberOwnName`.
    *
+   * The whole arm runs inside `autonomyQueue.run`, after the name is known, so
+   * two sign-ins arming at once run one after the other (D-27). While it
+   * waits, its grant id is listed in `pendingArmGrants`, so an arm ahead of it
+   * does not sweep the grant it is about to arm.
+   *
    * Never throws: an error's class does not survive RPC, and the caller must be
    * able to tell "not armed" from nothing at all.
    */
@@ -790,19 +824,29 @@ export class UserAgent extends DurableObject<Env> {
     if (typeof code !== "string") return { kind: "not_armed" };
     const name = this.rememberOwnName();
     if (name === null) return { kind: "not_armed" };
+    const grantId = code.split(":")[1] ?? "";
+    const pending = this.pendingArmGrants;
+    pending.set(grantId, (pending.get(grantId) ?? 0) + 1);
     try {
-      return await armWith(
-        {
-          storage: this.ctx.storage.kv,
-          name,
-          env: this.env,
-          selfFetch: (request) => this.autonomySelfFetch(request),
-          now: () => Date.now(),
-        },
-        code,
+      return await this.autonomyQueue.run(() =>
+        armWith(
+          {
+            storage: this.ctx.storage.kv,
+            name,
+            env: this.env,
+            selfFetch: (request) => this.autonomySelfFetch(request),
+            now: () => Date.now(),
+            pendingArms: () => new Set(pending.keys()),
+          },
+          code,
+        ),
       );
     } catch {
       return { kind: "not_armed" };
+    } finally {
+      const left = (pending.get(grantId) ?? 1) - 1;
+      if (left > 0) pending.set(grantId, left);
+      else pending.delete(grantId);
     }
   }
 
