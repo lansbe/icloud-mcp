@@ -412,12 +412,19 @@ export class UserAgent extends DurableObject<Env> {
 
   /**
    * Revoke every autonomy grant the person whose user id is `name` holds,
-   * keeping none, except the grants whose arm is waiting in the queue: those
-   * are sign-ins still in flight (D-27). The alarm job calls it when the key
-   * has ended. A seam, like the one above.
+   * except `keepGrantId` and the grants whose arm is waiting in the queue:
+   * those are sign-ins still in flight (D-27). The alarm job calls it keeping
+   * none when the key has ended, and keeping the record's grant while the key
+   * stands (review R2-WR-02). A seam, like the one above.
    */
-  sweepAutonomy = (name: string): Promise<unknown> =>
-    sweepAutonomyGrants(this.env.OAUTH_KV, name, null, new Set(this.pendingArmGrants.keys()));
+  sweepAutonomy = (name: string, keepGrantId: string | null = null): Promise<unknown> =>
+    sweepAutonomyGrants(
+      this.env.OAUTH_KV,
+      name,
+      keepGrantId,
+      new Set(this.pendingArmGrants.keys()),
+      Math.floor(Date.now() / 1000),
+    );
 
   /**
    * The one autonomy queue (Phase 27, D-27). Every autonomy entry point runs
@@ -610,7 +617,7 @@ export class UserAgent extends DurableObject<Env> {
             storage: this.ctx.storage.kv,
             name: ownName,
             keyStanding: (name, grantId) => this.keyStanding(name, grantId),
-            sweep: (name) => this.sweepAutonomy(name),
+            sweep: (name, keepGrantId) => this.sweepAutonomy(name, keepGrantId),
             now: () => Date.now(),
           }),
         );

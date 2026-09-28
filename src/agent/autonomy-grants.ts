@@ -5,10 +5,18 @@
 // time. Never props. Nothing here reads a grant's props, and nothing here calls
 // the library's token-unwrapping helper, which hands back decrypted props.
 //
+// One helper, `storedGrantOf`, also reads a single grant's stored record by its
+// key (review R2-WR-02, R2-IN-01). The library's listing loads the same record
+// to build its summary. The helper takes two facts from it, the client id and
+// whether the one-time code is still unexchanged, and nothing else. The props
+// in that record are encrypted under a key derived from a token this module
+// never holds, and nothing here looks at them.
+//
 // 1. `sweepAutonomyGrants` revokes this person's autonomy grants, all of them
 //    or all but one. The object runs it after every arm: a successful arm keeps
 //    the grant its record names, and a failed arm keeps none (D-13, D-28). It
-//    also runs when the standing check below says the key has ended.
+//    also runs when the standing check below says the key has ended, and on
+//    the alarm while the key stands, keeping the record's grant (R2-WR-02).
 // 2. `keyStandingFor` says whether the key the record names still stands: its
 //    own grant is still listed, and the person still holds an ordinary grant
 //    from some other client (D-33). The session asks it before every unseal,
@@ -31,6 +39,12 @@ import { AUTONOMY_CLIENT_ID } from "./autonomy-client";
 
 /** A user id: 64 lower-case hex characters. */
 const USER_ID = /^[0-9a-f]{64}$/;
+
+/**
+ * A grant id as the library makes them: base64url letters, and no colon, so it
+ * can only ever name one grant key of the one person it is read under.
+ */
+const GRANT_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 /** A page cap, so a store that keeps handing back a cursor cannot spin forever. */
 const MAX_PAGES = 1000;
@@ -123,6 +137,41 @@ async function everyGrantOf(kv: KVNamespace, userId: string): Promise<ListedGran
   }
 }
 
+/** What one grant's stored record says, as much of it as autonomy reads. */
+type StoredGrant =
+  | { readonly kind: "found"; readonly clientId: string; readonly codeUnexchanged: boolean }
+  | { readonly kind: "absent" }
+  | { readonly kind: "unreadable" };
+
+/**
+ * Read one grant's stored record straight from the store, by its key (review
+ * R2-WR-02, R2-IN-01). A direct key read, not a listing, so it does not lag a
+ * fresh write the way the listing can.
+ *
+ * Answers the grant's client id, and whether its one-time code is still
+ * unexchanged. The library keeps the code's wrapped key on the grant until the
+ * code is exchanged, and deletes it in the exchange, so its presence is the
+ * library's own mark of a code nobody has redeemed yet. `absent` when no grant
+ * has that key. `unreadable` when the ids are malformed or the read failed.
+ */
+async function storedGrantOf(kv: KVNamespace, userId: string, grantId: string): Promise<StoredGrant> {
+  if (typeof userId !== "string" || !USER_ID.test(userId)) return { kind: "unreadable" };
+  if (typeof grantId !== "string" || !GRANT_ID.test(grantId)) return { kind: "unreadable" };
+  try {
+    const raw: unknown = await kv.get(`grant:${userId}:${grantId}`, { type: "json" });
+    if (raw === null) return { kind: "absent" };
+    if (typeof raw !== "object" || Array.isArray(raw)) return { kind: "unreadable" };
+    const grant = raw as { clientId?: unknown; authCodeWrappedKey?: unknown };
+    return {
+      kind: "found",
+      clientId: typeof grant.clientId === "string" ? grant.clientId : "",
+      codeUnexchanged: typeof grant.authCodeWrappedKey === "string",
+    };
+  } catch {
+    return { kind: "unreadable" };
+  }
+}
+
 /**
  * Revoke every autonomy grant `userId` holds, except `keepGrantId` and any id
  * in `alsoKeep` (D-13, D-28).
@@ -132,23 +181,37 @@ async function everyGrantOf(kv: KVNamespace, userId: string): Promise<ListedGran
  * queue: those are other sign-ins still in flight, and revoking one would make
  * that arm fail and end the person's key (D-27).
  *
- * A SUCCESSFUL ARM'S SWEEP (a `keepGrantId` given) also leaves every autonomy
- * grant created less than `AUTONOMY_CODE_LIFETIME_SECONDS` before `nowSeconds`
- * (review WR-01). `alsoKeep` covers a sibling sign-in only once its arm has
- * reached the object. Its grant exists earlier than that: the sign-in mints it,
- * builds its answer, and only then sends the arm. The Claude client submits the
- * form twice, about 1.4 seconds apart, so a first arm's sweep regularly lands in
+ * A SWEEP THAT KEEPS A GRANT (a `keepGrantId` given: a successful arm, or the
+ * alarm while the key stands) also leaves every autonomy grant that is BOTH
+ * created less than `AUTONOMY_CODE_LIFETIME_SECONDS` before `nowSeconds` AND
+ * still holding an unexchanged code (review WR-01, narrowed by R2-WR-02).
+ * `alsoKeep` covers a sibling sign-in only once its arm has reached the
+ * object. Its grant exists earlier than that: the sign-in mints it, builds its
+ * answer, and only then sends the arm. The Claude client submits the form
+ * twice, about 1.4 seconds apart, so a first arm's sweep regularly lands in
  * that window. Revoking the sibling's grant there makes the sibling's arm fail,
  * and its fail-toward-off then ends the first arm's key too, so the person is
- * left with none. A young grant that is left alone is either about to be armed,
- * or was never exchanged and ends by itself when its code record expires. The
- * grant a re-arm replaced is revoked by id instead (`revokeAutonomyGrant`), so
- * this age rule does not keep it alive. A grant with no readable `createdAt` is
- * treated as old.
+ * left with none. Such a grant's code is unexchanged, because only its own arm
+ * exchanges it, and arms run one at a time. So a young grant is spared only
+ * when its stored record (`storedGrantOf`) still shows an unexchanged code:
+ * that grant is either about to be armed, or ends by itself when the library's
+ * ten-minute expiry on it runs out.
+ *
+ * A young grant that WAS exchanged is not spared (review R2-WR-02). Two kinds
+ * exist, and both land on the double-submit path, where every grant is young:
+ * the grant a re-arm replaced, when the revoke of it by id failed; and the
+ * grant of an arm that died after its exchange. An exchanged grant has no
+ * expiry of its own, so sparing it once left it live until the person's next
+ * sign-in. The revoke by id (`revokeAutonomyGrant`) is best effort, and this
+ * sweep is its backstop. When the listing lags and this sweep cannot see the
+ * grant either, the alarm's sweep finds it later. A young grant whose record
+ * cannot be read is spared and the answer is `incomplete`. A grant with no
+ * readable `createdAt` is treated as old.
  *
  * A sweep that ENDS the key (`keepGrantId` null: a failed arm, the standing
- * check, the alarm job) leaves only `alsoKeep`. It does not apply the age rule,
- * because leaving young grants there could leave a live grant with no record.
+ * check, the alarm job once the key has ended) leaves only `alsoKeep`. It does
+ * not apply the age rule, because leaving young grants there could leave a
+ * live grant with no record.
  *
  * Revokes one at a time, through the library's own revoke, which deletes the
  * grant and every token under it. Answers `done`, or `incomplete` when the
@@ -178,7 +241,14 @@ export async function sweepAutonomyGrants(
       grant.createdAt !== null &&
       nowSeconds - grant.createdAt < AUTONOMY_CODE_LIFETIME_SECONDS
     ) {
-      continue;
+      // Young. Spared only while its code is unexchanged (review R2-WR-02).
+      const stored = await storedGrantOf(kv, userId, grant.id);
+      if (stored.kind === "absent") continue;
+      if (stored.kind === "unreadable") {
+        outcome = "incomplete";
+        continue;
+      }
+      if (stored.codeUnexchanged) continue;
     }
     try {
       await helpersOver(kv).revokeGrant(grant.id, userId);
@@ -200,6 +270,11 @@ export async function sweepAutonomyGrants(
  * of the same sign-in form. That grant would then stay live, with its refresh
  * token thrown away and never revoked. The caller passes only an id it read
  * from its own record, which only ever names an autonomy grant.
+ *
+ * Best effort (review R2-WR-02). The caller does not act on `incomplete`: the
+ * arm's sweep that follows revokes the grant anyway, because an exchanged
+ * grant is never spared for being young, and when the listing does not show
+ * it yet, the alarm's sweep finds it later.
  *
  * Answers `done`, or `incomplete` when the user id is malformed, the id is
  * empty, or the revoke rejected. Never throws.

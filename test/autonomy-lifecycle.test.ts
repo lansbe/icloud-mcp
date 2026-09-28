@@ -464,6 +464,56 @@ function listingWithout(real: KVNamespace, hidden: string): KVNamespace {
   });
 }
 
+/**
+ * A store whose first delete of `key` rejects, the way a KV error would. Every
+ * other call, and every later delete of `key`, is the real store's.
+ */
+function deleteFailsOnce(real: KVNamespace, key: string): KVNamespace {
+  let failed = false;
+  return new Proxy(real, {
+    get(target, prop) {
+      if (prop === "delete") {
+        return async (name: string) => {
+          if (name === key && !failed) {
+            failed = true;
+            throw new Error("the store could not delete this key");
+          }
+          return target.delete(name);
+        };
+      }
+      const value = Reflect.get(target, prop, target) as unknown;
+      return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+    },
+  });
+}
+
+/**
+ * Exchange an autonomy code at the real token endpoint, as the autonomy
+ * client, the way an arm does, and write no record: an arm that died just
+ * after its exchange. The tokens in the answer are dropped.
+ */
+async function exchangeAutonomyCode(env: Env, code: string): Promise<void> {
+  const secret = entryEnv().AUTONOMY_CLIENT_SECRET as string;
+  const basic = btoa(`${encodeURIComponent(AUTONOMY_CLIENT_ID)}:${encodeURIComponent(secret)}`);
+  const response = await callWorker(
+    new Request(`${ORIGIN}/oauth/token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: `Basic ${basic}`,
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: AUTONOMY_REDIRECT_URI,
+      }).toString(),
+    }),
+    env,
+  );
+  expect(response.status).toBe(200);
+  await response.arrayBuffer();
+}
+
 // ---------------------------------------------------------------------------
 
 describe("autonomy credential: re-arm, sweep and failure isolation (D-11, D-13, D-26, D-28)", () => {
@@ -562,6 +612,63 @@ describe("autonomy credential: re-arm, sweep and failure isolation (D-11, D-13, 
       expect((await storedRecord(world.userId))?.generation).toBe(replaced.generation + 1);
       expect(await autonomyGrantIds(world.userId)).toEqual([newGrantId]);
       expect(await keysUnder(`token:${world.userId}:${replaced.grantId}:`)).toEqual([]);
+    } finally {
+      await world.cleanup();
+    }
+  });
+
+  it("a re-arm whose revoke of the replaced grant fails still ends it: the sweep does not spare an exchanged grant for being young (review R2-WR-02)", async () => {
+    const world = await setUp("lifecycle replaced revoke fails");
+    try {
+      await world.signIn();
+      const replaced = (await storedRecord(world.userId)) as AutonomyRecord;
+      const code = await mintAutonomyCode(world.env, world.userId);
+      const newGrantId = code.split(":")[1] as string;
+      // The replaced grant was armed seconds ago, so it is younger than a
+      // code's lifetime. The first try to delete it fails.
+      const flaky = deleteFailsOnce(entryEnv().OAUTH_KV, `grant:${world.userId}:${replaced.grantId}`);
+
+      const outcome = await runInDurableObject(objectOf(world.userId), async (instance: UserAgent, state) =>
+        instance.autonomyQueue.run(async (ticket) =>
+          armWith(
+            {
+              storage: state.storage.kv,
+              name: world.userId,
+              env: { ...entryEnv(), OAUTH_KV: flaky },
+              selfFetch: (request) => entryEnv().SELF.fetch(request),
+              now: () => Date.now(),
+              ticket,
+            },
+            code,
+          ),
+        ),
+      );
+
+      expect(outcome).toEqual({ kind: "armed", grantId: newGrantId });
+      expect(await autonomyGrantIds(world.userId)).toEqual([newGrantId]);
+      expect(await keysUnder(`grant:${world.userId}:${replaced.grantId}`)).toEqual([]);
+    } finally {
+      await world.cleanup();
+    }
+  });
+
+  it("an arm that died after its exchange leaves a young grant that the next arm's sweep ends (review R2-WR-02)", async () => {
+    const world = await setUp("lifecycle died after exchange");
+    try {
+      await world.signIn();
+      // A sibling sign-in's arm exchanged its code and then died: its grant
+      // is exchanged and young, and no record names it.
+      const deadCode = await mintAutonomyCode(world.env, world.userId);
+      const dead = deadCode.split(":")[1] as string;
+      await exchangeAutonomyCode(world.env, deadCode);
+      expect(await autonomyGrantIds(world.userId)).toContain(dead);
+
+      const code = await mintAutonomyCode(world.env, world.userId);
+      const grantId = code.split(":")[1] as string;
+      expect(await objectOf(world.userId).armAutonomy(code)).toEqual({ kind: "armed", grantId });
+
+      expect(await autonomyGrantIds(world.userId)).toEqual([grantId]);
+      expect(await keysUnder(`token:${world.userId}:${dead}:`)).toEqual([]);
     } finally {
       await world.cleanup();
     }

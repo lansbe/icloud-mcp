@@ -96,8 +96,17 @@ function helpers() {
   return getOAuthApi(oauthProviderOptions, entryEnv());
 }
 
-/** A grant for `userId` in the library's summary shape, under the library's key. */
-function seedGrant(userId: string, id: string, clientId: string): Promise<void> {
+/**
+ * A grant for `userId` in the library's summary shape, under the library's key.
+ * `extra` overrides fields, such as `createdAt`, or adds a code's wrapped key
+ * to make a grant whose code has not been exchanged.
+ */
+function seedGrant(
+  userId: string,
+  id: string,
+  clientId: string,
+  extra: Record<string, unknown> = {},
+): Promise<void> {
   return entryEnv().OAUTH_KV.put(
     `grant:${userId}:${id}`,
     JSON.stringify({
@@ -108,6 +117,7 @@ function seedGrant(userId: string, id: string, clientId: string): Promise<void> 
       metadata: { clientName: "a client" },
       encryptedProps: "not-real-ciphertext-written-by-a-test",
       createdAt: 1_780_000_000,
+      ...extra,
     }),
   );
 }
@@ -344,6 +354,34 @@ describe("the autonomy job on the alarm: when the key ends (AUTO-04, AUTO-06, D-
     expect(await storedRecord(a)).toEqual(record);
     expect(await autonomyGrantIds(userId)).toEqual(["auto-1"]);
     expect(seen).toEqual([]);
+  });
+
+  it("a standing key past its grace: the alarm ends stray autonomy grants, keeps its own, and spares a code not yet exchanged (review R2-WR-02)", async () => {
+    const userId = freshUserId();
+    const a = objectFor(userId);
+    const now = Math.floor(Date.now() / 1000);
+    await seedGrant(userId, "auto-1", AUTONOMY_CLIENT_ID);
+    await seedGrant(userId, "ordinary-1", "some-claude-client");
+    // An old stray: a replaced grant whose revoke failed, long ago.
+    await seedGrant(userId, "auto-old-stray", AUTONOMY_CLIENT_ID);
+    // A young stray that was exchanged: an arm that died after its exchange.
+    await seedGrant(userId, "auto-young-exchanged", AUTONOMY_CLIENT_ID, { createdAt: now - 30 });
+    // A young grant whose code is still unexchanged: a sign-in whose arm has
+    // not reached the object yet. It must be left alone.
+    await seedGrant(userId, "auto-young-code", AUTONOMY_CLIENT_ID, {
+      createdAt: now - 30,
+      authCodeWrappedKey: "not-a-real-wrapped-key",
+    });
+    const record = await seedRecord(a, userId, "auto-1");
+    const seen = await recordSelfCalls(a);
+
+    await runAlarm(a);
+
+    expect(await storedRecord(a)).toEqual(record);
+    expect((await autonomyGrantIds(userId)).sort()).toEqual(["auto-1", "auto-young-code"]);
+    expect((await grantsOf(userId)).map((grant) => grant.id)).toContain("ordinary-1");
+    expect(seen).toEqual([]);
+    expect(await alarmAt(a)).not.toBeNull();
   });
 
   it("inside the grace after arming, keeps the record and does not ask", async () => {

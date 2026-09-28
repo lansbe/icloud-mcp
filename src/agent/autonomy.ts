@@ -1071,11 +1071,14 @@ export async function armWith(deps: AutonomyDeps, code: string): Promise<ArmOutc
     // The sweep (D-13, D-28): every other autonomy grant this person holds is
     // revoked, so at most one survives any sign-in. It lists rather than
     // trusting the record it replaced, so a grant minted and never armed is
-    // caught too. It is the backstop to the revoke above, not the only way the
-    // replaced grant ends. It leaves any autonomy grant younger than a code's
-    // lifetime, because a sibling sign-in may have minted it and not yet sent
-    // its arm (review WR-01; see `sweepAutonomyGrants`). An incomplete sweep
-    // does not fail the arm.
+    // caught too. It is the backstop to the revoke above, which is best effort
+    // and whose answer is not acted on here. It leaves an autonomy grant
+    // younger than a code's lifetime only while its code is unexchanged,
+    // because a sibling sign-in may have minted it and not yet sent its arm
+    // (review WR-01). A young grant that was exchanged, such as the replaced
+    // one, is revoked (review R2-WR-02; see `sweepAutonomyGrants`). An
+    // incomplete sweep does not fail the arm. The alarm sweeps again while
+    // the key stands.
     await sweepAutonomyGrants(
       deps.env.OAUTH_KV,
       deps.name,
@@ -1102,15 +1105,15 @@ export const AUTONOMY_ALARM_RETRY_MS = 3600000;
  *
  * `name` is the object's stored own name, from `storedOwnName()`. The job never
  * looks for a name itself. `keyStanding` is 27-02's `keyStandingFor` over the
- * sign-in store, and `sweep` is 27-02's `sweepAutonomyGrants` keeping no grant.
- * Both are seams on the object, so tests can answer for the listing. `now`
- * answers milliseconds since the epoch.
+ * sign-in store, and `sweep` is 27-02's `sweepAutonomyGrants`, keeping
+ * `keepGrantId` or no grant when it is null. Both are seams on the object, so
+ * tests can answer for the listing. `now` answers milliseconds since the epoch.
  */
 export interface AutonomyAlarmDeps {
   readonly storage: AutonomyStorage;
   readonly name: string;
   readonly keyStanding: (name: string, grantId: string) => Promise<KeyStanding>;
-  readonly sweep: (name: string) => Promise<unknown>;
+  readonly sweep: (name: string, keepGrantId: string | null) => Promise<unknown>;
   readonly now: () => number;
 }
 
@@ -1152,6 +1155,12 @@ export interface AutonomyAlarmOutcome {
  *      only if it is still the one read (D-27), and wants no time. `standing`
  *      or `unknown` keeps it and wants one day from now: a listing error must
  *      not end every person's key at once.
+ *   4. On `standing`, one more sweep, keeping the record's grant (review
+ *      R2-WR-02). It ends stray autonomy grants an arm could not: a replaced
+ *      grant whose revoke failed while the listing hid it, or the grant of an
+ *      arm that died after its exchange. It applies the same rules as an
+ *      arm's sweep, so a grant whose arm is waiting, or whose code is young
+ *      and unexchanged, is left alone. Its answer changes nothing here.
  *
  * There is no expiry and no timer. The key ends only when its grant is gone or
  * the person holds no ordinary grant. Never throws: every `catch` answers a
@@ -1187,13 +1196,20 @@ export async function autonomyAlarmJob(deps: AutonomyAlarmDeps): Promise<Autonom
     }
     if (standing === "revoked" || standing === "connection_ended") {
       try {
-        await deps.sweep(deps.name);
+        await deps.sweep(deps.name, null);
       } catch {
         // An incomplete sweep still ends the key. A stray autonomy grant opens
         // nothing without the record, and the next arm sweeps again.
       }
       deleteIfStill(deps.storage, record);
       return { kind: "ended", wantedAt: null };
+    }
+    if (standing === "standing") {
+      try {
+        await deps.sweep(deps.name, record.grantId);
+      } catch {
+        // The key stands either way. The next alarm sweeps again.
+      }
     }
     return { kind: "kept", wantedAt: now + AUTONOMY_ALARM_INTERVAL_MS };
   } catch {
