@@ -446,15 +446,17 @@ const DAY_MS = 86_400_000;
  * default from 26-CONTEXT's notice-accuracy note (D-32), not the owner's draft:
  * the draft said "never the body", but the fingerprint is made from the
  * subject, the sender's name and the first lines of the body, so that was true
- * of what is kept and not of what is read (26-REVIEW WR-01). It agrees with
- * SECURITY.md's "What is kept". The owner still approves the words, and edits
- * this one constant if he wants them changed.
+ * of what is kept and not of what is read (26-REVIEW WR-01). Line two names all
+ * three, because `recallItemOf` in src/recall/mail-source.ts embeds all three
+ * (26-REVIEW-2 IN-01). It agrees with SECURITY.md's "What is kept". PENDING
+ * OWNER APPROVAL: the owner approves the words, and edits this one constant if
+ * he wants them changed.
  */
 export const RECALL_NOTICE: SignInNotice = {
   heading: "A searchable copy of your recent mail",
   lines: [
     "This server also keeps a searchable copy of your recent mail, so Claude can find a message by what it was about.",
-    `It keeps each message's subject line and a numeric fingerprint made from its opening lines, for ${RECALL_TTL_MS / DAY_MS} days. It does not keep the text itself.`,
+    `It keeps each message's subject line and a numeric fingerprint made from the subject, the sender's name and the opening lines, for ${RECALL_TTL_MS / DAY_MS} days. It does not keep the text itself.`,
     "It is deleted within a day of your access ending.",
   ],
 };

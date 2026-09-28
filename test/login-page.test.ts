@@ -978,8 +978,17 @@ describe("the recall notice is above the fields, on every render", () => {
     // what is kept and what it is made from, and that the text is not kept.
     const text = RECALL_NOTICE.lines.join(" ");
     expect(text).not.toMatch(/never the body/i);
-    expect(text).toMatch(/fingerprint made from its opening lines/);
     expect(text).toMatch(/does not keep the text itself/);
+  });
+
+  it("names everything the fingerprint is made from: the subject, the sender's name and the opening lines (26-REVIEW-2 IN-01)", () => {
+    // recallItemOf embeds all three, so naming only the opening lines left the
+    // sender's name out of the consent.
+    const text = RECALL_NOTICE.lines.join(" ");
+    expect(text).toMatch(
+      /fingerprint made from the subject, the sender's name and the opening lines/,
+    );
+    expect(text).toContain(`for ${RECALL_TTL_MS / 86_400_000} days`);
   });
 
   it("shows on the first load, for an ordinary client", async () => {
