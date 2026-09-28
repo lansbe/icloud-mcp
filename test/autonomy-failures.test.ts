@@ -156,7 +156,7 @@ describe("an auth failure (AUTO-10, D-16 as revised)", () => {
     expect(run.disarms).toBe(0);
   });
 
-  it("auth_failed from mail_flag mid-run: the run stops there, later verdicts are not attempted and have no record", async () => {
+  it("auth_failed from mail_flag mid-run: the run stops there, later verdicts are not attempted, and no verdict keeps a record", async () => {
     const storage = armedStorage([rule("r1", FLAG)]);
     const marker = storage.get(JOB_MARKER_KEY);
     const run = await directRun(storage, {
@@ -165,8 +165,13 @@ describe("an auth failure (AUTO-10, D-16 as revised)", () => {
     });
     expect(run.outcome).toBe("auth_failed");
     expect(run.calls.map((call) => call.tool)).toEqual(["changes_since", "mail_flag"]);
+    // The refused sign-in flagged nothing, so its reservation is removed and
+    // the next run tries that message again (28-REVIEW WR-02).
     const acted = [...storage.list<{ state: string }>({ prefix: "acted:" })];
-    expect(acted.map(([, value]) => value.state)).toEqual(["auth_failed"]);
+    expect(acted).toEqual([]);
+    expect(
+      (storage.get<ActivityEntry[]>(ACTIVITY_KEY) ?? []).filter((entry) => entry.kind === "flag").map((entry) => entry.outcome),
+    ).toEqual(["auth_failed"]);
     expect(failures(storage)).toBe(1);
     expect(storage.get(JOB_MARKER_KEY)).toEqual(marker);
   });

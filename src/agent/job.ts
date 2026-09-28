@@ -32,7 +32,9 @@
 //      record in that final state and make no call; otherwise write the record
 //      as `reserved` synchronously, make the one tool call, then write what
 //      happened. So a redelivered alarm never acts twice (D-15). A failure that
-//      means the account cannot be reached stops the run at once.
+//      means the account cannot be reached stops the run at once. A busy lease
+//      or a sign-in that did not go through proves nothing was done, so that
+//      reservation is removed and the next run tries again (28-REVIEW WR-02).
 //   6. Store the fresh marker LAST, only when the run reached the end. A run
 //      that stopped keeps the old marker, so the next run sees the same mail
 //      and the records skip what was already done.
@@ -276,6 +278,17 @@ export async function actedKey(ruleId: string, action: "flag" | "draft", message
 
 /** Outcomes that mean the account could not be reached: the run stops. */
 const STOPS_THE_RUN: readonly ActionOutcome[] = ["busy", "auth_failed", "error", "failed", "unreadable"];
+
+/**
+ * Outcomes that prove nothing reached the mailbox (28-REVIEW WR-02). A busy
+ * lease is refused at the door before any socket, and a sign-in that did not
+ * go through writes nothing. So the reservation is removed rather than kept:
+ * the run stops and keeps the old marker, and the next run, which sees the same
+ * message, acts on it then. Every other outcome may have reached iCloud (an
+ * error, a failed call, an unreadable answer), so it stays final: a missed
+ * draft beats two (D-15).
+ */
+const NOTHING_DONE: readonly ActionOutcome[] = ["busy", "auth_failed"];
 
 /** Reply outcomes that made no call. They never count toward a cap (D-30). */
 const REPLY_SKIPS: readonly ActionOutcome[] = [
@@ -529,6 +542,12 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
         deps.storage.put<ActedRecord>(v.key, { state: outcome, at: now });
         record(v.action, v.rule.id, v.row.id, outcome);
       };
+      // An answer that proves nothing was done: the reservation goes, so the
+      // next run tries again, and the entry still says what happened (WR-02).
+      const release = (v: (typeof verdicts)[number], outcome: ActionOutcome) => {
+        deps.storage.delete(v.key);
+        record(v.action, v.rule.id, v.row.id, outcome);
+      };
 
       for (const v of verdicts) {
         const prior = deps.storage.get<unknown>(v.key);
@@ -547,7 +566,8 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
           deps.storage.put<ActedRecord>(v.key, { state: "reserved", at: now });
           flagsThisRun += 1;
           const outcome = await setFlag(call, v.row);
-          settle(v, outcome);
+          if (NOTHING_DONE.includes(outcome)) release(v, outcome);
+          else settle(v, outcome);
           if (STOPS_THE_RUN.includes(outcome)) return stopOfAction(outcome, authFailed);
           continue;
         }
@@ -572,12 +592,13 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
         }
         deps.storage.put<ActedRecord>(v.key, { state: "reserved", at: now });
         const outcome = await placeDraft(call, v.row, draft, self);
-        if (!REPLY_SKIPS.includes(outcome)) {
+        if (!REPLY_SKIPS.includes(outcome) && !NOTHING_DONE.includes(outcome)) {
           draftsThisRun += 1;
           draftsToday += 1;
           deps.storage.put(JOB_DRAFT_DAY_KEY, { day, count: draftsToday });
         }
-        settle(v, outcome);
+        if (NOTHING_DONE.includes(outcome)) release(v, outcome);
+        else settle(v, outcome);
         if (STOPS_THE_RUN.includes(outcome)) return stopOfAction(outcome, authFailed);
       }
 

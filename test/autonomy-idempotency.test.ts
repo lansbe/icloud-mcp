@@ -29,7 +29,8 @@ import { AUTONOMY_KEY } from "../src/agent/autonomy";
 import { JOB_AUTH_FAILURES_KEY, JOB_NEXT_AT_KEY, RULES_KEY } from "../src/agent/job";
 import { nextWakeAfter } from "../src/agent/cadence";
 import type { UserAgent } from "../src/agent/user-agent";
-import { ConnectionBusyError } from "../src/errors";
+import { ConnectionBusyError, ImapAuthError, ImapConnectError, ImapCredentialRefusedError } from "../src/errors";
+import type { CallAnswer } from "../src/agent/tool-call";
 import { connectImap } from "../src/mail/socket";
 import { entryEnv } from "./fixtures/bound-secrets";
 import type { FakeDuplex } from "./fixtures/fake-duplex";
@@ -136,6 +137,61 @@ describe("never a second draft (AUTO-12, D-15)", () => {
       expect(around[2]).toBe(around[0]);
     });
   }
+});
+
+// ======================== an answer that proves nothing was done (28-REVIEW WR-02)
+
+describe("a busy or refused sign-in is tried again on the next run (28-REVIEW WR-02)", () => {
+  // Both answers come before any socket reaches the mailbox: a busy lease is
+  // refused at the door, and a refused sign-in writes nothing. So nothing was
+  // flagged or placed, and the reservation must not stand as if it had been.
+  // The run stops and keeps the old marker, so the next run sees the same
+  // message again and must act on it then.
+  const nothingDone: Array<[string, () => ReturnType<typeof toolError>]> = [
+    ["busy", () => toolError(new ConnectionBusyError())],
+    ["a refused password", () => toolError(new ImapCredentialRefusedError())],
+    ["a sign-in that did not go through", () => toolError(new ImapAuthError())],
+  ];
+
+  for (const [name, answer] of nothingDone) {
+    for (const [what, then, tool] of [
+      ["a flag", FLAG, "mail_flag"],
+      ["a draft", DRAFT, "mail_compose_reply"],
+    ] as const) {
+      it(`${what} answered ${name}: no record is left, the entry says so, and the next run acts`, async () => {
+        const storage = armedStorage([rule("r1", then)]);
+        const first = await directRun(storage, {
+          rows: [newRow(1)],
+          answer: (called) => (called === tool ? answer() : undefined),
+        });
+        expect(actions(first.calls).map((call) => call.tool)).toEqual([tool]);
+        expect(acted(storage)).toEqual([]);
+        expect(ring(storage).filter((entry) => entry.kind !== "run")).toHaveLength(1);
+
+        const second = await directRun(storage, { rows: [newRow(1)], now: T0 + 15 * MIN });
+        expect(actions(second.calls).map((call) => call.tool)).toEqual([tool]);
+        expect(second.outcome).toBe("done");
+        expect(acted(storage).map(([, value]) => value.state)).toEqual([tool === "mail_flag" ? "flagged" : "placed"]);
+      });
+    }
+  }
+
+  it("an answer that may have reached iCloud stays final: an error, a failed call, an unreadable answer", async () => {
+    for (const answer of [
+      () => toolError(new ImapConnectError()),
+      (): CallAnswer => ({ kind: "failed" }),
+      (): CallAnswer => ({ kind: "ok", result: { content: [{ type: "text", text: "not json" }] } }),
+    ]) {
+      const storage = armedStorage([rule("r1", DRAFT)]);
+      await directRun(storage, {
+        rows: [newRow(1)],
+        answer: (called) => (called === "mail_compose_reply" ? answer() : undefined),
+      });
+      expect(acted(storage)).toHaveLength(1);
+      const second = await directRun(storage, { rows: [newRow(1)], now: T0 + 15 * MIN });
+      expect(actions(second.calls)).toEqual([]);
+    }
+  });
 });
 
 // ============================================== the owner's record (AUTO-15)
