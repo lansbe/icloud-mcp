@@ -21,10 +21,12 @@ vi.mock("../src/mail/socket", async (importOriginal) => ({
   connectImap: vi.fn(),
 }));
 
+import { getOAuthApi } from "@cloudflare/workers-oauth-provider";
 import { AUTONOMY_CLIENT_ID } from "../src/agent/autonomy-client";
 import { ensureRecallSchema, utcDay, writeState } from "../src/agent/recall-ledger";
 import type { UserAgent } from "../src/agent/user-agent";
 import { connectImap } from "../src/mail/socket";
+import { grantClientOf } from "../src/mcp/grant-client";
 import { createServerFactory } from "../src/mcp/server";
 import {
   guardAgainstPause,
@@ -308,5 +310,106 @@ describe("no step on the autonomy grant, or after a refusal (D-28, D-35)", () =>
     expect(JSON.parse(answer.content[0]!.text).category).toBe("auth_failed");
     expect(connectImap).not.toHaveBeenCalled();
     expect(slotReads).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The autonomy id, through a stored grant (26-REVIEW WR-05)
+// ---------------------------------------------------------------------------
+
+/** The library's helpers over the pool's own OAuth store. */
+function oauthApi() {
+  const handler = {
+    fetch() {
+      return new Response(null, { status: 404 });
+    },
+  };
+  return getOAuthApi(
+    {
+      apiRoute: "/mcp",
+      apiHandler: handler,
+      defaultHandler: handler,
+      authorizeEndpoint: "/authorize",
+      tokenEndpoint: "/oauth/token",
+    } as never,
+    { OAUTH_KV: env.OAUTH_KV },
+  );
+}
+
+/**
+ * A grant made through the library itself, and a request carrying a bearer
+ * token that names it. With `clientId`, the stored grant's client id is set to
+ * that value, the way a grant issued to that client would hold it.
+ */
+async function requestOnGrant(clientId?: string): Promise<Request> {
+  const api = oauthApi();
+  const redirect = "https://client.example.invalid/callback";
+  const client = await api.createClient({
+    redirectUris: [redirect],
+    clientName: "A client",
+    tokenEndpointAuthMethod: "none",
+  });
+  const userId = [...crypto.getRandomValues(new Uint8Array(32))]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  await api.completeAuthorization({
+    request: {
+      responseType: "code",
+      clientId: client.clientId,
+      redirectUri: redirect,
+      scope: ["mcp"],
+      state: "state",
+      codeChallenge: "90EpwHQr_xi9uDtjYyz5mq9Z4RekugHRqg5ijpXC3FQ",
+      codeChallengeMethod: "S256",
+    },
+    userId,
+    metadata: { clientName: "A client" },
+    scope: ["mcp"],
+    props: { marker: "not read" },
+  });
+  const grantId = (await api.listUserGrants(userId)).items[0]!.id;
+  if (clientId !== undefined) {
+    const key = `grant:${userId}:${grantId}`;
+    const record = (await env.OAUTH_KV.get(key, { type: "json" })) as Record<string, unknown>;
+    expect(record.clientId).toBe(client.clientId);
+    await env.OAUTH_KV.put(key, JSON.stringify({ ...record, clientId }));
+  }
+  return new Request("https://example.invalid/mcp", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${userId}:${grantId}:secret-segment` },
+  });
+}
+
+describe("the autonomy client's id runs no step, read from a stored grant (26-REVIEW WR-05)", () => {
+  it("the id is exactly the one Phase 27 must register its client under", () => {
+    // Pinned as a literal. The exclusion is a match on this exact string, so a
+    // grant issued to any other id runs a step: changing it here, or
+    // registering the autonomy client under anything else, turns this red.
+    expect(AUTONOMY_CLIENT_ID).toBe("icloud-mcp-autonomy");
+  });
+
+  it("a stored grant whose client is the autonomy id: the door's own reader, one socket, and the slot is never read", async () => {
+    const request = await requestOnGrant(AUTONOMY_CLIENT_ID);
+    const slotReads = await countSlotReads();
+    vi.mocked(connectImap).mockReturnValueOnce(listingSession() as never);
+
+    const answer = await realTool("mail_list_folders", grantClientOf(request, env.OAUTH_KV))({});
+
+    expect(answer.isError).toBeUndefined();
+    expect(connectImap).toHaveBeenCalledTimes(1);
+    expect(slotReads).not.toHaveBeenCalled();
+  });
+
+  it("a positive control: the same kind of grant, with the library's own client id, does run a step", async () => {
+    const request = await requestOnGrant();
+    const slotReads = await countSlotReads();
+    vi.mocked(connectImap)
+      .mockReturnValueOnce(listingSession() as never)
+      .mockReturnValueOnce(listingSession() as never);
+
+    await realTool("mail_list_folders", grantClientOf(request, env.OAUTH_KV))({});
+
+    expect(slotReads).toHaveBeenCalledTimes(1);
+    expect(connectImap).toHaveBeenCalledTimes(2);
   });
 });
