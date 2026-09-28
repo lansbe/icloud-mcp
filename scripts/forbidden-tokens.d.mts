@@ -291,6 +291,58 @@ export declare function checkAgentObjectClosure(
   sources: Readonly<Record<string, string>>,
 ): Violation[];
 
+/** Phase 28, the rules job's counts (D-21 (b), (c), (g), (h), (i)). */
+export declare const AUTONOMY_WRITE_TOOLS: readonly string[];
+export declare const AUTONOMY_WRITE_TOOL_NAME: RegExp;
+export declare const AUTONOMY_WRITE_OWNER: string;
+export declare const AUTONOMY_WRITE_LIST_FILE: string;
+export declare const AUTONOMY_WRITE_SCOPE: string;
+export declare function collectAutonomyWriteNames(
+  relativePath: string,
+  contents: string,
+): Array<OwnershipMatch & { name: string }>;
+export declare function checkAutonomyWriteOwnership(
+  sites: ReadonlyArray<OwnershipMatch & { name: string }>,
+): Violation[];
+export declare const AUTONOMY_ACTIONS_MODULE: string;
+export declare const AUTONOMY_ACTION_EXPORTS: readonly string[];
+/** Every name a module exports, from every export form, in source order. */
+export declare function moduleExportNamesOf(contents: string): string[];
+/** `null` means the actions module was not found. */
+export declare function checkAutonomyActionExports(names: readonly string[] | null): Violation[];
+export declare const REPLY_RECIPIENT_DEFINITION: RegExp;
+export declare const REPLY_RECIPIENT_CALL: RegExp;
+export declare const REPLY_RECIPIENT_OWNER: string;
+export declare const REPLY_RECIPIENT_CALLER: string;
+export declare const REPLY_RECIPIENT_DEFINITION_SCOPE: string;
+export declare const REPLY_RECIPIENT_CALL_SCOPE: string;
+export interface ReplyRecipientSite extends OwnershipMatch {
+  readonly kind: "definition" | "call";
+}
+export declare function collectReplyRecipientSites(
+  relativePath: string,
+  contents: string,
+): ReplyRecipientSite[];
+export declare function checkReplyRecipientOwnership(
+  sites: ReadonlyArray<ReplyRecipientSite>,
+): Violation[];
+export declare const SENDER_ADDRESS_FIELD: RegExp;
+export declare const SENDER_ADDRESS_OWNERS: readonly string[];
+export declare const SENDER_ADDRESS_REQUIRED: string;
+export declare const SENDER_ADDRESS_SCOPE: string;
+export declare function collectSenderAddressNames(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+export declare function checkSenderAddressOwnership(
+  sites: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare const RULE_ADD_CALL: RegExp;
+export declare const RULE_ADD_OWNER: string;
+export declare const RULE_ADD_SCOPE: string;
+export declare function collectRuleAddCalls(relativePath: string, contents: string): OwnershipMatch[];
+export declare function checkRuleAddOwnership(calls: ReadonlyArray<OwnershipMatch>): Violation[];
+
 /** Every name `contents` exports as a `function` declaration, in source order. */
 export declare function exportedFunctionNames(contents: string): string[];
 

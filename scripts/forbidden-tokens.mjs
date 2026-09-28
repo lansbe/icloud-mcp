@@ -544,12 +544,22 @@ export const FORBIDDEN = [
   // `Promise.all(folders.map((f) => underLease(principal, deps, read)))`
   // named none of the listed tokens, so only the runtime gate would have
   // refused it. Measured at zero hits on the real tree before it was armed.
+  //
+  // Phase 28 (D-21 (f), AUTO-13) names the rules job's three entry points:
+  // `withAutonomySession` in src/agent/autonomy.ts, the one way the object
+  // opens a session with the autonomy key, and the job's two actions,
+  // `setFlag` and `placeDraft` in src/agent/actions.ts. Each action is one or
+  // two tool calls at /mcp, and each call is one iCloud session under the
+  // person's lease, so a combinator over a list of verdicts is the same N
+  // sockets as a combinator over the lease runner. The job's own call function
+  // is too common a name to list; `autonomy-job-combinator` holds the file that
+  // uses it. Measured at zero hits on the real tree before it was armed.
   {
     id: "concurrent-session",
     scope: "src/",
     pattern:
-      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit|indexNextPage|reconcileMailbox|recallStep|runRecallStep|indexNewMail|windowUids|summariesInRange|newMailPage|underLease|checkBuilt|syncDeletions|folderSnapshots|listFolders)/g,
-    why: "A concurrent combinator wrapped around the per-person lease runner (withConnectionLease in src/agent/lease.ts), either mail session orchestrator (read-only or mutating), the core under them, a triage verb in src/mail/triage.ts (mark read or unread, flag or unflag, move, or move one draft to Trash), the mail move composites (readMoveSet, readDraftForChange, buildMovePreview, applyMailCommit), or a recall build entry point in src/recall/build.ts (indexNextPage, reconcileMailbox). Each recall build entry point takes the person's connection lease and reads mail through one session, so it is a session like the others. The same holds for the recall step (recallStep in src/recall/sync.ts), its one runner (runRecallStep in src/recall/drive.ts), the new-mail indexer (indexNewMail) and page source (newMailPage), the two recall reads in src/mail/service.ts (windowUids, summariesInRange, and their stream forms), the step's own lease wrapper and the two per-folder actions it opens a session for (underLease, checkBuilt, syncDeletions in src/recall/sync.ts), and the two reads the step reaches through its deps (folderSnapshots, listFolders in src/mail/service.ts): the recall step and its reads each open the person's one iCloud connection. Each of those opens a session, and every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial, and a list of messages is worked through one at a time in one session: pass the whole list to moveMessages rather than mapping a verb over it.",
+      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit|indexNextPage|reconcileMailbox|recallStep|runRecallStep|indexNewMail|windowUids|summariesInRange|newMailPage|underLease|checkBuilt|syncDeletions|folderSnapshots|listFolders|withAutonomySession|setFlag|placeDraft)/g,
+    why: "A concurrent combinator wrapped around the per-person lease runner (withConnectionLease in src/agent/lease.ts), either mail session orchestrator (read-only or mutating), the core under them, a triage verb in src/mail/triage.ts (mark read or unread, flag or unflag, move, or move one draft to Trash), the mail move composites (readMoveSet, readDraftForChange, buildMovePreview, applyMailCommit), or a recall build entry point in src/recall/build.ts (indexNextPage, reconcileMailbox). Each recall build entry point takes the person's connection lease and reads mail through one session, so it is a session like the others. The same holds for the recall step (recallStep in src/recall/sync.ts), its one runner (runRecallStep in src/recall/drive.ts), the new-mail indexer (indexNewMail) and page source (newMailPage), the two recall reads in src/mail/service.ts (windowUids, summariesInRange, and their stream forms), the step's own lease wrapper and the two per-folder actions it opens a session for (underLease, checkBuilt, syncDeletions in src/recall/sync.ts), and the two reads the step reaches through its deps (folderSnapshots, listFolders in src/mail/service.ts): the recall step and its reads each open the person's one iCloud connection. Each of those opens a session, and every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial, and a list of messages is worked through one at a time in one session: pass the whole list to moveMessages rather than mapping a verb over it. The rules job's entry points are named too: withAutonomySession in src/agent/autonomy.ts and the job's two actions, setFlag and placeDraft in src/agent/actions.ts. Each action is one or two tool calls at this Worker's own /mcp, each call is one iCloud session under the person's lease, and the job runs with nobody present, so a fan-out over a run's verdicts would open several connections at once with nobody there to notice the lockout. Act on verdicts one at a time.",
   },
   // The same property one protocol over, and the reason is deliberately NOT the
   // same. The two rules above lean on the six-connection platform cap. That cap
@@ -1255,6 +1265,107 @@ export const FORBIDDEN = [
     scope: "src/",
     pattern: /\bunwrapToken\b/g,
     why: "The OAuth library's token-unwrapping helper, named under src/. It takes a token string and returns that grant's props, decrypted, and those props hold the person's Apple ID and app-specific password. The door in src/mcp/api-handler.ts is the one place props are read, and the props-reader count holds that, but the count matches only the request context's props and the auth-context reader, so it cannot see this helper. Named here, it is a second props read, reachable from any module holding a token string -- the per-person object holds one, the autonomy key, for every signed-in person (AUTO-02). Take the principal the door built instead. If this fired on a comment, describe the helper by role. Do not narrow the pattern: a second props read is a decision on the credential boundary, not a refactor.",
+  },
+
+  // ------------------------------------------------------------- rules job
+  // Phase 28, D-21 (as revised twice on 2026-09-27), AUTO-09, AUTO-13. The
+  // rules job runs on the person's own object, with nobody present, over mail
+  // strangers wrote. It may flag a message and place a draft reply to its
+  // sender, and nothing else. PITFALLS #42 is the reason these are rules rather
+  // than prose: "and archive" arrives one reasonable commit at a time, and a
+  // limit written only in a comment is not enforced by anything.
+  //
+  // Four pattern rules here. The five count constraints beside them live with
+  // the other counts below, and the two widenings are the closure list and the
+  // fan-out alternation above.
+  //
+  // (a) The tool names. The job may name exactly the four tools on the one list
+  // in src/agent/autonomy-client.ts. Phase 27's `call` refuses any other name
+  // at run time, before a request leaves the object. This refuses it at commit
+  // time, which is cheaper, and it also refuses a name that never reaches
+  // `call`: a second list, a test double, a comment in backticks.
+  //
+  // THE SHAPE. A quote, then a name in one of the tool families this server
+  // registers (mail, calendar, contacts, rules, account, changes, dav), then a
+  // quote -- unless the name is one of the four. The four are spelled in the
+  // lookahead, so a longer name that begins with one of them is still refused.
+  // There is no recall family: the recall tool's name begins with mail, and a
+  // draft of this rule that listed recall fired on the recall ledger's own
+  // table name, which is not a tool. Measured at zero hits under src/agent/
+  // before it was armed.
+  //
+  // WHAT IT DOES NOT SEE. A name assembled from fragments or from a template
+  // with a placeholder in it. That is a deliberate evasion, not a mistake.
+  {
+    id: "agent-tool-outside-allowlist",
+    scope: "src/agent/",
+    pattern:
+      /["'`](?!(?:account_whoami|changes_since|mail_flag|mail_compose_reply)["'`])(?:mail|calendar|contacts|rules|account|changes|dav)_[a-z0-9_]*["'`]/g,
+    why: "A tool name under src/agent/ that is not one of the four the rules job may call: the sign-in check, the change check, the flag and the reply tool, as listed once in src/agent/autonomy-client.ts. The job acts with nobody present on mail strangers wrote, so every tool it can name is a tool a stranger can make it use. The four are chosen so that it cannot send, delete, move, write a new message, answer an invitation or write an event. A fifth name is how 'and archive' arrives one reasonable commit at a time (PITFALLS #42), and a limit that lives only in prose is not enforced. Phase 27's call refuses the name at run time; this refuses it before it ships. If this fired on a comment, describe the tool by role. Adding a tool is a decision on the autonomous layer's boundary, not a refactor: get it, then change the list, never this pattern.",
+  },
+  // (b) The evaluator's imports. The evaluator turns rules and rows into
+  // verdicts, which are two numbers and a word, and it is synchronous. It has
+  // no runtime import at all, so nothing it could call can read mail, reach a
+  // tool, or carry a value out beside the verdict (PITFALLS #41, the zero-tool
+  // evaluator). Type imports are erased by the compiler and load nothing, so
+  // they are allowed. An import whose braces hold only type members is NOT
+  // allowed: under `verbatimModuleSyntax` that statement is kept and the module
+  // is loaded at run time, as the closure check above says.
+  //
+  // Scoped to the one file. Every other module under src/agent/ has runtime
+  // imports on purpose.
+  {
+    id: "agent-evaluator-runtime-import",
+    scope: "src/agent/evaluate.ts",
+    pattern:
+      /^[ \t]*import(?![ \t]+type\b)[ \t]*[\w${*"'`]|\bimport\s*\(|^[ \t]*export(?![ \t]+type\b)[^;\n]*?\bfrom\s*["']/gm,
+    why: "A runtime import, a dynamic import or a re-export in src/agent/evaluate.ts. The evaluator is the zero-tool evaluator of PITFALLS #41: it reads a rule and a row's sender and subject, and answers which rule, which message, and flag or draft. Nothing else comes out of it. With no runtime import, nothing it could call can read mail, reach a tool, or pass an identifier out beside the verdict, so nothing a stranger writes can steer what the job does. A single value import breaks that, and the import is where it starts. Type imports are allowed, because the compiler erases them. Write `import type` for a type; if the evaluator needs a function, put the function in this file. A runtime import here is a decision on the autonomous layer's boundary, not a refactor.",
+  },
+  // (c) A combinator in the job. The job's calls go through Phase 27's `call`,
+  // a name far too common to put in the fan-out alternation above: it would
+  // fire all over the tree. So the fan-out rule gains the job's three named
+  // entry points, and this rule refuses any concurrent combinator at all in the
+  // one file where the job holds `call`. A scan scope is one path prefix, so
+  // this needs its own rule.
+  //
+  // Every call the job makes is one iCloud session under the person's lease,
+  // and Phase 27's ticket allows one autonomy session per run. The calls inside
+  // it must go one after another (27 WR-04). Measured at zero hits in
+  // src/agent/job.ts before it was armed.
+  {
+    id: "autonomy-job-combinator",
+    scope: "src/agent/job.ts",
+    pattern: /\bPromise\s*\.\s*(?:all|allSettled|any|race)\s*\(/g,
+    why: "A concurrent combinator in src/agent/job.ts, where the rules job holds its session's call function. Every call the job makes is a tool call at this Worker's own /mcp, and each one opens an iCloud connection under the person's lease: a reply alone is two. A combinator over them opens several at once. The lease refuses the second as busy, so the run stops half done, and iCloud's own per-account ceiling is lower than the platform's, undocumented, and deliberately unmeasured, because going over it locks the person out of their own mail in Mail.app on their own devices. The session also ends its call function when its work settles, so a call still in flight is cut off (Phase 27). Work through the verdicts one at a time with await in a loop. The call function's name is too common for the fan-out rule to list, which is why this file has its own rule. Do not narrow the pattern.",
+  },
+  // (d) Any second address. The owner changed D-05 on 2026-09-27: a rule's
+  // draft is a reply to the triggering message's From address. That is the one
+  // place the autonomous layer takes an address from something a stranger
+  // wrote, so it is held tightly. The job reads the From address through one
+  // named row field, into one named function (the two counts below). This rule
+  // refuses every OTHER address field by name, so a second way to read an
+  // address cannot arrive as a small, reasonable edit.
+  //
+  // What it refuses, each described by role because this file's comments are
+  // held to the same standard as the source: the header that asks for replies
+  // to go somewhere else, in any spelling and any letter case; the field that
+  // holds the sender's display name (and the two other display-name spellings);
+  // the return path; the sender header's name in quotes; and a key naming a
+  // copy list, a blind copy list, reply-all, attachments or a folder.
+  //
+  // It does not fire on the row's From field, on the recipient function, on
+  // the sign-in check's reader, or on prose that says "the sender" or "a reply
+  // to". Prose with a space between the words is never matched.
+  //
+  // Measured at zero hits under src/agent/ before it was armed. If it fires on
+  // a legitimate line later, fix that line at the source and describe the
+  // header by role. Never narrow the pattern.
+  {
+    id: "agent-reads-other-address",
+    scope: "src/agent/",
+    pattern:
+      /\breply[-_]?to\b|\breturn[-_]?path\b|\b(?:from|sender|display)[-_]?name\b|["'`]sender["'`]|(?:\b|["'`])(?:cc|bcc|replyAll|attachmentIds|folderId)["'`]?\s*:/gi,
+    why: "Under src/agent/, a second address field: the header that asks for replies to go somewhere else (any spelling), a display-name field, the return path, the sender header by name, or a key for a copy list, a blind copy list, reply-all, attachments or a folder. The job may take exactly one address from a stranger's message, the From address, through one function (replyRecipient in src/agent/recipient.ts). A second way to read an address is how a reply gets aimed somewhere the stranger chose: the redirect header exists precisely to send replies elsewhere, and a copy list or reply-all widens who is told. PITFALLS #12 forbids a write target taken from content; the From address is the one exception, decided by the owner on 2026-09-27, and this keeps it the only one. If this fired on a comment, describe the header by role. Do not narrow the pattern: a second address is a decision on the boundary, not a refactor.",
   },
 ];
 
@@ -2274,10 +2385,21 @@ export const AGENT_CLOSURE_FORBIDDEN_DIRS = Object.freeze([
 ]);
 
 /** Single files the object's import closure must never reach. The OAuth
- *  wiring module is here because it reaches the handler and the mail tree. */
+ *  wiring module is here because it reaches the handler and the mail tree.
+ *
+ *  Phase 28 (D-21 (d), AUTO-09) adds two. The confirmation module mints and
+ *  redeems the tokens that let a previewed write happen: in the object, it is
+ *  a way to confirm a write with nobody present, which is the step every
+ *  preview exists to put a person in front of. The change-marker module builds
+ *  and reads the change check's markers: the job holds a marker only as the
+ *  opaque string the tool answered, and reads mail only through /mcp, so code
+ *  that decodes a marker has no business in the object. Type imports of it
+ *  stay allowed, as for every other forbidden module: they load nothing. */
 export const AGENT_CLOSURE_FORBIDDEN_FILES = Object.freeze([
   "src/auth/login-handler.ts",
   "src/auth/oauth.ts",
+  "src/confirm.ts",
+  "src/change-marker.ts",
 ]);
 
 /** The socket module's specifier, refused as an import anywhere in the
@@ -2377,7 +2499,8 @@ function forbiddenInAgentClosure(path) {
  * THE RULE. Walk every runtime import from `src/agent/user-agent.ts`, one hop
  * after another. Refuse any file reached under `src/mail/`, `src/dav/`,
  * `src/mcp/`, `src/staging/` or `src/feed/`, the login handler, the OAuth
- * wiring module, and any import of the socket module.
+ * wiring module, the confirmation module and the change-marker module (Phase
+ * 28), and any import of the socket module.
  *
  * WHY. 24-03's rule on the object module refuses those trees as DIRECT
  * imports. This refuses the same thing one or more hops away. The object
@@ -2419,7 +2542,7 @@ export function checkAgentObjectClosure(sources) {
         column: 0,
         pattern,
         patternIndex,
-        why: `The per-person object module ${AGENT_OBJECT_MODULE} was not found, so the walk over its import closure started nowhere and guarded nothing. The check refuses the object's imports reaching mail, DAV, tool, staging or feed code, the login handler, the OAuth wiring module or the socket module, one or more hops away. If the object really moved, that is a decision: move the start of this walk with it, never delete the walk.`,
+        why: `The per-person object module ${AGENT_OBJECT_MODULE} was not found, so the walk over its import closure started nowhere and guarded nothing. The check refuses the object's imports reaching mail, DAV, tool, staging or feed code, the login handler, the OAuth wiring module, the confirmation module, the change-marker module or the socket module, one or more hops away. If the object really moved, that is a decision: move the start of this walk with it, never delete the walk.`,
       },
     ];
   }
@@ -2450,7 +2573,7 @@ export function checkAgentObjectClosure(sources) {
       if (bad !== undefined) {
         violations.push({
           ...where,
-          why: `The per-person object's import closure reaches ${bad}, through ${chainTo(file)} -> ${bad}. The object may reach the allow-list reader through the autonomy module and the OAuth library through src/agent/autonomy-grants.ts, on purpose (D-14, D-28), and nothing else may ride in behind them: no mail, DAV, tool, staging or feed code, not the login handler, not the OAuth wiring module (it reaches the handler and the mail tree), and not the socket module. 24-03's rule refuses these as direct imports; this refuses them any number of hops away. The object reaches mail only through its own /mcp, with the autonomy key. Cut the edge at the module that added it. If this and test/recall-import-closure.test.ts ever disagree, fix the code, never either check.`,
+          why: `The per-person object's import closure reaches ${bad}, through ${chainTo(file)} -> ${bad}. The object may reach the allow-list reader through the autonomy module and the OAuth library through src/agent/autonomy-grants.ts, on purpose (D-14, D-28), and nothing else may ride in behind them: no mail, DAV, tool, staging or feed code, not the login handler, not the OAuth wiring module (it reaches the handler and the mail tree), not the confirmation module (in the object it would confirm a previewed write with nobody present), not the change-marker module (the job holds a marker only as the string the tool answered), and not the socket module. 24-03's rule refuses these as direct imports; this refuses them any number of hops away. The object reaches mail only through its own /mcp, with the autonomy key. Cut the edge at the module that added it. If this and test/recall-import-closure.test.ts ever disagree, fix the code, never either check.`,
         });
         continue;
       }
@@ -2460,6 +2583,285 @@ export function checkAgentObjectClosure(sources) {
     }
   }
   return violations;
+}
+
+// ------------------------------------------------------------ rules job counts
+// Phase 28, D-21 (b), (c), (g), (h), (i) as revised on 2026-09-27. Five count
+// constraints, each with both arms, on the one-owner shape the arm count above
+// uses: a collector per file, a pure checker over what was collected, ids in
+// `OWNERSHIP_VIOLATION_IDS`, wired into `scan()`. Every collector blanks
+// whole-line comments first, so a site that survives only in prose counts as
+// zero and prose describing a site by role is not a site.
+
+/** The two write tools the rules job may call. Every other name the job may
+ *  call reads, and every other tool name is refused under src/agent/ outright. */
+export const AUTONOMY_WRITE_TOOLS = Object.freeze(["mail_flag", "mail_compose_reply"]);
+
+/**
+ * A quoted name of one of the two write tools (Phase 28, D-21 (b), AUTO-09).
+ *
+ * THE RULE. Under `src/agent/`, the two names appear only in the actions
+ * module, which is where the job's two actions call them, and in the one tool
+ * list in `src/agent/autonomy-client.ts`, which is what Phase 27's `call`
+ * enforces. The actions module must name BOTH: one missing arm per name.
+ *
+ * WHY A COUNT. A write tool named in a second module is a second place the job
+ * can change the mailbox from, outside the two functions whose outcomes are
+ * recorded, capped and tested. Zero is a violation too: the actions module
+ * that no longer names a write tool has been emptied or rerouted, and the job
+ * would then reach the tool some other way, or silently stop acting.
+ *
+ * WHAT IT DOES NOT SEE. A name assembled from fragments. `agent-tool-outside-
+ * allowlist` refuses every other tool name; this holds where the two allowed
+ * write names may sit.
+ *
+ * No `g` flag; the collector builds its own global copy per file.
+ */
+export const AUTONOMY_WRITE_TOOL_NAME = /["'`](mail_flag|mail_compose_reply)["'`]/;
+
+/** The one module that may call the write tools, and must. */
+export const AUTONOMY_WRITE_OWNER = "src/agent/actions.ts";
+
+/** The one tool list, excepted: it names every tool the key may call. */
+export const AUTONOMY_WRITE_LIST_FILE = "src/agent/autonomy-client.ts";
+
+/** The tree the write-tool names are collected from. */
+export const AUTONOMY_WRITE_SCOPE = "src/agent/";
+
+/**
+ * The write-tool names one file contributes. Every match, comment lines
+ * blanked. An empty list outside `AUTONOMY_WRITE_SCOPE`.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number, name: string}>}
+ */
+export function collectAutonomyWriteNames(relativePath, contents) {
+  if (!relativePath.startsWith(AUTONOMY_WRITE_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  return [...code.matchAll(new RegExp(AUTONOMY_WRITE_TOOL_NAME, "g"))].map((match) => ({
+    file: relativePath,
+    ...positionOf(code, match.index),
+    name: match[1],
+  }));
+}
+
+/** The actions module, whose exports are fixed at exactly two. */
+export const AUTONOMY_ACTIONS_MODULE = "src/agent/actions.ts";
+
+/** The two exports the actions module has, and no others. */
+export const AUTONOMY_ACTION_EXPORTS = Object.freeze(["setFlag", "placeDraft"]);
+
+/**
+ * Every name a module exports, in source order, from every export form: a
+ * declaration (function, generator, const, let, var, class, type, interface,
+ * enum, namespace), a braced list (with or without `type`, taking the alias
+ * after `as`), `export default` (as "default") and `export *` (as "*"). A
+ * statement of any other shape is kept as its own text, so an export this
+ * reader does not understand still counts as an export rather than as none.
+ * Comments are blanked first.
+ *
+ * WHAT IT DOES NOT SEE. The second and later names of one `export const a = 1,
+ * b = 2`, and names in a destructuring export. Both are deliberate evasions,
+ * not mistakes; the destructuring form is kept as its text, so it still counts.
+ *
+ * @param {string} contents
+ * @returns {string[]}
+ */
+export function moduleExportNamesOf(contents) {
+  const code = withoutCommentsKeepingOffsets(contents);
+  const names = [];
+  for (const match of code.matchAll(/^[ \t]*export\b([^\n]*)/gm)) {
+    const rest = match[1].trim();
+    const declared = rest.match(
+      /^(?:declare\s+)?(?:async\s+)?(?:abstract\s+)?(?:function\s*\*?|const|let|var|class|type|interface|enum|namespace)\s+([A-Za-z_$][\w$]*)/,
+    );
+    if (/^default\b/.test(rest)) {
+      names.push("default");
+    } else if (declared) {
+      names.push(declared[1]);
+    } else if (/^\*/.test(rest)) {
+      names.push("*");
+    } else if (/^(?:type\s*)?\{/.test(rest)) {
+      const open = code.indexOf("{", match.index);
+      const close = code.indexOf("}", open);
+      const inner = close === -1 ? code.slice(open + 1) : code.slice(open + 1, close);
+      for (const part of inner.split(",")) {
+        const piece = part.trim().replace(/^type\s+/, "");
+        if (piece.length === 0) continue;
+        const alias = piece.split(/\s+as\s+/);
+        names.push(alias[alias.length - 1].trim());
+      }
+    } else {
+      names.push(rest.length > 0 ? rest.slice(0, 60) : "export");
+    }
+  }
+  return names;
+}
+
+/**
+ * The reply's one recipient function, defined in one module and called by one
+ * module (Phase 28, D-21 (h), D-30).
+ *
+ * THE RULE. `replyRecipient` is defined exactly once under `src/`, in
+ * `src/agent/recipient.ts`. Under `src/agent/` it is called only from the
+ * actions module, and it must be called there. A call from outside the
+ * object's tree -- the rules tool's test preview in `src/mcp/tools/rules.ts`
+ * -- is not counted: that is the person asking what a rule would do, not the
+ * job acting.
+ *
+ * WHY A COUNT. The job may take exactly one address from a stranger's
+ * message, the From address, through one function. A second definition is a
+ * second way to turn an address into a recipient, and a second caller is a
+ * second place a recipient can be chosen, outside the one action whose
+ * outcome is recorded. Zero is a violation too: a reply placed without this
+ * function has had its recipient chosen some other way.
+ *
+ * THE SHAPE. A definition is a function declaration or a `const`, `let` or
+ * `var` of the name. A call is the name, optional white space, an optional
+ * `?.`, and an opening parenthesis, not preceded by the word `function`. A
+ * method shorthand of the same name counts as a call, so one in a second
+ * module is refused. The word boundary keeps the mail tree's plural helper,
+ * which builds a person's own reply's recipients, out of it.
+ *
+ * WHAT IT DOES NOT SEE. The function taken as a value and called under another
+ * name, and `.call` or `.apply` on it. Both are deliberate evasions.
+ */
+export const REPLY_RECIPIENT_DEFINITION =
+  /\bfunction\s*\*?\s*replyRecipient\b|\b(?:const|let|var)\s+replyRecipient\b/;
+
+/** A call of the recipient function. No `g` flag; see the collector. */
+export const REPLY_RECIPIENT_CALL = /(?<!\bfunction\s*\*?\s*)\breplyRecipient\s*(?:\?\.\s*)?\(/;
+
+/** The one module that defines the recipient function. */
+export const REPLY_RECIPIENT_OWNER = "src/agent/recipient.ts";
+
+/** The one module under `src/agent/` that calls it, and must. */
+export const REPLY_RECIPIENT_CALLER = "src/agent/actions.ts";
+
+/** Where definitions are collected from: all of `src/`. */
+export const REPLY_RECIPIENT_DEFINITION_SCOPE = "src/";
+
+/** Where calls are collected from: the object's tree only. */
+export const REPLY_RECIPIENT_CALL_SCOPE = "src/agent/";
+
+/**
+ * The recipient function's definitions and calls one file contributes. Every
+ * match, comment lines blanked.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number, kind: "definition" | "call"}>}
+ */
+export function collectReplyRecipientSites(relativePath, contents) {
+  if (!relativePath.startsWith(REPLY_RECIPIENT_DEFINITION_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  const sites = [];
+  for (const match of code.matchAll(new RegExp(REPLY_RECIPIENT_DEFINITION, "g"))) {
+    sites.push({ file: relativePath, ...positionOf(code, match.index), kind: "definition" });
+  }
+  if (relativePath.startsWith(REPLY_RECIPIENT_CALL_SCOPE)) {
+    for (const match of code.matchAll(new RegExp(REPLY_RECIPIENT_CALL, "g"))) {
+      sites.push({ file: relativePath, ...positionOf(code, match.index), kind: "call" });
+    }
+  }
+  return sites.sort((a, b) => a.line - b.line || a.column - b.column);
+}
+
+/**
+ * The row field that holds the From address (Phase 28, D-21 (i)).
+ *
+ * THE RULE. Under `src/agent/`, the field is named only in the module that
+ * declares the row type, the module that reads it out of the change check's
+ * answer, the evaluator that matches rules on it, and the recipient function
+ * that turns it into a recipient. The recipient module must name it.
+ *
+ * WHY A COUNT. So the job reads exactly one address from a message, the From
+ * address, through one named function. The field named in the job or in the
+ * actions module is a second place the address is read, and the first step
+ * toward a recipient that did not go through the recipient function. Zero in
+ * the recipient module means the reply's recipient comes from somewhere else.
+ *
+ * WHAT IT DOES NOT SEE. The row spread or destructured without naming the
+ * field, and the field read by a computed key. Both are deliberate evasions.
+ */
+export const SENDER_ADDRESS_FIELD = /\bsenderAddress\b/;
+
+/** The four modules under `src/agent/` that may name the field. */
+export const SENDER_ADDRESS_OWNERS = Object.freeze([
+  "src/agent/tool-call.ts",
+  "src/agent/tool-reply.ts",
+  "src/agent/evaluate.ts",
+  "src/agent/recipient.ts",
+]);
+
+/** The one module that must name it. */
+export const SENDER_ADDRESS_REQUIRED = "src/agent/recipient.ts";
+
+/** The tree the field is collected from. */
+export const SENDER_ADDRESS_SCOPE = "src/agent/";
+
+/**
+ * Where one file names the From field. Every match, comment lines blanked.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectSenderAddressNames(relativePath, contents) {
+  if (!relativePath.startsWith(SENDER_ADDRESS_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  return [...code.matchAll(new RegExp(SENDER_ADDRESS_FIELD, "g"))].map((match) => ({
+    file: relativePath,
+    ...positionOf(code, match.index),
+  }));
+}
+
+/**
+ * A call of the per-person object's add-rule method (Phase 28, D-11, D-21 (g)).
+ *
+ * THE RULE. Exactly one member call exists under `src/`, in the rules tool
+ * module, inside the commit that writes exactly the rule a person was shown in
+ * a preview. The method's own definition in the object module has no leading
+ * dot, so it is not a call. A second call in the rules module counts the same
+ * as one elsewhere.
+ *
+ * WHY A COUNT. A rule runs on its own every 15 minutes with nobody present, so
+ * adding one is previewed: the person sees every value and what the rule will
+ * do before it exists. A second call site is a second way to add a rule with
+ * no preview behind it -- a tool, the alarm, a default or starter rule. Zero
+ * is a violation too: the commit's call was deleted or moved, and rules would
+ * then be added some other way, or not at all.
+ *
+ * THE SHAPE. The arm count's shape: a dot, the name, an optional `?.`, an
+ * opening parenthesis, with white space allowed between each.
+ *
+ * WHAT IT DOES NOT SEE. A bracket access with the name as a string, the method
+ * pulled off a stub and called bare, and `.call` or `.apply` on it. All three
+ * are deliberate evasions.
+ */
+export const RULE_ADD_CALL = /\.\s*addRule\s*(?:\?\.\s*)?\(/;
+
+/** The one file permitted to call the add-rule method, and only once. */
+export const RULE_ADD_OWNER = "src/mcp/tools/rules.ts";
+
+/** The tree add-rule calls are collected from. */
+export const RULE_ADD_SCOPE = "src/";
+
+/**
+ * The add-rule calls one file contributes. Every match, comment lines blanked.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectRuleAddCalls(relativePath, contents) {
+  if (!relativePath.startsWith(RULE_ADD_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  return [...code.matchAll(new RegExp(RULE_ADD_CALL, "g"))].map((match) => ({
+    file: relativePath,
+    ...positionOf(code, match.index),
+  }));
 }
 
 /**
@@ -3215,6 +3617,16 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "recall-step-call-missing",
   "autonomy-arm-outside-sign-in",
   "autonomy-arm-missing",
+  "autonomy-write-outside-actions",
+  "autonomy-write-missing",
+  "autonomy-action-export-extra",
+  "autonomy-action-export-missing",
+  "reply-recipient-outside-owner",
+  "reply-recipient-missing",
+  "sender-address-outside-owners",
+  "sender-address-missing",
+  "rules-add-outside-commit",
+  "rules-add-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -3471,6 +3883,11 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const modelIdLiterals = [];
   const recallStepCalls = [];
   const autonomyArmCalls = [];
+  const autonomyWriteNames = [];
+  let autonomyActionExports = null;
+  const replyRecipientSites = [];
+  const senderAddressNames = [];
+  const ruleAddCalls = [];
   const sourceTree = {};
   const davWriteExports = {};
 
@@ -3620,6 +4037,16 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
     // one call. Every match, comment lines blanked. The method's definition in
     // the object module has no leading dot, so it is not collected.
     autonomyArmCalls.push(...collectAutonomyArmCalls(relativePath, contents));
+    // The five phase 28 counts. Each owner is not skipped: it holds its sites.
+    // Every match, comment lines blanked. The actions module's exports are
+    // read whole, because that count is a shape rather than a site.
+    autonomyWriteNames.push(...collectAutonomyWriteNames(relativePath, contents));
+    if (relativePath === AUTONOMY_ACTIONS_MODULE) {
+      autonomyActionExports = moduleExportNamesOf(contents);
+    }
+    replyRecipientSites.push(...collectReplyRecipientSites(relativePath, contents));
+    senderAddressNames.push(...collectSenderAddressNames(relativePath, contents));
+    ruleAddCalls.push(...collectRuleAddCalls(relativePath, contents));
     // The phase 27 closure check reads every TypeScript file under src/ once,
     // after the walk, from this map.
     if (relativePath.startsWith("src/") && relativePath.endsWith(".ts")) {
@@ -3659,6 +4086,11 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   violations.push(...checkModelIdOwnership(modelIdLiterals));
   violations.push(...checkRecallStepCallOwnership(recallStepCalls));
   violations.push(...checkAutonomyArmOwnership(autonomyArmCalls));
+  violations.push(...checkAutonomyWriteOwnership(autonomyWriteNames));
+  violations.push(...checkAutonomyActionExports(autonomyActionExports));
+  violations.push(...checkReplyRecipientOwnership(replyRecipientSites));
+  violations.push(...checkSenderAddressOwnership(senderAddressNames));
+  violations.push(...checkRuleAddOwnership(ruleAddCalls));
   // Only when this scan walked src/ at all. A scan of scripts/ or test/ alone
   // has no object to start from, and that is not the object going missing.
   if (Object.keys(sourceTree).length > 0) {
@@ -4463,6 +4895,203 @@ export function checkAutonomyArmOwnership(calls) {
       pattern: "autonomy-arm-missing",
       patternIndex: FORBIDDEN.length + 44,
       why: `No call of the per-person object's arm method under ${AUTONOMY_ARM_SCOPE}, which means the sign-in's arming in ${AUTONOMY_ARM_OWNER} was deleted, emptied, or moved. Zero is as much a violation as two, and it is the quieter of the pair: every person silently stops getting an autonomy key at sign-in, the sign-in itself still works, and nothing fails on the way out, because arming runs after the answer is sent. A call that survives only in a comment counts as zero. Restore the call in the sign-in handler. If arming really moved, that is a decision, not a refactor: get it, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The write-tool count (Phase 28, D-21 (b), AUTO-09). A name in the actions
+ * module or the one tool list passes; a name anywhere else under
+ * `src/agent/` is `autonomy-write-outside-actions`. Each of the two names the
+ * actions module does not hold is one `autonomy-write-missing`.
+ *
+ * @param {Array<{file: string, line: number, column: number, name: string}>} sites
+ */
+export function checkAutonomyWriteOwnership(sites) {
+  const violations = [];
+  for (const site of sites) {
+    if (site.file === AUTONOMY_WRITE_OWNER || site.file === AUTONOMY_WRITE_LIST_FILE) continue;
+    violations.push({
+      file: site.file,
+      line: site.line,
+      column: site.column,
+      pattern: "autonomy-write-outside-actions",
+      patternIndex: FORBIDDEN.length + 46,
+      why: `A write tool the rules job may call is named in ${site.file}, outside ${AUTONOMY_WRITE_OWNER} and the one tool list in ${AUTONOMY_WRITE_LIST_FILE}. The job may do exactly two things to a mailbox, set a flag and place a draft reply, and both live in the actions module, where each outcome is recorded, capped and tested. A second module naming a write tool is a second place the job changes the mailbox from, with nobody present and outside every one of those limits -- the way a third action arrives one reasonable commit at a time (PITFALLS #42). Call the action instead. A second place that writes is a decision on the autonomous layer's boundary, not a refactor.`,
+    });
+  }
+  for (const name of AUTONOMY_WRITE_TOOLS) {
+    if (sites.some((site) => site.file === AUTONOMY_WRITE_OWNER && site.name === name)) continue;
+    violations.push({
+      file: AUTONOMY_WRITE_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "autonomy-write-missing",
+      patternIndex: FORBIDDEN.length + 47,
+      why: `${AUTONOMY_WRITE_OWNER} no longer names one of the two write tools the rules job may call. The actions module is where the job's flag and its draft reply are made, so a write tool it does not name has been emptied out of it, renamed, or rerouted, and the job would then reach that tool some other way or silently stop acting. Zero is as much a violation as two, and quieter: nothing fails when an action goes missing. A name that survives only in a comment counts as zero. Restore the call in the actions module. If the action really moved, that is a decision, not a refactor: get it, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The actions module's export shape (Phase 28, D-21 (c), AUTO-09). Every
+ * export other than the two actions is `autonomy-action-export-extra`; each
+ * action not exported is `autonomy-action-export-missing`. `null` means the
+ * module was not found, which is both actions missing.
+ *
+ * @param {string[] | null} names
+ */
+export function checkAutonomyActionExports(names) {
+  const violations = [];
+  const found = names ?? [];
+  for (const name of found) {
+    if (AUTONOMY_ACTION_EXPORTS.includes(name)) continue;
+    violations.push({
+      file: AUTONOMY_ACTIONS_MODULE,
+      line: 0,
+      column: 0,
+      pattern: "autonomy-action-export-extra",
+      patternIndex: FORBIDDEN.length + 48,
+      why: `${AUTONOMY_ACTIONS_MODULE} exports ${JSON.stringify(name)}, beside the two actions it may export, setFlag and placeDraft. The rules job acts with nobody present on mail strangers wrote, so each thing it can do is a thing a stranger can make it do. Two actions are the whole of it: a flag costs nothing the person cannot undo, and a draft waits for a person to send it. A third export is how a third action, or a helper that becomes one, arrives one reasonable commit at a time (PITFALLS #42). Keep helpers private to the module. A third action is a decision on the autonomous layer's boundary, not a refactor.`,
+    });
+  }
+  for (const name of AUTONOMY_ACTION_EXPORTS) {
+    if (found.includes(name)) continue;
+    violations.push({
+      file: AUTONOMY_ACTIONS_MODULE,
+      line: 0,
+      column: 0,
+      pattern: "autonomy-action-export-missing",
+      patternIndex: FORBIDDEN.length + 49,
+      why: `${AUTONOMY_ACTIONS_MODULE} does not export ${name}${names === null ? ", because the module was not found" : ""}. The module exports exactly the rules job's two actions, setFlag and placeDraft. One gone means it was renamed, moved or emptied, and the job either reaches that action some other way, outside the module whose export shape this check holds, or silently stops doing it. Nothing fails on the way out. Restore the export. If the actions really moved, that is a decision, not a refactor: get it, then change the owner, never the check.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The recipient-function count (Phase 28, D-21 (h), D-30). The first
+ * definition in the owner and every call in the actions module pass. Any
+ * other definition, and any other call under `src/agent/`, is
+ * `reply-recipient-outside-owner`. No definition in the owner is one
+ * `reply-recipient-missing`, and no call in the actions module is another.
+ *
+ * @param {Array<{file: string, line: number, column: number, kind: "definition" | "call"}>} sites
+ */
+export function checkReplyRecipientOwnership(sites) {
+  const violations = [];
+  let ownerDefinitions = 0;
+  let callerCalls = 0;
+  const outside = (site, what) => ({
+    file: site.file,
+    line: site.line,
+    column: site.column,
+    pattern: "reply-recipient-outside-owner",
+    patternIndex: FORBIDDEN.length + 50,
+    why: `${what} of replyRecipient in ${site.file}. The rules job may take exactly one address from a stranger's message, the From address, through one function: defined once, in ${REPLY_RECIPIENT_OWNER}, and called under src/agent/ only by the reply action in ${REPLY_RECIPIENT_CALLER}. A second way to read an address is how a reply gets aimed somewhere the stranger chose, and a second caller is a second place a recipient is chosen, outside the one action whose outcome is recorded and capped. PITFALLS #12 forbids a write target taken from content; the From address is the owner's one exception, and this keeps it one. Use the one function from the one action. A second is a decision on the boundary, not a refactor.`,
+  });
+  for (const site of sites) {
+    if (site.kind === "definition") {
+      if (site.file === REPLY_RECIPIENT_OWNER) {
+        ownerDefinitions += 1;
+        if (ownerDefinitions === 1) continue;
+        violations.push(outside(site, "A second definition"));
+        continue;
+      }
+      violations.push(outside(site, "A definition"));
+      continue;
+    }
+    if (site.file === REPLY_RECIPIENT_CALLER) {
+      callerCalls += 1;
+      continue;
+    }
+    violations.push(outside(site, "A call"));
+  }
+  const missing = (what) => ({
+    file: what === "definition" ? REPLY_RECIPIENT_OWNER : REPLY_RECIPIENT_CALLER,
+    line: 0,
+    column: 0,
+    pattern: "reply-recipient-missing",
+    patternIndex: FORBIDDEN.length + 51,
+    why:
+      what === "definition"
+        ? `No definition of replyRecipient in ${REPLY_RECIPIENT_OWNER}. The rules job may take exactly one address from a stranger's message, the From address, through one function, and that function is gone, renamed or moved. A reply placed without it has had its recipient chosen some other way. A definition that survives only in a comment counts as zero. Restore it. If it really moved, that is a decision, not a refactor: get it, then change the owner, never the pattern.`
+        : `No call of replyRecipient in ${REPLY_RECIPIENT_CALLER}. The reply action must take its one recipient from that function, which reads only the From address. With the call gone, the action is choosing its recipient some other way, which is how a reply gets aimed somewhere a stranger chose. A call that survives only in a comment counts as zero. Restore the call. If the action really moved, that is a decision, not a refactor.`,
+  });
+  if (ownerDefinitions === 0) violations.push(missing("definition"));
+  if (callerCalls === 0) violations.push(missing("call"));
+  return violations;
+}
+
+/**
+ * The From-field count (Phase 28, D-21 (i)). A name in one of the four owners
+ * passes; a name anywhere else under `src/agent/` is
+ * `sender-address-outside-owners`. A recipient module that does not name it
+ * is `sender-address-missing`.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} sites
+ */
+export function checkSenderAddressOwnership(sites) {
+  const violations = [];
+  for (const site of sites) {
+    if (SENDER_ADDRESS_OWNERS.includes(site.file)) continue;
+    violations.push({
+      file: site.file,
+      line: site.line,
+      column: site.column,
+      pattern: "sender-address-outside-owners",
+      patternIndex: FORBIDDEN.length + 52,
+      why: `The row's From field, senderAddress, is named in ${site.file}. Under src/agent/ it may be named only where the row is typed, read out of the change check's answer, matched by the evaluator, and turned into a recipient: ${SENDER_ADDRESS_OWNERS.join(", ")}. The job may take exactly one address from a stranger's message, the From address, through one function, and a second way to read an address is how a reply gets aimed somewhere the stranger chose. The field named anywhere else is a second reader of it, and the first step to a recipient that skipped the one function. Pass the row to replyRecipient instead. A second reader is a decision on the boundary, not a refactor.`,
+    });
+  }
+  if (!sites.some((site) => site.file === SENDER_ADDRESS_REQUIRED)) {
+    violations.push({
+      file: SENDER_ADDRESS_REQUIRED,
+      line: 0,
+      column: 0,
+      pattern: "sender-address-missing",
+      patternIndex: FORBIDDEN.length + 53,
+      why: `${SENDER_ADDRESS_REQUIRED} no longer names the row's From field, senderAddress. The recipient function must take the reply's one recipient from that field and nothing else. If it no longer reads the field, the reply's recipient is coming from somewhere else, which is how a reply gets aimed somewhere a stranger chose. A name that survives only in a comment counts as zero. Restore the read. If the field really changed name, that is a decision: change the owners and this count together, never the pattern alone.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The add-rule count (Phase 28, D-11, D-21 (g)), on the arm count's shape.
+ * The first call in the rules tool module passes; every other call, there or
+ * anywhere else under `src/`, is `rules-add-outside-commit`. No call at all is
+ * `rules-add-missing`.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} calls
+ */
+export function checkRuleAddOwnership(calls) {
+  const violations = [];
+  let ownerCalls = 0;
+  for (const call of calls) {
+    if (call.file === RULE_ADD_OWNER) {
+      ownerCalls += 1;
+      if (ownerCalls === 1) continue;
+    }
+    violations.push({
+      file: call.file,
+      line: call.line,
+      column: call.column,
+      pattern: "rules-add-outside-commit",
+      patternIndex: FORBIDDEN.length + 54,
+      why: `A second call of the per-person object's add-rule method under ${RULE_ADD_SCOPE} -- in another module, or a second one inside ${RULE_ADD_OWNER}, which counts the same. A rule runs on its own every 15 minutes, with nobody present, for as long as the person stays signed in, so adding one is previewed: the person sees every value and what the rule will do, and the commit writes exactly that rule or nothing. A second call site is a second way to add a rule with no preview behind it -- a tool, the alarm, or a default or starter rule the person never wrote. Add rules only through the commit's one call. A second way is a decision on the autonomous layer's boundary, not a refactor.`,
+    });
+  }
+  if (calls.length === 0) {
+    violations.push({
+      file: RULE_ADD_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "rules-add-missing",
+      patternIndex: FORBIDDEN.length + 55,
+      why: `No call of the per-person object's add-rule method under ${RULE_ADD_SCOPE}, which means the rules commit in ${RULE_ADD_OWNER} was deleted, emptied, or moved. Zero is as much a violation as two, and the quieter one: rules would then be added some other way, without the preview this count exists to hold, or not at all, and nothing fails on the way out. A call that survives only in a comment counts as zero. Restore the call in the commit. If it really moved, that is a decision, not a refactor: get it, then change the owner, never the pattern.`,
     });
   }
   return violations;

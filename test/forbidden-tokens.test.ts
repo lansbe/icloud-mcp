@@ -80,6 +80,32 @@ import {
   AGENT_CLOSURE_FORBIDDEN_FILES,
   checkAgentObjectClosure,
   checkSelfBindingConfig,
+  AUTONOMY_WRITE_TOOLS,
+  AUTONOMY_WRITE_OWNER,
+  AUTONOMY_WRITE_LIST_FILE,
+  AUTONOMY_WRITE_SCOPE,
+  collectAutonomyWriteNames,
+  checkAutonomyWriteOwnership,
+  AUTONOMY_ACTIONS_MODULE,
+  AUTONOMY_ACTION_EXPORTS,
+  moduleExportNamesOf,
+  checkAutonomyActionExports,
+  REPLY_RECIPIENT_OWNER,
+  REPLY_RECIPIENT_CALLER,
+  REPLY_RECIPIENT_DEFINITION_SCOPE,
+  REPLY_RECIPIENT_CALL_SCOPE,
+  collectReplyRecipientSites,
+  checkReplyRecipientOwnership,
+  SENDER_ADDRESS_OWNERS,
+  SENDER_ADDRESS_REQUIRED,
+  SENDER_ADDRESS_SCOPE,
+  collectSenderAddressNames,
+  checkSenderAddressOwnership,
+  RULE_ADD_CALL,
+  RULE_ADD_OWNER,
+  RULE_ADD_SCOPE,
+  collectRuleAddCalls,
+  checkRuleAddOwnership,
   OWNERSHIP_VIOLATION_IDS,
   PASSWORD_READER_IMPORT,
   PASSWORD_READER_OWNERS,
@@ -129,6 +155,7 @@ import {
   scan,
   scanWranglerConfig,
 } from "../scripts/forbidden-tokens.mjs";
+import { AUTONOMY_TOOLS } from "../src/agent/autonomy-client";
 
 const SCANNER_PATH = "scripts/forbidden-tokens.mjs";
 const THIS_TEST_PATH = "test/forbidden-tokens.test.ts";
@@ -1153,6 +1180,19 @@ describe("the patterns have teeth", () => {
     // library's helper and read the props it decrypts.
     "token-unwrap-helper":
       "const grant = await env.OAUTH_PROVIDER.unwrapToken(autonomyToken);",
+    // Phase 28 (AUTO-09). The rules job naming a fifth tool: the one-line edit
+    // that turns "flag and reply" into "flag, reply and archive".
+    "agent-tool-outside-allowlist": 'const moved = await call("mail_move", { ids: [row.id] });',
+    // The evaluator reaching for a helper at run time: the first value import.
+    "agent-evaluator-runtime-import": 'import { isBareAddress } from "./rules";',
+    // A combinator over the job's call function, which is too common a name
+    // for the fan-out rule to list.
+    "autonomy-job-combinator":
+      'await Promise.all(rows.map((r) => call("mail_flag", { id: r.id, flagged: true })));',
+    // Reading the header that asks for replies to go somewhere else. Built
+    // from fragments, as the plan asks for every sample of this rule, so this
+    // table does not spell the header's name.
+    "agent-reads-other-address": `const to = row.${["reply", "To"].join("")};`,
   };
 
   it("covers every rule with a known-violating sample", () => {
@@ -5628,6 +5668,21 @@ describe("the count constraints as a set", () => {
   const SIGN_IN_ARM_CALL = "    const answer = await agentFor(principal).armAutonomy(code);\n";
   const TOOL_ARM_CALL = "  await agentFor(actor).armAutonomy(args.code);\n";
   const COMMENTED_ARM_CALL = "    // const answer = await agentFor(principal).armAutonomy(code);\n";
+  /** Phase 28: the five rules-job counts' samples. Each pair gives exactly
+   *  one violation of each id. */
+  const JOB_MODULE = "src/agent/job.ts";
+  const JOB_FLAG_CALL = '    const a = await call("mail_flag", { id: row.id, flagged: true });\n';
+  const ACTIONS_FLAG_ONLY = '  await call("mail_flag", { id: row.id, flagged: true });\n';
+  const ACTIONS_BOTH =
+    '  await call("mail_flag", { id });\n  await call("mail_compose_reply", { parentId: id, text, to });\n';
+  const RECIPIENT_DEFINITION = "export function replyRecipient(row: EnvelopeRow, self: string) {}\n";
+  const ACTIONS_RECIPIENT_CALL = "    const recipient = replyRecipient(row, self);\n";
+  const JOB_RECIPIENT_CALL = "    const r = replyRecipient(row, self);\n";
+  const JOB_SENDER_READ = "    const from = row.senderAddress;\n";
+  const RECIPIENT_SENDER_READ = "    const from = row.senderAddress;\n";
+  const RULES_ADD_CALL = "  const added = await agentFor(actor).addRule(rule);\n";
+  const TOOL_ADD_CALL = "  await agentFor(actor).addRule(defaultRule);\n";
+  const COMMENTED_ADD_CALL = "  // const added = await agentFor(actor).addRule(rule);\n";
 
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
@@ -5756,6 +5811,43 @@ describe("the count constraints as a set", () => {
       ...checkAutonomyArmOwnership(
         collectAutonomyArmCalls(AUTONOMY_ARM_OWNER, COMMENTED_ARM_CALL),
       ).map((v) => v.pattern),
+      // The five phase 28 counts, both arms of each through scan()'s own
+      // collectors (the export shape through its own reader).
+      ...checkAutonomyWriteOwnership([
+        ...collectAutonomyWriteNames(AUTONOMY_WRITE_OWNER, ACTIONS_BOTH),
+        ...collectAutonomyWriteNames(JOB_MODULE, JOB_FLAG_CALL),
+      ]).map((v) => v.pattern),
+      ...checkAutonomyWriteOwnership(
+        collectAutonomyWriteNames(AUTONOMY_WRITE_OWNER, ACTIONS_FLAG_ONLY),
+      ).map((v) => v.pattern),
+      ...checkAutonomyActionExports(
+        moduleExportNamesOf("export function setFlag() {}\nexport function placeDraft() {}\nexport const third = 1;\n"),
+      ).map((v) => v.pattern),
+      ...checkAutonomyActionExports(moduleExportNamesOf("export function setFlag() {}\n")).map(
+        (v) => v.pattern,
+      ),
+      ...checkReplyRecipientOwnership([
+        ...collectReplyRecipientSites(REPLY_RECIPIENT_OWNER, RECIPIENT_DEFINITION),
+        ...collectReplyRecipientSites(REPLY_RECIPIENT_CALLER, ACTIONS_RECIPIENT_CALL),
+        ...collectReplyRecipientSites(JOB_MODULE, JOB_RECIPIENT_CALL),
+      ]).map((v) => v.pattern),
+      ...checkReplyRecipientOwnership(
+        collectReplyRecipientSites(REPLY_RECIPIENT_OWNER, RECIPIENT_DEFINITION),
+      ).map((v) => v.pattern),
+      ...checkSenderAddressOwnership([
+        ...collectSenderAddressNames(SENDER_ADDRESS_REQUIRED, RECIPIENT_SENDER_READ),
+        ...collectSenderAddressNames(JOB_MODULE, JOB_SENDER_READ),
+      ]).map((v) => v.pattern),
+      ...checkSenderAddressOwnership(
+        collectSenderAddressNames(SENDER_ADDRESS_REQUIRED, `// ${RECIPIENT_SENDER_READ}`),
+      ).map((v) => v.pattern),
+      ...checkRuleAddOwnership([
+        ...collectRuleAddCalls(RULE_ADD_OWNER, RULES_ADD_CALL),
+        ...collectRuleAddCalls(TOOL_LAYER, TOOL_ADD_CALL),
+      ]).map((v) => v.pattern),
+      ...checkRuleAddOwnership(collectRuleAddCalls(RULE_ADD_OWNER, COMMENTED_ADD_CALL)).map(
+        (v) => v.pattern,
+      ),
       // The second two-owner count, fed the same pair of lists the password
       // count is fed and for the same reason.
       ...checkPrincipalConstructorOwnership([
@@ -5865,6 +5957,35 @@ describe("the count constraints as a set", () => {
       ...checkAutonomyArmOwnership(
         collectAutonomyArmCalls(AUTONOMY_ARM_OWNER, COMMENTED_ARM_CALL),
       ),
+      // The five phase 28 counts: one outside and one missing each. Each
+      // outside sample carries its owner too, so only the outside id fires.
+      ...checkAutonomyWriteOwnership([
+        ...collectAutonomyWriteNames(AUTONOMY_WRITE_OWNER, ACTIONS_BOTH),
+        ...collectAutonomyWriteNames(JOB_MODULE, JOB_FLAG_CALL),
+      ]),
+      ...checkAutonomyWriteOwnership(collectAutonomyWriteNames(AUTONOMY_WRITE_OWNER, ACTIONS_FLAG_ONLY)),
+      ...checkAutonomyActionExports(
+        moduleExportNamesOf("export function setFlag() {}\nexport function placeDraft() {}\nexport const third = 1;\n"),
+      ),
+      ...checkAutonomyActionExports(moduleExportNamesOf("export function setFlag() {}\n")),
+      ...checkReplyRecipientOwnership([
+        ...collectReplyRecipientSites(REPLY_RECIPIENT_OWNER, RECIPIENT_DEFINITION),
+        ...collectReplyRecipientSites(REPLY_RECIPIENT_CALLER, ACTIONS_RECIPIENT_CALL),
+        ...collectReplyRecipientSites(JOB_MODULE, JOB_RECIPIENT_CALL),
+      ]),
+      ...checkReplyRecipientOwnership(collectReplyRecipientSites(REPLY_RECIPIENT_OWNER, RECIPIENT_DEFINITION)),
+      ...checkSenderAddressOwnership([
+        ...collectSenderAddressNames(SENDER_ADDRESS_REQUIRED, RECIPIENT_SENDER_READ),
+        ...collectSenderAddressNames(JOB_MODULE, JOB_SENDER_READ),
+      ]),
+      ...checkSenderAddressOwnership(
+        collectSenderAddressNames(SENDER_ADDRESS_REQUIRED, `// ${RECIPIENT_SENDER_READ}`),
+      ),
+      ...checkRuleAddOwnership([
+        ...collectRuleAddCalls(RULE_ADD_OWNER, RULES_ADD_CALL),
+        ...collectRuleAddCalls(TOOL_LAYER, TOOL_ADD_CALL),
+      ]),
+      ...checkRuleAddOwnership(collectRuleAddCalls(RULE_ADD_OWNER, COMMENTED_ADD_CALL)),
       // TWO owners again, so the same asymmetric pair the password count needs:
       // both owners plus a non-owner is exactly one outside, and one owner
       // alone is exactly one missing.
@@ -6922,8 +7043,9 @@ describe("the autonomy key's scan rules (Phase 27, D-21)", () => {
       expect([...AGENT_CLOSURE_FORBIDDEN_DIRS].sort()).toEqual(
         ["src/dav/", "src/feed/", "src/mail/", "src/mcp/", "src/staging/"].sort(),
       );
+      // Phase 28 (D-21 (d)) added the confirmation and change-marker modules.
       expect([...AGENT_CLOSURE_FORBIDDEN_FILES].sort()).toEqual(
-        ["src/auth/login-handler.ts", "src/auth/oauth.ts"].sort(),
+        ["src/auth/login-handler.ts", "src/auth/oauth.ts", "src/confirm.ts", "src/change-marker.ts"].sort(),
       );
     });
 
@@ -7139,6 +7261,663 @@ describe("the autonomy key's scan rules (Phase 27, D-21)", () => {
       const [violation] = checkSelfBindingConfig("wrangler.jsonc", config());
       expect(violation!.why.length).toBeGreaterThan(80);
       expect(violation!.patternIndex).toBe(6);
+    });
+  });
+});
+
+// Phase 28, D-21 as revised twice on 2026-09-27 (AUTO-08, AUTO-09, AUTO-13).
+// The rules job may flag and may place a draft reply to the From address, and
+// nothing else. Each limit is held by a rule here, not by prose (PITFALLS #42):
+// four pattern rules, five counts with both arms, and two widenings. Each was
+// measured on the real tree before it was armed.
+describe("the rules job's scan rules (Phase 28, D-21)", () => {
+  const rule = (id: string) => FORBIDDEN.find((r) => r.id === id)!;
+  /** Through the real scope mechanism, at a given path. */
+  const hits = (id: string, path: string, text: string): number =>
+    matchRule(rule(id), FORBIDDEN.indexOf(rule(id)), path, text).length;
+
+  // @ts-expect-error — Vite's `import.meta.glob` has no ambient declaration here; see RAW_SOURCES above.
+  const GLOBBED_SRC: Record<string, string> = import.meta.glob("../src/**/*.ts", {
+    query: "?raw",
+    import: "default",
+    eager: true,
+  });
+  /** Every TypeScript file under src/, keyed by its repo-relative path. */
+  const SRC: Record<string, string> = Object.fromEntries(
+    Object.entries(GLOBBED_SRC).map(([key, text]) => [key.replace(/^\.\.\//, ""), text]),
+  );
+  const agentFiles = Object.keys(SRC).filter((file) => file.startsWith("src/agent/"));
+
+  describe("a tool name outside the four (a, AUTO-09)", () => {
+    const ID = "agent-tool-outside-allowlist";
+    const REFUSED = [
+      "mail_compose_new",
+      "mail_move",
+      "mail_trash",
+      "mail_archive",
+      "mail_commit",
+      "mail_mark_read",
+      "calendar_create_event",
+      "contacts_commit",
+      "rules_add",
+      "calendar_respond_to_invitation",
+    ];
+
+    it("is scoped to src/agent/", () => {
+      expect(rule(ID).scope).toBe("src/agent/");
+    });
+
+    it("fires on each refused name, in any of the three quotes", () => {
+      for (const name of REFUSED) {
+        for (const quote of ['"', "'", "`"]) {
+          expect(hits(ID, "src/agent/job.ts", `await call(${quote}${name}${quote}, {});`), `${quote}${name}`).toBe(1);
+        }
+      }
+    });
+
+    it("fires on a longer name that begins with an allowed one, and on dav_diagnose", () => {
+      for (const name of ["mail_flag_all", "mail_compose_reply_all", "changes_since_all", "dav_diagnose"]) {
+        expect(hits(ID, "src/agent/job.ts", `call("${name}", {});`), name).toBe(1);
+      }
+    });
+
+    it("does not fire on the four names on the one list", () => {
+      expect([...AUTONOMY_TOOLS].sort()).toEqual(
+        ["account_whoami", "changes_since", "mail_compose_reply", "mail_flag"].sort(),
+      );
+      for (const name of AUTONOMY_TOOLS) {
+        expect(hits(ID, "src/agent/actions.ts", `await call("${name}", {});`), name).toBe(0);
+      }
+    });
+
+    it("gives nothing on the real list file, and nothing on any real src/agent/ file", () => {
+      expect(hits(ID, AUTONOMY_WRITE_LIST_FILE, SRC[AUTONOMY_WRITE_LIST_FILE]!)).toBe(0);
+      for (const file of agentFiles) expect(hits(ID, file, SRC[file]!), file).toBe(0);
+    });
+
+    it("fires nothing outside src/agent/, where the tools are registered", () => {
+      expect(hits(ID, "src/mcp/tools/mail.ts", 'server.registerTool("mail_move", config, handler);')).toBe(0);
+    });
+  });
+
+  describe("the two write tools live in the actions module (b, AUTO-09)", () => {
+    const owner = () => collectAutonomyWriteNames(AUTONOMY_WRITE_OWNER, SRC[AUTONOMY_WRITE_OWNER]!);
+
+    it("names the owner, the list file and the scope", () => {
+      expect(AUTONOMY_WRITE_OWNER).toBe("src/agent/actions.ts");
+      expect(AUTONOMY_WRITE_LIST_FILE).toBe("src/agent/autonomy-client.ts");
+      expect(AUTONOMY_WRITE_SCOPE).toBe("src/agent/");
+      expect([...AUTONOMY_WRITE_TOOLS].sort()).toEqual(["mail_compose_reply", "mail_flag"]);
+    });
+
+    it("gives nothing on the real tree, and the actions module names both", () => {
+      const collected = agentFiles.flatMap((file) => collectAutonomyWriteNames(file, SRC[file]!));
+      expect(checkAutonomyWriteOwnership(collected)).toEqual([]);
+      expect(new Set(owner().map((site) => site.name))).toEqual(new Set(AUTONOMY_WRITE_TOOLS));
+    });
+
+    it("refuses either name in a second agent file", () => {
+      for (const name of AUTONOMY_WRITE_TOOLS) {
+        const violations = checkAutonomyWriteOwnership([
+          ...owner(),
+          ...collectAutonomyWriteNames("src/agent/job.ts", `await call("${name}", {});\n`),
+        ]);
+        expect(violations.map((v) => `${v.pattern} ${v.file}`), name).toEqual([
+          "autonomy-write-outside-actions src/agent/job.ts",
+        ]);
+      }
+    });
+
+    it("does not count the list file, or a file outside src/agent/", () => {
+      expect(
+        checkAutonomyWriteOwnership([
+          ...owner(),
+          ...collectAutonomyWriteNames(AUTONOMY_WRITE_LIST_FILE, SRC[AUTONOMY_WRITE_LIST_FILE]!),
+          ...collectAutonomyWriteNames("src/mcp/tools/mail.ts", 'registerTool("mail_flag", c, h);\n'),
+        ]),
+      ).toEqual([]);
+    });
+
+    it("reports each name the actions module no longer holds, a commented one included", () => {
+      const neither = checkAutonomyWriteOwnership(
+        collectAutonomyWriteNames(AUTONOMY_WRITE_OWNER, "export async function setFlag() {}\n"),
+      );
+      expect(neither.map((v) => v.pattern)).toEqual(["autonomy-write-missing", "autonomy-write-missing"]);
+      const commented = checkAutonomyWriteOwnership(
+        collectAutonomyWriteNames(
+          AUTONOMY_WRITE_OWNER,
+          '  await call("mail_flag", {});\n  // await call("mail_compose_reply", {});\n',
+        ),
+      );
+      expect(commented.map((v) => v.pattern)).toEqual(["autonomy-write-missing"]);
+      expect(commented[0]!.why).toContain(AUTONOMY_WRITE_OWNER);
+    });
+  });
+
+  describe("the actions module exports exactly two functions (c, AUTO-09)", () => {
+    it("names the module and the two exports", () => {
+      expect(AUTONOMY_ACTIONS_MODULE).toBe("src/agent/actions.ts");
+      expect([...AUTONOMY_ACTION_EXPORTS].sort()).toEqual(["placeDraft", "setFlag"]);
+    });
+
+    it("reads the real module as exactly the two", () => {
+      expect(moduleExportNamesOf(SRC[AUTONOMY_ACTIONS_MODULE]!)).toEqual(["setFlag", "placeDraft"]);
+      expect(checkAutonomyActionExports(moduleExportNamesOf(SRC[AUTONOMY_ACTIONS_MODULE]!))).toEqual([]);
+    });
+
+    it("refuses a third export, in every export form", () => {
+      for (const extra of [
+        "export function third() {}",
+        "export async function archive() {}",
+        "export const third = 1;",
+        "export let third = 1;",
+        "export class Third {}",
+        "export type Third = string;",
+        "export interface Third {}",
+        "export { third };",
+        "export { helper as third };",
+        "export type { Third } from './tool-call';",
+        'export * from "./rules";',
+        "export default setFlag;",
+        "export const { a } = source;",
+      ]) {
+        const violations = checkAutonomyActionExports(
+          moduleExportNamesOf(`${SRC[AUTONOMY_ACTIONS_MODULE]!}\n${extra}\n`),
+        );
+        expect(violations.map((v) => v.pattern), extra).toEqual(["autonomy-action-export-extra"]);
+      }
+    });
+
+    it("reads a braced list as its names, taking the alias", () => {
+      expect(moduleExportNamesOf("export { setFlag, internal as placeDraft, type T };\n")).toEqual([
+        "setFlag",
+        "placeDraft",
+        "T",
+      ]);
+      expect(moduleExportNamesOf("// export function hidden() {}\n/* export const x = 1; */\n")).toEqual([]);
+    });
+
+    it("reports each action missing, and both when the module was not found", () => {
+      const withoutPlace = SRC[AUTONOMY_ACTIONS_MODULE]!.replace(
+        "export async function placeDraft(",
+        "async function placeDraft(",
+      );
+      expect(withoutPlace).not.toBe(SRC[AUTONOMY_ACTIONS_MODULE]);
+      const missing = checkAutonomyActionExports(moduleExportNamesOf(withoutPlace));
+      expect(missing.map((v) => v.pattern)).toEqual(["autonomy-action-export-missing"]);
+      expect(missing[0]!.why).toContain("placeDraft");
+      expect(checkAutonomyActionExports(null).map((v) => v.pattern)).toEqual([
+        "autonomy-action-export-missing",
+        "autonomy-action-export-missing",
+      ]);
+    });
+  });
+
+  describe("one function names the reply's recipient (h, D-30)", () => {
+    const realSites = () =>
+      Object.entries(SRC).flatMap(([file, text]) => collectReplyRecipientSites(file, text));
+
+    it("names the owner, the one caller and the two scopes", () => {
+      expect(REPLY_RECIPIENT_OWNER).toBe("src/agent/recipient.ts");
+      expect(REPLY_RECIPIENT_CALLER).toBe("src/agent/actions.ts");
+      expect(REPLY_RECIPIENT_DEFINITION_SCOPE).toBe("src/");
+      expect(REPLY_RECIPIENT_CALL_SCOPE).toBe("src/agent/");
+    });
+
+    it("finds one definition in the owner and calls only in the actions module, on the real tree", () => {
+      const sites = realSites();
+      expect(sites.filter((s) => s.kind === "definition").map((s) => s.file)).toEqual([REPLY_RECIPIENT_OWNER]);
+      expect(new Set(sites.filter((s) => s.kind === "call").map((s) => s.file))).toEqual(
+        new Set([REPLY_RECIPIENT_CALLER]),
+      );
+      expect(checkReplyRecipientOwnership(sites)).toEqual([]);
+    });
+
+    it("does not count the rules tool's call, which is outside src/agent/, or the mail tree's plural helper", () => {
+      expect(
+        collectReplyRecipientSites("src/mcp/tools/rules.ts", "const r = replyRecipient(row, self);\n"),
+      ).toEqual([]);
+      expect(
+        collectReplyRecipientSites(
+          "src/mail/compose.ts",
+          "export function replyRecipients(h: H) {}\nconst r = replyRecipients(h);\n",
+        ),
+      ).toEqual([]);
+      expect(
+        collectReplyRecipientSites("src/agent/actions.ts", 'import { replyRecipient } from "./recipient";\n'),
+      ).toEqual([]);
+    });
+
+    it("refuses a call from the job, and from any other agent file", () => {
+      for (const [file, text] of [
+        ["src/agent/job.ts", "    const r = replyRecipient(row, self);\n"],
+        ["src/agent/user-agent.ts", "    const r = replyRecipient ?. (row, self);\n"],
+        ["src/agent/evaluate.ts", "  replyRecipient(row, '');\n"],
+      ] as const) {
+        const violations = checkReplyRecipientOwnership([...realSites(), ...collectReplyRecipientSites(file, text)]);
+        expect(violations.map((v) => `${v.pattern} ${v.file}`), file).toEqual([
+          `reply-recipient-outside-owner ${file}`,
+        ]);
+      }
+    });
+
+    it("refuses a second definition in the owner, and a definition anywhere else under src/", () => {
+      for (const [file, text] of [
+        [REPLY_RECIPIENT_OWNER, "function replyRecipient(row: EnvelopeRow) { return row; }\n"],
+        ["src/agent/job.ts", "const replyRecipient = (row: EnvelopeRow) => row;\n"],
+        ["src/mcp/tools/rules.ts", "function replyRecipient(row: unknown) { return row; }\n"],
+      ] as const) {
+        const violations = checkReplyRecipientOwnership([...realSites(), ...collectReplyRecipientSites(file, text)]);
+        expect(violations.map((v) => `${v.pattern} ${v.file}`), file).toEqual([
+          `reply-recipient-outside-owner ${file}`,
+        ]);
+      }
+    });
+
+    it("reports no definition, and no call in the actions module, a commented one included", () => {
+      const withoutCaller = realSites().filter((s) => s.file !== REPLY_RECIPIENT_CALLER);
+      expect(checkReplyRecipientOwnership(withoutCaller).map((v) => `${v.pattern} ${v.file}`)).toEqual([
+        `reply-recipient-missing ${REPLY_RECIPIENT_CALLER}`,
+      ]);
+      const withoutDefinition = realSites().filter((s) => s.kind !== "definition");
+      expect(checkReplyRecipientOwnership(withoutDefinition).map((v) => `${v.pattern} ${v.file}`)).toEqual([
+        `reply-recipient-missing ${REPLY_RECIPIENT_OWNER}`,
+      ]);
+      const commented = [
+        ...collectReplyRecipientSites(REPLY_RECIPIENT_OWNER, "// export function replyRecipient(row) {}\n"),
+        ...collectReplyRecipientSites(REPLY_RECIPIENT_CALLER, "    // const r = replyRecipient(row, self);\n"),
+      ];
+      expect(commented).toEqual([]);
+      expect(checkReplyRecipientOwnership(commented).map((v) => v.pattern)).toEqual([
+        "reply-recipient-missing",
+        "reply-recipient-missing",
+      ]);
+    });
+  });
+
+  describe("the From field is named in four modules only (i)", () => {
+    const realSites = () => agentFiles.flatMap((file) => collectSenderAddressNames(file, SRC[file]!));
+
+    it("names the four owners, the required one and the scope", () => {
+      expect([...SENDER_ADDRESS_OWNERS].sort()).toEqual(
+        ["src/agent/evaluate.ts", "src/agent/recipient.ts", "src/agent/tool-call.ts", "src/agent/tool-reply.ts"].sort(),
+      );
+      expect(SENDER_ADDRESS_REQUIRED).toBe("src/agent/recipient.ts");
+      expect(SENDER_ADDRESS_SCOPE).toBe("src/agent/");
+    });
+
+    it("gives nothing on the real tree, where each of the four names it", () => {
+      const sites = realSites();
+      expect(checkSenderAddressOwnership(sites)).toEqual([]);
+      expect(new Set(sites.map((s) => s.file))).toEqual(new Set(SENDER_ADDRESS_OWNERS));
+    });
+
+    it("refuses the field in the job and in the actions module", () => {
+      for (const file of ["src/agent/job.ts", "src/agent/actions.ts"]) {
+        const violations = checkSenderAddressOwnership([
+          ...realSites(),
+          ...collectSenderAddressNames(file, "    const to = row.senderAddress;\n"),
+        ]);
+        expect(violations.map((v) => `${v.pattern} ${v.file}`), file).toEqual([
+          `sender-address-outside-owners ${file}`,
+        ]);
+      }
+    });
+
+    it("reports a recipient module that no longer names it, a commented read included", () => {
+      const withoutRecipient = realSites().filter((s) => s.file !== SENDER_ADDRESS_REQUIRED);
+      expect(checkSenderAddressOwnership(withoutRecipient).map((v) => v.pattern)).toEqual([
+        "sender-address-missing",
+      ]);
+      expect(
+        collectSenderAddressNames(SENDER_ADDRESS_REQUIRED, "    // const from = row.senderAddress;\n"),
+      ).toEqual([]);
+    });
+
+    it("collects nothing outside src/agent/", () => {
+      expect(collectSenderAddressNames("src/mcp/tools/rules.ts", "senderAddress: row.fromAddress,\n")).toEqual([]);
+    });
+  });
+
+  describe("no other address field under src/agent/ (j)", () => {
+    const ID = "agent-reads-other-address";
+    // Every header name below is built from fragments, as the plan asks, so
+    // this block does not spell the fields the rule refuses.
+    const R = "reply";
+    const T = "to";
+    const REFUSED = [
+      `row.${R}T${T.slice(1)}`,
+      `row.${R}_${T}`,
+      `headers["${R}-${T}"]`,
+      `headers["R${R.slice(1)}-T${T.slice(1)}"]`,
+      `const X = "${R.toUpperCase()}_${T.toUpperCase()}";`,
+      `row.R${R.slice(1)}T${T.slice(1)}`,
+      `const n = row.${"from"}${"Name"};`,
+      `const n = row.${"display"}${"Name"};`,
+      `const n = row.${"sender"}${"Name"};`,
+      `const p = row.${"return"}${"Path"};`,
+      `headers["${"Return"}-${"Path"}"]`,
+      `headers["${"Sen"}${"der"}"]`,
+      `headers['${"sen"}${"der"}']`,
+      `await call("mail_compose_reply", { parentId, text, ${"c"}${"c"}: [x] });`,
+      `await call("mail_compose_reply", { parentId, text, ${"b"}${"cc"}: [x] });`,
+      `await call("mail_compose_reply", { parentId, text, ${"reply"}${"All"}: true });`,
+      `await call("mail_compose_reply", { parentId, text, ${"attachment"}${"Ids"}: [] });`,
+      `const m = { ${"folder"}${"Id"}: "x" };`,
+      `const m = { "${"c"}${"c"}": [x] };`,
+    ];
+
+    it("is scoped to src/agent/", () => {
+      expect(rule(ID).scope).toBe("src/agent/");
+    });
+
+    it("fires on each field, in each spelling", () => {
+      for (const line of REFUSED) {
+        expect(hits(ID, "src/agent/job.ts", line), line).toBe(1);
+      }
+    });
+
+    it("does not fire on the From field, the recipient function, the sign-in reader or prose about the sender", () => {
+      for (const line of [
+        "const from = row.senderAddress;",
+        "const recipient = replyRecipient(row, self);",
+        "const address = who.kind === 'ok' ? readSignedInAs(who.result) : null;",
+        "// the sender's address",
+        "// the draft is a reply to each matching message's sender",
+        "// a reply to the sender, never to anyone copied",
+        'await call("mail_compose_reply", { parentId: row.id, text: draft.text, to: [recipient.to] });',
+        'const NOT_REPLY_KEYS = Object.freeze(["to", "subject", "cc", "bcc", "html"]);',
+        "const account = { signedInAs };",
+      ]) {
+        expect(hits(ID, "src/agent/actions.ts", line), line).toBe(0);
+      }
+    });
+
+    it("gives nothing on any real src/agent/ file", () => {
+      for (const file of agentFiles) expect(hits(ID, file, SRC[file]!), file).toBe(0);
+    });
+
+    it("fires nothing outside src/agent/", () => {
+      expect(hits(ID, "src/mail/service.ts", REFUSED[0]!)).toBe(0);
+    });
+  });
+
+  describe("the object's closure refuses confirm and the change marker (d)", () => {
+    const ID = "agent-object-closure-reaches-mail";
+    const BASE: Record<string, string> = {
+      "src/agent/user-agent.ts": 'import { runJob } from "./job";\n',
+      "src/agent/job.ts": 'import { setFlag } from "./actions";\n',
+      "src/agent/actions.ts": 'import { replyRecipient } from "./recipient";\n',
+      "src/agent/recipient.ts": "export const replyRecipient = 1;\n",
+    };
+    const ids = (sources: Record<string, string>) =>
+      checkAgentObjectClosure(sources).map((v) => `${v.pattern} ${v.file}`);
+
+    it("passes the small tree", () => {
+      expect(ids(BASE)).toEqual([]);
+    });
+
+    it("refuses the job importing the confirmation module", () => {
+      expect(ids({ ...BASE, "src/agent/job.ts": 'import { mintConfirmation } from "../confirm";\n' })).toEqual([
+        `${ID} src/agent/job.ts`,
+      ]);
+    });
+
+    it("refuses the change-marker module two hops from the object", () => {
+      const violations = checkAgentObjectClosure({
+        ...BASE,
+        "src/agent/actions.ts": 'import { decodeMarker } from "../change-marker";\n',
+      });
+      expect(violations.map((v) => `${v.pattern} ${v.file}`)).toEqual([`${ID} src/agent/actions.ts`]);
+      expect(violations[0]!.why).toContain(
+        "src/agent/user-agent.ts -> src/agent/job.ts -> src/agent/actions.ts -> src/change-marker.ts",
+      );
+    });
+
+    it("still allows a type import of the change-marker module, as the recall ledger has", () => {
+      expect(ids({ ...BASE, "src/agent/job.ts": 'import type { FolderState } from "../change-marker";\n' })).toEqual(
+        [],
+      );
+      expect(SRC["src/agent/recall-ledger.ts"]).toMatch(/import type \{[^}]*\} from "\.\.\/change-marker"/);
+    });
+
+    it("passes the real closure", () => {
+      expect(checkAgentObjectClosure(SRC)).toEqual([]);
+    });
+  });
+
+  describe("the evaluator has no runtime import (e)", () => {
+    const ID = "agent-evaluator-runtime-import";
+    const FILE = "src/agent/evaluate.ts";
+
+    it("is scoped to the evaluator alone", () => {
+      expect(rule(ID).scope).toBe(FILE);
+      expect(hits(ID, "src/agent/job.ts", 'import { evaluate } from "./evaluate";')).toBe(0);
+    });
+
+    it("fires on a value import, a type-member import, a side-effect import, a dynamic import and a re-export", () => {
+      for (const line of [
+        'import { isBareAddress } from "./rules";',
+        'import { type Rule } from "./rules";',
+        'import rules from "./rules";',
+        'import * as rules from "./rules";',
+        'import "./rules";',
+        'const later = await import("./rules");',
+        'export { isBareAddress } from "./rules";',
+        'export * from "./rules";',
+        'import typeGuard from "./guards";',
+      ]) {
+        expect(hits(ID, FILE, line), line).toBeGreaterThan(0);
+      }
+    });
+
+    it("does not fire on a type import, a type re-export or prose", () => {
+      for (const line of [
+        'import type { Rule } from "./rules";',
+        'import type { EnvelopeRow } from "./tool-call";',
+        'export type { Verdict } from "./verdict";',
+        "// this module has no runtime import",
+        " * runtime import.",
+        "export function evaluate(rules: readonly Rule[]): readonly Verdict[] {",
+      ]) {
+        expect(hits(ID, FILE, line), line).toBe(0);
+      }
+    });
+
+    it("gives nothing on the real evaluator", () => {
+      expect(hits(ID, FILE, SRC[FILE]!)).toBe(0);
+    });
+  });
+
+  describe("the fan-out rule reaches the job's entry points (f, AUTO-13)", () => {
+    /** `concurrent-session` exactly as it shipped before plan 28-06. */
+    const CONCURRENT_SESSION_BEFORE_28_06 =
+      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit|indexNextPage|reconcileMailbox|recallStep|runRecallStep|indexNewMail|windowUids|summariesInRange|newMailPage|underLease|checkBuilt|syncDeletions|folderSnapshots|listFolders)/g;
+    const SAMPLES = [
+      "await Promise.all(rows.map((r) => setFlag(call, r)));",
+      "await Promise.all(verdicts.map((v) => placeDraft(call, v.row, v.rule.then.draft!, self)));",
+      "await Promise.allSettled(tickets.map((t) => withAutonomySession({ ...deps, ticket: t }, use)));",
+    ];
+
+    it("fires on a combinator around each, and the old rule missed each", () => {
+      const old = () =>
+        new RegExp(CONCURRENT_SESSION_BEFORE_28_06.source, CONCURRENT_SESSION_BEFORE_28_06.flags);
+      for (const sample of SAMPLES) {
+        expect(hits("concurrent-session", "src/agent/job.ts", sample), sample).toBe(1);
+        expect(old().test(sample), sample).toBe(false);
+      }
+      for (const name of ["setFlag", "placeDraft", "withAutonomySession"]) {
+        for (const combinator of ["all", "allSettled", "any", "race"]) {
+          expect(
+            hits("concurrent-session", "src/agent/job.ts", `await Promise.${combinator}(xs.map((x) => ${name}(x)));`),
+            `${name} ${combinator}`,
+          ).toBe(1);
+        }
+      }
+      // The typed-out text really was the rule, and the standing samples still fire.
+      expect(old().test(violatingSamples_concurrentSession)).toBe(true);
+      expect(hits("concurrent-session", "src/mcp/tools/mail.ts", violatingSamples_concurrentSession)).toBe(1);
+    });
+
+    it("does not fire on one awaited call to each", () => {
+      for (const permitted of [
+        "const outcome = await setFlag(call, v.row);",
+        "const outcome = await placeDraft(call, v.row, draft, self);",
+        "return withAutonomySession({ ...deps, ticket }, use);",
+      ]) {
+        expect(hits("concurrent-session", "src/agent/job.ts", permitted), permitted).toBe(0);
+      }
+    });
+
+    it("finds no fan-out in the real tree", () => {
+      expect(scan().map((v) => v.pattern)).not.toContain("concurrent-session");
+    });
+  });
+
+  describe("no combinator at all in the job (f, AUTO-13)", () => {
+    const ID = "autonomy-job-combinator";
+
+    it("is scoped to the job", () => {
+      expect(rule(ID).scope).toBe("src/agent/job.ts");
+    });
+
+    it("fires on a fan-out over the call function and on any race", () => {
+      for (const line of [
+        'await Promise.all(rows.map((r) => call("mail_flag", r)));',
+        "const first = await Promise.race([a, b]);",
+        "await Promise . allSettled (calls);",
+        "await Promise.any(xs);",
+      ]) {
+        expect(hits(ID, "src/agent/job.ts", line), line).toBe(1);
+      }
+    });
+
+    it("does not fire in the activity module", () => {
+      expect(hits(ID, "src/agent/activity.ts", "await Promise.race([a, b]);")).toBe(0);
+    });
+
+    it("gives nothing on the real job", () => {
+      expect(hits(ID, "src/agent/job.ts", SRC["src/agent/job.ts"]!)).toBe(0);
+    });
+  });
+
+  describe("one place adds a rule, the commit (g)", () => {
+    it("names the rules tool module as the owner, over src/", () => {
+      expect(RULE_ADD_OWNER).toBe("src/mcp/tools/rules.ts");
+      expect(RULE_ADD_SCOPE).toBe("src/");
+    });
+
+    it("finds exactly one call in the real tree, and not the object's method definition", () => {
+      const collected = Object.entries(SRC).flatMap(([file, text]) => collectRuleAddCalls(file, text));
+      expect(collected.map((call) => call.file)).toEqual([RULE_ADD_OWNER]);
+      expect(checkRuleAddOwnership(collected)).toEqual([]);
+      expect(SRC[AGENT_OBJECT_MODULE]).toMatch(/async addRule\(/);
+    });
+
+    it("refuses a second file, and a second call in the commit's own module", () => {
+      const owner = collectRuleAddCalls(RULE_ADD_OWNER, SRC[RULE_ADD_OWNER]!);
+      for (const [file, text] of [
+        ["src/agent/user-agent.ts", "    await this.addRule(STARTER_RULE);\n"],
+        ["src/mcp/tools/account.ts", "  await agentFor(actor)?.addRule?.(rule);\n"],
+        [RULE_ADD_OWNER, "  await agentFor(actor).addRule(another);\n"],
+      ] as const) {
+        const violations = checkRuleAddOwnership([...owner, ...collectRuleAddCalls(file, text)]);
+        expect(violations.map((v) => `${v.pattern} ${v.file}`), file).toEqual([`rules-add-outside-commit ${file}`]);
+      }
+    });
+
+    it("reports the commit missing when it holds no call, or only a commented one", () => {
+      for (const contents of [
+        "export function registerRulesTools() {}\n",
+        "  // const added = await agentFor(actor).addRule(rule);\n",
+      ]) {
+        expect(
+          checkRuleAddOwnership(collectRuleAddCalls(RULE_ADD_OWNER, contents)).map((v) => v.pattern),
+          contents,
+        ).toEqual(["rules-add-missing"]);
+      }
+    });
+
+    it("does not count the definition, and collects nothing outside src/", () => {
+      const fires = (sample: string) => new RegExp(RULE_ADD_CALL.source, RULE_ADD_CALL.flags).test(sample);
+      expect(fires("  async addRule(rule: unknown): Promise<AddRuleAnswer> {")).toBe(false);
+      expect(fires("stub . addRule (rule)")).toBe(true);
+      expect(collectRuleAddCalls("test/rules-tools.test.ts", "await stub.addRule(rule);")).toEqual([]);
+    });
+  });
+
+  describe("the new constraints are wired into scan()", () => {
+    const COUNT_IDS = [
+      "autonomy-write-outside-actions",
+      "autonomy-write-missing",
+      "autonomy-action-export-extra",
+      "autonomy-action-export-missing",
+      "reply-recipient-outside-owner",
+      "reply-recipient-missing",
+      "sender-address-outside-owners",
+      "sender-address-missing",
+      "rules-add-outside-commit",
+      "rules-add-missing",
+    ];
+
+    it("lists every id in the count set", () => {
+      for (const id of COUNT_IDS) expect(OWNERSHIP_VIOLATION_IDS, id).toContain(id);
+    });
+
+    it("the real tree reports none of them, and scripts/ alone reports each missing arm", () => {
+      const whole = scan().map((v) => v.pattern);
+      for (const id of COUNT_IDS) expect(whole, id).not.toContain(id);
+      const scriptsOnly = new Set(scan("scripts").map((v) => v.pattern));
+      for (const id of [
+        "autonomy-write-missing",
+        "autonomy-action-export-missing",
+        "reply-recipient-missing",
+        "sender-address-missing",
+        "rules-add-missing",
+      ]) {
+        expect(scriptsOnly.has(id), id).toBe(true);
+      }
+    });
+
+    it("gives the ten ids distinct sort keys after the closure check's", () => {
+      const index = [
+        ...checkAutonomyWriteOwnership([{ file: "src/agent/job.ts", line: 1, column: 1, name: "mail_flag" }]),
+        ...checkAutonomyActionExports(["setFlag", "placeDraft", "third"]),
+        ...checkAutonomyActionExports(["setFlag"]),
+        ...checkReplyRecipientOwnership([
+          { file: REPLY_RECIPIENT_OWNER, line: 1, column: 1, kind: "definition" },
+          { file: "src/agent/job.ts", line: 1, column: 1, kind: "call" },
+        ]),
+        ...checkSenderAddressOwnership([{ file: "src/agent/job.ts", line: 1, column: 1 }]),
+        ...checkRuleAddOwnership([{ file: "src/agent/job.ts", line: 1, column: 1 }]),
+        ...checkRuleAddOwnership([]),
+      ].map((v) => `${v.pattern} ${v.patternIndex - FORBIDDEN.length}`);
+      expect(index).toEqual([
+        "autonomy-write-outside-actions 46",
+        "autonomy-write-missing 47",
+        "autonomy-write-missing 47",
+        "autonomy-action-export-extra 48",
+        "autonomy-action-export-missing 49",
+        "reply-recipient-outside-owner 50",
+        "reply-recipient-missing 51",
+        "sender-address-outside-owners 52",
+        "sender-address-missing 53",
+        "rules-add-outside-commit 54",
+        "rules-add-missing 55",
+      ]);
+    });
+
+    it("keeps every owner inside every pattern rule's reach", () => {
+      for (const owner of [
+        AUTONOMY_WRITE_OWNER,
+        AUTONOMY_ACTIONS_MODULE,
+        REPLY_RECIPIENT_OWNER,
+        REPLY_RECIPIENT_CALLER,
+        RULE_ADD_OWNER,
+        ...SENDER_ADDRESS_OWNERS,
+      ]) {
+        expect(EXCLUDED.has(owner), owner).toBe(false);
+      }
     });
   });
 });
