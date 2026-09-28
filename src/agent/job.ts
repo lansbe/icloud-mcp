@@ -613,11 +613,20 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
           settle(v, "skipped_cap");
           continue;
         }
+        // The reply is counted against the day together with its reservation,
+        // before the call, with no await in between (28-REVIEW IN-02). Counted
+        // after the call, an object evicted between the two would forget a
+        // reply that was placed, and the day's cap could be passed. A reply
+        // that was never placed (a skip, which makes no call; busy; a sign-in
+        // that did not go through) gives its count back.
         deps.storage.put<ActedRecord>(v.key, { state: "reserved", at: now });
+        draftsThisRun += 1;
+        draftsToday += 1;
+        deps.storage.put(JOB_DRAFT_DAY_KEY, { day, count: draftsToday });
         const outcome = await placeDraft(call, v.row, draft, self);
-        if (!REPLY_SKIPS.includes(outcome) && !NOTHING_DONE.includes(outcome)) {
-          draftsThisRun += 1;
-          draftsToday += 1;
+        if (REPLY_SKIPS.includes(outcome) || NOTHING_DONE.includes(outcome)) {
+          draftsThisRun -= 1;
+          draftsToday -= 1;
           deps.storage.put(JOB_DRAFT_DAY_KEY, { day, count: draftsToday });
         }
         if (NOTHING_DONE.includes(outcome)) release(v, outcome);

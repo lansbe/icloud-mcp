@@ -26,7 +26,7 @@ vi.mock("../src/mail/socket", async (importOriginal) => ({
 
 import { ACTIVITY_KEY, type ActivityEntry } from "../src/agent/activity";
 import { AUTONOMY_KEY } from "../src/agent/autonomy";
-import { JOB_AUTH_FAILURES_KEY, JOB_NEXT_AT_KEY, RULES_KEY } from "../src/agent/job";
+import { JOB_AUTH_FAILURES_KEY, JOB_DRAFT_DAY_KEY, JOB_NEXT_AT_KEY, RULES_KEY } from "../src/agent/job";
 import { nextWakeAfter } from "../src/agent/cadence";
 import type { UserAgent } from "../src/agent/user-agent";
 import { ConnectionBusyError, ImapAuthError, ImapConnectError, ImapCredentialRefusedError } from "../src/errors";
@@ -269,6 +269,47 @@ describe("a rule removed while a run is working stops at once (28-REVIEW WR-04)"
     // Row 1: r1 flags (and is then removed), r2 flags. Row 2: only r2.
     expect(actions(run.calls)).toHaveLength(3);
     expect(ring(storage).filter((entry) => entry.kind === "flag").map((entry) => entry.ruleId)).toEqual(["r1", "r2", "r2"]);
+  });
+});
+
+// ============= the day's reply count is taken before the call (28-REVIEW IN-02)
+
+describe("the day's reply count is taken before the reply call (28-REVIEW IN-02)", () => {
+  it("the count is written with the reservation, before the call", async () => {
+    const storage = armedStorage([rule("r1", DRAFT)]);
+    const run = await directRun(storage, { rows: [newRow(1)] });
+    const dayAt = run.events.indexOf(`put ${JOB_DRAFT_DAY_KEY}`);
+    expect(dayAt).toBeGreaterThanOrEqual(0);
+    expect(dayAt).toBeLessThan(run.events.indexOf("call mail_compose_reply"));
+    expect(storage.get(JOB_DRAFT_DAY_KEY)).toEqual({ day: "2026-09-28", count: 1 });
+  });
+
+  it("a run that dies after the reply call still leaves the reply counted", async () => {
+    const storage = armedStorage([rule("r1", DRAFT)]);
+    const put = storage.put.bind(storage);
+    storage.put = <T>(key: string, value: T) => {
+      const state = (value as { state?: unknown } | null)?.state;
+      if (key.startsWith("acted:") && state !== "reserved") throw new Error("the object went away");
+      put(key, value);
+    };
+    const run = await directRun(storage, { rows: [newRow(1)] });
+    expect(actions(run.calls).map((call) => call.tool)).toEqual(["mail_compose_reply"]);
+    expect(storage.get(JOB_DRAFT_DAY_KEY)).toEqual({ day: "2026-09-28", count: 1 });
+  });
+
+  it("a reply that was never placed gives its count back: own address, busy", async () => {
+    for (const [rows, answer] of [
+      [[newRow(1, { fromAddress: "me@icloud.com" })], undefined],
+      [[newRow(1)], () => toolError(new ConnectionBusyError())],
+    ] as const) {
+      const storage = armedStorage([rule("r1", DRAFT)]);
+      await directRun(storage, {
+        rows: [...rows],
+        answer: answer === undefined ? undefined : (called) => (called === "mail_compose_reply" ? answer() : undefined),
+      });
+      const day = storage.get<{ count: number }>(JOB_DRAFT_DAY_KEY);
+      expect(day?.count ?? 0).toBe(0);
+    }
   });
 });
 
