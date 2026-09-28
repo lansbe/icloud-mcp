@@ -37,6 +37,8 @@
 //      that stopped keeps the old marker, so the next run sees the same mail
 //      and the records skip what was already done.
 //   7. Remove "already acted" records older than 14 days, at most 500 a run.
+//   8. Write the owner's status record to the sign-in store (D-17,
+//      `./status.ts`), in its own `try`, for every run that got past step 1.
 //
 // THE REPLY. Its one recipient is the message's From address, through
 // `replyRecipient`, which only `placeDraft` calls; the job never reads the
@@ -95,6 +97,7 @@ import { autonomyArmed, type AutonomySessionOutcome } from "./autonomy";
 import { JOB_CADENCE_MS, nextWakeAfter } from "./cadence";
 import { evaluate } from "./evaluate";
 import { type Rule, storedRuleOf } from "./rules";
+import { type StatusStore, writeAutonomyStatus } from "./status";
 import type { ActionOutcome, CallAnswer, CallFn, EnvelopeRow, RunOutcome } from "./tool-call";
 import { isErrorAnswer, readChangesAnswer, readSignedInAs, readToolError } from "./tool-reply";
 
@@ -184,7 +187,8 @@ export interface JobStorage {
  * object's autonomy queue; tests replace it with a recording one. `disarm` is
  * bound to Phase 27's `disarmWith`, over the same storage, name and seam, and
  * is called only by the second-failure rule, inside the same queue run, after
- * the session has settled.
+ * the session has settled. `statusStore` is the sign-in store, where each run
+ * leaves the owner's status record under `name` (D-17, `./status.ts`).
  */
 export interface JobDeps {
   readonly storage: JobStorage;
@@ -196,6 +200,7 @@ export interface JobDeps {
     use: (call: CallFn) => Promise<T>,
   ) => Promise<AutonomySessionOutcome<T>>;
   readonly disarm: () => Promise<unknown>;
+  readonly statusStore: StatusStore;
 }
 
 /** What the "already acted" record holds: its state and when it was written. */
@@ -256,6 +261,11 @@ const REPLY_SKIPS: readonly ActionOutcome[] = [
   "skipped_own_address",
   "skipped_mailing_list",
 ];
+
+/** Whether a stored "already acted" record is still `reserved`. */
+function isReserved(value: unknown): boolean {
+  return typeof value === "object" && value !== null && (value as { state?: unknown }).state === "reserved";
+}
 
 /** The stored count of consecutive auth failures; 0 for anything else. */
 export function authFailuresOf(storage: Pick<JobStorage, "get">): number {
@@ -330,6 +340,26 @@ function expireActed(storage: JobStorage, now: number): void {
 export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
   let runId = "";
   let now = 0;
+  let nextAtForStatus: number | null = null;
+  let ruleCount = 0;
+  // The owner's status record, at the end of every run that got past the due
+  // check (D-17), in its own `try`: a failed write changes nothing about the
+  // run. Runs that ended before any I/O write none.
+  const finish = async (outcome: RunOutcome): Promise<RunOutcome> => {
+    if (runId === "") return outcome;
+    try {
+      await writeAutonomyStatus(deps.statusStore, deps.name, {
+        nextAt: nextAtForStatus,
+        authFailures: authFailuresOf(deps.storage),
+        lastRunAt: now,
+        lastOutcome: outcome,
+        rules: ruleCount,
+      });
+    } catch {
+      // The run's outcome stands. The next run writes the record again.
+    }
+    return outcome;
+  };
   const record = (
     kind: ActivityKind,
     ruleId: string | null,
@@ -371,9 +401,11 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
     }
 
     runId = crypto.randomUUID();
+    ruleCount = rules.length;
 
     // 2. The next wake, on the person's own offset, asked for before any I/O.
     const nextAt = nextWakeAfter(now, deps.name);
+    nextAtForStatus = nextAt;
     deps.storage.put(JOB_NEXT_AT_KEY, nextAt);
     await deps.requestWake(nextAt);
 
@@ -470,7 +502,13 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
       };
 
       for (const v of verdicts) {
-        const done = deps.storage.get<unknown>(v.key) !== undefined;
+        const prior = deps.storage.get<unknown>(v.key);
+        const done = prior !== undefined;
+        // A record an earlier run left `reserved`: its call went out and what
+        // happened was never written down (the run died in between). It is
+        // never tried again (D-15). It becomes `unknown`, once, with its entry,
+        // so the person can see the job cannot say.
+        if (isReserved(prior)) settle(v, "unknown");
         if (v.action === "flag") {
           if (done) continue;
           if (flagsThisRun >= MAX_FLAGS_PER_RUN) {
@@ -542,7 +580,7 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
     deps.storage.put(JOB_LAST_RUN_KEY, { at: now, outcome });
     // 7. Bounded records: old "already acted" records go, a few hundred a run.
     expireActed(deps.storage, now);
-    return outcome;
+    return await finish(outcome);
   } catch {
     try {
       if (runId !== "") {
@@ -552,6 +590,6 @@ export async function runAutonomyJob(deps: JobDeps): Promise<RunOutcome> {
     } catch {
       // Nothing left to record.
     }
-    return "failed";
+    return await finish("failed");
   }
 }

@@ -733,6 +733,9 @@ export class UserAgent extends DurableObject<Env> {
             requestWake: (wantedAt) => this.scheduleAlarm(wantedAt),
             withSession: (use) => withAutonomySession({ ...autonomyDeps, ticket }, use),
             disarm: () => disarmWith(autonomyDeps),
+            // The owner's status record goes to the sign-in store, under the
+            // stored own name above (D-17), never the platform's id.
+            statusStore: this.env.OAUTH_KV,
           }),
         );
       }

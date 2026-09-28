@@ -629,6 +629,7 @@ async function runOnce(
       }),
     }),
     disarm: async () => {},
+    statusStore: { put: async () => {} },
   };
   return { outcome: await runAutonomyJob(deps), calls };
 }

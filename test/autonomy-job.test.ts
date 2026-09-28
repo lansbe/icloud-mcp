@@ -146,6 +146,8 @@ async function signInArmed(): Promise<Armed> {
     for (const prefix of [`grant:${userId}:`, `token:${userId}:`]) {
       for (const key of (await kv.list({ prefix })).keys) await kv.delete(key.name);
     }
+    // The owner's status record a run writes (plan 28-03).
+    await kv.delete(`autonomy-status:v1:${userId}`);
     await runInDurableObject(stub, async (_i, state) => {
       for (const [key] of state.storage.kv.list()) state.storage.kv.delete(key);
       state.storage.sql.exec("DROP TABLE IF EXISTS recall_vectors");
