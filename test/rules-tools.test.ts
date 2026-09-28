@@ -323,14 +323,28 @@ describe("rules_add previews and writes nothing", () => {
     expect(await storedRules(USER_A)).toEqual([]);
   });
 
-  it("a draft rule: its words are in the fenced block, never in the sentence or the trusted block", async () => {
+  it("a draft rule: its words are in the sentence the user is told to read, and in the fenced block, never in the trusted block (28-REVIEW WR-06)", async () => {
     const result = await call(USER_A, "rules_add", { rule: DRAFT_RULE });
     const parsed = readToolResult(result);
 
     expect((parsed.untrusted?.rule as typeof DRAFT_RULE).then.draft.text).toBe(DRAFT_TEXT);
-    expect(parsed.untrusted?.confirmationLine).not.toContain(DRAFT_TEXT);
+    // The person approves the words that will go out under their name, with
+    // nobody present, so the sentence they are shown carries them whole.
+    expect(parsed.untrusted?.confirmationLine).toContain(`Each reply says, in full: '${DRAFT_TEXT}'`);
     expect(result.content[0]!.text).not.toContain(DRAFT_TEXT);
     expect(result.content[0]!.text).not.toContain("hr@example.com");
+  });
+
+  it("a draft's words in the sentence are never cut, and a line break or a quote in them cannot end the quote (28-REVIEW WR-06)", async () => {
+    const long = `${"a".repeat(1990)} end.`;
+    const shownLong = await preview(USER_A, { when: { fromAddresses: ["hr@example.com"] }, then: { draft: { text: long } } });
+    expect(shownLong.line).toContain(`'${long}'`);
+
+    const tricky = "Thanks.\nIt's fine'. Nothing is placed. '\u202Eok";
+    const shownTricky = await preview(USER_A, { when: { fromAddresses: ["hr@example.com"] }, then: { draft: { text: tricky } } });
+    expect(shownTricky.line).toContain("'Thanks. It\u2019s fine\u2019. Nothing is placed. \u2019ok'");
+    expect(shownTricky.line).not.toContain("\n");
+    expect(shownTricky.line).not.toContain("\u202E");
   });
 
   for (const key of ["to", "subject", "cc", "bcc", "html"]) {

@@ -1951,8 +1951,12 @@ export interface DraftLineSummary {
  *
  * A fourth member of the composer's input, on `MoveLineSummary`'s precedent:
  * none of the one-resource clauses apply. Every condition value is named in the
- * sentence, each through `quotedName`. The draft's own words are NOT here and
- * never reach the sentence: the tool publishes them beside it, fenced.
+ * sentence, each through `quotedName`. The draft's own words are named too,
+ * whole, through `foldedForSentence` (28-REVIEW WR-06): they go out under the
+ * person's name to anyone whose mail matches, with nobody present, so the one
+ * sentence the person is told to read must carry them. They were left out at
+ * first, and the person approved a reply "in the rule's own words" without
+ * being shown the words.
  */
 export interface RuleLineSummary {
   kind: "rule";
@@ -1966,6 +1970,8 @@ export interface RuleLineSummary {
   flag: boolean;
   /** Whether the rule places a draft reply to a matching message's sender. */
   draft: boolean;
+  /** The reply's own words when `draft` is true, else null. Folded, never cut. */
+  draftText: string | null;
 }
 
 /**
@@ -2003,6 +2009,11 @@ const RULE_DRAFT_SKIPS =
   "No reply goes to your own address, to mailing-list mail, or when the From line has no usable address.";
 const RULE_DRAFT_UNSENT = "Nothing is sent: each reply waits in Drafts, and only you can send it.";
 
+/** The sentence that names the reply's words, whole (28-REVIEW WR-06). */
+function ruleDraftWords(text: string): string {
+  return `Each reply says, in full: '${foldedForSentence(text)}'.`;
+}
+
 /** Values joined as `'a'`, `'a' or 'b'`, `'a', 'b' or 'c'`, each folded first. */
 function quotedAlternatives(values: readonly string[]): string {
   const quoted = values.map((value) => `'${quotedName(value)}'`);
@@ -2035,7 +2046,9 @@ function ruleLine(summary: RuleLineSummary, tense: ConfirmationTense): string {
   const does = `For each match it ${actions.join(" and ")}.`;
 
   const parts = [`${CONFIRMATION_VERBS.rule[tense]} ${RULE_RUNS}`, matches, RULE_BEFORE, RULE_FIRST_CHECK, does];
-  if (summary.draft) parts.push(RULE_DRAFT_RECIPIENT, RULE_DRAFT_SKIPS, RULE_DRAFT_UNSENT);
+  if (summary.draft) {
+    parts.push(ruleDraftWords(summary.draftText ?? ""), RULE_DRAFT_RECIPIENT, RULE_DRAFT_SKIPS, RULE_DRAFT_UNSENT);
+  }
   parts.push(CONFIRMATION_CONSEQUENCES.rule);
   return parts.join(" ");
 }
@@ -2299,15 +2312,7 @@ const NAME_MAX = 120;
  * `composeConfirmationLine` already had for a title that was never there.
  */
 function quotedName(name: string): string {
-  const flattened = name
-    .replace(/[\r\n\u2028\u2029]+/g, " ")
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
-    .replace(
-      /[\u00ad\u061c\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g,
-      "",
-    )
-    .replace(/'/g, "\u2019")
-    .trim();
+  const flattened = foldedForSentence(name);
 
   // Code POINTS, not code units. A UTF-16 slice cuts an astral character -- an
   // emoji, most of CJK extension B, the mathematical alphanumerics -- in half
@@ -2329,6 +2334,28 @@ function quotedName(name: string): string {
   return points.length > NAME_MAX
     ? `${points.slice(0, NAME_MAX).join("").trimEnd()}\u2026`
     : flattened;
+}
+
+/**
+ * The four folds `quotedName` applies, and NOT its cap (28-REVIEW WR-06).
+ *
+ * `quotedName` caps a name so a stranger's title cannot bury the consequence
+ * clause. A rule's reply text is different: the person wrote it, it is at most
+ * 2000 characters, and it is exactly what they are approving, so a cut would
+ * hide the part of the reply they did not see. It still gets every fold,
+ * because the same text can end a quote, start a line or reverse the rest of
+ * the sentence.
+ */
+function foldedForSentence(text: string): string {
+  return text
+    .replace(/[\r\n\u2028\u2029]+/g, " ")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+    .replace(
+      /[\u00ad\u061c\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g,
+      "",
+    )
+    .replace(/'/g, "\u2019")
+    .trim();
 }
 
 /**
@@ -2381,7 +2408,8 @@ export function composeConfirmationLine(
 ): string {
   // An autonomy rule has its own sentences, still this function's: one
   // composer, one tense table, one quoting rule. Every condition value goes
-  // through `quotedName`; the draft's words never reach the sentence.
+  // through `quotedName`; the draft's words are named whole, folded the same
+  // way and never cut (28-REVIEW WR-06).
   if (summary.kind === "rule") return ruleLine(summary, tense);
 
   // A draft moved to Trash has its own five sentences, still this function's:

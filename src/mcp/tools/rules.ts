@@ -166,6 +166,7 @@ function ruleLine(rule: RuleBody, tense: ConfirmationTense): string {
       subjectWords: rule.when.subjectContains ?? [],
       flag: rule.then.flag === true,
       draft: rule.then.draft !== undefined,
+      draftText: rule.then.draft?.text ?? null,
     },
     tense,
   );
