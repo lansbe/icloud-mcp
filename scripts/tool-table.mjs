@@ -1,6 +1,7 @@
 // README's tool block, written or checked from the code.
 //
-//   node scripts/tool-table.mjs --write   rewrite the block between the markers
+//   node scripts/tool-table.mjs --write   rewrite the block between the markers,
+//                                         only if the rows match the tools
 //   node scripts/tool-table.mjs --check   exit 1 if the block has drifted
 //
 // The work is in scripts/tool-table-core.mjs. This file only reads and writes
@@ -39,20 +40,41 @@ function main(argv) {
     return 2;
   }
   const names = registeredNames(toolSources());
-  let readme = readFileSync(README, "utf8");
+  const readme = readFileSync(README, "utf8");
 
-  if (mode === "--write") {
-    const next = withBlock(readme, TOOL_GROUPS);
-    if (next !== readme) writeFileSync(README, next);
-    process.stdout.write(next === readme ? "README.md is already up to date.\n" : "README.md written.\n");
-    readme = next;
+  if (mode === "--check") {
+    const findings = checkReadme(readme, TOOL_GROUPS, names);
+    report(findings);
+    if (findings.length > 0) return 1;
+    process.stdout.write(`README.md's tool block matches the ${names.length} registered tools.\n`);
+    return 0;
   }
 
-  const findings = checkReadme(readme, TOOL_GROUPS, names);
-  for (const finding of findings) process.stderr.write(`${finding.kind}: ${finding.detail}\n`);
-  if (findings.length > 0) return 1;
-  if (mode === "--check") process.stdout.write(`README.md's tool block matches the ${names.length} registered tools.\n`);
+  // --write. Check the result before writing it, so a bad set of rows never
+  // lands in README. With no markers there is nothing to write between, so
+  // that finding is reported as it is, not as a thrown error.
+  const markers = checkReadme(readme, TOOL_GROUPS, names).filter(
+    (finding) => finding.kind === "markers-missing",
+  );
+  if (markers.length > 0) {
+    report(markers);
+    process.stderr.write("README.md not written.\n");
+    return 1;
+  }
+  const next = withBlock(readme, TOOL_GROUPS);
+  const findings = checkReadme(next, TOOL_GROUPS, names);
+  if (findings.length > 0) {
+    report(findings);
+    process.stderr.write("README.md not written.\n");
+    return 1;
+  }
+  if (next !== readme) writeFileSync(README, next);
+  process.stdout.write(next === readme ? "README.md is already up to date.\n" : "README.md written.\n");
   return 0;
+}
+
+function report(findings) {
+  for (const finding of findings) process.stderr.write(`${finding.kind}: ${finding.detail}\n`);
 }
 
 process.exitCode = main(process.argv.slice(2));
