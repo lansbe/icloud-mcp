@@ -15,7 +15,7 @@ Several people can sign in, each with their own Apple ID and their own Apple app
 - **Tech stack**: Cloudflare Workers, TypeScript, MCP TypeScript SDK — consistency with the existing `code-assist` and `engram` servers.
 - **Runtime**: Workers has no persistent connections and a bounded CPU/wall-clock budget per request. IMAP sessions must be established and torn down within a single request, or pooled through Durable Objects.
 - **Transport**: IMAP must go over the Workers-native TCP Sockets API (`connect()` from `cloudflare:sockets`) with implicit TLS on port 993. No intermediary bridge.
-- **Security**: Credentials exist only in Cloudflare Secrets. They must never appear in tool responses, error messages, or logs. The MCP endpoint must be authenticated — it reaches real personal mail.
+- **Security**: Server secrets exist only in Cloudflare Secrets. Each person's app-specific password exists only in their own sign-ins' encrypted props. Their autonomy key exists only in their own Durable Object, sealed. None of these may ever appear in tool responses, error messages, or logs. The MCP endpoint must be authenticated — it reaches real personal mail.
 - **Safety**: Claude cannot send mail. Claude cannot perform a destructive calendar operation in a single call.
 - **Attachment staging**: Attaching files to drafts requires server-side file storage (R2 or KV), since Workers cannot hold files across requests.
 
@@ -35,6 +35,12 @@ Several people can sign in, each with their own Apple ID and their own Apple app
 - Concurrent open sockets count toward a per-Worker connection limit (exact numeric ceiling not published on this page; not a concern at single-user IMAP-then-close scale). *(2026-09-23: this reasoning was made for the single-user design, and the design has since changed — several people now sign in. The conclusion still holds, because each request still connects, acts and closes; what has changed is the number of people who can be doing that at once.)*
 
 ## Recommended Stack
+
+*(2026-09-28: the tables below are the research of 2026-08-11, and the build has moved on
+since. `package.json` is what counts. It pins `tsdav` 2.3.4, `wrangler` 4.122.0 and
+`@cloudflare/vitest-pool-workers` 0.21.2. `vcard4` was never added: vCard goes through
+`ical.js`, the fallback the table names. `aws4fetch` was added, to presign attachment
+uploads to R2.)*
 
 ### Core Technologies
 
@@ -146,6 +152,12 @@ one account, and that is no longer what this is.)*
 - Because it claims full RFC 9051 compliance and the exact command set this project needs (`LOGIN`, `SELECT`, `FETCH`, `SEARCH`, `APPEND`, `LOGOUT`) — but treat this as a scoped spike, not a default, given its 2-day track record at time of research.
 - Keep `@cloudflare/workers-oauth-provider` wired in regardless (it's the spec-compliant path and this project's own `PROJECT.md` already committed to it), but minimize `MyAuthHandler` to the smallest possible first-party check (a shared secret set via `wrangler secret`) rather than building out a full login UI.
 - Because the goal is gating the endpoint, not building an identity system — the OAuth *mechanics* matter for spec compliance and token revocation, not the identity *ceremony*.
+
+*(2026-09-28: these four bullets lost their opening lines when this summary was generated,
+and both choices they describe are closed. The IMAP client is hand-rolled, and `cf-imap` was
+never used. Sign-in has been per person since the Phase 13 cutover: each person signs in with
+their own Apple ID and app-specific password on a real login page, and there is no shared
+secret.)*
 
 ## Version Compatibility
 
@@ -423,7 +435,7 @@ The scan enforces this as a **count**, not as a prohibition: zero importers is a
 violation too. A choke-point that was quietly moved, renamed, or emptied guards
 nothing, and that failure is far easier to miss than a duplicate.
 
-**The same one-connection-per-request property is defended one layer up as
+**The same one-connection-at-a-time property is defended one layer up as
 well.** `src/mail/service.ts` holds two session orchestrators over one private
 core. The read one is `withMailSession`, plus `withMailSessionOver` for an
 already-open stream. The mutating one is `withMutatingMailbox`, plus
@@ -431,7 +443,8 @@ already-open stream. The mutating one is `withMutatingMailbox`, plus
 hatch past either orchestrator. Both take the same request gate, so one request
 has at most one session open at a time, whichever kind it is. A request can hold
 several sessions one after another, never together: a mail tool's own, and then
-the sessions of the one recall build step that may follow it. The gate refuses a
+the sessions of the one recall build step that may follow it, or the page sessions of
+one backfill call. One lease can cover up to three of them, one after another. The gate refuses a
 second session while the first is open, and allows one after the first has
 closed. Making the gate refuse every second session, open or not, would silently
 stop the recall build, because a step's refusals are silent. That is a decision,
@@ -486,6 +499,19 @@ been sent. One seam in `src/mcp/server.ts` applies it, to the mail, recall and c
 registrars only. The IMAP diagnostic never runs one. Widening that set, or running a step
 anywhere else, is a decision, not a refactor.
 
+The build has one other way to run: the backfill. `mail_recall_backfill` runs only when the
+person asks Claude to fill their index, on their own sign-in. It never runs on the autonomy
+key, and never from the object's alarm. One call reads up to ten build pages, one after
+another. Each page takes the person's lease itself, opens at most three sessions under it,
+one after another, and gives it back before the next page. One call opens at most fifteen
+sessions in all. A session that could outlive its 30-second lease is refused before its
+connection opens. So no two connections to iCloud are ever open at once. It reads only a
+folder that is still being built, the first time or again after a reset, and it stops when
+the index is built. It skips the minute's pause and the daily page count that ordinary steps
+obey, and nothing else. The object grants that only for a folder still being built, and caps
+it at a daily page count of its own. More pages a call, a folder that is already built, a
+call on the autonomy key, or a call nobody asked for, is a decision, not a refactor.
+
 ### 4. Credentials never reach a log or an error
 
 There are no logging calls anywhere under `src/`. Not "no logging of
@@ -506,11 +532,13 @@ rule has to be the blunt one.
 
 Three habits follow, and all three are already established in `src/`:
 
-- Credentials are consumed by write-only helpers that return nothing, so no
-  object holding a password is ever constructed, and nothing exists to
-  `JSON.stringify`, attach to an `Error`, or spread into a response.
+- Credentials are consumed by write-only helpers that return nothing. The
+  password is held in three places only: the props the sign-in page builds
+  once and hands to the OAuth library to encrypt, the props the door gets back
+  from it, and a holder private to `src/principal.ts`. None of them is passed to
+  `JSON.stringify`, attached to an `Error`, or spread into a response.
 - `toErrorCategory()` dispatches on error *type*, never reading `.message` or
-  `.stack` from a caught value, and maps to a fixed four-value vocabulary.
+  `.stack` from a caught value, and maps to a fixed, closed vocabulary.
 - No diagnostic field echoes the last command sent.
 
 #### The "which account" answer holds the whole address, and that is a decision
@@ -560,10 +588,12 @@ rather than left to be re-derived.
    written inline at any call site is still the breach.
 
 5. **The reversal is scoped to this one tool, and widening is a new decision.** No
-   other tool in this project returns an address. Adding an argument to this one
-   is a decision on this boundary rather than a refactor, and so is a second tool
-   that answers with an address, and so is a field on any existing answer that
-   carries one. What was decided on 2026-09-23 is a measured exception for one
+   other tool in this project answers with the address it is signed in as. Mail,
+   contact and event answers carry the addresses written in that mail or data.
+   Those have always been there, and this point is not about them. Adding an
+   argument to this one is a decision on this boundary rather than a refactor,
+   and so is a second tool that answers with the signed-in address, and so is a
+   field on any existing answer that carries it. What was decided on 2026-09-23 is a measured exception for one
    question, not a licence to put addresses into responses generally.
 
 6. **This adds no rule to the list, and no scan rule.** Tests hold it instead,
@@ -689,10 +719,18 @@ for.
 
 There are two halves to this, and it is worth knowing which is which.
 
-The **structural** half is that every mailbox opened on a read path is opened
-read-only. RFC 3501 says no change to the permanent state of a mailbox opened
-that way is allowed, per-user state included. So on a read path, iCloud refuses
-the change for the whole session, whatever a single command asks for. One
+The **structural** half is that every read opens its mailbox read-only. That
+covers listing, finding, reading and opening mail and its attachments, saving an
+attachment, the reads behind a reply draft, a move preview, a draft-delete
+preview and a rule preview, the change check, and the recall build. The
+diagnostic opens the inbox the same way. The sign-in check, the folder listing
+and the drafts write open no mailbox. RFC 3501 says no change to the permanent
+state of a mailbox opened that way is allowed, per-user state included. But
+iCloud answered that open as read-write when it was probed on 2026-09-27. So
+whether iCloud would refuse a change inside such a session has not been
+measured. What keeps mail unread is the convention half below: every fetch
+peeks, the scan enforces it, and `test/read-path-wire.test.ts` holds the exact
+commands every read sends. One
 separate path may open a mailbox in the mutating form. Only explicit triage
 tools use it, and the subsection below says how it is fenced. Opening a mailbox
 in the mutating form anywhere else is a decision, not a refactor.
@@ -740,6 +778,10 @@ verb: moving one draft to Trash.
    change in every session this server opened. Now that is true only on read
    paths. This trades an absolute for a bounded one, on purpose. Triage cannot
    exist any other way.
+   (2026-09-28: that iCloud refused the change was never measured. It answers
+   the read-only open as read-write. What held before Phase 20, and still holds
+   on read paths, is that every mailbox is opened read-only and every fetch
+   peeks. See the structural half above.)
 
 4. **What fences the other path.**
    - One place in the code opens a mailbox in the mutating form, and one module
@@ -871,7 +913,7 @@ entries exist today is a question for the script, not for this file.
 Every entry on that list carries a known-violating sample, asserted by a
 set-equality check against the rule ids, because a rule that silently matches
 nothing is indistinguishable from a rule that was never added. The count
-constraints — the socket importer, the two DAV ones, and the write — carry the
+constraints — the socket importer, the two DAV ones and the write among them — carry the
 same guarantee through a second set-equality, against the ids their checkers
 actually produce when run in both directions, because a constraint whose
 "missing" arm can never fire looks exactly like a constraint that was never
@@ -933,9 +975,13 @@ Take neither that fix nor an exclusion: the answer is always at the source.
 
 **The recall index fails open, so there is one way to it.** A query to the vector index with no namespace searches everyone's vectors. So one module, `src/recall/index.ts`, may name the index binding. Its read and write paths take the signed-in principal and nothing else. It sets the namespace and a metadata filter from `principal.userId`, and it drops any match that belongs to someone else. The store's two by-id read verbs skip the namespace and are banned under `src/`. Its keep-first write verb is banned in `src/recall/`. Describe all three by role in source comments, never by name. The per-person list of vector ids lives in that person's Durable Object. It is written before a vector is stored and cleared after a vector is deleted, so it always holds every id the index holds. Recall is inherent: every signed-in person's recent mail is indexed, with no switch. Their vectors are destroyed within a day of their access ending. The object checks that on its own alarm, asking about the name it stored for itself, so no caller can choose whose index is destroyed or kept. Changing any of this is a change to the safety boundary, not a refactor.
 
-Recall has one driver and one model. Exactly one call of the recall build step exists under
-`src/`, in `src/recall/drive.ts`, so neither the object's alarm nor the autonomy key can
-start building an index without a decision. Exactly one model id exists under `src/`, in
+Recall has two drivers and one model. Exactly one call of the recall build step exists under
+`src/`, and exactly one call of the backfill, both in `src/recall/drive.ts`. The step runs
+after a person's own mail call. The backfill runs when the person calls
+`mail_recall_backfill`. So neither the object's alarm nor the autonomy key can start building
+an index without a decision. Only one place outside the object asks for a backfill page, in
+`src/recall/sync.ts`, so the minute's pause and the daily page count cannot be skipped from
+anywhere else. Exactly one model id exists under `src/`, in
 `src/recall/embed.ts`, so no model can join the retrieval loop without a decision. The
 exhaustive search's old name is refused anywhere under `src/`, comments included, so an
 alias cannot come back. Describe the old name and any other model by role in comments,
@@ -974,7 +1020,7 @@ the rule see less.
 
 ## Architecture
 
-Architecture not yet mapped. Follow existing patterns found in the codebase.
+See `ARCHITECTURE.md` at the repository root. Follow existing patterns found in the codebase.
 <!-- GSD:architecture-end -->
 
 <!-- GSD:skills-start source:skills/ -->
