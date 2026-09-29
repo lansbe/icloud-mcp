@@ -112,6 +112,7 @@ import {
   ensureRecallSchema,
   expiredIds,
   anyIds,
+  type BackfillRefusal,
   folderListOf,
   forgetVectors,
   heldIds,
@@ -129,6 +130,8 @@ import {
   type RetryState,
   type SyncRow,
   readCursor,
+  readState,
+  SYNC_ROW,
   readPageSlot,
   recordVectors,
   type RecordRefusal,
@@ -237,9 +240,16 @@ export type BeginPageAnswer =
  * due to be listed again (26-REVIEW-2 WR-02). `listing` is the folder
  * listing's failure record, or null. `sync` is every mailbox's sync row that
  * parses, keyed by mailbox.
+ *
+ * `backfill` (Phase 29.1.1) is the first refusal a backfill page would get now,
+ * or `free`, or `unnamed` for an object that does not know whose it is. It is
+ * never `paused`: a backfill page skips the pause. It does not say whether a
+ * given folder may be backfilled; the page start refuses a folder that is not
+ * at build as `invalid`.
  */
 export interface RecallSyncState {
   readonly slot: PageRefusal | "unnamed" | "free";
+  readonly backfill: BackfillRefusal | "unnamed" | "free";
   readonly full: boolean;
   readonly folders: string[] | null;
   readonly listedAt: number | null;
@@ -807,6 +817,14 @@ export class UserAgent extends DurableObject<Env> {
    * ./recall-ledger.ts, the one predicate the sync-state read below shares
    * (Phase 26, D-29).
    *
+   * A backfill page is granted only for a folder whose sync row is at build:
+   * the backfill hurries a folder's FIRST build and nothing else. A new-mail
+   * page or a deletion sync on a built folder keeps the ordinary pace, whoever
+   * asks. So after `pageRefusal` has passed, a backfill page for a mailbox with
+   * no row, a row at seed, or a built row answers `invalid` and writes nothing.
+   * The check comes after, so destroying, busy, quota and full keep their
+   * precedence.
+   *
    * Otherwise it mints a page token, records the start, counts the page and
    * answers the stored cursor. A backfill page records its start exactly as
    * the other kinds do, so an ordinary page in the minute after it is told
@@ -826,6 +844,10 @@ export class UserAgent extends DurableObject<Env> {
     const now = Date.now();
     const refusal = pageRefusal(sql, kind, now);
     if (refusal !== null) return { ok: false, reason: refusal };
+    if (kind === "backfill") {
+      const row = syncRowFor(mailbox, readState(sql, SYNC_ROW + mailbox));
+      if (row === null || row.stage !== "build") return { ok: false, reason: "invalid" };
+    }
     const today = utcDay(now);
 
     const pageToken = crypto.randomUUID();
@@ -861,6 +883,7 @@ export class UserAgent extends DurableObject<Env> {
     const now = Date.now();
     return {
       slot: named ? (pageRefusal(sql, "reconcile", now) ?? "free") : "unnamed",
+      backfill: named ? (pageRefusal(sql, "backfill", now) ?? "free") : "unnamed",
       full: pageRefusal(sql, "build", now) === "full",
       folders: readFolders(sql),
       listedAt: readListedAt(sql),

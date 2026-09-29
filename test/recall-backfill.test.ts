@@ -16,7 +16,7 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ensureRecallSchema,
   readState,
@@ -27,13 +27,24 @@ import {
 import type { UserAgent } from "../src/agent/user-agent";
 import type { FolderState } from "../src/change-marker";
 import { RECALL_BACKFILL_TOOL_NAME, registerRecallBackfillTool } from "../src/mcp/tools/recall";
-import { RECALL_MAX_PAGES_PER_DAY } from "../src/recall/retention";
+import { createRecallStore } from "../src/recall/index";
+import {
+  RECALL_BACKFILL_MAX_PAGES_PER_DAY,
+  RECALL_MAX_PAGES_PER_DAY,
+  RECALL_MAX_VECTORS,
+  RECALL_PAGE_SIZE,
+} from "../src/recall/retention";
 import { scriptedMessages } from "./fixtures/fake-recall-source";
 import { fakeStepDeps, type StepHarness } from "./fixtures/fake-step-deps";
+import { createFakeVectorize } from "./fixtures/fake-vectorize";
 import { USER_A, testPrincipal } from "./fixtures/two-users";
 
 const INBOX = "INBOX";
 const ORDINARY_CLIENT = "claude-desktop-client";
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** The page kind under test, spelled once. */
+const BACKFILL = "backfill";
 
 type ToolAnswer = { isError?: boolean; content: { type: "text"; text: string }[] };
 type BackfillCallback = () => Promise<ToolAnswer>;
@@ -199,5 +210,183 @@ describe("the tracer: one backfill call indexes several pages, one leased sessio
 
     expect(await ordinaryCount(USER_A.userId)).toBe(String(RECALL_MAX_PAGES_PER_DAY));
     expect(await backfillCount(USER_A.userId)).toBe("3");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The object holds the backfill's limits (LD-5, LD-6)
+// ---------------------------------------------------------------------------
+
+/** Fill the ledger to within one page of the ceiling. */
+function fillToCeiling(sql: SqlStorage): void {
+  sql.exec(
+    `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < ?)
+     INSERT INTO recall_vectors (vector_id, mailbox, uid_validity, expires_at)
+     SELECT printf('%064x', x), 'INBOX', 100, ? FROM c`,
+    RECALL_MAX_VECTORS - RECALL_PAGE_SIZE + 1,
+    Date.now() + DAY_MS,
+  );
+}
+
+/** Every recall_state row, for a before-and-after compare. */
+function stateRows(userId: string): Promise<string[]> {
+  return withSql(userId, (sql) =>
+    sql
+      .exec<{ k: string; v: string }>("select k, v from recall_state order by k")
+      .toArray()
+      .map((row) => `${row.k}=${row.v}`),
+  );
+}
+
+describe("the object grants a backfill page only for a folder at build, and keeps its limits", () => {
+  it("RECALL_BACKFILL_MAX_PAGES_PER_DAY is exactly enough pages to fill the ceiling once: 400", () => {
+    expect(RECALL_BACKFILL_MAX_PAGES_PER_DAY).toBe(RECALL_MAX_VECTORS / RECALL_PAGE_SIZE);
+    expect(RECALL_BACKFILL_MAX_PAGES_PER_DAY).toBe(400);
+  });
+
+  const notAtBuild: [string, (userId: string) => Promise<void>][] = [
+    ["no row", async (userId) => seedRows(userId, [INBOX], {})],
+    [
+      "a row at seed",
+      async (userId) =>
+        seedRows(userId, [INBOX], { [INBOX]: buildRow(stateOf(INBOX, 100, 61), { stage: "seed", state: null }) }),
+    ],
+    [
+      "a row that is built",
+      async (userId) =>
+        seedRows(userId, [INBOX], { [INBOX]: buildRow(stateOf(INBOX, 100, 61), { stage: "built" }) }),
+    ],
+  ];
+
+  it.each(notAtBuild)("%s: answers invalid and writes nothing", async (_label, seed) => {
+    await seed(USER_A.userId);
+    const before = await stateRows(USER_A.userId);
+
+    const answer = await objectFor(USER_A.userId).recallBeginPage(INBOX, BACKFILL);
+
+    expect(answer).toEqual({ ok: false, reason: "invalid" });
+    expect(await stateRows(USER_A.userId)).toEqual(before);
+  });
+
+  it("refuses in the page start's own order, and skips only the pause and the ordinary count", async () => {
+    const stub = objectFor(USER_A.userId);
+    await seedRows(USER_A.userId, [INBOX], { [INBOX]: buildRow(stateOf(INBOX, 100, 61)) });
+    await withSql(USER_A.userId, (sql) => {
+      writeState(sql, "destroy_pending", "1");
+      writeState(sql, "page", JSON.stringify({ token: "live", expiresAt: Date.now() + 60_000 }));
+      writeState(sql, "last_page_at", String(Date.now() - 1000));
+      writeState(sql, "pages_day", utcDay(Date.now()));
+      writeState(sql, "pages_count", String(RECALL_MAX_PAGES_PER_DAY));
+      writeState(sql, "backfill_day", utcDay(Date.now()));
+      writeState(sql, "backfill_count", String(RECALL_BACKFILL_MAX_PAGES_PER_DAY));
+      fillToCeiling(sql);
+    });
+
+    expect(await stub.recallBeginPage(INBOX, BACKFILL)).toEqual({ ok: false, reason: "destroying" });
+    await withSql(USER_A.userId, (sql) => sql.exec("delete from recall_state where k = 'destroy_pending'"));
+    expect(await stub.recallBeginPage(INBOX, BACKFILL)).toEqual({ ok: false, reason: "busy" });
+    await withSql(USER_A.userId, (sql) => sql.exec("delete from recall_state where k = 'page'"));
+    // The pause 1 s ago and the ordinary count at its cap do not refuse.
+    expect(await stub.recallBeginPage(INBOX, BACKFILL)).toEqual({ ok: false, reason: "quota" });
+    await withSql(USER_A.userId, (sql) =>
+      writeState(sql, "backfill_count", String(RECALL_BACKFILL_MAX_PAGES_PER_DAY - 1)),
+    );
+    expect(await stub.recallBeginPage(INBOX, BACKFILL)).toEqual({ ok: false, reason: "full" });
+    await withSql(USER_A.userId, (sql) => sql.exec("delete from recall_vectors"));
+    const granted = await stub.recallBeginPage(INBOX, BACKFILL);
+    expect(granted.ok).toBe(true);
+  });
+
+  it("a granted page writes the slot and the start, counts on its own counter, and pauses an ordinary page", async () => {
+    const stub = objectFor(USER_A.userId);
+    await seedRows(USER_A.userId, [INBOX], { [INBOX]: buildRow(stateOf(INBOX, 100, 61)) });
+    await withSql(USER_A.userId, (sql) => {
+      writeState(sql, "pages_day", utcDay(Date.now()));
+      writeState(sql, "pages_count", "7");
+    });
+    const before = Date.now();
+
+    const granted = await stub.recallBeginPage(INBOX, BACKFILL);
+
+    expect(granted.ok).toBe(true);
+    const after = await withSql(USER_A.userId, (sql) => ({
+      page: readState(sql, "page"),
+      last: Number(readState(sql, "last_page_at")),
+    }));
+    expect(after.page).not.toBeNull();
+    expect(after.last).toBeGreaterThanOrEqual(before);
+    expect(await backfillCount(USER_A.userId)).toBe("1");
+    expect(await ordinaryCount(USER_A.userId)).toBe("7");
+
+    if (granted.ok) expect(await stub.recallEndPage(granted.pageToken, INBOX, { kind: "keep" })).toBe(true);
+    await withSql(USER_A.userId, (sql) =>
+      writeState(sql, "last_page_at", String(Number(readState(sql, "last_page_at")) - 1000)),
+    );
+    expect(await stub.recallBeginPage(INBOX, "build")).toEqual({ ok: false, reason: "paused" });
+    expect(await ordinaryCount(USER_A.userId)).toBe("7");
+  });
+
+  it("the backfill count is per UTC day: yesterday's count reads as nothing today", async () => {
+    const stub = objectFor(USER_A.userId);
+    await seedRows(USER_A.userId, [INBOX], { [INBOX]: buildRow(stateOf(INBOX, 100, 61)) });
+    await withSql(USER_A.userId, (sql) => {
+      writeState(sql, "backfill_day", utcDay(Date.now() - DAY_MS));
+      writeState(sql, "backfill_count", String(RECALL_BACKFILL_MAX_PAGES_PER_DAY));
+    });
+    expect((await stub.recallSyncState()).backfill).toBe("free");
+
+    expect((await stub.recallBeginPage(INBOX, BACKFILL)).ok).toBe(true);
+    expect(await backfillCount(USER_A.userId)).toBe("1");
+  });
+
+  it("a destroy clears both backfill rows with the rest of recall_state", async () => {
+    const stub = objectFor(USER_A.userId);
+    await seedRows(USER_A.userId, [INBOX], { [INBOX]: buildRow(stateOf(INBOX, 100, 61)) });
+    const granted = await stub.recallBeginPage(INBOX, BACKFILL);
+    expect(granted.ok).toBe(true);
+    expect(await backfillCount(USER_A.userId)).toBe("1");
+
+    await runInDurableObject(stub, async (instance: UserAgent) => {
+      const spy = vi.spyOn(instance, "vectorStore").mockReturnValue(createRecallStore(createFakeVectorize()));
+      try {
+        expect(await instance.destroyRecall()).toEqual({ ok: true });
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    expect(await stateRows(USER_A.userId)).toEqual([]);
+  });
+
+  it("recallSyncState answers the backfill field: free, a refusal, or unnamed, and never paused", async () => {
+    const stub = objectFor(USER_A.userId);
+    await seedRows(USER_A.userId, [INBOX], { [INBOX]: buildRow(stateOf(INBOX, 100, 61)) });
+    await withSql(USER_A.userId, (sql) => writeState(sql, "last_page_at", String(Date.now())));
+
+    let state = await stub.recallSyncState();
+    expect(state.slot).toBe("paused");
+    expect(state.backfill).toBe("free");
+
+    await withSql(USER_A.userId, (sql) => {
+      writeState(sql, "backfill_day", utcDay(Date.now()));
+      writeState(sql, "backfill_count", String(RECALL_BACKFILL_MAX_PAGES_PER_DAY));
+    });
+    expect((await stub.recallSyncState()).backfill).toBe("quota");
+
+    await withSql(USER_A.userId, (sql) => {
+      sql.exec("delete from recall_state where k = 'backfill_count'");
+      fillToCeiling(sql);
+    });
+    state = await stub.recallSyncState();
+    expect(state.backfill).toBe("full");
+
+    await withSql(USER_A.userId, (sql) => writeState(sql, "destroy_pending", "1"));
+    expect((await stub.recallSyncState()).backfill).toBe("destroying");
+
+    await resetObject(USER_A.userId);
+    await runInDurableObject(stub, (_instance, st) => {
+      st.storage.kv.put("own-name", "not-a-user-id");
+    });
+    expect((await stub.recallSyncState()).backfill).toBe("unnamed");
   });
 });
