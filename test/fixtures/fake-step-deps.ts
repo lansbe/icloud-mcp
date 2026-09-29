@@ -17,9 +17,9 @@
 // mod-sequence or changes the validity there. The page source's own messages
 // are the ones the first build reads, and do not change.
 
-import { ImapNotFoundError } from "../../src/errors";
+import { ImapNotFoundError, ImapThrottleError } from "../../src/errors";
 import { createLeasedMail } from "../../src/agent/lease";
-import type { FolderSnapshotOutcome } from "../../src/mail/service";
+import type { FolderSnapshotOutcome, SessionGate } from "../../src/mail/service";
 import { createSessionGate } from "../../src/mail/service";
 import type { RecallSource } from "../../src/recall/build";
 import { createEmbedder } from "../../src/recall/embed";
@@ -87,6 +87,22 @@ export interface StepHarness {
 /** One turn of the event loop. */
 function tick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/**
+ * Run one read as one iCloud session on `gate`, the way the real mail service
+ * does: refused before it starts when the gate is held, then the slot taken
+ * and given back. So a wrapper that counts or refuses sessions at the gate sees
+ * each read as the session it stands for (29.1.1-REVIEW WR-03). Logs nothing.
+ */
+async function asSession<T>(gate: SessionGate, read: () => Promise<T>): Promise<T> {
+  if (gate.held) throw new ImapThrottleError();
+  gate.acquire();
+  try {
+    return await read();
+  } finally {
+    gate.release();
+  }
 }
 
 /** One folder as the status check and the new-mail read see it now. */
@@ -190,7 +206,7 @@ export function fakeStepDeps(options: {
   const index = createFakeVectorize();
   const ai = createFakeAi();
 
-  const deps: StepDeps = {
+  const scripted: StepDeps = {
     store: createRecallStore(index),
     embedder: createEmbedder(ai),
     leased: {
@@ -253,6 +269,27 @@ export function fakeStepDeps(options: {
       },
     },
     now: () => clock ?? Date.now(),
+  };
+
+  // Every read is one session on the gate it is handed, as in production.
+  const deps: StepDeps = {
+    ...scripted,
+    source: {
+      page: (gate, principal, mailbox, cursor) =>
+        asSession(gate, () => scripted.source.page(gate, principal, mailbox, cursor)),
+      uids: (gate, principal, mailbox) =>
+        asSession(gate, () => scripted.source.uids(gate, principal, mailbox)),
+    },
+    reads: {
+      folders: (gate, principal) =>
+        asSession(gate, () => scripted.reads.folders(gate, principal)),
+      snapshot: (gate, principal, mailbox) =>
+        asSession(gate, () => scripted.reads.snapshot(gate, principal, mailbox)),
+      newMail: (gate, principal, mailbox, uidValidity, fromUid, toUidExclusive) =>
+        asSession(gate, () =>
+          scripted.reads.newMail(gate, principal, mailbox, uidValidity, fromUid, toUidExclusive),
+        ),
+    },
   };
 
   return {

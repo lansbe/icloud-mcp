@@ -967,10 +967,20 @@ export const RECALL_BACKFILL_MAX_PAGES = 10;
 export const RECALL_BACKFILL_BUDGET_MS = 20000;
 
 /**
- * The most sessions one backfill call opens: one listing, one seed per folder,
- * and the pages.
+ * The most iCloud sessions one backfill call opens: one listing, one seed per
+ * folder, and the pages. Each session is a sign-in. This is a hard bound: a
+ * pass starts only while RECALL_PASS_MAX_SESSIONS more still fit under it
+ * (29.1.1-REVIEW WR-03).
  */
 export const RECALL_BACKFILL_MAX_STEPS = RECALL_BACKFILL_MAX_PAGES + MAX_RECALL_FOLDERS + 1;
+
+/**
+ * The most iCloud sessions one pass of the backfill can open. A build page
+ * opens up to three, one after another under its one lease: the page read, the
+ * read again from the top after a validity change, and the validity read for a
+ * page with no rows (./mail-source.ts). A seed or a listing opens one.
+ */
+export const RECALL_PASS_MAX_SESSIONS = 3;
 
 /**
  * Why a backfill call stopped.
@@ -998,7 +1008,10 @@ export interface BackfillOutcome {
   readonly stopped: BackfillStop;
   /** Pages indexed in this call. */
   readonly pages: number;
-  /** iCloud sessions this call opened, one after another. */
+  /**
+   * iCloud sessions this call opened, one after another, counted at the
+   * session gate: a lease can hold up to three.
+   */
   readonly sessions: number;
 }
 
@@ -1042,18 +1055,19 @@ function backfillStopOf(outcome: StepOutcome): BackfillStop {
  * backfill page kind. It stops as `built` when every listed folder is built or
  * parked, so a call on a built index opens nothing and changes nothing.
  *
- * `sessions` counts every time the leased work began, so it is the number of
- * iCloud sessions the call opened, failed ones included. `pages` counts pages
- * indexed. A page that found the folder's validity changed is a session and not
- * a page.
+ * `sessions` counts every session opened on the gate the lease hands over, so
+ * it is the number of iCloud sessions the call opened, failed ones included.
+ * One lease can hold up to three (RECALL_PASS_MAX_SESSIONS), so a pass starts
+ * only while that many more fit under the session limit, and the limit is never
+ * passed. `pages` counts pages indexed. A page that found the folder's validity
+ * changed is a session and not a page.
  *
  * Never throws for a failure on a folder or the listing: those are recorded
  * where a step records them, and the call stops as `failed`. A throw from the
  * first object read means the object is out of reach, and propagates. A later
  * object read that fails stops the call as `failed`, since pages may already
- * be indexed. No
- * caught value is read, nothing here logs, and there is no combinator, sleep or
- * retry.
+ * be indexed. No caught value is read, nothing here logs, and there is no
+ * combinator, sleep or retry.
  */
 export async function recallBackfill(
   principal: Principal,
@@ -1069,15 +1083,24 @@ export async function recallBackfill(
   let sessions = 0;
   const stop = (stopped: BackfillStop): BackfillOutcome => ({ stopped, pages, sessions });
 
-  // The same deps, except that each session the lease runner begins is counted.
+  // The same deps, except that each session opened on the lease's gate is
+  // counted (WR-03). A session takes the gate once, after its socket opened.
   const counted: StepDeps = {
     ...deps,
     leased: {
       withConnectionLease: (who, fn) =>
-        deps.leased.withConnectionLease(who, (gate) => {
-          sessions += 1;
-          return fn(gate);
-        }),
+        deps.leased.withConnectionLease(who, (gate) =>
+          fn({
+            acquire() {
+              sessions += 1;
+              gate.acquire();
+            },
+            release: () => gate.release(),
+            get held() {
+              return gate.held;
+            },
+          }),
+        ),
     },
   };
 
@@ -1100,7 +1123,11 @@ export async function recallBackfill(
 
   // 3. One pass at a time, strictly one after another.
   for (;;) {
-    if (pages >= maxPages || sessions >= maxSteps || deps.now() - started >= budgetMs) {
+    if (
+      pages >= maxPages ||
+      sessions + RECALL_PASS_MAX_SESSIONS > maxSteps ||
+      deps.now() - started >= budgetMs
+    ) {
       return stop("budget");
     }
     // Only the first read may throw out of here (29.1.1-REVIEW WR-01): pages

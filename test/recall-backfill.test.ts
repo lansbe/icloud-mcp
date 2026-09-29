@@ -47,6 +47,8 @@ import {
   type BackfillOutcome,
   RECALL_BACKFILL_BUDGET_MS,
   RECALL_BACKFILL_MAX_PAGES,
+  RECALL_BACKFILL_MAX_STEPS,
+  RECALL_PASS_MAX_SESSIONS,
   recallBackfill,
   recallStep,
   type StepDeps,
@@ -537,14 +539,49 @@ describe("recallBackfill fills a person's index across calls, one session at a t
     expect(3000 * allowed).toBeGreaterThanOrEqual(RECALL_BACKFILL_BUDGET_MS);
   });
 
-  it("the session budget: with maxSteps 4, no more than four sessions are opened", async () => {
+  it("the session budget: with maxSteps 6, a pass starts only while a whole pass's sessions still fit", async () => {
     const a = await testPrincipal(USER_A);
     const h = twoFolders(300, 10);
 
-    const { outcome, log } = await backfill(a, h, h.deps, { maxPages: 50, maxSteps: 4 });
+    const { outcome, log } = await backfill(a, h, h.deps, { maxPages: 50, maxSteps: 6 });
 
+    // The listing, the seed and two pages: a third page could open up to
+    // three more sessions, past six.
+    expect(RECALL_PASS_MAX_SESSIONS).toBe(3);
     expect(outcome).toEqual({ stopped: "budget", pages: 2, sessions: 4 });
     expect(log.filter((entry) => entry === "enter")).toHaveLength(4);
+  });
+
+  // 29.1.1-REVIEW WR-03: one page can open up to three sessions under one
+  // lease, and each is a sign-in. The count and the cap are of sessions.
+  it("a page that opens three sessions: every session is counted, and a call never opens more than RECALL_BACKFILL_MAX_STEPS", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = await inboxAtBuild(300);
+    let opened = 0;
+    const deps: StepDeps = {
+      ...h.deps,
+      source: {
+        ...h.deps.source,
+        async page(gate, principal, mailbox, cursor) {
+          // Two sessions before the page's own, as the re-read after a
+          // validity change and the validity read for an empty page are.
+          for (let i = 0; i < 2; i += 1) {
+            expect(gate.held).toBe(false);
+            gate.acquire();
+            opened += 1;
+            gate.release();
+          }
+          opened += 1;
+          return h.deps.source.page(gate, principal, mailbox, cursor);
+        },
+      },
+    };
+
+    const outcome = await recallBackfill(a, deps);
+
+    expect(outcome.sessions).toBe(opened);
+    expect(opened).toBeLessThanOrEqual(RECALL_BACKFILL_MAX_STEPS);
+    expect(outcome).toEqual({ stopped: "budget", pages: 5, sessions: 15 });
   });
 
   it("every folder built: stops as built, opens nothing and changes nothing", async () => {
