@@ -8583,7 +8583,7 @@ describe("the save path's scan rules (Phase 29.1)", () => {
         "  SAVE_LINK_SEAL_KEY?: string | undefined;\n",
         "// the route never reads env.SAVE_LINK_KV itself\n",
         "  /*\n   * sealed with env.SAVE_LINK_SEAL_KEY\n   */\n",
-        " * Read only by the link module, never env.SAVE_LINK_SEAL_KEY here.\n",
+        "/**\n * Read only by the link module, never env.SAVE_LINK_SEAL_KEY here.\n */\n",
       ]) {
         expect(collectSaveLinkBindingReads(ROUTE_MODULE, contents), contents).toEqual([]);
       }

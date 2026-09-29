@@ -170,11 +170,16 @@ export const FORBIDDEN = [
   // The wire name is also everyday OAuth vocabulary. A script or a test that
   // talks about token exchange may reach for it inside a log line. If this rule
   // fires on a line that looks innocent, reword the line. Never reword the rule.
+  //
+  // Phase 29.1 (SAVE-06, 29.1-WORDING.md decision 1a). ONE MORE NAME: the Worker
+  // secret that seals every attachment save link. Whoever holds it can read
+  // any link and make one for any person's stored copy, so it joins this rule
+  // the same way the autonomy names did: unscoped, never a scoped copy.
   {
     id: "secret-binding-in-log-call",
     pattern:
-      /\b(?:console|logger)\s*\??\.\s*[A-Za-z_$][\w$]*\s*\([^)]*\b(?:APPLE_APP_PASSWORD|APPLE_ID|AUTH_SECRET|appPassword|appleId|autonomyRefreshToken|autonomyAccessToken|sealedRefreshToken|refresh_token|AUTONOMY_CLIENT_SECRET|AUTONOMY_SEAL_KEY)\b/g,
-    why: "A logging call whose arguments mention a secret binding name, one of the two credential field names the grant's props carry, or one of the six names the autonomy key travels under. A log line naming either props field leaks the Apple ID or the app-specific password. Credentials must never reach a log, an error, or a tool response. THREE OF THE ELEVEN NAMES ARE DEAD BINDINGS and they stay on purpose: phase 13 deleted the account bindings and the login gate's secret from the platform, so nothing supplies those three now, but the rule only refuses MORE by keeping them -- and what it catches is a future session re-introducing a binding under one of those exact names, which is the singular-owner assumption coming back. Do not tidy them out. THE SIX AUTONOMY NAMES (phase 27, AUTO-07): autonomy is inherent, so this server holds, for every signed-in person, a token that signs in to their mail with nobody present. Its plaintext name, the bearer made from it, its sealed field, its OAuth wire name, and the two Worker secrets that seal it and prove the client must never reach a log in src/, scripts/ or test/: a retained log line holding one of them is a working key to somebody's mail, or the means to open every key at once. The wire name is also ordinary OAuth vocabulary; if it fires on an innocent line, reword the line, never this rule.",
+      /\b(?:console|logger)\s*\??\.\s*[A-Za-z_$][\w$]*\s*\([^)]*\b(?:APPLE_APP_PASSWORD|APPLE_ID|AUTH_SECRET|appPassword|appleId|autonomyRefreshToken|autonomyAccessToken|sealedRefreshToken|refresh_token|AUTONOMY_CLIENT_SECRET|AUTONOMY_SEAL_KEY|SAVE_LINK_SEAL_KEY)\b/g,
+    why: "A logging call whose arguments mention a secret binding name, one of the two credential field names the grant's props carry, one of the six names the autonomy key travels under, or the secret that seals attachment save links. A log line naming either props field leaks the Apple ID or the app-specific password. Credentials must never reach a log, an error, or a tool response. THREE OF THE TWELVE NAMES ARE DEAD BINDINGS and they stay on purpose: phase 13 deleted the account bindings and the login gate's secret from the platform, so nothing supplies those three now, but the rule only refuses MORE by keeping them -- and what it catches is a future session re-introducing a binding under one of those exact names, which is the singular-owner assumption coming back. Do not tidy them out. THE SIX AUTONOMY NAMES (phase 27, AUTO-07): autonomy is inherent, so this server holds, for every signed-in person, a token that signs in to their mail with nobody present. Its plaintext name, the bearer made from it, its sealed field, its OAuth wire name, and the two Worker secrets that seal it and prove the client must never reach a log in src/, scripts/ or test/: a retained log line holding one of them is a working key to somebody's mail, or the means to open every key at once. The wire name is also ordinary OAuth vocabulary; if it fires on an innocent line, reword the line, never this rule. THE SAVE LINK'S SEAL KEY (phase 29.1): the Worker secret that seals every attachment save link. A retained log line holding it lets anyone read every link and make a link to any person's stored copy of an attachment, with no sign-in.",
   },
   // Phase 9 (D-02). Widened together with the blanket src/ rule below, so the
   // two cannot drift: both listed the same six method names, and both now
@@ -563,12 +568,23 @@ export const FORBIDDEN = [
   // runner. `runRecallBackfill` is not shadowed by `recallBackfill`: the match
   // is case-sensitive and the runner spells the loop with a capital. Measured
   // at zero hits on the real tree before it was armed.
+  //
+  // Phase 29.1 (SAVE-06) names the save path's two: `getAttachmentsForSave` in
+  // src/mail/service.ts, the one read-only session that fetches a message's
+  // attachments for saving (its stream form, `getAttachmentsForSaveOver`, is
+  // covered by the prefix), and `saveParts` in src/save/stage.ts, the loop that
+  // stores each part and mints its link. The read is a session, so a
+  // combinator over several messages is several sockets. The loop holds each
+  // part in memory while it stores it, so a combinator over several calls holds
+  // several parts at once and multiplies the storage calls; it must stay one
+  // part at a time. `save-combinator` refuses any combinator at all under
+  // src/save/. Measured at zero hits on the real tree before it was armed.
   {
     id: "concurrent-session",
     scope: "src/",
     pattern:
-      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit|indexNextPage|reconcileMailbox|recallStep|runRecallStep|recallBackfill|runRecallBackfill|indexNewMail|windowUids|summariesInRange|newMailPage|underLease|checkBuilt|syncDeletions|folderSnapshots|listFolders|withAutonomySession|setFlag|placeDraft)/g,
-    why: "A concurrent combinator wrapped around the per-person lease runner (withConnectionLease in src/agent/lease.ts), either mail session orchestrator (read-only or mutating), the core under them, a triage verb in src/mail/triage.ts (mark read or unread, flag or unflag, move, or move one draft to Trash), the mail move composites (readMoveSet, readDraftForChange, buildMovePreview, applyMailCommit), or a recall build entry point in src/recall/build.ts (indexNextPage, reconcileMailbox). Each recall build entry point takes the person's connection lease and reads mail through one session, so it is a session like the others. The same holds for the recall step (recallStep in src/recall/sync.ts), its one runner (runRecallStep in src/recall/drive.ts), the new-mail indexer (indexNewMail) and page source (newMailPage), the two recall reads in src/mail/service.ts (windowUids, summariesInRange, and their stream forms), the step's own lease wrapper and the two per-folder actions it opens a session for (underLease, checkBuilt, syncDeletions in src/recall/sync.ts), and the two reads the step reaches through its deps (folderSnapshots, listFolders in src/mail/service.ts): the recall step and its reads each open the person's one iCloud connection. Each of those opens a session, and every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial, and a list of messages is worked through one at a time in one session: pass the whole list to moveMessages rather than mapping a verb over it. The recall backfill is named too: recallBackfill in src/recall/sync.ts, the loop that indexes several pages in one call, one leased session per page, and runRecallBackfill in src/recall/drive.ts, its one runner; a combinator around either opens a session per branch. The rules job's entry points are named too: withAutonomySession in src/agent/autonomy.ts and the job's two actions, setFlag and placeDraft in src/agent/actions.ts. Each action is one or two tool calls at this Worker's own /mcp, each call is one iCloud session under the person's lease, and the job runs with nobody present, so a fan-out over a run's verdicts would open several connections at once with nobody there to notice the lockout. Act on verdicts one at a time.",
+      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit|indexNextPage|reconcileMailbox|recallStep|runRecallStep|recallBackfill|runRecallBackfill|indexNewMail|windowUids|summariesInRange|newMailPage|underLease|checkBuilt|syncDeletions|folderSnapshots|listFolders|withAutonomySession|setFlag|placeDraft|getAttachmentsForSave|saveParts)/g,
+    why: "A concurrent combinator wrapped around the per-person lease runner (withConnectionLease in src/agent/lease.ts), either mail session orchestrator (read-only or mutating), the core under them, a triage verb in src/mail/triage.ts (mark read or unread, flag or unflag, move, or move one draft to Trash), the mail move composites (readMoveSet, readDraftForChange, buildMovePreview, applyMailCommit), or a recall build entry point in src/recall/build.ts (indexNextPage, reconcileMailbox). Each recall build entry point takes the person's connection lease and reads mail through one session, so it is a session like the others. The same holds for the recall step (recallStep in src/recall/sync.ts), its one runner (runRecallStep in src/recall/drive.ts), the new-mail indexer (indexNewMail) and page source (newMailPage), the two recall reads in src/mail/service.ts (windowUids, summariesInRange, and their stream forms), the step's own lease wrapper and the two per-folder actions it opens a session for (underLease, checkBuilt, syncDeletions in src/recall/sync.ts), and the two reads the step reaches through its deps (folderSnapshots, listFolders in src/mail/service.ts): the recall step and its reads each open the person's one iCloud connection. Each of those opens a session, and every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial, and a list of messages is worked through one at a time in one session: pass the whole list to moveMessages rather than mapping a verb over it. The recall backfill is named too: recallBackfill in src/recall/sync.ts, the loop that indexes several pages in one call, one leased session per page, and runRecallBackfill in src/recall/drive.ts, its one runner; a combinator around either opens a session per branch. The rules job's entry points are named too: withAutonomySession in src/agent/autonomy.ts and the job's two actions, setFlag and placeDraft in src/agent/actions.ts. Each action is one or two tool calls at this Worker's own /mcp, each call is one iCloud session under the person's lease, and the job runs with nobody present, so a fan-out over a run's verdicts would open several connections at once with nobody there to notice the lockout. Act on verdicts one at a time. The save path is named too: getAttachmentsForSave in src/mail/service.ts (and its stream form), the one read-only session that fetches a message's attachments for saving, and saveParts in src/save/stage.ts, the loop that stores each part and mints its link. A combinator over the read opens a session per message; one over the loop holds several attachments in memory at once and multiplies the storage calls. Save one message per call, one part at a time.",
   },
   // The same property one protocol over, and the reason is deliberately NOT the
   // same. The two rules above lean on the six-connection platform cap. That cap
@@ -1425,6 +1441,54 @@ export const FORBIDDEN = [
     pattern:
       /(?:\bfrom\s*|\bimport\s*(?:\(\s*)?)["'`](?:\.\/|\.\.\/agent\/)lease(?:\.[cm]?[jt]s)?["'`]/g,
     why: "A module under src/agent/ imports src/agent/lease.ts, the Worker-side half of the connection lease. The rules job runs on the person's own object with nobody present, and it must never take the lease itself (AUTO-13): each of its tool calls takes the lease inside the door at /mcp, like any other request, so a lease held by the job would make every one of its own calls answer busy, and the lease is what keeps two connections to the person's iCloud account from opening at once. The object and its jobs are the other side of the lease; only Worker-side code under src/mcp/, src/auth/ and src/recall/ imports it. Reach mail through the job's tool calls. A lease taken from inside the object is a decision on the autonomous layer's boundary, not a refactor: get it, then change this rule, never narrow the pattern.",
+  },
+
+  // -------------------------------------------------------------- save path
+  // Phase 29.1 (SAVE-06). Saving an attachment adds the one public path this
+  // server has besides the sign-in form: GET /save/<link>, which needs no
+  // sign-in and serves one stored copy named by a sealed link. The two counts
+  // below the list hold who reads the link's secrets and who hands requests to
+  // the route. These two rules hold what the route can reach and how the save
+  // module may run its work.
+  //
+  // (a) The route module's imports. The route opens no mail connection, takes
+  // no lease and reads no sign-in. It imports only the link helpers, the bucket
+  // helpers and the environment's type. Anything else it could import is a way
+  // for a request with no sign-in to reach mail, DAV, a tool, the per-person
+  // object, recall, the sign-in handler, the feed, a principal, the
+  // confirmation signer or the change marker. Static and dynamic imports and
+  // re-exports are all seen, and type imports are refused too: a type is
+  // where a second use starts.
+  //
+  // Scoped to the route module itself. src/save/stage.ts imports the mail
+  // read's type and the decoder on purpose: it runs inside the signed-in tool.
+  //
+  // WHAT IT DOES NOT SEE. An import of a sibling under src/save/ that itself
+  // imports mail code, a specifier assembled at run time, and a CommonJS
+  // require. The first is why the route imports only ./link, which imports no
+  // mail code; the other two are deliberate evasions, not mistakes. Measured at
+  // zero hits on the real route before it was armed.
+  {
+    id: "save-route-reaches-mail",
+    scope: "src/save/route.ts",
+    pattern:
+      /(?:\bfrom\s*|\bimport\s*(?:\(\s*)?)["'`]\.\.\/(?:mail|dav|mcp|agent|recall|auth|feed|principal|confirm|change-marker)(?:[/.][^"'`\n]*)?["'`]/g,
+    why: "The download route module (src/save/route.ts) imports mail, DAV, tool, agent, recall, sign-in, feed, principal, confirm or change-marker code. The route is a public door with no sign-in: anyone holding a link reaches it. It serves exactly one stored copy the signed-in save tool already made, and who the copy belongs to comes from the sealed link and nothing else. One of these imports turns a file server into a mail reader with no sign-in, or lets a request with no sign-in name a person, take their lease or read their grant. Keep the route to the link helpers, the bucket helpers and the environment's type; do the mail work in the tool. A new import here is a decision on the boundary, not a refactor: get it, then change this rule, never narrow the pattern.",
+  },
+  // (b) A combinator in the save module. Every part the save loop stores is
+  // decoded in memory and written to the bucket, and the route streams one
+  // copy per request. A combinator over parts holds several attachments at
+  // once and multiplies the storage calls; one over the mail read opens a
+  // session per branch. The fan-out rule names the read and the loop wherever
+  // they are called from; this refuses any combinator at all inside the save
+  // module, because its helpers' names are too common to list. A scan scope is
+  // one path prefix, so this needs its own rule. Measured at zero hits under
+  // src/save/ before it was armed.
+  {
+    id: "save-combinator",
+    scope: "src/save/",
+    pattern: /\bPromise\s*\.\s*(?:all|allSettled|any|race)\s*\(/g,
+    why: "A concurrent combinator under src/save/. The save loop decodes each attachment in memory, hashes it and writes it to the bucket, one part at a time, so a single call stays inside the Worker's memory limit and makes a bounded number of storage calls. A combinator over parts holds several attachments at once and multiplies the storage calls, and one wrapped around the mail read opens an iCloud session per branch, which counts against the six connections a Worker invocation may hold and against iCloud's own lower, undocumented per-account ceiling. Work through the parts with await in a loop. Do not narrow the pattern: running the save path concurrently is a decision, not a refactor.",
   },
 ];
 
@@ -2499,6 +2563,139 @@ export function collectRecallBackfillKinds(relativePath, contents) {
   if (RECALL_BACKFILL_KIND_EXEMPT.includes(relativePath)) return [];
   const code = withoutCommentLines(contents);
   return [...code.matchAll(new RegExp(RECALL_BACKFILL_KIND, "g"))].map((match) => ({
+    file: relativePath,
+    ...positionOf(code, match.index),
+  }));
+}
+
+/**
+ * The attachment save link's two bindings: the spent-mark store and the link
+ * seal key, each read in exactly one file of the source tree (Phase 29.1,
+ * SAVE-06; 29.1-WORDING.md decisions 1 and 1a).
+ *
+ * THE RULE. Exactly one file under `src/` names either binding in code, and it
+ * is `src/save/link.ts`, which seals and opens links with the key and writes
+ * and reads the spent marks. It must name BOTH. The type declarations in
+ * `src/env.ts` are not reads, excluded the way the namespace-read count
+ * excludes its own: by exempting the interface member that declares each one.
+ *
+ * WHY A COUNT. A second reader of the seal key is a second way to open or make
+ * a link, so a second place that can forge one for any person's stored copy. A
+ * second reader of the spent-mark store is a second way to spend a link or to
+ * un-spend it, which is the only thing that makes a link work once in
+ * practice. The mark's key is a hash of the link and has no user segment, by
+ * the owner's decision, so `store-key-without-a-user` cannot see it, and this
+ * count is what holds the store instead. Zero is a violation too, and it is
+ * the quieter one: a link module that stopped reading either binding was
+ * moved, renamed or emptied, and nothing fails on the way out.
+ *
+ * THE SHAPE. Per binding, the namespace-read count's: any line that names the
+ * binding as a whole word, except the interface member that declares it
+ * (`SAVE_LINK_KV: KVNamespace`, `SAVE_LINK_SEAL_KEY: string ...`, optionally
+ * `readonly` or optional). So member access, destructuring, bracket access with
+ * the name as a string and an object-literal line all count.
+ *
+ * COMMENTS. Matched against the file with comment LINES blanked, so a
+ * commented-out read does not keep the missing arm quiet, and prose naming a
+ * binding is not a read.
+ *
+ * WHAT IT DOES NOT SEE. A name assembled from fragments and indexed, and a
+ * whole-environment alias handed to a function that reads a binding off it
+ * under another name. Both are deliberate evasions, not mistakes.
+ *
+ * Collected from `src/` only. Tests pass their own environment, and a test is
+ * not a code path. First match per binding per file, so no `g` flag.
+ */
+export const SAVE_LINK_BINDING_READS = Object.freeze({
+  SAVE_LINK_KV:
+    /^(?![ \t]*(?:readonly[ \t]+)?SAVE_LINK_KV[ \t]*\??[ \t]*:[ \t]*KVNamespace\b)[^\n]*?\bSAVE_LINK_KV\b/m,
+  SAVE_LINK_SEAL_KEY:
+    /^(?![ \t]*(?:readonly[ \t]+)?SAVE_LINK_SEAL_KEY[ \t]*\??[ \t]*:[ \t]*string\b)[^\n]*?\bSAVE_LINK_SEAL_KEY\b/m,
+});
+
+/** The two bindings, in a fixed order. The owner must name both. */
+export const SAVE_LINK_BINDING_NAMES = Object.freeze(Object.keys(SAVE_LINK_BINDING_READS));
+
+/** The one file under `SAVE_LINK_SCOPE` permitted to read either binding. */
+export const SAVE_LINK_OWNER = "src/save/link.ts";
+
+/** The tree the save link bindings are collected from. */
+export const SAVE_LINK_SCOPE = "src/";
+
+/**
+ * The save link binding reads one file contributes, as `scan()` collects
+ * them. At most one entry per binding per file, at the first reading line,
+ * with the column of the binding's name and the name itself. Comment lines
+ * blanked, positions unchanged. An empty list outside `SAVE_LINK_SCOPE`.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number, name: string}>}
+ */
+export function collectSaveLinkBindingReads(relativePath, contents) {
+  if (!relativePath.startsWith(SAVE_LINK_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  const reads = [];
+  for (const name of SAVE_LINK_BINDING_NAMES) {
+    const match = SAVE_LINK_BINDING_READS[name].exec(code);
+    if (match === null) continue;
+    const index = match.index + match[0].search(new RegExp(`\\b${name}\\b`));
+    reads.push({ file: relativePath, ...positionOf(code, index), name });
+  }
+  return reads;
+}
+
+/**
+ * A call of the download route's handler, permitted in exactly one file of
+ * the source tree (Phase 29.1, SAVE-06).
+ *
+ * THE RULE. Exactly one file under `src/` calls `handleSaveDownload`, and it
+ * is `src/auth/oauth.ts`, whose default handler sends GET /save/<link> to the
+ * route before anything else sees it. The handler's definition in
+ * `src/save/route.ts` is not a call: the pattern refuses a name preceded by
+ * the word that declares a function.
+ *
+ * WHY A COUNT. The route is a public door with no sign-in. A second caller is
+ * a second public door to the stored copies, under a path or a method nobody
+ * reviewed. Zero is a violation too, and it is the quieter one: a dispatch
+ * that stopped calling the route turns every link into a dead link, and
+ * nothing fails on the way out.
+ *
+ * THE SHAPE. The handler's name as a whole word, optional space, an optional
+ * `?.`, then an opening parenthesis, not preceded by `function`. An import line
+ * and `typeof` carry no parenthesis after the name, so they are not calls.
+ *
+ * COMMENTS. Matched with comment lines blanked, so a commented-out call cannot
+ * keep the missing arm quiet.
+ *
+ * WHAT IT DOES NOT SEE. The handler taken as a value and called under another
+ * name, and `.call` or `.apply` on it. Both are deliberate evasions, not
+ * mistakes.
+ *
+ * Collected from `src/` only. Tests call the handler directly. No `g` flag;
+ * the collector builds its own global copy per file.
+ */
+export const SAVE_ROUTE_CALL = /(?<!\bfunction\s*)\bhandleSaveDownload\s*(?:\?\.\s*)?\(/;
+
+/** The one file under `SAVE_ROUTE_SCOPE` permitted to match `SAVE_ROUTE_CALL`. */
+export const SAVE_ROUTE_OWNER = "src/auth/oauth.ts";
+
+/** The tree `SAVE_ROUTE_CALL` is collected from. */
+export const SAVE_ROUTE_SCOPE = "src/";
+
+/**
+ * The calls of the download route's handler one file contributes, as `scan()`
+ * collects them. EVERY match, with a fresh global copy per call. Comment lines
+ * blanked, positions unchanged. An empty list outside `SAVE_ROUTE_SCOPE`.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectSaveRouteCalls(relativePath, contents) {
+  if (!relativePath.startsWith(SAVE_ROUTE_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  return [...code.matchAll(new RegExp(SAVE_ROUTE_CALL, "g"))].map((match) => ({
     file: relativePath,
     ...positionOf(code, match.index),
   }));
@@ -3837,6 +4034,10 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "recall-backfill-call-missing",
   "recall-backfill-kind-duplicated",
   "recall-backfill-kind-missing",
+  "save-link-bindings-outside-owner",
+  "save-link-bindings-missing",
+  "save-route-outside-dispatch",
+  "save-route-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -4101,6 +4302,8 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const replyRecipientSites = [];
   const senderAddressNames = [];
   const ruleAddCalls = [];
+  const saveLinkBindingReads = [];
+  const saveRouteCalls = [];
   const sourceTree = {};
   const davWriteExports = {};
 
@@ -4266,6 +4469,11 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
     replyRecipientSites.push(...collectReplyRecipientSites(relativePath, contents));
     senderAddressNames.push(...collectSenderAddressNames(relativePath, contents));
     ruleAddCalls.push(...collectRuleAddCalls(relativePath, contents));
+    // The two phase 29.1 counts. The link module and the dispatch are not
+    // skipped: each holds its reads or its call. Comment lines blanked; the
+    // declarations in src/env.ts and the route's definition are not counted.
+    saveLinkBindingReads.push(...collectSaveLinkBindingReads(relativePath, contents));
+    saveRouteCalls.push(...collectSaveRouteCalls(relativePath, contents));
     // The phase 27 closure check reads every TypeScript file under src/ once,
     // after the walk, from this map.
     if (relativePath.startsWith("src/") && relativePath.endsWith(".ts")) {
@@ -4312,6 +4520,8 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   violations.push(...checkReplyRecipientOwnership(replyRecipientSites));
   violations.push(...checkSenderAddressOwnership(senderAddressNames));
   violations.push(...checkRuleAddOwnership(ruleAddCalls));
+  violations.push(...checkSaveLinkBindingOwnership(saveLinkBindingReads));
+  violations.push(...checkSaveRouteCallOwnership(saveRouteCalls));
   // Only when this scan walked src/ at all. A scan of scripts/ or test/ alone
   // has no object to start from, and that is not the object going missing.
   if (Object.keys(sourceTree).length > 0) {
@@ -5155,6 +5365,84 @@ export function checkRecallBackfillKindOwnership(sites) {
       pattern: "recall-backfill-kind-missing",
       patternIndex: FORBIDDEN.length + 59,
       why: `No place under ${RECALL_BACKFILL_KIND_SCOPE}, outside the object's two files, names the page kind the backfill asks for, which means the backfill engine in ${RECALL_BACKFILL_KIND_OWNER} was emptied or rewired. Zero is as much a violation as two, and it is the quieter of the pair: the backfill would stop being exempt, would be told paused after its first page, and nothing on the way out would say why. A word that survives only in a comment counts as zero. Restore the ask in the engine. If it really moved, that is a decision on the recall boundary, not a refactor: get it, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The save link bindings count (Phase 29.1, SAVE-06), as a pure function over
+ * the collected reads. Every read outside the owner is reported, once per
+ * binding per file. The owner missing either binding is the missing arm,
+ * reported once. See the `SAVE_LINK_BINDING_READS` docstring for why this is a
+ * count and for what it cannot see.
+ *
+ * @param {Array<{file: string, line: number, column: number, name?: string}>} readers
+ */
+export function checkSaveLinkBindingOwnership(readers) {
+  const violations = [];
+  const ownerNames = new Set();
+  for (const reader of readers) {
+    if (reader.file === SAVE_LINK_OWNER) {
+      if (reader.name !== undefined) ownerNames.add(reader.name);
+      continue;
+    }
+    violations.push({
+      file: reader.file,
+      line: reader.line,
+      column: reader.column,
+      pattern: "save-link-bindings-outside-owner",
+      patternIndex: FORBIDDEN.length + 60,
+      why: `A read of the attachment save link's spent-mark store or its seal key under ${SAVE_LINK_SCOPE} outside ${SAVE_LINK_OWNER}. A second reader of the seal key is a second place that can open or make a link, so a second way to forge one for any person's stored copy. A second reader of the spent-mark store is a second way to spend a link or un-spend it, and the mark is the only thing that makes a link work once in practice. By the owner's 29.1-WORDING.md decisions 1 and 1a the mark is keyed by a hash of the link with no user segment, and the seal key is one Worker secret for everyone, so store-key-without-a-user cannot see either: this count is what holds them. Call the link helpers in ${SAVE_LINK_OWNER} instead. A second reader is a decision on the boundary, not a refactor: get the decision, then change the owner, never the pattern.`,
+    });
+  }
+  const absent = SAVE_LINK_BINDING_NAMES.filter((name) => !ownerNames.has(name));
+  if (absent.length > 0) {
+    violations.push({
+      file: SAVE_LINK_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "save-link-bindings-missing",
+      patternIndex: FORBIDDEN.length + 61,
+      why: `${SAVE_LINK_OWNER} no longer reads ${absent.join(" or ")}, which means the link module was moved, renamed, emptied, or rewired to reach the attachment save link's secrets some other way. Zero is as much a violation as two, and it is the quieter of the pair: "no second reader" is trivially true of a tree where the one reader is gone, and nothing fails on the way out. A read that survives only in a comment counts as zero. Restore the read in the link module. If it really moved, that is a decision on the boundary, not a refactor: get it, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The download route's dispatch count (Phase 29.1, SAVE-06), as a pure
+ * function over the collected calls. Every call outside the owner is
+ * reported. No call in the owner is the missing arm. See the `SAVE_ROUTE_CALL`
+ * docstring for why this is a count and for what it cannot see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} calls
+ */
+export function checkSaveRouteCallOwnership(calls) {
+  const violations = [];
+  let ownerCalls = 0;
+  for (const call of calls) {
+    if (call.file === SAVE_ROUTE_OWNER) {
+      ownerCalls += 1;
+      continue;
+    }
+    violations.push({
+      file: call.file,
+      line: call.line,
+      column: call.column,
+      pattern: "save-route-outside-dispatch",
+      patternIndex: FORBIDDEN.length + 62,
+      why: `A call of the download route's handler under ${SAVE_ROUTE_SCOPE} outside ${SAVE_ROUTE_OWNER}. The route serves stored attachment copies to anyone holding a link, with no sign-in. A second caller is a second public door to those copies, under a path or a method nobody reviewed. Send requests to the route only from the dispatch in ${SAVE_ROUTE_OWNER}. A second door is a decision on the boundary, not a refactor: get the decision, then change the owner, never the pattern.`,
+    });
+  }
+  if (ownerCalls === 0) {
+    violations.push({
+      file: SAVE_ROUTE_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "save-route-missing",
+      patternIndex: FORBIDDEN.length + 63,
+      why: `${SAVE_ROUTE_OWNER} no longer hands requests to the download route, which means the dispatch was deleted, emptied, or moved. Zero is as much a violation as two, and it is the quieter of the pair: every save link would answer as if it were dead, and nothing fails on the way out. A call that survives only in a comment counts as zero. Restore the dispatch. If it really moved, that is a decision on the boundary, not a refactor: get it, then change the owner, never the pattern.`,
     });
   }
   return violations;
