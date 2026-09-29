@@ -562,9 +562,9 @@ export function registerRecallBackfillTool(
     {
       description:
         "Fill your own recall index now, while you watch. Each call indexes up to " +
-        `${RECALL_BACKFILL_MAX_PAGES} pages (about ${RECALL_BACKFILL_MAX_PAGES * RECALL_PAGE_SIZE} ` +
-        "messages) of recent inbox and archive mail and says how far it got. Call it " +
-        "again until it says the index is built.",
+        `${RECALL_BACKFILL_MAX_PAGES} pages (${RECALL_PAGE_SIZE} messages each) of recent ` +
+        "inbox and archive mail. Its time limit usually stops it after 4 or 5 pages. " +
+        "It says how far it got. Call it again until it says the index is built.",
     },
     async () => {
       let actor: Principal;
