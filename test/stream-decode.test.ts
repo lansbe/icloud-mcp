@@ -264,9 +264,13 @@ describe("decodeWindows: malformed base64 is refused by name, never shortened", 
     expectRefused(decodeWindows([text(body)], "base64"), "malformed-encoding");
   });
 
-  it("the shipped decoder's empty answer on the same input is exactly the failure refused here", () => {
+  it("where the shipped decoder answers empty or drops a character, this one refuses", () => {
     // Not a claim about the shipped decoder being wrong: it is right for a snippet.
-    expect(transferDecode(text("QUJD!RA=="), "base64").length).toBe(0);
+    // Padding in the middle: the shipped decoder answers with no bytes at all.
+    expect(transferDecode(text("QQ==QUJD"), "base64").length).toBe(0);
+    expectRefused(decodeWindows([text("QQ==QUJD")], "base64"), "malformed-encoding");
+    // A foreign character: the shipped decoder drops it and decodes the rest.
+    expect(transferDecode(text("QUJD!RA=="), "base64").length).toBe(4);
     expectRefused(decodeWindows([text("QUJD!RA==")], "base64"), "malformed-encoding");
   });
 });
