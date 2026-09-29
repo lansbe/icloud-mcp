@@ -661,6 +661,56 @@ describe("the save read defers what does not fit in this call", () => {
       "a9 LOGOUT",
     ]);
   });
+
+  it("inside the time budget, a part that would not finish before the deadline comes back deferred, and the part already read is kept", async () => {
+    const duplex = createFakeDuplex([
+      ...authPrefix(),
+      examineReply("a4"),
+      structureReply(
+        "a5",
+        mixedStructure(attachmentPart("offer.pdf", 20), attachmentPart("second.pdf", 16)),
+        4000,
+      ),
+      literalReply("a6", "BODY[2]<0>", "SGVsbG8s"),
+      literalReply("a7", "BODY[2]<8>", "IHNhdmUh"),
+      literalReply("a8", "BODY[2]<16>", "IQ=="),
+      logoutExchange("a9"),
+    ]);
+
+    // The first 20 octets took 9 s, which is inside the start budget. At that
+    // pace the next 16 octets finish at 9 s x 36 / 20 = 16.2 s, past four fifths
+    // of the call deadline. So the second part is not started.
+    const elapsed = 9_000;
+    expect(elapsed).toBeLessThan(SAVE_START_BUDGET_MS);
+    expect((elapsed * 36) / 20).toBeGreaterThan(CALL_DEADLINE_MS * 0.8);
+    let readings = 0;
+    const now = (): number => {
+      readings += 1;
+      return readings === 1 ? 0 : elapsed;
+    };
+
+    const reads = await getAttachmentsForSaveOver(
+      duplex,
+      principal,
+      createSessionGate(),
+      [refTo("2"), refTo("3"), refTo("2")],
+      { ...EIGHT, now },
+    );
+
+    expect(reads.map((one) => one.outcome)).toEqual(["fetched", "deferred", "deferred"]);
+    expect(windowTexts(reads[0])).toEqual(["SGVsbG8s", "IHNhdmUh", "IQ=="]);
+    expect(wireOf(duplex)).toEqual([
+      "a1 CAPABILITY",
+      "a2 LOGIN [redacted]",
+      "a3 CAPABILITY",
+      'a4 EXAMINE "INBOX"',
+      "a5 UID FETCH 42 (UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE)",
+      "a6 UID FETCH 42 (BODY.PEEK[2]<0.8>)",
+      "a7 UID FETCH 42 (BODY.PEEK[2]<8.8>)",
+      "a8 UID FETCH 42 (BODY.PEEK[2]<16.4>)",
+      "a9 LOGOUT",
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------

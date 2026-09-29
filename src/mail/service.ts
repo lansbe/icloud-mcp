@@ -2047,6 +2047,19 @@ export const SAVE_MAX_PARTS = 10;
 export const SAVE_START_BUDGET_MS = 10_000;
 
 /**
+ * How far into a save call a later part must be expected to finish, in
+ * milliseconds.
+ *
+ * **CALIBRATED, NOT MEASURED.** Four fifths of `CALL_DEADLINE_MS`. The start
+ * budget alone does not look at size, so a large part started just inside it
+ * could run past the deadline, and the deadline throws away the parts already
+ * read. So a later part is also deferred when, at the pace this call has read
+ * so far, it would finish after this. The rest of the deadline is margin for a
+ * pace that slows down.
+ */
+const SAVE_FINISH_BY_MS = CALL_DEADLINE_MS * 0.8;
+
+/**
  * What a caller may vary about one save read.
  *
  * Every limit here can only be LOWERED. Each is clamped against its `SAVE_`
@@ -2257,7 +2270,9 @@ async function readSaveWindows(
  *    inside a forwarded message; not a row, refused `not-found`;
  * 4. the empty check: zero encoded octets, refused `empty`;
  * 5. the per-part cap: refused `part-too-large`, with the size and the cap;
- * 6. the per-call total: over it, once a part was fetched, deferred.
+ * 6. the per-call total: over it, once a part was fetched, deferred;
+ * 7. the finish estimate, once a part was fetched: at the pace read so far,
+ *    this part would end after `SAVE_FINISH_BY_MS`, deferred.
  *
  * Once one ref is deferred, every ref after it is deferred too, so the rest
  * come back in order and a later call can take them as they stand.
@@ -2326,6 +2341,17 @@ async function readSaveParts(
       deferring = true;
       reads.push({ outcome: "deferred", ref });
       continue;
+    }
+    // The pace so far is heldOctets over the time spent, so this part is
+    // expected to end at elapsed x (held + this part) / held.
+    if (fetchedParts > 0) {
+      const elapsed = limits.now() - started;
+      const expectedEnd = (elapsed * (heldOctets + part.encodedOctets)) / heldOctets;
+      if (expectedEnd > SAVE_FINISH_BY_MS) {
+        deferring = true;
+        reads.push({ outcome: "deferred", ref });
+        continue;
+      }
     }
 
     const windows = await readSaveWindows(
