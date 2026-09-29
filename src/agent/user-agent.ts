@@ -119,6 +119,8 @@ import {
   idsForMailbox,
   markDestroyPending,
   type LedgerRowInput,
+  type MailboxProgress,
+  mailboxProgress,
   type MailboxRow,
   type PageRefusal,
   pageRefusal,
@@ -255,6 +257,19 @@ export interface RecallSyncState {
   readonly listedAt: number | null;
   readonly listing: RetryState | null;
   readonly sync: Record<string, SyncRow>;
+}
+
+/**
+ * How far the person's index has got (Phase 29.1.1): `total` vector ids, and
+ * one entry per mailbox the ledger holds, with its count and earliest expiry.
+ *
+ * An entry holds a folder name, because this crosses RPC to the Worker. The
+ * Worker never puts that name into an answer: the backfill tool names folders
+ * by role.
+ */
+export interface RecallProgress {
+  readonly total: number;
+  readonly mailboxes: MailboxProgress[];
 }
 
 /**
@@ -890,6 +905,26 @@ export class UserAgent extends DurableObject<Env> {
       listing: readListingFailure(sql),
       sync: readSyncRows(sql),
     };
+  }
+
+  /**
+   * Report how far this object's own index has got, for the backfill tool's
+   * progress answer (Phase 29.1.1, LD-9): how many vector ids the ledger holds,
+   * and for each mailbox it holds, how many and the earliest expiry.
+   *
+   * It answers only about the object it is called on: one person's own ledger,
+   * never anyone else's. It takes no argument, so no caller can widen or aim
+   * it. An empty ledger answers a total of 0 and an empty list.
+   *
+   * Writes nothing, apart from the one-time copy of the object's own name that
+   * every recall method makes (Phase 25, D-22).
+   */
+  recallProgress(): RecallProgress {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    this.rememberOwnName();
+    const mailboxes = mailboxProgress(sql);
+    return { total: mailboxes.reduce((sum, one) => sum + one.count, 0), mailboxes };
   }
 
   /**

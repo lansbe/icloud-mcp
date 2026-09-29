@@ -45,13 +45,21 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { agentFor, type LeasedMail } from "../../agent/lease";
 import { isParked } from "../../agent/recall-ledger";
-import { toErrorCategory } from "../../errors";
+import { ConnectionBusyError, toErrorCategory } from "../../errors";
 import { decodeMessageId } from "../../mail/ids";
 import type { Principal } from "../../principal";
 import { type GrantClient, runRecallBackfill } from "../../recall/drive";
 import type { RecallMatch } from "../../recall/index";
 import { type RecallDeps, recallDeps, recallFor } from "../../recall/pipeline";
-import { type BackfillOutcome, productionStepDeps, type StepDeps } from "../../recall/sync";
+import { RECALL_MAX_VECTORS, RECALL_PAGE_SIZE, RECALL_TTL_MS } from "../../recall/retention";
+import {
+  type BackfillOutcome,
+  type BackfillStop,
+  productionStepDeps,
+  RECALL_BACKFILL_MAX_PAGES,
+  readyNow,
+  type StepDeps,
+} from "../../recall/sync";
 import { type ToolResult, UNTRUSTED_NOTICE, untrustedToolResult } from "../untrusted";
 
 /** The tool's registered name. SEED-006 fixes it. */
@@ -88,6 +96,9 @@ export const NOTE_PARKED =
 /** The one sentence a failed recall answers with (D-09). */
 export const RECALL_UNAVAILABLE =
   "Recall could not be reached just now, so nothing was searched. mail_find still works.";
+
+/** The first listed folder, always. */
+const INBOX = "INBOX";
 
 /** One folder's row, as far as this tool reads it. */
 interface SyncRowView {
@@ -273,21 +284,240 @@ export const BACKFILL_REFUSED =
 export const BACKFILL_UNAVAILABLE =
   "The recall index could not be reached just now, so nothing was indexed.";
 
+/** A folder's stage, as the backfill answer names it. */
+export type BackfillStage = "not_started" | "building" | "built" | "waiting" | "parked";
+
 /**
- * The backfill answer: one trusted block with where the index is, why this call
- * stopped, and what it did.
- *
- * Exported so the answer's shape can be asserted without a server.
+ * A folder's role. The first listed folder is always INBOX, so it is `inbox`;
+ * any other is `archive`. A folder's name is untrusted data and never appears.
  */
-export function backfillResult(outcome: BackfillOutcome, index: RecallIndexWord): ToolResult {
+export type FolderRole = "inbox" | "archive";
+
+/** One listed folder's row in the backfill answer. */
+export interface BackfillFolderRow {
+  readonly role: FolderRole;
+  readonly stage: BackfillStage;
+  /** Messages indexed for this folder. */
+  readonly indexed: number;
+  /** About how many messages the folder has in the window, or null when it is too early to say. */
+  readonly estimate: number | null;
+  /** The UTC day of the oldest message indexed, as YYYY-MM-DD, or null with nothing indexed. */
+  readonly reachedBack: string | null;
+}
+
+/** The object's progress read, as far as this tool reads it. */
+interface ProgressView {
+  readonly total: number;
+  readonly mailboxes: readonly {
+    readonly mailbox: string;
+    readonly count: number;
+    readonly oldestExpiry: number;
+  }[];
+}
+
+/** What the backfill answer is built from. */
+export interface BackfillAnswerInput {
+  /** The object's progress read before the run. */
+  readonly before: ProgressView;
+  /** The object's progress read after the run. */
+  readonly after: ProgressView;
+  /** The object's sync state read after the run. */
+  readonly state: SyncStateView;
+  readonly outcome: BackfillOutcome;
+  /** When the answer is built, in ms since the epoch. */
+  readonly now: number;
+  /** When the call began, in ms since the epoch. */
+  readonly startedAt: number;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** The window in whole days, from RECALL_TTL_MS: 90. */
+const WINDOW_DAYS = Math.round(RECALL_TTL_MS / DAY_MS);
+
+/** A fixed English month table, so no locale reaches the answer. */
+const MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+] as const;
+
+/** `n` with a comma between each group of three digits, in ASCII. */
+function withCommas(n: number): string {
+  return String(Math.trunc(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+/** `n` messages, with the right plural. */
+function messagesWord(n: number): string {
+  return n === 1 ? "1 message" : `${withCommas(n)} messages`;
+}
+
+/** The UTC day of `at` as "Mon D". */
+function shortDay(at: number): string {
+  const date = new Date(at);
+  return `${MONTHS[date.getUTCMonth()]} ${date.getUTCDate()}`;
+}
+
+/** Round an estimate up: to the nearest 50 below 1,000, and the nearest 100 from 1,000. */
+function roundUpEstimate(raw: number): number {
+  const step = raw < 1000 ? 50 : 100;
+  return Math.ceil(raw / step) * step;
+}
+
+/**
+ * About how many messages a folder that is still building has in the window.
+ *
+ * The build walks each folder newest first, so the messages indexed so far
+ * cover the span from the oldest one indexed up to now. The estimate stretches
+ * that rate over the whole window. Null when nothing is indexed, or when the
+ * span covered is under a day: too early to say. Never below the count, and
+ * never above RECALL_MAX_VECTORS.
+ */
+function estimateOf(count: number, oldestDate: number | null, now: number): number | null {
+  if (count === 0 || oldestDate === null) return null;
+  const span = now - oldestDate;
+  if (span < DAY_MS) return null;
+  const raw = (count * RECALL_TTL_MS) / span;
+  return Math.min(Math.max(roundUpEstimate(raw), count), RECALL_MAX_VECTORS);
+}
+
+/**
+ * A folder's stage, from its sync row, with the loop's own predicates so the
+ * answer and the loop never disagree.
+ */
+function stageOf(row: SyncRowView | undefined, listedAt: number | null, now: number): BackfillStage {
+  if (row === undefined) return "not_started";
+  if (row.stage === "built") return "built";
+  if (isParked(row, listedAt)) return "parked";
+  if (!readyNow(row, listedAt, now)) return "waiting";
+  return row.stage === "seed" ? "not_started" : "building";
+}
+
+/** Every folder's row, by role. With no folder list yet, one inbox row. */
+function folderRows(state: SyncStateView, after: ProgressView, now: number): BackfillFolderRow[] {
+  const folders = state.folders === null || state.folders.length === 0 ? [INBOX] : state.folders;
+  return folders.map((mailbox, i) => {
+    // An own key only: the name is the account's own and may be `constructor`.
+    const row = Object.hasOwn(state.sync, mailbox) ? state.sync[mailbox] : undefined;
+    const stage = stageOf(row, state.listedAt, now);
+    const held = after.mailboxes.find((one) => one.mailbox === mailbox);
+    const indexed = held?.count ?? 0;
+    const oldestDate = held === undefined ? null : held.oldestExpiry - RECALL_TTL_MS;
+    const role: FolderRole = i === 0 ? "inbox" : "archive";
+    return {
+      role,
+      stage,
+      indexed,
+      estimate: stage === "built" ? indexed : estimateOf(indexed, oldestDate, now),
+      reachedBack:
+        oldestDate === null || indexed === 0 ? null : new Date(oldestDate).toISOString().slice(0, 10),
+    };
+  });
+}
+
+/** One row's sentence, in plain ASCII English. */
+function rowSentence(row: BackfillFolderRow): string {
+  const label = row.role === "inbox" ? "Inbox" : "Archive";
+  if (row.stage === "not_started") return `${label}: not started yet.`;
+  if (row.stage === "built") {
+    return row.indexed === 0
+      ? `${label}: built, with no messages from the last ${WINDOW_DAYS} days.`
+      : `${label}: all ${messagesWord(row.indexed)} from the last ${WINDOW_DAYS} days indexed.`;
+  }
+  let sentence: string;
+  if (row.indexed === 0 || row.reachedBack === null) {
+    sentence = `${label}: started, no messages indexed yet. It is too early to estimate how many there are.`;
+  } else {
+    const back = shortDay(Date.parse(row.reachedBack));
+    if (row.estimate === null) {
+      sentence =
+        `${label}: ${messagesWord(row.indexed)} indexed, back to ${back}. ` +
+        "It is too early to estimate how many there are.";
+    } else if (row.estimate >= RECALL_MAX_VECTORS) {
+      sentence =
+        `${label}: ${messagesWord(row.indexed)} indexed, back to ${back}. ` +
+        "There is more mail than the index can hold.";
+    } else {
+      sentence = `${label}: ${withCommas(row.indexed)} of about ${messagesWord(row.estimate)} indexed, back to ${back}.`;
+    }
+  }
+  if (row.stage === "waiting") sentence += " It is waiting a few minutes after a failed read.";
+  if (row.stage === "parked") {
+    sentence += " It could not be read lately, and is tried again about once a day.";
+  }
+  return sentence;
+}
+
+/** The one sentence that says what to do next, per stop word. */
+const NEXT: Readonly<Record<Exclude<BackfillStop, "unnamed">, string>> = {
+  budget: "Call mail_recall_backfill again to continue.",
+  built:
+    "The index is built. There is nothing more to do, and it stays current as the person uses mail.",
+  waiting: "A folder is waiting a few minutes after a failed read. Stop now, and try again later.",
+  busy:
+    "Another part of the build or another request is using the connection. " +
+    "Try again in a minute or two.",
+  lease_busy:
+    "Another part of the build or another request is using the connection. " +
+    "Try again in a minute or two.",
+  quota:
+    "The backfill has read its most pages for today. Stop now. It continues tomorrow, " +
+    "and ordinary mail use keeps building the index meanwhile.",
+  full:
+    `The index holds its most messages, ${withCommas(RECALL_MAX_VECTORS)}. ` +
+    "The oldest mail in the window is not indexed. Stop now.",
+  destroying: "This index is being deleted because access ended. Stop now.",
+  failed:
+    "A read failed, and that folder waits before it is tried again. Stop now. " +
+    "mail_imap_diagnose checks the connection.",
+};
+
+/** The sentence every backfill answer carries. */
+export const BACKFILL_NOTE =
+  "These numbers describe how far the build has got. Recall itself stays ranked and best-effort.";
+
+/**
+ * The backfill answer (LD-9, LD-10): one trusted block of JSON with where the
+ * index is, why this call stopped, what this call did, one row per listed
+ * folder by role, a progress sentence, a next sentence and the note.
+ *
+ * Pure, and exported so the answer can be asserted without a server. It is
+ * this server's own words and numbers, so it never goes through the untrusted
+ * fence: no folder name, subject, sender, id or address is in it. The only
+ * numbers in its sentences are counts, estimates, dates, the window's days and
+ * the vector ceiling.
+ *
+ * `unnamed` never reaches here; the tool answers it with its fixed error.
+ */
+export function backfillResult(input: BackfillAnswerInput): ToolResult {
+  const { before, after, state, outcome, now, startedAt } = input;
+  const folders = folderRows(state, after, now);
+  const stopped = outcome.stopped === "unnamed" ? "failed" : outcome.stopped;
   return {
     content: [
       {
         type: "text",
         text: JSON.stringify({
-          index,
+          index: indexWordOf(state),
           stopped: outcome.stopped,
-          thisCall: { pages: outcome.pages },
+          thisCall: {
+            pages: outcome.pages,
+            messages: Math.max(0, after.total - before.total),
+            seconds: Math.max(0, Math.floor((now - startedAt) / 1000)),
+          },
+          folders,
+          progress: folders.map(rowSentence).join(" "),
+          next: NEXT[stopped],
+          note: BACKFILL_NOTE,
         }),
       },
     ],
@@ -323,8 +553,9 @@ export function registerRecallBackfillTool(
     {
       description:
         "Fill your own recall index now, while you watch. Each call indexes up to " +
-        "about 250 of your recent messages and says how far it got. Call it again " +
-        "until it says the index is built.",
+        `${RECALL_BACKFILL_MAX_PAGES} pages (about ${RECALL_BACKFILL_MAX_PAGES * RECALL_PAGE_SIZE} ` +
+        "messages) of recent inbox and archive mail and says how far it got. Call it " +
+        "again until it says the index is built.",
     },
     async () => {
       let actor: Principal;
@@ -337,11 +568,37 @@ export function registerRecallBackfillTool(
           content: [{ type: "text" as const, text: JSON.stringify({ category, message }) }],
         };
       }
+      const startedAt = Date.now();
       try {
-        const ran = await runRecallBackfill(actor, mail, grantClient, depsFor);
+        const stub = agentFor(actor);
+        // Read after the grant check passes and before the run, so a refused
+        // grant makes no object call at all.
+        let before = null as ProgressView | null;
+        const ran = await runRecallBackfill(actor, mail, grantClient, depsFor, async () => {
+          before = await stub.recallProgress();
+        });
         if (ran.kind === "refused") return fixedError(BACKFILL_REFUSED);
-        const state = await agentFor(actor).recallSyncState();
-        return backfillResult(ran.outcome, indexWordOf(state));
+        if (ran.outcome.stopped === "unnamed" || before === null) {
+          return fixedError(BACKFILL_UNAVAILABLE);
+        }
+        // Nothing was opened for anyone else: the standard busy answer.
+        if (ran.outcome.stopped === "lease_busy" && ran.outcome.sessions === 0) {
+          const { category, message } = toErrorCategory(new ConnectionBusyError());
+          return {
+            isError: true,
+            content: [{ type: "text" as const, text: JSON.stringify({ category, message }) }],
+          };
+        }
+        const state = await stub.recallSyncState();
+        const after = await stub.recallProgress();
+        return backfillResult({
+          before,
+          after,
+          state,
+          outcome: ran.outcome,
+          now: Date.now(),
+          startedAt,
+        });
       } catch {
         return fixedError(BACKFILL_UNAVAILABLE);
       }

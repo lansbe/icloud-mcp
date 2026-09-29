@@ -218,7 +218,7 @@ describe("the tracer: one backfill call indexes several pages, one leased sessio
     expect(answer.isError).not.toBe(true);
     expect(answer.content).toHaveLength(1);
     const trusted = trustedOf(answer);
-    expect(trusted.thisCall).toEqual({ pages: 3 });
+    expect(trusted.thisCall).toMatchObject({ pages: 3, messages: 60 });
     expect(trusted.index).toBe("built");
     expect(await ledgerCount(USER_A.userId)).toBe(60);
 

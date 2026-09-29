@@ -148,6 +148,10 @@ export type BackfillRun = { kind: "refused" } | { kind: "ran"; outcome: Backfill
  * autonomy client: the same test `runRecallStep` makes (D-35). This is the one
  * call of the backfill under `src/`.
  *
+ * `beforeRun`, when given, is awaited after the grant check passes and before
+ * the backfill starts. The tool reads the person's progress there, so a refused
+ * grant makes no object call at all (Phase 29.1.1, LD-9).
+ *
  * It does not swallow a thrown value. A throw here means the object could not
  * be reached, and the tool turns that into its fixed answer. Nothing here logs.
  */
@@ -156,10 +160,12 @@ export async function runRecallBackfill(
   mail: LeasedMail,
   grantClient: GrantClient,
   depsFor: (mail: LeasedMail) => StepDeps = productionStepDeps,
+  beforeRun?: () => Promise<void>,
 ): Promise<BackfillRun> {
   const client = await grantClient();
   if (typeof client !== "string" || client.length === 0) return { kind: "refused" };
   if (client === AUTONOMY_CLIENT_ID) return { kind: "refused" };
+  if (beforeRun !== undefined) await beforeRun();
   return { kind: "ran", outcome: await recallBackfill(principal, depsFor(mail)) };
 }
 

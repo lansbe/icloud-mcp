@@ -212,8 +212,12 @@ export function recallRetryWaitMs(failures: number): number {
   return Math.min(RECALL_CHECK_INTERVAL_MS * 2 ** doublings, RECALL_MAX_RETRY_WAIT_MS);
 }
 
-/** Whether something that failed at `failedAt`, `failures` times in a row, is still waiting at `now`. */
-function waiting(
+/**
+ * Whether something that failed at `failedAt`, `failures` times in a row, is
+ * still waiting at `now`. Exported so the backfill's progress answer names a
+ * folder as waiting with the loop's own logic (Phase 29.1.1).
+ */
+export function waiting(
   retry: { readonly failedAt: number | null; readonly failures: number } | null | undefined,
   now: number,
 ): boolean {
@@ -225,9 +229,15 @@ function waiting(
  * Whether a folder may be tried now: not while it waits out a failure (CR-01),
  * and not while it is parked (WR-03). A folder un-parked by a listing since its
  * last failure is tried at once, without the wait. `listedAt` is when the
- * folder list was listed. The step and the backfill both ask this.
+ * folder list was listed. The step and the backfill both ask this, and the
+ * backfill's progress answer asks it too, so the answer and the loop never
+ * disagree (Phase 29.1.1).
  */
-function readyNow(row: SyncRow, listedAt: number | null, now: number): boolean {
+export function readyNow(
+  row: { readonly failures: number; readonly failedAt: number | null },
+  listedAt: number | null,
+  now: number,
+): boolean {
   return row.failures >= RECALL_PARK_AFTER_FAILURES ? !isParked(row, listedAt) : !waiting(row, now);
 }
 

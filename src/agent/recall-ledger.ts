@@ -600,6 +600,34 @@ export function countVectors(sql: SqlStorage): number {
   return row.n;
 }
 
+/** One mailbox's share of the ledger (Phase 29.1.1). */
+export interface MailboxProgress {
+  readonly mailbox: string;
+  /** How many vector ids the ledger holds for this mailbox. */
+  readonly count: number;
+  /** The earliest expiry among them, in ms since the epoch. */
+  readonly oldestExpiry: number;
+}
+
+/**
+ * How many vector ids each mailbox holds, and the earliest expiry among them:
+ * one grouped read, one entry per mailbox the ledger holds, ordered by mailbox.
+ * An empty ledger answers an empty list.
+ *
+ * The expiry is the message's date, clamped to when it was written, plus the
+ * window, so the earliest expiry minus the window is the oldest message date
+ * indexed.
+ */
+export function mailboxProgress(sql: SqlStorage): MailboxProgress[] {
+  return sql
+    .exec<{ mailbox: string; n: number; m: number }>(
+      `select mailbox, count(*) as n, min(expires_at) as m
+       from recall_vectors group by mailbox order by mailbox`,
+    )
+    .toArray()
+    .map((row) => ({ mailbox: row.mailbox, count: row.n, oldestExpiry: row.m }));
+}
+
 /** How many of `ids` the ledger does not hold yet. Duplicates count once. */
 export function countNewIds(sql: SqlStorage, ids: readonly string[]): number {
   let fresh = 0;
