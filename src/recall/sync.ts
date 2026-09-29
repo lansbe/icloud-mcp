@@ -57,10 +57,30 @@
 // build loses at most one step in five minutes per built folder to it, and
 // that step takes no page slot.
 //
-// There is no loop over pages, no second read after the first, no sleep, no
-// retry and no combinator. Nothing sweeps every folder. The pace is the
-// object's: a step that comes too early is told `paused` and stops. Recall is
-// inherent (owner, 2026-09-27), so there is no off state to check.
+// There is no loop over pages in the step, no second read after the first, no
+// sleep, no retry and no combinator. Nothing sweeps every folder. The pace is
+// the object's: a step that comes too early is told `paused` and stops. Recall
+// is inherent (owner, 2026-09-27), so there is no off state to check.
+//
+// THE BACKFILL IS THE ONE LOOP OVER PAGES (Phase 29.1.1). `recallBackfill`, at
+// the bottom of this module, fills a person's index faster while they watch.
+// It is driven only by the backfill tool the person calls, through its runner
+// in ./drive.ts, never by the seam that drives steps and never by the object's
+// alarm. What it does, and what it does not:
+//   - one serial loop, bounded by RECALL_BACKFILL_MAX_PAGES pages,
+//     RECALL_BACKFILL_MAX_STEPS sessions and RECALL_BACKFILL_BUDGET_MS of time;
+//   - one lease per session, taken and given back before the next one starts,
+//     and a page slot per page from the object, asked for as a backfill page;
+//   - only folders whose first build is not finished: the listing when there is
+//     no folder list yet, a seed, and build pages. It never runs a status check
+//     on a built folder, a new-mail page or a deletion sync. Those remain the
+//     step's upkeep;
+//   - the object skips the one-minute pause and the ordinary day count for a
+//     backfill page, and nothing else. It still refuses as destroying, busy,
+//     quota (on its own day counter) and full, and it grants the page only for
+//     a folder at build;
+//   - it stops at the first failure, recorded exactly as a step records it, and
+//     does not try a folder that is waiting out a failure or is parked.
 //
 // A lease refusal answers `lease_busy` and stores nothing.
 //
@@ -199,6 +219,16 @@ function waiting(
 ): boolean {
   if (retry === null || retry === undefined || retry.failedAt === null) return false;
   return now - retry.failedAt < recallRetryWaitMs(retry.failures);
+}
+
+/**
+ * Whether a folder may be tried now: not while it waits out a failure (CR-01),
+ * and not while it is parked (WR-03). A folder un-parked by a listing since its
+ * last failure is tried at once, without the wait. `listedAt` is when the
+ * folder list was listed. The step and the backfill both ask this.
+ */
+function readyNow(row: SyncRow, listedAt: number | null, now: number): boolean {
+  return row.failures >= RECALL_PARK_AFTER_FAILURES ? !isParked(row, listedAt) : !waiting(row, now);
 }
 
 /** The reads a step makes, each inside the person's connection lease. */
@@ -458,10 +488,7 @@ export async function recallStep(principal: Principal, deps: StepDeps): Promise<
   // Whether a folder may be tried now: not while it waits out a failure
   // (CR-01), and not while it is parked (WR-03). A folder un-parked by a
   // listing since its last failure is tried at once, without the wait.
-  const ready = (row: SyncRow): boolean =>
-    row.failures >= RECALL_PARK_AFTER_FAILURES
-      ? !isParked(row, state.listedAt)
-      : !waiting(row, now);
+  const ready = (row: SyncRow): boolean => readyNow(row, state.listedAt, now);
 
   // 3. A built folder whose last status check left something due goes first.
   //    At the vector ceiling a new-mail page would add vectors, so it waits;
@@ -952,9 +979,49 @@ export interface BackfillLimits {
   readonly budgetMs?: number;
 }
 
+/** A step outcome as the reason a backfill call stops. */
+function backfillStopOf(outcome: StepOutcome): BackfillStop {
+  switch (outcome) {
+    case "lease_busy":
+    case "busy":
+    case "quota":
+    case "full":
+    case "destroying":
+    case "unnamed":
+      return outcome;
+    // A backfill page is never paused. Should the object say so anyway, stop
+    // as busy rather than try again.
+    case "paused":
+      return "busy";
+    default:
+      // Nothing else stops a backfill here; stop rather than loop.
+      return "failed";
+  }
+}
+
 /**
  * Index several pages of `principal`'s own index in one call, one leased
- * session at a time (Phase 29.1.1, LD-4 to LD-6).
+ * session at a time (Phase 29.1.1, LD-4 to LD-6, LD-10).
+ *
+ * Reads the object first, and stops on any refusal it gives a backfill page,
+ * with nothing opened. With no folder list yet, lists the folders. Then, one
+ * pass at a time: stops when it has reached its page, session or time limit;
+ * re-reads the object, since rows change between passes; picks the first
+ * listed folder that is not built and is ready (not waiting out a failure, not
+ * parked); and seeds it or indexes one page of it, as a step would, under the
+ * backfill page kind. It stops as `built` when every listed folder is built or
+ * parked, so a call on a built index opens nothing and changes nothing.
+ *
+ * `sessions` counts every time the leased work began, so it is the number of
+ * iCloud sessions the call opened, failed ones included. `pages` counts pages
+ * indexed. A page that found the folder's validity changed is a session and not
+ * a page.
+ *
+ * Never throws for a failure on a folder or the listing: those are recorded
+ * where a step records them, and the call stops as `failed`. A throw from the
+ * first object read means the object is out of reach, and propagates. No
+ * caught value is read, nothing here logs, and there is no combinator, sleep or
+ * retry.
  */
 export async function recallBackfill(
   principal: Principal,
@@ -962,36 +1029,82 @@ export async function recallBackfill(
   limits: BackfillLimits = {},
 ): Promise<BackfillOutcome> {
   const maxPages = limits.maxPages ?? RECALL_BACKFILL_MAX_PAGES;
+  const maxSteps = limits.maxSteps ?? RECALL_BACKFILL_MAX_STEPS;
+  const budgetMs = limits.budgetMs ?? RECALL_BACKFILL_BUDGET_MS;
   const stub = agentFor(principal);
+  const started = deps.now();
   let pages = 0;
   let sessions = 0;
   const stop = (stopped: BackfillStop): BackfillOutcome => ({ stopped, pages, sessions });
 
-  while (pages < maxPages) {
-    const state = await stub.recallSyncState();
-    const folders = state.folders ?? [];
-    const mailbox = folders.find((one) => syncRowIn(state.sync, one)?.stage === "build");
-    if (mailbox === undefined) return stop("built");
-    const row = syncRowIn(state.sync, mailbox)!;
+  // The same deps, except that each session the lease runner begins is counted.
+  const counted: StepDeps = {
+    ...deps,
+    leased: {
+      withConnectionLease: (who, fn) =>
+        deps.leased.withConnectionLease(who, (gate) => {
+          sessions += 1;
+          return fn(gate);
+        }),
+    },
+  };
 
+  // 1. The object first. A refusal opens nothing.
+  const first = await stub.recallSyncState();
+  if (first.backfill !== "free") return stop(first.backfill);
+
+  // 2. No folder list yet: list them, unless the listing is waiting out a
+  //    failure. The listing's own code records a failure.
+  if (first.folders === null) {
+    if (waiting(first.listing, deps.now())) return stop("waiting");
+    let listed: StepOutcome;
+    try {
+      listed = await listFoldersStep(principal, null, counted);
+    } catch {
+      return stop("failed");
+    }
+    if (listed !== "folders") return stop(backfillStopOf(listed));
+  }
+
+  // 3. One pass at a time, strictly one after another.
+  for (;;) {
+    if (pages >= maxPages || sessions >= maxSteps || deps.now() - started >= budgetMs) {
+      return stop("budget");
+    }
+    const state = await stub.recallSyncState();
+    if (state.backfill !== "free") return stop(state.backfill);
+    const folders = state.folders;
+    if (folders === null) return stop("waiting");
+    const now = deps.now();
+    const rowOf = (mailbox: string): SyncRow | undefined => syncRowIn(state.sync, mailbox);
+
+    const next = folders.find((one) => {
+      const row = rowOf(one) ?? SEED_ROW;
+      return row.stage !== "built" && readyNow(row, state.listedAt, now);
+    });
+    if (next === undefined) {
+      const finished = folders.every((one) => {
+        const row = rowOf(one);
+        return row !== undefined && (row.stage === "built" || isParked(row, state.listedAt));
+      });
+      return stop(finished ? "built" : "waiting");
+    }
+
+    const row = rowOf(next) ?? SEED_ROW;
     let outcome: StepOutcome;
     try {
-      outcome = await attempt(principal, mailbox, row, deps, () =>
-        advanceUnbuilt(principal, folders, mailbox, row, deps, "backfill"),
+      outcome = await attempt(principal, next, row, counted, () =>
+        advanceUnbuilt(principal, folders, next, row, counted, "backfill"),
       );
     } catch {
       return stop("failed");
     }
     if (outcome === "indexed" || outcome === "done") {
-      sessions += 1;
       pages += 1;
       continue;
     }
-    if (outcome === "reset") {
-      sessions += 1;
-      continue;
-    }
-    return stop(outcome === "lease_busy" ? "lease_busy" : "failed");
+    if (outcome === "seeded" || outcome === "gone" || outcome === "reset") continue;
+    if (outcome === "unanswered") return stop("failed");
+    return stop(backfillStopOf(outcome));
   }
-  return stop("budget");
 }

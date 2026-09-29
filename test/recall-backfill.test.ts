@@ -19,14 +19,22 @@ import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ensureRecallSchema,
+  RECALL_PARK_AFTER_FAILURES,
   readState,
   type SyncRow,
   utcDay,
   writeState,
 } from "../src/agent/recall-ledger";
 import type { UserAgent } from "../src/agent/user-agent";
+import { AUTONOMY_CLIENT_ID } from "../src/agent/autonomy-client";
 import type { FolderState } from "../src/change-marker";
-import { RECALL_BACKFILL_TOOL_NAME, registerRecallBackfillTool } from "../src/mcp/tools/recall";
+import type { Principal } from "../src/principal";
+import { runRecallBackfill } from "../src/recall/drive";
+import {
+  BACKFILL_REFUSED,
+  RECALL_BACKFILL_TOOL_NAME,
+  registerRecallBackfillTool,
+} from "../src/mcp/tools/recall";
 import { createRecallStore } from "../src/recall/index";
 import {
   RECALL_BACKFILL_MAX_PAGES_PER_DAY,
@@ -34,12 +42,22 @@ import {
   RECALL_MAX_VECTORS,
   RECALL_PAGE_SIZE,
 } from "../src/recall/retention";
-import { scriptedMessages } from "./fixtures/fake-recall-source";
+import {
+  type BackfillLimits,
+  type BackfillOutcome,
+  RECALL_BACKFILL_BUDGET_MS,
+  RECALL_BACKFILL_MAX_PAGES,
+  recallBackfill,
+  recallStep,
+  type StepDeps,
+} from "../src/recall/sync";
+import { type FakeMessage, scriptedMessages } from "./fixtures/fake-recall-source";
 import { fakeStepDeps, type StepHarness } from "./fixtures/fake-step-deps";
 import { createFakeVectorize } from "./fixtures/fake-vectorize";
 import { USER_A, testPrincipal } from "./fixtures/two-users";
 
 const INBOX = "INBOX";
+const ARCHIVE = "Archive";
 const ORDINARY_CLIENT = "claude-desktop-client";
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -388,5 +406,420 @@ describe("the object grants a backfill page only for a folder at build, and keep
       st.storage.kv.put("own-name", "not-a-user-id");
     });
     expect((await stub.recallSyncState()).backfill).toBe("unnamed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The engine loop, whole: listing, seed, both folders, and every stop
+// ---------------------------------------------------------------------------
+
+/** Run one backfill call, and hold the one-session rule on what it logged. */
+async function backfill(
+  a: Principal,
+  h: StepHarness,
+  deps: StepDeps = h.deps,
+  limits: BackfillLimits = {},
+): Promise<{ outcome: BackfillOutcome; log: string[] }> {
+  const from = h.log.length;
+  const outcome = await recallBackfill(a, deps, limits);
+  const log = h.log.slice(from);
+  expectOneSessionAtATime(log);
+  expect(log.filter((entry) => entry === "enter")).toHaveLength(outcome.sessions);
+  return { outcome, log };
+}
+
+function syncRowOf(userId: string, mailbox: string): Promise<SyncRow | undefined> {
+  return objectFor(userId)
+    .recallSyncState()
+    .then((state) => state.sync[mailbox]);
+}
+
+/** A built row, as a finished build leaves it. */
+function builtRow(state: FolderState, over: Partial<SyncRow> = {}): SyncRow {
+  return buildRow(state, { stage: "built", ...over });
+}
+
+/** Every recall table, for a before-and-after compare. */
+async function recallTables(userId: string) {
+  return { state: await stateRows(userId), vectors: await ledgerCount(userId) };
+}
+
+/** Two scripted folders: `inbox` messages in INBOX, `archive` in the archive. */
+function twoFolders(inbox: number, archive: number): StepHarness {
+  return fakeStepDeps({
+    folders: [INBOX, ARCHIVE],
+    mailboxes: {
+      [INBOX]: { uidValidity: 100, messages: scriptedMessages(inbox) },
+      [ARCHIVE]: { uidValidity: 300, messages: scriptedMessages(archive) },
+    },
+  });
+}
+
+/** One folder, INBOX, with `count` messages, at build. */
+async function inboxAtBuild(count: number): Promise<StepHarness> {
+  const h = fakeStepDeps({
+    folders: [INBOX],
+    mailboxes: { [INBOX]: { uidValidity: 100, messages: scriptedMessages(count) } },
+  });
+  await seedRows(USER_A.userId, [INBOX], { [INBOX]: buildRow(stateOf(INBOX, 100, count + 1)) });
+  return h;
+}
+
+/** Every vector id the store was asked to upsert, repeats kept. */
+function upsertedIds(h: StepHarness): string[] {
+  return h.index.calls
+    .filter((call) => call.method === "upsert")
+    .flatMap((call) => (call.args[0] as { id: string }[]).map((v) => v.id));
+}
+
+/** `count` messages from UID `from` up, dated yesterday. */
+function messagesFrom(from: number, count: number): FakeMessage[] {
+  return Array.from({ length: count }, (_, i) => ({
+    uid: from + i,
+    date: Date.now() - DAY_MS,
+    text: `new message ${from + i}`,
+    snippet: `New ${from + i}`,
+  }));
+}
+
+describe("recallBackfill fills a person's index across calls, one session at a time", () => {
+  it("a fresh person: one call lists, seeds INBOX, pages it, seeds the archive and pages it", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders(30, 10);
+
+    const { outcome, log } = await backfill(a, h);
+
+    expect(outcome).toEqual({ stopped: "built", pages: 3, sessions: 6 });
+    expect(await ledgerCount(USER_A.userId)).toBe(40);
+    expect((await syncRowOf(USER_A.userId, INBOX))!.stage).toBe("built");
+    expect((await syncRowOf(USER_A.userId, ARCHIVE))!.stage).toBe("built");
+    expect(log.filter((entry) => entry === "folders:start")).toHaveLength(1);
+  });
+
+  it("300 messages: the first call stops at the page limit, and the next resumes without reading a message twice", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = await inboxAtBuild(300);
+
+    const first = await backfill(a, h);
+    expect(first.outcome).toEqual({
+      stopped: "budget",
+      pages: RECALL_BACKFILL_MAX_PAGES,
+      sessions: RECALL_BACKFILL_MAX_PAGES,
+    });
+    expect(await ledgerCount(USER_A.userId)).toBe(250);
+    const cursor = await withSql(USER_A.userId, (sql) => readState(sql, `cursor:${INBOX}`));
+    expect(cursor).not.toBeNull();
+
+    const second = await backfill(a, h);
+    expect(second.outcome).toEqual({ stopped: "built", pages: 2, sessions: 2 });
+    expect(await ledgerCount(USER_A.userId)).toBe(300);
+    const ids = upsertedIds(h);
+    expect(ids).toHaveLength(300);
+    expect(new Set(ids).size).toBe(300);
+    expect(h.sources[INBOX]!.calls).toHaveLength(12);
+  });
+
+  it("the time budget: no page starts once RECALL_BACKFILL_BUDGET_MS has passed since the call began", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = await inboxAtBuild(300);
+    const base = Date.now();
+    // A clock that moves 3 s on every read.
+    const reads = () => h.log.filter((entry) => entry.endsWith(":start")).length;
+    const deps: StepDeps = { ...h.deps, now: () => base + 3000 * reads() };
+
+    const { outcome } = await backfill(a, h, deps);
+
+    const allowed = Math.ceil(RECALL_BACKFILL_BUDGET_MS / 3000);
+    expect(allowed).toBeLessThan(RECALL_BACKFILL_MAX_PAGES);
+    expect(outcome).toEqual({ stopped: "budget", pages: allowed, sessions: allowed });
+    // The last page started before the budget ran out, and the next would not have.
+    expect(3000 * (allowed - 1)).toBeLessThan(RECALL_BACKFILL_BUDGET_MS);
+    expect(3000 * allowed).toBeGreaterThanOrEqual(RECALL_BACKFILL_BUDGET_MS);
+  });
+
+  it("the session budget: with maxSteps 4, no more than four sessions are opened", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders(300, 10);
+
+    const { outcome, log } = await backfill(a, h, h.deps, { maxPages: 50, maxSteps: 4 });
+
+    expect(outcome).toEqual({ stopped: "budget", pages: 2, sessions: 4 });
+    expect(log.filter((entry) => entry === "enter")).toHaveLength(4);
+  });
+
+  it("every folder built: stops as built, opens nothing and changes nothing", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders(30, 10);
+    await seedRows(USER_A.userId, [INBOX, ARCHIVE], {
+      [INBOX]: builtRow(stateOf(INBOX, 100, 31)),
+      [ARCHIVE]: builtRow(stateOf(ARCHIVE, 300, 11)),
+    });
+    const before = await recallTables(USER_A.userId);
+
+    const { outcome, log } = await backfill(a, h);
+
+    expect(outcome).toEqual({ stopped: "built", pages: 0, sessions: 0 });
+    expect(log.filter((entry) => entry === "lease")).toHaveLength(0);
+    expect(await recallTables(USER_A.userId)).toEqual(before);
+  });
+
+  it("a parked folder and a built one: built, with no session", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders(30, 10);
+    await seedRows(USER_A.userId, [INBOX, ARCHIVE], {
+      [INBOX]: builtRow(stateOf(INBOX, 100, 31)),
+      [ARCHIVE]: buildRow(stateOf(ARCHIVE, 300, 11), {
+        failures: RECALL_PARK_AFTER_FAILURES,
+        failedAt: Date.now() + 1000,
+      }),
+    });
+
+    const { outcome, log } = await backfill(a, h);
+
+    expect(outcome).toEqual({ stopped: "built", pages: 0, sessions: 0 });
+    expect(log).toEqual([]);
+  });
+
+  it("a folder waiting out a failure, with nothing else to build: waiting, with no session", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders(30, 10);
+    await seedRows(USER_A.userId, [INBOX, ARCHIVE], {
+      [INBOX]: builtRow(stateOf(INBOX, 100, 31)),
+      [ARCHIVE]: buildRow(stateOf(ARCHIVE, 300, 11), { failures: 1, failedAt: Date.now() }),
+    });
+
+    const { outcome, log } = await backfill(a, h);
+
+    expect(outcome).toEqual({ stopped: "waiting", pages: 0, sessions: 0 });
+    expect(log).toEqual([]);
+  });
+
+  it("a page that fails is recorded as a step records it, and nothing opens after it", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = await inboxAtBuild(60);
+    const now = Date.now();
+    h.setNow(now);
+    h.setGone(INBOX, true);
+
+    const { outcome, log } = await backfill(a, h);
+
+    // The session that failed is counted; nothing opens after it.
+    expect(outcome).toEqual({ stopped: "failed", pages: 0, sessions: 1 });
+    expect(log).toEqual(["lease", "enter", `page:${INBOX}:start`, `page:${INBOX}:end`, "exit"]);
+    const row = (await syncRowOf(USER_A.userId, INBOX))!;
+    expect(row.failures).toBe(1);
+    expect(row.failedAt).toBe(now);
+  });
+
+  it("a listing that fails is recorded; the next call, inside the wait, is waiting with no session", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders(30, 10);
+    const now = Date.now();
+    h.setNow(now);
+    h.setListingFails(true);
+
+    const first = await backfill(a, h);
+    expect(first.outcome.stopped).toBe("failed");
+    expect((await objectFor(USER_A.userId).recallSyncState()).listing).toEqual({
+      failedAt: now,
+      failures: 1,
+    });
+
+    const second = await backfill(a, h);
+    expect(second.outcome).toEqual({ stopped: "waiting", pages: 0, sessions: 0 });
+    expect(second.log).toEqual([]);
+  });
+
+  it("a lease held by another request at the first session: lease_busy, and nothing stored", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders(30, 10);
+    expect((await objectFor(USER_A.userId).acquire()).held).toBe(true);
+    const before = await recallTables(USER_A.userId);
+
+    const { outcome, log } = await backfill(a, h);
+
+    expect(outcome).toEqual({ stopped: "lease_busy", pages: 0, sessions: 0 });
+    expect(log).toEqual(["lease"]);
+    expect(await recallTables(USER_A.userId)).toEqual(before);
+  });
+
+  it("the lease taken by another request between pages 2 and 3: lease_busy after two pages, and the slot is ended", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = await inboxAtBuild(100);
+    const stub = objectFor(USER_A.userId);
+    let leases = 0;
+    const deps: StepDeps = {
+      ...h.deps,
+      leased: {
+        async withConnectionLease(principal, fn) {
+          leases += 1;
+          if (leases === 3) expect((await stub.acquire()).held).toBe(true);
+          return h.deps.leased.withConnectionLease(principal, fn);
+        },
+      },
+    };
+
+    const { outcome } = await backfill(a, h, deps);
+
+    expect(outcome).toEqual({ stopped: "lease_busy", pages: 2, sessions: 2 });
+    expect(await withSql(USER_A.userId, (sql) => readState(sql, "page"))).toBeNull();
+    expect(await ledgerCount(USER_A.userId)).toBe(50);
+  });
+
+  const refusals: [BackfillOutcome["stopped"], (sql: SqlStorage) => void][] = [
+    ["destroying", (sql) => writeState(sql, "destroy_pending", "1")],
+    [
+      "busy",
+      (sql) =>
+        writeState(sql, "page", JSON.stringify({ token: "live", expiresAt: Date.now() + 60_000 })),
+    ],
+    [
+      "quota",
+      (sql) => {
+        writeState(sql, "backfill_day", utcDay(Date.now()));
+        writeState(sql, "backfill_count", String(RECALL_BACKFILL_MAX_PAGES_PER_DAY));
+      },
+    ],
+    ["full", fillToCeiling],
+  ];
+
+  it.each(refusals)("the object refuses as %s: stopped before any session", async (word, seed) => {
+    const a = await testPrincipal(USER_A);
+    const h = await inboxAtBuild(60);
+    await withSql(USER_A.userId, seed);
+
+    const { outcome, log } = await backfill(a, h);
+
+    expect(outcome).toEqual({ stopped: word, pages: 0, sessions: 0 });
+    expect(log).toEqual([]);
+  });
+
+  it("an object that does not know whose it is: unnamed, before any session", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders(30, 10);
+    await runInDurableObject(objectFor(USER_A.userId), (_instance, state) => {
+      state.storage.kv.put("own-name", "not-a-user-id");
+    });
+
+    const { outcome, log } = await backfill(a, h);
+
+    expect(outcome).toEqual({ stopped: "unnamed", pages: 0, sessions: 0 });
+    expect(log).toEqual([]);
+  });
+
+  it("a built folder is never touched: no status check, no new mail and no deletion sync", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders(30, 10);
+    await seedRows(USER_A.userId, [INBOX, ARCHIVE], {
+      [INBOX]: builtRow(stateOf(INBOX, 100, 31), {
+        checkedAt: Date.now() - DAY_MS,
+        due: "new_mail",
+        seen: stateOf(INBOX, 100, 33),
+      }),
+      [ARCHIVE]: buildRow(stateOf(ARCHIVE, 300, 11)),
+    });
+    h.addMessages(INBOX, messagesFrom(31, 2));
+
+    const { outcome, log } = await backfill(a, h);
+
+    expect(outcome).toEqual({ stopped: "built", pages: 1, sessions: 1 });
+    for (const read of [`snapshot:${INBOX}:start`, `newMail:${INBOX}:start`, `uids:${INBOX}:start`]) {
+      expect(log).not.toContain(read);
+    }
+    expect((await syncRowOf(USER_A.userId, INBOX))!.due).toBe("new_mail");
+  });
+
+  it("a validity change during the archive's build: back to seed, seeded again and paged from the top in the same call", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders(30, 60);
+    await seedRows(USER_A.userId, [INBOX, ARCHIVE], {
+      [INBOX]: builtRow(stateOf(INBOX, 100, 31)),
+      [ARCHIVE]: buildRow(stateOf(ARCHIVE, 300, 61)),
+    });
+    let archivePages = 0;
+    h.sources[ARCHIVE]!.onPage = () => {
+      archivePages += 1;
+      if (archivePages === 2) h.setValidity(ARCHIVE, 301);
+    };
+
+    const { outcome } = await backfill(a, h);
+
+    // Page 1 under the old validity, the page that found the change (a
+    // session, not a page), the seed, then three pages from the top.
+    expect(outcome).toEqual({ stopped: "built", pages: 4, sessions: 6 });
+    const validities = await withSql(USER_A.userId, (sql) =>
+      sql
+        .exec<{ v: number; n: number }>(
+          "select uid_validity as v, count(*) as n from recall_vectors where mailbox = ? group by uid_validity",
+          ARCHIVE,
+        )
+        .toArray(),
+    );
+    expect(validities).toEqual([{ v: 301, n: 60 }]);
+    expect((await syncRowOf(USER_A.userId, ARCHIVE))!.state!.uidValidity).toBe(301);
+  });
+
+  it("the ordinary step is unchanged: paused for a minute after a backfill, and its day count did not move", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = await inboxAtBuild(60);
+    await withSql(USER_A.userId, (sql) => {
+      writeState(sql, "pages_day", utcDay(Date.now()));
+      writeState(sql, "pages_count", "5");
+    });
+
+    const { outcome } = await backfill(a, h);
+    expect(outcome.pages).toBe(3);
+
+    const from = h.log.length;
+    expect(await recallStep(a, h.deps)).toBe("paused");
+    expect(h.log.slice(from)).toEqual([]);
+    expect(await ordinaryCount(USER_A.userId)).toBe("5");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The runner: only an ordinary client's grant runs a backfill (LD-2, LD-3)
+// ---------------------------------------------------------------------------
+
+describe("runRecallBackfill runs only for an ordinary client's grant", () => {
+  const refused: [string, string | null][] = [
+    ["the autonomy client", AUTONOMY_CLIENT_ID],
+    ["an empty client", ""],
+    ["an unknown client", null],
+  ];
+
+  it.each(refused)("%s: refused, with no object call and no session", async (_label, client) => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders(30, 10);
+    const ownName = () =>
+      runInDurableObject(objectFor(USER_A.userId), (_i, state) => state.storage.kv.get("own-name"));
+    // Every recall call to the object stores its own name; none has been made yet.
+    expect(await ownName()).toBeUndefined();
+
+    const run = await runRecallBackfill(a, h.deps.leased, async () => client, () => h.deps);
+
+    expect(run).toEqual({ kind: "refused" });
+    expect(h.log).toEqual([]);
+    expect(await ownName()).toBeUndefined();
+  });
+
+  it("an ordinary client: runs", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders(30, 10);
+
+    const run = await runRecallBackfill(a, h.deps.leased, async () => ORDINARY_CLIENT, () => h.deps);
+
+    expect(run).toEqual({ kind: "ran", outcome: { stopped: "built", pages: 3, sessions: 6 } });
+  });
+
+  it("the tool answers the refusal with one fixed sentence, and indexes nothing", async () => {
+    const h = twoFolders(30, 10);
+
+    const answer = await backfillTool(h, async () => AUTONOMY_CLIENT_ID)();
+
+    expect(answer.isError).toBe(true);
+    expect(trustedOf(answer)).toEqual({ message: BACKFILL_REFUSED });
+    expect(h.log).toEqual([]);
+    expect(await ledgerCount(USER_A.userId)).toBe(0);
   });
 });

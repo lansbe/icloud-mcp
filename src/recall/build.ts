@@ -26,6 +26,13 @@
 // (Phase 26). The object owns the pause, the one-in-flight rule and both
 // ceilings, so no caller can hurry a build.
 //
+// One call is still one page when the backfill runs (Phase 29.1.1). The
+// backfill loop in ./sync.ts calls `indexNextPage` once per page, one after
+// another, and asks for each slot as a backfill page. The object decides what
+// that kind may skip (the pause and the ordinary day count, and nothing else),
+// and grants it only for a folder whose first build is not finished. This
+// module only passes the kind through.
+//
 // RESUME. The cursor is committed only after the store write succeeded. A
 // failure part-way leaves the cursor where it was, so the next call reads the
 // same page again, and because every write is an upsert, re-indexing it leaves

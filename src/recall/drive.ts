@@ -69,6 +69,21 @@
 // per five minutes. The folder listing runs at most once a day, plus once
 // after a folder is dropped as gone (26-REVIEW-2 WR-02). The numbers and their
 // assumptions are in 26-CONTEXT D-31 and 25-CONTEXT D-24.
+//
+// THE BACKFILL THE PERSON ASKS FOR (Phase 29.1.1). `runRecallBackfill` runs one
+// call of `recallBackfill` in ./sync.ts. It runs only from the backfill tool the
+// person calls, while they watch, never from the seam above that drives steps
+// and never from the object's alarm. It makes the same grant check a step makes:
+// nothing runs, and nothing is called, unless the grant belongs to a client
+// other than the autonomy client. One call indexes at most
+// RECALL_BACKFILL_MAX_PAGES pages, one leased session at a time. Its pages skip
+// the one-minute pause and the ordinary day count, and count on their own:
+// at most RECALL_BACKFILL_MAX_PAGES_PER_DAY (400) pages a day, which is at most
+// RECALL_MAX_VECTORS (10,000) messages. That is about $0.12 once to embed, the
+// same as filling the ceiling (26-CONTEXT D-31, 25-CONTEXT D-24), and it is also
+// the most a runaway backfill can cost a person in a day. The 10,000-vector
+// ceiling, the 90-day window, read-only opens and peeking fetches are the same
+// as for a step.
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { AUTONOMY_CLIENT_ID } from "../agent/autonomy-client";
