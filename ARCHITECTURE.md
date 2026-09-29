@@ -317,10 +317,11 @@ tool; this map does not repeat it.
   cannot hold it for ever. The lease is added to the gate and does not replace
   it.
 - **Flow:** connect → `LOGIN` → `EXAMINE` (read-only) → work → `LOGOUT` → close,
-  every session. The one exception is `triage.ts`: it opens its mailbox in the
-  mutating form, refuses unless iCloud says the mailbox is writable, then
-  changes one flag or moves the messages it was given, one at a time. Decoding,
-  extraction and storage all happen *outside* the session.
+  for every session that opens a mailbox. The sign-in check, the folder listing
+  and the drafts write open none. The one exception is `triage.ts`: it opens
+  its mailbox in the mutating form, refuses unless iCloud says the mailbox is
+  writable, then changes one flag or moves the messages it was given, one at a
+  time. Decoding, extraction and storage all happen *outside* the session.
 
 Why: production allows six platform connections per Worker invocation, shared
 across KV, outbound fetch and sockets, and the OAuth provider has already spent
