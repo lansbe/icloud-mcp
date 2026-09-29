@@ -15,35 +15,56 @@ leaving the server.
 
 iCloud MCP is a single Cloudflare Worker that speaks three Apple protocols and
 exposes them to an MCP client (such as Claude) as a set of tools. The assistant
-can read and search your mail, draft replies into your Drafts folder, read and
-manage calendar events, find free time, and look up contacts — all against your
-real iCloud account.
+can read and search your mail, draft replies into your Drafts folder, sort mail
+into folders, read and manage calendar events, find free time, and read and
+update contacts — all against your real iCloud account.
 
-It was built for one person against one Apple ID, but nothing about it is
-personal to that account: every account-specific value lives in configuration
+Several people can sign in, each with their own Apple ID and their own
+app-specific password, and each reaches only their own account. Who may sign in
+is an allow list you set. Every account-specific value lives in configuration
 you supply. See [Deploy](#deploy).
 
 ### What the assistant can do
 
-- **Read mail** it does not send — list, search, and read messages and
-  attachments (including text extracted from PDFs).
+- **Read mail** — list, search, and read messages and attachments (including
+  text extracted from PDFs), and save attachments to your own computer.
+- **Find mail by meaning** — the server keeps a searchable index of your recent
+  inbox and archive mail. See
+  [SECURITY.md](SECURITY.md#recall-keeps-a-searchable-copy-of-your-recent-mail)
+  for what it keeps and for how long.
 - **Draft mail** into your iCloud Drafts folder — new messages and threaded
   replies, with staged attachments. **It cannot send.** A human reviews every
   draft and sends it by hand. This is a safety boundary, not a limitation. See
-  [Security](#security).
+  [Safety enforcement](#safety-enforcement).
+- **Sort mail** — mark a message read or unread, flag it, and move messages to
+  another folder, the archive or Trash. A move is **previewed first**. A draft
+  can be moved to Trash the same way. Nothing removes mail for good.
+- **Say what changed** since an earlier call: new mail by sender and subject,
+  and how many events changed on each calendar.
 - **Manage the calendar** — list, search, read, create, update, and delete
-  events. Every change that is destructive or notifies someone is **previewed
-  first** and only applied after an explicit confirm step.
+  events and calendars, and answer invitations. Every change that is
+  destructive or notifies someone is **previewed first** and only applied after
+  an explicit confirm step.
 - **Find free time** across all your calendars for a given duration.
-- **Look up contacts** by name or email.
+- **Look up and change contacts** — search and read them, and create or update
+  one. A contact change is **previewed first**.
+- **Run your own rules** — rules you add can flag new inbox mail or place a
+  draft reply to its sender, every 15 minutes, with nobody present. See
+  [Tools → Rules](#rules).
 
 ### What it deliberately does not do
 
 - **Send mail.** No SMTP, ever. The draft-and-review step is the backstop
-  against prompt-injected email content going out under your name.
-- **Act on its own.** No cron jobs, no background watchers, no digests.
-- **Cache your content.** iCloud is the system of record; only discovery
-  metadata (which server holds your account) is cached, for 24 hours.
+  against prompt-injected email content going out under your name. A draft
+  reply a rule places is still only a draft.
+- **Act on its own beyond your rules.** With no rules, nothing runs. A rule can
+  only flag a message or place a draft reply to its sender. No model reads your
+  mail to decide what to do.
+- **Keep your mail.** iCloud is the system of record. What the server does keep
+  is short-lived or small: the recall index (subject lines and a numeric
+  fingerprint, never the message text, for 90 days), staged and saved
+  attachments (removed within about two days), which server holds your account
+  (24 hours), and your rules and what they did.
 - **Let anyone in.** Who may sign in is an allow list you set. Everyone else is
   refused before Apple is ever contacted. Taking somebody off the list stops
   them signing in again; ending a session they already have is a second step.
@@ -65,20 +86,39 @@ MCP handler (/mcp)  ──  builds a fresh server per request
       │
       ├─ Mail tools  ──▶ IMAP over TLS (raw TCP socket) ──▶ imap.mail.me.com:993
       ├─ Cal tools   ──▶ CalDAV over HTTPS  ──▶ caldav.icloud.com
-      └─ Contact tools ▶ CardDAV over HTTPS ──▶ contacts.icloud.com
+      ├─ Contact tools ▶ CardDAV over HTTPS ──▶ contacts.icloud.com
+      └─ Recall      ──▶ Workers AI (embeddings) + Vectorize (the index)
+
+Per-person Durable Object  ──  mail lease, recall ledger, rules and their job
+      │  (for a person with rules, its alarm runs the rules job every 15 minutes)
+      └─ calls this Worker's own /mcp through the SELF service binding
 ```
 
 - The endpoint is **OAuth-gated**. An unauthenticated request never reaches a
-  tool.
+  tool. Apart from the OAuth sign-in endpoints, the one other public path is
+  `/save/`, which serves an attachment save link and nothing else.
 - IMAP runs over the Workers-native TCP socket API with implicit TLS on port
-  993 — no bridge, no proxy. A connection is opened, used, and closed within a
-  single request.
+  993 — no bridge, no proxy. Each session is opened, used, and closed within a
+  single request. A request may open more than one session, one after another,
+  never two at once.
+- Each signed-in person has one Durable Object. A mail tool call takes that
+  object's short lease before it connects, so two apps signed in as the same
+  person never hold two mail connections at once. A second call that finds the
+  lease held is refused with a plain reason.
+- The rules job runs from that object's alarm. It reaches mail only by calling
+  this Worker's own `/mcp`, with a token from that person's autonomy sign-in, like
+  any other client. It can call only four tools.
 - CalDAV/CardDAV use [`tsdav`](https://github.com/natelindev/tsdav); resolved
   server locations are cached in KV.
-- Each person's Apple credentials live only in their own OAuth grant, encrypted
+- Recall turns each recent message's subject, sender and opening lines into a
+  numeric fingerprint with Workers AI, and stores it in a Vectorize index, in the
+  signed-in person's own partition.
+- Each person's Apple credentials live only in their own OAuth grants, encrypted
   by the provider, written there when they sign in. The server holds no Apple
-  credential of its own. They are never logged, never returned in a response,
-  and never placed in an error message.
+  credential of its own. For the rules job, each person's Durable Object also
+  keeps one sealed token for a second sign-in made at the same time; see
+  [SECURITY.md](SECURITY.md#autonomy-inherent). Credentials are never logged,
+  never returned in a response, and never placed in an error message.
 
 For the full design — request flow, transport internals, the safety
 enforcement, and the module map — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
@@ -88,9 +128,9 @@ enforcement, and the module map — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 ## Tools
 
 <!-- tools:start. Generated by scripts/tool-table.mjs. Edit the lines in scripts/tool-table-core.mjs, then run: node scripts/tool-table.mjs --write -->
-47 tools in six groups. Every tool description carries an untrusted-content
-notice; event titles, message bodies, and contact fields are treated as data,
-never as instructions.
+47 tools in six groups. Each tool that returns message, event or contact
+text says in its description that the text is untrusted. Event titles, message
+bodies and contact fields are data, never instructions.
 
 ### Diagnostics
 
@@ -109,7 +149,7 @@ never as instructions.
 | `mail_list_unread` | List a folder's unread mail. |
 | `mail_find` | Search one folder by keyword, sender, and date range. Exhaustive in that folder: an empty answer means no such mail is there. |
 | `mail_recall` | Find recent mail by meaning. Ranked and best-effort: an empty answer means nothing scored high enough, not that no such mail exists. Returns message ids and subjects only; open one with `mail_get_message`. It searches a copy of your recent mail this server keeps for everyone who signs in; [SECURITY.md](SECURITY.md#recall-keeps-a-searchable-copy-of-your-recent-mail) says what is kept and for how long. |
-| `mail_recall_backfill` | Fill your own recall index in one sitting, while you watch. Each call indexes up to 10 pages (about 250 messages) of recent inbox and archive mail, one page at a time, and says how far it has got. Call again until it says the index is built. It takes no arguments and only ever fills your own index. |
+| `mail_recall_backfill` | Fill your own recall index in one sitting, while you watch. Each call indexes up to 10 pages of 25 messages of recent inbox and archive mail, one page at a time. A 20-second time limit usually stops it after 4 or 5 pages, about 100 to 125 messages. It says how far it has got. Call again until it says the index is built. It takes no arguments and only ever fills your own index. |
 | `mail_get_message` | Read one message in full by opaque id. |
 | `mail_mark_read` | Mark one message read or unread. **Writes immediately** — no preview, because the same tool puts it back. Reports the state iCloud returned. |
 | `mail_flag` | Flag or unflag one message. **Writes immediately** — no preview, because the same tool puts it back. Reports the flag state iCloud returned. |
@@ -118,11 +158,11 @@ never as instructions.
 | `mail_trash` | Preview moving up to 25 messages to Trash, where they can be moved back. Writes nothing; apply with `mail_commit`. |
 | `mail_delete_draft` | Preview moving one draft to Trash. Acts only on a draft in the drafts folder, exactly as the preview showed it. Writes nothing; apply with `mail_commit`. |
 | `mail_commit` | Apply a move, archive, Trash or draft-delete preview, only if the messages are unchanged since. Reports each message as `moved`, `copied_not_removed`, `not_copied` or `unknown`. Never removes mail for good. |
-| `mail_get_attachment` | Read one attachment as text (PDF text is extracted). |
+| `mail_get_attachment` | Read one attachment as text: plain text, HTML, or PDF (its text is extracted). Other types are refused. |
 | `mail_compose_new` | Compose a new message **into Drafts** (never sent). |
 | `mail_compose_reply` | Reply to a message **into Drafts**, threaded (never sent). |
 | `mail_stage_attachment` | Stage a file to attach to a draft (from a message, raw bytes, or an upload URL). |
-| `mail_save_attachment` | Save attachments to your own computer from Claude Cowork. One download link per file, valid five minutes. |
+| `mail_save_attachment` | Save attachments to your own computer. One download link per file, valid five minutes. The local Claude session that has your folder connected (such as Claude Cowork) downloads it. |
 | `mail_confirm_upload` | Finish a presigned attachment upload. |
 
 ### Calendar
@@ -157,7 +197,7 @@ never as instructions.
 
 | Tool | What it does |
 |------|--------------|
-| `changes_since` | Say what changed since a marker from an earlier call: counts first, then new mail by sender and subject only, then each calendar's count of events added or changed and removed. Returns a fresh marker every time. Never marks mail read. |
+| `changes_since` | Say what changed since a marker from an earlier call: counts first, then new mail by sender, subject and whether it came from a mailing list (never a body), then each calendar's count of events added or changed and removed. Watches the inbox, or up to five folders you name. Returns a fresh marker every time. Never marks mail read. |
 
 ### Rules
 
@@ -186,6 +226,7 @@ in [ARCHITECTURE.md](ARCHITECTURE.md).
 |-------------|-----|
 | **Cloudflare account, Workers Paid plan** | The free tier's 10 ms CPU budget cannot parse MIME bodies and PDF attachments. |
 | **A domain on Cloudflare** | `workers.dev` and preview URLs are disabled by design, so a custom-domain route is required. |
+| **Vectorize and Workers AI on the same account** | Recall stores its index in Vectorize and makes its fingerprints with a Workers AI embedding model. Both bill per use; the estimate in `src/recall/retention.ts` is about 2 cents a month for a typical person, and about 11 cents at the ceiling. |
 | **An Apple ID with an app-specific password** | iCloud requires an app-specific password for IMAP/DAV when the account has two-factor auth (it does). |
 | **Node.js 22.18+ and npm** | Wrangler and Vitest need 20+, but `scripts/grants.mjs` — the command that cuts off a connection — needs 22.18: it uses the synchronous module resolve hook (22.15) and built-in TypeScript type stripping (22.18) so it can call the Worker's own masking and user-id functions instead of keeping second copies. `package.json` declares the floor in `engines`, and the script says so and stops if the runtime is older. |
 
@@ -214,14 +255,25 @@ npx wrangler kv namespace create OAUTH_KV
 npx wrangler kv namespace create DAV_CACHE
 npx wrangler kv namespace create CONFIRM_KV
 npx wrangler kv namespace create ALLOW_LIST
+npx wrangler kv namespace create SAVE_LINK
 
 npx wrangler r2 bucket create icloud-mcp-attachments
+
+npx wrangler vectorize create icloud-mcp-recall --dimensions=1024 --metric=cosine
+npx wrangler vectorize create-metadata-index icloud-mcp-recall --propertyName=u --type=string
 ```
+
+The Vectorize index holds the recall index. Create it, and its metadata index,
+before the first deploy: wrangler does not create an index on deploy, and a
+deploy fails until it exists. Its size (1024) and metric (cosine) cannot be
+changed later. The metadata index must exist before the first vector is written,
+because recall filters every search to the signed-in person with it.
 
 Add a lifecycle rule to the bucket so staged uploads expire after one day
 (Cloudflare dashboard → R2 → your bucket → Settings → Object lifecycle rules:
 prefix `staging/`, delete after 1 day). This is required — the staging token
-expires at 24 h and the bytes must not outlive it by much.
+expires at 24 h and the bytes must not outlive it by much. Attachment copies made
+for a save link live under the same prefix, so the rule clears them too.
 
 ### 3. Fill in `wrangler.jsonc`
 
@@ -231,7 +283,12 @@ Edit these values in your git-ignored `wrangler.jsonc`:
 - `vars.R2_ACCOUNT_ID` → your Cloudflare account id
 - `vars.ALLOWED_APPLE_IDS_SEED` → your own Apple ID, as a one-element JSON array
   string: `"[\"you@example.com\"]"`
-- `kv_namespaces[].id` → the four ids from step 2
+- `kv_namespaces[].id` → the five ids from step 2
+
+Leave the other bindings as they are. `vectorize[0].index_name` must match the
+index you created. `services[0].service` must equal `name` at the top of the
+file: that binding lets the rules job call this same Worker, and it must never
+point at another one.
 
 The hostname is baked into the build automatically from `routes[0].pattern`;
 you never edit it in code.
@@ -274,9 +331,15 @@ is a KV document and not a Workers Secret: a secret cannot be read back, so
 npx wrangler secret put CONFIRM_SECRET         # e.g. `openssl rand -base64 32`
 npx wrangler secret put R2_ACCESS_KEY_ID       # from an R2 S3 API token,
 npx wrangler secret put R2_SECRET_ACCESS_KEY   #   Object Read & Write, scoped to the bucket
+
+# 32 random bytes, base64url, sent on standard input so it is never printed:
+node -e "process.stdout.write(require('crypto').randomBytes(32).toString('base64url'))" \
+  | npx wrangler secret put SAVE_LINK_SEAL_KEY
 ```
 
-See [`.dev.vars.example`](.dev.vars.example) for what each secret is.
+See [`.dev.vars.example`](.dev.vars.example) for what each secret is. Two more
+secrets, `AUTONOMY_CLIENT_SECRET` and `AUTONOMY_SEAL_KEY`, are set for you in
+step 7.
 
 **There is no `AUTH_SECRET`, `APPLE_ID` or `APPLE_APP_PASSWORD` any more.** Each
 person now signs in with their own Apple ID and their own app-specific password,
@@ -292,6 +355,20 @@ npm run deploy
 npm run smoke     # confirms the live endpoint refuses an unauthenticated request
 ```
 
+### 7. Set up autonomy
+
+```bash
+node scripts/grants.mjs autonomy-setup         # shows what it would do
+node scripts/grants.mjs autonomy-setup --yes   # does it
+```
+
+This creates the client the rules job signs in as, and sets
+`AUTONOMY_CLIENT_SECRET` and `AUTONOMY_SEAL_KEY` through standard input. It never
+prints either value. Setting a secret deploys a new version of the Worker. From
+then on, every sign-in also makes that person's autonomy key. Until you run it,
+sign-in works but nobody has a key, so no rules run. Running it again refuses;
+`--replace` makes a new client and ends everyone's key until their next sign-in.
+
 ---
 
 ## Connect an MCP client
@@ -302,7 +379,9 @@ Dynamic Client Registration.
 1. Add the connector URL (`https://your-domain.example/mcp`) in your MCP client.
 2. The client sends you to the `/authorize` page.
 3. Check that the page names your client and the address it will send you back
-   to, and that it says it is not an Apple page.
+   to, and that it says it is not an Apple page. Above the fields it also says
+   that the server keeps a searchable copy of your recent mail and, once
+   autonomy is set up, that it can act on your own rules while you are away.
 4. Enter your Apple ID and your app-specific password, and approve.
 
 Paste the app-specific password exactly as Apple showed it to you. The server
@@ -354,6 +433,8 @@ shown by a masked address. One line per connection:
 | `created` | The day somebody signed in to make it. |
 | `expires` | The day it runs out, or `never`. A login made now never expires. |
 | `client present` / `client gone` | Whether the app's registration still exists. `client gone` means that connection is already dead — its next refresh is refused whatever you do. |
+| `autonomy` | At the end of a line: this is the person's autonomy key, the second sign-in the rules job uses. It also says `never` under `expires`, because it ends with the person's ordinary connections instead. |
+| `rules job ...` | A line under an autonomy row: the rules job's next wake or when it was last idle, how many times Apple refused the password, and the last outcome. |
 
 **Then cut them off:**
 
@@ -376,6 +457,16 @@ up to one hour.
 Once both are gone, their next request is refused and their client shows a
 sign-in page. The store is eventually consistent, so allow about a minute for
 the deletes to be seen everywhere.
+
+**Revoking by address also ends their autonomy key**, because it is one of their
+grants. What else they leave behind goes on its own:
+
+- Their recall index is deleted within a day of their access ending.
+- Their rules, what the rules did and the job's state are deleted once they hold
+  no sign-in of any kind, seen on two checks a day apart.
+
+Taking someone off the list without revoking stops their rules job before it
+reads the key, but does not delete the key. Revoke to end it.
 
 The script runs as you, through wrangler's own login, and reads the live store —
 never a local copy. There is deliberately no web page for this: a revoke
@@ -433,7 +524,7 @@ stricter and is actually broken: the seed holds only you, so somebody you had
 just added to the list would sign in successfully and be refused on their very
 next request. They would never get a working session at all.
 
-### Three more things worth knowing
+### More things worth knowing
 
 **They are not told they were removed.** Their client sees a sign-in page again,
 the same one anybody who was never on the list sees. If you want them to know,
@@ -478,7 +569,9 @@ npx wrangler dev                 # runs the Worker locally
 ```
 
 `.dev.vars` is git-ignored and refused by the pre-commit hook. Local runs use
-Miniflare's local KV/R2 — no live Cloudflare storage is touched.
+Miniflare's local KV, R2 and Durable Objects — no live Cloudflare storage is
+touched. Workers AI and Vectorize have no local simulator; see the notes on the
+recall bindings in `wrangler.jsonc.example`.
 
 Do **not** point tests or any automated step at your real Apple ID. The suite
 uses fake credentials on purpose (D-09).
@@ -488,32 +581,41 @@ uses fake credentials on purpose (D-09).
 ## Testing
 
 ```bash
-npm test          # full suite
-npm run typecheck # tsc --noEmit
-npm run scan      # the safety scanner (see below)
+npm test           # full suite
+npm run typecheck  # tsc --noEmit
+npm run scan       # the safety scanner (see below)
+npm run docs:tools # checks README's tool tables against the code
 ```
 
-Tests run inside the real `workerd` runtime via
+The suite has two Vitest projects. Most tests run inside the real `workerd`
+runtime via
 [`@cloudflare/vitest-pool-workers`](https://developers.cloudflare.com/workers/testing/vitest-integration/),
 so socket and DAV code is exercised against realistic Workers constraints, not a
-Node mock. ~2,400 tests, no live account required.
+Node mock. A few that must read files off disk, such as the safety scanner's own
+tests, run under Node. No live account is needed, and the suite never reaches
+the Cloudflare account.
+
+README's tool count and tables are generated from the code by
+`scripts/tool-table.mjs`. To change a tool's line, edit
+`scripts/tool-table-core.mjs` and run `node scripts/tool-table.mjs --write`. A
+test fails if the tables and the registered tools disagree.
 
 ---
 
 ## Safety enforcement
 
-Five safety rules are enforced mechanically by `scripts/forbidden-tokens.mjs`,
-which runs both from the test suite and from a pre-commit hook:
+Six safety rules are enforced mechanically by `scripts/forbidden-tokens.mjs`,
+which runs both from the test suite and from a pre-commit hook. They cover the
+mail transport, sending mail (there is none), the one module that opens a
+socket, logging (there is none in `src/`), reading mail without marking it
+read, and the two things the rules job may do.
 
-1. No opportunistic-TLS transport paths (implicit TLS on 993 only).
-2. No mail sending — no SMTP, one draft-write path, enforced as a count.
-3. One and only one module may open a TCP socket.
-4. No credential ever reaches a log or an error (there is no logging in `src/`).
-5. Reading mail never marks it read (read paths open mailboxes read-only, fetches peek). One separate path changes mail only when you ask: it marks a message read or unread, flags it, moves messages to another folder, or moves one draft to Trash. A move is previewed first, and nothing removes mail for good.
-
-Changing any of these is a change to the project's safety boundary. The rules,
-their reasons, and how they are enforced are documented in
-[ARCHITECTURE.md](ARCHITECTURE.md) → *Safety model*.
+The rules, their reasons and the decisions recorded against them are written
+out in [`.claude/CLAUDE.md`](.claude/CLAUDE.md) under *Conventions*. The script
+itself is the list of what is checked today. Changing any rule is a change to
+the project's safety boundary, not a refactor. The design side is in
+[ARCHITECTURE.md](ARCHITECTURE.md) → *Safety model*, and the security side in
+[SECURITY.md](SECURITY.md).
 
 ---
 
@@ -521,26 +623,37 @@ their reasons, and how they are enforced are documented in
 
 ```
 src/
-  index.ts            Worker entry (the OAuth provider)
-  env.ts              binding surface (KV, R2, vars, secrets)
+  index.ts            Worker entry (the OAuth provider) and the Durable Object export
+  env.ts              binding surface (KV, R2, Vectorize, AI, Durable Object, vars, secrets)
+  principal.ts        who a request acts for, and the one masking function
+  confirm.ts          preview-and-commit confirmation tokens
+  change-marker.ts    the marker changes_since hands back
+  password-pause.ts   the fifteen-minute pause after Apple refuses a password
   auth/               OAuth options + the /authorize login handler
-  mcp/                MCP handler, per-request server factory, tool registrations
-  mail/               IMAP: the one socket importer, session orchestrator, MIME
+  mcp/                MCP handler, per-request server factory, instructions, tool registrations
+  mail/               IMAP: the one socket importer, session orchestrators, triage, MIME
   dav/                CalDAV/CardDAV: transport, discovery, calendar/contacts, parsers
+  agent/              the per-person Durable Object: lease, autonomy key, rules and their job
+  recall/             the recall index: build, sync, backfill, embedding, search
+  save/               attachment save links and the /save/ download route
   staging/            R2 attachment staging + presigned uploads
   feed/               subscription-feed fetch (calendar subscriptions)
-scripts/              hostname generation, the safety scanner, smoke test
-test/                 ~2,400 tests, run inside workerd
+scripts/              the safety scanner, the owner's grants command, the README tool
+                      table, hostname generation, smoke test
+test/                 the test suite (Vitest, mostly inside workerd)
 ```
 
 ---
 
 ## Tech stack
 
-Cloudflare Workers · TypeScript · MCP SDK v2 (`@modelcontextprotocol/server`) ·
-`agents` (`createMcpHandler`) · `@cloudflare/workers-oauth-provider` · `tsdav`
-(CalDAV/CardDAV) · `ical.js` (iCalendar **and** vCard) · `postal-mime` (MIME) ·
-`unpdf` (PDF text) · `aws4fetch` (R2 presign) · `zod` (schemas).
+Cloudflare Workers, Durable Objects (SQLite), Vectorize and Workers AI ·
+TypeScript 5.9 · MCP SDK v2 (`@modelcontextprotocol/server` 2.0.0) · `agents`
+0.20.1 (`createMcpHandler`) · `@cloudflare/workers-oauth-provider` 0.10.3 ·
+`tsdav` 2.3.4 (CalDAV/CardDAV) · `ical.js` 2.2.1 (iCalendar **and** vCard) ·
+`postal-mime` 3.0.0 (MIME) · `unpdf` 1.8.0 (PDF text) · `aws4fetch` 1.0.20 (R2
+presign) · `zod` 4.4.3 (schemas) · Wrangler 4.122.0 · Vitest 4.1.10 with
+`@cloudflare/vitest-pool-workers` 0.21.2.
 
 ---
 

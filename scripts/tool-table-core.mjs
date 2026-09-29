@@ -81,7 +81,7 @@ export const TOOL_GROUPS = Object.freeze([
       ["mail_recall",
         "Find recent mail by meaning. Ranked and best-effort: an empty answer means nothing scored high enough, not that no such mail exists. Returns message ids and subjects only; open one with `mail_get_message`. It searches a copy of your recent mail this server keeps for everyone who signs in; [SECURITY.md](SECURITY.md#recall-keeps-a-searchable-copy-of-your-recent-mail) says what is kept and for how long."],
       ["mail_recall_backfill",
-        "Fill your own recall index in one sitting, while you watch. Each call indexes up to 10 pages (about 250 messages) of recent inbox and archive mail, one page at a time, and says how far it has got. Call again until it says the index is built. It takes no arguments and only ever fills your own index."],
+        "Fill your own recall index in one sitting, while you watch. Each call indexes up to 10 pages of 25 messages of recent inbox and archive mail, one page at a time. A 20-second time limit usually stops it after 4 or 5 pages, about 100 to 125 messages. It says how far it has got. Call again until it says the index is built. It takes no arguments and only ever fills your own index."],
       ["mail_get_message",
         "Read one message in full by opaque id."],
       ["mail_mark_read",
@@ -99,7 +99,7 @@ export const TOOL_GROUPS = Object.freeze([
       ["mail_commit",
         "Apply a move, archive, Trash or draft-delete preview, only if the messages are unchanged since. Reports each message as `moved`, `copied_not_removed`, `not_copied` or `unknown`. Never removes mail for good."],
       ["mail_get_attachment",
-        "Read one attachment as text (PDF text is extracted)."],
+        "Read one attachment as text: plain text, HTML, or PDF (its text is extracted). Other types are refused."],
       ["mail_compose_new",
         "Compose a new message **into Drafts** (never sent)."],
       ["mail_compose_reply",
@@ -107,7 +107,7 @@ export const TOOL_GROUPS = Object.freeze([
       ["mail_stage_attachment",
         "Stage a file to attach to a draft (from a message, raw bytes, or an upload URL)."],
       ["mail_save_attachment",
-        "Save attachments to your own computer from Claude Cowork. One download link per file, valid five minutes."],
+        "Save attachments to your own computer. One download link per file, valid five minutes. The local Claude session that has your folder connected (such as Claude Cowork) downloads it."],
       ["mail_confirm_upload",
         "Finish a presigned attachment upload."],
     ],
@@ -165,7 +165,7 @@ export const TOOL_GROUPS = Object.freeze([
     null,
     [
       ["changes_since",
-        "Say what changed since a marker from an earlier call: counts first, then new mail by sender and subject only, then each calendar's count of events added or changed and removed. Returns a fresh marker every time. Never marks mail read."],
+        "Say what changed since a marker from an earlier call: counts first, then new mail by sender, subject and whether it came from a mailing list (never a body), then each calendar's count of events added or changed and removed. Watches the inbox, or up to five folders you name. Returns a fresh marker every time. Never marks mail read."],
     ],
   ),
   group(
@@ -236,9 +236,9 @@ export function renderBlock(groups) {
   const count = rowNames(groups).length;
   const word = COUNT_WORDS[groups.length] ?? String(groups.length);
   const parts = [
-    `${count} tools in ${word} groups. Every tool description carries an untrusted-content\n` +
-      "notice; event titles, message bodies, and contact fields are treated as data,\n" +
-      "never as instructions.\n",
+    `${count} tools in ${word} groups. Each tool that returns message, event or contact\n` +
+      "text says in its description that the text is untrusted. Event titles, message\n" +
+      "bodies and contact fields are data, never instructions.\n",
   ];
   for (const one of groups) {
     let text = `### ${one.heading}\n\n`;
