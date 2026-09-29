@@ -163,6 +163,7 @@ import {
   indexNextPage,
   RECALL_PAGE_SIZE,
   RecallBuildError,
+  RecallSlotInvalidError,
   reconcileMailbox,
 } from "./build";
 import { mailRecallSource, type NewMailPage, newMailPage } from "./mail-source";
@@ -277,11 +278,14 @@ export type StepDeps = BuildDeps & {
  * `idle`: every folder is built and none is due a status check. `unnamed`:
  * the object does not know whose it is, so nothing was opened. `checked`: a
  * built folder's status check found nothing to do. `due`: it found new mail or
- * a deletion sync to do, and recorded it for the next step. Or any build
- * status, which carries `lease_busy` and every page refusal.
+ * a deletion sync to do, and recorded it for the next step. `moved`: a
+ * backfill page found its folder no longer at build, because another request
+ * moved the row; only the backfill loop answers it (29.1.1-REVIEW WR-02). Or
+ * any build status, which carries `lease_busy` and every page refusal.
  */
 export type StepOutcome =
   | "unnamed"
+  | "moved"
   | "folders"
   | "seeded"
   | "gone"
@@ -1128,9 +1132,16 @@ export async function recallBackfill(
     const row = rowOf(next) ?? SEED_ROW;
     let outcome: StepOutcome;
     try {
-      outcome = await attempt(principal, next, row, counted, () =>
-        advanceUnbuilt(principal, folders, next, row, counted, "backfill"),
-      );
+      outcome = await attempt(principal, next, row, counted, async () => {
+        try {
+          return await advanceUnbuilt(principal, folders, next, row, counted, "backfill");
+        } catch (error) {
+          // The row left build after it was read (WR-02): another request
+          // moved it. Not a failure: read the rows again.
+          if (error instanceof RecallSlotInvalidError) return "moved";
+          throw error;
+        }
+      });
     } catch {
       return stop("failed");
     }
@@ -1138,7 +1149,9 @@ export async function recallBackfill(
       pages += 1;
       continue;
     }
-    if (outcome === "seeded" || outcome === "gone" || outcome === "reset") continue;
+    if (outcome === "moved" || outcome === "seeded" || outcome === "gone" || outcome === "reset") {
+      continue;
+    }
     if (outcome === "unanswered") return stop("failed");
     return stop(backfillStopOf(outcome));
   }

@@ -759,6 +759,40 @@ describe("recallBackfill fills a person's index across calls, one session at a t
     expect((await syncRowOf(USER_A.userId, ARCHIVE))!.state!.uidValidity).toBe(301);
   });
 
+  // 29.1.1-REVIEW WR-02: the row leaves build between the loop's read and its
+  // page request, as when another backfill call just finished the folder.
+  it("a folder finished by another request between the read and the page: not a failure, and the built row is kept", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = await inboxAtBuild(60);
+    const finished = builtRow(stateOf(INBOX, 100, 61));
+    const spy = await runInDurableObject(objectFor(USER_A.userId), (instance: UserAgent) => {
+      const prototype = Object.getPrototypeOf(instance) as UserAgent;
+      const original = prototype.recallBeginPage;
+      let calls = 0;
+      return vi
+        .spyOn(prototype, "recallBeginPage")
+        .mockImplementation(function (this: UserAgent, mailbox: unknown, kind: unknown) {
+          calls += 1;
+          // The second page request: another request marks the folder built first.
+          if (calls === 2) expect(this.recallSetSync(INBOX, finished)).toEqual({ ok: true });
+          return original.call(this, mailbox, kind);
+        });
+    });
+
+    let outcome: BackfillOutcome;
+    try {
+      ({ outcome } = await backfill(a, h));
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(outcome).toEqual({ stopped: "built", pages: 1, sessions: 1 });
+    const row = (await syncRowOf(USER_A.userId, INBOX))!;
+    expect(row.stage).toBe("built");
+    expect(row.failures).toBe(0);
+    expect(row.failedAt).toBeNull();
+  });
+
   it("the ordinary step is unchanged: paused for a minute after a backfill, and its day count did not move", async () => {
     const a = await testPrincipal(USER_A);
     const h = await inboxAtBuild(60);
