@@ -18,6 +18,7 @@ import type { Env } from "../env";
 import type { SavePartRead } from "../mail/service";
 import { decodeWindows } from "../mail/stream-decode";
 import { deleteStaged, putSaved } from "../staging/r2";
+import { suggestSaveName } from "./filename";
 import { mintSaveLink } from "./link";
 
 /** One part the caller asked for: the caller's own id string and its read. */
@@ -33,7 +34,8 @@ export interface SaveItem {
  * not be written or its link could not be sealed. `not-stored` is unreachable
  * while the tool checks the seal key first and the user id comes from the
  * principal; it exists so that a failure there is a named row rather than a
- * lost id.
+ * lost id. `mixed-messages` is the tool's own: ids from more than one message,
+ * refused before anything is read.
  */
 export type SavePartRefusal =
   | "not-found"
@@ -42,7 +44,8 @@ export type SavePartRefusal =
   | "part-changed"
   | "malformed-encoding"
   | "encoding-unsupported"
-  | "not-stored";
+  | "not-stored"
+  | "mixed-messages";
 
 /** What happened to one part. Filename and type are a stranger's. */
 export type SaveRow =
@@ -55,6 +58,11 @@ export type SaveRow =
       sizeBytes: number;
       /** Lowercase hex SHA-256 of the decoded file. */
       sha256: string;
+      /**
+       * A safe name for the person's disk, from `suggestSaveName`. Still
+       * derived from a stranger's text, so it travels only inside the fence.
+       */
+      suggestedFilename: string;
       filename: string | null;
       mimeType: string | null;
     }
@@ -155,6 +163,7 @@ export async function saveParts(
       expiresAtMs: link.expiresAtMs,
       sizeBytes: bytes.byteLength,
       sha256,
+      suggestedFilename: suggestSaveName(read.filename),
       filename: read.filename,
       mimeType: read.mimeType,
     });

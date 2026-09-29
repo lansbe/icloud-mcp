@@ -949,3 +949,49 @@ export async function openSaved(
   if (object === null) return null;
   return { body: object.body, sizeBytes: object.size };
 }
+
+/**
+ * Delete this person's own saved copies whose links have died, in one batched
+ * delete.
+ *
+ * This is the "next save" half of the unused-copy deletion the owner approved
+ * on 2026-09-29. The bucket's one-day rule is the other half. A copy is
+ * normally deleted by its download; this reaches only the ones never
+ * downloaded.
+ *
+ * It can only ever reach the caller's own saved copies. It lists one page under
+ * the caller's own segment and the saved-copy stem, and keeps a key only if it
+ * passes `underStagingPrefix` for this user AND its name segment is a saved
+ * copy's. So a draft-staging object, an upload, or another person's copy is
+ * never deleted, whatever the list returns.
+ *
+ * The age is read from the time in the copy's own name: the moment it was
+ * saved, which is the moment its link's life counts from. A copy saved more
+ * than `olderThanMs` before `nowMs` is deleted.
+ *
+ * The caller swallows any failure. A failed sweep must never fail a save.
+ */
+export async function sweepExpiredSaves(
+  env: Env,
+  userId: string,
+  olderThanMs: number,
+  nowMs: number,
+): Promise<void> {
+  if (!USER_SEGMENT.test(userId)) return;
+  const cutoff = nowMs - olderThanMs;
+  const listed = await env.ATTACHMENT_STAGING.list({
+    prefix: `${STAGING_PREFIX}${userId}/${SAVE_STEM}-`,
+  });
+
+  const expired: string[] = [];
+  for (const object of listed.objects) {
+    const key = object.key;
+    if (!underStagingPrefix(userId, key)) continue;
+    const name = key.slice(STAGING_PREFIX.length + userId.length + 1);
+    if (!isSavedName(name)) continue;
+    const savedAt = Number(name.slice(name.lastIndexOf("-") + 1));
+    if (!Number.isSafeInteger(savedAt) || savedAt >= cutoff) continue;
+    expired.push(key);
+  }
+  if (expired.length > 0) await env.ATTACHMENT_STAGING.delete(expired);
+}
