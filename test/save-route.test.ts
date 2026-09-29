@@ -342,3 +342,92 @@ describe("a copy never outlives its download", () => {
     expect(await stored(live.key)).toBe(false);
   });
 });
+
+/** A fresh documentation-range address, so each case has a budget of its own. */
+function freshAddress(): string {
+  const [a, b] = crypto.getRandomValues(new Uint16Array(2));
+  return `2001:db8:${a!.toString(16)}:${b!.toString(16)}::1`;
+}
+
+/** The approved brake: this many requests a minute from one address. */
+const BRAKE_LIMIT = 30;
+
+/** The pool's real brake, wrapped so a case can see every key it was given. */
+function recordingBrake(): { brake: RateLimit; keys: string[] } {
+  const keys: string[] = [];
+  const real = entryEnv().SAVE_IP_LIMITER;
+  return {
+    keys,
+    brake: {
+      limit: (options: RateLimitOptions) => {
+        keys.push(options.key);
+        return real.limit(options);
+      },
+    } as RateLimit,
+  };
+}
+
+describe("the per-address brake", () => {
+  it("answers the approved number of bad links a minute, then an empty 429", async () => {
+    const headers = { "cf-connecting-ip": freshAddress() };
+    for (let i = 0; i < BRAKE_LIMIT; i += 1) {
+      const answer = await settle(urlFor(`${SAVE_ROUTE_PATH}${randomBase64Url(180)}`), { headers });
+      expect(answer).toEqual(GONE);
+    }
+    const braked = await settle(urlFor(`${SAVE_ROUTE_PATH}${randomBase64Url(180)}`), { headers });
+    expect(braked).toEqual({
+      status: 429,
+      headers: [["cache-control", "no-store"]],
+      body: new Uint8Array(0),
+    });
+  });
+
+  it("does not spend a live link it refuses, and another address then downloads it", async () => {
+    const braked = { "cf-connecting-ip": freshAddress() };
+    for (let i = 0; i < BRAKE_LIMIT; i += 1) {
+      await settle(urlFor(`${SAVE_ROUTE_PATH}${randomBase64Url(180)}`), { headers: braked });
+    }
+    const live = await saveCopy(SMALL);
+
+    expect((await settle(live.url, { headers: braked })).status).toBe(429);
+    expect(await spent(live.token)).toBe(false);
+    expect(await stored(live.key)).toBe(true);
+
+    const download = await settle(live.url, { headers: { "cf-connecting-ip": freshAddress() } });
+    expect(download.status).toBe(200);
+    expect(download.body).toEqual(SMALL);
+  });
+
+  it("refuses malformed tokens before the brake, so they do not count", async () => {
+    const { brake, keys } = recordingBrake();
+    const env = { ...entryEnv(), SAVE_IP_LIMITER: brake };
+    const headers = { "cf-connecting-ip": freshAddress() };
+    for (let i = 0; i < BRAKE_LIMIT + 10; i += 1) {
+      expect(await settle(urlFor(`${SAVE_ROUTE_PATH}bad.${i}`), { env, headers })).toEqual(GONE);
+    }
+    expect(keys).toEqual([]);
+
+    // The address's budget is untouched: a well-formed request is still let through.
+    expect(await settle(urlFor(`${SAVE_ROUTE_PATH}${randomBase64Url(180)}`), { env, headers })).toEqual(
+      GONE,
+    );
+    expect(keys).toEqual([headers["cf-connecting-ip"]]);
+  });
+
+  it("brakes a request with no address header under one shared key", async () => {
+    const { brake, keys } = recordingBrake();
+    const env = { ...entryEnv(), SAVE_IP_LIMITER: brake };
+    await settle(urlFor(`${SAVE_ROUTE_PATH}${randomBase64Url(180)}`), { env });
+    await settle(urlFor(`${SAVE_ROUTE_PATH}${randomBase64Url(180)}`), { env });
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toBe(keys[1]);
+    expect(keys[0]!.length).toBeGreaterThan(0);
+
+    // And that key is braked, not waved through.
+    const refusing = { limit: () => Promise.resolve({ success: false }) } as unknown as RateLimit;
+    const live = await saveCopy(SMALL);
+    const answer = await settle(live.url, { env: { ...entryEnv(), SAVE_IP_LIMITER: refusing } });
+    expect(answer.status).toBe(429);
+    expect(await spent(live.token)).toBe(false);
+  });
+});
