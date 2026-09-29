@@ -20,7 +20,7 @@ import { registerContactsTools } from "./tools/contacts";
 import { registerDavDiagnoseTool } from "./tools/dav-diagnose";
 import { registerDiagnoseTool } from "./tools/diagnose";
 import { registerMailTools } from "./tools/mail";
-import { registerRecallTools } from "./tools/recall";
+import { registerRecallBackfillTool, registerRecallTools } from "./tools/recall";
 import { registerRulesTools } from "./tools/rules";
 
 /**
@@ -48,10 +48,11 @@ export function createServerFactory(
   principal: Promise<Principal>,
   extraTools: Array<(server: McpServer) => void> = [],
   // Which client the request's grant belongs to, read only when a recall step
-  // is about to run (Phase 26, D-35). The default answers null, and null runs
-  // no step. That is the safe direction: a factory built without knowing whose
-  // grant it serves never indexes anybody's mail. The door is the only
-  // production caller and passes the real reader.
+  // is about to run (Phase 26, D-35), and now also when a recall backfill is
+  // about to run (Phase 29.1.1, LD-2, LD-3). The default answers null, and
+  // null runs no step and no backfill. That is the safe direction: a factory
+  // built without knowing whose grant it serves never indexes anybody's mail.
+  // The door is the only production caller and passes the real reader.
   grantClient: GrantClient = async () => null,
 ): McpServerFactory {
   return () => {
@@ -179,6 +180,14 @@ export function createServerFactory(
       registerChangesTool(server, leasedMail, principal, davFetch);
     };
     registerMailRegistrars(driven);
+    // The recall backfill (Phase 29.1.1, RCLL-14). On the plain server, not
+    // the driven one: it IS the build, and a recall step after it would be a
+    // second build pass in the same request. It takes the leased runner, so
+    // each page it reads takes the person's lease for that one session and
+    // gives it back before the next. And it takes the door's grant reader, so
+    // a request on the autonomy grant, or one whose client is unknown, runs
+    // nothing at all (LD-2, LD-3).
+    registerRecallBackfillTool(server, leasedMail, principal, grantClient);
     registerDavDiagnoseTool(server, davFetch, unpaused);
     // The same `davFetch` the diagnostic takes, deliberately: one queue per
     // request means a calendar call and a diagnosis issued in the same request

@@ -31,6 +31,10 @@
 // `mail_delete_draft`, `mail_compose_new`, `mail_compose_reply` and
 // `mail_stage_attachment` as the answer to one question: how do I revise a
 // draft. There is no revise tool, so the answer is those tools, in order.
+// The recall paragraph names `mail_recall_backfill` as the answer to one more
+// question: how does a person fill their recall index now, rather than over
+// days of ordinary mail use (Phase 29.1.1). Its words were decided by Claude,
+// and the owner may revise them.
 //
 // **The prohibitions here are described by role, never by command name**, for
 // the reason `./../../.claude/CLAUDE.md` Conventions sections 1 and 2 record: the
@@ -115,6 +119,8 @@ There is no tool that edits a draft. To revise one, write the new version first,
 \`rules_list\`, \`rules_add\`, \`rules_commit\`, \`rules_remove\` and \`rules_test\` manage the user's own rules, which run on their own every 15 minutes with nobody present. With no rules nothing runs. A rule can only flag a message or place a draft reply to its sender, and adding one is previewed by \`rules_add\` and happens only through \`rules_commit\`.
 
 Two tools find mail, and their empty answers mean different things. \`mail_find\` is exhaustive in the one folder it searches, so an empty answer means no such mail is there. \`mail_recall\` finds recent mail by meaning. It is ranked and best-effort, so an empty answer means nothing scored high enough, never that no such mail exists. It returns message ids and subjects only; open results with \`mail_get_message\`.
+
+\`mail_recall_backfill\` fills the person's own recall index faster than ordinary mail use does. Call it only when the person asks you to build or fill their recall index, and only while they are here. Each call reads up to 10 pages of recent inbox and archive mail and says how far the build has got; tell the person that line. Call it again when the answer says to continue. Stop when an answer says the index is built, or says to stop.
 
 Calendar EVENTS can be created, updated and deleted, through the preview-and-commit shape above.
 

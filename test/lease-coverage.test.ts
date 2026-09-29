@@ -88,10 +88,10 @@ const SERVER_SOURCE: string = Object.values(SERVER_SOURCE_GLOB)[0] ?? "";
  * One factory call is one request: every callback here shares that request's
  * one gate and one leased runner, exactly as in production.
  */
-function realTools(): Map<string, Callback> {
+function realTools(grantClient?: () => Promise<string | null>): Map<string, Callback> {
   const spy = vi.spyOn(McpServer.prototype, "registerTool");
   try {
-    createServerFactory(ownerPrincipal())({ era: "modern" } as never);
+    createServerFactory(ownerPrincipal(), [], grantClient)({ era: "modern" } as never);
     const tools = new Map<string, Callback>();
     for (const call of spy.mock.calls as unknown as [string, unknown, Callback][]) {
       const [name, , callback] = call;
@@ -222,6 +222,14 @@ async function mintedDraftDelete(): Promise<{ confirmToken: string; jti: string;
 
 type Args = Record<string, unknown> | (() => Promise<Record<string, unknown>>);
 
+/**
+ * An ordinary Claude app's grant reader. The backfill runs nothing without
+ * one, and the factory's default reader answers null, so the backfill's row
+ * alone is built with this. Every other row keeps the default, so no other
+ * row's assertions change.
+ */
+const ORDINARY_GRANT = async (): Promise<string | null> => "claude-desktop-client";
+
 async function argsOf(args: Args): Promise<Record<string, unknown>> {
   return typeof args === "function" ? args() : args;
 }
@@ -233,7 +241,11 @@ const LEASE_RULE = { when: { fromAddresses: ["lease@example.invalid"] }, then: {
  * Every tool that can open an iCloud mail connection. Each must take the lease
  * before any socket, so with the lease held it answers connection_busy.
  */
-const LEASED: ReadonlyArray<{ name: string; args: Args }> = [
+const LEASED: ReadonlyArray<{
+  name: string;
+  args: Args;
+  grantClient?: () => Promise<string | null>;
+}> = [
   { name: "mail_get_message", args: { id: MESSAGE_ID } },
   { name: "mail_list_folders", args: {} },
   { name: "mail_list_messages", args: { folderId: FOLDER_ID } },
@@ -263,6 +275,9 @@ const LEASED: ReadonlyArray<{ name: string; args: Args }> = [
   { name: "changes_since", args: {} },
   // Phase 28: the one rules tool that reads mail.
   { name: "rules_test", args: { rule: LEASE_RULE } },
+  // Phase 29.1.1: the backfill. Its first session, the folder listing for a
+  // fresh object, is refused by the lease.
+  { name: "mail_recall_backfill", args: {}, grantClient: ORDINARY_GRANT },
 ];
 
 /** Why a rules tool other than the test takes no lease. */
@@ -433,7 +448,7 @@ describe("every registered tool has a row (DOBJ-03)", () => {
 describe("with the lease held by another request (DOBJ-02, DOBJ-03)", () => {
   for (const row of LEASED) {
     it(`${row.name} answers connection_busy and opens no socket`, async () => {
-      const tools = realTools();
+      const tools = realTools(row.grantClient);
       const args = await argsOf(row.args);
       const held = heldByAnotherRequest();
       await seedLease(held);
@@ -543,6 +558,9 @@ describe("no registrar is handed the raw gate (structural half)", () => {
     expect(code).toContain("registerMailTools(server, leasedMail, principal);");
     expect(code).toContain("registerDiagnoseTool(server, leasedMail, unpaused);");
     expect(code).toContain("registerChangesTool(server, leasedMail, principal, davFetch);");
+    expect(code).toContain(
+      "registerRecallBackfillTool(server, leasedMail, principal, grantClient);",
+    );
   });
 });
 

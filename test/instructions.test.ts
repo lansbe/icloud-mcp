@@ -38,6 +38,7 @@ import type { JSONRPCMessage } from "@modelcontextprotocol/server";
 import { describe, expect, it } from "vitest";
 import { SERVER_INSTRUCTIONS } from "../src/mcp/instructions";
 import { createServerFactory } from "../src/mcp/server";
+import { RECALL_BACKFILL_MAX_PAGES } from "../src/recall/sync";
 import { ownerPrincipal } from "./fixtures/bound-secrets";
 
 // ---------------------------------------------------------------------------
@@ -99,6 +100,7 @@ const EXPECTED_TOOLS: readonly string[] = [
   "mail_mark_read",
   "mail_move",
   "mail_recall",
+  "mail_recall_backfill",
   "mail_stage_attachment",
   "mail_trash",
   "rules_add",
@@ -433,6 +435,14 @@ describe("the tool set is pinned against the instructions", () => {
  * account and not decided here.
  */
 const CAPABILITY_CLAIMS = [
+  // Phase 29.1.1. The backfill the person asks for. Words decided by Claude;
+  // the owner may revise them.
+  {
+    claim: "the recall backfill runs only when the person asks, and stops when the index is built",
+    clause:
+      "Call it only when the person asks you to build or fill their recall index, and only while they are here.",
+    tools: ["mail_recall_backfill"],
+  },
   // Phase 28. The one capability sentence about the rules tools. The
   // Boundaries line about the job is the owner's, in plan 28-07.
   {
@@ -771,10 +781,16 @@ describe("every capability claim is pinned to the tools it is about", () => {
   it("has a claim per row, each named once", () => {
     // The count lives in an assertion and nowhere in the prose above, for the
     // reason the boundary table's own docstring records.
-    expect(CAPABILITY_CLAIMS.length).toBe(33);
+    expect(CAPABILITY_CLAIMS.length).toBe(34);
     expect(new Set(CAPABILITY_CLAIMS.map((row) => row.claim)).size).toBe(
       CAPABILITY_CLAIMS.length,
     );
+  });
+
+  it("the backfill paragraph states the per-call page cap the engine enforces", () => {
+    const stated = SERVER_INSTRUCTIONS.match(/Each call reads up to (\d+) pages of recent/);
+    expect(stated, "the backfill paragraph no longer states its page count").not.toBeNull();
+    expect(Number(stated![1])).toBe(RECALL_BACKFILL_MAX_PAGES);
   });
 
   for (const { claim, clause } of CAPABILITY_CLAIMS) {
