@@ -487,6 +487,22 @@ describe("backfillResult: stages, estimates and sentences", () => {
     expect(answer.next).toContain(RECALL_MAX_VECTORS.toLocaleString("en-US"));
   });
 
+  // 29.1.1-REVIEW IN-02: the last page of the page limit finished the build.
+  it("stopped at its limit with the index built: says it is built, not to continue", () => {
+    const answer = parse(
+      backfillResult(
+        input({
+          state: { folders: [INBOX], listedAt: NOW - DAY_MS, sync: { [INBOX]: row("built") } },
+          outcome: { stopped: "budget", pages: RECALL_BACKFILL_MAX_PAGES, sessions: 10 },
+        }),
+      ) as ToolAnswer,
+    );
+    expect(answer.index).toBe("built");
+    expect(answer.next).toBe(
+      "The index is built. There is nothing more to do, and it stays current as the person uses mail.",
+    );
+  });
+
   it("the note says the numbers describe the build, and recall stays ranked and best-effort", () => {
     expect(BACKFILL_NOTE).toContain("how far the build has got");
     expect(BACKFILL_NOTE).toContain("ranked and best-effort");

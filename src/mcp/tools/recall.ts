@@ -509,12 +509,13 @@ export function backfillResult(input: BackfillAnswerInput): ToolResult {
   const { before, after, state, outcome, now, startedAt } = input;
   const folders = folderRows(state, after, now);
   const stopped = outcome.stopped === "unnamed" ? "failed" : outcome.stopped;
+  const index = indexWordOf(state);
   return {
     content: [
       {
         type: "text",
         text: JSON.stringify({
-          index: indexWordOf(state),
+          index,
           stopped: outcome.stopped,
           thisCall: {
             pages: outcome.pages,
@@ -523,7 +524,8 @@ export function backfillResult(input: BackfillAnswerInput): ToolResult {
           },
           folders,
           progress: folders.map(rowSentence).join(" "),
-          next: NEXT[stopped],
+          // A call whose last page finished the build is told so (IN-02).
+          next: stopped === "budget" && index === "built" ? NEXT.built : NEXT[stopped],
           note: BACKFILL_NOTE,
         }),
       },
