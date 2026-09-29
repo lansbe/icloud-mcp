@@ -854,3 +854,144 @@ export async function deleteStaged(
   if (!underStagingPrefix(userId, key)) return;
   await env.ATTACHMENT_STAGING.delete(key);
 }
+
+// ------------------------------------------------------------ saved copies
+//
+// Phase 29.1. A saved copy is an attachment copied into this bucket so the
+// person can download it once, through the save route, onto their own disk.
+// It lives beside the draft-staging objects, under the same prefix and the
+// same user segment, so the bucket's own sweep reaches it too.
+
+/**
+ * The stem every saved copy's name segment starts with.
+ *
+ * Private, and the name segment is nothing but this stem, random hex and a
+ * time: no filename is ever in a saved copy's key. The download route re-checks
+ * the stem through `openSaved`, so a link can only ever reach a saved copy,
+ * never a draft-staging object.
+ */
+const SAVE_STEM = "save";
+
+/** The name segment a saved copy is written under, and nothing else. */
+const SAVED_NAME = /^save-[0-9a-f]{16}-[0-9]{1,16}$/;
+
+/**
+ * Whether `name` is a saved copy's name segment: the part of the key after the
+ * user segment. The one rule for that shape, shared with the link seal in
+ * `../save/link.ts`, so the two cannot drift.
+ */
+export function isSavedName(name: unknown): boolean {
+  return typeof name === "string" && SAVED_NAME.test(name);
+}
+
+/** A saved copy, opened for streaming. */
+export interface SavedStream {
+  /** The stored bytes, as a stream. Read it once. */
+  body: ReadableStream<Uint8Array>;
+  /** The size R2 recorded for the object. */
+  sizeBytes: number;
+}
+
+/**
+ * Write one saved copy, and return its key, or `null`.
+ *
+ * `staging/<user id>/save-<16 random hex>-<nowMs>`. The same post-condition
+ * `stagingKeyFor` runs is asked of the finished key, through
+ * `underStagingPrefix`, so this cannot write a key the read side would refuse.
+ * Stored as `application/octet-stream`, with no custom metadata: the filename
+ * and the declared type are a stranger's, and neither is kept here.
+ *
+ * Like everything in this module, it runs outside the mail session.
+ */
+export async function putSaved(
+  env: Env,
+  userId: string,
+  bytes: Uint8Array,
+  nowMs: number,
+): Promise<string | null> {
+  if (!Number.isSafeInteger(nowMs) || nowMs <= 0) return null;
+
+  const random = new Uint8Array(KEY_RANDOM_BYTES);
+  crypto.getRandomValues(random);
+  const segment = [...random]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+
+  const key = `${STAGING_PREFIX}${userId}/${SAVE_STEM}-${segment}-${nowMs}`;
+  if (!underStagingPrefix(userId, key)) return null;
+  if (!isSavedName(key.slice(STAGING_PREFIX.length + userId.length + 1))) return null;
+
+  await env.ATTACHMENT_STAGING.put(key, bytes, {
+    httpMetadata: { contentType: DEFAULT_MEDIA_TYPE },
+  });
+  return key;
+}
+
+/**
+ * Open one saved copy for streaming, or `null` when there is nothing there.
+ *
+ * `null` unless the key sits beneath the passed-in user's own segment AND its
+ * name segment is a saved copy's. So a draft-staging object is never served,
+ * whatever a link says. A missing object is the same `null`, for `getStaged`'s
+ * reason: a distinguishable answer would be an existence oracle.
+ *
+ * The body is a stream and is never read here. The caller reads it once.
+ */
+export async function openSaved(
+  env: Env,
+  userId: string,
+  key: string,
+): Promise<SavedStream | null> {
+  if (!underStagingPrefix(userId, key)) return null;
+  if (!isSavedName(key.slice(STAGING_PREFIX.length + userId.length + 1))) return null;
+
+  const object = await env.ATTACHMENT_STAGING.get(key);
+  if (object === null) return null;
+  return { body: object.body, sizeBytes: object.size };
+}
+
+/**
+ * Delete this person's own saved copies whose links have died, in one batched
+ * delete.
+ *
+ * This is the "next save" half of the unused-copy deletion the owner approved
+ * on 2026-09-29. The bucket's one-day rule is the other half. A copy is
+ * normally deleted by its download; this reaches only the ones never
+ * downloaded.
+ *
+ * It can only ever reach the caller's own saved copies. It lists one page under
+ * the caller's own segment and the saved-copy stem, and keeps a key only if it
+ * passes `underStagingPrefix` for this user AND its name segment is a saved
+ * copy's. So a draft-staging object, an upload, or another person's copy is
+ * never deleted, whatever the list returns.
+ *
+ * The age is read from the time in the copy's own name: the moment it was
+ * saved, which is the moment its link's life counts from. A copy saved more
+ * than `olderThanMs` before `nowMs` is deleted.
+ *
+ * The caller swallows any failure. A failed sweep must never fail a save.
+ */
+export async function sweepExpiredSaves(
+  env: Env,
+  userId: string,
+  olderThanMs: number,
+  nowMs: number,
+): Promise<void> {
+  if (!USER_SEGMENT.test(userId)) return;
+  const cutoff = nowMs - olderThanMs;
+  const listed = await env.ATTACHMENT_STAGING.list({
+    prefix: `${STAGING_PREFIX}${userId}/${SAVE_STEM}-`,
+  });
+
+  const expired: string[] = [];
+  for (const object of listed.objects) {
+    const key = object.key;
+    if (!underStagingPrefix(userId, key)) continue;
+    const name = key.slice(STAGING_PREFIX.length + userId.length + 1);
+    if (!isSavedName(name)) continue;
+    const savedAt = Number(name.slice(name.lastIndexOf("-") + 1));
+    if (!Number.isSafeInteger(savedAt) || savedAt >= cutoff) continue;
+    expired.push(key);
+  }
+  if (expired.length > 0) await env.ATTACHMENT_STAGING.delete(expired);
+}

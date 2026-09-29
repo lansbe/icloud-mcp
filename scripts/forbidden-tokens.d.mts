@@ -162,6 +162,16 @@ export declare const RECALL_BACKFILL_KIND: RegExp;
 export declare const RECALL_BACKFILL_KIND_OWNER: string;
 export declare const RECALL_BACKFILL_KIND_EXEMPT: readonly string[];
 export declare const RECALL_BACKFILL_KIND_SCOPE: string;
+/** Phase 29.1 (SAVE-06): the one reader of the save link's spent-mark store
+ *  and seal key, per binding. */
+export declare const SAVE_LINK_BINDING_READS: Readonly<Record<string, RegExp>>;
+export declare const SAVE_LINK_BINDING_NAMES: readonly string[];
+export declare const SAVE_LINK_OWNER: string;
+export declare const SAVE_LINK_SCOPE: string;
+/** Phase 29.1 (SAVE-06): the one file that hands requests to the download route. */
+export declare const SAVE_ROUTE_CALL: RegExp;
+export declare const SAVE_ROUTE_OWNER: string;
+export declare const SAVE_ROUTE_SCOPE: string;
 /** Phase 27 (D-21 b): the one arm call, in the sign-in handler. */
 export declare const AUTONOMY_ARM_CALL: RegExp;
 export declare const AUTONOMY_ARM_OWNER: string;
@@ -289,6 +299,24 @@ export declare function checkRecallBackfillCallOwnership(
   calls: ReadonlyArray<OwnershipMatch>,
 ): Violation[];
 export declare function collectRecallBackfillCalls(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+/** A save link binding read: an ownership match that also names the binding. */
+export interface SaveLinkBindingRead extends OwnershipMatch {
+  readonly name?: string;
+}
+export declare function checkSaveLinkBindingOwnership(
+  readers: ReadonlyArray<SaveLinkBindingRead>,
+): Violation[];
+export declare function collectSaveLinkBindingReads(
+  relativePath: string,
+  contents: string,
+): Array<SaveLinkBindingRead & { readonly name: string }>;
+export declare function checkSaveRouteCallOwnership(
+  calls: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function collectSaveRouteCalls(
   relativePath: string,
   contents: string,
 ): OwnershipMatch[];

@@ -474,6 +474,8 @@ uses the autonomy key: it reads the grant id and the arming time, and asks the s
 job adds a clause to that predicate; a second condition or a second set is a decision, not a
 refactor. It never opens a socket and never imports mail code. Changing either of those is a
 decision, not a refactor.
+The download route that Phase 29.1 adds opens no socket, takes no lease and reads no sign-in. It only
+serves a copy a mail tool already made.
 
 A mail tool call can be followed by one recall build step, in the same request. The step
 runs only after the tool's own session has closed and its answer is built, and only when
@@ -631,6 +633,52 @@ written down here so nobody has to work it out again.
    that can arm it, minting one without an interactive sign-in, letting it outlive the person's
    ordinary connection, storing the token unsealed, handing the token or a bearer out of the object, and letting the key call any tool
    beyond the one check that it works. Phase 28 adds the rule set under its own decision.
+
+#### Saving an attachment hands out a link, and that is a decision
+
+Phase 29.1 adds a tool, `mail_save_attachment`. It lets a person save mail attachments to a folder on
+their own computer, from Claude Cowork. This server cannot write to anyone's disk. So it copies each
+attachment into storage, under that person's own prefix, and hands back a link. Cowork downloads the
+link with the shell of the session that has the person's folder connected. The owner decided this on
+2026-09-28.
+
+1. **Only the person, asking now.** The tool runs only through the signed-in door. The autonomous
+   layer cannot name it, and the scan refuses the name under `src/agent/`.
+2. **One link names one copy.** A link names one stored copy and nothing else. Five minutes after it
+   is made, it stops working. The download deletes the copy when it ends.
+3. **A link works once in practice, not once for certain.** The first download marks the link spent
+   before it sends a byte, and deletes the copy when it ends. A second download from the same place,
+   or after the first has finished, is refused. Anything that fetches the link first spends it, a
+   person's click included, and so does a download that breaks part-way. The answer then is a new
+   link. But the spent mark lives in a key-value store that takes time to reach every Cloudflare
+   location. So two downloads from two different places, at almost the same moment, can both get the
+   file. A strict version needed a new kind of Durable Object. The owner declined it on 2026-09-28, to
+   keep rollback open.
+4. **An unused copy outlives its link.** The link dies at five minutes. The copy is deleted the next
+   time that person saves anything, when anyone tries the dead link, or by the bucket's daily sweep,
+   which can take up to two days.
+5. **The link is a password for one file.** Anyone who has it before it is used, and before it
+   expires, gets the file. It sits in the conversation. The platform's request log keeps every URL for
+   seven days, so the link stays there, dead, for up to seven days. The URL shows no user id.
+6. **The link is sealed with a new Worker secret.** The link carries whose copy it is, its name, its
+   expiry and its size, sealed with `SAVE_LINK_SEAL_KEY`. Nobody can read them from the URL, or make a
+   link, without that secret. It is a new credential. It lives in Cloudflare Secrets, one module reads
+   it, and its name is in the logging scan.
+7. **The spent mark is keyed by the link, not the person.** The download has no signed-in person, so
+   the mark cannot be keyed by user id. It is keyed by a hash of the link, in a store of its own, and
+   it holds nothing about the person. The first download writes it. Making a link writes nothing, so a
+   new link never waits for the store. `store-key-without-a-user` cannot see that key. One module may
+   read the store, and the scan counts it.
+8. **The download touches no mail.** The copy is made by one read-only, peeking session, like every
+   other read. The download opens no mail connection, takes no lease and reads no sign-in. It serves
+   only a copy the tool made.
+9. **The file is a stranger's.** The answer says so, and says not to open it. The download is always
+   sent as a file to save, never as a page to show. macOS does not mark the saved file as downloaded,
+   so it gives no warning when the file is opened.
+10. **Widening it is a decision, not a refactor.** Each of these is one: a link that works twice; a
+    longer life; a link that names more than one copy; a second way to reach a stored copy; the
+    autonomous layer calling the tool; a user id in the URL; a link that is not sealed; saving anywhere
+    but the person's own disk.
 
 ### 5. Reading mail does not mark it read
 
@@ -905,6 +953,14 @@ helper that decrypts a token's props is banned by name under `src/`, comments
 included, so **describe it by role** ("the library's token-unwrapping helper")
 in any `src/` comment, exactly as §2 and the Phase 17 paragraph say for the
 other banned names. Both Worker configs must bind `SELF` to their own name.
+
+**Phase 29.1 added two counts and two rules for saving attachments, and widened two more.** The
+counts: one module may read the spent-mark store and the link seal key, and one file hands requests to
+the download route; zero is a violation for each. The rules: the route's module may not import mail,
+DAV, tool, agent, recall, sign-in, feed, principal, confirm or change-marker code, and no concurrent
+combinator is allowed under `src/save/`. The widenings: the fan-out rule names the save read and the
+save loop, and the logging rule that covers `src/`, `scripts/` and `test/` names the seal key.
+Describe these by role in source comments.
 
 Changing any of these six is a change to the project's safety boundary, not a
 refactor. If one of them is genuinely in the way, say so and get a decision —

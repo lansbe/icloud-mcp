@@ -26,3 +26,8 @@ CONFIRM_SECRET=
 # (Cloudflare dashboard → R2 → Manage API tokens). It yields these two halves.
 R2_ACCESS_KEY_ID=
 R2_SECRET_ACCESS_KEY=
+
+# The key that seals attachment save links (Phase 29.1). 32 random bytes,
+# base64url with no padding. In production it is set from standard input and
+# never printed. Leave it unset locally unless you are testing the save tool.
+# SAVE_LINK_SEAL_KEY=

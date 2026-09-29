@@ -1002,8 +1002,14 @@ export function transferDecode(window: Uint8Array, encoding: string): Uint8Array
   return window;
 }
 
-/** Decode a quoted-printable body fragment to bytes. */
-function decodeQuotedPrintable(text: string): Uint8Array {
+/**
+ * Decode a quoted-printable body fragment to bytes.
+ *
+ * Exported for the save path's window decoder (`./stream-decode.ts`), which
+ * feeds it one window at a time and carries an unfinished escape across the
+ * cut. Unchanged by the export.
+ */
+export function decodeQuotedPrintable(text: string): Uint8Array {
   const decoded: number[] = [];
   for (let index = 0; index < text.length; index += 1) {
     if (text[index] !== "=") {

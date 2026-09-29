@@ -10,6 +10,8 @@ import type { OAuthProviderOptions } from "@cloudflare/workers-oauth-provider";
 import type { Env } from "../env";
 import { DEPLOYED_HOSTNAME, mcpApiHandler } from "../mcp/api-handler";
 import { loginHandler, refuseUnlistedRedirects } from "./login-handler";
+import { SAVE_ROUTE_PATH } from "../save/link";
+import { handleSaveDownload } from "../save/route";
 
 export const oauthProviderOptions: OAuthProviderOptions<Env> = {
   apiRoute: "/mcp",
@@ -18,9 +20,22 @@ export const oauthProviderOptions: OAuthProviderOptions<Env> = {
   // assigning the handler directly would silently discard.
   apiHandler: mcpApiHandler,
 
-  // Everything that is not an API request, which for this server means the
-  // /authorize form and nothing else.
-  defaultHandler: loginHandler,
+  // Everything that is not an API request. Two things live here: the
+  // attachment download route (Phase 29.1) and the /authorize form.
+  //
+  // A path that starts with /save/ goes to the download route, and every other
+  // path goes to the login handler exactly as before. The check sits in front
+  // of the login handler and does not touch it: that handler's timing floor
+  // starts at its own first statement, and nothing here runs inside it. This is
+  // the only place in src/ that hands a request to the download route.
+  defaultHandler: {
+    fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+      if (new URL(request.url).pathname.startsWith(SAVE_ROUTE_PATH)) {
+        return handleSaveDownload(request, env, ctx);
+      }
+      return loginHandler.fetch(request, env, ctx);
+    },
+  },
 
   authorizeEndpoint: "/authorize",
   tokenEndpoint: "/oauth/token",

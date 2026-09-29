@@ -22,6 +22,7 @@ import { registerDiagnoseTool } from "./tools/diagnose";
 import { registerMailTools } from "./tools/mail";
 import { registerRecallBackfillTool, registerRecallTools } from "./tools/recall";
 import { registerRulesTools } from "./tools/rules";
+import { registerSaveTool } from "./tools/save";
 
 /**
  * Build the per-request server factory.
@@ -204,6 +205,15 @@ export function createServerFactory(
     // recall step after it would be a second iCloud session nobody asked for.
     // The leased mail, never the gate, so that one read takes the lease.
     registerRulesTools(server, leasedMail, principal);
+    // Saving attachments to the person's own disk (Phase 29.1). On the plain
+    // server, not the driven one, for two reasons. The answer carries links
+    // that work for five minutes, so it should come back fast, not after a
+    // recall step. And the save already runs one long session, reading whole
+    // attachments; a recall step after it would be a second iCloud session in
+    // the same request that nobody asked for. The leased mail, never the gate,
+    // so the read takes the person's lease like every mail tool. The grant
+    // client, so the autonomy key is refused here as the backfill refuses it.
+    registerSaveTool(server, leasedMail, principal, grantClient);
     for (const register of extraTools) register(server);
     return server;
   };

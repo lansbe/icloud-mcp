@@ -989,8 +989,11 @@ function partScopedItems(path: string | null): string {
  * that had to try both spellings is a lookup someone eventually writes one of.
  *
  * The origin itself is discarded rather than reported. Every window this client
- * asks for starts at octet zero, so the only value it can carry is one already
- * known at the call site.
+ * asked for used to start at octet zero. The save read (`readSaveParts`) now
+ * asks for windows that start further in, so a reply can carry a non-zero
+ * origin too. Stripping it is still right: each caller already knows the origin
+ * it asked for, sends one window per command, and checks the reply's length
+ * against the window it asked for.
  */
 const ORIGIN_MARKER = /<\d+>$/;
 
@@ -1959,8 +1962,10 @@ export async function getAttachmentContentOver(
  * part's encoded octet count; this one is the composition for a caller holding
  * only an id. Both route through the same private `readAttachmentPart`, so the
  * unconditional pre-check that refuses before a fetch line is written is
- * inherited rather than re-implemented — there is exactly one place in this
- * project that decides whether a part is too large to ask for.
+ * inherited rather than re-implemented — there is exactly one place for these
+ * two tools that decides whether a part is too large to ask for. The save read
+ * below has its own caps, on purpose, so raising its limit cannot raise these
+ * tools' (RESEARCH Pitfall 10).
  */
 export async function getAttachmentContent(
   principal: Principal,
@@ -1975,6 +1980,485 @@ export async function getAttachmentContent(
     ref.uidValidity,
     (session) => readAttachmentContent(session, ref),
     attachmentSessionOptions(options),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The save read: any attachment iCloud can hold, in windows (phase 29.1)
+// ---------------------------------------------------------------------------
+//
+// `mail_get_attachment` and `mail_stage_attachment` fetch a part as one
+// literal, capped at `MAX_ATTACHMENT_PART_OCTETS`. That path is proven live and
+// is left exactly as it was. Saving a file to the person's disk needs more:
+// iCloud holds attachments up to about 14.6 MB of file. So the save path reads a
+// part in fixed windows, each a peeking partial fetch, one command at a time,
+// inside one read-only session. Its caps are its own names, so raising one
+// cannot widen what can be attached to a draft.
+
+/**
+ * The size of one window, in encoded octets.
+ *
+ * **CALIBRATED, NOT MEASURED.** Half of `MAX_ATTACHMENT_PART_OCTETS`, the
+ * largest single literal already proven live, so each reply is well inside what
+ * this client has read before. Five windows cover the largest part. Fewer,
+ * larger windows would save round trips; smaller ones would spend more of the
+ * call deadline on them.
+ */
+export const SAVE_WINDOW_OCTETS = 4 * 1024 * 1024;
+
+/**
+ * The largest attachment part the save read will ask for, in encoded octets.
+ *
+ * **CALIBRATED, NOT MEASURED.** 20 MiB encoded is about 15 MB of file. That is
+ * above the most any iCloud message can carry, because iCloud refuses a message
+ * over 20 MB, and base64 leaves about 14.6 MB of that for one file. A part over
+ * this is refused with its size and this limit, before any window of it is
+ * fetched. It is never cut short: a cut file is a corrupt file.
+ */
+export const SAVE_MAX_PART_OCTETS = 20 * 1024 * 1024;
+
+/**
+ * The most encoded octets one save call will hold, across all its parts.
+ *
+ * **CALIBRATED, NOT MEASURED.** Equal to the per-part cap, so one number bounds
+ * the memory one call can use: about 20 MiB of windows plus about 15 MB
+ * decoded, one part at a time. Every attachment of one ordinary iCloud message
+ * fits. A part that would take the call over this, once at least one part was
+ * fetched, comes back deferred for a later call.
+ */
+export const SAVE_MAX_CALL_OCTETS = 20 * 1024 * 1024;
+
+/**
+ * The most attachments one save call will fetch.
+ *
+ * **CALIBRATED, NOT MEASURED.** Ten short-lived links is already more than a
+ * person acts on at once. The rest come back deferred, in the order asked.
+ */
+export const SAVE_MAX_PARTS = 10;
+
+/**
+ * How long into a save call a new part may still be started, in milliseconds.
+ *
+ * **CALIBRATED, NOT MEASURED.** Half of `CALL_DEADLINE_MS`. A part not started
+ * by then comes back deferred rather than risking the deadline part-way through
+ * it. The first part is always started, whatever the clock says, so a call can
+ * never make no progress at all.
+ */
+export const SAVE_START_BUDGET_MS = 10_000;
+
+/**
+ * How far into a save call a later part must be expected to finish, in
+ * milliseconds.
+ *
+ * **CALIBRATED, NOT MEASURED.** Four fifths of `CALL_DEADLINE_MS`. The start
+ * budget alone does not look at size, so a large part started just inside it
+ * could run past the deadline, and the deadline throws away the parts already
+ * read. So a later part is also deferred when, at the pace this call has read
+ * so far, it would finish after this. The rest of the deadline is margin for a
+ * pace that slows down.
+ */
+const SAVE_FINISH_BY_MS = CALL_DEADLINE_MS * 0.8;
+
+/**
+ * What a caller may vary about one save read.
+ *
+ * Every limit here can only be LOWERED. Each is clamped against its `SAVE_`
+ * constant with `Math.min`, the same instinct as `putStaged`'s clamp: a test
+ * can drive a small window, and nothing can drive a larger one.
+ */
+export interface SaveReadOptions extends MailSessionOptions {
+  /** Lowers `SAVE_WINDOW_OCTETS`. */
+  windowOctets?: number;
+  /** Lowers `SAVE_MAX_PART_OCTETS`. */
+  maxPartOctets?: number;
+  /** Lowers `SAVE_MAX_CALL_OCTETS`. */
+  maxCallOctets?: number;
+  /** Lowers `SAVE_MAX_PARTS`. */
+  maxParts?: number;
+  /** Lowers `SAVE_START_BUDGET_MS`. */
+  startBudgetMs?: number;
+  /** The clock the time budget reads. `Date.now` when absent. */
+  now?: () => number;
+}
+
+/**
+ * Why one part of a save read was not fetched.
+ *
+ * - `not-found`: the id's path is not an attachment row of this message now.
+ * - `empty`: the part declares zero encoded octets. There is no file to save.
+ * - `part-too-large`: over the per-part cap. Carries the size and the cap.
+ * - `part-changed`: a window came back shorter or longer than asked, or not at
+ *   all. The part is not what the structure said it was, so none of it is kept.
+ */
+export type SaveRefusal = "not-found" | "empty" | "part-too-large" | "part-changed";
+
+/**
+ * One part of a save read: fetched, refused, or deferred to a later call.
+ *
+ * Refusals and deferrals are fields on a successful result, never a fifth
+ * error category (D-35), as `AttachmentFetch`'s refusal is.
+ *
+ * The windows of a fetched part are STILL TRANSFER-ENCODED and kept as
+ * separate arrays. Decoding is the caller's, after the session has closed, for
+ * `getAttachmentBytes`'s reason; `decodeWindows` in `./stream-decode.ts` does
+ * it without joining them.
+ */
+export type SavePartRead =
+  | {
+      outcome: "fetched";
+      ref: AttachmentRef;
+      /** The sender's filename, or `null`. Sender-authored. */
+      filename: string | null;
+      /** The declared media type. Sender-authored. */
+      mimeType: string;
+      /** The structure's DECODED size estimate. Never the wire count. */
+      sizeBytes: number;
+      /** Lowercased `body-fld-enc`. The caller undoes this after the session. */
+      encoding: string;
+      /** `body-fld-octets`: the encoded count the caps decided on. */
+      encodedOctets: number;
+      /** The part's encoded octets, window by window, in order. */
+      windows: Uint8Array[];
+    }
+  | {
+      outcome: "refused";
+      ref: AttachmentRef;
+      refusal: SaveRefusal;
+      /** The encoded octet count, when the part was found. */
+      encodedOctets?: number;
+      /** The cap that refused it, for `part-too-large`. */
+      limitBytes?: number;
+      /** The sender's filename, when the part was found. Sender-authored. */
+      filename?: string | null;
+      /** The declared media type, when the part was found. Sender-authored. */
+      mimeType?: string;
+    }
+  | { outcome: "deferred"; ref: AttachmentRef };
+
+/** The save read's limits after clamping. */
+interface SaveLimits {
+  windowOctets: number;
+  maxPartOctets: number;
+  maxCallOctets: number;
+  maxParts: number;
+  startBudgetMs: number;
+  now: () => number;
+}
+
+/**
+ * A caller's value for one limit, never above `ceiling` and never below `floor`.
+ *
+ * A missing or non-finite value is the ceiling. The floor keeps a window from
+ * being zero octets, which would ask for the same window forever.
+ */
+function lowered(value: number | undefined, ceiling: number, floor: number): number {
+  if (value === undefined || !Number.isFinite(value)) return ceiling;
+  return Math.max(floor, Math.floor(Math.min(value, ceiling)));
+}
+
+/** Clamp every save limit against its constant. */
+function saveLimits(options: SaveReadOptions): SaveLimits {
+  return {
+    windowOctets: lowered(options.windowOctets, SAVE_WINDOW_OCTETS, 1),
+    maxPartOctets: lowered(options.maxPartOctets, SAVE_MAX_PART_OCTETS, 1),
+    maxCallOctets: lowered(options.maxCallOctets, SAVE_MAX_CALL_OCTETS, 1),
+    maxParts: lowered(options.maxParts, SAVE_MAX_PARTS, 1),
+    startBudgetMs: lowered(options.startBudgetMs, SAVE_START_BUDGET_MS, 0),
+    now: options.now ?? Date.now,
+  };
+}
+
+/**
+ * The session bounds a save read runs under.
+ *
+ * **The literal ceiling is one octet above the window.** The channel keeps at
+ * most its ceiling of any literal and quietly drops the rest. With the ceiling
+ * at the window size, a reply longer than asked would be cut to exactly the
+ * window and pass the length check. One octet more lets the check see it.
+ *
+ * **The call deadline is NOT raised, and a caller cannot raise it.** Twenty
+ * seconds of work, plus the 2 s drain and the 3 s close, is 25 s, inside the
+ * 30 s connection lease (`LEASE_TTL_MS`). A longer deadline would let the lease
+ * lapse while this socket is still open, so a second call could open a second
+ * connection to the same account. CLAUDE.md § 3 treats that as a decision, not
+ * a tuning. A large part that does not fit in the deadline is deferred by the
+ * time budget instead.
+ *
+ * The save-only fields are dropped here, so only session bounds reach the core.
+ */
+function saveSessionOptions(
+  options: SaveReadOptions,
+  limits: SaveLimits,
+): MailSessionOptions {
+  const {
+    windowOctets: _window,
+    maxPartOctets: _part,
+    maxCallOctets: _call,
+    maxParts: _parts,
+    startBudgetMs: _budget,
+    now: _now,
+    ...session
+  } = options;
+  return {
+    ...session,
+    maxLiteralOctets: limits.windowOctets + 1,
+    callDeadlineMs: Math.min(options.callDeadlineMs ?? CALL_DEADLINE_MS, CALL_DEADLINE_MS),
+  };
+}
+
+/**
+ * One window of one part, in the PEEKING form.
+ *
+ * `snippetItems` with a moving origin. The peeking spelling is a literal inside
+ * this function, so nothing about the item's shape is caller-supplied, and
+ * CLAUDE.md § 5 holds here as it does for every read: the mailbox is open
+ * read-only and the item itself peeks.
+ *
+ * The path comes from a decoded attachment id, whose codec allows only anchored
+ * digits and dots. The origin and the octet count are numbers this module
+ * computed. So nothing a caller passes reaches the wire as anything but a
+ * window.
+ */
+function saveWindowItems(path: string, origin: number, octets: number): string {
+  return `(BODY.PEEK[${path}]<${origin}.${octets}>)`;
+}
+
+/**
+ * Fetch one part's windows, in order, one command at a time.
+ *
+ * Each reply must be exactly the octets asked for. Anything else means the part
+ * is not what the structure said, and the part is refused as changed: no
+ * further window is sent for it and none of its windows are kept.
+ *
+ * A server refusal of the command is `ImapNotFoundError`, as it is for
+ * `readAttachmentPart`.
+ */
+async function readSaveWindows(
+  session: MailSession,
+  ref: AttachmentRef,
+  encodedOctets: number,
+  windowOctets: number,
+): Promise<Uint8Array[] | null> {
+  const windows: Uint8Array[] = [];
+  for (let origin = 0; origin < encodedOctets; origin += windowOctets) {
+    const octets = Math.min(windowOctets, encodedOctets - origin);
+    const result = await sendCommand(
+      session.channel,
+      session.channel.nextTag(),
+      `UID FETCH ${ref.uid} ${saveWindowItems(ref.path, origin, octets)}`,
+    );
+    if (result.status !== "OK") throw new ImapNotFoundError();
+
+    // The reply key carries the origin; `fetchItems` has already stripped it.
+    const content = firstFetchItems(result.untagged)?.get(`BODY[${ref.path}]`);
+    if (!(content instanceof Uint8Array) || content.length !== octets) return null;
+    windows.push(content);
+  }
+  return windows;
+}
+
+/**
+ * Read the structure once, then each requested part in windows.
+ *
+ * A plain `for` loop over the refs, one part after another and one window at a
+ * time. Per ref, in this order:
+ *
+ * 1. the count: past `maxParts`, deferred;
+ * 2. the time budget, never for the first ref: past it, deferred;
+ * 3. the row lookup: the path must be an ATTACHMENT ROW, as in
+ *    `readAttachmentContent`, so an id cannot address the body or a part
+ *    inside a forwarded message; not a row, refused `not-found`;
+ * 4. the empty check: zero encoded octets, refused `empty`;
+ * 5. the per-part cap: refused `part-too-large`, with the size and the cap;
+ * 6. the per-call total: over it, once a part was fetched, deferred;
+ * 7. the finish estimate, once a part was fetched: at the pace read so far,
+ *    this part would end after `SAVE_FINISH_BY_MS`, deferred.
+ *
+ * Once one ref is deferred, every ref after it is deferred too, so the rest
+ * come back in order and a later call can take them as they stand.
+ *
+ * The per-part cap is never above the per-call cap, so the first part fetched
+ * always fits in the call.
+ */
+async function readSaveParts(
+  session: MailSession,
+  refs: readonly AttachmentRef[],
+  limits: SaveLimits,
+): Promise<SavePartRead[]> {
+  const started = limits.now();
+  const first = refs[0] as AttachmentRef;
+  const structure = await readStructure(session, first);
+  const partLimit = Math.min(limits.maxPartOctets, limits.maxCallOctets);
+
+  const reads: SavePartRead[] = [];
+  let deferring = false;
+  let fetchedParts = 0;
+  let heldOctets = 0;
+
+  for (let index = 0; index < refs.length; index += 1) {
+    const ref = refs[index] as AttachmentRef;
+
+    if (!deferring && index >= limits.maxParts) deferring = true;
+    if (!deferring && index > 0 && limits.now() - started > limits.startBudgetMs) {
+      deferring = true;
+    }
+    if (deferring) {
+      reads.push({ outcome: "deferred", ref });
+      continue;
+    }
+
+    const row = structure.attachments.find((one) => one.path === ref.path);
+    const part =
+      row === undefined
+        ? undefined
+        : structure.parts.find((one) => one.path === ref.path);
+    if (row === undefined || part === undefined) {
+      reads.push({ outcome: "refused", ref, refusal: "not-found" });
+      continue;
+    }
+
+    const known = {
+      encodedOctets: part.encodedOctets,
+      filename: row.filename,
+      mimeType: row.mimeType,
+    };
+
+    if (part.encodedOctets <= 0) {
+      reads.push({ outcome: "refused", ref, refusal: "empty", ...known });
+      continue;
+    }
+    if (part.encodedOctets > partLimit) {
+      reads.push({
+        outcome: "refused",
+        ref,
+        refusal: "part-too-large",
+        ...known,
+        limitBytes: partLimit,
+      });
+      continue;
+    }
+    if (fetchedParts > 0 && heldOctets + part.encodedOctets > limits.maxCallOctets) {
+      deferring = true;
+      reads.push({ outcome: "deferred", ref });
+      continue;
+    }
+    // The pace so far is heldOctets over the time spent, so this part is
+    // expected to end at elapsed x (held + this part) / held.
+    if (fetchedParts > 0) {
+      const elapsed = limits.now() - started;
+      const expectedEnd = (elapsed * (heldOctets + part.encodedOctets)) / heldOctets;
+      if (expectedEnd > SAVE_FINISH_BY_MS) {
+        deferring = true;
+        reads.push({ outcome: "deferred", ref });
+        continue;
+      }
+    }
+
+    const windows = await readSaveWindows(
+      session,
+      ref,
+      part.encodedOctets,
+      limits.windowOctets,
+    );
+    if (windows === null) {
+      reads.push({ outcome: "refused", ref, refusal: "part-changed", ...known });
+      continue;
+    }
+
+    fetchedParts += 1;
+    heldOctets += part.encodedOctets;
+    reads.push({
+      outcome: "fetched",
+      ref,
+      filename: row.filename,
+      mimeType: row.mimeType,
+      sizeBytes: row.sizeBytes,
+      encoding: part.encoding,
+      encodedOctets: part.encodedOctets,
+      windows,
+    });
+  }
+
+  return reads;
+}
+
+/**
+ * The refs of one save call, checked before any gate or socket.
+ *
+ * Non-empty, and every ref names the same message: the same mailbox, validity
+ * and UID. One session opens one mailbox and reads one structure, so refs from
+ * two messages cannot be answered by it, and are refused rather than half
+ * answered. The refusal is `ImapNotFoundError`, one of the four categories.
+ */
+function checkedSaveRefs(refs: readonly AttachmentRef[]): AttachmentRef {
+  const first = refs[0];
+  if (first === undefined) throw new ImapNotFoundError();
+  for (const ref of refs) {
+    if (
+      ref.mailbox !== first.mailbox ||
+      ref.uidValidity !== first.uidValidity ||
+      ref.uid !== first.uid
+    ) {
+      throw new ImapNotFoundError();
+    }
+  }
+  return first;
+}
+
+/** The save read over an already-open stream pair. */
+export async function getAttachmentsForSaveOver(
+  duplex: DuplexLike,
+  principal: Principal,
+  gate: SessionGate,
+  refs: readonly AttachmentRef[],
+  options: SaveReadOptions = {},
+): Promise<SavePartRead[]> {
+  const first = checkedSaveRefs(refs);
+  const limits = saveLimits(options);
+  return withMailSessionOver(
+    duplex,
+    principal,
+    gate,
+    first.mailbox,
+    first.uidValidity,
+    (session) => readSaveParts(session, refs, limits),
+    saveSessionOptions(options, limits),
+  );
+}
+
+/**
+ * Fetch up to ten attachments of one message from iCloud, in windows, on ONE
+ * read-only session.
+ *
+ * The pair shape every entry point in this file follows, through the one read
+ * orchestrator: the mailbox opens read-only and every window peeks. There is no
+ * second orchestrator and no mode argument.
+ *
+ * The refs are checked first, synchronously, before the gate check and before
+ * any socket, so refs naming two messages open nothing. Nothing awaits between
+ * the gate check inside `withMailSession` and the acquire in the core.
+ *
+ * **The windows come back still transfer-encoded.** Decoding a 15 MB file is
+ * real CPU, and `CALL_DEADLINE_MS` races the session's work, so a decode inside
+ * would hold the socket open for arithmetic. The caller decodes after this
+ * returns, with `decodeWindows`, and nothing is written to storage while the
+ * session is open.
+ */
+export async function getAttachmentsForSave(
+  principal: Principal,
+  gate: SessionGate,
+  refs: readonly AttachmentRef[],
+  options: SaveReadOptions = {},
+): Promise<SavePartRead[]> {
+  const first = checkedSaveRefs(refs);
+  const limits = saveLimits(options);
+  return withMailSession(
+    principal,
+    gate,
+    first.mailbox,
+    first.uidValidity,
+    (session) => readSaveParts(session, refs, limits),
+    saveSessionOptions(options, limits),
   );
 }
 

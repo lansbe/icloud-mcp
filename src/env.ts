@@ -484,6 +484,53 @@ declare global {
        */
       AUTONOMY_SEAL_KEY: string | undefined;
 
+      /**
+       * The spent marks for attachment save links (Phase 29.1, 29.1-WORDING.md
+       * decision 1).
+       *
+       * Holds only spent marks: one per link that has been downloaded, keyed by
+       * the SHA-256 of the link's token, gone after ten minutes. Nothing is
+       * written when a link is made, so a new link never waits for this store
+       * to reach another Cloudflare location. A miss means "not spent".
+       *
+       * Read and written only by `src/save/link.ts`. Typed `KVNamespace`, not
+       * widened, for the reason spelled out on `DAV_CACHE` above.
+       */
+      SAVE_LINK_KV: KVNamespace;
+
+      /**
+       * The key that seals every attachment save link (Phase 29.1, 29.1-WORDING.md
+       * decision 1a). Workers Secret: 32 random bytes, base64url with no padding.
+       *
+       * A link carries whose copy it is, the copy's name, its expiry and its
+       * size, sealed with AES-GCM under this key. Nobody can read those from the
+       * URL, or make a link, without it.
+       *
+       * Source: set with `wrangler secret put` on standard input, generated from
+       * a random source and never printed. Admits `undefined` for the reason
+       * every Workers Secret does; `saveLinksConfigured` in `src/save/link.ts`
+       * narrows it and also checks the length. Read only by `src/save/link.ts`,
+       * which imports it as a non-extractable key and returns nothing that
+       * carries it (./.claude/CLAUDE.md §4).
+       */
+      SAVE_LINK_SEAL_KEY: string | undefined;
+
+      /**
+       * The download route's brake, keyed by the connecting address (Phase 29.1,
+       * 29.1-WORDING.md decision 3).
+       *
+       * Thirty requests a minute from one address. Consulted by
+       * `src/save/route.ts` after the method and shape checks and before the
+       * link is opened, so a refused request reads nothing and never spends a
+       * link. A request with no address header is counted under one fixed key,
+       * never let through unbraked.
+       *
+       * The limit and the window live on the binding in wrangler.jsonc. Pass a
+       * key and nothing else, for the reason given on `LOGIN_IP_LIMITER`.
+       * Typed `RateLimit` for the reason given there too.
+       */
+      SAVE_IP_LIMITER: RateLimit;
+
       // The single write-only Secret that used to hold the whole allow list is
       // GONE from this type, along with its two readers, in one commit — a
       // half-removed binding is a name the compiler still accepts and nobody

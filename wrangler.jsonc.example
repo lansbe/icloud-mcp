@@ -221,11 +221,32 @@
   // point of the change:
   //   wrangler kv key put   --namespace-id=<id> --remote "allow-list:v1" '["someone@example.com"]'
   //   wrangler kv key get   --namespace-id=<id> --remote "allow-list:v1"
+  //
+  // SAVE_LINK_KV is a FIFTH namespace (Phase 29.1, 29.1-WORDING.md decision 1).
+  // It holds ONLY SPENT MARKS: one per attachment save link that has been
+  // downloaded, keyed by the SHA-256 of the link's token, each gone after ten
+  // minutes. It holds nothing about the person. NOTHING IS WRITTEN WHEN A LINK
+  // IS MADE -- the link is sealed and carries its own expiry -- so a new link
+  // never waits for this store to reach another Cloudflare location, and a miss
+  // means "not spent". The first download writes the mark before it sends a
+  // byte. One module, src/save/link.ts, reads and writes it.
+  //
+  // Its TITLE is `icloud-mcp-SAVE_LINK` and carries the project prefix for the
+  // reason every title above does. THE NAMESPACE IS ACCOUNT STATE AND IS NOT IN
+  // GIT, like the four above: `wrangler kv namespace create` made it on
+  // 2026-09-28 and printed the id below. `wrangler kv namespace list` naming
+  // the id is the only check.
+  //
+  // `store-key-without-a-user` in scripts/forbidden-tokens.mjs cannot see this
+  // namespace's key, and that is by design (decision 1): the download has no
+  // signed-in person, so the mark cannot be keyed by a user id. It is keyed by
+  // a hash of the link instead, and the link is sealed to one person's copy.
   "kv_namespaces": [
     { "binding": "OAUTH_KV", "id": "YOUR_OAUTH_KV_NAMESPACE_ID" },
     { "binding": "DAV_CACHE", "id": "YOUR_DAV_CACHE_NAMESPACE_ID" },
     { "binding": "CONFIRM_KV", "id": "YOUR_CONFIRM_KV_NAMESPACE_ID" },
-    { "binding": "ALLOW_LIST_KV", "id": "YOUR_ALLOW_LIST_NAMESPACE_ID" }
+    { "binding": "ALLOW_LIST_KV", "id": "YOUR_ALLOW_LIST_NAMESPACE_ID" },
+    { "binding": "SAVE_LINK_KV", "id": "YOUR_SAVE_LINK_NAMESPACE_ID" }
   ],
 
   // Attachment staging (D-83, ATT-03). A bucket of its own rather than a prefix
@@ -340,6 +361,18 @@
   // There is no provisioning step and no id to look up: the ids below are
   // chosen, not discovered, which is exactly why the collision argument above
   // is the only thing standing between us and a sibling's counters.
+  //
+  // SAVE_IP_LIMITER (Phase 29.1) is a third binding, for the attachment
+  // download route, GET /save/<link>. That route needs no sign-in, so anyone
+  // can probe it with made-up links. It brakes that: thirty requests a minute
+  // from one connecting address, refused with an empty 429. It is keyed by
+  // address because the download has no signed-in person to key it by, and
+  // it is consulted after the method and shape checks and before the link is
+  // opened, so a refused request never spends a link. Namespace 2003 is in the
+  // same 2000 block, chosen and not created, and like 2001 and 2002 it is a
+  // claim about the account that this repository cannot check. A shared
+  // counter would show up as 429s on downloads with no traffic of ours to
+  // explain them.
   "ratelimits": [
     {
       "name": "LOGIN_IP_LIMITER",
@@ -350,6 +383,11 @@
       "name": "LOGIN_ID_LIMITER",
       "namespace_id": "2002",
       "simple": { "limit": 3, "period": 60 }
+    },
+    {
+      "name": "SAVE_IP_LIMITER",
+      "namespace_id": "2003",
+      "simple": { "limit": 30, "period": 60 }
     }
   ],
 

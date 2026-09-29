@@ -30,6 +30,7 @@ import {
 } from "../src/auth/login-handler";
 import type { Env } from "../src/env";
 import { DEPLOYED_HOSTNAME } from "../src/mcp/api-handler";
+import { entryEnv } from "./fixtures/bound-secrets";
 
 const ORIGIN = `https://${DEPLOYED_HOSTNAME}`;
 
@@ -130,5 +131,31 @@ describe("/authorize is unaffected", () => {
 
     expect(response.status).toBe(503);
     expect(await response.text()).toBe(UNCONFIGURED_BODY);
+  });
+});
+
+describe("the download route takes /save/ and nothing else (Phase 29.1)", () => {
+  // Through the real Worker entry, because the split between the two handlers
+  // lives in the dispatch in front of the login handler, not in either of them.
+  function viaEntry(path: string): Promise<Response> {
+    return entryEnv().SELF.fetch(`${ORIGIN}${path}`, {
+      headers: { "cf-connecting-ip": "2001:db8:29:1::6" },
+    });
+  }
+
+  it("answers /save/<anything> with the route's empty 410, not the unknown-path body", async () => {
+    const response = await viaEntry("/save/x");
+
+    expect(response.status).toBe(410);
+    expect(await response.text()).toBe("");
+  });
+
+  it("still answers /, /savex and /save with the login handler's unknown-path body", async () => {
+    for (const path of ["/", "/savex", "/save"]) {
+      const response = await viaEntry(path);
+
+      expect(response.status).toBe(404);
+      expect(await response.text()).toBe(notFoundBody(ORIGIN));
+    }
   });
 });
