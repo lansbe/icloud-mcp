@@ -940,7 +940,23 @@ async function syncDeletions(
 // The backfill (Phase 29.1.1)
 // ---------------------------------------------------------------------------
 
-/** The most pages one backfill call indexes (LD-4): about 250 messages. */
+/**
+ * The most pages one backfill call indexes (LD-4): about 250 messages.
+ *
+ * Why 10:
+ * - the owner asked for "up to about 10" pages a call;
+ * - one call stays far under the platform's per-invocation limits. Measured in
+ *   the pool on 2026-09-28 (test/recall-backfill-wire.test.ts), one 10-page call
+ *   costs 10 sockets, 64 object calls, 10 model calls, 10 store calls and 1
+ *   grant read: 95 in all, against a bound of 200, and against 1,000 internal
+ *   calls and 10,000 subrequests on the paid plan;
+ * - sessions are serial, one socket open at a time, so the six-connection
+ *   budget is never approached;
+ * - RECALL_BACKFILL_BUDGET_MS bounds wall-clock time whatever a real page
+ *   costs.
+ * CPU time and real per-page seconds cannot be measured in the pool. The
+ * owner's first live run records both (plan 29.1.1-04).
+ */
 export const RECALL_BACKFILL_MAX_PAGES = 10;
 
 /** The most time one backfill call spends starting new work, in ms (LD-7). */
