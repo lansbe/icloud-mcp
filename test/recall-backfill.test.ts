@@ -631,6 +631,19 @@ describe("recallBackfill fills a person's index across calls, one session at a t
     },
   );
 
+  // 29.1.1-REVIEW WR-05: the drop of a gone folder is paced, and a backfill
+  // page in the last minute pauses it. That is a wait, not another request.
+  it("a folder found gone after a backfill page: waiting, not busy", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders(30, 10);
+    h.setGone(ARCHIVE, true);
+
+    const { outcome, log } = await backfill(a, h);
+
+    expect(log).toContain(`snapshot:${ARCHIVE}:start`);
+    expect(outcome).toEqual({ stopped: "waiting", pages: 2, sessions: 5 });
+  });
+
   it("every folder built: stops as built, opens nothing and changes nothing", async () => {
     const a = await testPrincipal(USER_A);
     const h = twoFolders(30, 10);

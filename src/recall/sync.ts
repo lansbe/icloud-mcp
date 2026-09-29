@@ -1008,7 +1008,8 @@ export const RECALL_SESSION_MAX_MS = CALL_DEADLINE_MS + DRAIN_TIMEOUT_MS + CLOSE
  *
  * `built`: every listed folder is built or parked. `budget`: it reached its
  * page, session or time limit, and the next call goes on. `waiting`: the only
- * folders left are waiting out a failure. `lease_busy`: another request holds
+ * folders left are waiting out a failure, or the removal of a gone folder must
+ * wait out the page pause. `lease_busy`: another request holds
  * the person's connection. `failed`: an attempt failed, and the failure is
  * recorded where a step records it. Or one of the object's refusals.
  */
@@ -1053,10 +1054,11 @@ function backfillStopOf(outcome: StepOutcome): BackfillStop {
     case "destroying":
     case "unnamed":
       return outcome;
-    // A backfill page is never paused. Should the object say so anyway, stop
-    // as busy rather than try again.
+    // A backfill page is never paused, but the removal that drops a gone
+    // folder is, for a minute after any page. That is a wait, not another
+    // request (29.1.1-REVIEW WR-05): stop as waiting rather than try again.
     case "paused":
-      return "busy";
+      return "waiting";
     default:
       // Nothing else stops a backfill here; stop rather than loop.
       return "failed";
