@@ -2241,9 +2241,11 @@ async function handleAuthorize(
       },
     });
 
-    // The arm runs AFTER the answer is built, through the request's
-    // `waitUntil`, so it can neither slow nor fail the person's sign-in. It
-    // never rejects.
+    // The mint above is awaited before this answer is built. It is one props
+    // encryption and one store write, so it adds a little time to the sign-in,
+    // and its `catch` means it cannot fail it. Only the arm runs after the
+    // answer, through the request's `waitUntil`, so the arm can neither slow
+    // nor fail the person's sign-in. It never rejects.
     if (autonomyCode !== null && ctx !== undefined) {
       ctx.waitUntil(armAfterAnswer(env, principal, userId, autonomyCode));
     }
