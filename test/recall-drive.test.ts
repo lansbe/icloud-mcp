@@ -393,6 +393,12 @@ const NOT_DRIVEN: ReadonlyArray<{ name: string; reason: string }> = [
     name: "rules_test",
     reason: "tries a rule on 25 inbox headers and writes nothing; a recall step would add a second session",
   },
+  // Phase 29.1.1: the backfill the person asks for, on the plain server.
+  {
+    name: "mail_recall_backfill",
+    reason:
+      "it is the build itself; a recall step after it would be a second build pass in the same request",
+  },
 ];
 
 function isDriven(callback: Callback): boolean {
@@ -473,5 +479,15 @@ describe("src/mcp/server.ts hands the driven server to the mail registrars only"
       expect(block, call).not.toContain(call);
     }
     expect(code).not.toMatch(/register\w*\(\s*driven\s*,/);
+  });
+
+  it("the backfill is registered exactly once, on the plain server, outside the driven block", () => {
+    const call = "registerRecallBackfillTool(server, leasedMail, principal, grantClient);";
+    const block = drivenBlock();
+    expect(code.split(call).length - 1).toBe(1);
+    expect((code.match(/registerRecallBackfillTool\(/g) ?? []).length).toBe(1);
+    expect(block).not.toContain("registerRecallBackfillTool(");
+    // After the driven server is handed in, so it cannot be inside that call.
+    expect(code.indexOf(call)).toBeGreaterThan(code.indexOf("registerMailRegistrars(driven);"));
   });
 });

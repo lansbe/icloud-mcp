@@ -209,6 +209,7 @@ describe("the object's sync-state read (D-29)", () => {
     const state = await objectFor(USER_A.userId).recallSyncState();
     expect(state).toEqual({
       slot: "free",
+      backfill: "free",
       full: false,
       folders: null,
       listedAt: null,

@@ -69,12 +69,33 @@
 // per five minutes. The folder listing runs at most once a day, plus once
 // after a folder is dropped as gone (26-REVIEW-2 WR-02). The numbers and their
 // assumptions are in 26-CONTEXT D-31 and 25-CONTEXT D-24.
+//
+// THE BACKFILL THE PERSON ASKS FOR (Phase 29.1.1). `runRecallBackfill` runs one
+// call of `recallBackfill` in ./sync.ts. It runs only from the backfill tool the
+// person calls, while they watch, never from the seam above that drives steps
+// and never from the object's alarm. It makes the same grant check a step makes:
+// nothing runs, and nothing is called, unless the grant belongs to a client
+// other than the autonomy client. One call indexes at most
+// RECALL_BACKFILL_MAX_PAGES pages, one leased session at a time. Its pages skip
+// the one-minute pause and the ordinary day count, and count on their own:
+// at most RECALL_BACKFILL_MAX_PAGES_PER_DAY (400) pages a day, which is at most
+// RECALL_MAX_VECTORS (10,000) messages. That is about $0.12 once to embed, the
+// same as filling the ceiling (26-CONTEXT D-31, 25-CONTEXT D-24), and it is also
+// the most a runaway backfill can cost a person in a day. The 10,000-vector
+// ceiling, the 90-day window, read-only opens and peeking fetches are the same
+// as for a step.
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { AUTONOMY_CLIENT_ID } from "../agent/autonomy-client";
 import type { LeasedMail } from "../agent/lease";
 import type { Principal } from "../principal";
-import { productionStepDeps, recallStep } from "./sync";
+import {
+  type BackfillOutcome,
+  productionStepDeps,
+  recallBackfill,
+  recallStep,
+  type StepDeps,
+} from "./sync";
 
 /**
  * The mark every driven callback carries, as a non-enumerable property.
@@ -113,6 +134,39 @@ export async function runRecallStep(
     // Silent on purpose. A step that fails only delays the build, and the next
     // mail call tries again. The caught value is not read.
   }
+}
+
+/** What a backfill run came to: refused by the grant check, or ran. */
+export type BackfillRun = { kind: "refused" } | { kind: "ran"; outcome: BackfillOutcome };
+
+/**
+ * Run one recall backfill call for the person behind `principal` (Phase
+ * 29.1.1, LD-2, LD-8).
+ *
+ * The principal is already resolved: the tool has awaited it. Runs nothing, and
+ * calls nothing, unless the grant client is a non-empty string other than the
+ * autonomy client: the same test `runRecallStep` makes (D-35). This is the one
+ * call of the backfill under `src/`.
+ *
+ * `beforeRun`, when given, is awaited after the grant check passes and before
+ * the backfill starts. The tool reads the person's progress there, so a refused
+ * grant makes no object call at all (Phase 29.1.1, LD-9).
+ *
+ * It does not swallow a thrown value. A throw here means the object could not
+ * be reached, and the tool turns that into its fixed answer. Nothing here logs.
+ */
+export async function runRecallBackfill(
+  principal: Principal,
+  mail: LeasedMail,
+  grantClient: GrantClient,
+  depsFor: (mail: LeasedMail) => StepDeps = productionStepDeps,
+  beforeRun?: () => Promise<void>,
+): Promise<BackfillRun> {
+  const client = await grantClient();
+  if (typeof client !== "string" || client.length === 0) return { kind: "refused" };
+  if (client === AUTONOMY_CLIENT_ID) return { kind: "refused" };
+  if (beforeRun !== undefined) await beforeRun();
+  return { kind: "ran", outcome: await recallBackfill(principal, depsFor(mail)) };
 }
 
 /** True when a tool's answer says it is an error. */

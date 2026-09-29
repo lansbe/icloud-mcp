@@ -152,6 +152,16 @@ export declare const MODEL_ID_SCOPE: string;
 export declare const RECALL_STEP_CALL: RegExp;
 export declare const RECALL_STEP_OWNER: string;
 export declare const RECALL_STEP_SCOPE: string;
+/** Phase 29.1.1 (LD-11): the one call of the backfill engine, in the runner. */
+export declare const RECALL_BACKFILL_CALL: RegExp;
+export declare const RECALL_BACKFILL_OWNER: string;
+export declare const RECALL_BACKFILL_SCOPE: string;
+/** Phase 29.1.1 (LD-5): the one place outside the object that asks for the
+ *  pace-exempt page kind. */
+export declare const RECALL_BACKFILL_KIND: RegExp;
+export declare const RECALL_BACKFILL_KIND_OWNER: string;
+export declare const RECALL_BACKFILL_KIND_EXEMPT: readonly string[];
+export declare const RECALL_BACKFILL_KIND_SCOPE: string;
 /** Phase 27 (D-21 b): the one arm call, in the sign-in handler. */
 export declare const AUTONOMY_ARM_CALL: RegExp;
 export declare const AUTONOMY_ARM_OWNER: string;
@@ -272,6 +282,20 @@ export declare function checkRecallStepCallOwnership(
   calls: ReadonlyArray<OwnershipMatch>,
 ): Violation[];
 export declare function collectRecallStepCalls(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+export declare function checkRecallBackfillCallOwnership(
+  calls: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function collectRecallBackfillCalls(
+  relativePath: string,
+  contents: string,
+): OwnershipMatch[];
+export declare function checkRecallBackfillKindOwnership(
+  sites: ReadonlyArray<OwnershipMatch>,
+): Violation[];
+export declare function collectRecallBackfillKinds(
   relativePath: string,
   contents: string,
 ): OwnershipMatch[];

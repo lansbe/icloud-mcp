@@ -70,6 +70,16 @@ import {
   RECALL_STEP_SCOPE,
   collectRecallStepCalls,
   checkRecallStepCallOwnership,
+  RECALL_BACKFILL_CALL,
+  RECALL_BACKFILL_OWNER,
+  RECALL_BACKFILL_SCOPE,
+  collectRecallBackfillCalls,
+  checkRecallBackfillCallOwnership,
+  RECALL_BACKFILL_KIND,
+  RECALL_BACKFILL_KIND_OWNER,
+  RECALL_BACKFILL_KIND_EXEMPT,
+  collectRecallBackfillKinds,
+  checkRecallBackfillKindOwnership,
   AUTONOMY_ARM_CALL,
   AUTONOMY_ARM_OWNER,
   AUTONOMY_ARM_SCOPE,
@@ -5629,6 +5639,11 @@ describe("the per-person object rules (Phase 24, D-10 b to e)", () => {
 const violatingSamples_concurrentSession =
   "await Promise.all(refs.map((ref) => withMailSession(env, gate, ref.mailbox, ref.uidValidity, one)));";
 
+/** The pace-exempt page kind's word (Phase 29.1.1, LD-5). Named once, so every
+ *  sample below that asks for that kind of page is built from it rather than
+ *  spelled out. */
+const PACE_EXEMPT_KIND = "backfill";
+
 describe("the count constraints as a set", () => {
   /** A barrel's named re-export of the mutating orchestrator (WR-05). */
   const BARREL_REEXPORT = 'export { withMutatingMailbox } from "./service";\n';
@@ -5666,6 +5681,17 @@ describe("the count constraints as a set", () => {
   const ALARM_STEP_CALL = "    await recallStep(principal, deps);\n";
   const COMMENTED_STEP_CALL = "    // await recallStep(actor, productionStepDeps(mail));\n";
   const OBJECT_MODULE = "src/agent/user-agent.ts";
+  /** Phase 29.1.1: the backfill engine called from the object's alarm, and a
+   *  runner whose only call is inside a comment. */
+  const ALARM_BACKFILL_CALL = "    await recallBackfill(principal, deps);\n";
+  const COMMENTED_BACKFILL_CALL =
+    '  // return { kind: "ran", outcome: await recallBackfill(principal, depsFor(mail)) };\n';
+  /** Phase 29.1.1: the pace-exempt page kind asked for in the build module and
+   *  in the sync module, and a sync module whose only one is inside a comment. */
+  const BUILD_KIND_ASK = `    await indexNextPage(principal, deps, mailbox, "${PACE_EXEMPT_KIND}");\n`;
+  const SYNC_KIND_ASK = `      advanceUnbuilt(principal, folders, next, row, counted, "${PACE_EXEMPT_KIND}"),\n`;
+  const COMMENTED_KIND_ASK = `      // advanceUnbuilt(principal, folders, next, row, counted, "${PACE_EXEMPT_KIND}"),\n`;
+  const BUILD_MODULE = "src/recall/build.ts";
   /** Phase 27: the sign-in's one arm call, a second one in the tool layer,
    *  and a sign-in handler whose only call is inside a comment. */
   const SIGN_IN_ARM_CALL = "    const answer = await agentFor(principal).armAutonomy(code);\n";
@@ -5803,6 +5829,28 @@ describe("the count constraints as a set", () => {
       ]).map((v) => v.pattern),
       ...checkRecallStepCallOwnership(
         collectRecallStepCalls(RECALL_STEP_OWNER, COMMENTED_STEP_CALL),
+      ).map((v) => v.pattern),
+      // The two phase 29.1.1 counts, one owner each, both arms through scan()'s
+      // own collectors: the backfill engine called from the object's alarm
+      // beside the runner's one call, the pace-exempt kind asked for in the
+      // build module beside the sync module's one, and each owner with its only
+      // occurrence inside a comment.
+      ...checkRecallBackfillCallOwnership([
+        ...collectRecallBackfillCalls(
+          RECALL_BACKFILL_OWNER,
+          '  return { kind: "ran", outcome: await recallBackfill(principal, depsFor(mail)) };\n',
+        ),
+        ...collectRecallBackfillCalls(OBJECT_MODULE, ALARM_BACKFILL_CALL),
+      ]).map((v) => v.pattern),
+      ...checkRecallBackfillCallOwnership(
+        collectRecallBackfillCalls(RECALL_BACKFILL_OWNER, COMMENTED_BACKFILL_CALL),
+      ).map((v) => v.pattern),
+      ...checkRecallBackfillKindOwnership([
+        ...collectRecallBackfillKinds(RECALL_BACKFILL_KIND_OWNER, SYNC_KIND_ASK),
+        ...collectRecallBackfillKinds(BUILD_MODULE, BUILD_KIND_ASK),
+      ]).map((v) => v.pattern),
+      ...checkRecallBackfillKindOwnership(
+        collectRecallBackfillKinds(RECALL_BACKFILL_KIND_OWNER, COMMENTED_KIND_ASK),
       ).map((v) => v.pattern),
       // The phase 27 arm count, one owner, both arms through scan()'s own
       // collector: an arm call in the tool layer beside the sign-in's one, and
@@ -5953,6 +6001,18 @@ describe("the count constraints as a set", () => {
       ...checkRecallStepCallOwnership(collectRecallStepCalls(OBJECT_MODULE, ALARM_STEP_CALL)),
       ...checkRecallStepCallOwnership(
         collectRecallStepCalls(RECALL_STEP_OWNER, COMMENTED_STEP_CALL),
+      ),
+      // The two phase 29.1.1 counts: a lone occurrence outside the owner, and
+      // an owner whose only occurrence is commented out, one of each id.
+      ...checkRecallBackfillCallOwnership(
+        collectRecallBackfillCalls(OBJECT_MODULE, ALARM_BACKFILL_CALL),
+      ),
+      ...checkRecallBackfillCallOwnership(
+        collectRecallBackfillCalls(RECALL_BACKFILL_OWNER, COMMENTED_BACKFILL_CALL),
+      ),
+      ...checkRecallBackfillKindOwnership(collectRecallBackfillKinds(BUILD_MODULE, BUILD_KIND_ASK)),
+      ...checkRecallBackfillKindOwnership(
+        collectRecallBackfillKinds(RECALL_BACKFILL_KIND_OWNER, COMMENTED_KIND_ASK),
       ),
       // The phase 27 arm count: a lone arm call in the tool layer, and a
       // sign-in handler whose only call is commented out, one of each id.
@@ -6732,8 +6792,8 @@ describe("the recall answer's scan rules (Phase 26, D-20)", () => {
       // Measured, not listed: every exported async function in these modules
       // opens, or runs something that opens, the person's one connection.
       for (const [file, expected] of [
-        ["src/recall/sync.ts", ["recallStep", "indexNewMail"]],
-        ["src/recall/drive.ts", ["runRecallStep"]],
+        ["src/recall/sync.ts", ["recallStep", "indexNewMail", "recallBackfill"]],
+        ["src/recall/drive.ts", ["runRecallStep", "runRecallBackfill"]],
         ["src/recall/mail-source.ts", ["newMailPage"]],
       ] as const) {
         const source = rawSourceOf(file);
@@ -8000,6 +8060,402 @@ describe("the rules job's scan rules (Phase 28, D-21)", () => {
       ]) {
         expect(EXCLUDED.has(owner), owner).toBe(false);
       }
+    });
+  });
+});
+
+// Phase 29.1.1 (LD-3, LD-5, LD-11). The backfill the person asks for is a
+// second driver of the recall build, and the one caller that may ask for a
+// page that skips the minute's pause and the day count. Each is held by its own
+// count, in both directions, measured on the real tree before it was armed.
+describe("the recall backfill's scan rules (Phase 29.1.1)", () => {
+  const rule = (id: string) => FORBIDDEN.find((r) => r.id === id)!;
+  /** Through the real scope mechanism, at a given path. */
+  const hits = (id: string, path: string, text: string): number =>
+    matchRule(rule(id), FORBIDDEN.indexOf(rule(id)), path, text).length;
+
+  // @ts-expect-error — Vite's `import.meta.glob` has no ambient declaration here; see RAW_SOURCES above.
+  const GLOBBED_SRC: Record<string, string> = import.meta.glob("../src/**/*.ts", {
+    query: "?raw",
+    import: "default",
+    eager: true,
+  });
+  /** Every TypeScript file under src/, keyed by its repo-relative path. */
+  const SRC: Record<string, string> = Object.fromEntries(
+    Object.entries(GLOBBED_SRC).map(([key, text]) => [key.replace(/^\.\.\//, ""), text]),
+  );
+  const OBJECT_MODULE = "src/agent/user-agent.ts";
+  const LEDGER_MODULE = "src/agent/recall-ledger.ts";
+  const RECALL_TOOL = "src/mcp/tools/recall.ts";
+
+  /** The quoted kind word, in one of the three quotes. */
+  const quoted = (quote: string): string => `${quote}${PACE_EXEMPT_KIND}${quote}`;
+
+  describe("one call of the backfill engine, in the runner (LD-11)", () => {
+    const owner = () => collectRecallBackfillCalls(RECALL_BACKFILL_OWNER, SRC[RECALL_BACKFILL_OWNER]!);
+
+    it("names the driver as the owner, over src/", () => {
+      expect(RECALL_BACKFILL_OWNER).toBe("src/recall/drive.ts");
+      expect(RECALL_BACKFILL_SCOPE).toBe("src/");
+      expect(RECALL_BACKFILL_OWNER).toBe(RECALL_STEP_OWNER);
+    });
+
+    it("finds exactly one call in the whole real src/ tree, in the runner, and not the engine's definition", () => {
+      const collected = Object.keys(SRC).flatMap((file) => collectRecallBackfillCalls(file, SRC[file]!));
+      expect(collected.map((call) => call.file)).toEqual([RECALL_BACKFILL_OWNER]);
+      expect(checkRecallBackfillCallOwnership(collected)).toEqual([]);
+      expect(SRC["src/recall/sync.ts"]).toMatch(/export async function recallBackfill\(/);
+    });
+
+    it("reports a call from the object's alarm as the duplicate", () => {
+      const alarm = collectRecallBackfillCalls(
+        OBJECT_MODULE,
+        "  async alarm(): Promise<void> {\n    await recallBackfill(this.principal, deps);\n  }\n",
+      );
+      const violations = checkRecallBackfillCallOwnership([...owner(), ...alarm]);
+      expect(violations.map((v) => v.pattern)).toEqual(["recall-backfill-call-duplicated"]);
+      expect(violations[0]!.file).toBe(OBJECT_MODULE);
+    });
+
+    it("reports a second driver anywhere else under src/, through a namespace import too", () => {
+      for (const [file, text] of [
+        ["src/recall/second-driver.ts", "void recallBackfill(actor, deps);\n"],
+        [RECALL_TOOL, "await sync.recallBackfill (actor, deps);\n"],
+        ["src/agent/job.ts", "    const out = await recallBackfill(principal, autonomyDeps);\n"],
+      ] as const) {
+        const violations = checkRecallBackfillCallOwnership([
+          ...owner(),
+          ...collectRecallBackfillCalls(file, text),
+        ]);
+        expect(violations.map((v) => v.pattern), file).toEqual(["recall-backfill-call-duplicated"]);
+        expect(violations[0]!.file, file).toBe(file);
+      }
+    });
+
+    it("reports a second call inside the runner itself as the duplicate", () => {
+      const twice = `${SRC[RECALL_BACKFILL_OWNER]!}\nexport async function again(a: Principal, d: StepDeps) {\n  await recallBackfill(a, d);\n}\n`;
+      const violations = checkRecallBackfillCallOwnership(
+        collectRecallBackfillCalls(RECALL_BACKFILL_OWNER, twice),
+      );
+      expect(violations.map((v) => v.pattern)).toEqual(["recall-backfill-call-duplicated"]);
+      expect(violations[0]!.file).toBe(RECALL_BACKFILL_OWNER);
+    });
+
+    it("reports the runner missing when it holds no call, or only a commented one", () => {
+      const commentedOut = SRC[RECALL_BACKFILL_OWNER]!.replace(
+        /^(\s*)(return \{ kind: "ran", outcome: await recallBackfill\()/m,
+        "$1// $2",
+      );
+      expect(commentedOut).not.toBe(SRC[RECALL_BACKFILL_OWNER]);
+      for (const contents of [
+        "export async function runRecallBackfill(): Promise<void> {}\n",
+        '  // return { kind: "ran", outcome: await recallBackfill(principal, depsFor(mail)) };\n',
+        "  /*\n   * return { kind: \"ran\", outcome: await recallBackfill(principal, depsFor(mail)) };\n   */\n",
+        commentedOut,
+      ]) {
+        const violations = checkRecallBackfillCallOwnership(
+          collectRecallBackfillCalls(RECALL_BACKFILL_OWNER, contents),
+        );
+        expect(violations.map((v) => v.pattern), contents.slice(0, 80)).toEqual([
+          "recall-backfill-call-missing",
+        ]);
+        expect(violations[0]!.file).toBe(RECALL_BACKFILL_OWNER);
+      }
+    });
+
+    it("does not count the definition, the runner's name, an import or typeof", () => {
+      const fires = (sample: string): boolean =>
+        new RegExp(RECALL_BACKFILL_CALL.source, RECALL_BACKFILL_CALL.flags).test(sample);
+      for (const sample of [
+        "export async function recallBackfill(principal: Principal, deps: StepDeps) {",
+        "async function recallBackfill (p, d) {",
+        "export async function runRecallBackfill(",
+        "const ran = await runRecallBackfill(actor, mail, grantClient, depsFor, async () => {",
+        'import { productionStepDeps, recallBackfill, recallStep } from "./sync";',
+        "const engine: typeof recallBackfill = fake;",
+      ]) {
+        expect(fires(sample), `false-positived on ${JSON.stringify(sample)}`).toBe(false);
+      }
+      for (const sample of [
+        "await recallBackfill(actor, deps);",
+        "void recallBackfill (actor, deps);",
+        "return sync.recallBackfill(actor, deps);",
+      ]) {
+        expect(fires(sample), `missed ${JSON.stringify(sample)}`).toBe(true);
+      }
+    });
+
+    it("collects nothing outside src/", () => {
+      expect(
+        collectRecallBackfillCalls("test/recall-backfill.test.ts", "await recallBackfill(actor, deps);"),
+      ).toEqual([]);
+      expect(
+        collectRecallBackfillCalls("scripts/grants.mjs", "await recallBackfill(actor, deps);"),
+      ).toEqual([]);
+    });
+  });
+
+  describe("one place asks for the pace-exempt page, in the sync module (LD-5)", () => {
+    const owner = () => collectRecallBackfillKinds(RECALL_BACKFILL_KIND_OWNER, SRC[RECALL_BACKFILL_KIND_OWNER]!);
+
+    it("names the sync module as the owner, and exactly the object's two files as exempt", () => {
+      expect(RECALL_BACKFILL_KIND_OWNER).toBe("src/recall/sync.ts");
+      expect([...RECALL_BACKFILL_KIND_EXEMPT].sort()).toEqual([LEDGER_MODULE, OBJECT_MODULE].sort());
+      // The exemption is a count's, not a path exclusion: both files stay
+      // inside every pattern rule's reach.
+      for (const file of [RECALL_BACKFILL_KIND_OWNER, ...RECALL_BACKFILL_KIND_EXEMPT]) {
+        expect(EXCLUDED.has(file), file).toBe(false);
+      }
+    });
+
+    it("the two exempt files really do hold the word, so the exemption is not decorative", () => {
+      for (const file of RECALL_BACKFILL_KIND_EXEMPT) {
+        const code = withoutCommentLines(SRC[file]!);
+        expect(new RegExp(RECALL_BACKFILL_KIND.source, "g").test(code), file).toBe(true);
+        expect(collectRecallBackfillKinds(file, SRC[file]!), file).toEqual([]);
+      }
+    });
+
+    it("finds exactly one in the whole real src/ tree, in the sync module", () => {
+      const collected = Object.keys(SRC).flatMap((file) => collectRecallBackfillKinds(file, SRC[file]!));
+      expect(collected.map((site) => site.file)).toEqual([RECALL_BACKFILL_KIND_OWNER]);
+      expect(checkRecallBackfillKindOwnership(collected)).toEqual([]);
+    });
+
+    it("reports the word in the build module, the runner, the tool module or the lease module", () => {
+      for (const file of ["src/recall/build.ts", "src/recall/drive.ts", RECALL_TOOL, "src/agent/lease.ts"]) {
+        const violations = checkRecallBackfillKindOwnership([
+          ...owner(),
+          ...collectRecallBackfillKinds(file, `    await indexNextPage(principal, deps, mailbox, ${quoted('"')});\n`),
+        ]);
+        expect(violations.map((v) => v.pattern), file).toEqual(["recall-backfill-kind-duplicated"]);
+        expect(violations[0]!.file, file).toBe(file);
+      }
+    });
+
+    it("reports a second one inside the sync module itself", () => {
+      const twice = `${SRC[RECALL_BACKFILL_KIND_OWNER]!}\nconst again = () => indexNextPage(p, d, m, ${quoted("'")});\n`;
+      const violations = checkRecallBackfillKindOwnership(
+        collectRecallBackfillKinds(RECALL_BACKFILL_KIND_OWNER, twice),
+      );
+      expect(violations.map((v) => v.pattern)).toEqual(["recall-backfill-kind-duplicated"]);
+      expect(violations[0]!.file).toBe(RECALL_BACKFILL_KIND_OWNER);
+    });
+
+    it("reports the sync module missing when it holds none, or only a commented one", () => {
+      const source = SRC[RECALL_BACKFILL_KIND_OWNER]!;
+      const without = source.split(quoted('"')).join('"build"');
+      const commented = source.replace(
+        new RegExp(`^(\\s*)(\\S.*${quoted('"')}.*)$`, "m"),
+        "$1// $2",
+      );
+      expect(without).not.toBe(source);
+      expect(commented).not.toBe(source);
+      for (const contents of [without, commented, `  // kind ${quoted("`")}\n`]) {
+        const violations = checkRecallBackfillKindOwnership(
+          collectRecallBackfillKinds(RECALL_BACKFILL_KIND_OWNER, contents),
+        );
+        expect(violations.map((v) => v.pattern)).toEqual(["recall-backfill-kind-missing"]);
+        expect(violations[0]!.file).toBe(RECALL_BACKFILL_KIND_OWNER);
+      }
+    });
+
+    it("matches the word in any of the three quotes, and not the tool name, the counter keys or prose", () => {
+      const fires = (sample: string): boolean =>
+        new RegExp(RECALL_BACKFILL_KIND.source, RECALL_BACKFILL_KIND.flags).test(sample);
+      for (const quote of ['"', "'", "`"]) {
+        expect(fires(`kind === ${quoted(quote)}`), quote).toBe(true);
+      }
+      for (const sample of [
+        'export const RECALL_BACKFILL_TOOL_NAME = "mail_recall_backfill";',
+        `const DAY = "${PACE_EXEMPT_KIND}_day";`,
+        `const COUNT = '${PACE_EXEMPT_KIND}_count';`,
+        `const note = "the ${PACE_EXEMPT_KIND} runs one page at a time";`,
+        `export async function recall${PACE_EXEMPT_KIND[0]!.toUpperCase()}${PACE_EXEMPT_KIND.slice(1)}(`,
+        `"${PACE_EXEMPT_KIND}' mixed quotes`,
+      ]) {
+        expect(fires(sample), `false-positived on ${JSON.stringify(sample)}`).toBe(false);
+      }
+    });
+
+    it("collects nothing outside src/, and nothing in the two exempt files", () => {
+      const ask = `  await begin(${quoted('"')});\n`;
+      expect(collectRecallBackfillKinds("test/recall-backfill.test.ts", ask)).toEqual([]);
+      expect(collectRecallBackfillKinds("scripts/grants.mjs", ask)).toEqual([]);
+      for (const file of RECALL_BACKFILL_KIND_EXEMPT) {
+        expect(collectRecallBackfillKinds(file, ask), file).toEqual([]);
+      }
+      // A file whose path merely begins with an exempt file's is not exempt.
+      expect(collectRecallBackfillKinds("src/agent/user-agent.ts.bak.ts", ask)).toHaveLength(1);
+    });
+  });
+
+  describe("the four ids are wired into scan()", () => {
+    const COUNT_IDS = [
+      "recall-backfill-call-duplicated",
+      "recall-backfill-call-missing",
+      "recall-backfill-kind-duplicated",
+      "recall-backfill-kind-missing",
+    ];
+
+    it("lists every id in the count set", () => {
+      for (const id of COUNT_IDS) expect(OWNERSHIP_VIOLATION_IDS, id).toContain(id);
+    });
+
+    it("the real tree reports none of them, and scripts/ alone reports each missing arm", () => {
+      const whole = scan().map((v) => v.pattern);
+      for (const id of COUNT_IDS) expect(whole, id).not.toContain(id);
+      const scriptsOnly = new Set(scan("scripts").map((v) => v.pattern));
+      expect(scriptsOnly.has("recall-backfill-call-missing")).toBe(true);
+      expect(scriptsOnly.has("recall-backfill-kind-missing")).toBe(true);
+    });
+
+    it("gives the four ids distinct sort keys after the rules-add count's", () => {
+      const index = [
+        ...checkRecallBackfillCallOwnership([{ file: RECALL_TOOL, line: 1, column: 1 }]),
+        ...checkRecallBackfillCallOwnership([]),
+        ...checkRecallBackfillKindOwnership([{ file: RECALL_TOOL, line: 1, column: 1 }]),
+        ...checkRecallBackfillKindOwnership([]),
+      ].map((v) => `${v.pattern} ${v.patternIndex - FORBIDDEN.length}`);
+      expect(index).toEqual([
+        "recall-backfill-call-duplicated 56",
+        "recall-backfill-call-missing 57",
+        "recall-backfill-kind-duplicated 58",
+        "recall-backfill-kind-missing 59",
+      ]);
+    });
+
+    it("each reason says what breaks and that moving it is a decision", () => {
+      const violations = [
+        ...checkRecallBackfillCallOwnership([{ file: OBJECT_MODULE, line: 1, column: 1 }]),
+        ...checkRecallBackfillCallOwnership([]),
+        ...checkRecallBackfillKindOwnership([{ file: "src/recall/build.ts", line: 1, column: 1 }]),
+        ...checkRecallBackfillKindOwnership([]),
+      ];
+      expect(violations).toHaveLength(4);
+      for (const v of violations) {
+        expect(v.why, v.pattern).toMatch(/decision/);
+        expect(v.why, v.pattern).toMatch(/never the pattern/);
+        expect(v.why, v.pattern).not.toContain(quoted('"'));
+      }
+      expect(violations[0]!.why).toMatch(/alarm/);
+      expect(violations[0]!.why).toMatch(/autonomy key/);
+      expect(violations[1]!.why).toMatch(/quieter/);
+      expect(violations[2]!.why).toMatch(/wait/);
+      expect(violations[3]!.why).toMatch(/quieter/);
+      expect(violations[3]!.why).toMatch(/paused/);
+    });
+  });
+
+  describe("the recall step's own count names the backfill as the second driver", () => {
+    it("keeps the step's pattern, owner and ids", () => {
+      expect(RECALL_STEP_CALL.source).toBe(String.raw`(?<!\bfunction\s*)\brecallStep\s*\(`);
+      expect(RECALL_STEP_OWNER).toBe("src/recall/drive.ts");
+      expect(
+        [
+          ...checkRecallStepCallOwnership([{ file: RECALL_TOOL, line: 1, column: 1 }]),
+          ...checkRecallStepCallOwnership([]),
+        ].map((v) => v.pattern),
+      ).toEqual(["recall-step-call-duplicated", "recall-step-call-missing"]);
+    });
+
+    it("both reasons and the docstring say the backfill is a second driver with its own count", () => {
+      for (const v of [
+        ...checkRecallStepCallOwnership([{ file: RECALL_TOOL, line: 1, column: 1 }]),
+        ...checkRecallStepCallOwnership([]),
+      ]) {
+        expect(v.why, v.pattern).toMatch(/2026-09-28/);
+        expect(v.why, v.pattern).toMatch(/recall-backfill-call-\*/);
+      }
+      const scanner = rawSourceOf(SCANNER_PATH);
+      const doc = scanner.slice(
+        scanner.lastIndexOf("/**", scanner.indexOf("export const RECALL_STEP_CALL")),
+        scanner.indexOf("export const RECALL_STEP_CALL"),
+      );
+      expect(doc).toMatch(/2026-09-28/);
+      expect(doc).toMatch(/recall-backfill-call-\*/);
+    });
+  });
+
+  describe("the fan-out rule reaches the backfill (LD-4)", () => {
+    /** `concurrent-session` exactly as it shipped before Phase 29.1.1, typed
+     *  out so the widening has something to be measured against. */
+    const CONCURRENT_SESSION_BEFORE_29_1_1 =
+      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit|indexNextPage|reconcileMailbox|recallStep|runRecallStep|indexNewMail|windowUids|summariesInRange|newMailPage|underLease|checkBuilt|syncDeletions|folderSnapshots|listFolders|withAutonomySession|setFlag|placeDraft)/g;
+    const old = () =>
+      new RegExp(CONCURRENT_SESSION_BEFORE_29_1_1.source, CONCURRENT_SESSION_BEFORE_29_1_1.flags);
+
+    const fanOut = (name: string, combinator = "all"): string =>
+      `await Promise.${combinator}(folders.map((f) => ${name}(principal, deps)));`;
+
+    it("fires on a combinator around the engine and around its runner, for all four combinators", () => {
+      for (const name of ["recallBackfill", "runRecallBackfill"]) {
+        for (const combinator of ["all", "allSettled", "any", "race"]) {
+          expect(hits("concurrent-session", "src/recall/sync.ts", fanOut(name, combinator)), `${name} ${combinator}`)
+            .toBe(1);
+          expect(hits("concurrent-session", RECALL_TOOL, fanOut(name, combinator)), `${name} ${combinator}`)
+            .toBe(1);
+        }
+      }
+    });
+
+    it("the rule as it shipped before this phase misses both names, so the widening has teeth", () => {
+      for (const name of ["recallBackfill", "runRecallBackfill"]) {
+        expect(old().test(fanOut(name)), `the old pattern already saw ${name}`).toBe(false);
+      }
+      // The typed-out text really was the rule: it fires on the standing sample.
+      expect(old().test(violatingSamples_concurrentSession)).toBe(true);
+      // And the shipped rule is exactly the old one plus the two names.
+      const shipped = rule("concurrent-session").pattern.source;
+      expect(shipped).toBe(
+        CONCURRENT_SESSION_BEFORE_29_1_1.source.replace("|runRecallStep|", "|runRecallStep|recallBackfill|runRecallBackfill|"),
+      );
+    });
+
+    it("every sample the old rule fired on still fires", () => {
+      for (const name of [
+        "withMailSession",
+        "withConnectionLease",
+        "indexNextPage",
+        "recallStep",
+        "runRecallStep",
+        "underLease",
+        "withAutonomySession",
+        "placeDraft",
+      ]) {
+        expect(old().test(fanOut(name)), name).toBe(true);
+        expect(hits("concurrent-session", RECALL_TOOL, fanOut(name)), name).toBe(1);
+      }
+      expect(hits("concurrent-session", RECALL_TOOL, violatingSamples_concurrentSession)).toBe(1);
+    });
+
+    it("does not fire on one awaited call of each", () => {
+      for (const permitted of [
+        "return { kind: \"ran\", outcome: await recallBackfill(principal, depsFor(mail)) };",
+        "const ran = await runRecallBackfill(actor, mail, grantClient, depsFor, before);",
+      ]) {
+        expect(hits("concurrent-session", RECALL_TOOL, permitted), permitted).toBe(0);
+      }
+    });
+  });
+
+  describe("the rules job cannot name the backfill tool (LD-3)", () => {
+    const ID = "agent-tool-outside-allowlist";
+
+    it("fires on a quoted mail_recall_backfill in the job and in the one tool list file", () => {
+      for (const file of ["src/agent/job.ts", AUTONOMY_WRITE_LIST_FILE]) {
+        for (const quote of ['"', "'", "`"]) {
+          expect(
+            hits(ID, file, `await call(${quote}mail_recall_backfill${quote}, {});`),
+            `${file} ${quote}`,
+          ).toBe(1);
+        }
+      }
+      expect(AUTONOMY_WRITE_LIST_FILE).toBe("src/agent/autonomy-client.ts");
+    });
+
+    it("the tool is not on the job's list", () => {
+      expect([...AUTONOMY_TOOLS]).not.toContain("mail_recall_backfill");
     });
   });
 });

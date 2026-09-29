@@ -26,6 +26,13 @@
 // (Phase 26). The object owns the pause, the one-in-flight rule and both
 // ceilings, so no caller can hurry a build.
 //
+// One call is still one page when the backfill runs (Phase 29.1.1). The
+// backfill loop in ./sync.ts calls `indexNextPage` once per page, one after
+// another, and asks for each slot as a backfill page. The object decides what
+// that kind may skip (the pause and the ordinary day count, and nothing else),
+// and grants it only for a folder whose first build is not finished. This
+// module only passes the kind through.
+//
 // RESUME. The cursor is committed only after the store write succeeded. A
 // failure part-way leaves the cursor where it was, so the next call reads the
 // same page again, and because every write is an upsert, re-indexing it leaves
@@ -47,7 +54,7 @@
 // `RecallBuildError`. No logging (./.claude/CLAUDE.md §4).
 
 import { agentFor, type LeasedMail } from "../agent/lease";
-import { PAGE_REFUSALS, type PageRefusal } from "../agent/recall-ledger";
+import { PAGE_REFUSALS, type PageKind, type PageRefusal } from "../agent/recall-ledger";
 import type { CursorUpdate } from "../agent/user-agent";
 import { ConnectionBusyError } from "../errors";
 import {
@@ -154,7 +161,7 @@ function isValidPage(page: unknown): page is RecallPage {
 async function beginSlot(
   principal: Principal,
   mailbox: string,
-  kind: "build" | "reconcile",
+  kind: PageKind,
 ): Promise<
   | { ok: true; cursor: string | null; end: (update: CursorUpdate) => Promise<void> }
   | { ok: false; reason: PageRefusal }
@@ -238,13 +245,20 @@ async function removeStaleGeneration(
  * the build starts again from the top on the next call), `lease_busy` (another
  * request holds the person's connection), or one of the object's refusals.
  * Throws `RecallBuildError` on any other failure, with the cursor unchanged.
+ *
+ * `kind` is the page kind the slot is asked for: a build page unless the
+ * caller says otherwise. The backfill loop in ./sync.ts passes the backfill
+ * kind (Phase 29.1.1), which the object grants without the one-minute pause and
+ * the ordinary day count, and only for a folder whose first build is not
+ * finished. Everything after the slot is the same for both.
  */
 export async function indexNextPage(
   principal: Principal,
   mailbox: string,
   deps: BuildDeps,
+  kind: Exclude<PageKind, "reconcile"> = "build",
 ): Promise<BuildStatus> {
-  const slot = await beginSlot(principal, mailbox, "build");
+  const slot = await beginSlot(principal, mailbox, kind);
   if (!slot.ok) return slot.reason;
 
   if (slot.cursor === DONE_CURSOR) {

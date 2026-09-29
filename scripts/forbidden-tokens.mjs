@@ -554,12 +554,21 @@ export const FORBIDDEN = [
   // sockets as a combinator over the lease runner. The job's own call function
   // is too common a name to list; `autonomy-job-combinator` holds the file that
   // uses it. Measured at zero hits on the real tree before it was armed.
+  //
+  // Phase 29.1.1 (LD-4) names the recall backfill: `recallBackfill` in
+  // src/recall/sync.ts, the loop that indexes several pages in one call, and
+  // `runRecallBackfill` in src/recall/drive.ts, its one runner. Every page the
+  // loop indexes takes the person's lease and opens one session, so a
+  // combinator around either is the same N sockets as one around the lease
+  // runner. `runRecallBackfill` is not shadowed by `recallBackfill`: the match
+  // is case-sensitive and the runner spells the loop with a capital. Measured
+  // at zero hits on the real tree before it was armed.
   {
     id: "concurrent-session",
     scope: "src/",
     pattern:
-      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit|indexNextPage|reconcileMailbox|recallStep|runRecallStep|indexNewMail|windowUids|summariesInRange|newMailPage|underLease|checkBuilt|syncDeletions|folderSnapshots|listFolders|withAutonomySession|setFlag|placeDraft)/g,
-    why: "A concurrent combinator wrapped around the per-person lease runner (withConnectionLease in src/agent/lease.ts), either mail session orchestrator (read-only or mutating), the core under them, a triage verb in src/mail/triage.ts (mark read or unread, flag or unflag, move, or move one draft to Trash), the mail move composites (readMoveSet, readDraftForChange, buildMovePreview, applyMailCommit), or a recall build entry point in src/recall/build.ts (indexNextPage, reconcileMailbox). Each recall build entry point takes the person's connection lease and reads mail through one session, so it is a session like the others. The same holds for the recall step (recallStep in src/recall/sync.ts), its one runner (runRecallStep in src/recall/drive.ts), the new-mail indexer (indexNewMail) and page source (newMailPage), the two recall reads in src/mail/service.ts (windowUids, summariesInRange, and their stream forms), the step's own lease wrapper and the two per-folder actions it opens a session for (underLease, checkBuilt, syncDeletions in src/recall/sync.ts), and the two reads the step reaches through its deps (folderSnapshots, listFolders in src/mail/service.ts): the recall step and its reads each open the person's one iCloud connection. Each of those opens a session, and every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial, and a list of messages is worked through one at a time in one session: pass the whole list to moveMessages rather than mapping a verb over it. The rules job's entry points are named too: withAutonomySession in src/agent/autonomy.ts and the job's two actions, setFlag and placeDraft in src/agent/actions.ts. Each action is one or two tool calls at this Worker's own /mcp, each call is one iCloud session under the person's lease, and the job runs with nobody present, so a fan-out over a run's verdicts would open several connections at once with nobody there to notice the lockout. Act on verdicts one at a time.",
+      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit|indexNextPage|reconcileMailbox|recallStep|runRecallStep|recallBackfill|runRecallBackfill|indexNewMail|windowUids|summariesInRange|newMailPage|underLease|checkBuilt|syncDeletions|folderSnapshots|listFolders|withAutonomySession|setFlag|placeDraft)/g,
+    why: "A concurrent combinator wrapped around the per-person lease runner (withConnectionLease in src/agent/lease.ts), either mail session orchestrator (read-only or mutating), the core under them, a triage verb in src/mail/triage.ts (mark read or unread, flag or unflag, move, or move one draft to Trash), the mail move composites (readMoveSet, readDraftForChange, buildMovePreview, applyMailCommit), or a recall build entry point in src/recall/build.ts (indexNextPage, reconcileMailbox). Each recall build entry point takes the person's connection lease and reads mail through one session, so it is a session like the others. The same holds for the recall step (recallStep in src/recall/sync.ts), its one runner (runRecallStep in src/recall/drive.ts), the new-mail indexer (indexNewMail) and page source (newMailPage), the two recall reads in src/mail/service.ts (windowUids, summariesInRange, and their stream forms), the step's own lease wrapper and the two per-folder actions it opens a session for (underLease, checkBuilt, syncDeletions in src/recall/sync.ts), and the two reads the step reaches through its deps (folderSnapshots, listFolders in src/mail/service.ts): the recall step and its reads each open the person's one iCloud connection. Each of those opens a session, and every session is a socket, so a fan-out over N mailboxes opens N of them: production allows six simultaneous connections per Worker invocation (counting KV reads and outbound fetches, one of which the OAuth provider has already spent), and iCloud's own per-account ceiling is lower, undocumented, and deliberately unmeasured because exhausting it locks the user out of their own mail in Mail.app on their own devices. The structural half is the request-scoped gate in src/mail/service.ts, which refuses a second acquire at runtime; this is the detective half, which refuses it at commit time. An account-wide sweep or search must be serial, and a list of messages is worked through one at a time in one session: pass the whole list to moveMessages rather than mapping a verb over it. The recall backfill is named too: recallBackfill in src/recall/sync.ts, the loop that indexes several pages in one call, one leased session per page, and runRecallBackfill in src/recall/drive.ts, its one runner; a combinator around either opens a session per branch. The rules job's entry points are named too: withAutonomySession in src/agent/autonomy.ts and the job's two actions, setFlag and placeDraft in src/agent/actions.ts. Each action is one or two tool calls at this Worker's own /mcp, each call is one iCloud session under the person's lease, and the job runs with nobody present, so a fan-out over a run's verdicts would open several connections at once with nobody there to notice the lockout. Act on verdicts one at a time.",
   },
   // The same property one protocol over, and the reason is deliberately NOT the
   // same. The two rules above lean on the six-connection platform cap. That cap
@@ -2302,6 +2311,13 @@ export function collectModelIdLiterals(relativePath, contents) {
  * lost caller stops every person's index from growing, and nothing fails,
  * because a step that never runs reports nothing.
  *
+ * THE SECOND DRIVER. On 2026-09-28 the owner decided on one more driver: the
+ * backfill the person asks for, `mail_recall_backfill`, run on their own
+ * sign-in. It does not call this step. It runs a different function,
+ * `recallBackfill`, counted by its own constraint, recall-backfill-call-*.
+ * So this count still means exactly one call of the step, and it is not the
+ * whole story of who may build an index. Read the two together.
+ *
  * THE SHAPE. The step's name as a whole word, then optional space, then an
  * opening parenthesis, not preceded by `function`. `runRecallStep(` is not a
  * match: the match is case-sensitive and the runner spells the step with a
@@ -2343,6 +2359,146 @@ export function collectRecallStepCalls(relativePath, contents) {
   if (!relativePath.startsWith(RECALL_STEP_SCOPE)) return [];
   const code = withoutCommentLines(contents);
   return [...code.matchAll(new RegExp(RECALL_STEP_CALL, "g"))].map((match) => ({
+    file: relativePath,
+    ...positionOf(code, match.index),
+  }));
+}
+
+/**
+ * A call of the recall backfill engine, permitted exactly once in the source
+ * tree (Phase 29.1.1, LD-11; the owner's decision of 2026-09-28).
+ *
+ * THE RULE. Exactly one call of `recallBackfill` exists under `src/`, and it
+ * is in `src/recall/drive.ts`, inside `runRecallBackfill`, the runner the
+ * `mail_recall_backfill` tool calls when the person asks Claude to fill their
+ * index. The runner refuses the autonomy key before it calls anything. The
+ * engine's definition in `src/recall/sync.ts` is not a call: the pattern
+ * refuses a name preceded by the word that declares a function.
+ *
+ * WHY A COUNT. The backfill reads up to ten pages in one call and skips the
+ * minute's pause and the ordinary day count. The owner allowed that only when
+ * the person asks for it, on their own sign-in. A second caller is how the
+ * object's alarm or the autonomy key would start a fast build with nobody
+ * asking: one line in the alarm handler, or one in the rules job. Zero is a
+ * violation too, and it is the quieter one: the tool would stop filling
+ * anything, and nothing fails on the way out.
+ *
+ * THE SHAPE. The engine's name as a whole word, then optional space, then an
+ * opening parenthesis, not preceded by `function`. `runRecallBackfill(` is
+ * not a match: the match is case-sensitive and the runner spells the engine
+ * with a capital. An import line and `typeof` carry no parenthesis after the
+ * name, so they are not calls.
+ *
+ * COMMENTS. Matched with comment lines blanked, so a commented-out call cannot
+ * keep the missing arm quiet, and prose naming the engine is not a call.
+ *
+ * A call through a namespace import (`sync.recallBackfill(...)`) IS seen,
+ * because the name and the parenthesis are still spelled.
+ *
+ * WHAT IT DOES NOT SEE. The engine taken as a value and called under another
+ * name (`const fill = recallBackfill; fill(...)`), and `.call` or `.apply` on
+ * it. Both are deliberate evasions, not mistakes.
+ *
+ * Collected from `src/` only. Tests call the engine directly with fakes. No
+ * `g` flag; the collector builds its own global copy per file.
+ */
+export const RECALL_BACKFILL_CALL = /(?<!\bfunction\s*)\brecallBackfill\s*\(/;
+
+/** The one file under `RECALL_BACKFILL_SCOPE` permitted to match
+ *  `RECALL_BACKFILL_CALL`, and only once. */
+export const RECALL_BACKFILL_OWNER = "src/recall/drive.ts";
+
+/** The tree `RECALL_BACKFILL_CALL` is collected from. */
+export const RECALL_BACKFILL_SCOPE = "src/";
+
+/**
+ * The calls of the backfill engine one file contributes, as `scan()` collects
+ * them. EVERY match, with a fresh global copy per call: two calls in the owner
+ * are two calls. Comment lines blanked, positions unchanged. An empty list
+ * outside `RECALL_BACKFILL_SCOPE`.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectRecallBackfillCalls(relativePath, contents) {
+  if (!relativePath.startsWith(RECALL_BACKFILL_SCOPE)) return [];
+  const code = withoutCommentLines(contents);
+  return [...code.matchAll(new RegExp(RECALL_BACKFILL_CALL, "g"))].map((match) => ({
+    file: relativePath,
+    ...positionOf(code, match.index),
+  }));
+}
+
+/**
+ * The pace-exempt page kind, asked for in exactly one place outside the
+ * per-person object (Phase 29.1.1, LD-5; the owner's decision of 2026-09-28).
+ *
+ * THE RULE. The object grants a page of this kind without the minute's pause
+ * and without the ordinary day count, and only for a folder still on its first
+ * build. It is counted on a day counter of its own. The kind is named by one
+ * quoted word. Outside the object's two files, that word appears exactly once
+ * under `src/`: in `src/recall/sync.ts`, where the backfill engine asks for
+ * its pages.
+ *
+ * WHY THE TWO FILES ARE EXEMPT. `src/agent/recall-ledger.ts` defines the kind
+ * and its refusals. `src/agent/user-agent.ts` checks it when a page is asked
+ * for, and answers the slot word for it. Neither ever asks for a page. The
+ * exemption is part of the count and not a path exclusion, so both files stay
+ * inside every other rule.
+ *
+ * WHY A COUNT. Saying the word is what skips the pace. A second place that
+ * says it is how an ordinary step, the object's alarm or a new tool would get
+ * unpaced pages as an ordinary edit, and ordinary pages would stop waiting.
+ * Zero is a violation too, and it is the quieter one: the backfill would stop
+ * being exempt, would be told paused after its first page, and nothing on the
+ * way out would say why.
+ *
+ * THE SHAPE. The word between two matching quotes: single, double or back
+ * quotes. The tool's name, the two counter row names and prose do not match,
+ * because in each of them the word runs on into a longer token or has no quote
+ * on both sides.
+ *
+ * COMMENTS. Matched with comment lines blanked, so a commented-out ask cannot
+ * keep the missing arm quiet.
+ *
+ * WHAT IT DOES NOT SEE. The word assembled from fragments, or read from a
+ * variable that was set somewhere else. Both are deliberate evasions, not
+ * mistakes.
+ *
+ * Collected from `src/` only, minus `RECALL_BACKFILL_KIND_EXEMPT`. No `g`
+ * flag; the collector builds its own global copy per file.
+ */
+export const RECALL_BACKFILL_KIND = /(["'`])backfill\1/;
+
+/** The one file permitted to match `RECALL_BACKFILL_KIND`, and only once. */
+export const RECALL_BACKFILL_KIND_OWNER = "src/recall/sync.ts";
+
+/** The object's two files, which define and check the kind and never ask for
+ *  a page. Exact paths, not prefixes. */
+export const RECALL_BACKFILL_KIND_EXEMPT = [
+  "src/agent/user-agent.ts",
+  "src/agent/recall-ledger.ts",
+];
+
+/** The tree `RECALL_BACKFILL_KIND` is collected from. */
+export const RECALL_BACKFILL_KIND_SCOPE = "src/";
+
+/**
+ * The pace-exempt kind words one file contributes, as `scan()` collects them.
+ * EVERY match, with a fresh global copy per call. Comment lines blanked,
+ * positions unchanged. An empty list outside `RECALL_BACKFILL_KIND_SCOPE` and
+ * for the two exempt files.
+ *
+ * @param {string} relativePath
+ * @param {string} contents
+ * @returns {Array<{file: string, line: number, column: number}>}
+ */
+export function collectRecallBackfillKinds(relativePath, contents) {
+  if (!relativePath.startsWith(RECALL_BACKFILL_KIND_SCOPE)) return [];
+  if (RECALL_BACKFILL_KIND_EXEMPT.includes(relativePath)) return [];
+  const code = withoutCommentLines(contents);
+  return [...code.matchAll(new RegExp(RECALL_BACKFILL_KIND, "g"))].map((match) => ({
     file: relativePath,
     ...positionOf(code, match.index),
   }));
@@ -3677,6 +3833,10 @@ export const OWNERSHIP_VIOLATION_IDS = [
   "sender-address-missing",
   "rules-add-outside-commit",
   "rules-add-missing",
+  "recall-backfill-call-duplicated",
+  "recall-backfill-call-missing",
+  "recall-backfill-kind-duplicated",
+  "recall-backfill-kind-missing",
 ];
 
 // NOT ENFORCED HERE, and deliberately so rather than by oversight: the ban on
@@ -3796,7 +3956,8 @@ function walk(absoluteDir, collected = []) {
  * is kept, and so is a block comment opened after code. Used by the two
  * mutating-path counts, the three move-step counts, the namespace-read
  * count, the two recall binding counts, the model id and recall step counts,
- * the Durable Object config checks and the recall config checks only.
+ * the two recall backfill counts, the Durable Object config checks and the
+ * recall config checks only.
  *
  * @param {string} text
  * @returns {string}
@@ -3932,6 +4093,8 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   const aiBindingReaders = [];
   const modelIdLiterals = [];
   const recallStepCalls = [];
+  const recallBackfillCalls = [];
+  const recallBackfillKinds = [];
   const autonomyArmCalls = [];
   const autonomyWriteNames = [];
   let autonomyActionExports = null;
@@ -4083,6 +4246,12 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
     // is not a call, so it is not collected.
     modelIdLiterals.push(...collectModelIdLiterals(relativePath, contents));
     recallStepCalls.push(...collectRecallStepCalls(relativePath, contents));
+    // The two phase 29.1.1 counts, beside the step's. The runner and the sync
+    // module are not skipped: each holds its one occurrence. EVERY match,
+    // comment lines blanked. The engine's definition is not a call, and the
+    // object's two files are never collected for the kind.
+    recallBackfillCalls.push(...collectRecallBackfillCalls(relativePath, contents));
+    recallBackfillKinds.push(...collectRecallBackfillKinds(relativePath, contents));
     // The phase 27 arm count. The sign-in handler is not skipped: it holds the
     // one call. Every match, comment lines blanked. The method's definition in
     // the object module has no leading dot, so it is not collected.
@@ -4135,6 +4304,8 @@ export function scan(roots = SCAN_ROOTS, { excluded = EXCLUDED } = {}) {
   violations.push(...checkAiBindingOwnership(aiBindingReaders));
   violations.push(...checkModelIdOwnership(modelIdLiterals));
   violations.push(...checkRecallStepCallOwnership(recallStepCalls));
+  violations.push(...checkRecallBackfillCallOwnership(recallBackfillCalls));
+  violations.push(...checkRecallBackfillKindOwnership(recallBackfillKinds));
   violations.push(...checkAutonomyArmOwnership(autonomyArmCalls));
   violations.push(...checkAutonomyWriteOwnership(autonomyWriteNames));
   violations.push(...checkAutonomyActionExports(autonomyActionExports));
@@ -4895,7 +5066,7 @@ export function checkRecallStepCallOwnership(calls) {
       column: call.column,
       pattern: "recall-step-call-duplicated",
       patternIndex: FORBIDDEN.length + 41,
-      why: `A second call of the recall build step under ${RECALL_STEP_SCOPE} -- either in another module, the per-person object included, or a second one inside ${RECALL_STEP_OWNER} itself, which counts the same. The owner ruled on 2026-09-27 that only a signed-in person's own mail calls drive the build, after the call's own answer: never the object's alarm, and never the autonomy key. A second caller is how either would arrive without a decision. Run the step through the one runner in ${RECALL_STEP_OWNER} instead. A second driver is a decision on the recall boundary, not a refactor: get the decision, then change the owner, never the pattern.`,
+      why: `A second call of the recall build step under ${RECALL_STEP_SCOPE} -- either in another module, the per-person object included, or a second one inside ${RECALL_STEP_OWNER} itself, which counts the same. The owner ruled on 2026-09-27 that only a signed-in person's own mail calls drive the build, after the call's own answer: never the object's alarm, and never the autonomy key. A second caller is how either would arrive without a decision. Run the step through the one runner in ${RECALL_STEP_OWNER} instead. The owner decided on one second driver on 2026-09-28, the backfill the person asks for, and it runs a different function counted by recall-backfill-call-*, so this count still means one call of the step. A further driver is a decision on the recall boundary, not a refactor: get the decision, then change the owner, never the pattern.`,
     });
   }
   if (calls.length === 0) {
@@ -4905,7 +5076,85 @@ export function checkRecallStepCallOwnership(calls) {
       column: 0,
       pattern: "recall-step-call-missing",
       patternIndex: FORBIDDEN.length + 42,
-      why: `No call of the recall build step under ${RECALL_STEP_SCOPE}, which means the runner in ${RECALL_STEP_OWNER} was deleted, emptied, or rewired to reach the step some other way. Zero is as much a violation as two, and it is the quieter of the pair: a lost caller stops every person's index from growing, and nothing fails, because a step that never runs reports nothing. A call that survives only in a comment counts as zero. Restore the call in the runner. If the driver really moved, that is a decision, not a refactor: get it, then change the owner, never the pattern.`,
+      why: `No call of the recall build step under ${RECALL_STEP_SCOPE}, which means the runner in ${RECALL_STEP_OWNER} was deleted, emptied, or rewired to reach the step some other way. Zero is as much a violation as two, and it is the quieter of the pair: a lost caller stops every person's index from growing, and nothing fails, because a step that never runs reports nothing. A call that survives only in a comment counts as zero. The backfill the owner decided on 2026-09-28 is a second driver with its own count, recall-backfill-call-*, and it does not stand in for this one: it runs only when a person asks. Restore the call in the runner. If the driver really moved, that is a decision, not a refactor: get it, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The backfill engine's one caller, as a pure function over the collected
+ * calls (Phase 29.1.1, LD-11). One owner, one call: the first call in the
+ * owner is skipped, every other call anywhere is reported, and an empty list
+ * is the missing arm. See the `RECALL_BACKFILL_CALL` docstring for why this is
+ * a count and for what it cannot see.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} calls
+ */
+export function checkRecallBackfillCallOwnership(calls) {
+  const violations = [];
+  let ownerCalls = 0;
+  for (const call of calls) {
+    if (call.file === RECALL_BACKFILL_OWNER) {
+      ownerCalls += 1;
+      if (ownerCalls === 1) continue;
+    }
+    violations.push({
+      file: call.file,
+      line: call.line,
+      column: call.column,
+      pattern: "recall-backfill-call-duplicated",
+      patternIndex: FORBIDDEN.length + 56,
+      why: `A second call of the recall backfill engine under ${RECALL_BACKFILL_SCOPE} -- either in another module, the per-person object's alarm included, or a second one inside ${RECALL_BACKFILL_OWNER} itself, which counts the same. The backfill reads up to ten pages a call and skips the minute's pause and the ordinary day count. The owner allowed that on 2026-09-28 only when the person asks for it, on their own sign-in, through the one runner in ${RECALL_BACKFILL_OWNER}, which refuses the autonomy key. A second caller is how the object's alarm or the autonomy key would start a fast build with nobody asking. Call the runner instead. A second backfill driver is a decision on the recall boundary, not a refactor: get the decision, then change the owner, never the pattern.`,
+    });
+  }
+  if (calls.length === 0) {
+    violations.push({
+      file: RECALL_BACKFILL_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "recall-backfill-call-missing",
+      patternIndex: FORBIDDEN.length + 57,
+      why: `No call of the recall backfill engine under ${RECALL_BACKFILL_SCOPE}, which means the runner in ${RECALL_BACKFILL_OWNER} was deleted, emptied, or rewired to reach the engine some other way. Zero is as much a violation as two, and it is the quieter of the pair: the backfill tool would stop filling anyone's index, and nothing on the way out would say so. A call that survives only in a comment counts as zero. Restore the call in the runner. If the driver really moved, that is a decision on the recall boundary, not a refactor: get it, then change the owner, never the pattern.`,
+    });
+  }
+  return violations;
+}
+
+/**
+ * The pace-exempt page kind's one asker, as a pure function over the collected
+ * sites (Phase 29.1.1, LD-5). One owner, one site: the first in the owner is
+ * skipped, every other one anywhere is reported, and an empty list is the
+ * missing arm. The object's two files are never collected. See the
+ * `RECALL_BACKFILL_KIND` docstring for why this is a count.
+ *
+ * @param {Array<{file: string, line: number, column: number}>} sites
+ */
+export function checkRecallBackfillKindOwnership(sites) {
+  const violations = [];
+  let ownerSites = 0;
+  for (const site of sites) {
+    if (site.file === RECALL_BACKFILL_KIND_OWNER) {
+      ownerSites += 1;
+      if (ownerSites === 1) continue;
+    }
+    violations.push({
+      file: site.file,
+      line: site.line,
+      column: site.column,
+      pattern: "recall-backfill-kind-duplicated",
+      patternIndex: FORBIDDEN.length + 58,
+      why: `A second place under ${RECALL_BACKFILL_KIND_SCOPE} names the page kind the backfill asks for -- either in another module or a second one inside ${RECALL_BACKFILL_KIND_OWNER} itself, which counts the same. The object grants a page of that kind without the minute's pause and without the ordinary day count. The owner allowed that on 2026-09-28 for the backfill the person asks for and nothing else, and the one place that asks for it is the backfill engine in ${RECALL_BACKFILL_KIND_OWNER}. A second place that asks is how an ordinary step, the object's alarm or a new tool would get unpaced pages, and ordinary pages would stop waiting. Ask for an ordinary build page instead. A second pace-exempt asker is a decision on the recall boundary, not a refactor: get the decision, then change the owner, never the pattern.`,
+    });
+  }
+  if (sites.length === 0) {
+    violations.push({
+      file: RECALL_BACKFILL_KIND_OWNER,
+      line: 0,
+      column: 0,
+      pattern: "recall-backfill-kind-missing",
+      patternIndex: FORBIDDEN.length + 59,
+      why: `No place under ${RECALL_BACKFILL_KIND_SCOPE}, outside the object's two files, names the page kind the backfill asks for, which means the backfill engine in ${RECALL_BACKFILL_KIND_OWNER} was emptied or rewired. Zero is as much a violation as two, and it is the quieter of the pair: the backfill would stop being exempt, would be told paused after its first page, and nothing on the way out would say why. A word that survives only in a comment counts as zero. Restore the ask in the engine. If it really moved, that is a decision on the recall boundary, not a refactor: get it, then change the owner, never the pattern.`,
     });
   }
   return violations;

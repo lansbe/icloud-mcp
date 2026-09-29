@@ -104,6 +104,7 @@ import {
   clearPageSlot,
   clearRecallStateExceptPending,
   destroyPending,
+  countBackfillPageOn,
   countNewIds,
   countPageOn,
   countVectors,
@@ -111,12 +112,15 @@ import {
   ensureRecallSchema,
   expiredIds,
   anyIds,
+  type BackfillRefusal,
   folderListOf,
   forgetVectors,
   heldIds,
   idsForMailbox,
   markDestroyPending,
   type LedgerRowInput,
+  type MailboxProgress,
+  mailboxProgress,
   type MailboxRow,
   type PageRefusal,
   pageRefusal,
@@ -128,6 +132,8 @@ import {
   type RetryState,
   type SyncRow,
   readCursor,
+  readState,
+  SYNC_ROW,
   readPageSlot,
   recordVectors,
   type RecordRefusal,
@@ -236,14 +242,34 @@ export type BeginPageAnswer =
  * due to be listed again (26-REVIEW-2 WR-02). `listing` is the folder
  * listing's failure record, or null. `sync` is every mailbox's sync row that
  * parses, keyed by mailbox.
+ *
+ * `backfill` (Phase 29.1.1) is the first refusal a backfill page would get now,
+ * or `free`, or `unnamed` for an object that does not know whose it is. It is
+ * never `paused`: a backfill page skips the pause. It does not say whether a
+ * given folder may be backfilled; the page start refuses a folder that is not
+ * at build as `invalid`.
  */
 export interface RecallSyncState {
   readonly slot: PageRefusal | "unnamed" | "free";
+  readonly backfill: BackfillRefusal | "unnamed" | "free";
   readonly full: boolean;
   readonly folders: string[] | null;
   readonly listedAt: number | null;
   readonly listing: RetryState | null;
   readonly sync: Record<string, SyncRow>;
+}
+
+/**
+ * How far the person's index has got (Phase 29.1.1): `total` vector ids, and
+ * one entry per mailbox the ledger holds, with its count and earliest expiry.
+ *
+ * An entry holds a folder name, because this crosses RPC to the Worker. The
+ * Worker never puts that name into an answer: the backfill tool names folders
+ * by role.
+ */
+export interface RecallProgress {
+  readonly total: number;
+  readonly mailboxes: MailboxProgress[];
 }
 
 /**
@@ -789,39 +815,61 @@ export class UserAgent extends DurableObject<Env> {
   }
 
   /**
-   * Ask to start one recall page for `mailbox` (Phase 25, D-15, D-24).
+   * Ask to start one recall page for `mailbox` (Phase 25, D-15, D-24;
+   * Phase 29.1.1).
    *
    * The object decides, not the caller. Refuses, in this order: `invalid` for a
-   * bad mailbox or a kind that is not exactly "build" or "reconcile"; `unnamed`
-   * when the object does not know whose it is; `busy` while another page's
-   * token has not expired; `paused` within RECALL_PAGE_PAUSE_MS of the last
-   * page's start; `quota` once RECALL_MAX_PAGES_PER_DAY pages began today
-   * (UTC), reconciles included; and, for a build only, `full` when one more
-   * page could take the ledger past RECALL_MAX_VECTORS. A reconcile only
-   * removes, so it is never refused as full. Every check after `unnamed` and
-   * `invalid` is `pageRefusal` in ./recall-ledger.ts, the one predicate the
-   * sync-state read below shares (Phase 26, D-29).
+   * bad mailbox or a kind that is not exactly "build", "reconcile" or
+   * "backfill"; `unnamed` when the object does not know whose it is; `busy`
+   * while another page's token has not expired; `paused` within
+   * RECALL_PAGE_PAUSE_MS of the last page's start, for a build or a reconcile
+   * only; `quota` once RECALL_MAX_PAGES_PER_DAY ordinary pages began today
+   * (UTC), reconciles included, or for a backfill page once
+   * RECALL_BACKFILL_MAX_PAGES_PER_DAY backfill pages did; and, for a build or a
+   * backfill page, `full` when one more page could take the ledger past
+   * RECALL_MAX_VECTORS. A reconcile only removes, so it is never refused as
+   * full. Every check after `unnamed` and `invalid` is `pageRefusal` in
+   * ./recall-ledger.ts, the one predicate the sync-state read below shares
+   * (Phase 26, D-29).
+   *
+   * A backfill page is granted only for a folder whose sync row is at build:
+   * the backfill hurries a folder's FIRST build and nothing else. A new-mail
+   * page or a deletion sync on a built folder keeps the ordinary pace, whoever
+   * asks. So after `pageRefusal` has passed, a backfill page for a mailbox with
+   * no row, a row at seed, or a built row answers `invalid` and writes nothing.
+   * The check comes after, so destroying, busy, quota and full keep their
+   * precedence.
    *
    * Otherwise it mints a page token, records the start, counts the page and
-   * answers the stored cursor. No `await`, so the check and the set are one
-   * atomic step. There is no `off` refusal: recall is inherent.
+   * answers the stored cursor. A backfill page records its start exactly as
+   * the other kinds do, so an ordinary page in the minute after it is told
+   * paused; it counts on the backfill day counter, never the ordinary one. No
+   * `await`, so the check and the set are one atomic step. There is no `off`
+   * refusal: recall is inherent.
    */
   recallBeginPage(mailbox: unknown, kind: unknown): BeginPageAnswer {
     const sql = this.ctx.storage.sql;
     ensureRecallSchema(sql);
     if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
     if (!isMailbox(mailbox)) return { ok: false, reason: "invalid" };
-    if (kind !== "build" && kind !== "reconcile") return { ok: false, reason: "invalid" };
+    if (kind !== "build" && kind !== "reconcile" && kind !== "backfill") {
+      return { ok: false, reason: "invalid" };
+    }
 
     const now = Date.now();
     const refusal = pageRefusal(sql, kind, now);
     if (refusal !== null) return { ok: false, reason: refusal };
+    if (kind === "backfill") {
+      const row = syncRowFor(mailbox, readState(sql, SYNC_ROW + mailbox));
+      if (row === null || row.stage !== "build") return { ok: false, reason: "invalid" };
+    }
     const today = utcDay(now);
 
     const pageToken = crypto.randomUUID();
     writePageSlot(sql, { token: pageToken, expiresAt: now + RECALL_PAGE_TTL_MS });
     writeLastPageAt(sql, now);
-    countPageOn(sql, today);
+    if (kind === "backfill") countBackfillPageOn(sql, today);
+    else countPageOn(sql, today);
     return { ok: true, pageToken, cursor: readCursor(sql, mailbox) };
   }
 
@@ -850,12 +898,33 @@ export class UserAgent extends DurableObject<Env> {
     const now = Date.now();
     return {
       slot: named ? (pageRefusal(sql, "reconcile", now) ?? "free") : "unnamed",
+      backfill: named ? (pageRefusal(sql, "backfill", now) ?? "free") : "unnamed",
       full: pageRefusal(sql, "build", now) === "full",
       folders: readFolders(sql),
       listedAt: readListedAt(sql),
       listing: readListingFailure(sql),
       sync: readSyncRows(sql),
     };
+  }
+
+  /**
+   * Report how far this object's own index has got, for the backfill tool's
+   * progress answer (Phase 29.1.1, LD-9): how many vector ids the ledger holds,
+   * and for each mailbox it holds, how many and the earliest expiry.
+   *
+   * It answers only about the object it is called on: one person's own ledger,
+   * never anyone else's. It takes no argument, so no caller can widen or aim
+   * it. An empty ledger answers a total of 0 and an empty list.
+   *
+   * Writes nothing, apart from the one-time copy of the object's own name that
+   * every recall method makes (Phase 25, D-22).
+   */
+  recallProgress(): RecallProgress {
+    const sql = this.ctx.storage.sql;
+    ensureRecallSchema(sql);
+    this.rememberOwnName();
+    const mailboxes = mailboxProgress(sql);
+    return { total: mailboxes.reduce((sum, one) => sum + one.count, 0), mailboxes };
   }
 
   /**
