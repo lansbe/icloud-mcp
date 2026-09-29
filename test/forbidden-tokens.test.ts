@@ -116,6 +116,17 @@ import {
   RULE_ADD_SCOPE,
   collectRuleAddCalls,
   checkRuleAddOwnership,
+  SAVE_LINK_BINDING_NAMES,
+  SAVE_LINK_BINDING_READS,
+  SAVE_LINK_OWNER,
+  SAVE_LINK_SCOPE,
+  collectSaveLinkBindingReads,
+  checkSaveLinkBindingOwnership,
+  SAVE_ROUTE_CALL,
+  SAVE_ROUTE_OWNER,
+  SAVE_ROUTE_SCOPE,
+  collectSaveRouteCalls,
+  checkSaveRouteCallOwnership,
   OWNERSHIP_VIOLATION_IDS,
   PASSWORD_READER_IMPORT,
   PASSWORD_READER_OWNERS,
@@ -1206,6 +1217,11 @@ describe("the patterns have teeth", () => {
     // 28-VERIFICATION. The job reaching for the Worker-side lease module, the
     // first line of any edit that has the job take the lease itself.
     "agent-imports-lease": 'import { agentFor } from "./lease";',
+    // Phase 29.1 (SAVE-06). The download route reaching for the mail read, the
+    // first line of any edit that has the public route serve mail itself.
+    "save-route-reaches-mail": 'import { getAttachmentsForSave } from "../mail/service";',
+    // A combinator over the save loop's parts, inside the save module.
+    "save-combinator": "const rows = await Promise.all(items.map((item) => saveOne(env, item)));",
   };
 
   it("covers every rule with a known-violating sample", () => {
@@ -1839,7 +1855,8 @@ describe("the patterns have teeth", () => {
    *  field names the grant's props use for the same two values. The last six
    *  are the autonomy key's names (Phase 27, AUTO-07): its plaintext, the
    *  bearer made from it, its sealed field, its OAuth wire name, and the two
-   *  Worker secrets that seal it and prove the client. */
+   *  Worker secrets that seal it and prove the client. The last is the Worker
+   *  secret that seals every attachment save link (Phase 29.1). */
   const SECRET_LOG_NAMES = [
     "APPLE_APP_PASSWORD",
     "APPLE_ID",
@@ -1852,6 +1869,7 @@ describe("the patterns have teeth", () => {
     "refresh_token",
     "AUTONOMY_CLIENT_SECRET",
     "AUTONOMY_SEAL_KEY",
+    "SAVE_LINK_SEAL_KEY",
   ];
 
   /** A logging call that reads one named field, with the name substituted in.
@@ -1868,8 +1886,8 @@ describe("the patterns have teeth", () => {
     const rule = FORBIDDEN.find((r) => r.id === "secret-binding-in-log-call")!;
     expect(
       SECRET_LOG_NAMES.length,
-      "three bindings, the grant's two fields and the autonomy key's six names",
-    ).toBe(11);
+      "three bindings, the grant's two fields, the autonomy key's six names and the save link's seal key",
+    ).toBe(12);
     for (const name of SECRET_LOG_NAMES) {
       const fresh = new RegExp(rule.pattern.source, rule.pattern.flags);
       expect(
@@ -5712,6 +5730,20 @@ describe("the count constraints as a set", () => {
   const RULES_ADD_CALL = "  const added = await agentFor(actor).addRule(rule);\n";
   const TOOL_ADD_CALL = "  await agentFor(actor).addRule(defaultRule);\n";
   const COMMENTED_ADD_CALL = "  // const added = await agentFor(actor).addRule(rule);\n";
+  /** Phase 29.1: the link module reading both save bindings, the route reading
+   *  the spent-mark store itself, and a link module whose read of the seal key
+   *  survives only in a comment. */
+  const LINK_BOTH_READS =
+    "  const raw = sealKeyBytes(env.SAVE_LINK_SEAL_KEY);\n  if ((await env.SAVE_LINK_KV.get(mark)) !== null) return null;\n";
+  const ROUTE_MARK_READ = "  const spent = await env.SAVE_LINK_KV.get(mark);\n";
+  const LINK_KV_ONLY =
+    "  // const raw = sealKeyBytes(env.SAVE_LINK_SEAL_KEY);\n  await env.SAVE_LINK_KV.put(mark, \"1\");\n";
+  const SAVE_ROUTE_MODULE = "src/save/route.ts";
+  /** Phase 29.1: the dispatch's one call, a second door in the tool layer, and
+   *  a dispatch whose only call is inside a comment. */
+  const DISPATCH_CALL = "        return handleSaveDownload(request, env, ctx);\n";
+  const TOOL_DISPATCH_CALL = "  return handleSaveDownload(new Request(url), env, ctx);\n";
+  const COMMENTED_DISPATCH_CALL = "        // return handleSaveDownload(request, env, ctx);\n";
 
   /** One entry per password owner, in the owners' own order. */
   const bothPasswordOwners = PASSWORD_READER_OWNERS.map((file) => ({ file, line: 1, column: 1 }));
@@ -5899,6 +5931,24 @@ describe("the count constraints as a set", () => {
       ...checkRuleAddOwnership(collectRuleAddCalls(RULE_ADD_OWNER, COMMENTED_ADD_CALL)).map(
         (v) => v.pattern,
       ),
+      // The two phase 29.1 counts, both arms through scan()'s own collectors:
+      // the route reading the spent-mark store beside the link module's two
+      // reads, a second door to the route beside the dispatch's one call, and
+      // each owner with a read or its call surviving only in a comment.
+      ...checkSaveLinkBindingOwnership([
+        ...collectSaveLinkBindingReads(SAVE_LINK_OWNER, LINK_BOTH_READS),
+        ...collectSaveLinkBindingReads(SAVE_ROUTE_MODULE, ROUTE_MARK_READ),
+      ]).map((v) => v.pattern),
+      ...checkSaveLinkBindingOwnership(
+        collectSaveLinkBindingReads(SAVE_LINK_OWNER, LINK_KV_ONLY),
+      ).map((v) => v.pattern),
+      ...checkSaveRouteCallOwnership([
+        ...collectSaveRouteCalls(SAVE_ROUTE_OWNER, DISPATCH_CALL),
+        ...collectSaveRouteCalls(TOOL_LAYER, TOOL_DISPATCH_CALL),
+      ]).map((v) => v.pattern),
+      ...checkSaveRouteCallOwnership(
+        collectSaveRouteCalls(SAVE_ROUTE_OWNER, COMMENTED_DISPATCH_CALL),
+      ).map((v) => v.pattern),
       // The second two-owner count, fed the same pair of lists the password
       // count is fed and for the same reason.
       ...checkPrincipalConstructorOwnership([
@@ -6049,6 +6099,18 @@ describe("the count constraints as a set", () => {
         ...collectRuleAddCalls(TOOL_LAYER, TOOL_ADD_CALL),
       ]),
       ...checkRuleAddOwnership(collectRuleAddCalls(RULE_ADD_OWNER, COMMENTED_ADD_CALL)),
+      // The two phase 29.1 counts: one outside and one missing each. Each
+      // outside sample carries its owner too, so only the outside id fires.
+      ...checkSaveLinkBindingOwnership([
+        ...collectSaveLinkBindingReads(SAVE_LINK_OWNER, LINK_BOTH_READS),
+        ...collectSaveLinkBindingReads(SAVE_ROUTE_MODULE, ROUTE_MARK_READ),
+      ]),
+      ...checkSaveLinkBindingOwnership(collectSaveLinkBindingReads(SAVE_LINK_OWNER, LINK_KV_ONLY)),
+      ...checkSaveRouteCallOwnership([
+        ...collectSaveRouteCalls(SAVE_ROUTE_OWNER, DISPATCH_CALL),
+        ...collectSaveRouteCalls(TOOL_LAYER, TOOL_DISPATCH_CALL),
+      ]),
+      ...checkSaveRouteCallOwnership(collectSaveRouteCalls(SAVE_ROUTE_OWNER, COMMENTED_DISPATCH_CALL)),
       // TWO owners again, so the same asymmetric pair the password count needs:
       // both owners plus a non-owner is exactly one outside, and one owner
       // alone is exactly one missing.
@@ -8406,7 +8468,12 @@ describe("the recall backfill's scan rules (Phase 29.1.1)", () => {
       // The typed-out text really was the rule: it fires on the standing sample.
       expect(old().test(violatingSamples_concurrentSession)).toBe(true);
       // And the shipped rule is exactly the old one plus the two names.
-      const shipped = rule("concurrent-session").pattern.source;
+      // Phase 29.1's two save names, added later at the end, are taken off
+      // first; the phase 29.1 block below pins them on their own.
+      const shipped = rule("concurrent-session").pattern.source.replace(
+        "|getAttachmentsForSave|saveParts)",
+        ")",
+      );
       expect(shipped).toBe(
         CONCURRENT_SESSION_BEFORE_29_1_1.source.replace("|runRecallStep|", "|runRecallStep|recallBackfill|runRecallBackfill|"),
       );
@@ -8456,6 +8523,496 @@ describe("the recall backfill's scan rules (Phase 29.1.1)", () => {
 
     it("the tool is not on the job's list", () => {
       expect([...AUTONOMY_TOOLS]).not.toContain("mail_recall_backfill");
+    });
+  });
+});
+
+// Phase 29.1 (SAVE-06, SAVE-08). Saving an attachment adds a public way out of
+// this server: a sealed link to one stored copy, served by a route that needs
+// no sign-in. These rules hold that way out by mechanism. Two counts (one
+// reader of the spent-mark store and the seal key, one file that hands
+// requests to the route), two pattern rules (the route imports no mail or
+// sign-in code, no combinator under src/save/), and three widenings (the
+// fan-out rule, the logging rule, and a sample for the rules job's tool list).
+describe("the save path's scan rules (Phase 29.1)", () => {
+  const rule = (id: string) => FORBIDDEN.find((r) => r.id === id)!;
+  /** Through the real scope mechanism, at a given path. */
+  const hits = (id: string, path: string, text: string): number =>
+    matchRule(rule(id), FORBIDDEN.indexOf(rule(id)), path, text).length;
+
+  // @ts-expect-error — Vite's `import.meta.glob` has no ambient declaration here; see RAW_SOURCES above.
+  const GLOBBED_SRC: Record<string, string> = import.meta.glob("../src/**/*.ts", {
+    query: "?raw",
+    import: "default",
+    eager: true,
+  });
+  /** Every TypeScript file under src/, keyed by its repo-relative path. */
+  const SRC: Record<string, string> = Object.fromEntries(
+    Object.entries(GLOBBED_SRC).map(([key, text]) => [key.replace(/^\.\.\//, ""), text]),
+  );
+  const ROUTE_MODULE = "src/save/route.ts";
+  const STAGE_MODULE = "src/save/stage.ts";
+  const SAVE_TOOL = "src/mcp/tools/save.ts";
+  const ENV_MODULE = "src/env.ts";
+
+  describe("one reader of the spent-mark store and the seal key (save-link-bindings-*)", () => {
+    const owner = () => collectSaveLinkBindingReads(SAVE_LINK_OWNER, SRC[SAVE_LINK_OWNER]!);
+
+    it("names the link module as the owner, over src/, for both bindings", () => {
+      expect(SAVE_LINK_OWNER).toBe("src/save/link.ts");
+      expect(SAVE_LINK_SCOPE).toBe("src/");
+      expect([...SAVE_LINK_BINDING_NAMES].sort()).toEqual(["SAVE_LINK_KV", "SAVE_LINK_SEAL_KEY"]);
+      expect(Object.keys(SAVE_LINK_BINDING_READS).sort()).toEqual([...SAVE_LINK_BINDING_NAMES].sort());
+    });
+
+    it("finds both names read in the real link module, and no reader anywhere else under src/", () => {
+      const collected = Object.keys(SRC).flatMap((file) => collectSaveLinkBindingReads(file, SRC[file]!));
+      expect([...new Set(collected.map((read) => read.file))]).toEqual([SAVE_LINK_OWNER]);
+      expect(collected.map((read) => read.name).sort()).toEqual([...SAVE_LINK_BINDING_NAMES].sort());
+      expect(checkSaveLinkBindingOwnership(collected)).toEqual([]);
+    });
+
+    it("does not count the two declarations in src/env.ts, or a comment line", () => {
+      // The exemption is not decorative: the environment module really does
+      // declare both, and names them in its doc comments too.
+      expect(SRC[ENV_MODULE]).toMatch(/^\s*SAVE_LINK_KV: KVNamespace;$/m);
+      expect(SRC[ENV_MODULE]).toMatch(/^\s*SAVE_LINK_SEAL_KEY: string \| undefined;$/m);
+      expect(collectSaveLinkBindingReads(ENV_MODULE, SRC[ENV_MODULE]!)).toEqual([]);
+      for (const contents of [
+        "  readonly SAVE_LINK_KV: KVNamespace;\n",
+        "  SAVE_LINK_SEAL_KEY?: string | undefined;\n",
+        "// the route never reads env.SAVE_LINK_KV itself\n",
+        "  /*\n   * sealed with env.SAVE_LINK_SEAL_KEY\n   */\n",
+        " * Read only by the link module, never env.SAVE_LINK_SEAL_KEY here.\n",
+      ]) {
+        expect(collectSaveLinkBindingReads(ROUTE_MODULE, contents), contents).toEqual([]);
+      }
+    });
+
+    it("refuses member access, destructuring, bracket access and an object-literal line outside the owner", () => {
+      for (const file of [ROUTE_MODULE, STAGE_MODULE, SAVE_TOOL, "src/mcp/api-handler.ts"]) {
+        for (const line of [
+          "  const spent = await env.SAVE_LINK_KV.get(mark);\n",
+          "  const { SAVE_LINK_SEAL_KEY } = env;\n",
+          '  const key = env["SAVE_LINK_SEAL_KEY"];\n',
+          "    SAVE_LINK_KV: env.SAVE_LINK_KV,\n",
+          "  await environment?.SAVE_LINK_KV.delete(mark);\n",
+        ]) {
+          const violations = checkSaveLinkBindingOwnership([
+            ...owner(),
+            ...collectSaveLinkBindingReads(file, line),
+          ]);
+          expect(violations.map((v) => `${v.pattern} ${v.file}`), `${file}: ${line}`).toEqual([
+            `save-link-bindings-outside-owner ${file}`,
+          ]);
+        }
+      }
+    });
+
+    it("reports a file that reads both, once per binding", () => {
+      const violations = checkSaveLinkBindingOwnership([
+        ...owner(),
+        ...collectSaveLinkBindingReads(
+          ROUTE_MODULE,
+          "  const { SAVE_LINK_KV, SAVE_LINK_SEAL_KEY } = env;\n",
+        ),
+      ]);
+      expect(violations.map((v) => v.pattern)).toEqual([
+        "save-link-bindings-outside-owner",
+        "save-link-bindings-outside-owner",
+      ]);
+    });
+
+    it("reports the link module missing when it no longer names both", () => {
+      const source = SRC[SAVE_LINK_OWNER]!;
+      const withoutSeal = source.split("SAVE_LINK_SEAL_KEY").join("SAVE_LINK_OTHER_KEY");
+      const withoutMarks = source.split("SAVE_LINK_KV").join("SAVE_LINK_OTHER_KV");
+      expect(withoutSeal).not.toBe(source);
+      expect(withoutMarks).not.toBe(source);
+      for (const contents of [
+        withoutSeal,
+        withoutMarks,
+        "export function mintSaveLink(): void {}\n",
+        "  // const raw = sealKeyBytes(env.SAVE_LINK_SEAL_KEY);\n  // await env.SAVE_LINK_KV.get(mark);\n",
+      ]) {
+        const violations = checkSaveLinkBindingOwnership(
+          collectSaveLinkBindingReads(SAVE_LINK_OWNER, contents),
+        );
+        expect(violations.map((v) => v.pattern), contents.slice(0, 80)).toEqual([
+          "save-link-bindings-missing",
+        ]);
+        expect(violations[0]!.file).toBe(SAVE_LINK_OWNER);
+      }
+    });
+
+    it("reports the link module missing even when another file reads both", () => {
+      const violations = checkSaveLinkBindingOwnership(
+        collectSaveLinkBindingReads(ROUTE_MODULE, "  const { SAVE_LINK_KV, SAVE_LINK_SEAL_KEY } = env;\n"),
+      );
+      expect(violations.map((v) => v.pattern).sort()).toEqual([
+        "save-link-bindings-missing",
+        "save-link-bindings-outside-owner",
+        "save-link-bindings-outside-owner",
+      ]);
+    });
+
+    it("collects nothing outside src/", () => {
+      expect(collectSaveLinkBindingReads("test/save-route.test.ts", "env.SAVE_LINK_KV.get(k);")).toEqual([]);
+      expect(collectSaveLinkBindingReads("scripts/grants.mjs", "env.SAVE_LINK_SEAL_KEY;")).toEqual([]);
+    });
+
+    it("each reason says what breaks, names decisions 1 and 1a, and says the store-key rule cannot see it", () => {
+      const [outside, missing] = [
+        ...checkSaveLinkBindingOwnership([{ file: ROUTE_MODULE, line: 1, column: 1, name: "SAVE_LINK_KV" }]),
+      ];
+      expect(outside!.pattern).toBe("save-link-bindings-outside-owner");
+      expect(missing!.pattern).toBe("save-link-bindings-missing");
+      expect(outside!.why).toMatch(/forge/);
+      expect(outside!.why).toMatch(/un-spend/);
+      expect(outside!.why).toMatch(/decisions? 1 and 1a/);
+      expect(outside!.why).toMatch(/store-key-without-a-user/);
+      expect(outside!.why).toMatch(/never the pattern/);
+      expect(missing!.why).toMatch(/quieter/);
+      expect(missing!.why).toMatch(/never the pattern/);
+    });
+  });
+
+  describe("the seal key cannot reach a log in any directory", () => {
+    const PATHS = ["src/save/probe.ts", "scripts/probe.mjs", "test/probe.test.ts"];
+
+    it("fires on the seal key's name inside a logging call, in src/, scripts/ and test/", () => {
+      for (const path of PATHS) {
+        expect(
+          hits("secret-binding-in-log-call", path, 'console.log("sealing", env.SAVE_LINK_SEAL_KEY);'),
+          path,
+        ).toBe(1);
+        expect(
+          hits("secret-binding-in-log-call", path, 'logger.debug("key", holder.SAVE_LINK_SEAL_KEY);'),
+          path,
+        ).toBe(1);
+      }
+    });
+
+    it("fires nothing on the name outside a logging call, and its earlier names still fire", () => {
+      for (const path of PATHS) {
+        expect(hits("secret-binding-in-log-call", path, "const raw = env.SAVE_LINK_SEAL_KEY;"), path).toBe(0);
+        expect(
+          hits("secret-binding-in-log-call", path, 'console.log("x", holder.AUTONOMY_SEAL_KEY);'),
+          path,
+        ).toBe(1);
+        expect(
+          hits("secret-binding-in-log-call", path, 'console.log("x", holder.APPLE_APP_PASSWORD);'),
+          path,
+        ).toBe(1);
+      }
+    });
+
+    it("keeps the rule unscoped, and its reason counts twelve names", () => {
+      expect(rule("secret-binding-in-log-call").scope).toBeUndefined();
+      expect(rule("secret-binding-in-log-call").why).toMatch(/TWELVE/);
+      expect(rule("secret-binding-in-log-call").why).toMatch(/save link/);
+    });
+  });
+
+  describe("one door to the download route (save-route-*)", () => {
+    const owner = () => collectSaveRouteCalls(SAVE_ROUTE_OWNER, SRC[SAVE_ROUTE_OWNER]!);
+
+    it("names the OAuth wiring module as the owner, over src/", () => {
+      expect(SAVE_ROUTE_OWNER).toBe("src/auth/oauth.ts");
+      expect(SAVE_ROUTE_SCOPE).toBe("src/");
+    });
+
+    it("finds exactly one call in the whole real src/ tree, in the dispatch, and not the definition", () => {
+      const collected = Object.keys(SRC).flatMap((file) => collectSaveRouteCalls(file, SRC[file]!));
+      expect(collected.map((call) => call.file)).toEqual([SAVE_ROUTE_OWNER]);
+      expect(checkSaveRouteCallOwnership(collected)).toEqual([]);
+      expect(SRC[ROUTE_MODULE]).toMatch(/export async function handleSaveDownload\(/);
+    });
+
+    it("refuses a second door anywhere else under src/", () => {
+      for (const [file, text] of [
+        ["src/mcp/api-handler.ts", "    return handleSaveDownload(request, env, ctx);\n"],
+        [SAVE_TOOL, "  const res = await handleSaveDownload(new Request(url), environment, ctx);\n"],
+        ["src/save/link.ts", "  return route.handleSaveDownload (request, env, ctx);\n"],
+        ["src/index.ts", "  if (saving) return handleSaveDownload?.(request, env, ctx);\n"],
+      ] as const) {
+        const violations = checkSaveRouteCallOwnership([...owner(), ...collectSaveRouteCalls(file, text)]);
+        expect(violations.map((v) => `${v.pattern} ${v.file}`), file).toEqual([
+          `save-route-outside-dispatch ${file}`,
+        ]);
+      }
+    });
+
+    it("reports the dispatch missing when it holds no call, or only a commented one", () => {
+      const source = SRC[SAVE_ROUTE_OWNER]!;
+      const commentedOut = source.replace(/^(\s*)(return handleSaveDownload\()/m, "$1// $2");
+      expect(commentedOut).not.toBe(source);
+      for (const contents of [
+        "export const oauthOptions = {};\n",
+        "        // return handleSaveDownload(request, env, ctx);\n",
+        commentedOut,
+      ]) {
+        const violations = checkSaveRouteCallOwnership(collectSaveRouteCalls(SAVE_ROUTE_OWNER, contents));
+        expect(violations.map((v) => v.pattern), contents.slice(0, 80)).toEqual(["save-route-missing"]);
+        expect(violations[0]!.file).toBe(SAVE_ROUTE_OWNER);
+      }
+    });
+
+    it("reports the dispatch missing when the only call moved elsewhere", () => {
+      const violations = checkSaveRouteCallOwnership(
+        collectSaveRouteCalls("src/mcp/api-handler.ts", "    return handleSaveDownload(request, env, ctx);\n"),
+      );
+      expect(violations.map((v) => v.pattern).sort()).toEqual([
+        "save-route-missing",
+        "save-route-outside-dispatch",
+      ]);
+    });
+
+    it("does not count the definition, an import or typeof", () => {
+      const fires = (sample: string): boolean =>
+        new RegExp(SAVE_ROUTE_CALL.source, SAVE_ROUTE_CALL.flags).test(sample);
+      for (const sample of [
+        "export async function handleSaveDownload(",
+        "async function handleSaveDownload (request, env, ctx) {",
+        'import { handleSaveDownload } from "../save/route";',
+        "const route: typeof handleSaveDownload = fake;",
+      ]) {
+        expect(fires(sample), `false-positived on ${JSON.stringify(sample)}`).toBe(false);
+      }
+      for (const sample of [
+        "return handleSaveDownload(request, env, ctx);",
+        "void handleSaveDownload (request, env, ctx);",
+        "return handleSaveDownload?.(request, env, ctx);",
+      ]) {
+        expect(fires(sample), `missed ${JSON.stringify(sample)}`).toBe(true);
+      }
+    });
+
+    it("collects nothing outside src/", () => {
+      expect(collectSaveRouteCalls("test/save-route.test.ts", "await handleSaveDownload(req, env, ctx);")).toEqual([]);
+      expect(collectSaveRouteCalls("scripts/probe.mjs", "await handleSaveDownload(req, env, ctx);")).toEqual([]);
+    });
+
+    it("each reason says what breaks and that moving it is a decision", () => {
+      const violations = [
+        ...checkSaveRouteCallOwnership([{ file: "src/mcp/api-handler.ts", line: 1, column: 1 }]),
+      ];
+      expect(violations.map((v) => v.pattern)).toEqual(["save-route-outside-dispatch", "save-route-missing"]);
+      expect(violations[0]!.why).toMatch(/public door/);
+      expect(violations[1]!.why).toMatch(/quieter/);
+      for (const v of violations) expect(v.why, v.pattern).toMatch(/never the pattern/);
+    });
+  });
+
+  describe("the route imports no mail or sign-in code (save-route-reaches-mail)", () => {
+    const ID = "save-route-reaches-mail";
+    const REFUSED = [
+      "../mail/service",
+      "../dav/x",
+      "../mcp/tools/mail",
+      "../agent/lease",
+      "../recall/index",
+      "../auth/login-handler",
+      "../feed/x",
+      "../principal",
+      "../confirm",
+      "../change-marker",
+    ];
+
+    it("is scoped to the route module", () => {
+      expect(rule(ID).scope).toBe(ROUTE_MODULE);
+    });
+
+    it("fires on a static import, a dynamic import and a re-export of each", () => {
+      for (const specifier of REFUSED) {
+        for (const line of [
+          `import { thing } from "${specifier}";`,
+          `import * as all from '${specifier}';`,
+          `import "${specifier}";`,
+          `const later = await import("${specifier}");`,
+          `const later = await import(\n  "${specifier}"\n);`,
+          `export { thing } from "${specifier}";`,
+          `export * from "${specifier}";`,
+          `import type { Thing } from "${specifier}";`,
+          `import { thing } from "${specifier}.ts";`,
+        ]) {
+          expect(hits(ID, ROUTE_MODULE, line), line).toBe(1);
+        }
+      }
+    });
+
+    it("does not fire on the environment's type, the link helpers, the bucket helpers or prose", () => {
+      for (const line of [
+        'import type { Env } from "../env";',
+        'import { SAVE_ROUTE_PATH, type SaveClaim, claimSaveLink, hasSaveTokenShape } from "./link";',
+        'import { type SavedStream, deleteStaged, openSaved } from "../staging/r2";',
+        "// It opens no mail connection, takes no lease and reads no sign-in.",
+        'import { thing } from "../principalish";',
+      ]) {
+        expect(hits(ID, ROUTE_MODULE, line), line).toBe(0);
+      }
+    });
+
+    it("gives nothing on the real route", () => {
+      expect(hits(ID, ROUTE_MODULE, SRC[ROUTE_MODULE]!)).toBe(0);
+    });
+
+    it("does not reach the stage module, which reads mail on purpose", () => {
+      expect(hits(ID, STAGE_MODULE, 'import type { SavePartRead } from "../mail/service";')).toBe(0);
+    });
+
+    it("its reason says the route would become a mail reader with no sign-in", () => {
+      expect(rule(ID).why).toMatch(/no sign-in/);
+      expect(rule(ID).why).toMatch(/decision/);
+    });
+  });
+
+  describe("no combinator under src/save/ (save-combinator)", () => {
+    const ID = "save-combinator";
+
+    it("is scoped to the save module", () => {
+      expect(rule(ID).scope).toBe("src/save/");
+    });
+
+    it("fires on each of the four combinators in the save module", () => {
+      for (const file of [STAGE_MODULE, ROUTE_MODULE, "src/save/link.ts"]) {
+        for (const line of [
+          "const rows = await Promise.all(items.map((item) => saveOne(env, item)));",
+          "await Promise.allSettled(puts);",
+          "const first = await Promise.any(reads);",
+          "const winner = await Promise . race ([a, b]);",
+        ]) {
+          expect(hits(ID, file, line), `${file}: ${line}`).toBe(1);
+        }
+      }
+    });
+
+    it("does not fire outside src/save/", () => {
+      expect(hits(ID, "src/mcp/tools/rules.ts", "await Promise.all(rules.map((r) => check(r)));")).toBe(0);
+    });
+
+    it("gives nothing on the real save module", () => {
+      for (const file of Object.keys(SRC).filter((f) => f.startsWith("src/save/"))) {
+        expect(hits(ID, file, SRC[file]!), file).toBe(0);
+      }
+    });
+
+    it("its reason says what a combinator multiplies", () => {
+      expect(rule(ID).why).toMatch(/session/);
+      expect(rule(ID).why).toMatch(/storage/);
+    });
+  });
+
+  describe("the fan-out rule reaches the save read and the save loop", () => {
+    /** `concurrent-session` exactly as it shipped before plan 29.1-08. */
+    const CONCURRENT_SESSION_BEFORE_29_1_08 =
+      /\bPromise\.(?:all|allSettled|any|race)\s*\([^;]{0,400}?(?:withMailSession|withMutatingMailbox|withConnectionLease|markRead|markUnread|flagMessage|unflagMessage|moveMessages|deleteDraft|readMoveSet|readDraftForChange|buildMovePreview|applyMailCommit|indexNextPage|reconcileMailbox|recallStep|runRecallStep|recallBackfill|runRecallBackfill|indexNewMail|windowUids|summariesInRange|newMailPage|underLease|checkBuilt|syncDeletions|folderSnapshots|listFolders|withAutonomySession|setFlag|placeDraft)/g;
+    const old = () =>
+      new RegExp(CONCURRENT_SESSION_BEFORE_29_1_08.source, CONCURRENT_SESSION_BEFORE_29_1_08.flags);
+    const fanOut = (name: string, combinator = "all"): string =>
+      `await Promise.${combinator}(messages.map((m) => ${name}(actor, gate, m.refs)));`;
+
+    it("fires on a combinator around the save read, its stream form and the save loop, anywhere under src/", () => {
+      for (const name of ["getAttachmentsForSave", "getAttachmentsForSaveOver", "saveParts"]) {
+        for (const combinator of ["all", "allSettled", "any", "race"]) {
+          for (const file of [SAVE_TOOL, STAGE_MODULE, "src/mcp/tools/mail.ts"]) {
+            expect(hits("concurrent-session", file, fanOut(name, combinator)), `${name} ${combinator} ${file}`)
+              .toBe(1);
+          }
+        }
+      }
+    });
+
+    it("the rule as it shipped before this plan misses each, so the widening has teeth", () => {
+      for (const name of ["getAttachmentsForSave", "saveParts"]) {
+        expect(old().test(fanOut(name)), `the old pattern already saw ${name}`).toBe(false);
+      }
+      expect(old().test(violatingSamples_concurrentSession)).toBe(true);
+      const shipped = rule("concurrent-session").pattern.source;
+      expect(shipped).toBe(
+        CONCURRENT_SESSION_BEFORE_29_1_08.source.replace("|placeDraft)", "|placeDraft|getAttachmentsForSave|saveParts)"),
+      );
+    });
+
+    it("every sample the old rule fired on still fires", () => {
+      for (const name of ["withMailSession", "withConnectionLease", "recallBackfill", "placeDraft"]) {
+        expect(old().test(fanOut(name)), name).toBe(true);
+        expect(hits("concurrent-session", SAVE_TOOL, fanOut(name)), name).toBe(1);
+      }
+    });
+
+    it("does not fire on one awaited call of each", () => {
+      for (const permitted of [
+        "          getAttachmentsForSave(actor, gate, refs),",
+        "  const rows = await saveParts(env, userId, items, now);",
+      ]) {
+        expect(hits("concurrent-session", SAVE_TOOL, permitted), permitted).toBe(0);
+      }
+    });
+
+    it("finds no fan-out in the real tree", () => {
+      expect(scan().map((v) => v.pattern)).not.toContain("concurrent-session");
+    });
+  });
+
+  describe("the rules job cannot name the save tool", () => {
+    const ID = "agent-tool-outside-allowlist";
+
+    it("fires on a quoted mail_save_attachment in the job and in the one tool list file", () => {
+      for (const file of ["src/agent/job.ts", AUTONOMY_WRITE_LIST_FILE]) {
+        for (const quote of ['"', "'", "`"]) {
+          expect(
+            hits(ID, file, `await call(${quote}mail_save_attachment${quote}, { id: row.id });`),
+            `${file} ${quote}`,
+          ).toBe(1);
+        }
+      }
+    });
+
+    it("the tool is not on the job's list", () => {
+      expect([...AUTONOMY_TOOLS]).not.toContain("mail_save_attachment");
+    });
+  });
+
+  describe("the four ids are wired into scan()", () => {
+    const COUNT_IDS = [
+      "save-link-bindings-outside-owner",
+      "save-link-bindings-missing",
+      "save-route-outside-dispatch",
+      "save-route-missing",
+    ];
+
+    it("lists every id in the count set", () => {
+      for (const id of COUNT_IDS) expect(OWNERSHIP_VIOLATION_IDS, id).toContain(id);
+    });
+
+    it("the real tree reports none of them, nor the two new rules, and scripts/ alone reports each missing arm", () => {
+      const whole = scan().map((v) => v.pattern);
+      for (const id of [...COUNT_IDS, "save-route-reaches-mail", "save-combinator"]) {
+        expect(whole, id).not.toContain(id);
+      }
+      const scriptsOnly = new Set(scan("scripts").map((v) => v.pattern));
+      expect(scriptsOnly.has("save-link-bindings-missing")).toBe(true);
+      expect(scriptsOnly.has("save-route-missing")).toBe(true);
+    });
+
+    it("gives the four ids distinct sort keys after the backfill counts'", () => {
+      const index = [
+        ...checkSaveLinkBindingOwnership([{ file: ROUTE_MODULE, line: 1, column: 1, name: "SAVE_LINK_KV" }]),
+        ...checkSaveRouteCallOwnership([{ file: SAVE_TOOL, line: 1, column: 1 }]),
+      ].map((v) => `${v.pattern} ${v.patternIndex - FORBIDDEN.length}`);
+      expect(index).toEqual([
+        "save-link-bindings-outside-owner 60",
+        "save-link-bindings-missing 61",
+        "save-route-outside-dispatch 62",
+        "save-route-missing 63",
+      ]);
+    });
+
+    it("keeps both owners and the route inside every pattern rule's reach", () => {
+      for (const file of [SAVE_LINK_OWNER, SAVE_ROUTE_OWNER, ROUTE_MODULE, STAGE_MODULE]) {
+        expect(EXCLUDED.has(file), file).toBe(false);
+      }
     });
   });
 });
