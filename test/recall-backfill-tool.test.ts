@@ -31,6 +31,7 @@ import type { FolderState } from "../src/change-marker";
 import { toErrorCategory, ConnectionBusyError } from "../src/errors";
 import {
   BACKFILL_NOTE,
+  BACKFILL_PROGRESS_UNREAD,
   BACKFILL_REFUSED,
   BACKFILL_UNAVAILABLE,
   type BackfillAnswerInput,
@@ -658,6 +659,60 @@ describe("the backfill tool, live against the real object", () => {
     expect(answer.isError).toBe(true);
     expect(answer.content[0]!.text).toBe(JSON.stringify({ message: BACKFILL_UNAVAILABLE }));
     expect(h.log).toEqual([]);
+  });
+
+  // 29.1.1-REVIEW WR-01: an object read that fails after a page was indexed
+  // must not answer that nothing was indexed.
+  it("the object read fails mid-call, after a page: the call stops as failed and the answer says what was indexed", async () => {
+    const h = fakeStepDeps({
+      folders: [INBOX],
+      mailboxes: { [INBOX]: { uidValidity: 100, messages: canaryMessages(60, 2, "w") } },
+    });
+    // Reads 1 to 3: the loop's first read, the seed pass and the first page's
+    // pass. Read 4, the next pass, fails; every read after it works.
+    await runInDurableObject(objectFor(USER_A.userId), (instance: UserAgent) => {
+      const prototype = Object.getPrototypeOf(instance) as UserAgent;
+      const original = prototype.recallSyncState;
+      let calls = 0;
+      vi.spyOn(prototype, "recallSyncState").mockImplementation(function (this: UserAgent) {
+        calls += 1;
+        if (calls === 4) throw new Error("object-out-of-reach");
+        return original.call(this);
+      });
+    });
+
+    const answer = await backfillTool(h).call();
+
+    expect(answer.isError).not.toBe(true);
+    const parsed = parse(answer);
+    expect(parsed.stopped).toBe("failed");
+    expect(parsed.thisCall).toMatchObject({ pages: 1, messages: 25 });
+    expect(await ledgerCount(USER_A.userId)).toBe(25);
+  });
+
+  it("the read after the run fails, after pages were indexed: a fixed error that does not say nothing was indexed", async () => {
+    const h = fakeStepDeps({
+      folders: [INBOX],
+      mailboxes: { [INBOX]: { uidValidity: 100, messages: canaryMessages(30, 2, "v") } },
+    });
+    // The read before the run works; the read after it fails.
+    await runInDurableObject(objectFor(USER_A.userId), (instance: UserAgent) => {
+      const prototype = Object.getPrototypeOf(instance) as UserAgent;
+      const original = prototype.recallProgress;
+      let calls = 0;
+      vi.spyOn(prototype, "recallProgress").mockImplementation(function (this: UserAgent) {
+        calls += 1;
+        if (calls === 2) throw new Error("object-out-of-reach");
+        return original.call(this);
+      });
+    });
+
+    const answer = await backfillTool(h).call();
+
+    expect(await ledgerCount(USER_A.userId)).toBe(30);
+    expect(answer.isError).toBe(true);
+    expect(JSON.parse(answer.content[0]!.text)).toEqual({ message: BACKFILL_PROGRESS_UNREAD });
+    expect(BACKFILL_PROGRESS_UNREAD).not.toMatch(/nothing was indexed/);
   });
 
   const refused: [string, string | null][] = [

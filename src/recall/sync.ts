@@ -1045,7 +1045,9 @@ function backfillStopOf(outcome: StepOutcome): BackfillStop {
  *
  * Never throws for a failure on a folder or the listing: those are recorded
  * where a step records them, and the call stops as `failed`. A throw from the
- * first object read means the object is out of reach, and propagates. No
+ * first object read means the object is out of reach, and propagates. A later
+ * object read that fails stops the call as `failed`, since pages may already
+ * be indexed. No
  * caught value is read, nothing here logs, and there is no combinator, sleep or
  * retry.
  */
@@ -1097,7 +1099,14 @@ export async function recallBackfill(
     if (pages >= maxPages || sessions >= maxSteps || deps.now() - started >= budgetMs) {
       return stop("budget");
     }
-    const state = await stub.recallSyncState();
+    // Only the first read may throw out of here (29.1.1-REVIEW WR-01): pages
+    // may already be indexed, and the caller must not say nothing was.
+    let state: Awaited<ReturnType<typeof stub.recallSyncState>>;
+    try {
+      state = await stub.recallSyncState();
+    } catch {
+      return stop("failed");
+    }
     if (state.backfill !== "free") return stop(state.backfill);
     const folders = state.folders;
     if (folders === null) return stop("waiting");
