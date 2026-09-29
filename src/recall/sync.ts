@@ -143,10 +143,12 @@ import {
   type SyncRow,
   syncRowIn,
 } from "../agent/recall-ledger";
-import type { CursorUpdate } from "../agent/user-agent";
+import { type CursorUpdate, LEASE_TTL_MS } from "../agent/user-agent";
 import type { FolderState } from "../change-marker";
 import { ConnectionBusyError } from "../errors";
+import { CLOSE_TIMEOUT_MS, DRAIN_TIMEOUT_MS } from "../mail/imap-session";
 import {
+  CALL_DEADLINE_MS,
   DEFAULT_MAILBOX,
   type FolderListing,
   type FolderSnapshotOutcome,
@@ -956,14 +958,18 @@ async function syncDeletions(
  *   calls and 10,000 subrequests on the paid plan;
  * - sessions are serial, one socket open at a time, so the six-connection
  *   budget is never approached;
- * - RECALL_BACKFILL_BUDGET_MS bounds wall-clock time whatever a real page
- *   costs.
+ * - RECALL_BACKFILL_BUDGET_MS bounds how long the call goes on starting new
+ *   work. It does not bound how long the last page takes (29.1.1-REVIEW
+ *   WR-04): a page started just inside it runs to its end.
  * CPU time and real per-page seconds cannot be measured in the pool. The
  * owner's first live run records both (plan 29.1.1-04).
  */
 export const RECALL_BACKFILL_MAX_PAGES = 10;
 
-/** The most time one backfill call spends starting new work, in ms (LD-7). */
+/**
+ * How long into a backfill call a new pass may still start, in ms (LD-7). A
+ * pass started just inside it runs to its end, so a call can take longer.
+ */
 export const RECALL_BACKFILL_BUDGET_MS = 20000;
 
 /**
@@ -981,6 +987,21 @@ export const RECALL_BACKFILL_MAX_STEPS = RECALL_BACKFILL_MAX_PAGES + MAX_RECALL_
  * page with no rows (./mail-source.ts). A seed or a listing opens one.
  */
 export const RECALL_PASS_MAX_SESSIONS = 3;
+
+/**
+ * The longest one session keeps its socket open once its work has started:
+ * the call deadline, the drain bound and the close bound, 25 s. The lease is
+ * sized from the same sum plus a margin (LEASE_TTL_MS, 30 s).
+ *
+ * A backfill session starts only when this much time is left on its lease,
+ * measured from before the lease was asked for, so the lease cannot expire
+ * while the socket is open and let another request open a second connection
+ * (29.1.1-REVIEW WR-04). A lease's first session always fits. A second or
+ * third session under the same lease starts only within the margin; after it,
+ * the gate refuses before any socket opens, and the page fails as any failed
+ * read does.
+ */
+export const RECALL_SESSION_MAX_MS = CALL_DEADLINE_MS + DRAIN_TIMEOUT_MS + CLOSE_TIMEOUT_MS;
 
 /**
  * Why a backfill call stopped.
@@ -1084,12 +1105,15 @@ export async function recallBackfill(
   const stop = (stopped: BackfillStop): BackfillOutcome => ({ stopped, pages, sessions });
 
   // The same deps, except that each session opened on the lease's gate is
-  // counted (WR-03). A session takes the gate once, after its socket opened.
+  // counted (WR-03), and a session that could outlive the lease reads the gate
+  // as held, so it is refused before its socket opens (WR-04). A session
+  // checks the gate before its socket opens, and takes it once after.
   const counted: StepDeps = {
     ...deps,
     leased: {
-      withConnectionLease: (who, fn) =>
-        deps.leased.withConnectionLease(who, (gate) =>
+      withConnectionLease: (who, fn) => {
+        const askedAt = deps.now();
+        return deps.leased.withConnectionLease(who, (gate) =>
           fn({
             acquire() {
               sessions += 1;
@@ -1097,10 +1121,11 @@ export async function recallBackfill(
             },
             release: () => gate.release(),
             get held() {
-              return gate.held;
+              return gate.held || deps.now() - askedAt + RECALL_SESSION_MAX_MS > LEASE_TTL_MS;
             },
           }),
-        ),
+        );
+      },
     },
   };
 

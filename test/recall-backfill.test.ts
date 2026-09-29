@@ -25,9 +25,10 @@ import {
   utcDay,
   writeState,
 } from "../src/agent/recall-ledger";
-import type { UserAgent } from "../src/agent/user-agent";
+import { LEASE_TTL_MS, type UserAgent } from "../src/agent/user-agent";
 import { AUTONOMY_CLIENT_ID } from "../src/agent/autonomy-client";
 import type { FolderState } from "../src/change-marker";
+import { ImapThrottleError } from "../src/errors";
 import type { Principal } from "../src/principal";
 import { runRecallBackfill } from "../src/recall/drive";
 import {
@@ -49,6 +50,7 @@ import {
   RECALL_BACKFILL_MAX_PAGES,
   RECALL_BACKFILL_MAX_STEPS,
   RECALL_PASS_MAX_SESSIONS,
+  RECALL_SESSION_MAX_MS,
   recallBackfill,
   recallStep,
   type StepDeps,
@@ -583,6 +585,51 @@ describe("recallBackfill fills a person's index across calls, one session at a t
     expect(opened).toBeLessThanOrEqual(RECALL_BACKFILL_MAX_STEPS);
     expect(outcome).toEqual({ stopped: "budget", pages: 5, sessions: 15 });
   });
+
+  // 29.1.1-REVIEW WR-04: a session that could still be open when its lease
+  // expires is never started, so no other request can take the lease while
+  // this socket is open.
+  const lateSessions: [string, number, "opened" | "refused"][] = [
+    ["fits in the lease", LEASE_TTL_MS - RECALL_SESSION_MAX_MS, "opened"],
+    ["could outlive the lease", LEASE_TTL_MS - RECALL_SESSION_MAX_MS + 1, "refused"],
+  ];
+
+  it.each(lateSessions)(
+    "a second session under one lease that %s (%i ms in): %s",
+    async (_label, elapsed, expected) => {
+      const a = await testPrincipal(USER_A);
+      const h = await inboxAtBuild(60);
+      let clock = Date.now();
+      let extra: "pending" | "opened" | "refused" = "pending";
+      const deps: StepDeps = {
+        ...h.deps,
+        now: () => clock,
+        source: {
+          ...h.deps.source,
+          async page(gate, principal, mailbox, cursor) {
+            const page = await h.deps.source.page(gate, principal, mailbox, cursor);
+            if (extra === "pending") {
+              // The page's own session took `elapsed` since the lease was asked for.
+              clock += elapsed;
+              if (gate.held) {
+                extra = "refused";
+                throw new ImapThrottleError();
+              }
+              gate.acquire();
+              gate.release();
+              extra = "opened";
+            }
+            return page;
+          },
+        },
+      };
+
+      const outcome = await recallBackfill(a, deps);
+
+      expect(extra).toBe(expected);
+      expect(outcome.stopped).toBe(expected === "opened" ? "built" : "failed");
+    },
+  );
 
   it("every folder built: stops as built, opens nothing and changes nothing", async () => {
     const a = await testPrincipal(USER_A);
