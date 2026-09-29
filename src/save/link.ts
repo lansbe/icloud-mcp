@@ -85,6 +85,20 @@ const TOKEN_ALPHABET = /^[A-Za-z0-9_-]+$/;
 const TOKEN_MIN_CHARS = 64;
 const TOKEN_MAX_CHARS = 512;
 
+/**
+ * Whether `token` has a link's shape: the URL-safe alphabet, inside the length
+ * window. Nothing is read and no crypto runs. The route asks this before it
+ * reads anything, and `claimSaveLink` asks it again, so the two cannot drift.
+ */
+export function hasSaveTokenShape(token: unknown): token is string {
+  return (
+    typeof token === "string" &&
+    token.length >= TOKEN_MIN_CHARS &&
+    token.length <= TOKEN_MAX_CHARS &&
+    TOKEN_ALPHABET.test(token)
+  );
+}
+
 /** What a link opens to. */
 export type SaveClaim =
   | { state: "live"; userId: string; key: string; sizeBytes: number }
@@ -250,9 +264,7 @@ export async function claimSaveLink(
   token: string,
   nowMs: number,
 ): Promise<SaveClaim | null> {
-  if (typeof token !== "string") return null;
-  if (token.length < TOKEN_MIN_CHARS || token.length > TOKEN_MAX_CHARS) return null;
-  if (!TOKEN_ALPHABET.test(token)) return null;
+  if (!hasSaveTokenShape(token)) return null;
 
   const cryptoKey = await sealKey(env);
   if (cryptoKey === null) return null;

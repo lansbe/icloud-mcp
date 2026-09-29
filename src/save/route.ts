@@ -9,8 +9,9 @@
 //
 // What each answer is:
 //   - anything but GET: 405, and nothing is read;
-//   - every bad link, spent link, expired link and missing copy: one empty 410;
-//   - the spent-mark store failing: an empty 503;
+//   - every bad link, spent link, expired link and missing copy: one empty 410,
+//     and an expired link's copy is deleted first;
+//   - the spent-mark store or the bucket failing: an empty 503;
 //   - otherwise: 200, the copy's exact bytes, always as a file to save and never
 //     as a page to show, and the copy is deleted once the stream ends.
 //
@@ -18,11 +19,19 @@
 // any. A caught value is never read.
 
 import type { Env } from "../env";
-import { deleteStaged, openSaved } from "../staging/r2";
-import { SAVE_ROUTE_PATH, claimSaveLink } from "./link";
+import { type SavedStream, deleteStaged, openSaved } from "../staging/r2";
+import { SAVE_ROUTE_PATH, type SaveClaim, claimSaveLink, hasSaveTokenShape } from "./link";
 
-/** The headers every answer carries: nothing here may be cached. */
-const NO_STORE = { "cache-control": "no-store" } as const;
+/**
+ * Every answer that is not a download, built in one place so the bodies and
+ * headers cannot drift apart. Always an empty body and no-store; a 405 also
+ * says which method works. Nothing here names why a link was refused.
+ */
+function refuse(status: 405 | 410 | 503): Response {
+  const headers: Record<string, string> = { "cache-control": "no-store" };
+  if (status === 405) headers.allow = "GET";
+  return new Response(null, { status, headers });
+}
 
 /**
  * The download's headers, fixed. The filename is the fixed word "download",
@@ -38,13 +47,12 @@ const DOWNLOAD_HEADERS = {
   "referrer-policy": "no-referrer",
 } as const;
 
-/** The one answer for every link that does not lead to a file. */
-function gone(): Response {
-  return new Response(null, { status: 410, headers: NO_STORE });
-}
-
 /**
  * Serve one download.
+ *
+ * The checks run in a fixed order. The method first and the token's shape
+ * second, both before anything is read, so a HEAD or any other prefetch never
+ * reaches the spent mark. Then the claim, which spends the link.
  *
  * `clock` is injectable so a test can pin the instant; production passes
  * nothing and gets the wall clock.
@@ -55,41 +63,38 @@ export async function handleSaveDownload(
   ctx: ExecutionContext,
   clock: () => number = () => Date.now(),
 ): Promise<Response> {
-  if (request.method !== "GET") {
-    return new Response(null, { status: 405, headers: { allow: "GET", ...NO_STORE } });
-  }
+  if (request.method !== "GET") return refuse(405);
 
   const pathname = new URL(request.url).pathname;
-  if (!pathname.startsWith(SAVE_ROUTE_PATH)) return gone();
-  const token = pathname.slice(SAVE_ROUTE_PATH.length);
+  const token = pathname.startsWith(SAVE_ROUTE_PATH)
+    ? pathname.slice(SAVE_ROUTE_PATH.length)
+    : "";
+  if (!hasSaveTokenShape(token)) return refuse(410);
 
-  let claim: Awaited<ReturnType<typeof claimSaveLink>>;
+  let claim: SaveClaim | null;
+  let saved: SavedStream | null;
   try {
     claim = await claimSaveLink(env, token, clock());
-  } catch {
-    return new Response(null, { status: 503, headers: NO_STORE });
-  }
-  if (claim === null) return gone();
-  if (claim.state === "expired") {
-    // The link is dead, so its copy is too: remove it now rather than leave it
-    // for the bucket's sweep. A failed delete still answers 410.
-    try {
-      await deleteStaged(env, claim.userId, claim.key);
-    } catch {
-      // The bucket's sweep is the backstop.
+    if (claim === null) return refuse(410);
+    if (claim.state === "expired") {
+      // The link is dead, so its copy is too: remove it now rather than leave
+      // it for the bucket's sweep. A failed delete still answers 410.
+      await deleteStaged(env, claim.userId, claim.key).catch(() => undefined);
+      return refuse(410);
     }
-    return gone();
+    saved = await openSaved(env, claim.userId, claim.key);
+  } catch {
+    // The mark store or the bucket failed. Serve nothing.
+    return refuse(503);
   }
-
-  const { userId, key } = claim;
-  const saved = await openSaved(env, userId, key);
-  if (saved === null) return gone();
+  if (saved === null) return refuse(410);
   if (saved.sizeBytes !== claim.sizeBytes) {
     // Not the copy the link was sealed for. Serve nothing.
     await saved.body.cancel().catch(() => undefined);
-    return gone();
+    return refuse(410);
   }
 
+  const { userId, key } = claim;
   const { readable, writable } = new FixedLengthStream(saved.sizeBytes);
   const piped = saved.body.pipeTo(writable).then(
     () => undefined,
