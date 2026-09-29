@@ -3,8 +3,15 @@
 // SECURITY.md's recall section ends by saying "a check keeps this section equal
 // to them". This file is that check. It reads SECURITY.md as text and asserts
 // that the recall section and the autonomous rules section state each number
-// exactly as the code has it. Each expected phrase is built from its constant,
-// never typed, so changing a constant turns this red until the text changes too.
+// the code holds as a constant exactly as the code has it, and that the
+// connection section states the lease length. Each expected phrase is built
+// from its constant, never typed, so changing a constant turns this red until
+// the text changes too. A "day" in the text is held by asserting its constant
+// is one day, since any other length needs new words.
+//
+// What it does not hold: numbers with no constant behind them, such as the
+// rules section's "a reply is two iCloud sessions", and any section other than
+// these three.
 //
 // Text is compared with runs of whitespace collapsed to one space, because the
 // file wraps its lines and a phrase can cross a line break.
@@ -12,10 +19,16 @@
 import { describe, expect, it } from "vitest";
 
 import { JOB_CADENCE_MS } from "../src/agent/cadence";
-import { MAX_DRAFTS_PER_DAY, MAX_DRAFTS_PER_RUN, MAX_FLAGS_PER_RUN } from "../src/agent/job";
+import {
+  JOB_BACKOFF_MAX_MS,
+  MAX_DRAFTS_PER_DAY,
+  MAX_DRAFTS_PER_RUN,
+  MAX_FLAGS_PER_RUN,
+  RULES_FORGET_GRACE_MS,
+} from "../src/agent/job";
 import { RECALL_PAGE_PAUSE_MS } from "../src/agent/recall-ledger";
 import { MAX_RULES } from "../src/agent/rules";
-import { LEASE_TTL_MS } from "../src/agent/user-agent";
+import { LEASE_TTL_MS, RECALL_SWEEP_MAX_INTERVAL_MS } from "../src/agent/user-agent";
 import {
   RECALL_BACKFILL_MAX_PAGES_PER_DAY,
   RECALL_MAX_PAGES_PER_DAY,
@@ -23,7 +36,7 @@ import {
   RECALL_PAGE_SIZE,
   RECALL_TTL_MS,
 } from "../src/recall/retention";
-import { RECALL_BACKFILL_MAX_PAGES } from "../src/recall/sync";
+import { RECALL_BACKFILL_MAX_PAGES, RECALL_PASS_MAX_SESSIONS } from "../src/recall/sync";
 
 // A Workers isolate has no filesystem, so the file is read with Vite's
 // build-time glob, as the other source-reading tests do.
@@ -51,6 +64,7 @@ function count(n: number): string {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
+const WORDS = ["zero", "one", "two", "three", "four", "five"];
 
 const RECALL = section("Recall keeps a searchable copy of your recent mail");
 const RULES = section("Autonomous rules");
@@ -97,6 +111,18 @@ describe("SECURITY.md's numbers equal the constants in the code", () => {
     expect(RECALL).toContain(`outlast its ${LEASE_TTL_MS / 1000}-second lease`);
   });
 
+  it("the recall section states how many sessions an ordinary page opens", () => {
+    const word = WORDS[RECALL_PASS_MAX_SESSIONS];
+    expect(word, "the session count has no word; the text needs new words").toBeDefined();
+    expect(RECALL).toContain(`An ordinary page can open up to ${word} sessions`);
+  });
+
+  it("the recall section states how soon it notices lost access", () => {
+    // Written as "within a day"; any other interval needs new words.
+    expect(RECALL_SWEEP_MAX_INTERVAL_MS).toBe(DAY_MS);
+    expect(RECALL).toContain("Everything is deleted within a day of the person's access ending.");
+  });
+
   it("the recall section names every file its numbers come from", () => {
     for (const file of ["src/recall/retention.ts", "src/recall/sync.ts", "src/agent/recall-ledger.ts"]) {
       expect(RECALL).toContain(`\`${file}\``);
@@ -111,6 +137,14 @@ describe("SECURITY.md's numbers equal the constants in the code", () => {
       `Limits: ${MAX_FLAGS_PER_RUN} flags and ${MAX_DRAFTS_PER_RUN} replies a run, ` +
         `${MAX_DRAFTS_PER_DAY} replies a day, ${MAX_RULES} rules.`,
     );
+  });
+
+  it("the autonomous rules section states the longest wait and the forget gap", () => {
+    // Both are written as "a day"; any other length needs new words.
+    expect(JOB_BACKOFF_MAX_MS).toBe(DAY_MS);
+    expect(RULES).toContain("between tries instead, up to a day,");
+    expect(RULES_FORGET_GRACE_MS).toBe(DAY_MS);
+    expect(RULES).toContain("seen on two checks a day apart");
   });
 
   it("the connection section states the lease length", () => {
