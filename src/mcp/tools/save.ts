@@ -9,7 +9,9 @@
 //
 // THE ORDER IS THE SAFETY (./.claude/CLAUDE.md §3, §5):
 //   1. await the principal;
-//   2. refuse as a value if links cannot be sealed, before anything else;
+//   2. refuse as a value if links cannot be sealed, or if the request's grant
+//      is not a person's own app (the autonomy key, or a client that cannot be
+//      named), before anything else;
 //   3. drop repeated ids, then decode every id, so a bad id costs no
 //      connection;
 //   4. refuse as a value if the ids name more than one message, before the
@@ -24,6 +26,8 @@
 //
 // Only the person, asking now. This tool is not one the autonomous layer can
 // name, and it is registered on the plain server, so no recall step follows it.
+// It also refuses the autonomy key at the server, with the same test the recall
+// backfill makes, so the calling side is not the only guard.
 //
 // WHAT IS TRUSTED. Ids, links, sizes, hashes, expiries, refusals, whether a
 // file can run code, and the two fixed sentences are this server's, and go in
@@ -41,6 +45,7 @@ import { decodeAttachmentId } from "../../mail/ids";
 import type { AttachmentRef } from "../../mail/ids";
 import { getAttachmentsForSave } from "../../mail/service";
 import type { Principal } from "../../principal";
+import { type GrantClient, isPersonClient } from "../../recall/drive";
 import { opensAsProgram } from "../../save/filename";
 import { SAVE_LINK_TTL_MS, saveLinksConfigured } from "../../save/link";
 import { type SaveRow, saveParts } from "../../save/stage";
@@ -187,6 +192,9 @@ export function saveToolResult(
 /**
  * Register `mail_save_attachment`.
  *
+ * `grantClient` says which client the request's grant belongs to. Anything but
+ * a person's own app is refused, as the recall backfill refuses it.
+ *
  * `environment` is the test seam, like `createLoginHandler`'s injected
  * defaults: production passes nothing and gets the Worker's own environment. A
  * test hands a fresh copy with one field changed, never a write onto the
@@ -196,6 +204,7 @@ export function registerSaveTool(
   server: McpServer,
   mail: LeasedMail,
   principal: Promise<Principal>,
+  grantClient: GrantClient,
   environment: Env = ambientEnv,
 ): void {
   server.registerTool(
@@ -220,6 +229,12 @@ export function registerSaveTool(
         // No seal key, no links: refused as a value, before anything is read,
         // decoded, leased or stored.
         if (!saveLinksConfigured(environment)) {
+          return saveToolResult([], "save-not-set-up");
+        }
+
+        // Only a person's own app, never the autonomy key: refused the same
+        // way, before any id is decoded or the lease is taken.
+        if (!isPersonClient(await grantClient())) {
           return saveToolResult([], "save-not-set-up");
         }
 

@@ -27,7 +27,7 @@ vi.mock("../src/mail/service", async (importOriginal) => {
   return { ...actual, getAttachmentsForSave: vi.fn(actual.getAttachmentsForSave) };
 });
 
-import { AUTONOMY_TOOLS } from "../src/agent/autonomy-client";
+import { AUTONOMY_CLIENT_ID, AUTONOMY_TOOLS } from "../src/agent/autonomy-client";
 import { createLeasedMail } from "../src/agent/lease";
 import type { Env } from "../src/env";
 import { encodeAttachmentId } from "../src/mail/ids";
@@ -231,10 +231,17 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 
 // ---------------------------------------------------------------- the tool
 
-function realSave(): { callback: Callback; options: Registration } {
+/** The grant of a person's own app, as the door reads it. */
+const PERSON_GRANT = async (): Promise<string | null> => "claude-desktop-client";
+
+function realSave(
+  grantClient: () => Promise<string | null> = PERSON_GRANT,
+): { callback: Callback; options: Registration } {
   const spy = vi.spyOn(McpServer.prototype, "registerTool");
   try {
-    createServerFactory(ownerPrincipal() as Promise<Principal>)({ era: "modern" } as never);
+    createServerFactory(ownerPrincipal() as Promise<Principal>, [], grantClient)({
+      era: "modern",
+    } as never);
     const found = (spy.mock.calls as unknown as [string, Registration, Callback][]).find(
       ([name]) => name === TOOL,
     );
@@ -257,6 +264,7 @@ function saveOver(environment: Env): Callback {
     server as unknown as McpServer,
     createLeasedMail(createSessionGate()),
     ownerPrincipal(),
+    PERSON_GRANT,
     environment,
   );
   expect(callback, `${TOOL} is not registered`).toBeDefined();
@@ -554,5 +562,22 @@ describe("the tool's standing gates", () => {
 
   it("is not one of the autonomous layer's tools", () => {
     expect((AUTONOMY_TOOLS as readonly string[]).includes(TOOL)).toBe(false);
+  });
+
+  it("refuses the autonomy key, and a grant it cannot name, at the server, before any read", async () => {
+    const grants: [string, () => Promise<string | null>][] = [
+      ["the autonomy key", async () => AUTONOMY_CLIENT_ID],
+      ["no client", async () => null],
+      ["an empty client", async () => ""],
+    ];
+    for (const [label, grantClient] of grants) {
+      const answer = await realSave(grantClient).callback({ attachmentIds: [idFor("2")] });
+      expect(answer.isError, label).toBeUndefined();
+      const trusted = trustedOf(answer);
+      expect(trusted.refusal, label).toBe("save-not-set-up");
+      expect(trusted.links, label).toEqual([]);
+    }
+    expect(connectImap).not.toHaveBeenCalled();
+    expect(getAttachmentsForSave).not.toHaveBeenCalled();
   });
 });

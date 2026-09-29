@@ -163,10 +163,15 @@ const ATTACHMENT_ID = encodeAttachmentId({
 });
 
 /** The save callback and its options, from the REAL factory. */
+/** The grant of a person's own app, as the door reads it. */
+const PERSON_GRANT = async (): Promise<string | null> => "claude-desktop-client";
+
 function realSave(): { callback: Callback; options: { description?: string } } {
   const spy = vi.spyOn(McpServer.prototype, "registerTool");
   try {
-    createServerFactory(ownerPrincipal() as Promise<Principal>)({ era: "modern" } as never);
+    createServerFactory(ownerPrincipal() as Promise<Principal>, [], PERSON_GRANT)({
+      era: "modern",
+    } as never);
     const found = (spy.mock.calls as unknown as [string, { description?: string }, Callback][]).find(
       ([name]) => name === TOOL,
     );
@@ -334,6 +339,7 @@ describe("the save tracer: one attachment, tool call to bytes on the wire", () =
       server as unknown as McpServer,
       createLeasedMail(createSessionGate()),
       ownerPrincipal(),
+      PERSON_GRANT,
       { ...entryEnv(), SAVE_LINK_SEAL_KEY: undefined },
     );
     expect(callback, `${TOOL} is not registered`).toBeDefined();

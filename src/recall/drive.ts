@@ -114,6 +114,17 @@ export const RECALL_DRIVEN: unique symbol = Symbol("recall-driven");
 export type GrantClient = () => Promise<string | null>;
 
 /**
+ * Whether a grant client is a person's own app: a non-empty string other than
+ * the autonomy client. Null, empty and the autonomy client all answer false.
+ *
+ * The one test made before acting for the person asking now: by the recall
+ * step, the backfill and the save tool.
+ */
+export function isPersonClient(client: string | null): client is string {
+  return typeof client === "string" && client.length > 0 && client !== AUTONOMY_CLIENT_ID;
+}
+
+/**
  * Run one recall build step for the person behind `principal`.
  *
  * Never throws. Runs nothing unless the grant client is a non-empty string other
@@ -125,9 +136,7 @@ export async function runRecallStep(
   grantClient: GrantClient,
 ): Promise<void> {
   try {
-    const client = await grantClient();
-    if (typeof client !== "string" || client.length === 0) return;
-    if (client === AUTONOMY_CLIENT_ID) return;
+    if (!isPersonClient(await grantClient())) return;
     const actor = await principal;
     await recallStep(actor, productionStepDeps(mail));
   } catch {
@@ -162,9 +171,7 @@ export async function runRecallBackfill(
   depsFor: (mail: LeasedMail) => StepDeps = productionStepDeps,
   beforeRun?: () => Promise<void>,
 ): Promise<BackfillRun> {
-  const client = await grantClient();
-  if (typeof client !== "string" || client.length === 0) return { kind: "refused" };
-  if (client === AUTONOMY_CLIENT_ID) return { kind: "refused" };
+  if (!isPersonClient(await grantClient())) return { kind: "refused" };
   if (beforeRun !== undefined) await beforeRun();
   return { kind: "ran", outcome: await recallBackfill(principal, depsFor(mail)) };
 }

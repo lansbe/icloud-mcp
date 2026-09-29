@@ -211,8 +211,9 @@ export function createServerFactory(
     // recall step. And the save already runs one long session, reading whole
     // attachments; a recall step after it would be a second iCloud session in
     // the same request that nobody asked for. The leased mail, never the gate,
-    // so the read takes the person's lease like every mail tool.
-    registerSaveTool(server, leasedMail, principal);
+    // so the read takes the person's lease like every mail tool. The grant
+    // client, so the autonomy key is refused here as the backfill refuses it.
+    registerSaveTool(server, leasedMail, principal, grantClient);
     for (const register of extraTools) register(server);
     return server;
   };
