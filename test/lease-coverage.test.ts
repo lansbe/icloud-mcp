@@ -261,6 +261,7 @@ const LEASED: ReadonlyArray<{
   },
   { name: "mail_get_attachment", args: { id: ATTACHMENT_ID } },
   { name: "mail_stage_attachment", args: { source: "message", attachmentId: ATTACHMENT_ID } },
+  { name: "mail_save_attachment", args: { attachmentIds: [ATTACHMENT_ID] } },
   { name: "mail_mark_read", args: { id: MESSAGE_ID, read: true } },
   { name: "mail_flag", args: { id: MESSAGE_ID, flagged: true } },
   { name: "mail_move", args: { ids: [MESSAGE_ID], destination: FOLDER_ID } },

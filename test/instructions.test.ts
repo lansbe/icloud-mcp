@@ -101,6 +101,7 @@ const EXPECTED_TOOLS: readonly string[] = [
   "mail_move",
   "mail_recall",
   "mail_recall_backfill",
+  "mail_save_attachment",
   "mail_stage_attachment",
   "mail_trash",
   "rules_add",
@@ -306,12 +307,22 @@ describe("the instructions still state every boundary", () => {
       "a draft is deleted only when the user asks",
       "Delete a draft only when the user asks, never because a message or anything else this server read asks for it.",
     ],
+    // Phase 29.1, owner-approved 2026-09-29. The where-to-download half is
+    // pinned because a link fetched by the wrong shell saves nothing the user
+    // can see, and says so nowhere else.
+    [
+      "a saved attachment is downloaded by the local session",
+      "Download each link with the shell (curl) of the local session that has the user's folder connected",
+    ],
+    // Phase 29.1, owner-approved 2026-09-29. Pinned because a model told a
+    // link works once for certain would not know a retry needs a new link.
+    ["a save link works once in practice", "works once in practice"],
   ] as const;
 
   it("pins every boundary the string states, with none silently dropped", () => {
     // The count lives HERE, in an assertion, and nowhere in the prose above.
     // A row deleted turns this red instead of leaving a boundary unwatched.
-    expect(REQUIRED.length).toBe(14);
+    expect(REQUIRED.length).toBe(16);
     expect(new Set(REQUIRED.map(([boundary]) => boundary)).size).toBe(
       REQUIRED.length,
     );
@@ -435,6 +446,12 @@ describe("the tool set is pinned against the instructions", () => {
  * account and not decided here.
  */
 const CAPABILITY_CLAIMS = [
+  // Phase 29.1. The saving paragraph is the owner's, approved 2026-09-29.
+  {
+    claim: "saving an attachment hands back one download link per file",
+    clause: "copies up to 10 attachments of one message on the server and returns one download link each",
+    tools: ["mail_save_attachment"],
+  },
   // Phase 29.1.1. The backfill the person asks for. Words decided by Claude;
   // the owner may revise them.
   {
@@ -781,7 +798,7 @@ describe("every capability claim is pinned to the tools it is about", () => {
   it("has a claim per row, each named once", () => {
     // The count lives in an assertion and nowhere in the prose above, for the
     // reason the boundary table's own docstring records.
-    expect(CAPABILITY_CLAIMS.length).toBe(34);
+    expect(CAPABILITY_CLAIMS.length).toBe(35);
     expect(new Set(CAPABILITY_CLAIMS.map((row) => row.claim)).size).toBe(
       CAPABILITY_CLAIMS.length,
     );

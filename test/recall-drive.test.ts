@@ -399,6 +399,11 @@ const NOT_DRIVEN: ReadonlyArray<{ name: string; reason: string }> = [
     reason:
       "it is the build itself; a recall step after it would be a second build pass in the same request",
   },
+  {
+    name: "mail_save_attachment",
+    reason:
+      "answers with five-minute links and runs one long session; a recall step after it would delay the links (29.1)",
+  },
 ];
 
 function isDriven(callback: Callback): boolean {

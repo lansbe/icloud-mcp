@@ -87,7 +87,7 @@ enforcement, and the module map — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ## Tools
 
-46 tools in six groups. Every tool description carries an untrusted-content
+47 tools in six groups. Every tool description carries an untrusted-content
 notice; event titles, message bodies, and contact fields are treated as data,
 never as instructions.
 
@@ -121,6 +121,7 @@ never as instructions.
 | `mail_compose_new` | Compose a new message **into Drafts** (never sent). |
 | `mail_compose_reply` | Reply to a message **into Drafts**, threaded (never sent). |
 | `mail_stage_attachment` | Stage a file to attach to a draft (from a message, raw bytes, or an upload URL). |
+| `mail_save_attachment` | Save attachments to your own computer from Claude Cowork. One download link per file, valid five minutes. |
 | `mail_confirm_upload` | Finish a presigned attachment upload. |
 
 ### Calendar
