@@ -219,7 +219,12 @@ describe("suggestSaveName: a property sweep over random strings", () => {
 
 describe("opensAsProgram", () => {
   it("is true for a file that can run code, in any case", () => {
-    for (const ext of ["app", "command", "sh", "pkg", "dmg", "exe", "js", "scpt", "bat", "ps1", "jar", "py"]) {
+    for (const ext of [
+      "app", "command", "tool", "terminal", "sh", "zsh", "bash", "csh", "ksh", "pkg", "mpkg",
+      "dmg", "exe", "msi", "bat", "cmd", "com", "scr", "vbs", "ps1", "js", "jar", "jnlp", "py",
+      "pl", "rb", "php", "scpt", "scptd", "applescript", "workflow", "action", "webloc",
+      "inetloc", "fileloc", "docm", "xlsm", "pptm", "html", "htm", "svg",
+    ]) {
       expect(opensAsProgram(`run.${ext}`), ext).toBe(true);
       expect(opensAsProgram(`run.${ext.toUpperCase()}`), ext.toUpperCase()).toBe(true);
     }

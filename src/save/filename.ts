@@ -32,20 +32,25 @@ const EXTENSION = /^[\p{L}\p{N}]{1,16}$/u;
 /** A Windows device name, any case. */
 const DEVICE_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 
-/** Extensions of files that can run code when opened. */
+/**
+ * Extensions of files that can run code, or open a link or another file, when
+ * opened. A saved file carries no quarantine mark, so this flag is the only
+ * warning the person gets.
+ */
 const PROGRAM_EXTENSIONS = new Set([
-  "app",
-  "command",
-  "sh",
-  "pkg",
-  "dmg",
-  "exe",
-  "js",
-  "scpt",
-  "bat",
-  "ps1",
-  "jar",
-  "py",
+  // Programs, installers and shell scripts.
+  "app", "command", "tool", "terminal", "sh", "zsh", "bash", "csh", "ksh",
+  "pkg", "mpkg", "dmg", "exe", "msi", "bat", "cmd", "com", "scr", "vbs", "ps1",
+  // Script languages and Java.
+  "js", "jar", "jnlp", "py", "pl", "rb", "php",
+  // AppleScript and Automator.
+  "scpt", "scptd", "applescript", "workflow", "action",
+  // Files that open a link or another file.
+  "webloc", "inetloc", "fileloc",
+  // Office files with macros.
+  "docm", "xlsm", "pptm",
+  // Pages that run script in the browser.
+  "html", "htm", "svg",
 ]);
 
 const ENCODER = new TextEncoder();
