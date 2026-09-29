@@ -38,6 +38,7 @@ changes where the secrets are, so read this table before the rest.
 | Each person's own app-specific password | Inside **their own grant's encrypted props**, and nowhere else | Proving that person to Apple, on their own calls only |
 | `CONFIRM_SECRET` | Cloudflare Secrets | The HMAC key for calendar confirmation tokens |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | Cloudflare Secrets | The R2 S3 API token for presigned attachment uploads |
+| `SAVE_LINK_SEAL_KEY` | Cloudflare Secrets | The key that seals each attachment download link, so a link cannot be read or forged |
 
 The server holds no account credential of its own. There is no shared login
 password and no Apple identity in the Worker environment. Both existed before
@@ -332,6 +333,36 @@ form, so the assistant reading your mail never sets the seen flag. Read status
 stays a field *you* control. It changes only when you ask the assistant to mark
 a message read or unread, one message at a time.
 Flagging works the same way: one message at a time, only when you ask.
+
+### Saving an attachment to your own computer
+
+`mail_save_attachment` saves attachments from one message to a folder on your own computer, from
+Claude Cowork. The server copies each file into its storage, under your own prefix, and gives back a
+download link. Cowork downloads the link with the shell of your local session, into the folder you
+connected, and checks the file's SHA-256.
+
+- A link names one copy. It stops working five minutes after it is made.
+- A link works once in practice. The first download marks it spent before it sends a byte, and
+  deletes the copy when it ends. A second download from the same place, or after the first has
+  finished, is refused. Opening the link in a browser spends it too, and so does a download that
+  breaks part-way. Then ask Claude for a new link. The mark takes time to reach every Cloudflare
+  location, so two downloads from two different places at almost the same moment can both succeed.
+- A link is sealed with a Worker secret, `SAVE_LINK_SEAL_KEY`. It carries whose copy it is, its name,
+  its expiry and its size, and nobody can read them or make a link without that secret.
+- The download deletes the copy. An unused copy is deleted at your next save, when anyone tries its
+  dead link, or by the bucket's daily sweep within two days.
+- Until it is used or expires, the link is a password for one file. It appears in your conversation,
+  and Cloudflare's request log keeps every URL for seven days. By then the link is dead. The URL
+  shows no user id.
+- The download needs no sign-in, reads no mail and opens no mail connection. It serves only a copy the
+  tool made. Bad links all get the same empty answer, and requests are braked per address.
+- The file is always sent as a download, never shown as a page. It came from a stranger, and the
+  tool's answer says not to open it.
+- macOS does not mark the saved file as downloaded from the internet, so it gives no warning when you
+  open it. Treat it like any attachment from a stranger.
+- Only you, asking in the moment, can save. The rules job cannot call this tool.
+- One file can be up to about 15 MB. iCloud refuses messages over 20 MB, so no real attachment is
+  larger.
 
 ### Moving mail is previewed, and nothing is removed for good
 
