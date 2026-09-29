@@ -10,6 +10,11 @@
 //      README line fails here.
 //   3. README's block is exactly what the core renders. A hand edit between
 //      the markers, a wrong count or a stale row fails here.
+//   4. Each number a tool line states equals the constant the code enforces.
+//      The expected phrase is built from the constant, never typed, as
+//      test/security-numbers.test.ts does for SECURITY.md. Checks 1 to 3 compare
+//      names and layout only, so without this a changed constant would leave
+//      README stale with every check green.
 //
 // The server is driven the way test/instructions.test.ts drives it: the real
 // per-request factory, raw JSON-RPC over an in-memory pair. No tool is called
@@ -28,7 +33,13 @@ import {
   withBlock,
 } from "../scripts/tool-table-core.mjs";
 import type { ToolGroup } from "../scripts/tool-table-core.mjs";
+import { JOB_CADENCE_MS } from "../src/agent/cadence";
+import { MAX_CHANGE_FOLDERS } from "../src/change-marker";
+import { MOVE_SET_CAP } from "../src/mail/triage";
 import { createServerFactory } from "../src/mcp/server";
+import { RECALL_PAGE_SIZE } from "../src/recall/retention";
+import { RECALL_BACKFILL_BUDGET_MS, RECALL_BACKFILL_MAX_PAGES } from "../src/recall/sync";
+import { SAVE_LINK_TTL_MS } from "../src/save/link";
 import { ownerPrincipal } from "./fixtures/bound-secrets";
 
 // A Workers isolate has no filesystem, so files are read with Vite's
@@ -104,6 +115,83 @@ describe("README's tool block matches the running server", () => {
 
   it("finds nothing wrong with the real README", async () => {
     expect(checkReadme(README, TOOL_GROUPS, await liveToolNames())).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The numbers in the tool lines equal the constants
+// ---------------------------------------------------------------------------
+
+const MINUTE_MS = 60 * 1000;
+const WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
+
+/** A small count as README writes it: as a word. */
+function word(n: number): string {
+  const one = WORDS[n];
+  expect(one, `${n} has no word; the README line needs new words`).toBeDefined();
+  return one!;
+}
+
+/** One tool's README line, whitespace collapsed. */
+function line(name: string): string {
+  const row = TOOL_GROUPS.flatMap((one) => one.rows).find((one) => one.name === name);
+  expect(row, `no row for ${name}`).toBeDefined();
+  return row!.line.replace(/\s+/g, " ");
+}
+
+/**
+ * The rules test's message count. It is a private constant in its registrar, so
+ * it is read from that file's text rather than imported.
+ */
+function rulesTestMessages(): number {
+  const text = Object.entries(TOOL_SOURCES).find(([path]) => path.endsWith("/rules.ts"))?.[1];
+  expect(text, "the rules registrar was not read").toBeDefined();
+  const found = /\bconst TEST_MESSAGES = (\d+);/.exec(text!);
+  expect(found, "src/mcp/tools/rules.ts has no `const TEST_MESSAGES = <n>;`").not.toBeNull();
+  return Number(found![1]);
+}
+
+describe("each number in a README tool line equals its constant", () => {
+  it("mail_recall_backfill states the pages, page size and time limit", () => {
+    const backfill = line("mail_recall_backfill");
+    expect(backfill).toContain(
+      `up to ${RECALL_BACKFILL_MAX_PAGES} pages of ${RECALL_PAGE_SIZE} messages`,
+    );
+    expect(RECALL_BACKFILL_BUDGET_MS % 1000).toBe(0);
+    expect(backfill).toContain(`A ${RECALL_BACKFILL_BUDGET_MS / 1000}-second time limit`);
+    // "4 or 5 pages" is a measurement (29.1.1 UAT), not a constant. The message
+    // count that follows it is that measurement times the page size.
+    expect(backfill).toContain(
+      `after 4 or 5 pages, about ${4 * RECALL_PAGE_SIZE} to ${5 * RECALL_PAGE_SIZE} messages`,
+    );
+  });
+
+  it("the move, archive and Trash previews state the move cap", () => {
+    for (const name of ["mail_move", "mail_archive", "mail_trash"]) {
+      expect(line(name)).toContain(`up to ${MOVE_SET_CAP} messages`);
+    }
+  });
+
+  it("mail_save_attachment states the link's lifetime", () => {
+    expect(SAVE_LINK_TTL_MS % MINUTE_MS).toBe(0);
+    expect(line("mail_save_attachment")).toContain(
+      `valid ${word(SAVE_LINK_TTL_MS / MINUTE_MS)} minutes`,
+    );
+  });
+
+  it("changes_since states the folder cap", () => {
+    expect(line("changes_since")).toContain(`up to ${word(MAX_CHANGE_FOLDERS)} folders you name`);
+  });
+
+  it("rules_test states how many messages it tries", () => {
+    expect(line("rules_test")).toContain(`newest ${rulesTestMessages()} inbox messages`);
+  });
+
+  it("the Rules intro states the job's cadence", () => {
+    const intro = TOOL_GROUPS.find((one) => one.heading === "Rules")?.intro;
+    expect(intro, "the Rules group has no intro").toBeTruthy();
+    expect(JOB_CADENCE_MS % MINUTE_MS).toBe(0);
+    expect(intro!.replace(/\s+/g, " ")).toContain(`every ${JOB_CADENCE_MS / MINUTE_MS} minutes`);
   });
 });
 

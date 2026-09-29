@@ -584,7 +584,7 @@ uses fake credentials on purpose (D-09).
 npm test           # full suite
 npm run typecheck  # tsc --noEmit
 npm run scan       # the safety scanner (see below)
-npm run docs:tools # checks README's tool tables against the code
+npm run docs:tools # checks README's tool names and table layout against the code
 ```
 
 The suite has two Vitest projects. Most tests run inside the real `workerd`
@@ -598,7 +598,8 @@ the Cloudflare account.
 README's tool count and tables are generated from the code by
 `scripts/tool-table.mjs`. To change a tool's line, edit
 `scripts/tool-table-core.mjs` and run `node scripts/tool-table.mjs --write`. A
-test fails if the tables and the registered tools disagree.
+test fails if the tables and the registered tools disagree, or if a number in a
+tool's line differs from the constant the code enforces.
 
 ---
 

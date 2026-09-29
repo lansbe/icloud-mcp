@@ -51,7 +51,9 @@ function group(heading, intro, rows) {
 /**
  * README's tool groups, in README's order. Each row is one tool and its README
  * line. The lines are hand-written, but the test forces the set of names to
- * equal the registered tools, so a new tool without a line fails.
+ * equal the registered tools, so a new tool without a line fails. It also holds
+ * each number a line states to the constant the code enforces, so a changed
+ * constant fails until its line changes too.
  */
 export const TOOL_GROUPS = Object.freeze([
   group(
