@@ -30,12 +30,15 @@ export interface SaveItem {
 /**
  * Why one part got no link, from a closed set.
  *
- * The read's own refusals, the decoder's two, and `not-stored`: the copy could
- * not be written or its link could not be sealed. `not-stored` is unreachable
- * while the tool checks the seal key first and the user id comes from the
- * principal; it exists so that a failure there is a named row rather than a
- * lost id. `mixed-messages` is the tool's own: ids from more than one message,
- * refused before anything is read.
+ * The read's own refusals, the decoder's two, and `not-stored`: the copy's key
+ * was refused before any write (a bad user id or time), or its link could not
+ * be sealed. `not-stored` is unreachable while the tool checks the seal key
+ * first and the user id comes from the principal; it exists so that a failure
+ * there is a named row rather than a lost id. A storage error is NOT a
+ * `not-stored` row: the bucket's own failure is not caught here, so it fails
+ * the whole call, and the links already made in it are lost with it (their
+ * copies are left for the sweep). `mixed-messages` is the tool's own: ids from
+ * more than one message, refused before anything is read.
  */
 export type SavePartRefusal =
   | "not-found"
