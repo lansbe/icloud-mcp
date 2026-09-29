@@ -25,9 +25,10 @@ import {
   utcDay,
   writeState,
 } from "../src/agent/recall-ledger";
-import type { UserAgent } from "../src/agent/user-agent";
+import { LEASE_TTL_MS, type UserAgent } from "../src/agent/user-agent";
 import { AUTONOMY_CLIENT_ID } from "../src/agent/autonomy-client";
 import type { FolderState } from "../src/change-marker";
+import { ImapThrottleError } from "../src/errors";
 import type { Principal } from "../src/principal";
 import { runRecallBackfill } from "../src/recall/drive";
 import {
@@ -47,6 +48,9 @@ import {
   type BackfillOutcome,
   RECALL_BACKFILL_BUDGET_MS,
   RECALL_BACKFILL_MAX_PAGES,
+  RECALL_BACKFILL_MAX_STEPS,
+  RECALL_PASS_MAX_SESSIONS,
+  RECALL_SESSION_MAX_MS,
   recallBackfill,
   recallStep,
   type StepDeps,
@@ -537,14 +541,107 @@ describe("recallBackfill fills a person's index across calls, one session at a t
     expect(3000 * allowed).toBeGreaterThanOrEqual(RECALL_BACKFILL_BUDGET_MS);
   });
 
-  it("the session budget: with maxSteps 4, no more than four sessions are opened", async () => {
+  it("the session budget: with maxSteps 6, a pass starts only while a whole pass's sessions still fit", async () => {
     const a = await testPrincipal(USER_A);
     const h = twoFolders(300, 10);
 
-    const { outcome, log } = await backfill(a, h, h.deps, { maxPages: 50, maxSteps: 4 });
+    const { outcome, log } = await backfill(a, h, h.deps, { maxPages: 50, maxSteps: 6 });
 
+    // The listing, the seed and two pages: a third page could open up to
+    // three more sessions, past six.
+    expect(RECALL_PASS_MAX_SESSIONS).toBe(3);
     expect(outcome).toEqual({ stopped: "budget", pages: 2, sessions: 4 });
     expect(log.filter((entry) => entry === "enter")).toHaveLength(4);
+  });
+
+  // 29.1.1-REVIEW WR-03: one page can open up to three sessions under one
+  // lease, and each is a sign-in. The count and the cap are of sessions.
+  it("a page that opens three sessions: every session is counted, and a call never opens more than RECALL_BACKFILL_MAX_STEPS", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = await inboxAtBuild(300);
+    let opened = 0;
+    const deps: StepDeps = {
+      ...h.deps,
+      source: {
+        ...h.deps.source,
+        async page(gate, principal, mailbox, cursor) {
+          // Two sessions before the page's own, as the re-read after a
+          // validity change and the validity read for an empty page are.
+          for (let i = 0; i < 2; i += 1) {
+            expect(gate.held).toBe(false);
+            gate.acquire();
+            opened += 1;
+            gate.release();
+          }
+          opened += 1;
+          return h.deps.source.page(gate, principal, mailbox, cursor);
+        },
+      },
+    };
+
+    const outcome = await recallBackfill(a, deps);
+
+    expect(outcome.sessions).toBe(opened);
+    expect(opened).toBeLessThanOrEqual(RECALL_BACKFILL_MAX_STEPS);
+    expect(outcome).toEqual({ stopped: "budget", pages: 5, sessions: 15 });
+  });
+
+  // 29.1.1-REVIEW WR-04: a session that could still be open when its lease
+  // expires is never started, so no other request can take the lease while
+  // this socket is open.
+  const lateSessions: [string, number, "opened" | "refused"][] = [
+    ["fits in the lease", LEASE_TTL_MS - RECALL_SESSION_MAX_MS, "opened"],
+    ["could outlive the lease", LEASE_TTL_MS - RECALL_SESSION_MAX_MS + 1, "refused"],
+  ];
+
+  it.each(lateSessions)(
+    "a second session under one lease that %s (%i ms in): %s",
+    async (_label, elapsed, expected) => {
+      const a = await testPrincipal(USER_A);
+      const h = await inboxAtBuild(60);
+      let clock = Date.now();
+      let extra: "pending" | "opened" | "refused" = "pending";
+      const deps: StepDeps = {
+        ...h.deps,
+        now: () => clock,
+        source: {
+          ...h.deps.source,
+          async page(gate, principal, mailbox, cursor) {
+            const page = await h.deps.source.page(gate, principal, mailbox, cursor);
+            if (extra === "pending") {
+              // The page's own session took `elapsed` since the lease was asked for.
+              clock += elapsed;
+              if (gate.held) {
+                extra = "refused";
+                throw new ImapThrottleError();
+              }
+              gate.acquire();
+              gate.release();
+              extra = "opened";
+            }
+            return page;
+          },
+        },
+      };
+
+      const outcome = await recallBackfill(a, deps);
+
+      expect(extra).toBe(expected);
+      expect(outcome.stopped).toBe(expected === "opened" ? "built" : "failed");
+    },
+  );
+
+  // 29.1.1-REVIEW WR-05: the drop of a gone folder is paced, and a backfill
+  // page in the last minute pauses it. That is a wait, not another request.
+  it("a folder found gone after a backfill page: waiting, not busy", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = twoFolders(30, 10);
+    h.setGone(ARCHIVE, true);
+
+    const { outcome, log } = await backfill(a, h);
+
+    expect(log).toContain(`snapshot:${ARCHIVE}:start`);
+    expect(outcome).toEqual({ stopped: "waiting", pages: 2, sessions: 5 });
   });
 
   it("every folder built: stops as built, opens nothing and changes nothing", async () => {
@@ -757,6 +854,40 @@ describe("recallBackfill fills a person's index across calls, one session at a t
     );
     expect(validities).toEqual([{ v: 301, n: 60 }]);
     expect((await syncRowOf(USER_A.userId, ARCHIVE))!.state!.uidValidity).toBe(301);
+  });
+
+  // 29.1.1-REVIEW WR-02: the row leaves build between the loop's read and its
+  // page request, as when another backfill call just finished the folder.
+  it("a folder finished by another request between the read and the page: not a failure, and the built row is kept", async () => {
+    const a = await testPrincipal(USER_A);
+    const h = await inboxAtBuild(60);
+    const finished = builtRow(stateOf(INBOX, 100, 61));
+    const spy = await runInDurableObject(objectFor(USER_A.userId), (instance: UserAgent) => {
+      const prototype = Object.getPrototypeOf(instance) as UserAgent;
+      const original = prototype.recallBeginPage;
+      let calls = 0;
+      return vi
+        .spyOn(prototype, "recallBeginPage")
+        .mockImplementation(function (this: UserAgent, mailbox: unknown, kind: unknown) {
+          calls += 1;
+          // The second page request: another request marks the folder built first.
+          if (calls === 2) expect(this.recallSetSync(INBOX, finished)).toEqual({ ok: true });
+          return original.call(this, mailbox, kind);
+        });
+    });
+
+    let outcome: BackfillOutcome;
+    try {
+      ({ outcome } = await backfill(a, h));
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(outcome).toEqual({ stopped: "built", pages: 1, sessions: 1 });
+    const row = (await syncRowOf(USER_A.userId, INBOX))!;
+    expect(row.stage).toBe("built");
+    expect(row.failures).toBe(0);
+    expect(row.failedAt).toBeNull();
   });
 
   it("the ordinary step is unchanged: paused for a minute after a backfill, and its day count did not move", async () => {

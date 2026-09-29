@@ -284,6 +284,13 @@ export const BACKFILL_REFUSED =
 export const BACKFILL_UNAVAILABLE =
   "The recall index could not be reached just now, so nothing was indexed.";
 
+/**
+ * The one sentence a backfill answers with when it indexed pages but could not
+ * read its progress afterwards (29.1.1-REVIEW WR-01).
+ */
+export const BACKFILL_PROGRESS_UNREAD =
+  "The build ran, but how far it got could not be read just now. Call mail_recall_backfill again to see.";
+
 /** A folder's stage, as the backfill answer names it. */
 export type BackfillStage = "not_started" | "building" | "built" | "waiting" | "parked";
 
@@ -502,13 +509,14 @@ export function backfillResult(input: BackfillAnswerInput): ToolResult {
   const { before, after, state, outcome, now, startedAt } = input;
   const folders = folderRows(state, after, now);
   const stopped = outcome.stopped === "unnamed" ? "failed" : outcome.stopped;
+  const index = indexWordOf(state);
   return {
     content: [
       {
         type: "text",
         text: JSON.stringify({
-          index: indexWordOf(state),
-          stopped: outcome.stopped,
+          index,
+          stopped,
           thisCall: {
             pages: outcome.pages,
             messages: Math.max(0, after.total - before.total),
@@ -516,7 +524,8 @@ export function backfillResult(input: BackfillAnswerInput): ToolResult {
           },
           folders,
           progress: folders.map(rowSentence).join(" "),
-          next: NEXT[stopped],
+          // A call whose last page finished the build is told so (IN-02).
+          next: stopped === "budget" && index === "built" ? NEXT.built : NEXT[stopped],
           note: BACKFILL_NOTE,
         }),
       },
@@ -569,6 +578,7 @@ export function registerRecallBackfillTool(
         };
       }
       const startedAt = Date.now();
+      let indexed = false;
       try {
         const stub = agentFor(actor);
         // Read after the grant check passes and before the run, so a refused
@@ -578,6 +588,7 @@ export function registerRecallBackfillTool(
           before = await stub.recallProgress();
         });
         if (ran.kind === "refused") return fixedError(BACKFILL_REFUSED);
+        indexed = ran.outcome.pages > 0;
         if (ran.outcome.stopped === "unnamed" || before === null) {
           return fixedError(BACKFILL_UNAVAILABLE);
         }
@@ -600,7 +611,7 @@ export function registerRecallBackfillTool(
           startedAt,
         });
       } catch {
-        return fixedError(BACKFILL_UNAVAILABLE);
+        return fixedError(indexed ? BACKFILL_PROGRESS_UNREAD : BACKFILL_UNAVAILABLE);
       }
     },
   );

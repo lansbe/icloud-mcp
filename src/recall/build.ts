@@ -126,6 +126,15 @@ export class RecallBuildError extends Error {
   }
 }
 
+/**
+ * Thrown when the object answers a page start with `invalid`. A plain
+ * `RecallBuildError` to every caller that does not ask. The backfill loop in
+ * ./sync.ts asks: the object answers `invalid` to its page kind when the
+ * folder's row is no longer at build, which means another request moved the
+ * row, not that a read failed (29.1.1-REVIEW WR-02).
+ */
+export class RecallSlotInvalidError extends RecallBuildError {}
+
 const KEEP: CursorUpdate = { kind: "keep" };
 const RESET: CursorUpdate = { kind: "reset" };
 
@@ -175,6 +184,7 @@ async function beginSlot(
   }
   if (!answer.ok) {
     if (isPageRefusal(answer.reason)) return { ok: false, reason: answer.reason };
+    if (answer.reason === "invalid") throw new RecallSlotInvalidError();
     throw new RecallBuildError();
   }
   const { pageToken } = answer;

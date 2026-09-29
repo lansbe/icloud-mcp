@@ -143,10 +143,12 @@ import {
   type SyncRow,
   syncRowIn,
 } from "../agent/recall-ledger";
-import type { CursorUpdate } from "../agent/user-agent";
+import { type CursorUpdate, LEASE_TTL_MS } from "../agent/user-agent";
 import type { FolderState } from "../change-marker";
 import { ConnectionBusyError } from "../errors";
+import { CLOSE_TIMEOUT_MS, DRAIN_TIMEOUT_MS } from "../mail/imap-session";
 import {
+  CALL_DEADLINE_MS,
   DEFAULT_MAILBOX,
   type FolderListing,
   type FolderSnapshotOutcome,
@@ -163,6 +165,7 @@ import {
   indexNextPage,
   RECALL_PAGE_SIZE,
   RecallBuildError,
+  RecallSlotInvalidError,
   reconcileMailbox,
 } from "./build";
 import { mailRecallSource, type NewMailPage, newMailPage } from "./mail-source";
@@ -277,11 +280,14 @@ export type StepDeps = BuildDeps & {
  * `idle`: every folder is built and none is due a status check. `unnamed`:
  * the object does not know whose it is, so nothing was opened. `checked`: a
  * built folder's status check found nothing to do. `due`: it found new mail or
- * a deletion sync to do, and recorded it for the next step. Or any build
- * status, which carries `lease_busy` and every page refusal.
+ * a deletion sync to do, and recorded it for the next step. `moved`: a
+ * backfill page found its folder no longer at build, because another request
+ * moved the row; only the backfill loop answers it (29.1.1-REVIEW WR-02). Or
+ * any build status, which carries `lease_busy` and every page refusal.
  */
 export type StepOutcome =
   | "unnamed"
+  | "moved"
   | "folders"
   | "seeded"
   | "gone"
@@ -952,28 +958,58 @@ async function syncDeletions(
  *   calls and 10,000 subrequests on the paid plan;
  * - sessions are serial, one socket open at a time, so the six-connection
  *   budget is never approached;
- * - RECALL_BACKFILL_BUDGET_MS bounds wall-clock time whatever a real page
- *   costs.
+ * - RECALL_BACKFILL_BUDGET_MS bounds how long the call goes on starting new
+ *   work. It does not bound how long the last page takes (29.1.1-REVIEW
+ *   WR-04): a page started just inside it runs to its end.
  * CPU time and real per-page seconds cannot be measured in the pool. The
  * owner's first live run records both (plan 29.1.1-04).
  */
 export const RECALL_BACKFILL_MAX_PAGES = 10;
 
-/** The most time one backfill call spends starting new work, in ms (LD-7). */
+/**
+ * How long into a backfill call a new pass may still start, in ms (LD-7). A
+ * pass started just inside it runs to its end, so a call can take longer.
+ */
 export const RECALL_BACKFILL_BUDGET_MS = 20000;
 
 /**
- * The most sessions one backfill call opens: one listing, one seed per folder,
- * and the pages.
+ * The most iCloud sessions one backfill call opens: one listing, one seed per
+ * folder, and the pages. Each session is a sign-in. This is a hard bound: a
+ * pass starts only while RECALL_PASS_MAX_SESSIONS more still fit under it
+ * (29.1.1-REVIEW WR-03).
  */
 export const RECALL_BACKFILL_MAX_STEPS = RECALL_BACKFILL_MAX_PAGES + MAX_RECALL_FOLDERS + 1;
+
+/**
+ * The most iCloud sessions one pass of the backfill can open. A build page
+ * opens up to three, one after another under its one lease: the page read, the
+ * read again from the top after a validity change, and the validity read for a
+ * page with no rows (./mail-source.ts). A seed or a listing opens one.
+ */
+export const RECALL_PASS_MAX_SESSIONS = 3;
+
+/**
+ * The longest one session keeps its socket open once its work has started:
+ * the call deadline, the drain bound and the close bound, 25 s. The lease is
+ * sized from the same sum plus a margin (LEASE_TTL_MS, 30 s).
+ *
+ * A backfill session starts only when this much time is left on its lease,
+ * measured from before the lease was asked for, so the lease cannot expire
+ * while the socket is open and let another request open a second connection
+ * (29.1.1-REVIEW WR-04). A lease's first session always fits. A second or
+ * third session under the same lease starts only within the margin; after it,
+ * the gate refuses before any socket opens, and the page fails as any failed
+ * read does.
+ */
+export const RECALL_SESSION_MAX_MS = CALL_DEADLINE_MS + DRAIN_TIMEOUT_MS + CLOSE_TIMEOUT_MS;
 
 /**
  * Why a backfill call stopped.
  *
  * `built`: every listed folder is built or parked. `budget`: it reached its
  * page, session or time limit, and the next call goes on. `waiting`: the only
- * folders left are waiting out a failure. `lease_busy`: another request holds
+ * folders left are waiting out a failure, or the removal of a gone folder must
+ * wait out the page pause. `lease_busy`: another request holds
  * the person's connection. `failed`: an attempt failed, and the failure is
  * recorded where a step records it. Or one of the object's refusals.
  */
@@ -994,7 +1030,10 @@ export interface BackfillOutcome {
   readonly stopped: BackfillStop;
   /** Pages indexed in this call. */
   readonly pages: number;
-  /** iCloud sessions this call opened, one after another. */
+  /**
+   * iCloud sessions this call opened, one after another, counted at the
+   * session gate: a lease can hold up to three.
+   */
   readonly sessions: number;
 }
 
@@ -1015,10 +1054,11 @@ function backfillStopOf(outcome: StepOutcome): BackfillStop {
     case "destroying":
     case "unnamed":
       return outcome;
-    // A backfill page is never paused. Should the object say so anyway, stop
-    // as busy rather than try again.
+    // A backfill page is never paused, but the removal that drops a gone
+    // folder is, for a minute after any page. That is a wait, not another
+    // request (29.1.1-REVIEW WR-05): stop as waiting rather than try again.
     case "paused":
-      return "busy";
+      return "waiting";
     default:
       // Nothing else stops a backfill here; stop rather than loop.
       return "failed";
@@ -1038,16 +1078,19 @@ function backfillStopOf(outcome: StepOutcome): BackfillStop {
  * backfill page kind. It stops as `built` when every listed folder is built or
  * parked, so a call on a built index opens nothing and changes nothing.
  *
- * `sessions` counts every time the leased work began, so it is the number of
- * iCloud sessions the call opened, failed ones included. `pages` counts pages
- * indexed. A page that found the folder's validity changed is a session and not
- * a page.
+ * `sessions` counts every session opened on the gate the lease hands over, so
+ * it is the number of iCloud sessions the call opened, failed ones included.
+ * One lease can hold up to three (RECALL_PASS_MAX_SESSIONS), so a pass starts
+ * only while that many more fit under the session limit, and the limit is never
+ * passed. `pages` counts pages indexed. A page that found the folder's validity
+ * changed is a session and not a page.
  *
  * Never throws for a failure on a folder or the listing: those are recorded
  * where a step records them, and the call stops as `failed`. A throw from the
- * first object read means the object is out of reach, and propagates. No
- * caught value is read, nothing here logs, and there is no combinator, sleep or
- * retry.
+ * first object read means the object is out of reach, and propagates. A later
+ * object read that fails stops the call as `failed`, since pages may already
+ * be indexed. No caught value is read, nothing here logs, and there is no
+ * combinator, sleep or retry.
  */
 export async function recallBackfill(
   principal: Principal,
@@ -1063,15 +1106,28 @@ export async function recallBackfill(
   let sessions = 0;
   const stop = (stopped: BackfillStop): BackfillOutcome => ({ stopped, pages, sessions });
 
-  // The same deps, except that each session the lease runner begins is counted.
+  // The same deps, except that each session opened on the lease's gate is
+  // counted (WR-03), and a session that could outlive the lease reads the gate
+  // as held, so it is refused before its socket opens (WR-04). A session
+  // checks the gate before its socket opens, and takes it once after.
   const counted: StepDeps = {
     ...deps,
     leased: {
-      withConnectionLease: (who, fn) =>
-        deps.leased.withConnectionLease(who, (gate) => {
-          sessions += 1;
-          return fn(gate);
-        }),
+      withConnectionLease: (who, fn) => {
+        const askedAt = deps.now();
+        return deps.leased.withConnectionLease(who, (gate) =>
+          fn({
+            acquire() {
+              sessions += 1;
+              gate.acquire();
+            },
+            release: () => gate.release(),
+            get held() {
+              return gate.held || deps.now() - askedAt + RECALL_SESSION_MAX_MS > LEASE_TTL_MS;
+            },
+          }),
+        );
+      },
     },
   };
 
@@ -1094,10 +1150,21 @@ export async function recallBackfill(
 
   // 3. One pass at a time, strictly one after another.
   for (;;) {
-    if (pages >= maxPages || sessions >= maxSteps || deps.now() - started >= budgetMs) {
+    if (
+      pages >= maxPages ||
+      sessions + RECALL_PASS_MAX_SESSIONS > maxSteps ||
+      deps.now() - started >= budgetMs
+    ) {
       return stop("budget");
     }
-    const state = await stub.recallSyncState();
+    // Only the first read may throw out of here (29.1.1-REVIEW WR-01): pages
+    // may already be indexed, and the caller must not say nothing was.
+    let state: Awaited<ReturnType<typeof stub.recallSyncState>>;
+    try {
+      state = await stub.recallSyncState();
+    } catch {
+      return stop("failed");
+    }
     if (state.backfill !== "free") return stop(state.backfill);
     const folders = state.folders;
     if (folders === null) return stop("waiting");
@@ -1119,9 +1186,16 @@ export async function recallBackfill(
     const row = rowOf(next) ?? SEED_ROW;
     let outcome: StepOutcome;
     try {
-      outcome = await attempt(principal, next, row, counted, () =>
-        advanceUnbuilt(principal, folders, next, row, counted, "backfill"),
-      );
+      outcome = await attempt(principal, next, row, counted, async () => {
+        try {
+          return await advanceUnbuilt(principal, folders, next, row, counted, "backfill");
+        } catch (error) {
+          // The row left build after it was read (WR-02): another request
+          // moved it. Not a failure: read the rows again.
+          if (error instanceof RecallSlotInvalidError) return "moved";
+          throw error;
+        }
+      });
     } catch {
       return stop("failed");
     }
@@ -1129,7 +1203,9 @@ export async function recallBackfill(
       pages += 1;
       continue;
     }
-    if (outcome === "seeded" || outcome === "gone" || outcome === "reset") continue;
+    if (outcome === "moved" || outcome === "seeded" || outcome === "gone" || outcome === "reset") {
+      continue;
+    }
     if (outcome === "unanswered") return stop("failed");
     return stop(backfillStopOf(outcome));
   }
