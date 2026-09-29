@@ -515,6 +515,22 @@ declare global {
        */
       SAVE_LINK_SEAL_KEY: string | undefined;
 
+      /**
+       * The download route's brake, keyed by the connecting address (Phase 29.1,
+       * 29.1-WORDING.md decision 3).
+       *
+       * Thirty requests a minute from one address. Consulted by
+       * `src/save/route.ts` after the method and shape checks and before the
+       * link is opened, so a refused request reads nothing and never spends a
+       * link. A request with no address header is counted under one fixed key,
+       * never let through unbraked.
+       *
+       * The limit and the window live on the binding in wrangler.jsonc. Pass a
+       * key and nothing else, for the reason given on `LOGIN_IP_LIMITER`.
+       * Typed `RateLimit` for the reason given there too.
+       */
+      SAVE_IP_LIMITER: RateLimit;
+
       // The single write-only Secret that used to hold the whole allow list is
       // GONE from this type, along with its two readers, in one commit — a
       // half-removed binding is a name the compiler still accepts and nobody

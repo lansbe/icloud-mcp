@@ -11,7 +11,9 @@
 //   - anything but GET: 405, and nothing is read;
 //   - every bad link, spent link, expired link and missing copy: one empty 410,
 //     and an expired link's copy is deleted first;
-//   - the spent-mark store or the bucket failing: an empty 503;
+//   - more than thirty well-formed requests a minute from one address: an
+//     empty 429, before the link is opened;
+//   - the brake, the spent-mark store or the bucket failing: an empty 503;
 //   - otherwise: 200, the copy's exact bytes, always as a file to save and never
 //     as a page to show, and the copy is deleted once the stream ends.
 //
@@ -27,10 +29,21 @@ import { SAVE_ROUTE_PATH, type SaveClaim, claimSaveLink, hasSaveTokenShape } fro
  * headers cannot drift apart. Always an empty body and no-store; a 405 also
  * says which method works. Nothing here names why a link was refused.
  */
-function refuse(status: 405 | 410 | 503): Response {
+function refuse(status: 405 | 410 | 429 | 503): Response {
   const headers: Record<string, string> = { "cache-control": "no-store" };
   if (status === 405) headers.allow = "GET";
   return new Response(null, { status, headers });
+}
+
+/**
+ * The brake's key for a request with no connecting-address header. Such a
+ * request is counted under this one shared key, never let through unbraked.
+ */
+const SHARED_ADDRESS_KEY = "unknown-address";
+
+/** The brake's key: the connecting address, or the shared key. */
+function addressKey(request: Request): string {
+  return request.headers.get("cf-connecting-ip") ?? SHARED_ADDRESS_KEY;
 }
 
 /**
@@ -52,7 +65,10 @@ const DOWNLOAD_HEADERS = {
  *
  * The checks run in a fixed order. The method first and the token's shape
  * second, both before anything is read, so a HEAD or any other prefetch never
- * reaches the spent mark. Then the claim, which spends the link.
+ * reaches the spent mark. Then the per-address brake (29.1-WORDING.md decision
+ * 3), so probing costs the prober a 429 before any store read and a refused
+ * request never spends a link. A malformed token is refused before the brake
+ * and does not count. Then the claim, which spends the link.
  *
  * `clock` is injectable so a test can pin the instant; production passes
  * nothing and gets the wall clock.
@@ -74,6 +90,9 @@ export async function handleSaveDownload(
   let claim: SaveClaim | null;
   let saved: SavedStream | null;
   try {
+    // A key and nothing else: the limit and the window live on the binding.
+    const brake = await env.SAVE_IP_LIMITER.limit({ key: addressKey(request) });
+    if (!brake.success) return refuse(429);
     claim = await claimSaveLink(env, token, clock());
     if (claim === null) return refuse(410);
     if (claim.state === "expired") {
@@ -84,7 +103,7 @@ export async function handleSaveDownload(
     }
     saved = await openSaved(env, claim.userId, claim.key);
   } catch {
-    // The mark store or the bucket failed. Serve nothing.
+    // The brake, the mark store or the bucket failed. Serve nothing.
     return refuse(503);
   }
   if (saved === null) return refuse(410);

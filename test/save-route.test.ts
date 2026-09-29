@@ -67,13 +67,20 @@ function urlFor(path: string): string {
   return `https://example.test${path}`;
 }
 
-/** One request to the route, with its execution context. */
+/**
+ * One request to the route, with its execution context.
+ *
+ * Each request comes from a fresh address unless the case names its headers,
+ * so the brake's shared no-address budget is never spent by accident across
+ * this suite. A case that wants no address header passes `headers: {}`.
+ */
 async function call(
   url: string,
   options: { method?: string; env?: Env; headers?: Record<string, string> } = {},
 ): Promise<{ response: Response; ctx: ExecutionContext }> {
   const ctx = createExecutionContext();
-  const request = new Request(url, { method: options.method ?? "GET", headers: options.headers });
+  const headers = options.headers ?? { "cf-connecting-ip": freshAddress() };
+  const request = new Request(url, { method: options.method ?? "GET", headers });
   const response = await handleSaveDownload(request, options.env ?? entryEnv(), ctx);
   return { response, ctx };
 }
@@ -417,8 +424,8 @@ describe("the per-address brake", () => {
   it("brakes a request with no address header under one shared key", async () => {
     const { brake, keys } = recordingBrake();
     const env = { ...entryEnv(), SAVE_IP_LIMITER: brake };
-    await settle(urlFor(`${SAVE_ROUTE_PATH}${randomBase64Url(180)}`), { env });
-    await settle(urlFor(`${SAVE_ROUTE_PATH}${randomBase64Url(180)}`), { env });
+    await settle(urlFor(`${SAVE_ROUTE_PATH}${randomBase64Url(180)}`), { env, headers: {} });
+    await settle(urlFor(`${SAVE_ROUTE_PATH}${randomBase64Url(180)}`), { env, headers: {} });
     expect(keys).toHaveLength(2);
     expect(keys[0]).toBe(keys[1]);
     expect(keys[0]!.length).toBeGreaterThan(0);
@@ -426,7 +433,10 @@ describe("the per-address brake", () => {
     // And that key is braked, not waved through.
     const refusing = { limit: () => Promise.resolve({ success: false }) } as unknown as RateLimit;
     const live = await saveCopy(SMALL);
-    const answer = await settle(live.url, { env: { ...entryEnv(), SAVE_IP_LIMITER: refusing } });
+    const answer = await settle(live.url, {
+      env: { ...entryEnv(), SAVE_IP_LIMITER: refusing },
+      headers: {},
+    });
     expect(answer.status).toBe(429);
     expect(await spent(live.token)).toBe(false);
   });

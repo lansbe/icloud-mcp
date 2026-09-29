@@ -361,6 +361,18 @@
   // There is no provisioning step and no id to look up: the ids below are
   // chosen, not discovered, which is exactly why the collision argument above
   // is the only thing standing between us and a sibling's counters.
+  //
+  // SAVE_IP_LIMITER (Phase 29.1) is a third binding, for the attachment
+  // download route, GET /save/<link>. That route needs no sign-in, so anyone
+  // can probe it with made-up links. It brakes that: thirty requests a minute
+  // from one connecting address, refused with an empty 429. It is keyed by
+  // address because the download has no signed-in person to key it by, and
+  // it is consulted after the method and shape checks and before the link is
+  // opened, so a refused request never spends a link. Namespace 2003 is in the
+  // same 2000 block, chosen and not created, and like 2001 and 2002 it is a
+  // claim about the account that this repository cannot check. A shared
+  // counter would show up as 429s on downloads with no traffic of ours to
+  // explain them.
   "ratelimits": [
     {
       "name": "LOGIN_IP_LIMITER",
@@ -371,6 +383,11 @@
       "name": "LOGIN_ID_LIMITER",
       "namespace_id": "2002",
       "simple": { "limit": 3, "period": 60 }
+    },
+    {
+      "name": "SAVE_IP_LIMITER",
+      "namespace_id": "2003",
+      "simple": { "limit": 30, "period": 60 }
     }
   ],
 
