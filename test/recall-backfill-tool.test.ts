@@ -487,6 +487,15 @@ describe("backfillResult: stages, estimates and sentences", () => {
     expect(answer.next).toContain(RECALL_MAX_VECTORS.toLocaleString("en-US"));
   });
 
+  // 29.1.1-REVIEW IN-03: the stop word emitted is the one the next sentence was chosen by.
+  it("an unnamed stop, should one ever reach the answer: emitted as failed, with the failed sentence", () => {
+    const answer = parse(
+      backfillResult(input({ outcome: { stopped: "unnamed", pages: 0, sessions: 0 } })) as ToolAnswer,
+    );
+    expect(answer.stopped).toBe("failed");
+    expect(answer.next).toMatch(/^A read failed/);
+  });
+
   // 29.1.1-REVIEW IN-02: the last page of the page limit finished the build.
   it("stopped at its limit with the index built: says it is built, not to continue", () => {
     const answer = parse(

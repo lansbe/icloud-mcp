@@ -516,7 +516,7 @@ export function backfillResult(input: BackfillAnswerInput): ToolResult {
         type: "text",
         text: JSON.stringify({
           index,
-          stopped: outcome.stopped,
+          stopped,
           thisCall: {
             pages: outcome.pages,
             messages: Math.max(0, after.total - before.total),
