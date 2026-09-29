@@ -111,6 +111,13 @@ export default defineConfig({
                 AUTONOMY_SEAL_KEY: "dGVzdC1zZWFsLWtleS0zMi1ieXRlcy1ub3QtcmVhbCE",
                 AUTONOMY_CLIENT_SECRET: "test-autonomy-client-secret-not-real",
 
+                // The save-link seal key (Phase 29.1, decision 1a), plainly
+                // fake and different from the autonomy seal key above. It must
+                // decode to exactly 32 bytes, or the save tool refuses to make
+                // links; this one is the 32 ASCII bytes
+                // "test-save-link-key-32-bytes-fake".
+                SAVE_LINK_SEAL_KEY: "dGVzdC1zYXZlLWxpbmsta2V5LTMyLWJ5dGVzLWZha2U",
+
                 // The SEED half of the allow list, as the JSON array string the
                 // real `vars` entry holds. The single write-only Secret this
                 // replaces is gone from every file in this repository.
