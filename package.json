@@ -18,6 +18,7 @@
     "deploy": "wrangler deploy",
     "smoke": "node scripts/smoke-unauthenticated.mjs",
     "scan": "node scripts/forbidden-tokens.mjs",
+    "docs:tools": "node scripts/tool-table.mjs --check",
     "prepare": "husky && node scripts/write-hostname.mjs"
   },
   "dependencies": {
