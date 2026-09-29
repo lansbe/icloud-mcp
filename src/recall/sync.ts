@@ -115,8 +115,10 @@ import { agentFor, type LeasedMail } from "../agent/lease";
 import {
   isParked,
   MAX_COUNTED_FAILURES,
+  MAX_RECALL_FOLDERS,
   PAGE_REFUSALS,
   RECALL_PARK_AFTER_FAILURES,
+  type PageKind,
   type PageRefusal,
   type SyncRow,
   syncRowIn,
@@ -589,6 +591,9 @@ async function listFoldersStep(
 /**
  * One step of a folder that is not built yet: its status check at seed, or one
  * page through Phase 25's engine at build.
+ *
+ * `kind` is the page kind a build page asks the object for: a build page
+ * unless the caller says otherwise. Only the backfill loop passes one.
  */
 async function advanceUnbuilt(
   principal: Principal,
@@ -596,6 +601,7 @@ async function advanceUnbuilt(
   mailbox: string,
   row: SyncRow,
   deps: StepDeps,
+  kind: Exclude<PageKind, "reconcile"> = "build",
 ): Promise<StepOutcome> {
   const stub = agentFor(principal);
 
@@ -625,7 +631,7 @@ async function advanceUnbuilt(
   }
 
   // Build: one page through Phase 25's engine.
-  const status = await indexNextPage(principal, mailbox, deps);
+  const status = await indexNextPage(principal, mailbox, deps, kind);
   if (status === "done") {
     const built: SyncRow = { ...row, stage: "built", ...NO_FAILURE };
     return afterSet(await stub.recallSetSync(mailbox, built)) ?? status;
@@ -891,4 +897,101 @@ async function syncDeletions(
     ...NO_FAILURE,
   };
   return afterSet(await stub.recallSetSync(mailbox, synced)) ?? status;
+}
+
+// ---------------------------------------------------------------------------
+// The backfill (Phase 29.1.1)
+// ---------------------------------------------------------------------------
+
+/** The most pages one backfill call indexes (LD-4): about 250 messages. */
+export const RECALL_BACKFILL_MAX_PAGES = 10;
+
+/** The most time one backfill call spends starting new work, in ms (LD-7). */
+export const RECALL_BACKFILL_BUDGET_MS = 20000;
+
+/**
+ * The most sessions one backfill call opens: one listing, one seed per folder,
+ * and the pages.
+ */
+export const RECALL_BACKFILL_MAX_STEPS = RECALL_BACKFILL_MAX_PAGES + MAX_RECALL_FOLDERS + 1;
+
+/**
+ * Why a backfill call stopped.
+ *
+ * `built`: every listed folder is built or parked. `budget`: it reached its
+ * page, session or time limit, and the next call goes on. `waiting`: the only
+ * folders left are waiting out a failure. `lease_busy`: another request holds
+ * the person's connection. `failed`: an attempt failed, and the failure is
+ * recorded where a step records it. Or one of the object's refusals.
+ */
+export type BackfillStop =
+  | "built"
+  | "budget"
+  | "waiting"
+  | "busy"
+  | "lease_busy"
+  | "quota"
+  | "full"
+  | "destroying"
+  | "unnamed"
+  | "failed";
+
+/** What one backfill call came to: why it stopped, and what it did. */
+export interface BackfillOutcome {
+  readonly stopped: BackfillStop;
+  /** Pages indexed in this call. */
+  readonly pages: number;
+  /** iCloud sessions this call opened, one after another. */
+  readonly sessions: number;
+}
+
+/** The limits of one backfill call. A test passes smaller ones. */
+export interface BackfillLimits {
+  readonly maxPages?: number;
+  readonly maxSteps?: number;
+  readonly budgetMs?: number;
+}
+
+/**
+ * Index several pages of `principal`'s own index in one call, one leased
+ * session at a time (Phase 29.1.1, LD-4 to LD-6).
+ */
+export async function recallBackfill(
+  principal: Principal,
+  deps: StepDeps,
+  limits: BackfillLimits = {},
+): Promise<BackfillOutcome> {
+  const maxPages = limits.maxPages ?? RECALL_BACKFILL_MAX_PAGES;
+  const stub = agentFor(principal);
+  let pages = 0;
+  let sessions = 0;
+  const stop = (stopped: BackfillStop): BackfillOutcome => ({ stopped, pages, sessions });
+
+  while (pages < maxPages) {
+    const state = await stub.recallSyncState();
+    const folders = state.folders ?? [];
+    const mailbox = folders.find((one) => syncRowIn(state.sync, one)?.stage === "build");
+    if (mailbox === undefined) return stop("built");
+    const row = syncRowIn(state.sync, mailbox)!;
+
+    let outcome: StepOutcome;
+    try {
+      outcome = await attempt(principal, mailbox, row, deps, () =>
+        advanceUnbuilt(principal, folders, mailbox, row, deps, "backfill"),
+      );
+    } catch {
+      return stop("failed");
+    }
+    if (outcome === "indexed" || outcome === "done") {
+      sessions += 1;
+      pages += 1;
+      continue;
+    }
+    if (outcome === "reset") {
+      sessions += 1;
+      continue;
+    }
+    return stop(outcome === "lease_busy" ? "lease_busy" : "failed");
+  }
+  return stop("budget");
 }

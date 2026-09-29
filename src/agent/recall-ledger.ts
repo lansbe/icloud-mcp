@@ -42,6 +42,7 @@
 
 import type { FolderState } from "../change-marker";
 import {
+  RECALL_BACKFILL_MAX_PAGES_PER_DAY,
   RECALL_MAX_PAGES_PER_DAY,
   RECALL_MAX_VECTORS,
   RECALL_PAGE_SIZE,
@@ -75,8 +76,22 @@ export const PAGE_REFUSALS = ["busy", "paused", "quota", "full", "destroying"] a
 /** One reason a page was refused. */
 export type PageRefusal = (typeof PAGE_REFUSALS)[number];
 
-/** What a page is for. A reconcile only removes, so it is never refused as full. */
-export type PageKind = "build" | "reconcile";
+/**
+ * What a page is for.
+ *
+ * - `build`: one page of a folder's build, or of a built folder's new mail.
+ * - `reconcile`: a removal. It only removes, so it is never refused as full.
+ * - `backfill` (Phase 29.1.1): one page of a folder's FIRST build, asked for by
+ *   the person from the backfill tool while they watch. It skips the one-minute
+ *   pause and the ordinary day count, and nothing else: it is still refused as
+ *   destroying, busy and full, and it counts on its own day counter, capped at
+ *   RECALL_BACKFILL_MAX_PAGES_PER_DAY. It still records when it began, so an
+ *   ordinary page in the minute after it is told paused.
+ */
+export type PageKind = "build" | "reconcile" | "backfill";
+
+/** The refusals a backfill page can get. It is never paused. */
+export type BackfillRefusal = Exclude<PageRefusal, "paused">;
 
 /** The in-flight page: a token the object minted, and when it stops blocking. */
 export interface PageSlot {
@@ -99,6 +114,14 @@ const LAST_PAGE_ROW = "last_page_at";
 /** The `recall_state` keys of the current UTC day and its page count. */
 const DAY_ROW = "pages_day";
 const DAY_COUNT_ROW = "pages_count";
+
+/**
+ * The `recall_state` keys of the current UTC day and its backfill page count
+ * (Phase 29.1.1). Apart from the ordinary two, so a backfill page never moves
+ * the ordinary count. A destroy clears them with the rest of recall_state.
+ */
+const BACKFILL_DAY_ROW = "backfill_day";
+const BACKFILL_COUNT_ROW = "backfill_count";
 
 /** The `recall_state` key of the pending-destroy flag. */
 const PENDING_DESTROY_ROW = "destroy_pending";
@@ -288,24 +311,41 @@ export function parseSyncRow(value: unknown): SyncRow | null {
 
 /**
  * The first reason a page of `kind` may not start now, or null when it may
- * (Phase 26, D-29).
+ * (Phase 26, D-29; Phase 29.1.1).
  *
  * THE ONE PREDICATE. The object's page start asks this before it mints a token,
  * and the object's sync-state read asks it too, so a build step's check before
  * any IMAP can never disagree with the refusal the page start would give. The
- * order is the page start's own: `destroying`, `busy`, `paused`, `quota`, and
- * `full` for a build only. A reconcile only removes, so it is never full.
+ * order is the page start's own, for all three kinds:
+ *   - `destroying`;
+ *   - `busy` while a page slot is in flight;
+ *   - `paused` for a build or a reconcile only, never for a backfill page;
+ *   - `quota`: a build or a reconcile reads the ordinary day count against
+ *     RECALL_MAX_PAGES_PER_DAY, and a backfill page reads its own day count
+ *     against RECALL_BACKFILL_MAX_PAGES_PER_DAY;
+ *   - `full` for a build and a backfill page. A reconcile only removes, so it
+ *     is never full.
  *
  * Reads only. It writes nothing.
  */
+export function pageRefusal(
+  sql: SqlStorage,
+  kind: "backfill",
+  now: number,
+): BackfillRefusal | null;
+export function pageRefusal(sql: SqlStorage, kind: PageKind, now: number): PageRefusal | null;
 export function pageRefusal(sql: SqlStorage, kind: PageKind, now: number): PageRefusal | null {
   if (destroyPending(sql)) return "destroying";
   const slot = readPageSlot(sql);
   if (slot !== null && slot.expiresAt > now) return "busy";
-  const last = readLastPageAt(sql);
-  if (last !== null && now - last < RECALL_PAGE_PAUSE_MS) return "paused";
-  if (pagesOn(sql, utcDay(now)) >= RECALL_MAX_PAGES_PER_DAY) return "quota";
-  if (kind === "build" && countVectors(sql) + RECALL_PAGE_SIZE > RECALL_MAX_VECTORS) {
+  if (kind === "backfill") {
+    if (backfillPagesOn(sql, utcDay(now)) >= RECALL_BACKFILL_MAX_PAGES_PER_DAY) return "quota";
+  } else {
+    const last = readLastPageAt(sql);
+    if (last !== null && now - last < RECALL_PAGE_PAUSE_MS) return "paused";
+    if (pagesOn(sql, utcDay(now)) >= RECALL_MAX_PAGES_PER_DAY) return "quota";
+  }
+  if (kind !== "reconcile" && countVectors(sql) + RECALL_PAGE_SIZE > RECALL_MAX_VECTORS) {
     return "full";
   }
   return null;
@@ -651,6 +691,26 @@ export function countPageOn(sql: SqlStorage, day: string): void {
   writeState(sql, DAY_COUNT_ROW, String(next));
 }
 
+/**
+ * How many backfill pages began on `day` (UTC). Zero when the stored day is
+ * another. Reads only the backfill keys, never the ordinary ones.
+ */
+export function backfillPagesOn(sql: SqlStorage, day: string): number {
+  if (readState(sql, BACKFILL_DAY_ROW) !== day) return 0;
+  const count = Number(readState(sql, BACKFILL_COUNT_ROW) ?? "0");
+  return Number.isFinite(count) ? count : 0;
+}
+
+/**
+ * Count one more backfill page on `day`, starting from zero on a new day.
+ * Writes only the backfill keys, so the ordinary count does not move.
+ */
+export function countBackfillPageOn(sql: SqlStorage, day: string): void {
+  const next = backfillPagesOn(sql, day) + 1;
+  writeState(sql, BACKFILL_DAY_ROW, day);
+  writeState(sql, BACKFILL_COUNT_ROW, String(next));
+}
+
 /** The stored build cursor for `mailbox`, or null. Opaque: never decoded here. */
 export function readCursor(sql: SqlStorage, mailbox: string): string | null {
   return readState(sql, CURSOR_ROW + mailbox);
@@ -769,7 +829,8 @@ export function clearDestroyPending(sql: SqlStorage): void {
 
 /**
  * Clear every recall state row except the pending-destroy flag: every cursor,
- * the page token, the last page time and the day's page count. The object's
+ * the page token, the last page time, the day's page count and the day's
+ * backfill page count. The object's
  * own name is not a recall state row, so it survives.
  */
 export function clearRecallStateExceptPending(sql: SqlStorage): void {

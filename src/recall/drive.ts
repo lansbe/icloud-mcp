@@ -74,7 +74,13 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { AUTONOMY_CLIENT_ID } from "../agent/autonomy-client";
 import type { LeasedMail } from "../agent/lease";
 import type { Principal } from "../principal";
-import { productionStepDeps, recallStep } from "./sync";
+import {
+  type BackfillOutcome,
+  productionStepDeps,
+  recallBackfill,
+  recallStep,
+  type StepDeps,
+} from "./sync";
 
 /**
  * The mark every driven callback carries, as a non-enumerable property.
@@ -113,6 +119,33 @@ export async function runRecallStep(
     // Silent on purpose. A step that fails only delays the build, and the next
     // mail call tries again. The caught value is not read.
   }
+}
+
+/** What a backfill run came to: refused by the grant check, or ran. */
+export type BackfillRun = { kind: "refused" } | { kind: "ran"; outcome: BackfillOutcome };
+
+/**
+ * Run one recall backfill call for the person behind `principal` (Phase
+ * 29.1.1, LD-2, LD-8).
+ *
+ * The principal is already resolved: the tool has awaited it. Runs nothing, and
+ * calls nothing, unless the grant client is a non-empty string other than the
+ * autonomy client: the same test `runRecallStep` makes (D-35). This is the one
+ * call of the backfill under `src/`.
+ *
+ * It does not swallow a thrown value. A throw here means the object could not
+ * be reached, and the tool turns that into its fixed answer. Nothing here logs.
+ */
+export async function runRecallBackfill(
+  principal: Principal,
+  mail: LeasedMail,
+  grantClient: GrantClient,
+  depsFor: (mail: LeasedMail) => StepDeps = productionStepDeps,
+): Promise<BackfillRun> {
+  const client = await grantClient();
+  if (typeof client !== "string" || client.length === 0) return { kind: "refused" };
+  if (client === AUTONOMY_CLIENT_ID) return { kind: "refused" };
+  return { kind: "ran", outcome: await recallBackfill(principal, depsFor(mail)) };
 }
 
 /** True when a tool's answer says it is an error. */

@@ -104,6 +104,7 @@ import {
   clearPageSlot,
   clearRecallStateExceptPending,
   destroyPending,
+  countBackfillPageOn,
   countNewIds,
   countPageOn,
   countVectors,
@@ -789,29 +790,38 @@ export class UserAgent extends DurableObject<Env> {
   }
 
   /**
-   * Ask to start one recall page for `mailbox` (Phase 25, D-15, D-24).
+   * Ask to start one recall page for `mailbox` (Phase 25, D-15, D-24;
+   * Phase 29.1.1).
    *
    * The object decides, not the caller. Refuses, in this order: `invalid` for a
-   * bad mailbox or a kind that is not exactly "build" or "reconcile"; `unnamed`
-   * when the object does not know whose it is; `busy` while another page's
-   * token has not expired; `paused` within RECALL_PAGE_PAUSE_MS of the last
-   * page's start; `quota` once RECALL_MAX_PAGES_PER_DAY pages began today
-   * (UTC), reconciles included; and, for a build only, `full` when one more
-   * page could take the ledger past RECALL_MAX_VECTORS. A reconcile only
-   * removes, so it is never refused as full. Every check after `unnamed` and
-   * `invalid` is `pageRefusal` in ./recall-ledger.ts, the one predicate the
-   * sync-state read below shares (Phase 26, D-29).
+   * bad mailbox or a kind that is not exactly "build", "reconcile" or
+   * "backfill"; `unnamed` when the object does not know whose it is; `busy`
+   * while another page's token has not expired; `paused` within
+   * RECALL_PAGE_PAUSE_MS of the last page's start, for a build or a reconcile
+   * only; `quota` once RECALL_MAX_PAGES_PER_DAY ordinary pages began today
+   * (UTC), reconciles included, or for a backfill page once
+   * RECALL_BACKFILL_MAX_PAGES_PER_DAY backfill pages did; and, for a build or a
+   * backfill page, `full` when one more page could take the ledger past
+   * RECALL_MAX_VECTORS. A reconcile only removes, so it is never refused as
+   * full. Every check after `unnamed` and `invalid` is `pageRefusal` in
+   * ./recall-ledger.ts, the one predicate the sync-state read below shares
+   * (Phase 26, D-29).
    *
    * Otherwise it mints a page token, records the start, counts the page and
-   * answers the stored cursor. No `await`, so the check and the set are one
-   * atomic step. There is no `off` refusal: recall is inherent.
+   * answers the stored cursor. A backfill page records its start exactly as
+   * the other kinds do, so an ordinary page in the minute after it is told
+   * paused; it counts on the backfill day counter, never the ordinary one. No
+   * `await`, so the check and the set are one atomic step. There is no `off`
+   * refusal: recall is inherent.
    */
   recallBeginPage(mailbox: unknown, kind: unknown): BeginPageAnswer {
     const sql = this.ctx.storage.sql;
     ensureRecallSchema(sql);
     if (this.rememberOwnName() === null) return { ok: false, reason: "unnamed" };
     if (!isMailbox(mailbox)) return { ok: false, reason: "invalid" };
-    if (kind !== "build" && kind !== "reconcile") return { ok: false, reason: "invalid" };
+    if (kind !== "build" && kind !== "reconcile" && kind !== "backfill") {
+      return { ok: false, reason: "invalid" };
+    }
 
     const now = Date.now();
     const refusal = pageRefusal(sql, kind, now);
@@ -821,7 +831,8 @@ export class UserAgent extends DurableObject<Env> {
     const pageToken = crypto.randomUUID();
     writePageSlot(sql, { token: pageToken, expiresAt: now + RECALL_PAGE_TTL_MS });
     writeLastPageAt(sql, now);
-    countPageOn(sql, today);
+    if (kind === "backfill") countBackfillPageOn(sql, today);
+    else countPageOn(sql, today);
     return { ok: true, pageToken, cursor: readCursor(sql, mailbox) };
   }
 

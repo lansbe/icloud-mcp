@@ -6732,8 +6732,8 @@ describe("the recall answer's scan rules (Phase 26, D-20)", () => {
       // Measured, not listed: every exported async function in these modules
       // opens, or runs something that opens, the person's one connection.
       for (const [file, expected] of [
-        ["src/recall/sync.ts", ["recallStep", "indexNewMail"]],
-        ["src/recall/drive.ts", ["runRecallStep"]],
+        ["src/recall/sync.ts", ["recallStep", "indexNewMail", "recallBackfill"]],
+        ["src/recall/drive.ts", ["runRecallStep", "runRecallBackfill"]],
         ["src/recall/mail-source.ts", ["newMailPage"]],
       ] as const) {
         const source = rawSourceOf(file);

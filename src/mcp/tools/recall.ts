@@ -26,7 +26,9 @@
 // **It opens no mail session and takes no connection lease.** It reads the
 // person's own object once and their own part of the index once. The build
 // step that follows a mail call comes from plan 26-07's driver, never from this
-// handler.
+// handler. The second tool in this module, the backfill at the bottom, is the
+// one that does open sessions, one leased session at a time, through its runner
+// in src/recall/drive.ts.
 //
 // **Recall is inherent (owner, 2026-09-27).** Nothing is turned on first, and
 // this module has no way to turn it off. The index word is `building` or
@@ -41,13 +43,15 @@
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { agentFor } from "../../agent/lease";
+import { agentFor, type LeasedMail } from "../../agent/lease";
 import { isParked } from "../../agent/recall-ledger";
 import { toErrorCategory } from "../../errors";
 import { decodeMessageId } from "../../mail/ids";
 import type { Principal } from "../../principal";
+import { type GrantClient, runRecallBackfill } from "../../recall/drive";
 import type { RecallMatch } from "../../recall/index";
 import { type RecallDeps, recallDeps, recallFor } from "../../recall/pipeline";
+import { type BackfillOutcome, productionStepDeps, type StepDeps } from "../../recall/sync";
 import { type ToolResult, UNTRUSTED_NOTICE, untrustedToolResult } from "../untrusted";
 
 /** The tool's registered name. SEED-006 fixes it. */
@@ -236,6 +240,110 @@ export function registerRecallTools(
         return recallResult(matches, indexWordOf(state), parkedIn(state));
       } catch {
         return unavailableResult();
+      }
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The backfill tool (Phase 29.1.1, RCLL-14)
+// ---------------------------------------------------------------------------
+//
+// One more tool, `mail_recall_backfill`. The person asks Claude to fill their
+// recall index now, and Claude calls it again and again while they watch. Each
+// call indexes up to about ten pages of the person's own mail, one leased
+// iCloud session at a time, and says how far it got.
+//
+// It takes no argument (LD-8): the principal the door built is the only thing
+// that decides whose index is filled. It runs only from a person's own sign-in
+// in a Claude app, never on the autonomy key (LD-2, LD-3): the runner in
+// src/recall/drive.ts checks the grant's client before it calls anything.
+//
+// Its answer is this server's own words and numbers, so it is one trusted
+// block. No subject line or any other text from mail reaches it.
+
+/** The backfill tool's registered name. */
+export const RECALL_BACKFILL_TOOL_NAME = "mail_recall_backfill";
+
+/** The one sentence a backfill refused by the grant check answers with. */
+export const BACKFILL_REFUSED =
+  "The recall backfill runs only from a person's own sign-in in a Claude app, so nothing was indexed.";
+
+/** The one sentence a backfill that could not reach the index answers with. */
+export const BACKFILL_UNAVAILABLE =
+  "The recall index could not be reached just now, so nothing was indexed.";
+
+/**
+ * The backfill answer: one trusted block with where the index is, why this call
+ * stopped, and what it did.
+ *
+ * Exported so the answer's shape can be asserted without a server.
+ */
+export function backfillResult(outcome: BackfillOutcome, index: RecallIndexWord): ToolResult {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({
+          index,
+          stopped: outcome.stopped,
+          thisCall: { pages: outcome.pages },
+        }),
+      },
+    ],
+  };
+}
+
+/** A fixed error answer, with one sentence and nothing else. */
+function fixedError(message: string): ToolResult {
+  return { isError: true, content: [{ type: "text", text: JSON.stringify({ message }) }] };
+}
+
+/**
+ * Register `mail_recall_backfill` on a per-request server instance.
+ *
+ * No input schema and no arguments, exactly as `account_whoami` does it (LD-8).
+ * `principal` is the same promise every tool gets, awaited first. A refusal
+ * answers the same fixed category every other tool gives. `mail` is the
+ * request's lease runner, and `grantClient` says which client the request's
+ * grant belongs to.
+ *
+ * `depsFor` is a function so registering the tool reads no binding. Tests pass
+ * fakes through it; production passes nothing.
+ */
+export function registerRecallBackfillTool(
+  server: McpServer,
+  mail: LeasedMail,
+  principal: Promise<Principal>,
+  grantClient: GrantClient,
+  depsFor: (mail: LeasedMail) => StepDeps = productionStepDeps,
+): void {
+  server.registerTool(
+    RECALL_BACKFILL_TOOL_NAME,
+    {
+      description:
+        "Fill your own recall index now, while you watch. Each call indexes up to " +
+        "about 250 of your recent messages and says how far it got. Call it again " +
+        "until it says the index is built.",
+    },
+    async () => {
+      let actor: Principal;
+      try {
+        actor = await principal;
+      } catch (err) {
+        const { category, message } = toErrorCategory(err);
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: JSON.stringify({ category, message }) }],
+        };
+      }
+      try {
+        const ran = await runRecallBackfill(actor, mail, grantClient, depsFor);
+        if (ran.kind === "refused") return fixedError(BACKFILL_REFUSED);
+        const state = await agentFor(actor).recallSyncState();
+        return backfillResult(ran.outcome, indexWordOf(state));
+      } catch {
+        return fixedError(BACKFILL_UNAVAILABLE);
       }
     },
   );

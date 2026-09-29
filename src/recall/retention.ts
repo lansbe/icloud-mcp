@@ -27,6 +27,13 @@
 // - RECALL_PAGE_SIZE: messages per build page. It lives here and not in the
 //   build engine because the object needs it to leave room for one page under
 //   the vector ceiling, and the object must not import the engine.
+// - RECALL_BACKFILL_MAX_PAGES_PER_DAY: the most backfill pages one person can
+//   run in one UTC day (Phase 29.1.1). A backfill page is one the person asked
+//   for, from the backfill tool, while they watch. It skips the one-minute pause
+//   and the ordinary day count, and counts here instead. The number is
+//   RECALL_MAX_VECTORS / RECALL_PAGE_SIZE: exactly enough pages to fill the
+//   ceiling once, so a runaway backfill costs at most what filling the ceiling
+//   costs, about $0.12 of embedding per person per day.
 //
 // What this costs per person, from the live price pages: Vectorize bills about
 // $0.01 per million queried dimensions (stored vectors plus queries, counted
@@ -61,3 +68,12 @@ export const RECALL_MAX_PAGES_PER_DAY = 200;
 
 /** Messages per build page. */
 export const RECALL_PAGE_SIZE = 25;
+
+/**
+ * The most backfill pages one person may run in a UTC day (Phase 29.1.1).
+ *
+ * It bounds a backfill the way RECALL_MAX_PAGES_PER_DAY bounds ordinary pages:
+ * exactly enough pages to fill the vector ceiling once. Decided by Claude,
+ * 2026-09-28; the owner may revise it.
+ */
+export const RECALL_BACKFILL_MAX_PAGES_PER_DAY = RECALL_MAX_VECTORS / RECALL_PAGE_SIZE;
