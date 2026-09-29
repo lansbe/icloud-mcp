@@ -4,7 +4,7 @@
 
 **iCloud MCP**
 
-An MCP server hosted on Cloudflare Workers that proxies iCloud Mail (IMAP), Calendar (CalDAV), and Contacts (CardDAV), giving Claude native tool access to the Apple ecosystem. Claude can read and search mail, draft replies into the iCloud Drafts folder, read and manage calendar events, and look up contacts — all without credentials ever leaving the server.
+An MCP server hosted on Cloudflare Workers that proxies iCloud Mail (IMAP), Calendar (CalDAV), and Contacts (CardDAV), giving Claude native tool access to the Apple ecosystem. Claude can read and search mail, draft replies into the iCloud Drafts folder, read and manage calendar events, and look up contacts — all without your password ever leaving the server.
 
 Several people can sign in, each with their own Apple ID and their own Apple app-specific password, and each reaching only their own account. The immediate driver is a job search: drafting thank-you notes, replying to recruiters, and finding calendar slots. The longer arc is moving Claude from "a thing you paste context into" toward a genuine personal assistant.
 

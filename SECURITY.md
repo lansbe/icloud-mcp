@@ -417,7 +417,7 @@ outside world. Tool results wrap them in an explicit untrusted-content fence
 as content to report, never as instructions to follow. Attendee lists for any
 write are always caller-supplied — never derived from content the server read.
 
-### One connection per request
+### One connection at a time
 
 IMAP sessions are opened, used, and closed within a single request. There is no
 connection pooling and no fan-out. One request can open several sessions one

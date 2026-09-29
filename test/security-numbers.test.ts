@@ -68,7 +68,7 @@ const WORDS = ["zero", "one", "two", "three", "four", "five"];
 
 const RECALL = section("Recall keeps a searchable copy of your recent mail");
 const RULES = section("Autonomous rules");
-const CONNECTIONS = section("One connection per request");
+const CONNECTIONS = section("One connection at a time");
 
 describe("SECURITY.md's numbers equal the constants in the code", () => {
   it("read SECURITY.md and found every section it checks", () => {
