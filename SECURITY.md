@@ -39,6 +39,9 @@ changes where the secrets are, so read this table before the rest.
 | `CONFIRM_SECRET` | Cloudflare Secrets | The HMAC key for calendar confirmation tokens |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | Cloudflare Secrets | The R2 S3 API token for presigned attachment uploads |
 | `SAVE_LINK_SEAL_KEY` | Cloudflare Secrets | The key that seals each attachment download link, so a link cannot be read or forged |
+| `AUTONOMY_CLIENT_SECRET` | Cloudflare Secrets | The autonomy client's secret. The token endpoint asks for it on every exchange, refresh and revocation, so a leaked autonomy token cannot be used on its own |
+| `AUTONOMY_SEAL_KEY` | Cloudflare Secrets | The key that seals each person's autonomy key, so reading every store opens nothing |
+| Each person's autonomy key | Their own Durable Object, sealed with `AUTONOMY_SEAL_KEY` | Letting the rules job reach that person's mail with nobody present |
 
 The server holds no account credential of its own. There is no shared login
 password and no Apple identity in the Worker environment. Both existed before
@@ -160,9 +163,14 @@ the one property that keeps the door cheap and testable.
 
 ### Per-user scoping
 
-Every store key carries the user's own derived id, with nothing between the key
-prefix and the id. That is enforced by a scan rule, not by care: a key with no
-user segment is a key any signed-in caller could name.
+Every store key that holds one person's data carries that person's own derived
+id, with nothing between the key prefix and the id. That is enforced by a scan
+rule, not by care: a key with no user segment is a key any signed-in caller
+could name.
+
+One store is an exception, on purpose. The spent mark for an attachment save
+link is keyed by a hash of the link, because the download has no signed-in
+person. The mark holds nothing about the person, and one module may read it.
 
 So one person's cache, staging objects and counters cannot be reached through
 another person's session.
@@ -195,18 +203,26 @@ signed-in person, and only that person can search it.
   someone is still the two steps "Removing someone" describes above; the index
   follows the second one.
 
-**How the index is built.** Only from mail tool calls made through the person's
-own sign-in. Never from anything this server does on its own. One page of 25
-messages at a time, at most one page a minute, under the same per-person
-connection lease every mail tool takes. So building the index never opens a
-second connection to iCloud at the same time as a tool call.
+**How the index is built.** Only from calls made through the person's own
+sign-in. Never from anything this server does on its own. Ordinary mail tool
+calls build it one page of 25 messages at a time, at most one page a minute.
+The person can also ask Claude to fill it faster with `mail_recall_backfill`.
+Each call reads up to 10 pages, one after another, and only from a folder that
+is still being built, the first time or again after a reset. Every page runs
+under the same per-person connection lease every mail tool takes, and its
+sessions run one after another. So building the index does not open a second
+connection to iCloud at the same time as a tool call. One rare case remains.
+An ordinary page can open up to three sessions, and a very slow one can
+outlast its 30-second lease, so another call may connect before it closes. A
+backfill page refuses to start a session that could do that.
 
-**The ceilings.** Each person holds at most 10,000 entries, and the index reads
-at most 200 pages for one person in one day. These bound what is kept and what
-it costs.
+**The ceilings.** Each person holds at most 10,000 entries. Ordinary calls read
+at most 200 pages for one person in one day. Backfill calls do not count toward
+that. They read at most 400 pages for one person in one day, which is enough to
+fill 10,000 entries once. These bound what is kept and what it costs.
 
-These numbers are the constants in `src/recall/retention.ts`, and a check keeps
-this section equal to them.
+These numbers are constants in `src/recall/retention.ts`, `src/recall/sync.ts`
+and `src/agent/recall-ledger.ts`, and a check keeps this section equal to them.
 
 ### Autonomy (inherent)
 
@@ -220,10 +236,10 @@ tied to that person, so it opens only in their own object. The Apple password is
 stored nowhere new: it sits inside the autonomy sign-in's locked props, the same
 as every other sign-in's.
 
-**What it does.** Today, one check right after sign-in that the key works. That
-check asks only which account the key belongs to, and reads no mail. Later, only
-what the person's own rules say, and only flag a message or put a draft in the
-Drafts folder. It never sends mail. With no rules, it does nothing.
+**What it does.** One check right after sign-in that the key works. That check
+asks only which account the key belongs to, and reads no mail. After that, only
+what the person's own rules say, and only flag a message or put a draft reply in
+the Drafts folder. It never sends mail. With no rules, it does nothing.
 
 **How long.** Exactly as long as the person's ordinary connection. There is no
 timer. The next interactive sign-in makes a new key and revokes the old one. A
@@ -332,7 +348,9 @@ Every read opens its mailbox **read-only**, and every fetch uses the peeking
 form, so the assistant reading your mail never sets the seen flag. Read status
 stays a field *you* control. It changes only when you ask the assistant to mark
 a message read or unread, one message at a time.
-Flagging works the same way: one message at a time, only when you ask.
+Flagging is one message at a time too. You can ask for it, and a rule you added
+can also set the flag on its own (see "Autonomous rules"). A rule never clears a
+flag and never changes read status.
 
 ### Saving an attachment to your own computer
 
@@ -401,12 +419,18 @@ write are always caller-supplied — never derived from content the server read.
 
 ### One connection per request
 
-IMAP sessions are opened, used, and closed within a single request; there is no
-connection pooling and no fan-out. This is enforced structurally (one socket
-importer, two session orchestrators — read and mutating — over one private core
-and one request gate, no concurrent combinator around any of them) so
-the server cannot exhaust iCloud's per-account connection ceiling and lock you
-out of your own mail.
+IMAP sessions are opened, used, and closed within a single request. There is no
+connection pooling and no fan-out. One request can open several sessions one
+after another, never two at once: a mail tool's own, then the recall step that
+may follow it, or the pages of one backfill call. This is enforced structurally
+(one socket importer, two session orchestrators — read and mutating — over one
+private core and one request gate, no concurrent combinator around any of them).
+
+Across requests, each person's Durable Object holds a lease. A mail call must
+take it before it connects. A second call that finds it held is refused at
+once, not queued, and the lease ends on its own after 30 seconds. Together
+these keep the server from exhausting iCloud's per-account connection ceiling
+and locking you out of your own mail.
 
 ### No Zero Trust portal in front of this server
 
@@ -454,15 +478,18 @@ still open for anyone who revisits this.
 ## Scope for reports
 
 **In scope:** authentication or authorization bypass; one person reaching
-another person's account, cache, staged files or counters; credential exposure
-in logs, responses, or errors; a path that sends mail or mutates data without
-the preview/commit gate; a way to make the server mark mail read; injection that
+another person's account, cache, staged files, counters, recall index or
+autonomy key; credential exposure in logs, responses, or errors; a path that
+sends mail, or makes a destructive change without its preview/commit gate; a
+way to make the server mark mail read without being asked; the rules job doing
+anything beyond flagging a message and placing a draft reply; injection that
 escapes the untrusted-content fence into tool-calling behavior; the transport
 safety rules being circumventable.
 
 **Out of scope:** anything requiring your Cloudflare account or Apple
 credentials to already be compromised; the deliberate design decisions above
-(no sending, no background jobs, no Zero Trust portal in front of the endpoint,
-and the two-step removal whose cost is stated above); and issues in third-party
+(no sending, the rules job and the risks "Autonomous rules" accepts, no Zero
+Trust portal in front of the endpoint, and the two-step removal whose cost is
+stated above); and issues in third-party
 dependencies that should be reported upstream
 (tell us anyway if they affect this server).
