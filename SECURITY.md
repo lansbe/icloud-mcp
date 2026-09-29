@@ -39,7 +39,7 @@ changes where the secrets are, so read this table before the rest.
 | `CONFIRM_SECRET` | Cloudflare Secrets | The HMAC key for calendar confirmation tokens |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | Cloudflare Secrets | The R2 S3 API token for presigned attachment uploads |
 | `SAVE_LINK_SEAL_KEY` | Cloudflare Secrets | The key that seals each attachment download link, so a link cannot be read or forged |
-| `AUTONOMY_CLIENT_SECRET` | Cloudflare Secrets | The autonomy client's secret. The token endpoint asks for it on every exchange, refresh and revocation, so a leaked autonomy token cannot be used on its own |
+| `AUTONOMY_CLIENT_SECRET` | Cloudflare Secrets | The autonomy client's secret. The token endpoint asks for it on every exchange, refresh and revocation, so a leaked stored autonomy key cannot be used on its own. The short-lived access token each rules run uses does work alone, until that run revokes it at the end |
 | `AUTONOMY_SEAL_KEY` | Cloudflare Secrets | The key that seals each person's autonomy key, so reading every store opens nothing |
 | Each person's autonomy key | Their own Durable Object, sealed with `AUTONOMY_SEAL_KEY` | Letting the rules job reach that person's mail with nobody present |
 
