@@ -360,8 +360,10 @@ so the token always dies before the bytes it names.
 session and closes it. Only then does `save/stage.ts` decode each part, store a
 copy under the person's own prefix in the same bucket, and seal a link to it.
 The link is `https://<host>/save/<token>`. It is sealed under
-`SAVE_LINK_SEAL_KEY`, works for five minutes and works once. The first download
-writes a spent mark to `SAVE_LINK_KV` before a byte is sent. `save/route.ts`
+`SAVE_LINK_SEAL_KEY`, works for five minutes, and works once in practice, not
+once for certain. The first download writes a spent mark to `SAVE_LINK_KV`
+before a byte is sent. That store takes time to reach every location, so two
+downloads from two places at almost the same moment can both get the file. `save/route.ts`
 serves it with no sign-in, no mail connection and no lease, and is rate-limited
 by `SAVE_IP_LIMITER`. A copy is deleted by its download. An unused copy is
 deleted at the person's next save, when anyone tries its dead link, or by the
