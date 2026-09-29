@@ -363,8 +363,9 @@ The link is `https://<host>/save/<token>`. It is sealed under
 `SAVE_LINK_SEAL_KEY`, works for five minutes and works once. The first download
 writes a spent mark to `SAVE_LINK_KV` before a byte is sent. `save/route.ts`
 serves it with no sign-in, no mail connection and no lease, and is rate-limited
-by `SAVE_IP_LIMITER`. A copy is deleted by its download, by the next save's
-sweep, or by the bucket's one-day rule. The save tool refuses the autonomy key.
+by `SAVE_IP_LIMITER`. A copy is deleted by its download. An unused copy is
+deleted at the person's next save, when anyone tries its dead link, or by the
+bucket's daily sweep within two days. The save tool refuses the autonomy key.
 
 ---
 
