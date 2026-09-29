@@ -83,7 +83,13 @@ async function liveToolNames(): Promise<string[]> {
     { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
   ];
   for (const request of requests) await clientSide.send(request);
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  // Wait for the tools/list answer itself, not a fixed number of ticks, so a
+  // slower handler does not make this flaky. Two seconds is far past any real
+  // wait; the checks below report a missing answer by name.
+  const deadline = Date.now() + 2000;
+  while (!received.some((message) => message.id === 2) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
   await server.close();
 
   const answer = received.find((message) => message.id === 2);
@@ -203,16 +209,14 @@ describe("each number in a README tool line equals its constant", () => {
 // and asserts the exact kinds reported. The last case checks that these cases
 // between them trigger every kind the core declares, so no kind exists that
 // nothing can trigger (the same guarantee test/forbidden-tokens.test.ts gives
-// its rules).
+// its rules). It runs every case itself rather than reading what the other
+// cases left behind, so it holds when run alone or in any order.
 
-/** Kinds produced by the cases below, for the set-equality case at the end. */
-const produced = new Set<string>();
-
+/** The distinct kinds `checkReadme` reports for this README and these rows, sorted. */
 function kindsOf(readme: string, groups: readonly ToolGroup[]): string[] {
   const kinds = checkReadme(readme, groups, registeredNames(TOOL_SOURCES)).map(
     (finding) => finding.kind,
   );
-  for (const kind of kinds) produced.add(kind);
   return [...new Set(kinds)].sort();
 }
 
@@ -228,52 +232,91 @@ function changeRows(
   );
 }
 
+/** One drift: a name, the kinds it must report, and a function that makes it. */
+interface Drift {
+  readonly name: string;
+  readonly expected: readonly string[];
+  readonly make: () => { readme: string; groups: readonly ToolGroup[] };
+}
+
+const DRIFTS: readonly Drift[] = [
+  {
+    name: "a row removed from README's block",
+    expected: ["block-differs"],
+    make: () => {
+      const row = "| `mail_flag` |";
+      const line = README.split("\n").find((one) => one.startsWith(row));
+      expect(line, "README has no mail_flag row to remove").toBeDefined();
+      const edited = README.replace(`${line}\n`, "");
+      expect(edited).not.toBe(README);
+      return { readme: edited, groups: TOOL_GROUPS };
+    },
+  },
+  {
+    name: "a registered tool with no row",
+    expected: ["missing-row"],
+    make: () => {
+      const groups = changeRows("Contacts", (rows) =>
+        rows.filter((row) => row.name !== "contacts_commit"),
+      );
+      return { readme: withBlock(README, groups), groups };
+    },
+  },
+  {
+    name: "a row for a tool that is not registered",
+    expected: ["unregistered-row"],
+    make: () => {
+      const groups = changeRows("Mail", (rows) => [
+        ...rows,
+        { name: "mail_not_a_tool", line: "Nothing." },
+      ]);
+      return { readme: withBlock(README, groups), groups };
+    },
+  },
+  {
+    name: "one tool in two groups",
+    expected: ["duplicate-row"],
+    make: () => {
+      const groups = changeRows("Rules", (rows) => [
+        ...rows,
+        { name: "mail_flag", line: "Flag one message." },
+      ]);
+      return { readme: withBlock(README, groups), groups };
+    },
+  },
+  {
+    name: "README without the markers",
+    expected: ["markers-missing"],
+    make: () => {
+      expect(README).toContain(START_MARKER);
+      return { readme: README.replace(START_MARKER, ""), groups: TOOL_GROUPS };
+    },
+  },
+  {
+    name: "a wrong count line",
+    expected: ["block-differs"],
+    make: () => {
+      const edited = README.replace(/^\d+ tools in /m, "44 tools in ");
+      expect(edited, "the count was already 44, so this case changes nothing").not.toBe(README);
+      return { readme: edited, groups: TOOL_GROUPS };
+    },
+  },
+];
+
 describe("every way the tool block can drift is reported", () => {
-  it("a row removed from README's block", () => {
-    const row = "| `mail_flag` |";
-    const line = README.split("\n").find((one) => one.startsWith(row));
-    expect(line, "README has no mail_flag row to remove").toBeDefined();
-    const edited = README.replace(`${line}\n`, "");
-    expect(edited).not.toBe(README);
-    expect(kindsOf(edited, TOOL_GROUPS)).toEqual(["block-differs"]);
-  });
-
-  it("a registered tool with no row", () => {
-    const groups = changeRows("Contacts", (rows) =>
-      rows.filter((row) => row.name !== "contacts_commit"),
-    );
-    expect(kindsOf(withBlock(README, groups), groups)).toEqual(["missing-row"]);
-  });
-
-  it("a row for a tool that is not registered", () => {
-    const groups = changeRows("Mail", (rows) => [
-      ...rows,
-      { name: "mail_not_a_tool", line: "Nothing." },
-    ]);
-    expect(kindsOf(withBlock(README, groups), groups)).toEqual(["unregistered-row"]);
-  });
-
-  it("one tool in two groups", () => {
-    const groups = changeRows("Rules", (rows) => [
-      ...rows,
-      { name: "mail_flag", line: "Flag one message." },
-    ]);
-    expect(kindsOf(withBlock(README, groups), groups)).toEqual(["duplicate-row"]);
-  });
-
-  it("README without the markers", () => {
-    expect(README).toContain(START_MARKER);
-    const edited = README.replace(START_MARKER, "");
-    expect(kindsOf(edited, TOOL_GROUPS)).toEqual(["markers-missing"]);
-  });
-
-  it("a wrong count line", () => {
-    const edited = README.replace(/^\d+ tools in /m, "44 tools in ");
-    expect(edited, "the count was already 44, so this case changes nothing").not.toBe(README);
-    expect(kindsOf(edited, TOOL_GROUPS)).toEqual(["block-differs"]);
-  });
+  for (const drift of DRIFTS) {
+    it(drift.name, () => {
+      const { readme, groups } = drift.make();
+      expect(kindsOf(readme, groups)).toEqual([...drift.expected]);
+    });
+  }
 
   it("between them, the cases above trigger every declared kind", () => {
+    const produced = new Set<string>();
+    for (const drift of DRIFTS) {
+      const { readme, groups } = drift.make();
+      for (const kind of kindsOf(readme, groups)) produced.add(kind);
+    }
     expect([...produced].sort()).toEqual([...FINDING_KINDS].sort());
   });
 });
