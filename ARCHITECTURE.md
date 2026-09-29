@@ -93,75 +93,153 @@ person's derived id.
 
 ## Module map
 
+Every file under `src/` has one row here. `test/architecture-map.test.ts` fails
+when a file is added or removed and this map does not follow. Each table's rows
+are written relative to the directory in its heading.
+
 ### Root (`src/`)
 
 | File | Role |
 |------|------|
-| `index.ts` | Worker entry — the OAuth provider. |
-| `env.ts` | The binding surface: declares `Cloudflare.Env` (KV, R2, vars, secrets). |
+| `index.ts` | Worker entry. The default export is the OAuth provider; it also exports the `UserAgent` Durable Object class. |
+| `env.ts` | The binding surface: declares `Cloudflare.Env` (KV, R2, the vector index, AI, the Durable Object, the self-binding, rate limiters, vars, secrets). |
 | `errors.ts` | Closed error vocabulary and the single translation boundary (`toErrorCategory`). |
-| `tokens.ts` | Byte-level token codec (base64url, strict UTF-8) shared by every opaque-id and cursor. |
-| `confirm.ts` | The calendar-write confirmation capability (signed, single-use, short-lived). |
-| `deployed-hostname.generated.ts` | **Generated, git-ignored** — the hostname baked in from config. |
+| `tokens.ts` | Byte-level token codec (base64url, strict UTF-8) shared by every opaque id and cursor. |
+| `confirm.ts` | The confirmation capability behind every preview and commit: signed, single-use, short-lived. |
+| `change-marker.ts` | The change check's marker: sealed, carried by the caller, never stored here. |
+| `principal.ts` | Who a request acts for: the user id derived from an Apple ID, the principal, and the holder that keeps the password off it. Also `maskAppleId`. |
+| `password-pause.ts` | The dead-password pause: after Apple refuses a stored password, stop asking Apple for that person for 15 minutes. |
+| `configured-secret.ts` | The one "is this secret set" predicate every secret reader shares. |
+| `deployed-hostname.generated.ts` | **Generated, git-ignored.** The hostname baked in from the wrangler config. |
 
-### `auth/` — OAuth gating
+### Sign-in (`auth/`)
 
 | File | Role |
 |------|------|
-| `oauth.ts` | The `OAuthProviderOptions` object. |
-| `login-handler.ts` | The `/authorize` surface: consent, the Apple ID and app-password form, the two-source allow-list check, the refusal floor and limiter layers, redirect allowlist. |
+| `oauth.ts` | The `OAuthProviderOptions` object. Routes `/save/` to the download route and everything else to the login handler. |
+| `login-handler.ts` | The `/authorize` flow: the allow-list check, the refusal floor and limiter layers, proving the password against Apple, the redirect allowlist, and arming the autonomy key after a sign-in. |
+| `login-page.ts` | Every byte of the sign-in page a person sees. |
 | `allow-list.ts` | The one store read, the parse rule shared with the seed, and what an absent or malformed document means. |
 
-### `mcp/` — protocol layer
+### Protocol layer (`mcp/`)
 
 | File | Role |
 |------|------|
-| `api-handler.ts` | MCP termination via `createMcpHandler`; the `mcpApiHandler` adapter; host/origin config. |
-| `server.ts` | Per-request server factory; session gate + DAV fetch; all tool registrations. |
-| `untrusted.ts` | The untrusted-content fence (notice + nonce + trusted/untrusted split). |
-| `tools/diagnose.ts` | `mail_imap_diagnose`. |
-| `tools/mail.ts` | The 17 mail tools and their response shapers. |
-| `tools/dav-diagnose.ts` | `dav_diagnose`. |
-| `tools/calendar.ts` | The 9 calendar tools; preview/commit logic. |
-| `tools/contacts.ts` | The 2 contact tools. |
+| `api-handler.ts` | The door. Checks the grant against the allow list, builds the principal, and hands the request to `createMcpHandler`. Holds the host and origin config. |
+| `server.ts` | The per-request server factory: the session gate, the leased mail runner, the DAV fetch, the recall step seam, and every tool registration. |
+| `instructions.ts` | The server-level instructions a client shows the model with the tool list. |
+| `grant-client.ts` | Reads which client a request's grant belongs to, so recall and the save tool can refuse the autonomy key. |
+| `untrusted.ts` | The untrusted-content fence (notice, nonce, trusted/untrusted split). |
 
-### `mail/` — IMAP
+### Tool registrars (`mcp/tools/`)
+
+Which group each file registers into. README's generated tool table lists every
+tool; this map does not repeat it.
+
+| File | Role |
+|------|------|
+| `diagnose.ts` | Diagnostics: the IMAP connectivity check. |
+| `dav-diagnose.ts` | Diagnostics: the CalDAV/CardDAV discovery check, plus two shapers the DAV tools share. |
+| `account.ts` | Diagnostics: which Apple ID this connection is signed in as. |
+| `mail.ts` | Mail: listing, finding, reading, attachments, compose into Drafts, staging, read status, the flag, moves and the draft delete with their commit. |
+| `recall.ts` | Mail: recall by meaning, and the recall backfill. |
+| `save.ts` | Mail: saving attachments to the person's own computer, as one link each. |
+| `changes.ts` | Changes: what changed in mail and calendars since a marker. |
+| `calendar.ts` | Calendar: calendars, events, invitations, free slots, and the calendar commit. |
+| `contacts.ts` | Contacts: the reads. It also calls the write registrar below. |
+| `contacts-write.ts` | Contacts: create and update previews, and the contact commit. |
+| `rules.ts` | Rules: list, add with a preview, commit, remove, and test a rule. |
+
+### IMAP (`mail/`)
 
 | File | Role |
 |------|------|
 | `socket.ts` | **The only module that may open a TCP socket.** `connectImap()` takes no parameters. |
-| `service.ts` | **The two session orchestrators** over one private core: read (`withMailSession`, `withMailSessionOver`) and mutating (`withMutatingMailbox`, `withMutatingMailboxOver`), plus `createSessionGate`. The sole draft-write (`APPEND`) site, and the one place a mailbox is opened in the mutating form. |
-| `triage.ts` | **The only user of the mutating orchestrator.** Hands out verbs, never a session. Marks one message read or unread, flags or unflags one message, and moves a list of messages to another folder: a copy, then the removal of that one original. Also moves one draft from the drafts folder to Trash, through the same move step. Fetches no message body. |
+| `service.ts` | **The two session orchestrators** over one private core: read (`withMailSession`, `withMailSessionOver`) and mutating (`withMutatingMailbox`, `withMutatingMailboxOver`), plus `createSessionGate`. The sole draft-write site, and the one place a mailbox is opened in the mutating form. |
+| `triage.ts` | **The only user of the mutating orchestrator.** Hands out verbs, never a session: mark one message read or unread, flag or unflag one message, move a list of messages (a copy, then the removal of that one original), and move one draft to Trash. Fetches no message body. |
 | `imap-session.ts` | The IMAP wire conversation over a `DuplexLike` (socket-free, no logging). |
 | `imap-parser.ts` | Pure IMAP line parsing, no I/O. |
 | `mime.ts` | Raw RFC822 → decoded message (`postal-mime`, `HTMLRewriter`). |
+| `stream-decode.ts` | Turns a saved attachment's transfer-encoded windows back into its bytes, and refuses rather than return bytes it is not sure of. |
 | `compose.ts` | Message fields → RFC 5322 bytes (hand-rolled). |
 | `credentials.ts` | Write-only credential helpers (consume the password, return nothing). |
 | `extract.ts` | Attachment bytes → text (`unpdf` for PDFs). |
-| `ids.ts` | Opaque identifiers for messages/folders/attachments/pages. |
+| `ids.ts` | Opaque identifiers for messages, folders, attachments and pages. |
 | `diagnose.ts` | The connectivity proof: one socket, report, close. |
 
-### `dav/` — CalDAV/CardDAV
+### CalDAV/CardDAV (`dav/`)
 
 | File | Role |
 |------|------|
 | `transport.ts` | **The only module that may issue a DAV request.** Builds `davFetch` (per-call Basic auth, manual redirects, status classification, per-request serialization). |
 | `discovery.ts` | **The only module that may name an iCloud DAV hostname.** Discovery + `DAV_CACHE` (24 h TTL). |
 | `calendar.ts` | Calendar service: collections, bounded range expansion, keyset paging, write helpers. |
-| `contacts.ts` | Contacts service: address books, matching, paging. |
+| `contacts.ts` | Contacts service: address books, matching, paging, write helpers. |
 | `icalendar.ts` | Pure iCalendar parsing, timezones, recurrence expansion (`ical.js`). |
-| `vcard.ts` | Pure vCard parsing/field extraction (via `ical.js`). |
+| `vcard.ts` | Pure vCard parsing and field extraction (via `ical.js`). |
 | `ids.ts` | Opaque identifiers (collection URL + object URL in one token). |
 | `errors.ts` | DAV typed errors + translation boundary (shares only the vocabulary with `errors.ts`). |
 | `diagnose.ts` | Transport-free half of `dav_diagnose`. |
 
-### `staging/` and `feed/`
+### The per-person object and the rules job (`agent/`)
 
 | File | Role |
 |------|------|
-| `staging/r2.ts` | The staging bucket: put/get/delete outside the mail session. |
-| `staging/presign.ts` | Presigned uploads (`aws4fetch`); the only reader of the two R2 credentials. |
-| `feed/subscription-feed.ts` | **The only module that may fetch a subscription feed.** Attaches no credential (the feed host is a third party). |
+| `user-agent.ts` | **The per-person Durable Object.** Holds the lease, its own stored name, the recall ledger, the sealed autonomy record, the rules and their job state, and one alarm. Never opens a socket, never imports mail, DAV, tool or auth code. |
+| `lease.ts` | The connection lease as the Worker request sees it: `agentFor` (the only place a stub is built) and `createLeasedMail`, which takes the lease before a mail session and gives it back after. |
+| `recall-ledger.ts` | The recall ledger's SQLite tables: every vector id a person owns, always a superset of the index. Also the page slot, pace and quota. |
+| `autonomy.ts` | The autonomy key: exchange the code, seal the refresh token, the standing check, the alarm job, and disarm. |
+| `autonomy-client.ts` | The autonomy client's fixed facts: its id, name, redirect path, and `AUTONOMY_TOOLS`, the four tools the job may name. |
+| `autonomy-grants.ts` | The one place autonomy asks the OAuth library about grants: sweep old autonomy grants, and whether the key still stands. |
+| `job.ts` | The rules job: one run from the alarm. Asks the change check for new inbox mail, matches, acts, records. |
+| `cadence.ts` | The job's clock: one fixed interval, and a per-person offset. |
+| `rules.ts` | A rule's shape, limits and the one strict parser. |
+| `evaluate.ts` | The matcher: rule index, message index, flag or draft. No identifier leaves it. |
+| `actions.ts` | The job's two actions: set the flag, and place a draft reply. |
+| `recipient.ts` | The one place an address from a message becomes a recipient: the From address only. |
+| `activity.ts` | The ring of the last 100 things the job did, with no subject, address or text. |
+| `status.ts` | The small per-person status record the owner's grants script can read. |
+| `tool-call.ts` | Types only: the shapes the job passes around. |
+| `tool-reply.ts` | Reads the tools' answers inside the object, including the fenced part, strictly. |
+
+### Recall (`recall/`)
+
+| File | Role |
+|------|------|
+| `index.ts` | **The only module that may name the vector index binding.** Every read and write takes the principal and sets the namespace and filter from it. |
+| `embed.ts` | **The only reader of the AI binding, and the one model id.** Text → vectors. |
+| `ids.ts` | A vector's id: a digest of the user id and the message token. |
+| `retention.ts` | The terms: 90-day retention, snippet and text caps, vector and page limits. |
+| `pipeline.ts` | Index a batch (ledger first, store second) and recall from the person's own vectors. |
+| `build.ts` | The build engine: one page per call, and the clean-up at sync time. |
+| `mail-source.ts` | The real page source over IMAP: read-only, peeking, newest first. |
+| `sync.ts` | One recall build step, and the backfill. Nothing else calls these. |
+| `drive.ts` | **The one driver.** `withRecallStep` runs one step after a mail tool answers without an error; also runs the backfill. |
+| `dead-ref.ts` | Removes a recall result that no longer opens. |
+| `lifecycle.ts` | Expiry and the wholesale destroy, run from the object's alarm. |
+| `grant-check.ts` | Asks whether this person still holds any grant. Only a definite "none" destroys their index. |
+
+### Saving attachments (`save/`)
+
+| File | Role |
+|------|------|
+| `stage.ts` | After the save tool's read-only session closes: decode each part, store a copy under the person's prefix, seal a link. |
+| `link.ts` | Save links: sealed, self-validating, spent once. |
+| `route.ts` | `GET /save/<link>`: serves one saved copy. No sign-in, no mail connection, no lease. |
+| `filename.ts` | The suggested filename, safe to put in a shell command. |
+
+### Attachment staging (`staging/`)
+
+| File | Role |
+|------|------|
+| `r2.ts` | The staging bucket: put, get and delete, always outside the mail session. |
+| `presign.ts` | Presigned uploads (`aws4fetch`); the only reader of the two R2 credentials. |
+
+### Subscription feeds (`feed/`)
+
+| File | Role |
+|------|------|
+| `subscription-feed.ts` | **The only module that may fetch a subscription feed.** Attaches no credential (the feed host is a third party). |
 
 ---
 
