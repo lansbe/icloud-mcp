@@ -177,6 +177,33 @@ describe("every bad link gets one answer: an empty 410", () => {
     expect(await spent(live.token)).toBe(false);
   });
 
+  it("refuses a second spelling of a real link, and spends nothing", async () => {
+    // A token's last character can carry bits no byte uses. Setting one names
+    // the same bytes, so it unseals, but it hashes to a different spent mark.
+    // Find a size whose token has such a tail: its length is not a multiple of 4.
+    let live: Saved | null = null;
+    for (const size of [41, 141, 1041]) {
+      const candidate = await saveCopy(new Uint8Array(size));
+      if (candidate.token.length % 4 !== 0) {
+        live = candidate;
+        break;
+      }
+    }
+    expect(live).not.toBeNull();
+    const real = live!.token;
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const last = alphabet.indexOf(real[real.length - 1]!);
+    const other = `${real.slice(0, -1)}${alphabet[last ^ 1]}`;
+    expect(other).not.toBe(real);
+
+    expect(await settle(urlFor(`${SAVE_ROUTE_PATH}${other}`))).toEqual(GONE);
+    expect(await spent(other)).toBe(false);
+    expect(await spent(real)).toBe(false);
+
+    // The one real spelling still downloads.
+    expect((await settle(live!.url)).status).toBe(200);
+  });
+
   it("refuses an expired link and deletes its copy", async () => {
     const old = await saveCopy(SMALL, { nowMs: Date.now() - 6 * 60 * 1000 });
     expect(await stored(old.key)).toBe(true);

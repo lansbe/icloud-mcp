@@ -271,6 +271,10 @@ export async function claimSaveLink(
 
   const joined = bytesFromBase64Url(token);
   if (joined === null || joined.byteLength <= IV_BYTES + TAG_BYTES) return null;
+  // One spelling per link. The decoder ignores the unused bits of the last
+  // character, so several tokens name the same bytes, and each would get its
+  // own spent mark. Only the spelling a mint writes is accepted.
+  if (base64UrlFromBytes(joined) !== token) return null;
 
   let opened: ArrayBuffer;
   try {
