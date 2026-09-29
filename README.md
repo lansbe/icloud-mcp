@@ -215,8 +215,8 @@ runs.
 | `rules_test` | Try a rule on your newest 25 inbox messages and say what it would do. Writes nothing. |
 <!-- tools:end -->
 
-Full input parameters for each tool are in the tool descriptions themselves and
-in [ARCHITECTURE.md](ARCHITECTURE.md).
+Each tool's full input parameters are in its input schema, which the server
+sends with the tool list, so an MCP client shows them with the tool.
 
 ---
 
