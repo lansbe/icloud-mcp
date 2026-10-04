@@ -93,6 +93,12 @@ Wrangler dry-run reports 2,546.50 KiB uncompressed / 606.17 KiB gzip.
 
 The explicitly authorized `icloud-mcp` placeholder Worker was created through
 the integrated browser after verifying no existing projects and an active Free
-plan at $0. The browser/tool connection then failed before the probe module or
-SQLite namespace was installed. **No cloud PDF/vector execution or platform CPU
-measurement is claimed.** Resume from the existing Worker; do not create it again.
+plan at $0. The browser/tool connection failed and was restored using the
+documented browser-session reset. The existing Worker was confirmed unchanged.
+The editor's upload command did not produce a file chooser through either
+documented browser interaction path. The dashboard's DO binding dialog lists
+only existing namespaces (zero options); the DO account page has no namespace
+creation control. Deployment through Wrangler/API therefore needs a separately
+approved authentication route, or a user-operated deployment. None was started.
+**No cloud PDF/vector execution or platform CPU measurement is claimed.** Resume
+from the existing Worker; do not create it again.

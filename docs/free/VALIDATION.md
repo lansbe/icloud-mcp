@@ -10,6 +10,7 @@ Environment: local Mac arm64, Node 26.5.0, pinned Wrangler 4.122.0 / workerd, Vi
 - `npm run build:free`: bundle builds with only five SQLite DO classes, three KV namespaces, AI, SELF and the existing rate limiters. Measured build: approximately 5,036 KiB uncompressed / 1,124 KiB gzip.
 - `npm audit --audit-level=high`: zero reported vulnerabilities on 2026-10-04. Compatible transitive updates and patched Vitest were applied; undici 7.29.1 and sharp 0.35.4 are pinned overrides. No audit bypass or forced major platform upgrade.
 - CI runs the same local check/build/audit with Node 22.18 and no cloud secrets or deployment step. Its first Linux run passed 6,169 tests and hit seven 5-second deadlines in repeated whole-repository scans. The static project now allows 30 seconds per test; Worker deadlines and explicit scanner complexity assertions are unchanged.
+- A later Linux run of `2397da6` passed 6,175/6,176 tests but measured 2,115 ms for the 600-page PDF probe against its unchanged 2,000 ms assertion. `npm test` now runs all 29 timing/protocol probes after the remaining suite, so they do not compete with other test files for CPU. No threshold, PDF limit or production deadline was raised. The 29 probes pass locally in this isolated mode; this remains elapsed local-runtime evidence, not cloud CPU evidence.
 
 ## Local profiling
 
