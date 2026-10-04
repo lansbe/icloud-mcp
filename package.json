@@ -25,7 +25,8 @@
     "pretest:free": "node scripts/free-config.mjs",
     "test:free": "vitest run --config vitest.free.config.ts",
     "check": "npm run typecheck && npm run scan && npm run docs:tools && npm test && npm run test:free",
-    "bench:free": "node scripts/benchmark-free.mjs"
+    "bench:free": "node scripts/benchmark-free.mjs",
+    "test:probe": "node scripts/test-cloud-probe.mjs"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "0.10.3",

@@ -21,4 +21,5 @@ jobs:
       - run: npm run prepare:free
       - run: npm run check
       - run: npm run build:free
+      - run: npm run test:probe
       - run: npm audit --audit-level=high

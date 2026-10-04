@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "icloud-mcp",
+  "main": "scripts/cloud-probe/worker.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "durable_objects": {"bindings": [{"name": "PROBE", "class_name": "CloudProbe"}]},
+  "exports": {"CloudProbe": {"type": "durable-object", "storage": "sqlite"}},
+  "observability": {"enabled": false},
+  "logpush": false
+}

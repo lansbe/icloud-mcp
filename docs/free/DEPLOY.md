@@ -1,6 +1,6 @@
 # Deploying the Free profile
 
-Status: locally tested; no live deployment or iCloud connection performed. Follow this profile instead of the upstream R2/Paid instructions. This is a fresh-install path; it does not migrate existing users or copy a live upstream datastore.
+Status: application locally tested; no product deployment or iCloud connection performed. A separately authorized test Worker placeholder exists; its probe installation remains pending (see [CLOUD-PROBE.md](CLOUD-PROBE.md)). Follow this profile instead of the upstream R2/Paid instructions. This is a fresh-install path; it does not migrate existing users or copy a live upstream datastore.
 
 ## Local verification without an account
 
@@ -19,7 +19,7 @@ npm run bench:free
 
 ## Approval required before cloud actions
 
-For this development task, the user has authorized GitHub fork/commits but has **not** authorized Cloudflare provisioning, deployment, secret creation, permission changes or iCloud login. The following commands are a reviewable runbook, not actions already taken. Stop if Cloudflare asks for payment, an upgrade, a new token, expanded permissions or a new account. Existing CLI authorization may be used only after the user approves the named account and intended cloud operations. Never inspect credential files or print tokens.
+For this development task, the user has authorized GitHub fork/commits and a specifically named synthetic test Worker with necessary SQLite storage on the verified Free account. This does **not** authorize product deployment, secret creation, permission changes or iCloud login. The following product commands are a reviewable runbook, not actions already taken. Stop if Cloudflare asks for payment, an upgrade, a new token, expanded permissions or a new account. Existing CLI authorization may be used only after the user approves the named account and intended cloud operations. Never inspect credential files or print tokens.
 
 The minimum approval is: use the user's identified existing **Workers Free** account; create three KV namespaces and this Worker's five SQLite DO classes; deploy only this fork with synthetic data first; create the four named application secrets; use included Workers AI with a tiny synthetic embedding. No R2, Vectorize, payment or third-party AI account is needed. An existing `workers.dev` subdomain avoids purchasing a domain. The dashboard must show Workers Free and no required billing checkout for these operations. The CLI acknowledgement is not an account-plan API check.
 

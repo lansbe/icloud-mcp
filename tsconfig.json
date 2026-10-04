@@ -16,5 +16,5 @@
       "@cloudflare/vitest-pool-workers/types"
     ]
   },
-  "include": ["src", "test", "vitest.config.ts", "vitest.free.config.ts"]
+  "include": ["src", "test", "scripts/cloud-probe", "vitest.config.ts", "vitest.free.config.ts"]
 }

@@ -1,6 +1,6 @@
 # Validation evidence
 
-Environment: local Mac arm64, Node 26.5.0, pinned Wrangler 4.122.0 / workerd, Vitest 4.1.11. Tests use synthetic identities and files. No iCloud login, Cloudflare deployment, account creation, secret creation, paid service or billing operation was performed.
+Environment: local Mac arm64, Node 26.5.0, pinned Wrangler 4.122.0 / workerd, Vitest 4.1.11. Tests use synthetic identities and files. No iCloud login, account creation, secret creation, paid service or billing operation was performed. An explicitly authorized test Worker placeholder was subsequently created on the verified Free account; the application and cloud probe are not deployed. See [CLOUD-PROBE.md](CLOUD-PROBE.md) for the exact state and local probe checks.
 
 ## Automated checks
 
