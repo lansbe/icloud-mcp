@@ -41,6 +41,10 @@ export default defineConfig({
       {
         test: {
           name: "static",
+          // These tests repeatedly scan the entire repository. Shared CI CPUs
+          // need more than Vitest's 5 s default; behavioral timing assertions
+          // inside the scanner tests and all Worker timeouts are unchanged.
+          testTimeout: 30000,
           environment: "node",
           include: FILESYSTEM_TESTS,
           exclude: IGNORED,
