@@ -48,7 +48,7 @@ describe("Free deployment gates", () => {
       ["src/free/semantic-store.ts", "FREE_RECALL", "recall-v1"]]) {
       const fixed = `env.${binding}.getByName("${name}")`;
       expect(matchRule(rule, 0, file, fixed)).toHaveLength(0);
-      for (const prefix of ["request.", "other", "$", "owner."]) {
+      for (const prefix of ["request.", "other", "$", "owner.", "request. ", "request.\n ", "request./* gap */"]) {
         expect(matchRule(rule, 0, file, prefix + fixed)).toHaveLength(1);
       }
     }

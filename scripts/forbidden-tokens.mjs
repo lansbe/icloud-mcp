@@ -4237,7 +4237,10 @@ export function matchRule(rule, ruleIndex, relativePath, contents) {
       if (fixed) {
         const before = `env.${fixed[0]}.`;
         const call = `getByName("${fixed[1]}")`;
-        if (!/[\w$.]/.test(contents[match.index - before.length - 1] ?? "") &&
+        const receiverPrefix = contents.slice(0, Math.max(0, match.index - before.length))
+          .replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "").trimEnd();
+        if (!/[\w$]/.test(contents[match.index - before.length - 1] ?? "") &&
+            !receiverPrefix.endsWith(".") &&
             contents.slice(match.index - before.length, match.index) === before &&
             contents.slice(match.index, match.index + call.length) === call) continue;
       }
