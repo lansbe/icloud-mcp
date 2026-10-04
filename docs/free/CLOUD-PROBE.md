@@ -68,6 +68,37 @@ Do not silently authorize Wrangler, connect a Git provider, create a token,
 upgrade a plan, or switch to a personal browser. The local dry-run does not
 authenticate or deploy anything. A Hello World placeholder is not the probe.
 
+### Optional private terminal deployment
+
+Only after separate approval for a temporary token, prepare a custom API token
+with **Account → Workers Scripts → Edit**, restricted to the approved account,
+with the shortest practical expiration. Do not add permissions if deployment
+fails. Review the summary before creation. Cloudflare displays the new secret
+once: when an assistant must not see it, the account owner completes that final
+step without another browser capture, then enters it in their own local terminal:
+
+```sh
+python3 scripts/deploy-probe-private.py --account YOUR_APPROVED_ACCOUNT_ID
+```
+
+Run the command from the repository. The account ID is not the token. Paste the
+token only at the masked prompt, never in the command, a file or a chat. The
+wrapper verifies the exact probe configuration and pinned Wrangler version,
+rejects non-terminal/unmasked input, excludes inherited debug/proxy/credential
+variables, disables Wrangler logs/metrics/error reports, and uses `--env-file`
+with the null device to avoid loading project secrets. It gives the token only
+to the child process environment and discards child output. Process memory and
+environment remain accessible to the OS/user; this is not a secret vault or a
+guarantee of memory erasure. A timeout or nonzero result is ambiguous: inspect
+the named Worker before retrying, without sharing any token or raw logs.
+
+After `DEPLOIEMENT_REUSSI`, leave the page displaying the secret before asking an
+assistant to resume browser inspection. Complete the fixed test and revoke the
+named temporary token. The public synthetic test itself needs no token.
+`python3 scripts/test-private-deploy.py` checks this wrapper offline, including
+a real pseudo-terminal with a known fake token and failure paths. It never
+authenticates or invokes Wrangler.
+
 Before running the probe, verify the uploaded module/version, SQLite class and
 binding, compatibility date/flags and Free plan. Verify logs/traces are disabled
 as configured; dashboard templates may enable logs by default. Open the probe's
@@ -99,6 +130,10 @@ The editor's upload command did not produce a file chooser through either
 documented browser interaction path. The dashboard's DO binding dialog lists
 only existing namespaces (zero options); the DO account page has no namespace
 creation control. Deployment through Wrangler/API therefore needs a separately
-approved authentication route, or a user-operated deployment. None was started.
+approved authentication route, or a user-operated deployment. A temporary,
+account-scoped token was subsequently approved, and its form prepared in the
+integrated browser. Final creation and private terminal entry remain with the
+account owner; no token was created or read by the assistant. The deployment
+wrapper is implemented and its six offline tests pass.
 **No cloud PDF/vector execution or platform CPU measurement is claimed.** Resume
 from the existing Worker; do not create it again.

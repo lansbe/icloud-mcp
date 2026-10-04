@@ -4,6 +4,7 @@ dist
 .dev.vars
 .env
 .DS_Store
+__pycache__/
 
 # Your live Worker config, holding your Cloudflare account id, KV namespace
 # ids, and custom domain. Copied from wrangler.jsonc.example on `npm install`;

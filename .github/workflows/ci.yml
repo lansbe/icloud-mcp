@@ -22,4 +22,5 @@ jobs:
       - run: npm run check
       - run: npm run build:free
       - run: npm run test:probe
+      - run: python3 scripts/test-private-deploy.py
       - run: npm audit --audit-level=high
