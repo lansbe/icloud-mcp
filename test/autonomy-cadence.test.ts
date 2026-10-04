@@ -510,9 +510,13 @@ describe("the job on the one shared alarm (D-14, 25 D-23)", () => {
     const callsAfterFirst = seen.length;
     expect(callsAfterFirst).toBeGreaterThan(0);
 
-    // The alarm fires again now, long before the job's own time.
-    await runInDurableObject(stub, (_i, state) => state.storage.setAlarm(Date.now() + 10));
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    // Fire the actual handler early, with its consumed alarm cleared as the
+    // runtime does. A real +10 ms alarm races the simulator's own delivery
+    // against runDurableObjectAlarm() on a busy CI host.
+    await runInDurableObject(stub, async (instance: UserAgent, state) => {
+      await state.storage.deleteAlarm();
+      await instance.alarm();
+    });
 
     expect(seen.length).toBe(callsAfterFirst);
     expect(await storedNextAt(stub)).toBe(own);
