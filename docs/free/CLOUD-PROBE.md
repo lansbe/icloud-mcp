@@ -109,7 +109,9 @@ times are **not metered CPU**. First/warm means successive calls, not guaranteed
 independent cold infrastructure starts. Do not infer a 30-second Free DO CPU
 allowance from local success alone.
 
-Keep results and account identifiers private unless publication is approved.
+Keep raw account metrics, identifiers and dashboard evidence private unless
+publication is approved. Repository validation summaries contain no credentials,
+account identifiers, personal endpoint names or private message content.
 Cleanup of the disposable deployment and its recovery history requires the
 agreed cleanup action. Do not delete/recreate the namespace to bypass a failed
 attempt or quota. Full acceptance still requires the additional application,
@@ -122,18 +124,23 @@ All 107 stages and the listed stop/concurrency checks passed in local workerd.
 TypeScript, the forbidden-token scanner and the 47-tool documentation check pass.
 Wrangler dry-run reports 2,546.50 KiB uncompressed / 606.17 KiB gzip.
 
-The explicitly authorized `icloud-mcp` placeholder Worker was created through
-the integrated browser after verifying no existing projects and an active Free
-plan at $0. The browser/tool connection failed and was restored using the
-documented browser-session reset. The existing Worker was confirmed unchanged.
-The editor's upload command did not produce a file chooser through either
-documented browser interaction path. The dashboard's DO binding dialog lists
-only existing namespaces (zero options); the DO account page has no namespace
-creation control. Deployment through Wrangler/API therefore needs a separately
-approved authentication route, or a user-operated deployment. A temporary,
-account-scoped token was subsequently approved, and its form prepared in the
-integrated browser. Final creation and private terminal entry remain with the
-account owner; no token was created or read by the assistant. The deployment
-wrapper is implemented and its six offline tests pass.
-**No cloud PDF/vector execution or platform CPU measurement is claimed.** Resume
-from the existing Worker; do not create it again.
+The probe was deployed to the explicitly authorized test Worker on a dashboard-
+verified Free account. The owner created a separately approved, account-scoped,
+short-lived token and entered it through the private terminal wrapper. The
+assistant did not read the token. After verifying the deployed version, binding,
+compatibility flags and disabled logs/traces, the one permitted sequence ran to
+completion: **107/107 stages returned HTTP 200**, including both 360-page PDF
+extractions, the MIME fixture, 10,000 full-dimensional vectors and both exact
+cosine searches. Persisted state is `complete`, with 107 stored results. The
+temporary token was then revoked and its absence verified in the dashboard.
+
+This establishes real cloud execution for the fixed synthetic workload, not
+full application acceptance, a maximum CPU allowance, unlimited capacity or a
+per-operation billing measurement. Raw responses, timing records and platform
+metrics remain in the owner's private validation report. The complete product,
+OAuth, Workers AI, staging, rules and live iCloud acceptance still require their
+separate protocol. Do not recreate the completed namespace to repeat this test.
+
+[CI for the tested code revision](https://github.com/lansbe/icloud-mcp/actions/runs/37244110804)
+passed the application and Free suites, all 107 local probe stages, six offline
+private-wrapper tests, the deployment build and npm audit (zero vulnerabilities).
