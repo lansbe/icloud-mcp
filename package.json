@@ -14,12 +14,18 @@
     "pretest": "node scripts/write-hostname.mjs",
     "test": "vitest run",
     "test:quick": "vitest run --reporter=dot",
-    "predeploy": "node scripts/write-hostname.mjs",
-    "deploy": "wrangler deploy",
+    "predeploy": "node scripts/free-config.mjs",
+    "deploy": "node scripts/free-deploy.mjs",
     "smoke": "node scripts/smoke-unauthenticated.mjs",
     "scan": "node scripts/forbidden-tokens.mjs",
     "docs:tools": "node scripts/tool-table.mjs --check",
-    "prepare": "husky && node scripts/write-hostname.mjs"
+    "prepare": "husky && node scripts/write-hostname.mjs",
+    "build:free": "node scripts/free-deploy.mjs --dry-run",
+    "prepare:free": "node scripts/free-config.mjs",
+    "pretest:free": "node scripts/free-config.mjs",
+    "test:free": "vitest run --config vitest.free.config.ts",
+    "check": "npm run typecheck && npm run scan && npm run docs:tools && npm test && npm run test:free",
+    "bench:free": "node scripts/benchmark-free.mjs"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "0.10.3",
@@ -35,11 +41,15 @@
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.21.2",
     "@cloudflare/workers-types": "5.20260812.1",
-    "@vitest/runner": "4.1.10",
-    "@vitest/snapshot": "4.1.10",
+    "@vitest/runner": "4.1.11",
+    "@vitest/snapshot": "4.1.11",
     "husky": "9.1.7",
     "typescript": "5.9.3",
-    "vitest": "4.1.10",
+    "vitest": "4.1.11",
     "wrangler": "4.122.0"
+  },
+  "overrides": {
+    "undici": "7.29.1",
+    "sharp": "0.35.4"
   }
 }

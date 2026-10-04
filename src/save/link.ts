@@ -33,6 +33,7 @@
 import { isConfiguredSecret } from "../configured-secret";
 import { DEPLOYED_HOSTNAME } from "../deployed-hostname.generated";
 import type { Env } from "../env";
+import { budgetOf } from "../free/budget";
 import { STAGING_PREFIX, USER_SEGMENT, isSavedName, underStagingPrefix } from "../staging/r2";
 
 /** How long a link works after it is made: five minutes. */
@@ -303,6 +304,10 @@ export async function claimSaveLink(
   if (payload.expiresAtMs <= nowMs) return { state: "expired", userId, key };
 
   const mark = await spentMarkKey(token);
+  if (env.FREE_BUDGET) {
+    if (!(await budgetOf(env).claim(mark, nowMs + SPENT_MARK_TTL_SECONDS * 1000))) return null;
+    return { state: "live", userId, key, sizeBytes: payload.sizeBytes };
+  }
   if ((await env.SAVE_LINK_KV.get(mark)) !== null) return null;
   await env.SAVE_LINK_KV.put(mark, "1", { expirationTtl: SPENT_MARK_TTL_SECONDS });
   return { state: "live", userId, key, sizeBytes: payload.sizeBytes };

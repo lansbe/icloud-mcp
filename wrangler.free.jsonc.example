@@ -1,0 +1,121 @@
+// Workers Free: no R2, no paid plan limits, no remote local bindings.
+// STORAGE BACKEND: sqlite
+// Immutable classes. Forward-fix deployments after the first release.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "icloud-mcp-free",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    {
+      "pattern": "icloud-mcp.example.com",
+      "custom_domain": true
+    }
+  ],
+  "vars": {
+    "ALLOWED_APPLE_IDS_SEED": "[\"YOUR_APPLE_ID@example.com\"]"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "YOUR_OAUTH_KV_NAMESPACE_ID"
+    },
+    {
+      "binding": "DAV_CACHE",
+      "id": "YOUR_DAV_CACHE_NAMESPACE_ID"
+    },
+    {
+      "binding": "ALLOW_LIST_KV",
+      "id": "YOUR_ALLOW_LIST_NAMESPACE_ID"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "LOGIN_IP_LIMITER",
+      "namespace_id": "2001",
+      "simple": {
+        "limit": 5,
+        "period": 60
+      }
+    },
+    {
+      "name": "LOGIN_ID_LIMITER",
+      "namespace_id": "2002",
+      "simple": {
+        "limit": 3,
+        "period": 60
+      }
+    },
+    {
+      "name": "SAVE_IP_LIMITER",
+      "namespace_id": "2003",
+      "simple": {
+        "limit": 30,
+        "period": 60
+      }
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "USER_AGENT",
+        "class_name": "UserAgent"
+      },
+      {
+        "name": "FREE_APPLICATION",
+        "class_name": "FreeApplication"
+      },
+      {
+        "name": "FREE_BLOBS",
+        "class_name": "BlobVault"
+      },
+      {
+        "name": "FREE_BUDGET",
+        "class_name": "FreeBudget"
+      },
+      {
+        "name": "FREE_RECALL",
+        "class_name": "SemanticStore"
+      }
+    ]
+  },
+  "exports": {
+    "UserAgent": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "FreeApplication": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "BlobVault": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "FreeBudget": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "SemanticStore": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+  "observability": {
+    "enabled": false
+  },
+  "services": [
+    {
+      "binding": "SELF",
+      "service": "icloud-mcp-free"
+    }
+  ]
+}

@@ -21,6 +21,7 @@
 // This module contains no logging calls of any kind and must never acquire any.
 
 import { AwsClient } from "aws4fetch";
+import { mintFreeUpload } from "../free/upload";
 import { isConfiguredSecret } from "../auth/login-handler";
 import type { Env } from "../env";
 import { ImapAuthError, ImapNotFoundError } from "../errors";
@@ -349,6 +350,7 @@ export async function mintUploadUrl(
   userId: string,
   request: UploadRequest,
 ): Promise<string> {
+  if (env.FREE_BLOBS) return mintFreeUpload(env, userId, request);
   const accountId = env.R2_ACCOUNT_ID;
   const accessKeyId = env.R2_ACCESS_KEY_ID;
   const secretAccessKey = env.R2_SECRET_ACCESS_KEY;

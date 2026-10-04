@@ -1,0 +1,131 @@
+import { env } from "cloudflare:workers";
+import { getOAuthApi } from "@cloudflare/workers-oauth-provider";
+import { beforeEach, describe, expect, it } from "vitest";
+import { runInDurableObject } from "cloudflare:test";
+import { oauthProviderOptions } from "../../src/auth/oauth";
+import entrypoint from "../../src/index";
+import type { Env } from "../../src/env";
+import { DEPLOYED_HOSTNAME } from "../../src/deployed-hostname.generated";
+import { budgetOf, FREE_BUDGETS } from "../../src/free/budget";
+import { USER_A, USER_B, type TestUser } from "../fixtures/two-users";
+
+const origin = `https://${DEPLOYED_HOSTNAME}`;
+const redirect = "https://claude.ai/api/mcp/auth_callback";
+const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+async function localToken(user: TestUser, clientCreated?: (id: string) => void): Promise<string> {
+  // Direct fixture authorization substitutes only the iCloud proof. Everything
+  // after it uses the real local provider, encrypted grants, PKCE and entrypoint.
+  const helpers = getOAuthApi(oauthProviderOptions, { ...env });
+  const client = await helpers.createClient({ redirectUris: [redirect], tokenEndpointAuthMethod: "none" });
+  clientCreated?.(client.clientId);
+  const request = await helpers.parseAuthRequest(new Request(`${origin}/authorize?${new URLSearchParams({
+    response_type: "code", client_id: client.clientId, redirect_uri: redirect, scope: "mcp", state: "fixture",
+    resource: `${origin}/mcp`, code_challenge: challenge, code_challenge_method: "S256",
+  })}`));
+  const result = await helpers.completeAuthorization({ request, userId: user.userId,
+    metadata: {}, scope: ["mcp"], props: { v: 1, appleId: user.appleId, appPassword: user.appPassword } });
+  const code = new URL(result.redirectTo).searchParams.get("code")!;
+  const response = await env.SELF.fetch(new Request(`${origin}/oauth/token`, { method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "authorization_code", code, client_id: client.clientId,
+      redirect_uri: redirect, code_verifier: verifier, resource: `${origin}/mcp` }) }));
+  expect(response.status).toBe(200);
+  return (await response.json() as {access_token: string}).access_token;
+}
+async function rpc(token: string, method: string, params: unknown = {}) {
+  const response = await env.SELF.fetch(new Request(`${origin}/mcp`, { method: "POST", headers: {
+    "authorization": `Bearer ${token}`, "content-type": "application/json", "accept": "application/json, text/event-stream",
+    "host": DEPLOYED_HOSTNAME,
+  }, body: JSON.stringify({jsonrpc: "2.0", id: 1, method, params}) }));
+  const text = await response.text();
+  const line = text.split("\n").find(x => x.startsWith("data: "))?.slice(6) ?? text;
+  return { response, body: JSON.parse(line) as {result?: any; error?: unknown}, text };
+}
+beforeEach(async () => {
+  await runInDurableObject(budgetOf(env), (_instance, state) => state.storage.sql.exec("delete from budget"));
+});
+
+describe("actual edge -> application DO -> OAuth -> MCP", () => {
+  it("returns a closed capacity response when the provider cannot deliver to the DO", async () => {
+    const unavailable = {FREE_APPLICATION: {getByName: () => ({fetch: async () => {throw new Error("synthetic unavailable");}})}} as unknown as Env;
+    const response = await entrypoint.fetch(new Request(`${origin}/mcp`), unavailable, {} as ExecutionContext);
+    expect(response.status).toBe(503);
+    expect(await response.text()).toContain("free_capacity_unavailable");
+  });
+  it("refuses unauthenticated tools and wrong hosts; discovery is served", async () => {
+    expect((await env.SELF.fetch(new Request(`${origin}/mcp`, {method: "POST", body: "{}"}))).status).toBe(401);
+    expect((await env.SELF.fetch(new Request("https://wrong.example.invalid/mcp"))).status).toBe(421);
+    const discovery = await env.SELF.fetch(`${origin}/.well-known/oauth-authorization-server`);
+    expect(discovery.status).toBe(200);
+    expect((await discovery.json() as {issuer: string}).issuer).toBe(origin);
+  });
+
+  it("keeps identity isolated across interleaved users and snapshots all 47 schemas", async () => {
+    const a = await localToken(USER_A);
+    const b = await localToken(USER_B);
+    const answers = await Promise.all([rpc(a, "tools/call", {name: "account_whoami", arguments: {}}),
+      rpc(b, "tools/call", {name: "account_whoami", arguments: {}})]);
+    for (const [i, user] of [USER_A, USER_B].entries()) {
+      expect(answers[i]!.response.status, answers[i]!.text).toBe(200);
+      expect(answers[i]!.text).toContain(user.appleId);
+      expect(answers[i]!.text).not.toContain(i ? USER_A.appleId : USER_B.appleId);
+      expect(answers[i]!.text).not.toContain(user.appPassword);
+    }
+    const list = await rpc(a, "tools/list");
+    expect(list.response.status).toBe(200);
+    expect(list.body.error).toBeUndefined();
+    expect(list.body.result.tools).toHaveLength(47);
+    expect(list.body.result.tools).toMatchSnapshot();
+    const unknown = await rpc(a, "tools/call", {name: "nonexistent-tool", arguments: {}});
+    expect(unknown.body.error).toBeDefined();
+  });
+
+  it("fails closed when its Free admission limit is reached", async () => {
+    await budgetOf(env).take("requests", FREE_BUDGETS.requests.limit);
+    const response = await env.SELF.fetch(`${origin}/.well-known/oauth-authorization-server`);
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("3600");
+    expect(await response.text()).toContain("free_capacity_unavailable");
+  });
+
+  it("recovers all application slots after four incomplete anonymous bodies", async () => {
+    const results = await Promise.all(Array.from({length: 4}, () =>
+      env.SELF.fetch(new Request(`${origin}/oauth/register`, {method: "POST",
+        headers: {"content-type": "application/json"},
+        body: new ReadableStream<Uint8Array>({start(controller) { controller.enqueue(new TextEncoder().encode("{")); }}),
+      })).then(response => response.status)));
+    expect(results).toEqual([408, 408, 408, 408]);
+    expect((await env.SELF.fetch(`${origin}/.well-known/oauth-authorization-server`)).status).toBe(200);
+  });
+
+  it("preserves token revocation after ordinary request and OAuth budgets exhaust", async () => {
+    let clientId = "";
+    const token = await localToken(USER_A, id => { clientId = id; });
+    await runInDurableObject(budgetOf(env), (_instance, state) => {
+      state.storage.sql.exec("delete from budget");
+    });
+    await budgetOf(env).take("requests", FREE_BUDGETS.requests.limit);
+    await budgetOf(env).take("oauthWrites", FREE_BUDGETS.oauthWrites.limit);
+    const response = await env.SELF.fetch(new Request(`${origin}/oauth/token`, {method: "POST",
+      headers: {"content-type": "application/x-www-form-urlencoded"},
+      body: new URLSearchParams({token, token_type_hint: "access_token", client_id: clientId}),
+    }));
+    // Public-client revocation is processed by the provider, not a Free 503.
+    expect(response.status).toBe(200);
+    expect(await budgetOf(env).take("oauthCleanup", FREE_BUDGETS.oauthCleanup.limit)).toBe(false);
+  });
+
+  it("does not mix identities across repeated concurrent requests", async () => {
+    const tokens = [await localToken(USER_A), await localToken(USER_B)];
+    for (let round = 0; round < 4; round++) {
+      const results = await Promise.all(Array.from({length: 4}, (_, i) =>
+        rpc(tokens[i % 2]!, "tools/call", {name: "account_whoami", arguments: {}})));
+      for (let i = 0; i < results.length; i++) {
+        expect(results[i]!.response.status).toBe(200);
+        expect(results[i]!.text).toContain(i % 2 ? USER_B.appleId : USER_A.appleId);
+        expect(results[i]!.text).not.toContain(i % 2 ? USER_A.appleId : USER_B.appleId);
+      }
+    }
+  });
+});

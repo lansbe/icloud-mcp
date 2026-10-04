@@ -25,6 +25,7 @@
 // This module contains no logging calls of any kind and must never acquire any.
 
 import type { Env } from "../env";
+import { attachmentStore } from "../free/blob-store";
 import { STAGED_ID_TTL_MS, encodeStagedId } from "../mail/ids";
 
 /**
@@ -729,7 +730,7 @@ export async function putStaged(
     return { staged: false, refusal: "filename-unusable", sizeBytes, limitBytes };
   }
 
-  await env.ATTACHMENT_STAGING.put(key, request.bytes, {
+  await attachmentStore(env).put(key, request.bytes, {
     httpMetadata: {
       contentType: MEDIA_TYPE.test(request.mimeType)
         ? request.mimeType
@@ -774,7 +775,7 @@ export async function getStaged(
 ): Promise<StagedObject | null> {
   if (!underStagingPrefix(userId, key)) return null;
 
-  const object = await env.ATTACHMENT_STAGING.get(key);
+  const object = await attachmentStore(env).get(key);
   if (object === null) return null;
 
   const bytes = new Uint8Array(await object.arrayBuffer());
@@ -821,7 +822,7 @@ export async function headStaged(
 ): Promise<StagedHead | null> {
   if (!underStagingPrefix(userId, key)) return null;
 
-  const object = await env.ATTACHMENT_STAGING.head(key);
+  const object = await attachmentStore(env).head(key);
   if (object === null) return null;
 
   return {
@@ -852,7 +853,7 @@ export async function deleteStaged(
   key: string,
 ): Promise<void> {
   if (!underStagingPrefix(userId, key)) return;
-  await env.ATTACHMENT_STAGING.delete(key);
+  await attachmentStore(env).delete(key);
 }
 
 // ------------------------------------------------------------ saved copies
@@ -921,7 +922,7 @@ export async function putSaved(
   if (!underStagingPrefix(userId, key)) return null;
   if (!isSavedName(key.slice(STAGING_PREFIX.length + userId.length + 1))) return null;
 
-  await env.ATTACHMENT_STAGING.put(key, bytes, {
+  await attachmentStore(env).put(key, bytes, {
     httpMetadata: { contentType: DEFAULT_MEDIA_TYPE },
   });
   return key;
@@ -945,7 +946,7 @@ export async function openSaved(
   if (!underStagingPrefix(userId, key)) return null;
   if (!isSavedName(key.slice(STAGING_PREFIX.length + userId.length + 1))) return null;
 
-  const object = await env.ATTACHMENT_STAGING.get(key);
+  const object = await attachmentStore(env).get(key);
   if (object === null) return null;
   return { body: object.body, sizeBytes: object.size };
 }
@@ -979,7 +980,7 @@ export async function sweepExpiredSaves(
 ): Promise<void> {
   if (!USER_SEGMENT.test(userId)) return;
   const cutoff = nowMs - olderThanMs;
-  const listed = await env.ATTACHMENT_STAGING.list({
+  const listed = await attachmentStore(env).list({
     prefix: `${STAGING_PREFIX}${userId}/${SAVE_STEM}-`,
   });
 
@@ -993,5 +994,5 @@ export async function sweepExpiredSaves(
     if (!Number.isSafeInteger(savedAt) || savedAt >= cutoff) continue;
     expired.push(key);
   }
-  if (expired.length > 0) await env.ATTACHMENT_STAGING.delete(expired);
+  if (expired.length > 0) await attachmentStore(env).delete(expired);
 }

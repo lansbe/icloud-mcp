@@ -1,17 +1,25 @@
-// Worker entry point.
-//
-// The default export is the OAuth provider itself, which is what makes
-// FND-02's ordering clause a property of the library rather than of project
-// code: the provider owns routing, and its API path validates the bearer
-// token and returns 401 before it ever reaches the API handler's fetch. No
-// project code sits in front of that check, so no refactor of project code
-// can move it.
+// The Free edge forwards requests to the bounded application DO. OAuth still
+// validates every bearer before entering MCP. The legacy path is retained for
+// the original test profile; the Free deploy validator requires all bindings.
 
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { oauthProviderOptions } from "./auth/oauth";
 import type { Env } from "./env";
+import { freeUnavailable } from "./free/application";
 
-export default new OAuthProvider<Env>(oauthProviderOptions);
+const legacyProvider = new OAuthProvider<Env>(oauthProviderOptions);
+export default {
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    if (env.FREE_APPLICATION) {
+      return env.FREE_APPLICATION.getByName("application-v1").fetch(request).catch(() => freeUnavailable());
+    }
+    return legacyProvider.fetch(request, env, ctx);
+  },
+};
+export { FreeApplication } from "./free/application";
+export { BlobVault } from "./free/blob-vault";
+export { FreeBudget } from "./free/budget";
+export { SemanticStore } from "./free/semantic-store";
 
 // The per-person Durable Object class (Phase 24). Deploy and the test pool both
 // require a class bound in wrangler.jsonc to be exported from this entry module;

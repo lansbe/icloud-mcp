@@ -10,10 +10,18 @@
 
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import type { UserAgent } from "./agent/user-agent";
+import type { BlobVault } from "./free/blob-vault";
+import type { FreeApplication } from "./free/application";
+import type { FreeBudget } from "./free/budget";
+import type { SemanticStore } from "./free/semantic-store";
 
 declare global {
   namespace Cloudflare {
     interface Env {
+      FREE_APPLICATION?: DurableObjectNamespace<FreeApplication>;
+      FREE_BLOBS?: DurableObjectNamespace<BlobVault>;
+      FREE_BUDGET?: DurableObjectNamespace<FreeBudget>;
+      FREE_RECALL?: DurableObjectNamespace<SemanticStore>;
       /**
        * Token, grant, and client storage for the OAuth provider.
        *

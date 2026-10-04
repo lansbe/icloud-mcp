@@ -1,0 +1,24 @@
+name: Verify Workers Free
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  local:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+          cache: npm
+      - run: npm ci
+      - run: cp wrangler.jsonc.example wrangler.jsonc
+      - run: npm run prepare:free
+      - run: npm run check
+      - run: npm run build:free
+      - run: npm audit --audit-level=high

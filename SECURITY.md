@@ -1,5 +1,7 @@
 # Security Policy
 
+**Free profile amendment:** [Free confidentiality, retention and recovery](docs/free/ARCHITECTURE.md#confidentiality-retention-and-recovery) supersedes the R2/Vectorize/KV spent-mark details below for this fork. Attachments and full embeddings use shared SQLite tables with logical owner isolation, platform encryption only and possible 30-day recovery copies. One-time claims are transactional. No SMTP guardrail is relaxed. The original protocol security analysis is retained below.
+
 iCloud MCP reaches real personal iCloud accounts — mail, calendar, and
 contacts. Security is the point of the design, not an afterthought. This
 document explains how to report a vulnerability and what the server does and

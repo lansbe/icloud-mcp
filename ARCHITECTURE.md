@@ -144,6 +144,18 @@ Every file under `src/` has one row here. `test/architecture-map.test.ts` fails
 when a file is added or removed and this map does not follow. Each table's rows
 are written relative to the directory in its heading.
 
+### `free/` — bounded Workers Free services
+
+| File | Responsibility |
+| --- | --- |
+| `application.ts` | OAuth and MCP execution in a SQLite Durable Object; fresh authentication context per request. |
+| `body.ts` | Bounded request bodies with an absolute read deadline and cancellation. |
+| `blob-vault.ts` | Bounded chunked SQLite attachment storage, atomic reservations, expiry alarm. |
+| `blob-store.ts` | Streaming attachment adapter retaining the upstream storage contract. |
+| `budget.ts` | Atomic deployment budgets and single-use capability claims. |
+| `semantic-store.ts` | Bounded exact cosine search over the unchanged 1024-dimensional embeddings. |
+| `upload.ts` | Signed, expiring same-origin upload capabilities. |
+
 ### Root (`src/`)
 
 | File | Role |

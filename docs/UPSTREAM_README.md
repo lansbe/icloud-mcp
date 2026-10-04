@@ -1,8 +1,4 @@
-# iCloud MCP — Workers Free fork
-
-> **Workers Free fork — locally tested, cloud validation pending.** Based on [Russell Moore’s icloud-mcp](https://github.com/russellkmoore/icloud-mcp) at `c40e748aa4c94ce8e8fff57adc70e5d761d9c91d`, retaining all 47 tools and the MIT attribution. The Free profile replaces R2 with bounded SQLite blobs, Vectorize with exact cosine over the same embeddings, and runs OAuth/MCP/PDF work in SQLite Durable Objects. No Paid subscription or external AI API is configured.
->
-> Start with the **[Free runbook](docs/free/DEPLOY.md)**, **[parity matrix](docs/free/PARITY.md)**, **[capacity and privacy differences](docs/free/ARCHITECTURE.md)**, and **[validation evidence](docs/free/VALIDATION.md)**. Production Free CPU/startup behavior and real iCloud interoperability still need an explicitly approved probe. The unchanged upstream README is [archived here](docs/UPSTREAM_README.md).
+# iCloud MCP
 
 An [MCP](https://modelcontextprotocol.io) server, hosted on Cloudflare Workers,
 that gives an AI assistant native tool access to **iCloud Mail, Calendar, and
@@ -67,7 +63,7 @@ you supply. See [Deploy](#deploy).
 - **Keep your mail.** iCloud is the system of record. What the server does keep
   is short-lived or small: the recall index (subject lines and a numeric
   fingerprint, never the message text, for 90 days), staged and saved
-  attachments (active rows expire within 24 hours; recovery copies can persist, see [Free retention](docs/free/ARCHITECTURE.md#confidentiality-retention-and-recovery)), which server holds your account
+  attachments (removed within about two days), which server holds your account
   (24 hours), and your rules and what they did.
 - **Let anyone in.** Who may sign in is an allow list you set. Everyone else is
   refused before Apple is ever contacted. Taking somebody off the list stops
@@ -78,8 +74,6 @@ you supply. See [Deploy](#deploy).
 ---
 
 ## How it works
-
-The following describes the original protocol design. In this fork, the [Free architecture](docs/free/ARCHITECTURE.md) supersedes its R2, Vectorize, KV spent-mark and execution-placement details.
 
 ```
 MCP client (Claude)
@@ -228,11 +222,154 @@ sends with the tool list, so an MCP client shows them with the tool.
 
 ## Requirements
 
-Node >=22.18 for local work. An existing Cloudflare Workers Free account and existing workers.dev hostname suffice for the proposed deployment; no R2, domain purchase or external AI key is required. Actual Free account eligibility must be verified before provisioning. See [quotas and limits](docs/free/ARCHITECTURE.md).
+| Requirement | Why |
+|-------------|-----|
+| **Cloudflare account, Workers Paid plan** | The free tier's 10 ms CPU budget cannot parse MIME bodies and PDF attachments. |
+| **A domain on Cloudflare** | `workers.dev` and preview URLs are disabled by design, so a custom-domain route is required. |
+| **Vectorize and Workers AI on the same account** | Recall stores its index in Vectorize and makes its fingerprints with a Workers AI embedding model. Both bill per use; the estimate in `src/recall/retention.ts` is about 2 cents a month for a typical person, and about 11 cents at the ceiling. |
+| **An Apple ID with an app-specific password** | iCloud requires an app-specific password for IMAP/DAV when the account has two-factor auth (it does). |
+| **Node.js 22.18+ and npm** | Wrangler and Vitest need 20+, but `scripts/grants.mjs` — the command that cuts off a connection — needs 22.18: it uses the synchronous module resolve hook (22.15) and built-in TypeScript type stripping (22.18) so it can call the Worker's own masking and user-id functions instead of keeping second copies. `package.json` declares the floor in `engines`, and the script says so and stops if the runtime is older. |
+
+---
 
 ## Deploy
 
-Use the [Free deployment and acceptance runbook](docs/free/DEPLOY.md). `npm run build:free` only builds locally. `npm run deploy -- --confirm-free-plan` validates the Free configuration and requires an operator acknowledgement; it cannot verify billing itself. Do not follow the historical Paid/R2 instructions.
+Every account-specific value goes in `wrangler.jsonc`, which is **git-ignored**.
+The tracked template is `wrangler.jsonc.example`. `npm install` copies the
+template into place on first run.
+
+### 1. Clone and install
+
+```bash
+git clone https://github.com/russellkmoore/icloud-mcp.git
+cd icloud-mcp
+npm install          # also copies wrangler.jsonc.example -> wrangler.jsonc
+```
+
+### 2. Create the storage bindings
+
+Each command prints an id. Paste it into the matching entry in `wrangler.jsonc`.
+
+```bash
+npx wrangler kv namespace create OAUTH_KV
+npx wrangler kv namespace create DAV_CACHE
+npx wrangler kv namespace create CONFIRM_KV
+npx wrangler kv namespace create ALLOW_LIST
+npx wrangler kv namespace create SAVE_LINK
+
+npx wrangler r2 bucket create icloud-mcp-attachments
+
+npx wrangler vectorize create icloud-mcp-recall --dimensions=1024 --metric=cosine
+npx wrangler vectorize create-metadata-index icloud-mcp-recall --propertyName=u --type=string
+```
+
+The Vectorize index holds the recall index. Create it, and its metadata index,
+before the first deploy: wrangler does not create an index on deploy, and a
+deploy fails until it exists. Its size (1024) and metric (cosine) cannot be
+changed later. The metadata index must exist before the first vector is written,
+because recall filters every search to the signed-in person with it.
+
+Add a lifecycle rule to the bucket so staged uploads expire after one day
+(Cloudflare dashboard → R2 → your bucket → Settings → Object lifecycle rules:
+prefix `staging/`, delete after 1 day). This is required — the staging token
+expires at 24 h and the bytes must not outlive it by much. Attachment copies made
+for a save link live under the same prefix, so the rule clears them too.
+
+### 3. Fill in `wrangler.jsonc`
+
+Edit these values in your git-ignored `wrangler.jsonc`:
+
+- `routes[0].pattern` → your custom domain (e.g. `icloud-mcp.your-domain.example`)
+- `vars.R2_ACCOUNT_ID` → your Cloudflare account id
+- `vars.ALLOWED_APPLE_IDS_SEED` → your own Apple ID, as a one-element JSON array
+  string: `"[\"you@example.com\"]"`
+- `kv_namespaces[].id` → the five ids from step 2
+
+Leave the other bindings as they are. `vectorize[0].index_name` must match the
+index you created. `services[0].service` must equal `name` at the top of the
+file: that binding lets the rules job call this same Worker, and it must never
+point at another one.
+
+The hostname is baked into the build automatically from `routes[0].pattern`;
+you never edit it in code.
+
+**Why your own address is in the config rather than in a secret.** The allow
+list has two halves, and they are split because the two readers ask different
+questions. `ALLOWED_APPLE_IDS_SEED` holds you, and it is read on **every API
+request** — which has to be synchronous, and a config value is. The KV list in
+step 4 holds everyone else and is read **only at sign-in**, which is already
+slow enough to afford a lookup. Keeping your own address in the config means a
+bad KV write can never lock you out of your own server.
+
+### 4. Write the allow list
+
+Everyone who may sign in, apart from you, goes in one KV document.
+
+```bash
+npx wrangler kv key put --namespace-id=YOUR_ALLOW_LIST_ID --remote \
+  "allow-list:v1" '["someone@example.com"]'
+```
+
+This pastes the namespace id, while the phase runbooks use `--binding
+ALLOW_LIST_KV`. Both forms are correct and they stay different on purpose: the
+binding name is the better habit once your config exists, because the id is then
+written down in exactly one place, but you are reading this before you have
+written that config, so the id is the only handle you have.
+
+An **empty list is valid** and is the right starting point — write `'[]'`, or
+skip this step entirely, and only you can sign in. A missing, empty or malformed
+document means nobody beyond the seed, never everybody. Only the exact value
+`["*"]` opens it to anyone.
+
+Read it back at any time with `wrangler kv key get`. That is the whole reason it
+is a KV document and not a Workers Secret: a secret cannot be read back, so
+"who is on the list?" would be a question you could not answer.
+
+### 5. Set the secrets
+
+```bash
+npx wrangler secret put CONFIRM_SECRET         # e.g. `openssl rand -base64 32`
+npx wrangler secret put R2_ACCESS_KEY_ID       # from an R2 S3 API token,
+npx wrangler secret put R2_SECRET_ACCESS_KEY   #   Object Read & Write, scoped to the bucket
+
+# 32 random bytes, base64url, sent on standard input so it is never printed:
+node -e "process.stdout.write(require('crypto').randomBytes(32).toString('base64url'))" \
+  | npx wrangler secret put SAVE_LINK_SEAL_KEY
+```
+
+See [`.dev.vars.example`](.dev.vars.example) for what each secret is. Two more
+secrets, `AUTONOMY_CLIENT_SECRET` and `AUTONOMY_SEAL_KEY`, are set for you in
+step 7.
+
+**There is no `AUTH_SECRET`, `APPLE_ID` or `APPLE_APP_PASSWORD` any more.** Each
+person now signs in with their own Apple ID and their own app-specific password,
+and those live in their own grant rather than in the server's environment. If
+you are upgrading an older deployment, those three secrets are inert after the
+switch and can be deleted.
+
+### 6. Deploy and verify
+
+```bash
+npm test          # optional: full suite against a local workerd (no live account needed)
+npm run deploy
+npm run smoke     # confirms the live endpoint refuses an unauthenticated request
+```
+
+### 7. Set up autonomy
+
+```bash
+node scripts/grants.mjs autonomy-setup         # shows what it would do
+node scripts/grants.mjs autonomy-setup --yes   # does it
+```
+
+This creates the client the rules job signs in as, and sets
+`AUTONOMY_CLIENT_SECRET` and `AUTONOMY_SEAL_KEY` through standard input. It never
+prints either value. Setting a secret deploys a new version of the Worker. From
+then on, every sign-in also makes that person's autonomy key. Until you run it,
+sign-in works but nobody has a key, so no rules run. Running it again refuses;
+`--replace` makes a new client and ends everyone's key until their next sign-in.
+
+---
 
 ## Connect an MCP client
 
@@ -283,7 +420,7 @@ passed the list check when they signed in.
 One command does this. **Look first:**
 
 ```bash
-ICLOUD_PROFILE=free node scripts/grants.mjs list
+node scripts/grants.mjs list
 ```
 
 That prints every connection to this server, grouped by person, each person
@@ -302,7 +439,7 @@ shown by a masked address. One line per connection:
 **Then cut them off:**
 
 ```bash
-ICLOUD_PROFILE=free node scripts/grants.mjs revoke --address "their-address@example.com" --yes
+node scripts/grants.mjs revoke --address "their-address@example.com" --yes
 ```
 
 **Without `--yes` nothing is deleted.** Leave it off and the command prints
@@ -334,7 +471,7 @@ reads the key, but does not delete the key. Revoke to end it.
 The script runs as you, through wrangler's own login, and reads the live store —
 never a local copy. There is deliberately no web page for this: a revoke
 endpoint would be new attack surface on a server that reaches real mail, for a
-job you do a few times a year. Run `ICLOUD_PROFILE=free node scripts/grants.mjs --help` for every
+job you do a few times a year. Run `node scripts/grants.mjs --help` for every
 form.
 
 ### Housekeeping — clearing out old app registrations
@@ -353,8 +490,8 @@ a real app ever is refused, those are the four numbers to raise.
 `list` tells you how many are lying around. To see them and clear them out:
 
 ```bash
-ICLOUD_PROFILE=free node scripts/grants.mjs prune-clients          # shows what it would delete
-ICLOUD_PROFILE=free node scripts/grants.mjs prune-clients --yes    # deletes it
+node scripts/grants.mjs prune-clients          # shows what it would delete
+node scripts/grants.mjs prune-clients --yes    # deletes it
 ```
 
 **It only ever deletes a registration that no connection was using in either of
@@ -406,7 +543,7 @@ revoke the connections that still hold the old one.** They fail at Apple, which
 does no harm on its own — but a failure at Apple pauses that person for fifteen
 minutes, and the pause is per person rather than per connection. So one app still
 carrying the dead password can keep pausing the apps you have already fixed.
-`ICLOUD_PROFILE=free node scripts/grants.mjs list` shows the date each connection was made; the ones
+`node scripts/grants.mjs list` shows the date each connection was made; the ones
 made before you changed the password are the stale ones.
 
 **Revoke those by id, one at a time — not with `--address`.** `--address` takes
@@ -415,7 +552,7 @@ signing in again, so using it here forces yet another sign-in. Read the ids off
 the `created` column and pass them:
 
 ```bash
-ICLOUD_PROFILE=free node scripts/grants.mjs revoke <old-id> <another-old-id> --yes
+node scripts/grants.mjs revoke <old-id> <another-old-id> --yes
 ```
 
 This is sharper than it used to be: connections never expire now, and each
@@ -425,8 +562,6 @@ app-specific password.
 ---
 
 ## Local development
-
-Use [the Free local commands](docs/free/DEPLOY.md#local-verification-without-an-account). The commands below describe the legacy test profile; never enable remote AI bindings or supply real credentials for automated tests.
 
 ```bash
 cp .dev.vars.example .dev.vars   # then fill in the values

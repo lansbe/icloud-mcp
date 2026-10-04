@@ -44,6 +44,8 @@
 // is never read. This module logs nothing (./.claude/CLAUDE.md §4).
 
 import { env } from "cloudflare:workers";
+import { semanticIndex } from "../free/semantic-store";
+import { takeBudget } from "../free/budget";
 import type { Principal } from "../principal";
 import { vectorIdOf } from "./ids";
 
@@ -137,7 +139,7 @@ function ownMatch(metadata: unknown, userId: string): RecallMatch | null {
 }
 
 /** A store over the given index binding. */
-export function createRecallStore(index: Vectorize): RecallStore {
+export function createRecallStore(index: Pick<Vectorize, "upsert" | "query" | "deleteByIds">): RecallStore {
   return {
     async upsert(principal, entries) {
       const vectors: VectorizeVector[] = [];
@@ -204,5 +206,12 @@ export function createRecallStore(index: Vectorize): RecallStore {
 
 /** The production store, over the real binding. */
 export function recallStore(): RecallStore {
+  if (env.FREE_RECALL) {
+    const local = createRecallStore(semanticIndex(env));
+    return { ...local, async query(principal, values, options) {
+      await takeBudget(env, "semanticScans");
+      return local.query(principal, values, options);
+    } };
+  }
   return createRecallStore(env.RECALL_INDEX);
 }

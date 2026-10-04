@@ -957,7 +957,8 @@ describe("a method this runtime cannot send", () => {
 
     expect(raised.message).toMatch(/^dav-[a-z-]+$/);
     expect(serialized).not.toContain(REFUSED_CREATE_METHOD);
-    expect(serialized).not.toContain("icloud");
+    // Source paths may contain the project name; only a service hostname is a leak.
+    expect(serialized).not.toContain("icloud.com");
     expect(serialized).not.toContain(FAKE_APPLE_ID);
     expect(serialized).not.toContain(FAKE_APP_PASSWORD);
   });

@@ -88,6 +88,8 @@
 // at all under `src/` — and this is exactly the module where a "log the payload
 // I am about to sign" line is tempting.
 
+import { env as runtimeEnv } from "cloudflare:workers";
+import { budgetOf } from "./free/budget";
 import { isConfiguredSecret } from "./auth/login-handler";
 import { TOKEN_DECODER, TOKEN_ENCODER, fromBase64Url, toBase64Url } from "./tokens";
 
@@ -2694,6 +2696,10 @@ export async function reserveConfirmation(
   expirySeconds: number,
 ): Promise<void> {
   const key = `${CONFIRM_KEY_PREFIX}${userId}:${jti}`;
+  if (runtimeEnv.FREE_BUDGET) {
+    if (!(await budgetOf(runtimeEnv).claim(key, expirySeconds * 1000))) throw new ConfirmationInvalidError();
+    return;
+  }
 
   const existing = await kv.get(key);
   if (existing !== null) throw new ConfirmationInvalidError();

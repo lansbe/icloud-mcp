@@ -27,12 +27,13 @@ import { defineConfig } from "vitest/config";
  *  the only ones that must run under Node. Named once and referenced by both
  *  projects, so a file cannot end up in both or in neither. */
 const FILESYSTEM_TESTS = [
+  "test/free-config.test.ts",
   "test/forbidden-tokens.test.ts",
   "test/vectorize-shape.test.ts",
   "test/recall-import-closure.test.ts",
 ];
 
-const IGNORED = ["**/node_modules/**", "**/dist/**", "**/.wrangler/**"];
+const IGNORED = ["**/node_modules/**", "**/dist/**", "**/.wrangler/**", "test/free/**"];
 
 export default defineConfig({
   test: {

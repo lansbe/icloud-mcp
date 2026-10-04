@@ -9,6 +9,8 @@ dist
 # ids, and custom domain. Copied from wrangler.jsonc.example on `npm install`;
 # fill in your own values. The tracked template is wrangler.jsonc.example.
 wrangler.jsonc
+wrangler.free.jsonc
+docs/free/benchmark.local.json
 
 # Generated at build time from the wrangler config's routes[0].pattern — never
 # committed, so it cannot go stale. See scripts/write-hostname.mjs.

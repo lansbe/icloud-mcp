@@ -4224,6 +4224,24 @@ export function matchRule(rule, ruleIndex, relativePath, contents) {
   const pattern = new RegExp(rule.pattern.source, flags);
   let match;
   while ((match = pattern.exec(contents)) !== null) {
+    // Free architecture decision: four deployment-wide services are not a
+    // person's UserAgent. Exempt only the exact fixed call at its one owner;
+    // caller-selected names, other bindings and every UserAgent call still fail.
+    if (rule.id === "agent-name-not-from-principal") {
+      const fixed = {
+        "src/index.ts": ['FREE_APPLICATION', 'application-v1'],
+        "src/free/blob-store.ts": ['FREE_BLOBS', 'attachments-v1'],
+        "src/free/budget.ts": ['FREE_BUDGET', 'deployment-v1'],
+        "src/free/semantic-store.ts": ['FREE_RECALL', 'recall-v1'],
+      }[relativePath];
+      if (fixed) {
+        const before = `env.${fixed[0]}.`;
+        const call = `getByName("${fixed[1]}")`;
+        if (!/[\w$.]/.test(contents[match.index - before.length - 1] ?? "") &&
+            contents.slice(match.index - before.length, match.index) === before &&
+            contents.slice(match.index, match.index + call.length) === call) continue;
+      }
+    }
     const { line, column } = positionOf(contents, match.index);
     found.push({
       file: relativePath,

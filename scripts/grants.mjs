@@ -234,7 +234,8 @@ const { unstable_readConfig } = await import("wrangler");
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
 /** The Worker config, by absolute path rather than relative to the caller's directory. */
-const CONFIG_PATH = fileURLToPath(new URL("../wrangler.jsonc", import.meta.url));
+const FREE_PROFILE = process.env.ICLOUD_PROFILE === "free";
+const CONFIG_PATH = fileURLToPath(new URL(FREE_PROFILE ? "../wrangler.free.jsonc" : "../wrangler.jsonc", import.meta.url));
 
 /**
  * This repository's OWN wrangler, never a global one.
@@ -295,7 +296,7 @@ const SOMETHING_WENT_WRONG =
  */
 function run(args) {
   try {
-    return execFileSync(WRANGLER, [...args], {
+    return execFileSync(WRANGLER, [...args, ...(FREE_PROFILE ? ["--config", CONFIG_PATH] : [])], {
       cwd: REPO_ROOT,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
@@ -326,7 +327,7 @@ function run(args) {
  */
 function runWithInput(args, input) {
   try {
-    return execFileSync(WRANGLER, [...args], {
+    return execFileSync(WRANGLER, [...args, ...(FREE_PROFILE ? ["--config", CONFIG_PATH] : [])], {
       cwd: REPO_ROOT,
       encoding: "utf8",
       input,
@@ -349,6 +350,10 @@ function runWithInput(args, input) {
  */
 function deployedHostname() {
   if (!existsSync(CONFIG_PATH)) throw new Error("no local wrangler.jsonc");
+  if (FREE_PROFILE) {
+    const config = unstable_readConfig({ config: CONFIG_PATH });
+    return config.workers_dev ? config.vars.PUBLIC_HOSTNAME : config.routes[0].pattern;
+  }
   return getHostname();
 }
 
