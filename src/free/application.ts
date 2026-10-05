@@ -6,6 +6,7 @@ import { DEPLOYED_HOSTNAME } from "../deployed-hostname.generated";
 import { takeBudget } from "./budget";
 import { handleUpload } from "./upload";
 import { boundedBody, BodyLimitError } from "./body";
+import { readOnlyValidation } from "../validation-access";
 
 export function freeUnavailable(status = 503): Response {
   return Response.json({ error: "free_capacity_unavailable", retry: "Retry later; no upgrade is performed." }, {
@@ -27,6 +28,7 @@ export class FreeApplication extends DurableObject<Env> {
     this.active++;
     try {
       if (url.pathname.startsWith("/upload/")) {
+        if (readOnlyValidation(this.env)) return new Response(null, { status: 403 });
         await takeBudget(this.env, "requests");
         return await handleUpload(request, this.env);
       }

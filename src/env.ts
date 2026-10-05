@@ -18,6 +18,10 @@ import type { SemanticStore } from "./free/semantic-store";
 declare global {
   namespace Cloudflare {
     interface Env {
+      /** Explicit full access, or read-only acceptance with indexing/autonomy off. */
+      ACCESS_MODE?: string;
+      /** Exact callback copied from the approved OpenAI connection; never a wildcard. */
+      OPENAI_REDIRECT_URI?: string;
       FREE_APPLICATION?: DurableObjectNamespace<FreeApplication>;
       FREE_BLOBS?: DurableObjectNamespace<BlobVault>;
       FREE_BUDGET?: DurableObjectNamespace<FreeBudget>;

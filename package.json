@@ -25,7 +25,8 @@
     "prepare:free": "node scripts/free-config.mjs",
     "pretest:free": "node scripts/free-config.mjs",
     "test:free": "vitest run --config vitest.free.config.ts",
-    "check": "npm run typecheck && npm run scan && npm run docs:tools && npm test && npm run test:free",
+    "test:validation": "vitest run --config vitest.validation.config.ts",
+    "check": "npm run typecheck && npm run scan && npm run docs:tools && npm test && npm run test:free && npm run test:validation",
     "bench:free": "node scripts/benchmark-free.mjs",
     "test:probe": "node scripts/test-cloud-probe.mjs"
   },

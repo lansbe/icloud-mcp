@@ -34,6 +34,15 @@ describe("Free deployment gates", () => {
     c.routes = [{pattern: "second.example.com", custom_domain: true}];
     expect(validateFreeConfig(c).problems.length).toBeGreaterThan(0);
   });
+  it("defaults to read-only acceptance and requires an explicit access mode", () => {
+    expect(config().vars.ACCESS_MODE).toBe("mail-read-only");
+    for (const mode of [undefined, "", "readonly", true]) {
+      const c = config(); c.vars.ACCESS_MODE = mode;
+      expect(validateFreeConfig(c).problems).toContain("Set ACCESS_MODE explicitly to mail-read-only, read-only or full.");
+    }
+    const c = config(); c.vars.ACCESS_MODE = "full";
+    expect(validateFreeConfig(c).problems).toEqual([]);
+  });
   it("keeps the per-person namespace check and limits service exceptions to exact names and modules", () => {
     const rule = FORBIDDEN.find(x => x.id === "agent-name-not-from-principal")!;
     const call = 'env.FREE_BLOBS.getByName("attachments-v1")';

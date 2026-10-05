@@ -86,6 +86,8 @@
 // as for a step.
 
 import type { McpServer } from "@modelcontextprotocol/server";
+import { env } from "cloudflare:workers";
+import { readOnlyValidation } from "../validation-access";
 import { AUTONOMY_CLIENT_ID } from "../agent/autonomy-client";
 import type { LeasedMail } from "../agent/lease";
 import type { Principal } from "../principal";
@@ -135,6 +137,7 @@ export async function runRecallStep(
   mail: LeasedMail,
   grantClient: GrantClient,
 ): Promise<void> {
+  if (readOnlyValidation(env)) return;
   try {
     if (!isPersonClient(await grantClient())) return;
     const actor = await principal;
@@ -171,6 +174,7 @@ export async function runRecallBackfill(
   depsFor: (mail: LeasedMail) => StepDeps = productionStepDeps,
   beforeRun?: () => Promise<void>,
 ): Promise<BackfillRun> {
+  if (readOnlyValidation(env)) return { kind: "refused" };
   if (!isPersonClient(await grantClient())) return { kind: "refused" };
   if (beforeRun !== undefined) await beforeRun();
   return { kind: "ran", outcome: await recallBackfill(principal, depsFor(mail)) };

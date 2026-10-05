@@ -33,7 +33,7 @@ const FILESYSTEM_TESTS = [
   "test/recall-import-closure.test.ts",
 ];
 
-const IGNORED = ["**/node_modules/**", "**/dist/**", "**/.wrangler/**", "test/free/**"];
+const IGNORED = ["**/node_modules/**", "**/dist/**", "**/.wrangler/**", "test/free/**", "test/validation/**"];
 
 export default defineConfig({
   test: {

@@ -5,6 +5,9 @@
 // callers.
 
 import { McpServer } from "@modelcontextprotocol/server";
+import { env } from "cloudflare:workers";
+import { readOnlyValidation, validationReadTools, VALIDATION_NOTICE, MAIL_VALIDATION_NOTICE } from "../validation-access";
+import { withValidationAccess } from "./validation-access";
 import type { McpServerFactory } from "@modelcontextprotocol/server";
 import { createLeasedMail } from "../agent/lease";
 import { createDavFetch } from "../dav/transport";
@@ -65,10 +68,12 @@ export function createServerFactory(
     // by `Server._oninitialize` / `Server._ondiscover`. Omitting it is what this
     // server did until now, and every boundary was being inferred from tool
     // names -- see `./instructions.ts` for the measurement that prompted it.
-    const server = new McpServer(
+    const restricted = readOnlyValidation(env);
+    const validationNotice = env.ACCESS_MODE === "read-only" ? VALIDATION_NOTICE : MAIL_VALIDATION_NOTICE;
+    const server = withValidationAccess(new McpServer(
       { name: "icloud-mcp", version: "0.1.0" },
-      { instructions: SERVER_INSTRUCTIONS },
-    );
+      { instructions: restricted ? `${validationNotice}\n\n${SERVER_INSTRUCTIONS}` : SERVER_INSTRUCTIONS },
+    ), restricted, validationReadTools(env));
     // Request-scoped BY CONSTRUCTION. This factory body runs once per request,
     // so the gate below cannot be shared with another caller — no bookkeeping,
     // no isolate-wide counter, and therefore no false refusal of a legitimate

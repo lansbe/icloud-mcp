@@ -161,6 +161,7 @@ are written relative to the directory in its heading.
 | File | Role |
 |------|------|
 | `index.ts` | Worker entry. The default export is the OAuth provider; it also exports the `UserAgent` Durable Object class. |
+| `validation-access.ts` | Mail-only and broader read-only validation modes; closed callback allow lists. |
 | `env.ts` | The binding surface: declares `Cloudflare.Env` (KV, R2, the vector index, AI, the Durable Object, the self-binding, rate limiters, vars, secrets). |
 | `errors.ts` | Closed error vocabulary and the single translation boundary (`toErrorCategory`). |
 | `tokens.ts` | Byte-level token codec (base64url, strict UTF-8) shared by every opaque id and cursor. |
@@ -177,6 +178,7 @@ are written relative to the directory in its heading.
 |------|------|
 | `oauth.ts` | The `OAuthProviderOptions` object. Routes `/save/` to the download route and everything else to the login handler. |
 | `login-handler.ts` | The `/authorize` flow: the allow-list check, the refusal floor and limiter layers, proving the password against Apple, the redirect allowlist, and arming the autonomy key after a sign-in. |
+| `openai-redirect.ts` | Matches only the exact configured OpenAI callback URL. |
 | `login-page.ts` | Every byte of the sign-in page a person sees. |
 | `allow-list.ts` | The one store read, the parse rule shared with the seed, and what an absent or malformed document means. |
 
@@ -184,6 +186,7 @@ are written relative to the directory in its heading.
 
 | File | Role |
 |------|------|
+| `validation-access.ts` | Keeps tool schemas and blocks unapproved callbacks before execution. |
 | `api-handler.ts` | The door. Checks the grant against the allow list, builds the principal, and hands the request to `createMcpHandler`. Holds the host and origin config. |
 | `server.ts` | The per-request server factory: the session gate, the leased mail runner, the DAV fetch, the recall step seam, and every tool registration. |
 | `instructions.ts` | The server-level instructions a client shows the model with the tool list. |

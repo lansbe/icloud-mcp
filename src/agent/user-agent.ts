@@ -67,6 +67,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
+import { readOnlyValidation } from "../validation-access";
 import {
   AUTONOMY_KEY,
   type ArmOutcome,
@@ -748,7 +749,7 @@ export class UserAgent extends DurableObject<Env> {
     //     again, so the alarm goes when no job is left (plan 28-03).
     try {
       const ownName = this.storedOwnName();
-      if (ownName !== null) {
+      if (ownName !== null && !readOnlyValidation(this.env)) {
         const storage = this.ctx.storage.kv;
         const autonomyDeps = {
           storage,
@@ -1108,6 +1109,7 @@ export class UserAgent extends DurableObject<Env> {
    * able to tell "not armed" from nothing at all.
    */
   async armAutonomy(code: unknown): Promise<ArmOutcome> {
+    if (readOnlyValidation(this.env)) return { kind: "not_armed" };
     if (typeof code !== "string") return { kind: "not_armed" };
     const name = this.rememberOwnName();
     if (name === null) return { kind: "not_armed" };

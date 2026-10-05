@@ -1,6 +1,6 @@
 # Deploying the Free profile
 
-Status: application locally tested; no product deployment or iCloud connection performed. A separately authorized test Worker placeholder exists; its probe installation remains pending (see [CLOUD-PROBE.md](CLOUD-PROBE.md)). Follow this profile instead of the upstream R2/Paid instructions. This is a fresh-install path; it does not migrate existing users or copy a live upstream datastore.
+Status: application locally tested; no product deployment or iCloud connection performed. The separately authorized synthetic cloud probe completed (see [CLOUD-PROBE.md](CLOUD-PROBE.md)); it is retained as evidence. Follow this profile instead of the upstream R2/Paid instructions. It does not migrate existing users or copy a live upstream datastore. The chosen Worker name remains `icloud-mcp`; archive the synthetic probe evidence before replacing its entrypoint. Do not create a second public Worker merely to retain the probe.
 
 ## Local verification without an account
 
@@ -21,9 +21,9 @@ npm run bench:free
 
 For this development task, the user has authorized GitHub fork/commits and a specifically named synthetic test Worker with necessary SQLite storage on the verified Free account. This does **not** authorize product deployment, secret creation, permission changes or iCloud login. The following product commands are a reviewable runbook, not actions already taken. Stop if Cloudflare asks for payment, an upgrade, a new token, expanded permissions or a new account. Existing CLI authorization may be used only after the user approves the named account and intended cloud operations. Never inspect credential files or print tokens.
 
-The minimum approval is: use the user's identified existing **Workers Free** account; create three KV namespaces and this Worker's five SQLite DO classes; deploy only this fork with synthetic data first; create the four named application secrets; use included Workers AI with a tiny synthetic embedding. No R2, Vectorize, payment or third-party AI account is needed. An existing `workers.dev` subdomain avoids purchasing a domain. The dashboard must show Workers Free and no required billing checkout for these operations. The CLI acknowledgement is not an account-plan API check.
+For a first read-only connection, approve the existing **Workers Free** account, three KV namespaces, five SQLite DO classes, deployment to the existing `icloud-mcp` Worker, a narrowly scoped temporary installation token, and the real user's encrypted OAuth connection for Mail only. The template defaults to `ACCESS_MODE: "mail-read-only"`. This mode needs **no application secret and no AI inference**; see [READ-ONLY.md](READ-ONLY.md). Approve those separately before enabling full access. No R2, Vectorize, payment or third-party AI account is needed. An existing `workers.dev` subdomain avoids purchasing a domain. The dashboard must show Workers Free and no required billing checkout. The CLI acknowledgement is not an account-plan API check.
 
-After approval, inspect the selected account in the dashboard and run `npx wrangler whoami` to confirm its identity. Do not dump tokens. Create the three namespaces with the pinned Wrangler:
+After approval, inspect the selected account in the dashboard and pass its exact ID to the installer. Do not request extra identity permissions merely to run `whoami`, or dump tokens. Create the three namespaces with the pinned Wrangler:
 
 ```sh
 npx wrangler kv namespace create OAUTH_KV --config wrangler.free.jsonc
@@ -31,9 +31,9 @@ npx wrangler kv namespace create DAV_CACHE --config wrangler.free.jsonc
 npx wrangler kv namespace create ALLOW_LIST_KV --config wrangler.free.jsonc
 ```
 
-Fill their distinct IDs in `wrangler.free.jsonc`. Keep its name and `SELF.service` equal. For a free hostname, set `workers_dev: true`, `routes: []`, and `vars.PUBLIC_HOSTNAME` to `icloud-mcp-free.<your-existing-subdomain>.workers.dev`. Keep `preview_urls: false`. Alternatively, use one custom domain already owned by the user, with `workers_dev: false`; do not buy a domain for this task. Set the explicit allow list in the ignored config. Never commit real IDs, addresses or secrets.
+Fill their distinct IDs in `wrangler.free.jsonc`. Keep its name and `SELF.service` equal. For a free hostname, set `workers_dev: true`, `routes: []`, and `vars.PUBLIC_HOSTNAME` to `icloud-mcp.<your-existing-subdomain>.workers.dev`. Keep `preview_urls: false`. Alternatively, use one custom domain already owned by the user, with `workers_dev: false`; do not buy a domain for this task. Set the explicit allow list in the ignored config. Never commit real IDs, addresses or secrets.
 
-The application requires `CONFIRM_SECRET` and `SAVE_LINK_SEAL_KEY`, plus `AUTONOMY_CLIENT_SECRET` and `AUTONOMY_SEAL_KEY`. The last pair are set by the existing autonomy setup command, which also creates its OAuth client. The save seal key and autonomy seal key must each be exactly 32 random bytes encoded as base64url; CONFIRM_SECRET must be a strong unpredictable value. Generate/store values only after separate authorization, privately through secure interactive input; never through command-line values or committed `.dev.vars`. Setting a Worker secret can itself publish a Worker version.
+Full access requires `CONFIRM_SECRET` and `SAVE_LINK_SEAL_KEY`, plus `AUTONOMY_CLIENT_SECRET` and `AUTONOMY_SEAL_KEY`. The last pair are set by the existing autonomy setup command, which also creates its OAuth client. The save seal key and autonomy seal key must each be exactly 32 random bytes encoded as base64url; CONFIRM_SECRET must be a strong unpredictable value. Generate/store values only after separate authorization, privately through secure interactive input; never through command-line values or committed `.dev.vars`. Setting a Worker secret can itself publish a Worker version.
 
 ```sh
 npx wrangler secret put CONFIRM_SECRET --config wrangler.free.jsonc

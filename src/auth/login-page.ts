@@ -423,6 +423,25 @@ export interface SignInNotice {
   readonly lines: readonly string[];
 }
 
+/** Accurate consent for the explicitly restricted first live session. */
+export const READ_ONLY_NOTICE: SignInNotice = {
+  heading: "Read-only validation",
+  lines: [
+    "This session can read your iCloud mail, calendars and contacts through the connected app. It cannot modify them, create drafts, stage files or activate rules.",
+    "Your app-specific password is kept in your encrypted connection grant on this Cloudflare deployment. Mail indexing and autonomous access are disabled. Apple does not restrict this password to read-only access; this server enforces that restriction.",
+    "Remove the connection and revoke this app-specific password at account.apple.com when the test is over.",
+  ],
+};
+
+export const MAIL_READ_ONLY_NOTICE: SignInNotice = {
+  heading: "Mail-only read validation",
+  lines: [
+    "This session can read your iCloud mail through the connected app. Calendar, contacts, changes, writes, drafts, file staging and autonomous rules are disabled.",
+    "Your app-specific password is kept in your encrypted connection grant on this Cloudflare deployment. No mail is indexed or sent to Workers AI. Apple does not scope this password to read-only Mail; this server enforces that restriction.",
+    "Remove the connection and revoke this app-specific password at account.apple.com when the test is over.",
+  ],
+};
+
 /** One day, in milliseconds. */
 const DAY_MS = 86_400_000;
 
@@ -918,7 +937,13 @@ export function renderForm(
     <button type="submit" aria-describedby="submit-help">Sign in</button>
     <p class="help" id="submit-help">This takes a few seconds while Apple checks the password. Press it once.</p>
   </form>
-  <div class="explainer">${EXPLAINER_SECTIONS.map(renderSection).join("")}</div>
+  <div class="explainer">${EXPLAINER_SECTIONS.map((section, index) => renderSection(
+    notices.includes(MAIL_READ_ONLY_NOTICE) && index === 2 ? {
+      ...section, paragraphs: ["This session can read only your iCloud mail. It cannot modify mail, read calendars or contacts, or send mail. Indexing and autonomous access are disabled. Your password is stored encrypted on this server and is used only to talk to Apple."],
+    } : notices.includes(READ_ONLY_NOTICE) && index === 2 ? {
+      ...section, paragraphs: ["This session can read your mail, calendars and contacts. It cannot modify them or send mail. Indexing and autonomous access are disabled. Your password is stored encrypted on this server and is used only to talk to Apple."],
+    } : section,
+  )).join("")}</div>
 </main>
 </body>
 </html>`,

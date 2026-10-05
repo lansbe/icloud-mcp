@@ -1,6 +1,7 @@
 import { readFileSync, existsSync, copyFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { stripJsonComments, stripTrailingCommas } from "./hostname.mjs";
+import { validOpenAiRedirect } from "../src/auth/openai-redirect.ts";
 
 export function readFreeConfig(path = "wrangler.free.jsonc") {
   return JSON.parse(stripTrailingCommas(stripJsonComments(readFileSync(path, "utf8"))));
@@ -25,8 +26,12 @@ export function validateFreeConfig(config, live = false) {
   }
   if (config.ai?.binding !== "AI" || config.ai.remote === true) problems.push("Use the AI binding without remote local access.");
   if (config.observability?.enabled !== false || config.observability?.logs?.enabled === true || config.observability?.traces?.enabled === true) problems.push("Disable invocation logging: URLs can carry capabilities.");
-  if (Object.keys(config.vars ?? {}).some(x => !["ALLOWED_APPLE_IDS_SEED", "PUBLIC_HOSTNAME"].includes(x))) {
+  if (Object.keys(config.vars ?? {}).some(x => !["ALLOWED_APPLE_IDS_SEED", "PUBLIC_HOSTNAME", "ACCESS_MODE", "OPENAI_REDIRECT_URI"].includes(x))) {
     problems.push("Unexpected variable; credentials do not belong in configuration.");
+  }
+  if (!["mail-read-only", "read-only", "full"].includes(config.vars?.ACCESS_MODE)) problems.push("Set ACCESS_MODE explicitly to mail-read-only, read-only or full.");
+  if (config.vars?.OPENAI_REDIRECT_URI !== undefined && !validOpenAiRedirect(config.vars.OPENAI_REDIRECT_URI)) {
+    problems.push("Copy one exact OpenAI redirect URI from its connection management page.");
   }
   const namespaces = config.kv_namespaces ?? [];
   if ([...namespaces.map(x => x.binding)].sort().join(",") !== "ALLOW_LIST_KV,DAV_CACHE,OAUTH_KV") {

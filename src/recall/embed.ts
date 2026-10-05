@@ -21,6 +21,7 @@
 
 import { env } from "cloudflare:workers";
 import { takeBudget } from "../free/budget";
+import { readOnlyValidation } from "../validation-access";
 
 /** The one embedding model recall uses. */
 export const RECALL_MODEL = "@cf/baai/bge-m3";
@@ -85,6 +86,7 @@ export function createEmbedder(ai: Ai): Embedder {
 
 /** The production embedder, over the real binding. */
 export function embedder(): Embedder {
+  if (readOnlyValidation(env)) return { async embed() { throw new RecallEmbedError(); } };
   const engine = createEmbedder(env.AI);
   return { async embed(texts) {
     await takeBudget(env, "embeddingBytes", texts.reduce((sum, text) => sum + new TextEncoder().encode(text).byteLength, 0));

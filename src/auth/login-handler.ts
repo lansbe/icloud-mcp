@@ -112,6 +112,8 @@
 // ---------------------------------------------------------------------------
 
 import { AuthorizationError } from "@cloudflare/workers-oauth-provider";
+import { env as runtimeEnv } from "cloudflare:workers";
+import { matchesOpenAiRedirect } from "./openai-redirect";
 import type {
   ClientInfo,
   ClientRegistrationCallbackOptions,
@@ -127,6 +129,7 @@ import { agentFor } from "../agent/lease";
 import { isConfiguredSecret } from "../configured-secret";
 import { DEPLOYED_HOSTNAME } from "../deployed-hostname.generated";
 import type { Env } from "../env";
+import { readOnlyValidation } from "../validation-access";
 import { ImapConnectError, ImapThrottleError } from "../errors";
 import type { SessionGate } from "../mail/service";
 import { createSessionGate, withMailSession } from "../mail/service";
@@ -141,6 +144,8 @@ import {
   AUTONOMY_NOTICE_FIELD,
   AUTONOMY_NOTICE_VERSION,
   RECALL_NOTICE,
+  READ_ONLY_NOTICE,
+  MAIL_READ_ONLY_NOTICE,
   RESPONSE_HEADERS,
   SOURCE_REFUSAL_BODY,
   renderForm,
@@ -941,6 +946,11 @@ export function isAllowedRedirectOrigin(origin: string | null): boolean {
   );
 }
 
+/** OpenAI callbacks use exact configured URIs, never a whole-origin grant. */
+export function isAllowedRedirectUri(uri: string, openAiRedirect?: string): boolean {
+  return matchesOpenAiRedirect(uri, openAiRedirect) || isAllowedRedirectOrigin(originOf(uri));
+}
+
 /**
  * The entire description served when a registration is refused (LIFE-02).
  *
@@ -1059,8 +1069,8 @@ export const MAX_REGISTRATION_BYTES = 8192;
  * That is the same never-throw shape `servesThisGrant` uses in
  * `src/mcp/api-handler.ts`, for the same reason.
  *
- * The callback is handed no environment, so it cannot reach a store or a
- * limiter. That is fine for a question about an origin.
+ * The callback receives no environment argument. It reads only the public
+ * exact OpenAI callback setting from the runtime; no store or limiter is used.
  */
 export function refuseUnlistedRedirects(
   options: ClientRegistrationCallbackOptions,
@@ -1080,7 +1090,7 @@ export function refuseUnlistedRedirects(
       uris.length > 0 &&
       uris.every(
         (uri: unknown) =>
-          typeof uri === "string" && isAllowedRedirectOrigin(originOf(uri)),
+          typeof uri === "string" && isAllowedRedirectUri(uri, runtimeEnv.OPENAI_REDIRECT_URI),
       );
 
     // A SIZE BOUND, and the redirect gate is not one. The registration endpoint
@@ -1276,8 +1286,8 @@ If that destination is genuinely yours, add its origin to ALLOWED_REDIRECT_ORIGI
  * The failure counter is deliberately not touched here. It counts guesses at
  * the secret, and a refused destination is not one.
  */
-function refusedRedirectResponse(redirectUri: string): Response | null {
-  if (isAllowedRedirectOrigin(originOf(redirectUri))) return null;
+function refusedRedirectResponse(redirectUri: string, env: Env): Response | null {
+  if (isAllowedRedirectUri(redirectUri, env.OPENAI_REDIRECT_URI)) return null;
 
   return new Response(refusedRedirectBody(displayDestination(redirectUri)), {
     status: 403,
@@ -1400,7 +1410,7 @@ export function createLoginHandler(
  * sign-in works exactly as it always did, and nothing is minted.
  */
 export function autonomyConfigured(env: Env): boolean {
-  return isConfiguredSecret(env.AUTONOMY_CLIENT_SECRET) && sealKeyUsable(env.AUTONOMY_SEAL_KEY);
+  return !readOnlyValidation(env) && isConfiguredSecret(env.AUTONOMY_CLIENT_SECRET) && sealKeyUsable(env.AUTONOMY_SEAL_KEY);
 }
 
 /**
@@ -1459,10 +1469,11 @@ export const loginHandler = createLoginHandler();
  * the same predicate the arming uses, and this is the one place the list is
  * built, so the page and the arming cannot disagree. The page renders the
  * autonomy notice's hidden field exactly when the notice is in this list. The
- * recall notice is always first and always present, because recall is
- * inherent: it does not depend on any setting.
+ * Full mode retains the original recall/autonomy notices. Read-only validation
+ * substitutes its own notice and never claims that indexing or autonomy runs.
  */
 export function signInNotices(env: Env): readonly SignInNotice[] {
+  if (readOnlyValidation(env)) return [env.ACCESS_MODE === "read-only" ? READ_ONLY_NOTICE : MAIL_READ_ONLY_NOTICE];
   return autonomyConfigured(env) ? [RECALL_NOTICE, AUTONOMY_NOTICE] : [RECALL_NOTICE];
 }
 
@@ -1557,7 +1568,7 @@ async function handleAuthorize(
       // is one this client actually registered, so what happens here is a
       // NARROWING of what may be registered-and-used — not a replacement for
       // that validation.
-      const refusedGet = refusedRedirectResponse(oauthRequest.redirectUri);
+      const refusedGet = refusedRedirectResponse(oauthRequest.redirectUri, env);
       if (refusedGet) return refusedGet;
 
       // Resolve who is asking BEFORE rendering, not after the secret has been
@@ -1684,7 +1695,7 @@ async function handleAuthorize(
     // a check on one verb only is a hole, because the POST is what actually
     // issues the code. It sits above the comparison as well as above the
     // lookup, so a correct secret buys nothing for a refused destination.
-    const refusedPost = refusedRedirectResponse(oauthRequest.redirectUri);
+    const refusedPost = refusedRedirectResponse(oauthRequest.redirectUri, env);
     if (refusedPost) return refusedPost;
 
     const client = await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId);
